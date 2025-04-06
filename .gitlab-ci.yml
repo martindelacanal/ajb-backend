@@ -1,0 +1,108 @@
+stages:
+  - buildpush          # List of stages for jobs, and their order of execution
+  - dev-deploy
+  - prd-deploy
+
+variables:
+
+  REPOSITORY_NAME: "ditory-backend"
+#  PVS_DOCKER_PROJECT: "pvs-base-images"
+  PVS_DOCKER_REGISTRY_URL: "dev-registry.pvssa.com.ar"
+  K8S_PVS_DEPLOYMENT: "test-ditory-backend"
+  K8S_PVS_DEPLOY_QA: "qa-ditory-backend"
+  K8S_PVS_DEPLOY_PRD: "prd-ditory-backend"
+  K8S_PVS_SERVER: "https://192.168.20.100:6443"
+  K8S_PVS_SERVER_QA: "https://10.10.22.8:6443"
+  K8S_PVS_SERVER_PRD: "https://10.10.32.8:6443"
+  K8S_PVS_NAMESPACE: development
+  K8S_PVS_NAMESPACE_QA: pvsapps
+  K8S_PVS_NAMESPACE_PRD: pvsapps
+  IMAGE_TAG: $CI_COMMIT_SHORT_SHA
+
+build_images:
+  stage: buildpush
+  tags:
+    - test-all-ditory
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${PVS_DOCKER_REGISTRY_URL}\":{\"auth\":\"$(printf "%s:%s" "${PVS_DOCKER_REGISTRY_USER}" "${PVS_DOCKER_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/Dockerfile"
+      --destination "${PVS_DOCKER_REGISTRY_URL}/${PVS_DOCKER_PROJECT}/${REPOSITORY_NAME}:${IMAGE_TAG}" 
+ # rules:
+ #   - if: $CI_COMMIT_TAG
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "develop") 
+      variables:
+          IMAGE_TAG: develop
+    - if: ($CI_COMMIT_BRANCH =~ /^release.*$/)
+      variables:
+          IMAGE_TAG: $CI_COMMIT_BRANCH
+          
+
+deploy_k8s:
+  stage: dev-deploy
+  tags:
+    - test-all-ditory
+#  needs: [build_images]
+  image: bitnami/kubectl
+
+  script:
+    - echo "$DEV_CA_PIPE" > ca.crt        #Declaradas como variables generales, solicitar a it@pvs.com.ar
+      ## se genera la config de conexion al cluster
+    - kubectl config --kubeconfig=gitlab-config set-cluster kubernetes --server=$K8S_PVS_SERVER --certificate-authority=ca.crt   
+    - kubectl config --kubeconfig=gitlab-config set-credentials pvsgitlab --token=$DEV_TOKEN_PIPE 
+    - kubectl config --kubeconfig=gitlab-config set-context gitlab --cluster=kubernetes --user=pvsgitlab
+    - kubectl config --kubeconfig=gitlab-config use-context gitlab
+      ## se actualiza el deploy  con la nueva imagen 
+      ##
+    - kubectl set image deploy $K8S_PVS_DEPLOYMENT $REPOSITORY_NAME=$PVS_DOCKER_REGISTRY_URL/$PVS_DOCKER_PROJECT/$REPOSITORY_NAME:$IMAGE_TAG --kubeconfig=gitlab-config -n $K8S_PVS_NAMESPACE --record
+    - kubectl rollout restart deploy $K8S_PVS_DEPLOYMENT --kubeconfig=gitlab-config -n $K8S_PVS_NAMESPACE 
+  
+  environment:
+    name: test
+
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "develop") 
+      variables:
+          IMAGE_TAG: develop
+  # - if: ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_TAG =~ /^*-release$/)
+
+
+deploy_k8s_prd:
+  stage: prd-deploy  
+  tags:
+    - test-all-ditory
+ #image: bitnami/kubectl
+  image: dev-registry.pvssa.com.ar/pvs-ci/kubectl:v1
+
+  script:
+
+    - MR_BRANCH_LAST_COMMIT_SHA=$(curl -s -X GET --header "PRIVATE-TOKEN:$GITLAB_TOKEN"  "$CI_API_V4_URL/projects/$CI_PROJECT_ID/repository/commits/$CI_COMMIT_SHA" | jq -r '.parent_ids | del(.[] | select(. == "'$CI_COMMIT_BEFORE_SHA'")) | .[-1]' )
+
+    - echo $MR_BRANCH_LAST_COMMIT_SHA
+
+    - MR_BRANCH_NAME=$(curl -s -X GET --header "PRIVATE-TOKEN:$GITLAB_TOKEN" "$CI_API_V4_URL/projects/$CI_PROJECT_ID/repository/commits/$MR_BRANCH_LAST_COMMIT_SHA/merge_requests" | jq -r '.[0].source_branch')
+    ### soruce branch name
+    - echo $MR_BRANCH_NAME
+     
+    - echo "$CA_PRD_PIPE" > ca.crt        
+    - kubectl config --kubeconfig=gitlab-config set-cluster kubernetes --server=$K8S_PVS_SERVER_PRD --certificate-authority=ca.crt   
+    - kubectl config --kubeconfig=gitlab-config set-credentials pvsgitlab --token=$TOKEN_PRD_PIPE 
+    - kubectl config --kubeconfig=gitlab-config set-context gitlab --cluster=kubernetes --user=pvsgitlab
+    - kubectl config --kubeconfig=gitlab-config use-context gitlab
+      ## se actualiza el deploy  con la nueva imagen 
+      ##
+    - kubectl set image deploy $K8S_PVS_DEPLOY_PRD $REPOSITORY_NAME=$PVS_DOCKER_REGISTRY_URL/$PVS_DOCKER_PROJECT/$REPOSITORY_NAME:$MR_BRANCH_NAME --kubeconfig=gitlab-config -n $K8S_PVS_NAMESPACE_PRD --record
+    - kubectl rollout restart deploy $K8S_PVS_DEPLOY_PRD --kubeconfig=gitlab-config -n $K8S_PVS_NAMESPACE_PRD
+
+  environment:
+    name: prd
+
+  rules:
+   - if: ($CI_COMMIT_BRANCH == "master")
