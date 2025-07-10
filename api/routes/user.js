@@ -41,24 +41,22 @@ const s3 = new S3Client({
 });
 // S3 FIN
 
-// desesperado
 router.post("/signin", async (req, res) => {
-  const identifier = req.body.email || null; // This field can be either email or legajo
+  const documento = req.body.documento || null;
   const password = req.body.password || null;
   const recordar = req.body.recordar || null;
 
-  let query = "";
-  let queryParams = [];
-
-  if (identifier && identifier.includes("@")) {
-    // It's an email
-    query = "SELECT usuario.id, usuario.nombre, usuario.email, usuario.password, usuario.departamental_id, rol.nombre AS rol, usuario.habilitado FROM usuario INNER JOIN rol ON rol.id = usuario.rol_id WHERE usuario.email = ?";
-    queryParams = [identifier];
-  } else {
-    // It's a legajo
-    query = "SELECT usuario.id, usuario.nombre, usuario.email, usuario.password, usuario.departamental_id, rol.nombre AS rol, usuario.habilitado FROM usuario INNER JOIN rol ON rol.id = usuario.rol_id WHERE usuario.legajo = ?";
-    queryParams = [identifier];
+  if (!documento || !password) {
+    return res.status(400).json("Documento y contraseña son requeridos");
   }
+
+  const query = `
+    SELECT usuario.id, usuario.nombre, usuario.apellido, usuario.documento, usuario.email, usuario.password, usuario.departamental_id, rol.nombre AS rol, usuario.habilitado
+    FROM usuario
+    INNER JOIN rol ON rol.id = usuario.rol_id
+    WHERE usuario.documento = ?
+  `;
+  const queryParams = [documento];
 
   mysqlConnection.query(query, queryParams, async (err, rows, fields) => {
     if (!err) {
@@ -66,20 +64,10 @@ router.post("/signin", async (req, res) => {
         if (rows[0].habilitado === "N") {
           res.status(403).json("Usuario inhabilitado");
         } else {
-          // delete field password in data
           delete rows[0].password;
           let data = rows[0];
 
-          // Adjust role logic
-          if (rows[0].rol === "afiliado") {
-            data.rol = "afiliado";
-          } else if (!identifier.includes("@")) {
-            data.rol = "afiliado";
-          }
-
           let tokenData = JSON.stringify(data);
-          console.log("los datos del token son: " + tokenData);
-
           const expiresIn = recordar ? "7d" : "8h";
           jwt.sign({ data: tokenData }, process.env.JWT_SECRET, { expiresIn }, (err, token) => {
             res.status(200).json({ token, data });
@@ -90,10 +78,10 @@ router.post("/signin", async (req, res) => {
       }
     } else {
       console.log(err);
+      res.status(500).json("Error interno");
     }
   });
 });
-
 router.get("/new/token", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   if (cabecera.rol === "admin" || cabecera.rol === "cliente") {
@@ -101,6 +89,8 @@ router.get("/new/token", verifyToken, async (req, res) => {
     const [rows] = await mysqlConnection.promise().query(
       'select usuario.id, \
                                 usuario.nombre, \
+                                usuario.apellido, \
+                                usuario.documento, \
                                 usuario.email, \
                                 rol.nombre AS rol, \
                                 usuario.habilitado, \
@@ -126,6 +116,224 @@ router.get("/new/token", verifyToken, async (req, res) => {
     }
   } else {
     res.status(401).send();
+  }
+});
+
+router.get("/lugares", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const [rows] = await mysqlConnection
+        .promise()
+        .query("SELECT lugar FROM servicio GROUP BY lugar");
+      const lugares = rows.map(row => row.lugar);
+      res.status(200).json(lugares);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los lugares");
+  }
+});
+
+router.get("/servicios", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      // Filtrar por lugar si viene el query param
+      const lugar = req.query.lugar;
+      let query = "SELECT id, tipo_servicio_id, nombre, lugar, rating FROM servicio";
+      let params = [];
+      if (lugar) {
+        query += " WHERE lugar = ?";
+        params.push(lugar);
+      }
+
+      // Obtener los servicios (filtrados o no)
+      const [servicios] = await mysqlConnection
+        .promise()
+        .query(query, params);
+
+      // Obtener todas las imagenes de servicios
+      const [imagenes] = await mysqlConnection
+        .promise()
+        .query("SELECT id, servicio_id, archivo FROM imagen_servicio");
+
+      // Mapear imagenes por servicio_id
+      const imagenesPorServicio = {};
+      imagenes.forEach(img => {
+        if (!imagenesPorServicio[img.servicio_id]) {
+          imagenesPorServicio[img.servicio_id] = [];
+        }
+        imagenesPorServicio[img.servicio_id].push({
+          id: img.id,
+          archivo: `http://localhost:3000/imagenes/${img.archivo}`
+        });
+      });
+
+      // Agregar campo imagenes a cada servicio
+      const serviciosConImagenes = servicios.map(servicio => ({
+        ...servicio,
+        imagenes: imagenesPorServicio[servicio.id] || []
+      }));
+
+      res.status(200).json(serviciosConImagenes);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los servicios");
+  }
+});
+
+router.get("/subtipo_servicio", verifyToken, async (req, res) => {
+  const cabecera = JSON.parse(req.data.data);
+  if (
+    cabecera.rol === "admin" ||
+    cabecera.rol === "afiliado" ||
+    cabecera.rol === "departamental"
+  ) {
+    try {
+      const servicioId = req.query.servicio;
+      if (!servicioId) {
+        return res.status(400).json("Falta el parámetro 'servicio'");
+      }
+      const [rows] = await mysqlConnection
+        .promise()
+        .query(
+          `SELECT sbs.id, sbs.nombre
+         FROM servicio s
+         INNER JOIN subtipo_servicio sbs ON s.tipo_servicio_id = sbs.tipo_servicio_id
+         WHERE s.id = ?`,
+          [servicioId]
+        );
+      res.status(200).json(rows);
+    } catch (error) {
+      console.log(error);
+      res.status(500).json("Error al obtener los tipos de servicio");
+    }
+  } else {
+    res.status(401).json("No autorizado");
+  }
+});
+
+router.get("/regimen", verifyToken, async (req, res) => {
+  const cabecera = JSON.parse(req.data.data);
+  if (
+    cabecera.rol === "admin" ||
+    cabecera.rol === "afiliado" ||
+    cabecera.rol === "departamental"
+  ) {
+    try {
+      const servicioId = req.query.servicio;
+      if (!servicioId) {
+        return res.status(400).json("Falta el parámetro 'servicio'");
+      }
+      const [rows] = await mysqlConnection
+        .promise()
+        .query(
+          `SELECT id, nombre FROM regimen WHERE servicio_id = ?`,
+          [servicioId]
+        );
+      res.status(200).json(rows);
+    } catch (error) {
+      console.log(error);
+      res.status(500).json("Error al obtener los regimenes");
+    }
+  } else {
+    res.status(401).json("No autorizado");
+  }
+});
+
+router.get("/tipo_persona", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const [rows] = await mysqlConnection
+        .promise()
+        .query("SELECT id, nombre FROM tipo_persona");
+      res.status(200).json(rows);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los tipos de persona");
+  }
+});
+
+router.get("/parentesco", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const [rows] = await mysqlConnection
+        .promise()
+        .query("SELECT id, nombre FROM parentesco");
+      res.status(200).json(rows);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los parentescos");
+  }
+});
+
+router.get("/usuario", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const documento = req.query.documento;
+      if (!documento) {
+        return res.status(400).json("Falta el parámetro 'documento'");
+      }
+      const [rows] = await mysqlConnection
+        .promise()
+        .query(
+          `SELECT 
+            id, 
+            nombre, 
+            apellido, 
+            documento, 
+            parentesco_id, 
+            fecha_nacimiento, 
+            contacto, 
+            email, 
+            rol_id as rol, 
+            departamental_id 
+          FROM usuario 
+          WHERE documento = ?`,
+          [documento]
+        );
+      res.status(200).json(rows);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener el usuario");
   }
 });
 
@@ -1828,7 +2036,7 @@ router.get("/comercios", verifyToken, (req, res) => {
         nombre_campania: 'Campaña Alarmas',
         rango_horario: '',
         rango_horario2: '',
-        latitud: -33.45172498315471, 
+        latitud: -33.45172498315471,
         longitud: -60.281162746252235,
         cantidad_misiones: 1,
         asignada_a: 0,
@@ -1849,7 +2057,7 @@ router.get("/comercios", verifyToken, (req, res) => {
         nombre_campania: 'Campaña Alarmas',
         rango_horario: '',
         rango_horario2: '',
-        latitud: -36.31427962797797, 
+        latitud: -36.31427962797797,
         longitud: -57.67653308895115,
         cantidad_misiones: 1,
         asignada_a: 0,
@@ -1870,7 +2078,7 @@ router.get("/comercios", verifyToken, (req, res) => {
         nombre_campania: 'Campaña Alarmas',
         rango_horario: '',
         rango_horario2: '',
-        latitud: -38.71460606520239, 
+        latitud: -38.71460606520239,
         longitud: -62.26634592354608,
         cantidad_misiones: 1,
         asignada_a: 0,
@@ -1891,7 +2099,7 @@ router.get("/comercios", verifyToken, (req, res) => {
         nombre_campania: 'Campaña Alarmas',
         rango_horario: '',
         rango_horario2: '',
-        latitud: -36.774055111818264, 
+        latitud: -36.774055111818264,
         longitud: -59.854691469297464,
         cantidad_misiones: 1,
         asignada_a: 0,
@@ -1912,7 +2120,7 @@ router.get("/comercios", verifyToken, (req, res) => {
         nombre_campania: 'Campaña Alarmas',
         rango_horario: '',
         rango_horario2: '',
-        latitud: -38.0069295044809, 
+        latitud: -38.0069295044809,
         longitud: -57.56484025828113,
         cantidad_misiones: 1,
         asignada_a: 0,
@@ -1933,7 +2141,7 @@ router.get("/comercios", verifyToken, (req, res) => {
         nombre_campania: 'Campaña Alarmas',
         rango_horario: '',
         rango_horario2: '',
-        latitud: -34.58799118142035, 
+        latitud: -34.58799118142035,
         longitud: -60.94925246018552,
         cantidad_misiones: 1,
         asignada_a: 0,
