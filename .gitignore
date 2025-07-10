@@ -5,6 +5,7 @@
 /api/public/uploads/*
 .env
 /logs/*
+/imagenes/*
 
 # compiled output
 /dist
