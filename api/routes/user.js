@@ -297,6 +297,103 @@ router.get("/parentesco", verifyToken, async (req, res) => {
   }
 });
 
+router.post("/tabla-temporadas", verifyToken, async (req, res) => {
+  const cabecera = JSON.parse(req.data.data);
+  let buscar = req.query.search;
+  const filters = req.body;
+  const fecha_desde = filters.startDate || "2023-01-01";
+  const fecha_hasta = filters.endDate || "2070-12-31";
+  let fromDate = new Date(fecha_desde);
+  let toDate = new Date(fecha_hasta);
+
+  // Format for SQL comparison (MySQL format)
+  fromDate = fromDate.toISOString().split("T")[0];
+  toDate.setDate(toDate.getDate() + 1);
+  toDate = toDate.toISOString().split("T")[0];
+
+  let queryBuscar = "";
+  if (
+    cabecera.rol === "admin"
+  ) {
+    const page = req.query.page ? Number(req.query.page) : 1;
+    const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 10;
+    const start = (page - 1) * resultsPerPage;
+
+    let orderBy = req.query.orderBy ? req.query.orderBy : "fecha_inicio";
+    const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
+
+    if (orderBy === "fecha_inicio") {
+      orderBy = "fecha_inicio";
+    } else if (orderBy === "fecha_fin") {
+      orderBy = "fecha_fin";
+    }
+
+    const queryOrderBy = `${orderBy} ${orderType}`;
+
+    if (buscar) {
+      buscar = "%" + buscar + "%";
+      queryBuscar = `AND (id LIKE '${buscar}' OR nombre LIKE '${buscar}' OR DATE_FORMAT(fecha_inicio, '%d/%m/%Y') LIKE '${buscar}' OR DATE_FORMAT(fecha_fin, '%d/%m/%Y') LIKE '${buscar}')`;
+    }
+
+    const queryParams = [];
+    let query = `
+      SELECT DATE_FORMAT(fecha_inicio, '%d/%m/%Y') AS fecha_inicio, 
+             nombre AS nombre, 
+             id AS id, 
+             DATE_FORMAT(fecha_fin, '%d/%m/%Y') AS fecha_fin
+      FROM temporada_tarifa
+      WHERE 1=1 
+        ${queryBuscar}
+        ${fromDate ? "AND fecha_inicio >= ?" : ""}
+        ${toDate ? "AND fecha_fin <= ?" : ""}
+    `;
+
+    if (fromDate) {
+      queryParams.push(fromDate);
+    }
+
+    if (toDate) {
+      queryParams.push(toDate);
+    }
+
+    query += ` ORDER BY ${queryOrderBy}, fecha_inicio DESC LIMIT ${start}, ${resultsPerPage}`;
+
+    try {
+      const [rows] = await mysqlConnection.promise().execute(query, queryParams);
+
+      const [countRows] = await mysqlConnection.promise().execute(
+        `
+        SELECT COUNT(*) AS count
+        FROM temporada_tarifa
+        WHERE 1=1 
+          ${queryBuscar}
+          ${fromDate ? "AND fecha_inicio >= ?" : ""}
+          ${toDate ? "AND fecha_fin <= ?" : ""}
+        `,
+        queryParams
+      );
+
+      const numOfResults = countRows[0].count;
+      const numOfPages = Math.ceil(numOfResults / resultsPerPage);
+
+      res.json({
+        results: rows,
+        numOfPages,
+        totalItems: numOfResults,
+        page: page - 1,
+        orderBy,
+        orderType,
+      });
+    } catch (error) {
+      console.log(error);
+      res.status(500).json("Error interno");
+    }
+  } else {
+    res.status(401).json("No autorizado");
+  }
+});
+
+
 router.get("/usuario", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
