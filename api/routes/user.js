@@ -151,12 +151,13 @@ router.get("/servicios", verifyToken, async (req, res) => {
     ) {
       // Filtrar por lugar si viene el query param
       const lugar = req.query.lugar;
-      let query = "SELECT id, tipo_servicio_id, nombre, lugar, rating FROM servicio order by nombre asc";
+      let query = "SELECT id, tipo_servicio_id, nombre, lugar, rating FROM servicio";
       let params = [];
       if (lugar) {
         query += " WHERE lugar = ?";
         params.push(lugar);
       }
+      query += " ORDER BY nombre ASC";
 
       // Obtener los servicios (filtrados o no)
       const [servicios] = await mysqlConnection
