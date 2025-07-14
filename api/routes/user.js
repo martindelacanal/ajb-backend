@@ -528,7 +528,6 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
           precio: todasPersonasTienenTarifa ? precioTotalDia : null
         });
       }
-      console.log(fechasConTarifa);
       res.status(200).json(fechasConTarifa);
     } else {
       res.status(401).json("No autorizado");
