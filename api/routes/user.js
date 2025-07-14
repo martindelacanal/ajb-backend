@@ -223,6 +223,322 @@ router.get("/recursos", verifyToken, async (req, res) => {
   }
 });
 
+router.post("/reserva/recursos", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const { fecha_inicio, fecha_fin, servicio_id, personas } = req.body;
+
+      if (!fecha_inicio || !fecha_fin || !servicio_id || !personas || personas.length === 0) {
+        return res.status(400).json("Faltan campos requeridos");
+      }
+
+      // Primero obtenemos solo los recursos que tienen tarifas válidas para el servicio y las personas
+      const recursosConTarifas = [];
+      
+      // Para cada persona, buscamos qué recursos tienen tarifas válidas
+      const recursosValidos = new Set();
+      
+      for (const persona of personas) {
+        const [tarifasPersona] = await mysqlConnection
+          .promise()
+          .query(`
+            SELECT DISTINCT recurso_id
+            FROM tarifa 
+            INNER JOIN recurso r ON tarifa.recurso_id = r.id
+            WHERE r.servicio_id = ?
+              AND tarifa.tipo_persona_id = ? 
+              AND tarifa.regimen_id = ?
+              AND (tarifa.edad_minima IS NULL OR tarifa.edad_minima <= ?)
+              AND (tarifa.edad_maxima IS NULL OR tarifa.edad_maxima >= ?)
+              AND tarifa.fecha_inicio <= ?
+              AND tarifa.fecha_fin >= ?
+          `, [
+            servicio_id,
+            persona.tipo_persona_id,
+            persona.regimen_id,
+            persona.edad,
+            persona.edad,
+            fecha_fin,
+            fecha_inicio
+          ]);
+        
+        tarifasPersona.forEach(tarifa => {
+          recursosValidos.add(tarifa.recurso_id);
+        });
+      }
+
+      if (recursosValidos.size === 0) {
+        return res.status(404).json("No se encontraron recursos con tarifas válidas para las personas especificadas");
+      }
+
+      // Ahora obtenemos solo los recursos que tienen tarifas válidas
+      const recursosIds = Array.from(recursosValidos);
+      const placeholders = recursosIds.map(() => '?').join(',');
+      
+      const [recursos] = await mysqlConnection
+        .promise()
+        .query(`SELECT id, servicio_id, grupo_recurso_id, nombre FROM recurso WHERE id IN (${placeholders})`, recursosIds);
+
+      // Obtener imágenes solo para los recursos válidos
+      const [imagenes] = await mysqlConnection
+        .promise()
+        .query(`
+          SELECT ir.id, ir.recurso_id, ir.archivo 
+          FROM imagen_recurso ir
+          WHERE ir.recurso_id IN (${placeholders})
+        `, recursosIds);
+
+      // Obtener filtros solo para los recursos válidos
+      const [filtros] = await mysqlConnection
+        .promise()
+        .query(`
+          SELECT fr.recurso_id, f.id as filtro_id, f.nombre, f.icono, fr.cantidad, fr.habilitado
+          FROM filtro_recurso fr
+          INNER JOIN filtro f ON fr.filtro_id = f.id
+          WHERE fr.recurso_id IN (${placeholders})
+        `, recursosIds);
+
+      // Mapear imagenes por recurso_id
+      const imagenesPorRecurso = {};
+      imagenes.forEach(img => {
+        if (!imagenesPorRecurso[img.recurso_id]) {
+          imagenesPorRecurso[img.recurso_id] = [];
+        }
+        imagenesPorRecurso[img.recurso_id].push({
+          id: img.id,
+          archivo: `http://localhost:3000/imagenes/${img.archivo}`
+        });
+      });
+
+      // Mapear filtros por recurso_id
+      const filtrosPorRecurso = {};
+      filtros.forEach(filtro => {
+        if (!filtrosPorRecurso[filtro.recurso_id]) {
+          filtrosPorRecurso[filtro.recurso_id] = [];
+        }
+        filtrosPorRecurso[filtro.recurso_id].push({
+          id: filtro.filtro_id,
+          nombre: filtro.nombre,
+          icono: filtro.icono,
+          cantidad: filtro.cantidad,
+          habilitado: filtro.habilitado
+        });
+      });
+
+      // Calcular tarifas para cada recurso
+      for (const recurso of recursos) {
+        let tarifaTotal = 0;
+        let todasPersonasTienenTarifa = true;
+
+        // Calcular tarifa por cada persona
+        for (const persona of personas) {
+          // Buscar todas las tarifas que apliquen para esta persona en este recurso
+          const [tarifasPersona] = await mysqlConnection
+            .promise()
+            .query(`
+              SELECT precio, fecha_inicio, fecha_fin
+              FROM tarifa 
+              WHERE recurso_id = ? 
+                AND tipo_persona_id = ? 
+                AND regimen_id = ?
+                AND (edad_minima IS NULL OR edad_minima <= ?)
+                AND (edad_maxima IS NULL OR edad_maxima >= ?)
+                AND fecha_inicio <= ?
+                AND fecha_fin >= ?
+              ORDER BY fecha_inicio ASC
+            `, [
+              recurso.id,
+              persona.tipo_persona_id,
+              persona.regimen_id,
+              persona.edad,
+              persona.edad,
+              fecha_fin,
+              fecha_inicio
+            ]);
+
+          if (tarifasPersona.length === 0) {
+            todasPersonasTienenTarifa = false;
+            break;
+          }
+
+          // Calcular el precio total para esta persona sumando los rangos de fechas
+          let tarifaPersona = 0;
+          const fechaInicioSolicitud = new Date(fecha_inicio);
+          const fechaFinSolicitud = new Date(fecha_fin);
+          
+          // Calcular días correctamente: NO incluir el día de salida
+          const diasTotales = Math.ceil((fechaFinSolicitud - fechaInicioSolicitud) / (1000 * 60 * 60 * 24));
+
+          // Crear un array para marcar qué días están cubiertos por tarifas
+          const diasCubiertos = new Array(diasTotales).fill(false);
+          
+          for (const tarifa of tarifasPersona) {
+            const fechaInicioTarifa = new Date(tarifa.fecha_inicio);
+            const fechaFinTarifa = new Date(tarifa.fecha_fin);
+            
+            // Calcular la intersección entre el rango solicitado y el rango de la tarifa
+            const inicioInterseccion = new Date(Math.max(fechaInicioSolicitud.getTime(), fechaInicioTarifa.getTime()));
+            const finInterseccion = new Date(Math.min(fechaFinSolicitud.getTime(), fechaFinTarifa.getTime()));
+            
+            if (inicioInterseccion < finInterseccion) {
+              // Calcular los días de intersección correctamente
+              const diasInterseccion = Math.ceil((finInterseccion - inicioInterseccion) / (1000 * 60 * 60 * 24));
+              
+              // Calcular el día inicial relativo al inicio de la solicitud
+              const diaInicioRelativo = Math.floor((inicioInterseccion - fechaInicioSolicitud) / (1000 * 60 * 60 * 24));
+              
+              // Marcar los días como cubiertos y sumar el precio
+              for (let i = 0; i < diasInterseccion; i++) {
+                const diaIndex = diaInicioRelativo + i;
+                if (diaIndex >= 0 && diaIndex < diasTotales && !diasCubiertos[diaIndex]) {
+                  diasCubiertos[diaIndex] = true;
+                  tarifaPersona += tarifa.precio;
+                }
+              }
+            }
+          }
+
+          // Verificar que todos los días estén cubiertos por alguna tarifa
+          const todosDiasCubiertos = diasCubiertos.every(dia => dia === true);
+          if (!todosDiasCubiertos) {
+            todasPersonasTienenTarifa = false;
+            break;
+          }
+
+          tarifaTotal += tarifaPersona;
+        }
+
+        // Solo incluir recursos que tengan tarifa para todas las personas y todos los días
+        if (todasPersonasTienenTarifa) {
+          recursosConTarifas.push({
+            id: recurso.id,
+            servicio_id: recurso.servicio_id,
+            grupo_recurso_id: recurso.grupo_recurso_id,
+            nombre: recurso.nombre,
+            tarifa: tarifaTotal,
+            imagenes: imagenesPorRecurso[recurso.id] || [],
+            filtros: filtrosPorRecurso[recurso.id] || []
+          });
+        }
+
+      }
+
+      res.status(200).json(recursosConTarifas);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los recursos con tarifas");
+  }
+});
+
+router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const { fecha_inicio, fecha_fin, servicio_id, recurso_id, personas } = req.body;
+
+      if (!fecha_inicio || !fecha_fin || !servicio_id || !recurso_id || !personas || personas.length === 0) {
+        return res.status(400).json("Faltan campos requeridos");
+      }
+
+      const fechaInicioSolicitud = new Date(fecha_inicio);
+      const fechaFinSolicitud = new Date(fecha_fin);
+      
+      // Calcular días correctamente: INCLUIR el día de salida (fecha_fin)
+      const diasTotales = Math.ceil((fechaFinSolicitud - fechaInicioSolicitud) / (1000 * 60 * 60 * 24)) + 1;
+      
+      if (diasTotales <= 0) {
+        return res.status(400).json("El rango de fechas no es válido");
+      }
+
+      // Array para almacenar el resultado
+      const fechasConTarifa = [];
+
+      // Verificar que el recurso pertenezca al servicio
+      const [recursoValido] = await mysqlConnection
+        .promise()
+        .query(`
+          SELECT id FROM recurso 
+          WHERE id = ? AND servicio_id = ?
+        `, [recurso_id, servicio_id]);
+
+      if (recursoValido.length === 0) {
+        return res.status(404).json("El recurso no pertenece al servicio especificado");
+      }
+
+      // Procesar cada día del rango
+      for (let dia = 0; dia < diasTotales; dia++) {
+        const fechaActual = new Date(fechaInicioSolicitud);
+        fechaActual.setDate(fechaInicioSolicitud.getDate() + dia);
+        
+        const fechaString = fechaActual.toISOString().split('T')[0];
+        let precioTotalDia = 0;
+        let todasPersonasTienenTarifa = true;
+
+        // Calcular tarifa por cada persona para este día específico
+        for (const persona of personas) {
+          // Buscar tarifa válida para esta persona en este día específico
+          const [tarifasPersona] = await mysqlConnection
+            .promise()
+            .query(`
+              SELECT precio
+              FROM tarifa 
+              WHERE recurso_id = ? 
+                AND tipo_persona_id = ? 
+                AND regimen_id = ?
+                AND (edad_minima IS NULL OR edad_minima <= ?)
+                AND (edad_maxima IS NULL OR edad_maxima >= ?)
+                AND fecha_inicio <= ?
+                AND fecha_fin >= ?
+              ORDER BY fecha_inicio ASC
+              LIMIT 1
+            `, [
+              recurso_id,
+              persona.tipo_persona_id,
+              persona.regimen_id,
+              persona.edad,
+              persona.edad,
+              fechaString,
+              fechaString
+            ]);
+
+          if (tarifasPersona.length === 0) {
+            // No hay tarifa válida para esta persona en este día
+            todasPersonasTienenTarifa = false;
+            break;
+          }
+
+          precioTotalDia += tarifasPersona[0].precio;
+        }
+
+        // Agregar el resultado para este día
+        fechasConTarifa.push({
+          fecha: fechaString,
+          precio: todasPersonasTienenTarifa ? precioTotalDia : null
+        });
+      }
+      console.log(fechasConTarifa);
+      res.status(200).json(fechasConTarifa);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener las tarifas por fecha");
+  }
+});
+
 router.get("/subtipo_servicio", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   if (
@@ -269,7 +585,11 @@ router.get("/regimen", verifyToken, async (req, res) => {
       const [rows] = await mysqlConnection
         .promise()
         .query(
-          `SELECT id, nombre FROM regimen WHERE servicio_id = ? ORDER BY nombre ASC`,
+          `SELECT r.id, r.nombre
+           FROM regimen r
+           INNER JOIN servicio_regimen sr ON r.id = sr.regimen_id
+           WHERE sr.servicio_id = ?
+           ORDER BY r.nombre ASC`,
           [servicioId]
         );
       res.status(200).json(rows);
@@ -328,10 +648,10 @@ router.post("/tabla-temporadas", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   let buscar = req.query.search;
   const filters = req.body;
-  const fecha_desde = filters.startDate || "2023-01-01";
-  const fecha_hasta = filters.endDate || "2070-12-31";
-  let fromDate = new Date(fecha_desde);
-  let toDate = new Date(fecha_hasta);
+  const fecha_incio = filters.startDate || "2023-01-01";
+  const fecha_fin = filters.endDate || "2070-12-31";
+  let fromDate = new Date(fecha_incio);
+  let toDate = new Date(fecha_fin);
 
   // Format for SQL comparison (MySQL format)
   fromDate = fromDate.toISOString().split("T")[0];
@@ -500,7 +820,7 @@ router.post("/temporada", verifyToken, async (req, res) => {
                     await connection.query(
                       `INSERT INTO tarifa 
                        (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id, 
-                        edad_minima, edad_maxima, precio, fecha_desde, fecha_hasta) 
+                        edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin) 
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                       [
                         recurso.id,
