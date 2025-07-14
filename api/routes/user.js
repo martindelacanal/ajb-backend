@@ -129,7 +129,7 @@ router.get("/lugares", verifyToken, async (req, res) => {
     ) {
       const [rows] = await mysqlConnection
         .promise()
-        .query("SELECT lugar FROM servicio GROUP BY lugar");
+        .query("SELECT lugar FROM servicio GROUP BY lugar ORDER BY lugar ASC");
       const lugares = rows.map(row => row.lugar);
       res.status(200).json(lugares);
     } else {
@@ -151,7 +151,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
     ) {
       // Filtrar por lugar si viene el query param
       const lugar = req.query.lugar;
-      let query = "SELECT id, tipo_servicio_id, nombre, lugar, rating FROM servicio";
+      let query = "SELECT id, tipo_servicio_id, nombre, lugar, rating FROM servicio order by nombre asc";
       let params = [];
       if (lugar) {
         query += " WHERE lugar = ?";
@@ -193,6 +193,32 @@ router.get("/servicios", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener los servicios");
+  }
+});
+
+router.get("/recursos", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const servicioId = req.query.servicio;
+      let query = "SELECT id, servicio_id, nombre, grupo_recurso_id FROM recurso";
+      let params = [];
+      if (servicioId) {
+        query += " WHERE servicio_id = ?";
+        params.push(servicioId);
+      }
+      const [rows] = await mysqlConnection.promise().query(query, params);
+      res.status(200).json(rows);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los recursos");
   }
 });
 
@@ -242,7 +268,7 @@ router.get("/regimen", verifyToken, async (req, res) => {
       const [rows] = await mysqlConnection
         .promise()
         .query(
-          `SELECT id, nombre FROM regimen WHERE servicio_id = ?`,
+          `SELECT id, nombre FROM regimen WHERE servicio_id = ? ORDER BY nombre ASC`,
           [servicioId]
         );
       res.status(200).json(rows);
@@ -265,7 +291,7 @@ router.get("/tipo_persona", verifyToken, async (req, res) => {
     ) {
       const [rows] = await mysqlConnection
         .promise()
-        .query("SELECT id, nombre FROM tipo_persona");
+        .query("SELECT id, nombre FROM tipo_persona order by nombre asc");
       res.status(200).json(rows);
     } else {
       res.status(401).json("No autorizado");
@@ -286,7 +312,7 @@ router.get("/parentesco", verifyToken, async (req, res) => {
     ) {
       const [rows] = await mysqlConnection
         .promise()
-        .query("SELECT id, nombre FROM parentesco");
+        .query("SELECT id, nombre FROM parentesco order by nombre asc");
       res.status(200).json(rows);
     } else {
       res.status(401).json("No autorizado");
@@ -393,7 +419,6 @@ router.post("/tabla-temporadas", verifyToken, async (req, res) => {
   }
 });
 
-
 router.get("/usuario", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -434,46 +459,97 @@ router.get("/usuario", verifyToken, async (req, res) => {
   }
 });
 
-router.get("/app/version", async (req, res) => {
+router.post("/temporada", verifyToken, async (req, res) => {
   try {
-    // seleccionar la ultima version de la app movil de la tabla version_app y devolverla junto con su fecha_creacion formateada
-    const [rows] = await mysqlConnection
-      .promise()
-      .query(
-        'select version, DATE_FORMAT(fecha_creacion, "%d-%m-%Y %T") as fecha_creacion from version_app order by id desc limit 1'
-      );
-    if (rows.length > 0) {
-      res.json(rows[0]);
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol === "admin") {
+      const { nombre_campania, fecha_inicio, fecha_fin, configuracion_servicios } = req.body;
+
+      if (!nombre_campania || !fecha_inicio || !fecha_fin || !configuracion_servicios) {
+        return res.status(400).json("Faltan campos requeridos");
+      }
+
+      // Iniciar transacción
+      let connection;
+      connection = await mysqlConnection.promise().getConnection();
+      await connection.beginTransaction();
+
+      try {
+        // 1. Crear la temporada principal
+        const [temporadaResult] = await connection.query(
+          "INSERT INTO temporada_tarifa (nombre, fecha_inicio, fecha_fin) VALUES (?, ?, ?)",
+          [nombre_campania, fecha_inicio, fecha_fin]
+        );
+
+        const temporadaId = temporadaResult.insertId;
+
+        // 2. Procesar cada servicio
+        for (const servicio of configuracion_servicios) {
+          // Procesar cada régimen del servicio
+          for (const regimen of servicio.regimenes) {
+            // Procesar cada recurso del régimen
+            for (const recurso of regimen.recursos) {
+              // Procesar cada fecha del recurso
+              for (const fecha of recurso.fechas) {
+                // Procesar cada tipo de persona de la fecha
+                for (const tipoPersona of fecha.tiposPersona) {
+                  // Procesar cada rango de edad del tipo de persona
+                  for (const rangoEdad of tipoPersona.rangosEdad) {
+                    // Insertar tarifa individual
+                    await connection.query(
+                      `INSERT INTO tarifa 
+                       (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id, 
+                        edad_minima, edad_maxima, precio, fecha_desde, fecha_hasta) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                      [
+                        recurso.id,
+                        tipoPersona.tipoPersonaId,
+                        regimen.id,
+                        temporadaId,
+                        rangoEdad.edadMinima,
+                        rangoEdad.edadMaxima,
+                        rangoEdad.precio,
+                        fecha.fecha_inicio,
+                        fecha.fecha_fin
+                      ]
+                    );
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // Confirmar transacción
+        await connection.commit();
+
+        res.status(201).json({
+          message: "Temporada creada correctamente",
+          temporadaId: temporadaId
+        });
+
+      } catch (transactionError) {
+        // Rollback en caso de error
+        if (connection) {
+          await connection.rollback();
+        }
+        throw transactionError;
+      } finally {
+        if (connection) {
+          connection.release();
+        }
+      }
+
     } else {
-      res.json({ version: "0", fecha_creacion: "0" });
+      res.status(401).json("No autorizado");
     }
-  } catch (err) {
-    console.log(err);
-    res.status(500).json("Internal server error");
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al crear la temporada");
   }
 });
 
-router.get("/app/apk/download", async (req, res) => {
-  try {
-    // seleccionar el archivo apk de la ruta api/apk/Znapp Enterprise.apk y devolverlo
-    const path_apk = path.join(__dirname, "../apk/Znapp Enterprise.apk");
-    const stat = fs.statSync(path_apk);
 
-    res.setHeader("Content-Type", "application/vnd.android.package-archive");
-    res.setHeader(
-      "Content-Disposition",
-      "attachment; filename=Znapp Enterprise.apk"
-    );
-    res.setHeader("Content-Length", stat.size);
-
-    const readStream = fs.createReadStream(path_apk);
-    readStream.pipe(res);
-    console.log("APK descargado");
-  } catch (err) {
-    console.log(err);
-    res.status(500).json("Internal server error");
-  }
-});
 
 const storage = multer.memoryStorage();
 var uploadImagen = multer({ storage: storage });
