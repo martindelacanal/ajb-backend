@@ -1043,7 +1043,7 @@ router.get("/parentesco", verifyToken, async (req, res) => {
   }
 });
 
-router.post("/tabla-temporadas", verifyToken, async (req, res) => {
+router.post("/tabla/temporadas", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   let buscar = req.query.search;
   const filters = req.body;
@@ -1139,6 +1139,124 @@ router.post("/tabla-temporadas", verifyToken, async (req, res) => {
   }
 });
 
+router.post("/tabla/reservas", verifyToken, async (req, res) => {
+  const cabecera = JSON.parse(req.data.data);
+  let buscar = req.query.search;
+  const filters = req.body;
+  const fecha_incio = filters.startDate || "2023-01-01";
+  const fecha_fin = filters.endDate || "2070-12-31";
+  let fromDate = new Date(fecha_incio);
+  let toDate = new Date(fecha_fin);
+
+  // Format for SQL comparison (MySQL format)
+  fromDate = fromDate.toISOString().split("T")[0];
+  toDate.setDate(toDate.getDate() + 1);
+  toDate = toDate.toISOString().split("T")[0];
+
+  let queryBuscar = "";
+  if (
+    cabecera.rol === "admin" || cabecera.rol === "departamental"
+  ) {
+    const page = req.query.page ? Number(req.query.page) : 1;
+    const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 10;
+    const start = (page - 1) * resultsPerPage;
+
+    let orderBy = req.query.orderBy ? req.query.orderBy : "fecha_inicio";
+    const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
+
+    if (orderBy === "fecha_inicio") {
+      orderBy = "r.fecha_inicio";
+    } else if (orderBy === "fecha_fin") {
+      orderBy = "r.fecha_fin";
+    } else if (orderBy === "id") {
+      orderBy = "r.id";
+    } else if (orderBy === "estado") {
+      orderBy = "er.nombre";
+    } else if (orderBy === "servicio") {
+      orderBy = "s.nombre";
+    } else if (orderBy === "recurso") {
+      orderBy = "rec.nombre";
+    } else if (orderBy === "afiliado") {
+      orderBy = "u.documento";
+    }
+
+    const queryOrderBy = `${orderBy} ${orderType}`;
+
+    if (buscar) {
+      buscar = "%" + buscar + "%";
+      queryBuscar = `AND (r.id LIKE '${buscar}' OR er.nombre LIKE '${buscar}' OR s.nombre LIKE '${buscar}' OR rec.nombre LIKE '${buscar}' OR u.documento LIKE '${buscar}' OR DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') LIKE '${buscar}' OR DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') LIKE '${buscar}' OR r.observaciones LIKE '${buscar}')`;
+    }
+
+    const queryParams = [];
+    let query = `
+      SELECT 
+        r.id,
+        COALESCE(er.nombre, 'Sin estado') AS estado,
+        s.nombre AS servicio,
+        rec.nombre AS recurso,
+        u.documento AS afiliado,
+        DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') AS fecha_inicio,
+        DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') AS fecha_fin,
+        COALESCE(r.observaciones, '') AS observaciones
+      FROM reserva r
+      INNER JOIN estado_reserva er ON r.estado_reserva_id = er.id
+      INNER JOIN recurso rec ON r.recurso_id = rec.id
+      INNER JOIN servicio s ON rec.servicio_id = s.id
+      INNER JOIN usuario u ON r.usuario_id = u.id
+      WHERE 1=1 
+        ${queryBuscar}
+        ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
+        ${toDate ? "AND r.fecha_fin <= ?" : ""}
+    `;
+
+    if (fromDate) {
+      queryParams.push(fromDate);
+    }
+
+    if (toDate) {
+      queryParams.push(toDate);
+    }
+
+    query += ` ORDER BY ${queryOrderBy} LIMIT ${start}, ${resultsPerPage}`;
+
+    try {
+      const [rows] = await mysqlConnection.promise().execute(query, queryParams);
+
+      const [countRows] = await mysqlConnection.promise().execute(
+        `
+        SELECT COUNT(*) AS count
+        FROM reserva r
+        INNER JOIN estado_reserva er ON r.estado_reserva_id = er.id
+        INNER JOIN recurso rec ON r.recurso_id = rec.id
+        INNER JOIN servicio s ON rec.servicio_id = s.id
+        INNER JOIN usuario u ON r.usuario_id = u.id
+        WHERE 1=1 
+          ${queryBuscar}
+          ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
+          ${toDate ? "AND r.fecha_fin <= ?" : ""}
+        `,
+        queryParams
+      );
+
+      const numOfResults = countRows[0].count;
+      const numOfPages = Math.ceil(numOfResults / resultsPerPage);
+
+      res.json({
+        results: rows,
+        numOfPages,
+        totalItems: numOfResults,
+        page: page - 1,
+        orderBy: req.query.orderBy || "fecha_inicio",
+        orderType,
+      });
+    } catch (error) {
+      console.log(error);
+      res.status(500).json("Error interno");
+    }
+  } else {
+    res.status(401).json("No autorizado");
+  }
+});
 router.get("/usuario", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
