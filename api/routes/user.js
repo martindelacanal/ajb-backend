@@ -54,7 +54,7 @@ router.post("/signin", async (req, res) => {
     SELECT usuario.id, usuario.nombre, usuario.apellido, usuario.documento, usuario.email, usuario.password, usuario.departamental_id, rol.nombre AS rol, usuario.habilitado
     FROM usuario
     INNER JOIN rol ON rol.id = usuario.rol_id
-    WHERE usuario.documento = ?
+    WHERE usuario.documento = ? AND usuario.password IS NOT NULL
   `;
   const queryParams = [documento];
 
@@ -239,10 +239,10 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
 
       // Primero obtenemos solo los recursos que tienen tarifas válidas para el servicio y las personas
       const recursosConTarifas = [];
-      
+
       // Para cada persona, buscamos qué recursos tienen tarifas válidas
       const recursosValidos = new Set();
-      
+
       for (const persona of personas) {
         const [tarifasPersona] = await mysqlConnection
           .promise()
@@ -266,7 +266,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
             fecha_fin,
             fecha_inicio
           ]);
-        
+
         tarifasPersona.forEach(tarifa => {
           recursosValidos.add(tarifa.recurso_id);
         });
@@ -279,7 +279,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       // Ahora obtenemos solo los recursos que tienen tarifas válidas
       const recursosIds = Array.from(recursosValidos);
       const placeholders = recursosIds.map(() => '?').join(',');
-      
+
       const [recursos] = await mysqlConnection
         .promise()
         .query(`SELECT id, servicio_id, grupo_recurso_id, nombre FROM recurso WHERE id IN (${placeholders})`, recursosIds);
@@ -370,28 +370,28 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           let tarifaPersona = 0;
           const fechaInicioSolicitud = new Date(fecha_inicio);
           const fechaFinSolicitud = new Date(fecha_fin);
-          
+
           // Calcular días correctamente: NO incluir el día de salida
           const diasTotales = Math.ceil((fechaFinSolicitud - fechaInicioSolicitud) / (1000 * 60 * 60 * 24));
 
           // Crear un array para marcar qué días están cubiertos por tarifas
           const diasCubiertos = new Array(diasTotales).fill(false);
-          
+
           for (const tarifa of tarifasPersona) {
             const fechaInicioTarifa = new Date(tarifa.fecha_inicio);
             const fechaFinTarifa = new Date(tarifa.fecha_fin);
-            
+
             // Calcular la intersección entre el rango solicitado y el rango de la tarifa
             const inicioInterseccion = new Date(Math.max(fechaInicioSolicitud.getTime(), fechaInicioTarifa.getTime()));
             const finInterseccion = new Date(Math.min(fechaFinSolicitud.getTime(), fechaFinTarifa.getTime()));
-            
+
             if (inicioInterseccion < finInterseccion) {
               // Calcular los días de intersección correctamente
               const diasInterseccion = Math.ceil((finInterseccion - inicioInterseccion) / (1000 * 60 * 60 * 24));
-              
+
               // Calcular el día inicial relativo al inicio de la solicitud
               const diaInicioRelativo = Math.floor((inicioInterseccion - fechaInicioSolicitud) / (1000 * 60 * 60 * 24));
-              
+
               // Marcar los días como cubiertos y sumar el precio
               for (let i = 0; i < diasInterseccion; i++) {
                 const diaIndex = diaInicioRelativo + i;
@@ -454,10 +454,10 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
 
       const fechaInicioSolicitud = new Date(fecha_inicio);
       const fechaFinSolicitud = new Date(fecha_fin);
-      
+
       // Calcular días correctamente: INCLUIR el día de salida (fecha_fin)
       const diasTotales = Math.ceil((fechaFinSolicitud - fechaInicioSolicitud) / (1000 * 60 * 60 * 24)) + 1;
-      
+
       if (diasTotales <= 0) {
         return res.status(400).json("El rango de fechas no es válido");
       }
@@ -481,7 +481,7 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
       for (let dia = 0; dia < diasTotales; dia++) {
         const fechaActual = new Date(fechaInicioSolicitud);
         fechaActual.setDate(fechaInicioSolicitud.getDate() + dia);
-        
+
         const fechaString = fechaActual.toISOString().split('T')[0];
         let precioTotalDia = 0;
         let todasPersonasTienenTarifa = true;
@@ -528,6 +528,7 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
           precio: todasPersonasTienenTarifa ? precioTotalDia : null
         });
       }
+
       res.status(200).json(fechasConTarifa);
     } else {
       res.status(401).json("No autorizado");
@@ -535,6 +536,405 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener las tarifas por fecha");
+  }
+});
+
+router.post("/reserva", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado"
+    ) {
+      const {
+        nombre,
+        observaciones,
+        fecha_inicio,
+        fecha_fin,
+        servicio_id,
+        recurso_id,
+        tipo_servicio_id,
+        regimen_id,
+        personas,
+        viaja_titular,
+        adultos,
+        ninos,
+        bebes,
+        total_tarifa,
+        firma
+      } = req.body;
+
+      // Validar campos requeridos
+      if (!nombre || !fecha_inicio || !fecha_fin || !servicio_id || !recurso_id ||
+        !regimen_id || !personas || personas.length === 0 || !total_tarifa) {
+        return res.status(400).json("Faltan campos requeridos");
+      }
+
+      let connection;
+      try {
+        // Iniciar transacción
+        connection = await mysqlConnection.promise().getConnection();
+        await connection.beginTransaction();
+
+        // Procesar firma si existe
+        let firmaArchivo = null;
+        if (firma) {
+          // Generar nombre único para el archivo
+          const firmaFileName = `firma_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.png`;
+
+          // Remover el prefijo data:image si existe
+          const base64Data = firma.replace(/^data:image\/[a-z]+;base64,/, '');
+
+          // Guardar archivo en carpeta imagenes
+          const firmaPath = path.join(__dirname, '../../imagenes', firmaFileName);
+          fs.writeFileSync(firmaPath, base64Data, 'base64');
+
+          firmaArchivo = firmaFileName;
+        }
+
+        // Obtener el usuario familiar principal del usuario que crea la reserva
+        const [usuarioCreador] = await connection.query(
+          "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
+          [cabecera.id]
+        );
+
+        let usuarioFamiliarPrincipalId = cabecera.id;
+
+        if (usuarioCreador.length > 0) {
+          let currentUserId = usuarioCreador[0].id;
+          let currentUserFamiliarId = usuarioCreador[0].usuario_familiar_id;
+
+          // Buscar el usuario principal de la familia (el que tiene usuario_familiar_id NULL)
+          while (currentUserFamiliarId !== null) {
+            const [nextUser] = await connection.query(
+              "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
+              [currentUserFamiliarId]
+            );
+
+            if (nextUser.length > 0) {
+              currentUserId = nextUser[0].id;
+              currentUserFamiliarId = nextUser[0].usuario_familiar_id;
+            } else {
+              break;
+            }
+          }
+
+          usuarioFamiliarPrincipalId = currentUserId;
+        }
+
+        // Crear o buscar usuarios para cada persona
+        const usuariosIds = [];
+        for (const persona of personas) {
+          // Verificar si el usuario ya existe por documento
+          const [existeUsuario] = await connection.query(
+            "SELECT id FROM usuario WHERE documento = ?",
+            [persona.dni]
+          );
+
+          let usuarioId;
+          if (existeUsuario.length > 0) {
+            usuarioId = existeUsuario[0].id;
+          } else {
+            // Crear nuevo usuario con usuario_familiar_id establecido
+            const [nuevoUsuario] = await connection.query(
+              `INSERT INTO usuario (
+                rol_id, parentesco_id, nombre, apellido, fecha_nacimiento, 
+                documento, contacto, password, usuario_familiar_id
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+              [
+                2, // Rol de "afiliado"
+                persona.parentesco_id,
+                persona.nombre,
+                persona.apellido,
+                persona.fecha_nacimiento,
+                persona.dni,
+                persona.contacto || null,
+                usuarioFamiliarPrincipalId
+              ]
+            );
+            usuarioId = nuevoUsuario.insertId;
+          }
+          usuariosIds.push({
+            ...persona,
+            usuario_id: usuarioId
+          });
+        }
+
+        // Insertar reserva principal
+        const [reservaResult] = await connection.query(
+          `INSERT INTO reserva (
+            subtipo_servicio_id, regimen_id, recurso_id, usuario_id,
+            firma_archivo, precio_total, fecha_inicio, fecha_fin, observaciones
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            tipo_servicio_id || null,
+            regimen_id,
+            recurso_id,
+            cabecera.id, // Usuario que hace la reserva
+            firmaArchivo,
+            total_tarifa,
+            fecha_inicio,
+            fecha_fin,
+            observaciones || null
+          ]
+        );
+
+        const reservaId = reservaResult.insertId;
+
+        // Insertar reserva_familiar para cada persona
+        const reservasFamiliaresIds = [];
+        for (const persona of usuariosIds) {
+          const [reservaFamiliarResult] = await connection.query(
+            `INSERT INTO reserva_familiar (
+              reserva_id, usuario_id, tipo_persona_id, parentesco_id, edad, precio
+            ) VALUES (?, ?, ?, ?, ?, ?)`,
+            [
+              reservaId,
+              persona.usuario_id,
+              persona.tipo_persona_id,
+              persona.parentesco_id,
+              persona.edad,
+              persona.tarifa_individual
+            ]
+          );
+
+          reservasFamiliaresIds.push({
+            reserva_familiar_id: reservaFamiliarResult.insertId,
+            ...persona
+          });
+        }
+
+        // Calcular días del rango de fechas (NO incluir día de salida)
+        const fechaInicioDate = new Date(fecha_inicio);
+        const fechaFinDate = new Date(fecha_fin);
+        const diasTotales = Math.ceil((fechaFinDate - fechaInicioDate) / (1000 * 60 * 60 * 24));
+
+        // Insertar reserva_familiar_tarifa para cada día y cada persona
+        for (const reservaFamiliar of reservasFamiliaresIds) {
+          for (let dia = 0; dia < diasTotales; dia++) {
+            const fechaActual = new Date(fechaInicioDate);
+            fechaActual.setDate(fechaInicioDate.getDate() + dia);
+            const fechaString = fechaActual.toISOString().split('T')[0];
+
+            // Buscar tarifa correspondiente para esta persona en esta fecha
+            const [tarifas] = await connection.query(
+              `SELECT id
+               FROM tarifa 
+               WHERE recurso_id = ? 
+                 AND tipo_persona_id = ? 
+                 AND regimen_id = ?
+                 AND (edad_minima IS NULL OR edad_minima <= ?)
+                 AND (edad_maxima IS NULL OR edad_maxima >= ?)
+                 AND fecha_inicio <= ?
+                 AND fecha_fin >= ?
+               ORDER BY fecha_inicio ASC
+               LIMIT 1`,
+              [
+                recurso_id,
+                reservaFamiliar.tipo_persona_id,
+                regimen_id,
+                reservaFamiliar.edad,
+                reservaFamiliar.edad,
+                fechaString,
+                fechaString
+              ]
+            );
+
+            if (tarifas.length > 0) {
+              await connection.query(
+                `INSERT INTO reserva_familiar_tarifa (
+                  reserva_familiar_id, tarifa_id, fecha
+                ) VALUES (?, ?, ?)`,
+                [
+                  reservaFamiliar.reserva_familiar_id,
+                  tarifas[0].id,
+                  fechaString
+                ]
+              );
+            }
+          }
+        }
+
+        // Confirmar transacción
+        await connection.commit();
+
+        // Generar número de reserva
+        // const numeroReserva = `RES-${reservaId.toString().padStart(6, '0')}`;
+        const numeroReserva = `${reservaId}`;
+
+        res.status(201).json({
+          id: reservaId,
+          numero_reserva: numeroReserva,
+          estado: "Confirmada",
+          mensaje: "Reserva creada exitosamente",
+          fecha_creacion: new Date().toISOString()
+        });
+
+      } catch (transactionError) {
+        // Rollback en caso de error
+        if (connection) {
+          await connection.rollback();
+        }
+        throw transactionError;
+      } finally {
+        if (connection) {
+          connection.release();
+        }
+      }
+
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al procesar la reserva");
+  }
+});
+
+router.get("/acompaniantes", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const usuario_id = req.query.usuario_id;
+      
+      if (!usuario_id) {
+        return res.status(400).json("Falta el parámetro 'usuario_id'");
+      }
+
+      // Obtener información del usuario principal
+      const [usuarioPrincipal] = await mysqlConnection
+        .promise()
+        .query(
+          "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
+          [usuario_id]
+        );
+
+      if (usuarioPrincipal.length === 0) {
+        return res.status(404).json("Usuario no encontrado");
+      }
+
+      const acompaniantes = new Map(); // Usar Map para evitar duplicados por usuario_id
+
+      // 1. Obtener familiares directos (que tienen usuario_familiar_id = usuario_id)
+      const [familiares] = await mysqlConnection
+        .promise()
+        .query(
+          `SELECT 
+            u.id as usuario_id,
+            u.nombre,
+            u.apellido,
+            u.documento,
+            u.fecha_nacimiento,
+            u.contacto,
+            u.parentesco_id,
+            NULL as tipo_persona_id
+          FROM usuario u
+          WHERE u.usuario_familiar_id = ?`,
+          [usuario_id]
+        );
+
+      familiares.forEach(familiar => {
+        acompaniantes.set(familiar.usuario_id, familiar);
+      });
+
+      // 2. Obtener el usuario familiar principal (si el usuario actual tiene usuario_familiar_id)
+      if (usuarioPrincipal[0].usuario_familiar_id) {
+        const [familiarPrincipal] = await mysqlConnection
+          .promise()
+          .query(
+            `SELECT 
+              u.id as usuario_id,
+              u.nombre,
+              u.apellido,
+              u.documento,
+              u.fecha_nacimiento,
+              u.contacto,
+              u.parentesco_id,
+              NULL as tipo_persona_id
+            FROM usuario u
+            WHERE u.id = ?`,
+            [usuarioPrincipal[0].usuario_familiar_id]
+          );
+
+        if (familiarPrincipal.length > 0) {
+          acompaniantes.set(familiarPrincipal[0].usuario_id, familiarPrincipal[0]);
+        }
+      }
+
+      // 3. Obtener personas que han compartido reservas
+      const [companierosReserva] = await mysqlConnection
+        .promise()
+        .query(
+          `SELECT DISTINCT
+            u.id as usuario_id,
+            u.nombre,
+            u.apellido,
+            u.documento,
+            u.fecha_nacimiento,
+            u.contacto,
+            COALESCE(
+              (SELECT rf2.parentesco_id 
+               FROM reserva_familiar rf2 
+               WHERE rf2.usuario_id = u.id 
+                 AND rf2.reserva_id IN (
+                   SELECT rf_main.reserva_id 
+                   FROM reserva_familiar rf_main 
+                   WHERE rf_main.usuario_id = ?
+                 )
+               ORDER BY rf2.fecha_creacion DESC 
+               LIMIT 1), 
+              u.parentesco_id
+            ) as parentesco_id,
+            (SELECT rf2.tipo_persona_id 
+             FROM reserva_familiar rf2 
+             WHERE rf2.usuario_id = u.id 
+               AND rf2.reserva_id IN (
+                 SELECT rf_main.reserva_id 
+                 FROM reserva_familiar rf_main 
+                 WHERE rf_main.usuario_id = ?
+               )
+             ORDER BY rf2.fecha_creacion DESC 
+             LIMIT 1) as tipo_persona_id
+          FROM usuario u
+          INNER JOIN reserva_familiar rf ON u.id = rf.usuario_id
+          WHERE rf.reserva_id IN (
+            SELECT reserva_id 
+            FROM reserva_familiar 
+            WHERE usuario_id = ?
+          )
+          AND u.id != ?`,
+          [usuario_id, usuario_id, usuario_id, usuario_id]
+        );
+
+      companierosReserva.forEach(companiero => {
+        // Si ya existe en acompañantes (familiar), actualizar con datos de reserva si están disponibles
+        if (acompaniantes.has(companiero.usuario_id)) {
+          const existing = acompaniantes.get(companiero.usuario_id);
+          if (companiero.tipo_persona_id) {
+            existing.tipo_persona_id = companiero.tipo_persona_id;
+          }
+          if (companiero.parentesco_id) {
+            existing.parentesco_id = companiero.parentesco_id;
+          }
+        } else {
+          // Es nuevo, agregarlo
+          acompaniantes.set(companiero.usuario_id, companiero);
+        }
+      });
+
+      // Convertir Map a Array
+      const resultado = Array.from(acompaniantes.values());
+      res.status(200).json(resultado);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los acompañantes");
   }
 });
 
