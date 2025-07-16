@@ -632,7 +632,6 @@ router.post("/reserva", verifyToken, async (req, res) => {
           );
 
           let usuarioId;
-          console.log("persona", persona);
           if (existeUsuario.length > 0) {
             usuarioId = existeUsuario[0].id;
           } else {
