@@ -151,6 +151,12 @@ router.get("/servicios", verifyToken, async (req, res) => {
     ) {
       // Filtrar por lugar si viene el query param
       const lugar = req.query.lugar;
+      const fecha_inicio = req.query.fecha_inicio;
+      const fecha_fin = req.query.fecha_fin;
+      const adultos = parseInt(req.query.adultos) || 0;
+      const ninios = parseInt(req.query.ninios) || 0;
+      const bebes = parseInt(req.query.bebes) || 0;
+
       let query = "SELECT id, tipo_servicio_id, nombre, lugar, rating FROM servicio";
       let params = [];
       if (lugar) {
@@ -181,10 +187,109 @@ router.get("/servicios", verifyToken, async (req, res) => {
         });
       });
 
-      // Agregar campo imagenes a cada servicio
-      const serviciosConImagenes = servicios.map(servicio => ({
-        ...servicio,
-        imagenes: imagenesPorServicio[servicio.id] || []
+      // Agregar campo imagenes y precios a cada servicio
+      const serviciosConImagenes = await Promise.all(servicios.map(async (servicio) => {
+        let precio_minimo = null;
+        let precio_maximo = null;
+
+        // Calcular precios solo si se proporcionan las fechas y al menos una persona
+        if (fecha_inicio && fecha_fin && (adultos > 0 || ninios > 0 || bebes > 0)) {
+          const fechaInicioSolicitud = new Date(fecha_inicio);
+          const fechaFinSolicitud = new Date(fecha_fin);
+
+          // Calcular días del rango (NO incluir el día de salida)
+          const diasTotales = Math.ceil((fechaFinSolicitud - fechaInicioSolicitud) / (1000 * 60 * 60 * 24));
+
+          let precios_minimos_totales = [];
+          let precios_maximos_totales = [];
+
+          // Procesar cada día del rango
+          for (let dia = 0; dia < diasTotales; dia++) {
+            const fechaActual = new Date(fechaInicioSolicitud);
+            fechaActual.setDate(fechaInicioSolicitud.getDate() + dia);
+            const fechaString = fechaActual.toISOString().split('T')[0];
+
+            let precio_minimo_dia = 0;
+            let precio_maximo_dia = 0;
+
+            // Procesar adultos (mayores de 5 años)
+            if (adultos > 0) {
+              const [tarifasAdultos] = await mysqlConnection
+                .promise()
+                .query(`
+          SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
+          FROM tarifa t
+          INNER JOIN recurso r ON t.recurso_id = r.id
+          WHERE r.servicio_id = ?
+            AND (t.edad_minima IS NULL OR t.edad_minima <= 5)
+            AND (t.edad_maxima IS NULL OR t.edad_maxima > 5)
+            AND t.fecha_inicio <= ?
+            AND t.fecha_fin >= ?
+        `, [servicio.id, fechaString, fechaString]);
+
+              if (tarifasAdultos.length > 0 && tarifasAdultos[0].precio_min !== null) {
+                precio_minimo_dia += tarifasAdultos[0].precio_min * adultos;
+                precio_maximo_dia += tarifasAdultos[0].precio_max * adultos;
+              }
+            }
+
+            // Procesar niños (entre 2 y 5 años)
+            if (ninios > 0) {
+              const [tarifasNinios] = await mysqlConnection
+                .promise()
+                .query(`
+          SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
+          FROM tarifa t
+          INNER JOIN recurso r ON t.recurso_id = r.id
+          WHERE r.servicio_id = ?
+            AND (t.edad_minima IS NULL OR t.edad_minima <= 2)
+            AND (t.edad_maxima IS NULL OR t.edad_maxima >= 5)
+            AND t.fecha_inicio <= ?
+            AND t.fecha_fin >= ?
+        `, [servicio.id, fechaString, fechaString]);
+
+              if (tarifasNinios.length > 0 && tarifasNinios[0].precio_min !== null) {
+                precio_minimo_dia += tarifasNinios[0].precio_min * ninios;
+                precio_maximo_dia += tarifasNinios[0].precio_max * ninios;
+              }
+            }
+
+            // Procesar bebés (menores de 2 años)
+            if (bebes > 0) {
+              const [tarifasBebes] = await mysqlConnection
+                .promise()
+                .query(`
+          SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
+          FROM tarifa t
+          INNER JOIN recurso r ON t.recurso_id = r.id
+          WHERE r.servicio_id = ?
+            AND (t.edad_minima IS NULL OR t.edad_minima <= 0)
+            AND (t.edad_maxima IS NULL OR t.edad_maxima < 2)
+            AND t.fecha_inicio <= ?
+            AND t.fecha_fin >= ?
+        `, [servicio.id, fechaString, fechaString]);
+
+              if (tarifasBebes.length > 0 && tarifasBebes[0].precio_min !== null) {
+                precio_minimo_dia += tarifasBebes[0].precio_min * bebes;
+                precio_maximo_dia += tarifasBebes[0].precio_max * bebes;
+              }
+            }
+
+            precios_minimos_totales.push(precio_minimo_dia);
+            precios_maximos_totales.push(precio_maximo_dia);
+          }
+
+          // Sumar todos los días
+          precio_minimo = precios_minimos_totales.reduce((sum, precio) => sum + precio, 0);
+          precio_maximo = precios_maximos_totales.reduce((sum, precio) => sum + precio, 0);
+        }
+
+        return {
+          ...servicio,
+          imagenes: imagenesPorServicio[servicio.id] || [],
+          precio_minimo: precio_minimo,
+          precio_maximo: precio_maximo
+        };
       }));
 
       res.status(200).json(serviciosConImagenes);
@@ -800,7 +905,7 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
       cabecera.rol === "departamental"
     ) {
       const usuario_id = req.query.usuario_id;
-      
+
       if (!usuario_id) {
         return res.status(400).json("Falta el parámetro 'usuario_id'");
       }
