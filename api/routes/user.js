@@ -742,7 +742,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
               `INSERT INTO usuario (
                 rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento, 
                 documento, telefono, password, usuario_familiar_id
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
               [
                 2, // Rol de "afiliado"
                 persona.parentesco_id,
