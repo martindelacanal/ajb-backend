@@ -289,7 +289,6 @@ router.get("/servicios", verifyToken, async (req, res) => {
           precio_maximo: precio_maximo
         };
       }));
-      console.log(serviciosConImagenes);
       res.status(200).json(serviciosConImagenes);
     } else {
       res.status(401).json("No autorizado");
