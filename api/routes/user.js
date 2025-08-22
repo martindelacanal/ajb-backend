@@ -334,7 +334,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       cabecera.rol === "departamental"
     ) {
       const { fecha_inicio, fecha_fin, servicio_id, personas } = req.body;
-
+      
       if (!fecha_inicio || !fecha_fin || !servicio_id || !personas || personas.length === 0) {
         return res.status(400).json("Faltan campos requeridos");
       }
@@ -889,6 +889,529 @@ router.post("/reserva", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al procesar la reserva");
+  }
+});
+
+router.put("/reserva/:id", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado"
+    ) {
+      const reservaId = req.params.id;
+      const {
+        nombre,
+        observaciones,
+        fecha_inicio,
+        fecha_fin,
+        servicio_id,
+        recurso_id,
+        regimen_id,
+        personas,
+        viaja_titular,
+        firma_base64
+      } = req.body;
+
+      // Validar campos requeridos
+      if (!reservaId || !nombre || !fecha_inicio || !fecha_fin || !servicio_id || 
+          !recurso_id || !regimen_id || !personas || personas.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Faltan campos requeridos"
+        });
+      }
+
+      let connection;
+      try {
+        // Iniciar transacción
+        connection = await mysqlConnection.promise().getConnection();
+        await connection.beginTransaction();
+
+        // Verificar que la reserva existe
+        const [reservaExistente] = await connection.query(
+          "SELECT id, usuario_id FROM reserva WHERE id = ?",
+          [reservaId]
+        );
+
+        if (reservaExistente.length === 0) {
+          return res.status(404).json({
+            success: false,
+            message: "Reserva no encontrada"
+          });
+        }
+
+        // Si el rol es afiliado, verificar que la reserva le pertenezca
+        if (cabecera.rol === "afiliado" && reservaExistente[0].usuario_id !== cabecera.id) {
+          return res.status(403).json({
+            success: false,
+            message: "No tienes permisos para editar esta reserva"
+          });
+        }
+
+        // Procesar firma si existe
+        let firmaArchivo = null;
+        if (firma_base64) {
+          // Generar nombre único para el archivo
+          const firmaFileName = `firma_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.png`;
+
+          // Remover el prefijo data:image si existe
+          const base64Data = firma_base64.replace(/^data:image\/[a-z]+;base64,/, '');
+
+          // Guardar archivo en carpeta imagenes
+          const firmaPath = path.join(__dirname, '../../imagenes', firmaFileName);
+          fs.writeFileSync(firmaPath, base64Data, 'base64');
+
+          firmaArchivo = firmaFileName;
+        }
+
+        // Obtener el usuario familiar principal del usuario que edita la reserva
+        const [usuarioCreador] = await connection.query(
+          "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
+          [cabecera.id]
+        );
+
+        let usuarioFamiliarPrincipalId = cabecera.id;
+
+        if (usuarioCreador.length > 0) {
+          let currentUserId = usuarioCreador[0].id;
+          let currentUserFamiliarId = usuarioCreador[0].usuario_familiar_id;
+
+          // Buscar el usuario principal de la familia (el que tiene usuario_familiar_id NULL)
+          while (currentUserFamiliarId !== null) {
+            const [nextUser] = await connection.query(
+              "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
+              [currentUserFamiliarId]
+            );
+
+            if (nextUser.length > 0) {
+              currentUserId = nextUser[0].id;
+              currentUserFamiliarId = nextUser[0].usuario_familiar_id;
+            } else {
+              break;
+            }
+          }
+
+          usuarioFamiliarPrincipalId = currentUserId;
+        }
+
+        // Calcular tarifa total
+        let tarifaTotal = 0;
+        for (const persona of personas) {
+          if (persona.tarifa_individual) {
+            tarifaTotal += persona.tarifa_individual;
+          }
+        }
+
+        // Actualizar reserva principal
+        const updateReservaQuery = `
+          UPDATE reserva SET 
+            regimen_id = ?, 
+            recurso_id = ?, 
+            ${firmaArchivo ? 'firma_archivo = ?,' : ''} 
+            precio_total = ?, 
+            fecha_inicio = ?, 
+            fecha_fin = ?, 
+            observaciones = ?,
+            estado_reserva_id = 1
+          WHERE id = ?
+        `;
+
+        const updateReservaParams = [
+          regimen_id,
+          recurso_id,
+          ...(firmaArchivo ? [firmaArchivo] : []),
+          tarifaTotal,
+          fecha_inicio,
+          fecha_fin,
+          observaciones || null,
+          reservaId
+        ];
+
+        await connection.query(updateReservaQuery, updateReservaParams);
+
+        // Eliminar registros existentes de reserva_familiar y reserva_familiar_tarifa
+        await connection.query(
+          "DELETE rft FROM reserva_familiar_tarifa rft INNER JOIN reserva_familiar rf ON rft.reserva_familiar_id = rf.id WHERE rf.reserva_id = ?",
+          [reservaId]
+        );
+
+        await connection.query(
+          "DELETE FROM reserva_familiar WHERE reserva_id = ?",
+          [reservaId]
+        );
+
+        // Crear o buscar usuarios para cada persona
+        const usuariosIds = [];
+        for (const persona of personas) {
+          let usuarioId;
+
+          // Si la persona tiene ID, verificar si existe
+          if (persona.id) {
+            const [usuarioExistente] = await connection.query(
+              "SELECT id FROM usuario WHERE id = ?",
+              [persona.id]
+            );
+
+            if (usuarioExistente.length > 0) {
+              usuarioId = persona.id;
+              
+              // Actualizar datos del usuario existente
+              await connection.query(
+                `UPDATE usuario SET 
+                   nombre = ?, apellido = ?, fecha_nacimiento = ?, 
+                   telefono = ?, email = ?, parentesco_id = ?, tipo_persona_id = ?
+                 WHERE id = ?`,
+                [
+                  persona.nombre,
+                  persona.apellido,
+                  persona.fecha_nacimiento,
+                  persona.telefono || null,
+                  persona.email || null,
+                  persona.parentesco_id,
+                  persona.tipo_persona_id,
+                  persona.id
+                ]
+              );
+            } else {
+              // El ID no existe, buscar por documento
+              const [existeUsuarioPorDni] = await connection.query(
+                "SELECT id FROM usuario WHERE documento = ?",
+                [persona.dni]
+              );
+
+              if (existeUsuarioPorDni.length > 0) {
+                usuarioId = existeUsuarioPorDni[0].id;
+              } else {
+                // Crear nuevo usuario
+                const [nuevoUsuario] = await connection.query(
+                  `INSERT INTO usuario (
+                    rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento, 
+                    documento, telefono, email, password, usuario_familiar_id
+                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+                  [
+                    2, // Rol de "afiliado"
+                    persona.parentesco_id,
+                    persona.tipo_persona_id,
+                    persona.nombre,
+                    persona.apellido,
+                    persona.fecha_nacimiento,
+                    persona.dni,
+                    persona.telefono || null,
+                    persona.email || null,
+                    usuarioFamiliarPrincipalId
+                  ]
+                );
+                usuarioId = nuevoUsuario.insertId;
+              }
+            }
+          } else {
+            // No tiene ID, verificar si existe por documento
+            const [existeUsuario] = await connection.query(
+              "SELECT id FROM usuario WHERE documento = ?",
+              [persona.dni]
+            );
+
+            if (existeUsuario.length > 0) {
+              usuarioId = existeUsuario[0].id;
+            } else {
+              // Crear nuevo usuario
+              const [nuevoUsuario] = await connection.query(
+                `INSERT INTO usuario (
+                  rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento, 
+                  documento, telefono, email, password, usuario_familiar_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+                [
+                  2, // Rol de "afiliado"
+                  persona.parentesco_id,
+                  persona.tipo_persona_id,
+                  persona.nombre,
+                  persona.apellido,
+                  persona.fecha_nacimiento,
+                  persona.dni,
+                  persona.telefono || null,
+                  persona.email || null,
+                  usuarioFamiliarPrincipalId
+                ]
+              );
+              usuarioId = nuevoUsuario.insertId;
+            }
+          }
+
+          usuariosIds.push({
+            ...persona,
+            usuario_id: usuarioId
+          });
+        }
+
+        // Insertar nuevos registros de reserva_familiar
+        const reservasFamiliaresIds = [];
+        for (const persona of usuariosIds) {
+          const [reservaFamiliarResult] = await connection.query(
+            `INSERT INTO reserva_familiar (
+              reserva_id, usuario_id, tipo_persona_id, parentesco_id, edad, precio
+            ) VALUES (?, ?, ?, ?, ?, ?)`,
+            [
+              reservaId,
+              persona.usuario_id,
+              persona.tipo_persona_id,
+              persona.parentesco_id,
+              persona.edad,
+              persona.tarifa_individual || 0
+            ]
+          );
+
+          reservasFamiliaresIds.push({
+            reserva_familiar_id: reservaFamiliarResult.insertId,
+            ...persona
+          });
+        }
+
+        // Calcular días del rango de fechas (NO incluir día de salida)
+        const fechaInicioDate = new Date(fecha_inicio);
+        const fechaFinDate = new Date(fecha_fin);
+        const diasTotales = Math.ceil((fechaFinDate - fechaInicioDate) / (1000 * 60 * 60 * 24));
+
+        // Insertar reserva_familiar_tarifa para cada día y cada persona
+        for (const reservaFamiliar of reservasFamiliaresIds) {
+          for (let dia = 0; dia < diasTotales; dia++) {
+            const fechaActual = new Date(fechaInicioDate);
+            fechaActual.setDate(fechaInicioDate.getDate() + dia);
+            const fechaString = fechaActual.toISOString().split('T')[0];
+
+            // Buscar tarifa correspondiente para esta persona en esta fecha
+            const [tarifas] = await connection.query(
+              `SELECT id
+               FROM tarifa 
+               WHERE recurso_id = ? 
+                 AND tipo_persona_id = ? 
+                 AND regimen_id = ?
+                 AND (edad_minima IS NULL OR edad_minima <= ?)
+                 AND (edad_maxima IS NULL OR edad_maxima >= ?)
+                 AND fecha_inicio <= ?
+                 AND fecha_fin >= ?
+               ORDER BY fecha_inicio ASC
+               LIMIT 1`,
+              [
+                recurso_id,
+                reservaFamiliar.tipo_persona_id,
+                regimen_id,
+                reservaFamiliar.edad,
+                reservaFamiliar.edad,
+                fechaString,
+                fechaString
+              ]
+            );
+
+            if (tarifas.length > 0) {
+              await connection.query(
+                `INSERT INTO reserva_familiar_tarifa (
+                  reserva_familiar_id, tarifa_id, fecha
+                ) VALUES (?, ?, ?)`,
+                [
+                  reservaFamiliar.reserva_familiar_id,
+                  tarifas[0].id,
+                  fechaString
+                ]
+              );
+            }
+          }
+        }
+
+        // Confirmar transacción
+        await connection.commit();
+
+        // Generar número de reserva
+        const numeroReserva = `RES-${reservaId.toString().padStart(6, '0')}`;
+
+        res.status(200).json({
+          success: true,
+          message: "Reserva actualizada correctamente",
+          numero_reserva: numeroReserva,
+          id: parseInt(reservaId)
+        });
+
+      } catch (transactionError) {
+        // Rollback en caso de error
+        if (connection) {
+          await connection.rollback();
+        }
+        throw transactionError;
+      } finally {
+        if (connection) {
+          connection.release();
+        }
+      }
+
+    } else {
+      res.status(401).json({
+        success: false,
+        message: "No autorizado"
+      });
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json({
+      success: false,
+      message: "Error al actualizar la reserva"
+    });
+  }
+});
+
+router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const reservaId = req.params.id;
+
+      if (!reservaId) {
+        return res.status(400).json("ID de reserva requerido");
+      }
+
+      let connection;
+      try {
+        connection = await mysqlConnection.promise().getConnection();
+
+        // Obtener información básica de la reserva
+        const [reservaInfo] = await connection.query(`
+          SELECT 
+            r.id,
+            r.precio_total as total_tarifa,
+            r.fecha_inicio,
+            r.fecha_fin,
+            r.observaciones,
+            r.fecha_creacion,
+            er.nombre as estado,
+            s.id as servicio_id,
+            s.nombre as servicio_nombre,
+            s.lugar,
+            rec.id as recurso_id,
+            rec.nombre as recurso_nombre,
+            reg.id as regimen_id,
+            reg.nombre as regimen_nombre
+          FROM reserva r
+          LEFT JOIN estado_reserva er ON r.estado_reserva_id = er.id
+          INNER JOIN recurso rec ON r.recurso_id = rec.id
+          INNER JOIN servicio s ON rec.servicio_id = s.id
+          INNER JOIN regimen reg ON r.regimen_id = reg.id
+          WHERE r.id = ?
+        `, [reservaId]);
+
+        if (reservaInfo.length === 0) {
+          return res.status(404).json("Reserva no encontrada");
+        }
+
+        const reserva = reservaInfo[0];
+
+        // Si el rol es afiliado, verificar que la reserva le pertenezca
+        if (cabecera.rol === "afiliado") {
+          const [usuarioReserva] = await connection.query(
+            "SELECT usuario_id FROM reserva WHERE id = ?",
+            [reservaId]
+          );
+
+          if (usuarioReserva.length === 0 || usuarioReserva[0].usuario_id !== cabecera.id) {
+            return res.status(403).json("No tienes permisos para editar esta reserva");
+          }
+        }
+
+        // Obtener las personas de la reserva con información completa para edición
+        const [personas] = await connection.query(`
+          SELECT 
+            u.id,
+            u.nombre,
+            u.apellido,
+            u.documento as dni,
+            u.fecha_nacimiento,
+            u.telefono,
+            u.email,
+            rf.edad,
+            rf.precio as tarifa_individual,
+            rf.tipo_persona_id,
+            rf.parentesco_id,
+            tp.nombre as tipo_persona_nombre,
+            p.nombre as parentesco_nombre
+          FROM reserva_familiar rf
+          INNER JOIN usuario u ON rf.usuario_id = u.id
+          INNER JOIN tipo_persona tp ON rf.tipo_persona_id = tp.id
+          INNER JOIN parentesco p ON rf.parentesco_id = p.id
+          WHERE rf.reserva_id = ?
+          ORDER BY p.id ASC
+        `, [reservaId]);
+
+        // Verificar si viaja el titular y formatear personas
+        let viaja_titular = false;
+        const personasFormateadas = personas.map(persona => {
+          const es_titular = persona.parentesco_id === 1;
+          if (es_titular) {
+            viaja_titular = true;
+          }
+
+          return {
+            id: persona.id,
+            nombre: persona.nombre,
+            apellido: persona.apellido,
+            dni: persona.dni,
+            fecha_nacimiento: persona.fecha_nacimiento,
+            telefono: persona.telefono,
+            email: persona.email,
+            tipo_persona_id: persona.tipo_persona_id,
+            parentesco_id: persona.parentesco_id,
+            regimen_id: reserva.regimen_id, // Todas las personas tienen el mismo régimen
+            edad: persona.edad,
+            es_titular: es_titular
+          };
+        });
+        
+        // Generar número de reserva
+        const numeroReserva = `RES-${reserva.id.toString().padStart(6, '0')}`;
+
+        // Construir respuesta para edición
+        const respuesta = {
+          id: reserva.id,
+          numero_reserva: numeroReserva,
+          nombre: reserva.observaciones || `Reserva ${numeroReserva}`,
+          fecha_inicio: reserva.fecha_inicio,
+          fecha_fin: reserva.fecha_fin,
+          observaciones: reserva.observaciones,
+          servicio: {
+            id: reserva.servicio_id,
+            nombre: reserva.servicio_nombre
+          },
+          recurso: {
+            id: reserva.recurso_id,
+            nombre: reserva.recurso_nombre,
+            location: reserva.lugar
+          },
+          regimen: {
+            id: reserva.regimen_id,
+            nombre: reserva.regimen_nombre
+          },
+          lugar: reserva.lugar,
+          personas: personasFormateadas,
+          viaja_titular: viaja_titular
+        };
+        
+        res.status(200).json(respuesta);
+
+      } catch (queryError) {
+        throw queryError;
+      } finally {
+        if (connection) {
+          connection.release();
+        }
+      }
+
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener la información de la reserva para edición");
   }
 });
 
