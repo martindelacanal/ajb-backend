@@ -912,17 +912,17 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
 
       // Construir filtros de edad basados en fecha de nacimiento
       let ageFilters = [];
-      
+
       // Si adultos > 0, incluir personas mayores de 5 años
       if (adultos && adultos > 0) {
         ageFilters.push("TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) > 5");
       }
-      
+
       // Si niños > 0, incluir personas entre 2 y 5 años
       if (ninos && ninos > 0) {
         ageFilters.push("(TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) >= 2 AND TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) <= 5)");
       }
-      
+
       // Si bebés > 0, incluir personas menores de 2 años
       if (bebes && bebes > 0) {
         ageFilters.push("TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) < 2");
@@ -1097,63 +1097,11 @@ router.put("/acompaniantes", verifyToken, async (req, res) => {
         connection = await mysqlConnection.promise().getConnection();
         await connection.beginTransaction();
 
-        // Obtener información del usuario que ejecuta el endpoint
-        const [usuarioEjecutor] = await connection.query(
-          "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
-          [cabecera.id]
-        );
-
-        if (usuarioEjecutor.length === 0) {
-          throw new Error("Usuario ejecutor no encontrado");
-        }
-
-        // Función para obtener el usuario padre de la familia
-        const obtenerUsuarioPadre = async (userId) => {
-          let currentUserId = userId;
-          let currentUserFamiliarId = usuarioEjecutor[0].usuario_familiar_id;
-
-          // Si el usuario ejecutor es el que estamos buscando, usar sus datos
-          if (userId === usuarioEjecutor[0].id) {
-            currentUserFamiliarId = usuarioEjecutor[0].usuario_familiar_id;
-          } else {
-            // Obtener datos del usuario específico
-            const [userData] = await connection.query(
-              "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
-              [userId]
-            );
-            if (userData.length > 0) {
-              currentUserId = userData[0].id;
-              currentUserFamiliarId = userData[0].usuario_familiar_id;
-            }
-          }
-
-          // Buscar el usuario padre (el que tiene usuario_familiar_id NULL)
-          while (currentUserFamiliarId !== null) {
-            const [nextUser] = await connection.query(
-              "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
-              [currentUserFamiliarId]
-            );
-
-            if (nextUser.length > 0) {
-              currentUserId = nextUser[0].id;
-              currentUserFamiliarId = nextUser[0].usuario_familiar_id;
-            } else {
-              break;
-            }
-          }
-
-          return currentUserId;
-        };
-
-        // Obtener el usuario padre del ejecutor
-        const usuarioPadreEjecutor = await obtenerUsuarioPadre(cabecera.id);
-
         let usuariosModificados = 0;
         const errores = [];
 
         // Procesar cada persona
         for (const persona of personas) {
-          
           try {
             if (!persona.dni) {
               errores.push(`Persona ${persona.nombre} ${persona.apellido}: DNI es requerido`);
@@ -1173,45 +1121,49 @@ router.put("/acompaniantes", verifyToken, async (req, res) => {
 
             const usuario = usuarioExistente[0];
 
-            // Verificar parentesco
-            let esPariente = false;
+            // Verificar permisos: solo dos condiciones permitidas
+            let tienePermisos = false;
 
-            // Caso 1: El usuario a modificar tiene como usuario_familiar_id el id del ejecutor
+            // Condición 1: El usuario a modificar tiene como usuario_familiar_id el id del ejecutor
             if (usuario.usuario_familiar_id === cabecera.id) {
-              esPariente = true;
+              tienePermisos = true;
             }
-            // Caso 2: Ambos usuarios tienen el mismo usuario_familiar_id (y no es null)
-            else if (usuario.usuario_familiar_id !== null && 
-                     usuario.usuario_familiar_id === usuarioEjecutor[0].usuario_familiar_id) {
-              esPariente = true;
-            }
-            // Caso 3: Verificar si comparten el mismo usuario padre de familia
-            else {
-              const usuarioPadreAModificar = await obtenerUsuarioPadre(usuario.id);
-              if (usuarioPadreAModificar === usuarioPadreEjecutor) {
-                esPariente = true;
-              }
+            // Condición 2: El id del usuario a modificar es el mismo que el id del usuario que ejecuta
+            else if (usuario.id === cabecera.id) {
+              tienePermisos = true;
             }
 
             // Caso especial: Si el usuario ejecutor es admin, puede modificar cualquier usuario
             if (cabecera.rol === "admin") {
-              esPariente = true;
+              tienePermisos = true;
             }
 
-            if (!esPariente) {
+            if (!tienePermisos) {
               errores.push(`Persona ${persona.nombre} ${persona.apellido}: No tienes permisos para modificar este usuario`);
               continue;
             }
-            
+
+            // Función auxiliar para normalizar fechas
+            const normalizarFecha = (fecha) => {
+              if (!fecha) return null;
+              if (fecha instanceof Date) return fecha.toISOString().split('T')[0];
+              return fecha;
+            };
+
+            // Función auxiliar para normalizar teléfonos
+            const normalizarTelefono = (telefono) => {
+              return String(telefono || '').trim();
+            };
+
             // Verificar si hay cambios
-            const haycambios = 
+            const hayCambios =
               usuario.nombre !== persona.nombre ||
               usuario.apellido !== persona.apellido ||
-              usuario.fecha_nacimiento !== persona.fechaNacimiento ||
-              usuario.telefono !== persona.telefono ||
+              normalizarFecha(usuario.fecha_nacimiento) !== normalizarFecha(persona.fechaNacimiento) ||
+              normalizarTelefono(usuario.telefono) !== normalizarTelefono(persona.telefono) ||
               usuario.parentesco_id !== persona.parentescoId;
 
-            if (haycambios) {
+            if (hayCambios) {
               // Actualizar el usuario
               await connection.query(
                 `UPDATE usuario SET 
