@@ -1067,6 +1067,227 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
   }
 });
 
+router.put("/acompaniantes", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const { usuarioId, personas } = req.body;
+
+      if (!usuarioId || !personas || !Array.isArray(personas) || personas.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Faltan datos requeridos o el array de personas está vacío"
+        });
+      }
+
+      // Verificar que el usuario que ejecuta el endpoint tiene permisos para modificar al usuarioId
+      if (cabecera.id !== usuarioId && cabecera.rol !== "admin") {
+        return res.status(403).json({
+          success: false,
+          message: "No tienes permisos para modificar los datos de este usuario"
+        });
+      }
+
+      let connection;
+      try {
+        connection = await mysqlConnection.promise().getConnection();
+        await connection.beginTransaction();
+
+        // Obtener información del usuario que ejecuta el endpoint
+        const [usuarioEjecutor] = await connection.query(
+          "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
+          [cabecera.id]
+        );
+
+        if (usuarioEjecutor.length === 0) {
+          throw new Error("Usuario ejecutor no encontrado");
+        }
+
+        // Función para obtener el usuario padre de la familia
+        const obtenerUsuarioPadre = async (userId) => {
+          let currentUserId = userId;
+          let currentUserFamiliarId = usuarioEjecutor[0].usuario_familiar_id;
+
+          // Si el usuario ejecutor es el que estamos buscando, usar sus datos
+          if (userId === usuarioEjecutor[0].id) {
+            currentUserFamiliarId = usuarioEjecutor[0].usuario_familiar_id;
+          } else {
+            // Obtener datos del usuario específico
+            const [userData] = await connection.query(
+              "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
+              [userId]
+            );
+            if (userData.length > 0) {
+              currentUserId = userData[0].id;
+              currentUserFamiliarId = userData[0].usuario_familiar_id;
+            }
+          }
+
+          // Buscar el usuario padre (el que tiene usuario_familiar_id NULL)
+          while (currentUserFamiliarId !== null) {
+            const [nextUser] = await connection.query(
+              "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
+              [currentUserFamiliarId]
+            );
+
+            if (nextUser.length > 0) {
+              currentUserId = nextUser[0].id;
+              currentUserFamiliarId = nextUser[0].usuario_familiar_id;
+            } else {
+              break;
+            }
+          }
+
+          return currentUserId;
+        };
+
+        // Obtener el usuario padre del ejecutor
+        const usuarioPadreEjecutor = await obtenerUsuarioPadre(cabecera.id);
+
+        let usuariosModificados = 0;
+        const errores = [];
+
+        // Procesar cada persona
+        for (const persona of personas) {
+          
+          try {
+            if (!persona.dni) {
+              errores.push(`Persona ${persona.nombre} ${persona.apellido}: DNI es requerido`);
+              continue;
+            }
+
+            // Buscar usuario por documento
+            const [usuarioExistente] = await connection.query(
+              "SELECT id, nombre, apellido, documento, fecha_nacimiento, telefono, parentesco_id, usuario_familiar_id FROM usuario WHERE documento = ?",
+              [persona.dni]
+            );
+
+            if (usuarioExistente.length === 0) {
+              // No insertar usuarios que no existen
+              continue;
+            }
+
+            const usuario = usuarioExistente[0];
+
+            // Verificar parentesco
+            let esPariente = false;
+
+            // Caso 1: El usuario a modificar tiene como usuario_familiar_id el id del ejecutor
+            if (usuario.usuario_familiar_id === cabecera.id) {
+              esPariente = true;
+            }
+            // Caso 2: Ambos usuarios tienen el mismo usuario_familiar_id (y no es null)
+            else if (usuario.usuario_familiar_id !== null && 
+                     usuario.usuario_familiar_id === usuarioEjecutor[0].usuario_familiar_id) {
+              esPariente = true;
+            }
+            // Caso 3: Verificar si comparten el mismo usuario padre de familia
+            else {
+              const usuarioPadreAModificar = await obtenerUsuarioPadre(usuario.id);
+              if (usuarioPadreAModificar === usuarioPadreEjecutor) {
+                esPariente = true;
+              }
+            }
+
+            // Caso especial: Si el usuario ejecutor es admin, puede modificar cualquier usuario
+            if (cabecera.rol === "admin") {
+              esPariente = true;
+            }
+
+            if (!esPariente) {
+              errores.push(`Persona ${persona.nombre} ${persona.apellido}: No tienes permisos para modificar este usuario`);
+              continue;
+            }
+            
+            // Verificar si hay cambios
+            const haycambios = 
+              usuario.nombre !== persona.nombre ||
+              usuario.apellido !== persona.apellido ||
+              usuario.fecha_nacimiento !== persona.fechaNacimiento ||
+              usuario.telefono !== persona.telefono ||
+              usuario.parentesco_id !== persona.parentescoId;
+
+            if (haycambios) {
+              // Actualizar el usuario
+              await connection.query(
+                `UPDATE usuario SET 
+                   nombre = ?, 
+                   apellido = ?, 
+                   fecha_nacimiento = ?, 
+                   telefono = ?, 
+                   parentesco_id = ?
+                 WHERE id = ?`,
+                [
+                  persona.nombre,
+                  persona.apellido,
+                  persona.fechaNacimiento || null,
+                  persona.telefono || null,
+                  persona.parentescoId,
+                  usuario.id
+                ]
+              );
+
+              usuariosModificados++;
+            }
+
+          } catch (personaError) {
+            errores.push(`Error procesando ${persona.nombre} ${persona.apellido}: ${personaError.message}`);
+          }
+        }
+
+        await connection.commit();
+
+        const success = usuariosModificados > 0;
+        let message = "";
+
+        if (success) {
+          message = `Se actualizaron ${usuariosModificados} usuario(s) correctamente`;
+          if (errores.length > 0) {
+            message += `. Errores: ${errores.join('; ')}`;
+          }
+        } else {
+          if (errores.length > 0) {
+            message = `No se pudo actualizar ningún usuario. Errores: ${errores.join('; ')}`;
+          } else {
+            message = "No se encontraron usuarios para actualizar o no había cambios";
+          }
+        }
+
+        res.status(200).json({
+          success,
+          message
+        });
+
+      } catch (transactionError) {
+        if (connection) {
+          await connection.rollback();
+        }
+        throw transactionError;
+      } finally {
+        if (connection) {
+          connection.release();
+        }
+      }
+
+    } else {
+      res.status(401).json({
+        success: false,
+        message: "No autorizado"
+      });
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json({
+      success: false,
+      message: "Error interno del servidor"
+    });
+  }
+});
+
 router.get("/subtipo_servicio", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   if (
