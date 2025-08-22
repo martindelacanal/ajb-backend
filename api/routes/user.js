@@ -646,6 +646,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
     const cabecera = JSON.parse(req.data.data);
     if (
       cabecera.rol === "admin" ||
+      cabecera.rol === "departamental" ||
       cabecera.rol === "afiliado"
     ) {
       const {
@@ -896,8 +897,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      cabecera.rol === "admin" ||
-      cabecera.rol === "afiliado"
+      cabecera.rol === "admin" || cabecera.rol === "departamental" || cabecera.rol === "afiliado"
     ) {
       const reservaId = req.params.id;
       const {
@@ -1598,6 +1598,135 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener el resumen de la reserva");
+  }
+});
+
+router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" || 
+      cabecera.rol === "departamental" ||
+      cabecera.rol === "afiliado"
+    ) {
+      const reservaId = req.params.id;
+      const { estado, observaciones, usuario_admin_id } = req.body;
+
+      // Validar campos requeridos
+      if (!reservaId || !estado) {
+        return res.status(400).json({
+          success: false,
+          message: "ID de reserva y estado son requeridos"
+        });
+      }
+
+      // Validar que el estado sea válido
+      const estadosValidos = ["Verificada", "Cancelada"];
+      if (!estadosValidos.includes(estado)) {
+        return res.status(400).json({
+          success: false,
+          message: "Estado no válido. Debe ser 'Verificada' o 'Cancelada'"
+        });
+      }
+
+      let connection;
+      try {
+        // Iniciar transacción
+        connection = await mysqlConnection.promise().getConnection();
+        await connection.beginTransaction();
+
+        // Verificar que la reserva existe
+        const [reservaExistente] = await connection.query(
+          "SELECT id, estado_reserva_id FROM reserva WHERE id = ?",
+          [reservaId]
+        );
+
+        if (reservaExistente.length === 0) {
+          return res.status(404).json({
+            success: false,
+            message: "Reserva no encontrada"
+          });
+        }
+
+        // Mapear estado a ID numérico
+        let estadoId;
+        let estadoNombre;
+        if (estado === "Verificada") {
+          estadoId = 2;
+          estadoNombre = "Verificada";
+        } else if (estado === "Cancelada") {
+          estadoId = 4; // Usando "Rechazada" como equivalente a "Cancelada"
+          estadoNombre = "Rechazada";
+        }
+
+        // Actualizar el estado de la reserva
+        const [updateResult] = await connection.query(
+          `UPDATE reserva SET 
+            estado_reserva_id = ?, 
+            observaciones = ?,
+            fecha_modificacion = NOW()
+          WHERE id = ?`,
+          [estadoId, observaciones || null, reservaId]
+        );
+
+        if (updateResult.affectedRows === 0) {
+          return res.status(500).json({
+            success: false,
+            message: "No se pudo actualizar la reserva"
+          });
+        }
+
+        // Insertar registro de auditoría si se proporciona usuario_admin_id
+        // if (usuario_admin_id) {
+        //   await connection.query(
+        //     `INSERT INTO auditoria_reserva (reserva_id, usuario_id, estado_anterior, estado_nuevo, observaciones, fecha_cambio)
+        //      VALUES (?, ?, ?, ?, ?, NOW())`,
+        //     [reservaId, usuario_admin_id, reservaExistente[0].estado_reserva_id, estadoId, observaciones || null]
+        //   );
+        // }
+
+        // Confirmar transacción
+        await connection.commit();
+
+        // Generar número de reserva para la respuesta
+        const numeroReserva = `RES-${reservaId.toString().padStart(6, '0')}`;
+
+        // Respuesta exitosa
+        res.status(200).json({
+          success: true,
+          message: `Reserva ${estado.toLowerCase()} exitosamente`,
+          reserva: {
+            id: parseInt(reservaId),
+            numero_reserva: numeroReserva,
+            estado: estadoNombre,
+            fecha_actualizacion: new Date().toISOString()
+          }
+        });
+
+      } catch (transactionError) {
+        // Rollback en caso de error
+        if (connection) {
+          await connection.rollback();
+        }
+        throw transactionError;
+      } finally {
+        if (connection) {
+          connection.release();
+        }
+      }
+
+    } else {
+      res.status(401).json({
+        success: false,
+        message: "No autorizado. Solo administradores y departamentales pueden cambiar estados de reservas"
+      });
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json({
+      success: false,
+      message: "Error interno del servidor al actualizar el estado de la reserva"
+    });
   }
 });
 
