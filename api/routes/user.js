@@ -157,7 +157,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
       const ninos = parseInt(req.query.ninos) || 0;
       const bebes = parseInt(req.query.bebes) || 0;
 
-      let query = "SELECT id, tipo_servicio_id, nombre, lugar, rating FROM servicio";
+      let query = "SELECT id, nombre, lugar, rating FROM servicio";
       let params = [];
       if (lugar) {
         query += " WHERE lugar = ?";
@@ -655,7 +655,6 @@ router.post("/reserva", verifyToken, async (req, res) => {
         fecha_fin,
         servicio_id,
         recurso_id,
-        tipo_servicio_id,
         regimen_id,
         personas,
         viaja_titular,
@@ -765,11 +764,10 @@ router.post("/reserva", verifyToken, async (req, res) => {
         // Insertar reserva principal
         const [reservaResult] = await connection.query(
           `INSERT INTO reserva (
-            subtipo_servicio_id, regimen_id, recurso_id, usuario_id,
+            regimen_id, recurso_id, usuario_id,
             firma_archivo, precio_total, fecha_inicio, fecha_fin, observaciones
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ) VALUES ( ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
-            tipo_servicio_id || null,
             regimen_id,
             recurso_id,
             cabecera.id, // Usuario que hace la reserva
@@ -1237,37 +1235,6 @@ router.put("/acompaniantes", verifyToken, async (req, res) => {
       success: false,
       message: "Error interno del servidor"
     });
-  }
-});
-
-router.get("/subtipo_servicio", verifyToken, async (req, res) => {
-  const cabecera = JSON.parse(req.data.data);
-  if (
-    cabecera.rol === "admin" ||
-    cabecera.rol === "afiliado" ||
-    cabecera.rol === "departamental"
-  ) {
-    try {
-      const servicioId = req.query.servicio;
-      if (!servicioId) {
-        return res.status(400).json("Falta el parámetro 'servicio'");
-      }
-      const [rows] = await mysqlConnection
-        .promise()
-        .query(
-          `SELECT sbs.id, sbs.nombre
-         FROM servicio s
-         INNER JOIN subtipo_servicio sbs ON s.tipo_servicio_id = sbs.tipo_servicio_id
-         WHERE s.id = ?`,
-          [servicioId]
-        );
-      res.status(200).json(rows);
-    } catch (error) {
-      console.log(error);
-      res.status(500).json("Error al obtener los tipos de servicio");
-    }
-  } else {
-    res.status(401).json("No autorizado");
   }
 });
 
