@@ -154,7 +154,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
       const fecha_inicio = req.query.fecha_inicio;
       const fecha_fin = req.query.fecha_fin;
       const adultos = parseInt(req.query.adultos) || 0;
-      const ninios = parseInt(req.query.ninios) || 0;
+      const ninos = parseInt(req.query.ninos) || 0;
       const bebes = parseInt(req.query.bebes) || 0;
 
       let query = "SELECT id, tipo_servicio_id, nombre, lugar, rating FROM servicio";
@@ -193,7 +193,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
         let precio_maximo = null;
 
         // Calcular precios solo si se proporcionan las fechas y al menos una persona
-        if (fecha_inicio && fecha_fin && (adultos > 0 || ninios > 0 || bebes > 0)) {
+        if (fecha_inicio && fecha_fin && (adultos > 0 || ninos > 0 || bebes > 0)) {
           const fechaInicioSolicitud = new Date(fecha_inicio);
           const fechaFinSolicitud = new Date(fecha_fin);
 
@@ -233,8 +233,8 @@ router.get("/servicios", verifyToken, async (req, res) => {
             }
 
             // Procesar niños (entre 2 y 5 años inclusivo)
-            if (ninios > 0) {
-              const [tarifasNinios] = await mysqlConnection
+            if (ninos > 0) {
+              const [tarifasninos] = await mysqlConnection
                 .promise()
                 .query(`
       SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
@@ -247,9 +247,9 @@ router.get("/servicios", verifyToken, async (req, res) => {
         AND t.fecha_fin >= ?
     `, [servicio.id, fechaString, fechaString]);
 
-              if (tarifasNinios.length > 0 && tarifasNinios[0].precio_min !== null) {
-                precio_minimo_dia += tarifasNinios[0].precio_min * ninios;
-                precio_maximo_dia += tarifasNinios[0].precio_max * ninios;
+              if (tarifasninos.length > 0 && tarifasninos[0].precio_min !== null) {
+                precio_minimo_dia += tarifasninos[0].precio_min * ninos;
+                precio_maximo_dia += tarifasninos[0].precio_max * ninos;
               }
             }
 
