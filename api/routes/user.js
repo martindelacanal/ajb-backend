@@ -741,7 +741,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
             const [nuevoUsuario] = await connection.query(
               `INSERT INTO usuario (
                 rol_id, parentesco_id, nombre, apellido, fecha_nacimiento, 
-                documento, contacto, password, usuario_familiar_id
+                documento, telefono, password, usuario_familiar_id
               ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
               [
                 2, // Rol de "afiliado"
@@ -750,7 +750,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
                 persona.apellido,
                 persona.fecha_nacimiento,
                 persona.dni,
-                persona.contacto || null,
+                persona.telefono || null,
                 usuarioFamiliarPrincipalId
               ]
             );
@@ -955,7 +955,7 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
             u.apellido,
             u.documento,
             u.fecha_nacimiento,
-            u.contacto,
+            u.telefono,
             u.parentesco_id,
             NULL as tipo_persona_id,
             TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) as edad
@@ -979,7 +979,7 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
               u.apellido,
               u.documento,
               u.fecha_nacimiento,
-              u.contacto,
+              u.telefono,
               u.parentesco_id,
               NULL as tipo_persona_id,
               TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) as edad
@@ -1003,7 +1003,7 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
             u.apellido,
             u.documento,
             u.fecha_nacimiento,
-            u.contacto,
+            u.telefono,
             COALESCE(
               (SELECT rf2.parentesco_id 
                FROM reserva_familiar rf2 
@@ -1408,7 +1408,7 @@ router.get("/usuario", verifyToken, async (req, res) => {
             documento, 
             parentesco_id, 
             fecha_nacimiento, 
-            contacto, 
+            telefono, 
             email, 
             rol_id as rol, 
             departamental_id 
