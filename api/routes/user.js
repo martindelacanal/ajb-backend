@@ -217,15 +217,14 @@ router.get("/servicios", verifyToken, async (req, res) => {
               const [tarifasAdultos] = await mysqlConnection
                 .promise()
                 .query(`
-          SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
-          FROM tarifa t
-          INNER JOIN recurso r ON t.recurso_id = r.id
-          WHERE r.servicio_id = ?
-            AND (t.edad_minima IS NULL OR t.edad_minima <= 5)
-            AND (t.edad_maxima IS NULL OR t.edad_maxima > 5)
-            AND t.fecha_inicio <= ?
-            AND t.fecha_fin >= ?
-        `, [servicio.id, fechaString, fechaString]);
+      SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
+      FROM tarifa t
+      INNER JOIN recurso r ON t.recurso_id = r.id
+      WHERE r.servicio_id = ?
+        AND (t.edad_maxima IS NULL OR t.edad_maxima > 5)
+        AND t.fecha_inicio <= ?
+        AND t.fecha_fin >= ?
+    `, [servicio.id, fechaString, fechaString]);
 
               if (tarifasAdultos.length > 0 && tarifasAdultos[0].precio_min !== null) {
                 precio_minimo_dia += tarifasAdultos[0].precio_min * adultos;
@@ -233,20 +232,20 @@ router.get("/servicios", verifyToken, async (req, res) => {
               }
             }
 
-            // Procesar niños (entre 2 y 5 años)
+            // Procesar niños (entre 2 y 5 años inclusivo)
             if (ninios > 0) {
               const [tarifasNinios] = await mysqlConnection
                 .promise()
                 .query(`
-          SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
-          FROM tarifa t
-          INNER JOIN recurso r ON t.recurso_id = r.id
-          WHERE r.servicio_id = ?
-            AND (t.edad_minima IS NULL OR t.edad_minima <= 2)
-            AND (t.edad_maxima IS NULL OR t.edad_maxima >= 5)
-            AND t.fecha_inicio <= ?
-            AND t.fecha_fin >= ?
-        `, [servicio.id, fechaString, fechaString]);
+      SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
+      FROM tarifa t
+      INNER JOIN recurso r ON t.recurso_id = r.id
+      WHERE r.servicio_id = ?
+        AND (t.edad_minima IS NULL OR t.edad_minima <= 5)
+        AND (t.edad_maxima IS NULL OR t.edad_maxima >= 2)
+        AND t.fecha_inicio <= ?
+        AND t.fecha_fin >= ?
+    `, [servicio.id, fechaString, fechaString]);
 
               if (tarifasNinios.length > 0 && tarifasNinios[0].precio_min !== null) {
                 precio_minimo_dia += tarifasNinios[0].precio_min * ninios;
@@ -259,15 +258,14 @@ router.get("/servicios", verifyToken, async (req, res) => {
               const [tarifasBebes] = await mysqlConnection
                 .promise()
                 .query(`
-          SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
-          FROM tarifa t
-          INNER JOIN recurso r ON t.recurso_id = r.id
-          WHERE r.servicio_id = ?
-            AND (t.edad_minima IS NULL OR t.edad_minima <= 0)
-            AND (t.edad_maxima IS NULL OR t.edad_maxima < 2)
-            AND t.fecha_inicio <= ?
-            AND t.fecha_fin >= ?
-        `, [servicio.id, fechaString, fechaString]);
+                SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
+                FROM tarifa t
+                INNER JOIN recurso r ON t.recurso_id = r.id
+                WHERE r.servicio_id = ?
+                  AND (t.edad_maxima IS NULL OR t.edad_maxima < 2)
+                  AND t.fecha_inicio <= ?
+                  AND t.fecha_fin >= ?
+              `, [servicio.id, fechaString, fechaString]);
 
               if (tarifasBebes.length > 0 && tarifasBebes[0].precio_min !== null) {
                 precio_minimo_dia += tarifasBebes[0].precio_min * bebes;
@@ -291,7 +289,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
           precio_maximo: precio_maximo
         };
       }));
-
+      console.log(serviciosConImagenes);
       res.status(200).json(serviciosConImagenes);
     } else {
       res.status(401).json("No autorizado");
