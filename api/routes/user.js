@@ -338,7 +338,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       if (!fecha_inicio || !fecha_fin || !servicio_id || !personas || personas.length === 0) {
         return res.status(400).json("Faltan campos requeridos");
       }
-
+      
       // Primero obtenemos solo los recursos que tienen tarifas válidas para el servicio y las personas
       const recursosConTarifas = [];
 
@@ -1466,7 +1466,8 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
         u.documento AS afiliado,
         DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') AS fecha_inicio,
         DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') AS fecha_fin,
-        COALESCE(r.observaciones, '') AS observaciones
+        COALESCE(r.observaciones, '') AS observaciones,
+        DATE_FORMAT(r.fecha_creacion, '%d/%m/%Y') AS fecha_creacion
       FROM reserva r
       INNER JOIN estado_reserva er ON r.estado_reserva_id = er.id
       INNER JOIN recurso rec ON r.recurso_id = rec.id
@@ -1526,6 +1527,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     res.status(401).json("No autorizado");
   }
 });
+
 router.get("/usuario", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
