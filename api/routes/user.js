@@ -338,7 +338,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       if (!fecha_inicio || !fecha_fin || !servicio_id || !personas || personas.length === 0) {
         return res.status(400).json("Faltan campos requeridos");
       }
-      
+
       // Primero obtenemos solo los recursos que tienen tarifas válidas para el servicio y las personas
       const recursosConTarifas = [];
 
@@ -739,12 +739,13 @@ router.post("/reserva", verifyToken, async (req, res) => {
             // Crear nuevo usuario con usuario_familiar_id establecido
             const [nuevoUsuario] = await connection.query(
               `INSERT INTO usuario (
-                rol_id, parentesco_id, nombre, apellido, fecha_nacimiento, 
+                rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento, 
                 documento, telefono, password, usuario_familiar_id
               ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
               [
                 2, // Rol de "afiliado"
                 persona.parentesco_id,
+                persona.tipo_persona_id,
                 persona.nombre,
                 persona.apellido,
                 persona.fecha_nacimiento,
@@ -891,7 +892,193 @@ router.post("/reserva", verifyToken, async (req, res) => {
   }
 });
 
-router.get("/acompaniantes", verifyToken, async (req, res) => {
+router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const reservaId = req.params.id;
+
+      if (!reservaId) {
+        return res.status(400).json("ID de reserva requerido");
+      }
+
+      let connection;
+      try {
+        connection = await mysqlConnection.promise().getConnection();
+
+        // Obtener información básica de la reserva
+        const [reservaInfo] = await connection.query(`
+          SELECT 
+            r.id,
+            r.precio_total as total_tarifa,
+            r.fecha_inicio,
+            r.fecha_fin,
+            r.observaciones,
+            r.fecha_creacion,
+            r.firma_archivo,
+            er.nombre as estado,
+            s.id as servicio_id,
+            s.nombre as servicio_nombre,
+            s.lugar,
+            rec.id as recurso_id,
+            rec.nombre as recurso_nombre,
+            reg.id as regimen_id,
+            reg.nombre as regimen_nombre
+          FROM reserva r
+          LEFT JOIN estado_reserva er ON r.estado_reserva_id = er.id
+          INNER JOIN recurso rec ON r.recurso_id = rec.id
+          INNER JOIN servicio s ON rec.servicio_id = s.id
+          INNER JOIN regimen reg ON r.regimen_id = reg.id
+          WHERE r.id = ?
+        `, [reservaId]);
+
+        if (reservaInfo.length === 0) {
+          return res.status(404).json("Reserva no encontrada");
+        }
+
+        const reserva = reservaInfo[0];
+
+        // Si el rol es afiliado, verificar que la reserva le pertenezca
+        if (cabecera.rol === "afiliado") {
+          const [usuarioReserva] = await connection.query(
+            "SELECT usuario_id FROM reserva WHERE id = ?",
+            [reservaId]
+          );
+
+          if (usuarioReserva.length === 0 || usuarioReserva[0].usuario_id !== cabecera.id) {
+            return res.status(403).json("No tienes permisos para ver esta reserva");
+          }
+        }
+
+        // Obtener las personas de la reserva
+        const [personas] = await connection.query(`
+          SELECT 
+            u.id,
+            u.nombre,
+            u.apellido,
+            u.documento as dni,
+            u.fecha_nacimiento,
+            u.telefono,
+            rf.edad,
+            rf.precio as tarifa_individual,
+            tp.id as tipo_persona_id,
+            tp.nombre as tipo_persona_nombre,
+            p.id as parentesco_id,
+            p.nombre as parentesco_nombre
+          FROM reserva_familiar rf
+          INNER JOIN usuario u ON rf.usuario_id = u.id
+          INNER JOIN tipo_persona tp ON rf.tipo_persona_id = tp.id
+          INNER JOIN parentesco p ON rf.parentesco_id = p.id
+          WHERE rf.reserva_id = ?
+          ORDER BY p.id ASC
+        `, [reservaId]);
+
+        // Contar tipos de personas
+        let adultos = 0;
+        let ninos = 0;
+        let bebes = 0;
+        let viaja_titular = false;
+
+        personas.forEach(persona => {
+          if (persona.edad > 5) {
+            adultos++;
+          } else if (persona.edad >= 2) {
+            ninos++;
+          } else {
+            bebes++;
+          }
+
+          // Verificar si viaja el titular (parentesco_id = 1 generalmente indica titular)
+          if (persona.parentesco_id === 1) {
+            viaja_titular = true;
+          }
+        });
+
+        // Formatear personas para la respuesta
+        const personasFormateadas = personas.map(persona => ({
+          id: persona.id,
+          tipo_persona: {
+            id: persona.tipo_persona_id,
+            nombre: persona.tipo_persona_nombre
+          },
+          parentesco: {
+            id: persona.parentesco_id,
+            nombre: persona.parentesco_nombre
+          },
+          nombre: persona.nombre,
+          apellido: persona.apellido,
+          dni: persona.dni,
+          fecha_nacimiento: persona.fecha_nacimiento,
+          telefono: persona.telefono,
+          edad: persona.edad,
+          tarifa_individual: persona.tarifa_individual
+        }));
+
+        // Generar número de reserva
+        const numeroReserva = `${reserva.id}`;
+
+        // Generar URL de firma si existe
+        let firmaUrl = null;
+        if (reserva.firma_archivo) {
+          firmaUrl = `http://localhost:3000/imagenes/${reserva.firma_archivo}`;
+        }
+
+        // Construir respuesta
+        const respuesta = {
+          id: reserva.id,
+          numero_reserva: numeroReserva,
+          nombre: reserva.observaciones || `Reserva ${numeroReserva}`,
+          estado: reserva.estado || "Confirmada",
+          fecha_creacion: reserva.fecha_creacion,
+          observaciones: reserva.observaciones,
+          fecha_inicio: reserva.fecha_inicio,
+          fecha_fin: reserva.fecha_fin,
+          servicio: {
+            id: reserva.servicio_id,
+            nombre: reserva.servicio_nombre
+          },
+          lugar: reserva.lugar,
+          recurso: {
+            id: reserva.recurso_id,
+            nombre: reserva.recurso_nombre
+          },
+          regimen: {
+            id: reserva.regimen_id,
+            nombre: reserva.regimen_nombre
+          },
+          personas: personasFormateadas,
+          total_tarifa: reserva.total_tarifa,
+          firma_url: firmaUrl,
+          viaja_titular: viaja_titular,
+          adultos: adultos,
+          ninos: ninos,
+          bebes: bebes
+        };
+
+        res.status(200).json(respuesta);
+
+      } catch (queryError) {
+        throw queryError;
+      } finally {
+        if (connection) {
+          connection.release();
+        }
+      }
+
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener el resumen de la reserva");
+  }
+});
+
+router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
@@ -900,6 +1087,36 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
       cabecera.rol === "departamental"
     ) {
       const usuario_id = req.query.usuario_id;
+      const specific_id = req.params.id; // ID específico opcional
+
+      // Si viene un ID específico, devolver directamente ese usuario
+      if (specific_id) {
+        const [usuario] = await mysqlConnection
+          .promise()
+          .query(
+            `SELECT 
+              u.id,
+              u.nombre,
+              u.apellido,
+              u.documento,
+              u.fecha_nacimiento,
+              u.telefono,
+              u.parentesco_id,
+              u.tipo_persona_id,
+              TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) as edad
+            FROM usuario u
+            WHERE u.id = ?`,
+            [parseInt(specific_id)]
+          );
+
+        if (usuario.length === 0) {
+          return res.status(404).json("No se encontró el acompañante con el ID especificado");
+        }
+
+        return res.status(200).json(usuario[0]);
+      }
+
+      // Lógica original cuando no viene ID específico
       const adultos = parseInt(req.query.adultos) || null;
       const ninos = parseInt(req.query.ninos) || null;
       const bebes = parseInt(req.query.bebes) || null;
@@ -955,7 +1172,7 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
             u.fecha_nacimiento,
             u.telefono,
             u.parentesco_id,
-            NULL as tipo_persona_id,
+            u.tipo_persona_id,
             TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) as edad
           FROM usuario u
           WHERE u.usuario_familiar_id = ? ${ageFilterClause}`,
@@ -979,7 +1196,7 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
               u.fecha_nacimiento,
               u.telefono,
               u.parentesco_id,
-              NULL as tipo_persona_id,
+              u.tipo_persona_id,
               TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) as edad
             FROM usuario u
             WHERE u.id = ? ${ageFilterClause}`,
@@ -1002,29 +1219,8 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
             u.documento,
             u.fecha_nacimiento,
             u.telefono,
-            COALESCE(
-              (SELECT rf2.parentesco_id 
-               FROM reserva_familiar rf2 
-               WHERE rf2.usuario_id = u.id 
-                 AND rf2.reserva_id IN (
-                   SELECT rf_main.reserva_id 
-                   FROM reserva_familiar rf_main 
-                   WHERE rf_main.usuario_id = ?
-                 )
-               ORDER BY rf2.fecha_creacion DESC 
-               LIMIT 1), 
-              u.parentesco_id
-            ) as parentesco_id,
-            (SELECT rf2.tipo_persona_id 
-             FROM reserva_familiar rf2 
-             WHERE rf2.usuario_id = u.id 
-               AND rf2.reserva_id IN (
-                 SELECT rf_main.reserva_id 
-                 FROM reserva_familiar rf_main 
-                 WHERE rf_main.usuario_id = ?
-               )
-             ORDER BY rf2.fecha_creacion DESC 
-             LIMIT 1) as tipo_persona_id,
+            u.parentesco_id,
+            u.tipo_persona_id,
             TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) as edad
           FROM usuario u
           INNER JOIN reserva_familiar rf ON u.id = rf.usuario_id
@@ -1034,27 +1230,19 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
             WHERE usuario_id = ?
           )
           AND u.id != ? ${ageFilterClause}`,
-          [usuario_id, usuario_id, usuario_id, usuario_id]
+          [usuario_id, usuario_id]
         );
 
       companierosReserva.forEach(companiero => {
-        // Si ya existe en acompañantes (familiar), actualizar con datos de reserva si están disponibles
-        if (acompaniantes.has(companiero.usuario_id)) {
-          const existing = acompaniantes.get(companiero.usuario_id);
-          if (companiero.tipo_persona_id) {
-            existing.tipo_persona_id = companiero.tipo_persona_id;
-          }
-          if (companiero.parentesco_id) {
-            existing.parentesco_id = companiero.parentesco_id;
-          }
-        } else {
-          // Es nuevo, agregarlo
+        // Si no existe ya en acompañantes, agregarlo
+        if (!acompaniantes.has(companiero.usuario_id)) {
           acompaniantes.set(companiero.usuario_id, companiero);
         }
       });
 
       // Convertir Map a Array
       const resultado = Array.from(acompaniantes.values());
+
       res.status(200).json(resultado);
     } else {
       res.status(401).json("No autorizado");
@@ -1065,7 +1253,7 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
   }
 });
 
-router.put("/acompaniantes", verifyToken, async (req, res) => {
+router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
@@ -1074,7 +1262,105 @@ router.put("/acompaniantes", verifyToken, async (req, res) => {
       cabecera.rol === "departamental"
     ) {
       const { usuarioId, personas } = req.body;
+      const specific_id = req.params.id; // ID específico opcional
 
+      // Si viene un ID específico, actualizar directamente ese usuario
+      if (specific_id) {
+        // Determinar si el cuerpo es un objeto directo o tiene el array personas
+        let persona;
+
+        if (req.body.nombre && req.body.apellido) {
+          // El cuerpo es el objeto Acompaniante directamente
+          persona = req.body;
+        } else if (personas && Array.isArray(personas) && personas.length > 0) {
+          // El cuerpo tiene el array personas
+          persona = personas[0];
+        } else {
+          return res.status(400).json({
+            success: false,
+            message: "Faltan datos de la persona a actualizar"
+          });
+        }
+
+        if (!persona.nombre || !persona.apellido) {
+          return res.status(400).json({
+            success: false,
+            message: "Nombre y apellido son requeridos"
+          });
+        }
+
+        // Función para convertir fecha ISO a formato YYYY-MM-DD
+        const formatearFecha = (fecha) => {
+          if (!fecha) return null;
+          try {
+            const fechaObj = new Date(fecha);
+            if (isNaN(fechaObj.getTime())) return null;
+            return fechaObj.toISOString().split('T')[0];
+          } catch (error) {
+            return null;
+          }
+        };
+
+        let connection;
+        try {
+          connection = await mysqlConnection.promise().getConnection();
+          await connection.beginTransaction();
+
+          // Preparar los campos para actualizar
+          let updateFields = [
+            "nombre = ?",
+            "apellido = ?",
+            "fecha_nacimiento = ?",
+            "telefono = ?",
+            "parentesco_id = ?",
+            "tipo_persona_id = ?"
+          ];
+
+          let updateValues = [
+            persona.nombre,
+            persona.apellido,
+            formatearFecha(persona.fecha_nacimiento),
+            persona.telefono || null,
+            persona.parentesco_id || null,
+            persona.tipo_persona_id || null
+          ];
+
+          // Si viene password, hashearlo y agregarlo a la actualización
+          if (persona.password) {
+            let passwordHash = await bcryptjs.hash(persona.password, 8);
+            updateFields.push("password = ?");
+            updateValues.push(passwordHash);
+          }
+
+          // Agregar el ID al final para el WHERE
+          updateValues.push(parseInt(specific_id));
+
+          // Construir la query dinámicamente
+          const updateQuery = `UPDATE usuario SET ${updateFields.join(', ')} WHERE id = ?`;
+
+          // Actualizar directamente el usuario por ID
+          const [result] = await connection.query(updateQuery, updateValues);
+
+          await connection.commit();
+
+          return res.status(200).json({
+            success: result.affectedRows > 0,
+            message: result.affectedRows > 0 ? "Usuario actualizado correctamente" : "No se encontró el usuario o no se realizaron cambios"
+          });
+
+        } catch (updateError) {
+          if (connection) {
+            await connection.rollback();
+          }
+          throw updateError;
+        } finally {
+          if (connection) {
+            connection.release();
+          }
+        }
+      }
+
+      // Lógica original cuando no viene ID específico
       if (!usuarioId || !personas || !Array.isArray(personas) || personas.length === 0) {
         return res.status(400).json({
           success: false,
@@ -1108,12 +1394,11 @@ router.put("/acompaniantes", verifyToken, async (req, res) => {
 
             // Buscar usuario por documento
             const [usuarioExistente] = await connection.query(
-              "SELECT id, nombre, apellido, documento, fecha_nacimiento, telefono, parentesco_id, usuario_familiar_id FROM usuario WHERE documento = ?",
+              `SELECT id, nombre, apellido, documento, fecha_nacimiento, telefono, parentesco_id, usuario_familiar_id, tipo_persona_id FROM usuario WHERE documento = ?`,
               [persona.dni]
             );
 
             if (usuarioExistente.length === 0) {
-              // No insertar usuarios que no existen
               continue;
             }
 
@@ -1159,7 +1444,8 @@ router.put("/acompaniantes", verifyToken, async (req, res) => {
               usuario.apellido !== persona.apellido ||
               normalizarFecha(usuario.fecha_nacimiento) !== normalizarFecha(persona.fechaNacimiento) ||
               normalizarTelefono(usuario.telefono) !== normalizarTelefono(persona.telefono) ||
-              usuario.parentesco_id !== persona.parentescoId;
+              usuario.parentesco_id !== persona.parentescoId ||
+              usuario.tipo_persona_id !== persona.tipoPersonaId;
 
             if (hayCambios) {
               // Actualizar el usuario
@@ -1169,7 +1455,8 @@ router.put("/acompaniantes", verifyToken, async (req, res) => {
                    apellido = ?, 
                    fecha_nacimiento = ?, 
                    telefono = ?, 
-                   parentesco_id = ?
+                   parentesco_id = ?,
+                   tipo_persona_id = ?
                  WHERE id = ?`,
                 [
                   persona.nombre,
@@ -1177,6 +1464,7 @@ router.put("/acompaniantes", verifyToken, async (req, res) => {
                   persona.fechaNacimiento || null,
                   persona.telefono || null,
                   persona.parentescoId,
+                  persona.tipoPersonaId,
                   usuario.id
                 ]
               );
@@ -1423,51 +1711,85 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
   toDate = toDate.toISOString().split("T")[0];
 
   let queryBuscar = "";
-  if (
-    cabecera.rol === "admin" || cabecera.rol === "departamental"
-  ) {
-    const page = req.query.page ? Number(req.query.page) : 1;
-    const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 10;
-    const start = (page - 1) * resultsPerPage;
+  const page = req.query.page ? Number(req.query.page) : 1;
+  const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 10;
+  const start = (page - 1) * resultsPerPage;
 
-    let orderBy = req.query.orderBy ? req.query.orderBy : "fecha_inicio";
-    const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
+  let orderBy = req.query.orderBy ? req.query.orderBy : "fecha_inicio";
+  const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
 
-    if (orderBy === "fecha_inicio") {
-      orderBy = "r.fecha_inicio";
-    } else if (orderBy === "fecha_fin") {
-      orderBy = "r.fecha_fin";
-    } else if (orderBy === "id") {
-      orderBy = "r.id";
-    } else if (orderBy === "estado") {
-      orderBy = "er.nombre";
-    } else if (orderBy === "servicio") {
-      orderBy = "s.nombre";
-    } else if (orderBy === "recurso") {
-      orderBy = "rec.nombre";
-    } else if (orderBy === "afiliado") {
-      orderBy = "u.documento";
-    }
+  if (orderBy === "fecha_inicio") {
+    orderBy = "r.fecha_inicio";
+  } else if (orderBy === "fecha_fin") {
+    orderBy = "r.fecha_fin";
+  } else if (orderBy === "id") {
+    orderBy = "r.id";
+  } else if (orderBy === "estado") {
+    orderBy = "er.nombre";
+  } else if (orderBy === "servicio") {
+    orderBy = "s.nombre";
+  } else if (orderBy === "recurso") {
+    orderBy = "rec.nombre";
+  } else if (orderBy === "afiliado") {
+    orderBy = "u.documento";
+  }
 
-    const queryOrderBy = `${orderBy} ${orderType}`;
+  const queryOrderBy = `${orderBy} ${orderType}`;
 
-    if (buscar) {
-      buscar = "%" + buscar + "%";
-      queryBuscar = `AND (r.id LIKE '${buscar}' OR er.nombre LIKE '${buscar}' OR s.nombre LIKE '${buscar}' OR rec.nombre LIKE '${buscar}' OR u.documento LIKE '${buscar}' OR DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') LIKE '${buscar}' OR DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') LIKE '${buscar}' OR r.observaciones LIKE '${buscar}')`;
-    }
+  if (buscar) {
+    buscar = "%" + buscar + "%";
+    queryBuscar = `AND (r.id LIKE '${buscar}' OR er.nombre LIKE '${buscar}' OR s.nombre LIKE '${buscar}' OR rec.nombre LIKE '${buscar}' OR u.documento LIKE '${buscar}' OR DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') LIKE '${buscar}' OR DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') LIKE '${buscar}' OR r.observaciones LIKE '${buscar}')`;
+  }
 
-    const queryParams = [];
-    let query = `
-      SELECT 
-        r.id,
-        COALESCE(er.nombre, 'Sin estado') AS estado,
-        s.nombre AS servicio,
-        rec.nombre AS recurso,
-        u.documento AS afiliado,
-        DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') AS fecha_inicio,
-        DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') AS fecha_fin,
-        COALESCE(r.observaciones, '') AS observaciones,
-        DATE_FORMAT(r.fecha_creacion, '%d/%m/%Y') AS fecha_creacion
+  const queryParams = [];
+  let query = `
+    SELECT 
+      r.id,
+      COALESCE(er.nombre, 'Sin estado') AS estado,
+      s.nombre AS servicio,
+      rec.nombre AS recurso,
+      u.documento AS afiliado,
+      DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') AS fecha_inicio,
+      DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') AS fecha_fin,
+      COALESCE(r.observaciones, '') AS observaciones,
+      DATE_FORMAT(r.fecha_creacion, '%d/%m/%Y') AS fecha_creacion
+    FROM reserva r
+    INNER JOIN estado_reserva er ON r.estado_reserva_id = er.id
+    INNER JOIN recurso rec ON r.recurso_id = rec.id
+    INNER JOIN servicio s ON rec.servicio_id = s.id
+    INNER JOIN usuario u ON r.usuario_id = u.id
+    WHERE 1=1 
+      ${queryBuscar}
+      ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
+      ${toDate ? "AND r.fecha_fin <= ?" : ""}
+  `;
+
+  if (fromDate) {
+    queryParams.push(fromDate);
+  }
+  if (toDate) {
+    queryParams.push(toDate);
+  }
+
+  // Si el rol es afiliado, filtrar por usuario_id
+  if (cabecera.rol === "afiliado") {
+    query += " AND r.usuario_id = ?";
+    queryParams.push(cabecera.id);
+  }
+
+  query += ` ORDER BY ${queryOrderBy} LIMIT ${start}, ${resultsPerPage}`;
+
+  try {
+    const [rows] = await mysqlConnection.promise().execute(query, queryParams);
+
+    // Construye los parámetros para el countQuery de forma independiente
+    const countParams = [];
+    if (fromDate) countParams.push(fromDate);
+    if (toDate) countParams.push(toDate);
+    if (cabecera.rol === "afiliado") countParams.push(cabecera.id);
+
+    let countQuery = `
+      SELECT COUNT(*) AS count
       FROM reserva r
       INNER JOIN estado_reserva er ON r.estado_reserva_id = er.id
       INNER JOIN recurso rec ON r.recurso_id = rec.id
@@ -1477,54 +1799,114 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
         ${queryBuscar}
         ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
         ${toDate ? "AND r.fecha_fin <= ?" : ""}
+        ${cabecera.rol === "afiliado" ? "AND r.usuario_id = ?" : ""}
     `;
 
-    if (fromDate) {
-      queryParams.push(fromDate);
-    }
+    const [countRows] = await mysqlConnection.promise().execute(countQuery, countParams);
 
-    if (toDate) {
-      queryParams.push(toDate);
-    }
+    const numOfResults = countRows[0].count;
+    const numOfPages = Math.ceil(numOfResults / resultsPerPage);
 
-    query += ` ORDER BY ${queryOrderBy} LIMIT ${start}, ${resultsPerPage}`;
+    res.json({
+      results: rows,
+      numOfPages,
+      totalItems: numOfResults,
+      page: page - 1,
+      orderBy: req.query.orderBy || "fecha_inicio",
+      orderType,
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error interno");
+  }
+});
 
-    try {
-      const [rows] = await mysqlConnection.promise().execute(query, queryParams);
+router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
+  const cabecera = JSON.parse(req.data.data);
 
-      const [countRows] = await mysqlConnection.promise().execute(
-        `
-        SELECT COUNT(*) AS count
-        FROM reserva r
-        INNER JOIN estado_reserva er ON r.estado_reserva_id = er.id
-        INNER JOIN recurso rec ON r.recurso_id = rec.id
-        INNER JOIN servicio s ON rec.servicio_id = s.id
-        INNER JOIN usuario u ON r.usuario_id = u.id
-        WHERE 1=1 
-          ${queryBuscar}
-          ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
-          ${toDate ? "AND r.fecha_fin <= ?" : ""}
-        `,
-        queryParams
-      );
+  if (cabecera.rol !== "afiliado") {
+    return res.status(401).json("No autorizado");
+  }
 
-      const numOfResults = countRows[0].count;
-      const numOfPages = Math.ceil(numOfResults / resultsPerPage);
+  let buscar = req.query.search;
+  const page = req.query.page ? Number(req.query.page) : 1;
+  const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 10;
+  const start = (page - 1) * resultsPerPage;
 
-      res.json({
-        results: rows,
-        numOfPages,
-        totalItems: numOfResults,
-        page: page - 1,
-        orderBy: req.query.orderBy || "fecha_inicio",
-        orderType,
-      });
-    } catch (error) {
-      console.log(error);
-      res.status(500).json("Error interno");
-    }
-  } else {
-    res.status(401).json("No autorizado");
+  let orderBy = req.query.orderBy ? req.query.orderBy : "fecha_creacion";
+  const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
+
+  // Map orderBy to correct SQL columns
+  if (orderBy === "nombre") {
+    orderBy = "u.nombre";
+  } else if (orderBy === "apellido") {
+    orderBy = "u.apellido";
+  } else if (orderBy === "documento") {
+    orderBy = "u.documento";
+  } else if (orderBy === "parentesco") {
+    orderBy = "p.nombre";
+  } else if (orderBy === "tipo_persona") {
+    orderBy = "tp.nombre";
+  } else if (orderBy === "fecha_creacion") {
+    orderBy = "u.fecha_creacion";
+  }
+
+  const queryOrderBy = `${orderBy} ${orderType}`;
+
+  let queryBuscar = "";
+  if (buscar) {
+    buscar = "%" + buscar + "%";
+    queryBuscar = `AND (u.nombre LIKE '${buscar}' OR u.apellido LIKE '${buscar}' OR u.documento LIKE '${buscar}' OR p.nombre LIKE '${buscar}' OR tp.nombre LIKE '${buscar}' OR DATE_FORMAT(u.fecha_creacion, '%d/%m/%Y') LIKE '${buscar}')`;
+  }
+
+  const queryParams = [cabecera.id];
+  let query = `
+    SELECT 
+      u.id,
+      u.nombre,
+      u.apellido,
+      u.documento,
+      u.tipo_persona_id,
+      p.nombre AS parentesco,
+      tp.nombre AS tipo_persona,
+      DATE_FORMAT(u.fecha_creacion, '%d/%m/%Y') AS fecha_creacion
+    FROM usuario u
+    LEFT JOIN parentesco p ON u.parentesco_id = p.id
+    LEFT JOIN tipo_persona tp ON u.tipo_persona_id = tp.id
+    WHERE u.usuario_familiar_id = ?
+      ${queryBuscar}
+    ORDER BY ${queryOrderBy}
+    LIMIT ${start}, ${resultsPerPage}
+  `;
+
+  try {
+    const [rows] = await mysqlConnection.promise().execute(query, queryParams);
+
+    // Count total items for pagination
+    let countQuery = `
+      SELECT COUNT(*) AS count
+      FROM usuario u
+      LEFT JOIN parentesco p ON u.parentesco_id = p.id
+      LEFT JOIN tipo_persona tp ON u.tipo_persona_id = tp.id
+      WHERE u.usuario_familiar_id = ?
+      ${queryBuscar}
+    `;
+    const [countRows] = await mysqlConnection.promise().execute(countQuery, queryParams);
+
+    const numOfResults = countRows[0].count;
+    const numOfPages = Math.ceil(numOfResults / resultsPerPage);
+
+    res.json({
+      results: rows,
+      numOfPages,
+      totalItems: numOfResults,
+      page: page - 1,
+      orderBy: req.query.orderBy || "fecha_creacion",
+      orderType,
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error interno");
   }
 });
 
