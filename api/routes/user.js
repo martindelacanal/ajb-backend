@@ -902,10 +902,34 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
       cabecera.rol === "departamental"
     ) {
       const usuario_id = req.query.usuario_id;
+      const adultos = parseInt(req.query.adultos) || null;
+      const ninos = parseInt(req.query.ninos) || null;
+      const bebes = parseInt(req.query.bebes) || null;
 
       if (!usuario_id) {
         return res.status(400).json("Falta el parámetro 'usuario_id'");
       }
+
+      // Construir filtros de edad basados en fecha de nacimiento
+      let ageFilters = [];
+      
+      // Si adultos > 0, incluir personas mayores de 5 años
+      if (adultos && adultos > 0) {
+        ageFilters.push("TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) > 5");
+      }
+      
+      // Si niños > 0, incluir personas entre 2 y 5 años
+      if (ninos && ninos > 0) {
+        ageFilters.push("(TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) >= 2 AND TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) <= 5)");
+      }
+      
+      // Si bebés > 0, incluir personas menores de 2 años
+      if (bebes && bebes > 0) {
+        ageFilters.push("TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) < 2");
+      }
+
+      // Si no se especifica ningún filtro de edad, no aplicar filtros
+      const ageFilterClause = ageFilters.length > 0 ? `AND (${ageFilters.join(' OR ')})` : '';
 
       // Obtener información del usuario principal
       const [usuarioPrincipal] = await mysqlConnection
@@ -933,9 +957,10 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
             u.fecha_nacimiento,
             u.contacto,
             u.parentesco_id,
-            NULL as tipo_persona_id
+            NULL as tipo_persona_id,
+            TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) as edad
           FROM usuario u
-          WHERE u.usuario_familiar_id = ?`,
+          WHERE u.usuario_familiar_id = ? ${ageFilterClause}`,
           [usuario_id]
         );
 
@@ -956,9 +981,10 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
               u.fecha_nacimiento,
               u.contacto,
               u.parentesco_id,
-              NULL as tipo_persona_id
+              NULL as tipo_persona_id,
+              TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) as edad
             FROM usuario u
-            WHERE u.id = ?`,
+            WHERE u.id = ? ${ageFilterClause}`,
             [usuarioPrincipal[0].usuario_familiar_id]
           );
 
@@ -1000,7 +1026,8 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
                  WHERE rf_main.usuario_id = ?
                )
              ORDER BY rf2.fecha_creacion DESC 
-             LIMIT 1) as tipo_persona_id
+             LIMIT 1) as tipo_persona_id,
+            TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) as edad
           FROM usuario u
           INNER JOIN reserva_familiar rf ON u.id = rf.usuario_id
           WHERE rf.reserva_id IN (
@@ -1008,7 +1035,7 @@ router.get("/acompaniantes", verifyToken, async (req, res) => {
             FROM reserva_familiar 
             WHERE usuario_id = ?
           )
-          AND u.id != ?`,
+          AND u.id != ? ${ageFilterClause}`,
           [usuario_id, usuario_id, usuario_id, usuario_id]
         );
 
