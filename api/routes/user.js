@@ -3012,29 +3012,54 @@ router.post("/temporada", verifyToken, async (req, res) => {
             for (const recurso of regimen.recursos) {
               // Procesar cada fecha del recurso
               for (const fecha of recurso.fechas) {
-                // Procesar cada tipo de persona de la fecha
-                for (const tipoPersona of fecha.tiposPersona) {
-                  // Procesar cada rango de edad del tipo de persona
-                  for (const rangoEdad of tipoPersona.rangosEdad) {
-                    // Insertar tarifa individual
-                    await connection.query(
-                      `INSERT INTO tarifa 
-                       (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id, 
-                        edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin) 
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                      [
-                        recurso.id,
-                        tipoPersona.tipoPersonaId,
-                        regimen.id,
-                        temporadaId,
-                        rangoEdad.edadMinima,
-                        rangoEdad.edadMaxima,
-                        rangoEdad.precio,
-                        fecha.fecha_inicio,
-                        fecha.fecha_fin
-                      ]
-                    );
+                
+                // Verificar si el precio es por persona o por recurso
+                if (recurso.precio_por_persona) {
+                  // Procesar cada tipo de persona de la fecha
+                  for (const tipoPersona of fecha.tiposPersona) {
+                    // Procesar cada rango de edad del tipo de persona
+                    for (const rangoEdad of tipoPersona.rangosEdad) {
+                      // Insertar tarifa individual con tipos de persona
+                      await connection.query(
+                        `INSERT INTO tarifa 
+                         (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id, 
+                          edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona) 
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                        [
+                          recurso.id,
+                          tipoPersona.tipoPersonaId,
+                          regimen.id,
+                          temporadaId,
+                          rangoEdad.edadMinima,
+                          rangoEdad.edadMaxima,
+                          rangoEdad.precio,
+                          fecha.fecha_inicio,
+                          fecha.fecha_fin,
+                          'Y' // precio_por_persona como 'Y'
+                        ]
+                      );
+                    }
                   }
+                } else {
+                  // Precio por recurso: insertar tarifa sin tipos de persona
+                  await connection.query(
+                    `INSERT INTO tarifa 
+                     (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id, 
+                      edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                      recurso.id,
+                      null, // tipo_persona_id como null
+                      regimen.id,
+                      temporadaId,
+                      null, // edad_minima como null
+                      null, // edad_maxima como null
+                      fecha.precio, // usar el precio del recurso desde FechaTemporada
+                      fecha.fecha_inicio,
+                      fecha.fecha_fin,
+                      'N' // precio_por_persona como 'N'
+                    ]
+                  );
                 }
               }
             }
