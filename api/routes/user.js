@@ -119,6 +119,68 @@ router.get("/new/token", verifyToken, async (req, res) => {
   }
 });
 
+router.get("/credencial-digital", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const userId = cabecera.id;
+
+      // Generar hash aleatorio de 50 caracteres
+      const hashCredencial = crypto.randomBytes(25).toString('hex'); // 25 bytes = 50 caracteres hex
+      const fechaActual = new Date();
+
+      // Actualizar el usuario con el nuevo hash y fecha
+      await mysqlConnection
+        .promise()
+        .query(
+          `UPDATE usuario SET 
+            hash_credencial = ?, 
+            fecha_hash_credencial = ?
+          WHERE id = ?`,
+          [hashCredencial, fechaActual, userId]
+        );
+
+      // Obtener los datos del usuario actualizados
+      const [rows] = await mysqlConnection
+        .promise()
+        .query(
+          `SELECT 
+            id,
+            nombre,
+            apellido,
+            fecha_nacimiento,
+            hash_credencial as hash,
+            documento as dni
+          FROM usuario 
+          WHERE id = ?`,
+          [userId]
+        );
+
+      if (rows.length > 0) {
+        const usuario = rows[0];
+        
+        // Formatear la fecha de nacimiento a string (YYYY-MM-DD)
+        if (usuario.fecha_nacimiento) {
+          usuario.fecha_nacimiento = usuario.fecha_nacimiento.toISOString().split('T')[0];
+        }
+
+        res.status(200).json(usuario);
+      } else {
+        res.status(404).json("Usuario no encontrado");
+      }
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener la credencial digital");
+  }
+});
+
 router.get("/lugares", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
