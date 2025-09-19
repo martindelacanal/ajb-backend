@@ -333,8 +333,8 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
-      const { fecha_inicio, fecha_fin, servicio_id, personas } = req.body;
-      
+      const { fecha_inicio, fecha_fin, servicio_id, personas, recurso_id, filtros } = req.body;
+
       if (!fecha_inicio || !fecha_fin || !servicio_id || !personas || personas.length === 0) {
         return res.status(400).json("Faltan campos requeridos");
       }
@@ -378,7 +378,80 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         return res.status(404).json("No se encontraron recursos con tarifas válidas para las personas especificadas");
       }
 
-      // Ahora obtenemos solo los recursos que tienen tarifas válidas
+      // Si se especifica recurso_id, filtramos solo ese recurso (si está en los válidos)
+      if (recurso_id) {
+        if (recursosValidos.has(recurso_id)) {
+          // Mantener solo el recurso especificado
+          recursosValidos.clear();
+          recursosValidos.add(recurso_id);
+        } else {
+          return res.status(404).json("El recurso especificado no tiene tarifas válidas para las personas especificadas");
+        }
+      }
+
+      // Aplicar filtros si se proporcionan
+      if (filtros && typeof filtros === 'object' && Object.keys(filtros).length > 0) {
+        const recursosQueCumplenFiltros = new Set();
+
+        for (const recursoId of recursosValidos) {
+          let cumpleTodosFiltros = true;
+
+          for (const [filtroId, valorFiltro] of Object.entries(filtros)) {
+            // Saltar filtros que son null, undefined o string vacío
+            if (valorFiltro === null || valorFiltro === undefined || valorFiltro === '') {
+              continue;
+            }
+
+            // Obtener información del filtro para este recurso
+            const [filtroRecurso] = await mysqlConnection
+              .promise()
+              .query(`
+                      SELECT cantidad, habilitado
+                      FROM filtro_recurso
+                      WHERE recurso_id = ? AND filtro_id = ?
+                    `, [recursoId, parseInt(filtroId)]);
+
+            if (filtroRecurso.length === 0) {
+              // Si el recurso no tiene este filtro, no cumple con los criterios
+              cumpleTodosFiltros = false;
+              break;
+            }
+
+            const filtroData = filtroRecurso[0];
+
+            // Verificar según el tipo de valor del filtro
+            if (typeof valorFiltro === 'boolean') {
+              // Filtro booleano: verificar campo habilitado
+              const habilitadoBoolean = filtroData.habilitado === 'Y';
+              if (habilitadoBoolean !== valorFiltro) {
+                cumpleTodosFiltros = false;
+                break;
+              }
+            } else if (typeof valorFiltro === 'number') {
+              // Filtro numérico: verificar campo cantidad
+              if (filtroData.cantidad !== valorFiltro) {
+                cumpleTodosFiltros = false;
+                break;
+              }
+            }
+          }
+
+          if (cumpleTodosFiltros) {
+            recursosQueCumplenFiltros.add(recursoId);
+          }
+        }
+
+        // Solo actualizar recursosValidos si se encontraron recursos que cumplen filtros
+        if (recursosQueCumplenFiltros.size > 0) {
+          recursosValidos.clear();
+          recursosQueCumplenFiltros.forEach(id => recursosValidos.add(id));
+        } else {
+          // Si no hay recursos que cumplan filtros, retornar error específico
+          return res.status(404).json("No se encontraron recursos que cumplan con los filtros especificados");
+        }
+      } else {
+      }
+      // Ahora obtenemos solo los recursos que pasaron todas las validaciones
       const recursosIds = Array.from(recursosValidos);
       const placeholders = recursosIds.map(() => '?').join(',');
 
@@ -396,7 +469,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         `, recursosIds);
 
       // Obtener filtros solo para los recursos válidos
-      const [filtros] = await mysqlConnection
+      const [filtrosData] = await mysqlConnection
         .promise()
         .query(`
           SELECT fr.recurso_id, f.id as filtro_id, f.nombre, f.icono, fr.cantidad, fr.habilitado
@@ -419,7 +492,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
 
       // Mapear filtros por recurso_id
       const filtrosPorRecurso = {};
-      filtros.forEach(filtro => {
+      filtrosData.forEach(filtro => {
         if (!filtrosPorRecurso[filtro.recurso_id]) {
           filtrosPorRecurso[filtro.recurso_id] = [];
         }
@@ -463,6 +536,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
               fecha_inicio
             ]);
 
+
           if (tarifasPersona.length === 0) {
             todasPersonasTienenTarifa = false;
             break;
@@ -483,9 +557,11 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
             const fechaInicioTarifa = new Date(tarifa.fecha_inicio);
             const fechaFinTarifa = new Date(tarifa.fecha_fin);
 
+
             // Calcular la intersección entre el rango solicitado y el rango de la tarifa
             const inicioInterseccion = new Date(Math.max(fechaInicioSolicitud.getTime(), fechaInicioTarifa.getTime()));
             const finInterseccion = new Date(Math.min(fechaFinSolicitud.getTime(), fechaFinTarifa.getTime()));
+
 
             if (inicioInterseccion < finInterseccion) {
               // Calcular los días de intersección correctamente
@@ -505,6 +581,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
             }
           }
 
+
           // Verificar que todos los días estén cubiertos por alguna tarifa
           const todosDiasCubiertos = diasCubiertos.every(dia => dia === true);
           if (!todosDiasCubiertos) {
@@ -514,6 +591,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
 
           tarifaTotal += tarifaPersona;
         }
+
 
         // Solo incluir recursos que tengan tarifa para todas las personas y todos los días
         if (todasPersonasTienenTarifa) {
@@ -527,7 +605,6 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
             filtros: filtrosPorRecurso[recurso.id] || []
           });
         }
-
       }
 
       res.status(200).json(recursosConTarifas);
@@ -537,6 +614,129 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener los recursos con tarifas");
+  }
+});
+
+router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      
+      const { fecha_inicio, fecha_fin, servicio_id, personas, recurso_id, filtros } = req.body;
+
+      if (!fecha_inicio || !fecha_fin || !servicio_id || !personas || personas.length === 0) {
+        return res.status(400).json("Faltan campos requeridos");
+      }
+
+      // Primero obtenemos solo los recursos que tienen tarifas válidas para el servicio y las personas
+      const recursosValidos = new Set();
+      for (const persona of personas) {
+        const [tarifasPersona] = await mysqlConnection
+          .promise()
+          .query(`
+            SELECT DISTINCT recurso_id
+            FROM tarifa 
+            INNER JOIN recurso r ON tarifa.recurso_id = r.id
+            WHERE r.servicio_id = ?
+              AND tarifa.tipo_persona_id = ? 
+              AND tarifa.regimen_id = ?
+              AND (tarifa.edad_minima IS NULL OR tarifa.edad_minima <= ?)
+              AND (tarifa.edad_maxima IS NULL OR tarifa.edad_maxima >= ?)
+              AND tarifa.fecha_inicio <= ?
+              AND tarifa.fecha_fin >= ?
+          `, [
+            servicio_id,
+            persona.tipo_persona_id,
+            persona.regimen_id,
+            persona.edad,
+            persona.edad,
+            fecha_fin,
+            fecha_inicio
+          ]);
+
+        tarifasPersona.forEach(tarifa => {
+          recursosValidos.add(tarifa.recurso_id);
+        });
+      }
+      if (recursosValidos.size === 0) {
+        return res.status(200).json([]); // No hay recursos válidos, retornamos array vacío
+      }
+
+      // Si se especifica recurso_id, filtramos solo ese recurso (si está en los válidos)
+      let recursosAConsiderar = Array.from(recursosValidos);
+      if (recurso_id) {
+        if (recursosValidos.has(recurso_id)) {
+          recursosAConsiderar = [recurso_id];
+        } else {
+          return res.status(200).json([]); // El recurso especificado no es válido
+        }
+      }
+
+      const placeholders = recursosAConsiderar.map(() => '?').join(',');
+
+      // Obtener todos los filtros asociados a los recursos válidos con sus cantidades
+      const [filtrosRecursos] = await mysqlConnection
+        .promise()
+        .query(`
+          SELECT 
+            f.id,
+            f.nombre,
+            f.icono,
+            fr.cantidad,
+            fr.habilitado
+          FROM filtro_recurso fr
+          INNER JOIN filtro f ON fr.filtro_id = f.id
+          WHERE fr.recurso_id IN (${placeholders})
+            AND fr.habilitado = 'Y'
+        `, recursosAConsiderar);
+
+      // Agrupar por filtro y calcular min/max
+      const filtrosAgrupados = {};
+
+      filtrosRecursos.forEach(filtroRecurso => {
+        const filtroId = filtroRecurso.id;
+
+        if (!filtrosAgrupados[filtroId]) {
+          filtrosAgrupados[filtroId] = {
+            id: filtroId,
+            nombre: filtroRecurso.nombre,
+            icono: filtroRecurso.icono,
+            cantidades: []
+          };
+        }
+
+        filtrosAgrupados[filtroId].cantidades.push(filtroRecurso.cantidad);
+      });
+
+      // Calcular valorMinimo y valorMaximo para cada filtro
+      const filtrosConValores = Object.values(filtrosAgrupados).map(filtro => {
+        const cantidades = filtro.cantidades;
+        const valorMinimo = Math.min(...cantidades);
+        const valorMaximo = Math.max(...cantidades);
+
+        return {
+          id: filtro.id,
+          nombre: filtro.nombre,
+          icono: filtro.icono,
+          valorMinimo: valorMinimo,
+          valorMaximo: valorMaximo,
+          habilitado: true
+        };
+      });
+
+      // Ordenar por nombre para consistencia
+      filtrosConValores.sort((a, b) => a.nombre.localeCompare(b.nombre));
+      res.status(200).json(filtrosConValores);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los filtros para recursos");
   }
 });
 
@@ -914,8 +1114,8 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
       } = req.body;
 
       // Validar campos requeridos
-      if (!reservaId || !nombre || !fecha_inicio || !fecha_fin || !servicio_id || 
-          !recurso_id || !regimen_id || !personas || personas.length === 0) {
+      if (!reservaId || !nombre || !fecha_inicio || !fecha_fin || !servicio_id ||
+        !recurso_id || !regimen_id || !personas || personas.length === 0) {
         return res.status(400).json({
           success: false,
           message: "Faltan campos requeridos"
@@ -1055,7 +1255,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
 
             if (usuarioExistente.length > 0) {
               usuarioId = persona.id;
-              
+
               // Actualizar datos del usuario existente
               await connection.query(
                 `UPDATE usuario SET 
@@ -1366,7 +1566,7 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
             es_titular: es_titular
           };
         });
-        
+
         // Generar número de reserva
         const numeroReserva = `RES-${reserva.id.toString().padStart(6, '0')}`;
 
@@ -1395,7 +1595,7 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
           personas: personasFormateadas,
           viaja_titular: viaja_titular
         };
-        
+
         res.status(200).json(respuesta);
 
       } catch (queryError) {
@@ -1605,7 +1805,7 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      cabecera.rol === "admin" || 
+      cabecera.rol === "admin" ||
       cabecera.rol === "departamental" ||
       cabecera.rol === "afiliado"
     ) {
