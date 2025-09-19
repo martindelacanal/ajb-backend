@@ -181,8 +181,9 @@ router.get("/credencial-digital", verifyToken, async (req, res) => {
   }
 });
 
-router.get("/verificacion/:hash", async (req, res) => {
+router.get("/credencial-digital/verificacion/:hash", async (req, res) => {
   try {
+    console.log("Verificando hash:", req.params.hash);
     const hash = req.params.hash;
 
     // Validar que el hash tenga exactamente 50 caracteres
@@ -447,6 +448,27 @@ router.get("/recursos", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener los recursos");
+  }
+});
+
+router.get("/adicionales", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const [rows] = await mysqlConnection
+        .promise()
+        .query("SELECT id, nombre FROM adicional ORDER BY nombre ASC");
+      res.status(200).json(rows);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los adicionales");
   }
 });
 
