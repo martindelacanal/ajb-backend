@@ -333,7 +333,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
-      const { fecha_inicio, fecha_fin, servicio_id, personas, recurso_id, filtros } = req.body;
+      const { fecha_inicio, fecha_fin, servicio_id, personas, recurso_id, filtros, precio_minimo, precio_maximo } = req.body;
 
       if (!fecha_inicio || !fecha_fin || !servicio_id || !personas || personas.length === 0) {
         return res.status(400).json("Faltan campos requeridos");
@@ -449,8 +449,8 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           // Si no hay recursos que cumplan filtros, retornar error específico
           return res.status(404).json("No se encontraron recursos que cumplan con los filtros especificados");
         }
-      } else {
       }
+
       // Ahora obtenemos solo los recursos que pasaron todas las validaciones
       const recursosIds = Array.from(recursosValidos);
       const placeholders = recursosIds.map(() => '?').join(',');
@@ -505,7 +505,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         });
       });
 
-      // Calcular tarifas para cada recurso
+      // Calcular tarifas para cada recurso y aplicar filtro de precio
       for (const recurso of recursos) {
         let tarifaTotal = 0;
         let todasPersonasTienenTarifa = true;
@@ -536,7 +536,6 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
               fecha_inicio
             ]);
 
-
           if (tarifasPersona.length === 0) {
             todasPersonasTienenTarifa = false;
             break;
@@ -557,11 +556,9 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
             const fechaInicioTarifa = new Date(tarifa.fecha_inicio);
             const fechaFinTarifa = new Date(tarifa.fecha_fin);
 
-
             // Calcular la intersección entre el rango solicitado y el rango de la tarifa
             const inicioInterseccion = new Date(Math.max(fechaInicioSolicitud.getTime(), fechaInicioTarifa.getTime()));
             const finInterseccion = new Date(Math.min(fechaFinSolicitud.getTime(), fechaFinTarifa.getTime()));
-
 
             if (inicioInterseccion < finInterseccion) {
               // Calcular los días de intersección correctamente
@@ -581,7 +578,6 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
             }
           }
 
-
           // Verificar que todos los días estén cubiertos por alguna tarifa
           const todosDiasCubiertos = diasCubiertos.every(dia => dia === true);
           if (!todosDiasCubiertos) {
@@ -592,18 +588,30 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           tarifaTotal += tarifaPersona;
         }
 
-
         // Solo incluir recursos que tengan tarifa para todas las personas y todos los días
         if (todasPersonasTienenTarifa) {
-          recursosConTarifas.push({
-            id: recurso.id,
-            servicio_id: recurso.servicio_id,
-            grupo_recurso_id: recurso.grupo_recurso_id,
-            nombre: recurso.nombre,
-            tarifa: tarifaTotal,
-            imagenes: imagenesPorRecurso[recurso.id] || [],
-            filtros: filtrosPorRecurso[recurso.id] || []
-          });
+          // Aplicar filtro de precio si se especifica
+          let cumpleFiltroPrecios = true;
+          
+          if (precio_minimo !== undefined && precio_minimo !== null && tarifaTotal < precio_minimo) {
+            cumpleFiltroPrecios = false;
+          }
+          
+          if (precio_maximo !== undefined && precio_maximo !== null && tarifaTotal > precio_maximo) {
+            cumpleFiltroPrecios = false;
+          }
+
+          if (cumpleFiltroPrecios) {
+            recursosConTarifas.push({
+              id: recurso.id,
+              servicio_id: recurso.servicio_id,
+              grupo_recurso_id: recurso.grupo_recurso_id,
+              nombre: recurso.nombre,
+              tarifa: tarifaTotal,
+              imagenes: imagenesPorRecurso[recurso.id] || [],
+              filtros: filtrosPorRecurso[recurso.id] || []
+            });
+          }
         }
       }
 
@@ -694,6 +702,110 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
             AND fr.habilitado = 'Y'
         `, recursosAConsiderar);
 
+      // Calcular el rango de precios de todos los recursos válidos
+      const [recursos] = await mysqlConnection
+        .promise()
+        .query(`SELECT id, servicio_id, grupo_recurso_id, nombre FROM recurso WHERE id IN (${placeholders})`, recursosAConsiderar);
+
+      let precioMinimo = null;
+      let precioMaximo = null;
+      const precios = [];
+
+      // Calcular tarifas para cada recurso para obtener el rango de precios
+      for (const recurso of recursos) {
+        let tarifaTotal = 0;
+        let todasPersonasTienenTarifa = true;
+
+        // Calcular tarifa por cada persona
+        for (const persona of personas) {
+          // Buscar todas las tarifas que apliquen para esta persona en este recurso
+          const [tarifasPersona] = await mysqlConnection
+            .promise()
+            .query(`
+              SELECT precio, fecha_inicio, fecha_fin
+              FROM tarifa 
+              WHERE recurso_id = ? 
+                AND tipo_persona_id = ? 
+                AND regimen_id = ?
+                AND (edad_minima IS NULL OR edad_minima <= ?)
+                AND (edad_maxima IS NULL OR edad_maxima >= ?)
+                AND fecha_inicio <= ?
+                AND fecha_fin >= ?
+              ORDER BY fecha_inicio ASC
+            `, [
+              recurso.id,
+              persona.tipo_persona_id,
+              persona.regimen_id,
+              persona.edad,
+              persona.edad,
+              fecha_fin,
+              fecha_inicio
+            ]);
+
+          if (tarifasPersona.length === 0) {
+            todasPersonasTienenTarifa = false;
+            break;
+          }
+
+          // Calcular el precio total para esta persona sumando los rangos de fechas
+          let tarifaPersona = 0;
+          const fechaInicioSolicitud = new Date(fecha_inicio);
+          const fechaFinSolicitud = new Date(fecha_fin);
+
+          // Calcular días correctamente: NO incluir el día de salida
+          const diasTotales = Math.ceil((fechaFinSolicitud - fechaInicioSolicitud) / (1000 * 60 * 60 * 24));
+
+          // Crear un array para marcar qué días están cubiertos por tarifas
+          const diasCubiertos = new Array(diasTotales).fill(false);
+
+          for (const tarifa of tarifasPersona) {
+            const fechaInicioTarifa = new Date(tarifa.fecha_inicio);
+            const fechaFinTarifa = new Date(tarifa.fecha_fin);
+
+            // Calcular la intersección entre el rango solicitado y el rango de la tarifa
+            const inicioInterseccion = new Date(Math.max(fechaInicioSolicitud.getTime(), fechaInicioTarifa.getTime()));
+            const finInterseccion = new Date(Math.min(fechaFinSolicitud.getTime(), fechaFinTarifa.getTime()));
+
+            if (inicioInterseccion < finInterseccion) {
+              // Calcular los días de intersección correctamente
+              const diasInterseccion = Math.ceil((finInterseccion - inicioInterseccion) / (1000 * 60 * 60 * 24));
+
+              // Calcular el día inicial relativo al inicio de la solicitud
+              const diaInicioRelativo = Math.floor((inicioInterseccion - fechaInicioSolicitud) / (1000 * 60 * 60 * 24));
+
+              // Marcar los días como cubiertos y sumar el precio
+              for (let i = 0; i < diasInterseccion; i++) {
+                const diaIndex = diaInicioRelativo + i;
+                if (diaIndex >= 0 && diaIndex < diasTotales && !diasCubiertos[diaIndex]) {
+                  diasCubiertos[diaIndex] = true;
+                  tarifaPersona += tarifa.precio;
+                }
+              }
+            }
+          }
+
+          // Verificar que todos los días estén cubiertos por alguna tarifa
+          const todosDiasCubiertos = diasCubiertos.every(dia => dia === true);
+          if (!todosDiasCubiertos) {
+            todasPersonasTienenTarifa = false;
+            break;
+          }
+
+          tarifaTotal += tarifaPersona;
+        }
+
+        // Solo incluir recursos que tengan tarifa para todas las personas y todos los días
+        if (todasPersonasTienenTarifa) {
+          precios.push(tarifaTotal);
+        }
+      }
+
+      // Calcular rango de precios
+      if (precios.length > 0) {
+        precioMinimo = Math.min(...precios);
+        precioMaximo = Math.max(...precios);
+      }
+
       // Agrupar por filtro y calcular min/max
       const filtrosAgrupados = {};
 
@@ -728,9 +840,26 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
         };
       });
 
-      // Ordenar por nombre para consistencia
+      // Agregar filtro de precio sintético al principio si hay precios válidos
+      const filtrosFinales = [];
+      if (precioMinimo !== null && precioMaximo !== null) {
+        filtrosFinales.push({
+          id: -1,
+          nombre: 'Precio',
+          icono: 'attach_money',
+          valorMinimo: precioMinimo,
+          valorMaximo: precioMaximo,
+          habilitado: true,
+          esPrecio: true,
+          precioMinimo: precioMinimo,
+          precioMaximo: precioMaximo
+        });
+      }
+
+      // Agregar el resto de filtros ordenados por nombre
       filtrosConValores.sort((a, b) => a.nombre.localeCompare(b.nombre));
-      res.status(200).json(filtrosConValores);
+      filtrosFinales.push(...filtrosConValores);
+      res.status(200).json(filtrosFinales);
     } else {
       res.status(401).json("No autorizado");
     }
