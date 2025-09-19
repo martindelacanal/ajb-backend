@@ -333,7 +333,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
-      const { fecha_inicio, fecha_fin, servicio_id, personas, recurso_id, filtros, precio_minimo, precio_maximo } = req.body;
+      const { fecha_inicio, fecha_fin, servicio_id, personas, recurso_id, filtros, precio_minimo, precio_maximo, orden_id } = req.body;
 
       if (!fecha_inicio || !fecha_fin || !servicio_id || !personas || personas.length === 0) {
         return res.status(400).json("Faltan campos requeridos");
@@ -602,6 +602,20 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           }
 
           if (cumpleFiltroPrecios) {
+            // Calcular datos adicionales para ordenamiento
+            let totalCamas = 0;
+            let ambientes = 0;
+
+            // Buscar camas (filtro_id 3 y 4) y ambientes (filtro_id 2)
+            const filtrosRecurso = filtrosPorRecurso[recurso.id] || [];
+            filtrosRecurso.forEach(filtro => {
+              if (filtro.id === 3 || filtro.id === 4) { // Cama individual (3) y matrimonial (4)
+                totalCamas += filtro.cantidad || 0;
+              } else if (filtro.id === 2) { // Ambientes
+                ambientes = filtro.cantidad || 0;
+              }
+            });
+
             recursosConTarifas.push({
               id: recurso.id,
               servicio_id: recurso.servicio_id,
@@ -609,13 +623,48 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
               nombre: recurso.nombre,
               tarifa: tarifaTotal,
               imagenes: imagenesPorRecurso[recurso.id] || [],
-              filtros: filtrosPorRecurso[recurso.id] || []
+              filtros: filtrosPorRecurso[recurso.id] || [],
+              totalCamas: totalCamas,
+              ambientes: ambientes
             });
           }
         }
       }
 
-      res.status(200).json(recursosConTarifas);
+      // Aplicar ordenamiento según orden_id
+      if (orden_id) {
+        switch (orden_id) {
+          case 1: // Precio (más bajo primero)
+            recursosConTarifas.sort((a, b) => a.tarifa - b.tarifa);
+            break;
+          case 2: // Precio (más alto primero)
+            recursosConTarifas.sort((a, b) => b.tarifa - a.tarifa);
+            break;
+          case 3: // Más camas primero
+            recursosConTarifas.sort((a, b) => b.totalCamas - a.totalCamas);
+            break;
+          case 4: // Menos camas primero
+            recursosConTarifas.sort((a, b) => a.totalCamas - b.totalCamas);
+            break;
+          case 5: // Más ambientes primero
+            recursosConTarifas.sort((a, b) => b.ambientes - a.ambientes);
+            break;
+          case 6: // Menos ambientes primero
+            recursosConTarifas.sort((a, b) => a.ambientes - b.ambientes);
+            break;
+          default:
+            // No aplicar ordenamiento adicional
+            break;
+        }
+      }
+
+      // Limpiar campos auxiliares antes de enviar la respuesta
+      const recursosLimpios = recursosConTarifas.map(recurso => {
+        const { totalCamas, ambientes, ...recursoLimpio } = recurso;
+        return recursoLimpio;
+      });
+
+      res.status(200).json(recursosLimpios);
     } else {
       res.status(401).json("No autorizado");
     }
