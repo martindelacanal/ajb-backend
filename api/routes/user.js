@@ -181,6 +181,69 @@ router.get("/credencial-digital", verifyToken, async (req, res) => {
   }
 });
 
+router.get("/verificacion/:hash", async (req, res) => {
+  try {
+    const hash = req.params.hash;
+
+    // Validar que el hash tenga exactamente 50 caracteres
+    if (!hash || hash.length !== 50) {
+      return res.status(400).json({
+        estado: "Inexistente",
+        descripcion: "Hash inválido"
+      });
+    }
+
+    // Buscar el usuario por hash_credencial
+    const [rows] = await mysqlConnection
+      .promise()
+      .query(
+        `SELECT 
+          id,
+          hash_credencial,
+          fecha_hash_credencial
+        FROM usuario 
+        WHERE hash_credencial = ?`,
+        [hash]
+      );
+
+    // Si no se encuentra el hash
+    if (rows.length === 0) {
+      return res.status(404).json({
+        estado: "Inexistente",
+        descripcion: "Credencial no encontrada"
+      });
+    }
+
+    const usuario = rows[0];
+    const fechaHash = new Date(usuario.fecha_hash_credencial);
+    const fechaActual = new Date();
+    
+    // Calcular la diferencia en milisegundos y convertir a días
+    const diferenciaDias = (fechaActual - fechaHash) / (1000 * 60 * 60 * 24);
+
+    // Si la diferencia es mayor a 1 día, está expirada
+    if (diferenciaDias > 1) {
+      return res.status(200).json({
+        estado: "Expirada",
+        descripcion: "La credencial ha expirado"
+      });
+    }
+
+    // Si está dentro del día, está vigente
+    return res.status(200).json({
+      estado: "Vigente",
+      descripcion: "Credencial válida y vigente"
+    });
+
+  } catch (error) {
+    console.log(error);
+    res.status(500).json({
+      estado: "Inexistente",
+      descripcion: "Error interno del servidor"
+    });
+  }
+});
+
 router.get("/lugares", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
