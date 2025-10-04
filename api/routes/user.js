@@ -3462,6 +3462,203 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
   }
 });
 
+router.post("/tabla/usuarios", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "departamental"
+    ) {
+      let buscar = req.query.search;
+      const filters = req.body;
+      
+      // Paginación
+      const page = req.query.page ? Number(req.query.page) : 1;
+      const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 10;
+      const start = (page - 1) * resultsPerPage;
+
+      // Ordenamiento
+      let orderBy = req.query.orderBy ? req.query.orderBy : "fecha_creacion";
+      const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
+
+      // Mapeo de columnas para ordenamiento
+      if (orderBy === "fecha_nacimiento") {
+        orderBy = "u.fecha_nacimiento";
+      } else if (orderBy === "fecha_creacion") {
+        orderBy = "u.fecha_creacion";
+      } else if (orderBy === "nombre") {
+        orderBy = "u.nombre";
+      } else if (orderBy === "apellido") {
+        orderBy = "u.apellido";
+      } else if (orderBy === "documento") {
+        orderBy = "u.documento";
+      } else if (orderBy === "legajo") {
+        orderBy = "u.legajo";
+      } else if (orderBy === "rol") {
+        orderBy = "r.nombre";
+      } else if (orderBy === "habilitado") {
+        orderBy = "u.habilitado";
+      }
+
+      const queryOrderBy = `${orderBy} ${orderType}`;
+
+      // Filtro de búsqueda general
+      let queryBuscar = "";
+      if (buscar) {
+        buscar = "%" + buscar + "%";
+        queryBuscar = `AND (u.id LIKE '${buscar}' OR u.nombre LIKE '${buscar}' OR u.apellido LIKE '${buscar}' OR u.documento LIKE '${buscar}' OR u.legajo LIKE '${buscar}' OR r.nombre LIKE '${buscar}' OR DATE_FORMAT(u.fecha_nacimiento, '%d/%m/%Y') LIKE '${buscar}' OR DATE_FORMAT(u.fecha_creacion, '%d/%m/%Y') LIKE '${buscar}')`;
+      }
+
+      // Construcción de filtros específicos
+      let whereConditions = [];
+      let queryParams = [];
+
+      // Filtro por roles
+      if (filters.roles && Array.isArray(filters.roles) && filters.roles.length > 0) {
+        const placeholders = filters.roles.map(() => '?').join(',');
+        whereConditions.push(`u.rol_id IN (${placeholders})`);
+        queryParams.push(...filters.roles);
+      }
+
+      // Filtro por edad (calculada desde fecha_nacimiento)
+      if (filters.edad_minima) {
+        whereConditions.push(`TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) >= ?`);
+        queryParams.push(filters.edad_minima);
+      }
+
+      if (filters.edad_maxima) {
+        whereConditions.push(`TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) <= ?`);
+        queryParams.push(filters.edad_maxima);
+      }
+
+      // Filtro por rango de fecha de nacimiento
+      if (filters.fecha_nacimiento_minima) {
+        whereConditions.push(`u.fecha_nacimiento >= ?`);
+        queryParams.push(filters.fecha_nacimiento_minima);
+      }
+
+      if (filters.fecha_nacimiento_maxima) {
+        whereConditions.push(`u.fecha_nacimiento <= ?`);
+        queryParams.push(filters.fecha_nacimiento_maxima);
+      }
+
+      // Filtro por habilitado
+      if (filters.habilitado && (filters.habilitado === 'Y' || filters.habilitado === 'N')) {
+        whereConditions.push(`u.habilitado = ?`);
+        queryParams.push(filters.habilitado);
+      }
+
+      // Filtro por rango de fecha de creación
+      if (filters.fecha_creacion_minima) {
+        whereConditions.push(`DATE(u.fecha_creacion) >= ?`);
+        queryParams.push(filters.fecha_creacion_minima);
+      }
+
+      if (filters.fecha_creacion_maxima) {
+        whereConditions.push(`DATE(u.fecha_creacion) <= ?`);
+        queryParams.push(filters.fecha_creacion_maxima);
+      }
+
+      // Construcción de la cláusula WHERE
+      let whereClause = "";
+      if (whereConditions.length > 0) {
+        whereClause = "AND " + whereConditions.join(" AND ");
+      }
+
+      // Query principal
+      let query = `
+        SELECT 
+          u.id,
+          CASE 
+            WHEN r.nombre = 'admin' THEN 'Admin'
+            WHEN r.nombre = 'afiliado' THEN 'Afiliado'
+            WHEN r.nombre = 'departamental' THEN 'Departamental'
+            WHEN r.nombre = 'noafiliado' THEN 'No afiliado'
+            ELSE r.nombre
+          END AS rol,
+          u.nombre,
+          u.apellido,
+          DATE_FORMAT(u.fecha_nacimiento, '%d/%m/%Y') AS fecha_nacimiento,
+          u.documento,
+          COALESCE(u.legajo, '') AS legajo,
+          u.habilitado,
+          DATE_FORMAT(u.fecha_creacion, '%d/%m/%Y') AS fecha_creacion
+        FROM usuario u
+        LEFT JOIN rol r ON u.rol_id = r.id
+        WHERE 1=1 
+          ${queryBuscar}
+          ${whereClause}
+        ORDER BY ${queryOrderBy}
+        LIMIT ${start}, ${resultsPerPage}
+      `;
+
+      const [rows] = await mysqlConnection.promise().execute(query, queryParams);
+
+      // Query para contar el total de registros
+      let countQuery = `
+        SELECT COUNT(*) AS count
+        FROM usuario u
+        LEFT JOIN rol r ON u.rol_id = r.id
+        WHERE 1=1 
+          ${queryBuscar}
+          ${whereClause}
+      `;
+
+      const [countRows] = await mysqlConnection.promise().execute(countQuery, queryParams);
+
+      const numOfResults = countRows[0].count;
+      const numOfPages = Math.ceil(numOfResults / resultsPerPage);
+
+      res.json({
+        results: rows,
+        numOfPages,
+        totalItems: numOfResults,
+        page: page - 1,
+        orderBy: req.query.orderBy || "fecha_creacion",
+        orderType,
+      });
+
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error interno");
+  }
+});
+
+router.get("/rol", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    // Permitir solo a usuarios autenticados
+    if (cabecera) {
+      const [rows] = await mysqlConnection
+        .promise()
+        .query("SELECT id, nombre FROM rol ORDER BY id ASC");
+
+      // Mapear los nombres de rol según lo solicitado
+      const rolesMap = {
+        admin: "Admin",
+        afiliado: "Afiliado",
+        departamental: "Departamental",
+        noafiliado: "No afiliado"
+      };
+
+      const roles = rows.map(r => ({
+        id: r.id,
+        nombre: rolesMap[r.nombre] || r.nombre
+      }));
+
+      res.status(200).json(roles);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los roles");
+  }
+});
+
 router.get("/usuario", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
