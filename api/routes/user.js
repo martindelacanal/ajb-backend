@@ -54,7 +54,7 @@ router.post("/signin", async (req, res) => {
     SELECT usuario.id, usuario.nombre, usuario.apellido, usuario.documento, usuario.email, usuario.password, usuario.departamental_id, rol.nombre AS rol, usuario.habilitado
     FROM usuario
     INNER JOIN rol ON rol.id = usuario.rol_id
-    WHERE usuario.documento = ? AND usuario.password IS NOT NULL
+    WHERE usuario.documento = ? AND usuario.password IS NOT NULL AND usuario.rol_id <> 4
   `;
   const queryParams = [documento];
 
@@ -1262,6 +1262,9 @@ router.post("/reserva", verifyToken, async (req, res) => {
           if (existeUsuario.length > 0) {
             usuarioId = existeUsuario[0].id;
           } else {
+            // Determinar el rol_id basado en tipo_persona_id
+            const rolId = persona.tipo_persona_id === 1 ? 2 : 4;
+            
             // Crear nuevo usuario con usuario_familiar_id establecido
             const [nuevoUsuario] = await connection.query(
               `INSERT INTO usuario (
@@ -1269,7 +1272,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
                 documento, telefono, password, usuario_familiar_id
               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
               [
-                2, // Rol de "afiliado"
+                rolId, // Rol basado en tipo_persona_id
                 persona.parentesco_id,
                 persona.tipo_persona_id,
                 persona.nombre,
@@ -1288,6 +1291,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
           });
         }
 
+        // ...existing code...
         // Insertar reserva principal
         const [reservaResult] = await connection.query(
           `INSERT INTO reserva (
@@ -1608,6 +1612,9 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
               if (existeUsuarioPorDni.length > 0) {
                 usuarioId = existeUsuarioPorDni[0].id;
               } else {
+                // Determinar el rol_id basado en tipo_persona_id
+                const rolId = persona.tipo_persona_id === 1 ? 2 : 4;
+                
                 // Crear nuevo usuario
                 const [nuevoUsuario] = await connection.query(
                   `INSERT INTO usuario (
@@ -1615,7 +1622,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                     documento, telefono, email, password, usuario_familiar_id
                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
                   [
-                    2, // Rol de "afiliado"
+                    rolId, // Rol basado en tipo_persona_id
                     persona.parentesco_id,
                     persona.tipo_persona_id,
                     persona.nombre,
@@ -1640,6 +1647,9 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
             if (existeUsuario.length > 0) {
               usuarioId = existeUsuario[0].id;
             } else {
+              // Determinar el rol_id basado en tipo_persona_id
+              const rolId = persona.tipo_persona_id === 1 ? 2 : 4;
+              
               // Crear nuevo usuario
               const [nuevoUsuario] = await connection.query(
                 `INSERT INTO usuario (
@@ -1647,7 +1657,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                   documento, telefono, email, password, usuario_familiar_id
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
                 [
-                  2, // Rol de "afiliado"
+                  rolId, // Rol basado en tipo_persona_id
                   persona.parentesco_id,
                   persona.tipo_persona_id,
                   persona.nombre,
@@ -1669,6 +1679,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           });
         }
 
+        // ...existing code...
         // Insertar nuevos registros de reserva_familiar
         const reservasFamiliaresIds = [];
         for (const persona of usuariosIds) {
