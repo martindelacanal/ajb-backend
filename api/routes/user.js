@@ -1166,6 +1166,59 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
   }
 });
 
+// Función auxiliar para registrar cambios en el historial
+async function registrarHistorial(connection, usuarioId, tipoOperacion, tablaAfectada, usuarioModificadorId, req, campos = null, observaciones = null) {
+  try {
+    const ipAddress = req.ip || req.connection.remoteAddress || req.socket.remoteAddress || 
+                     (req.connection.socket ? req.connection.socket.remoteAddress : null);
+    const userAgent = req.get('User-Agent') || null;
+
+    if (campos && Array.isArray(campos)) {
+      // Registrar cambio por cada campo modificado
+      for (const campo of campos) {
+        await connection.query(
+          `INSERT INTO historial_usuario 
+           (usuario_id, tipo_operacion, campo_modificado, valor_anterior, valor_nuevo, 
+            tabla_afectada, usuario_modificador_id, ip_address, user_agent, observaciones)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            usuarioId,
+            tipoOperacion,
+            campo.campo,
+            campo.valorAnterior,
+            campo.valorNuevo,
+            tablaAfectada,
+            usuarioModificadorId,
+            ipAddress,
+            userAgent,
+            observaciones
+          ]
+        );
+      }
+    } else {
+      // Registrar operación general (CREATE, DELETE)
+      await connection.query(
+        `INSERT INTO historial_usuario 
+         (usuario_id, tipo_operacion, tabla_afectada, usuario_modificador_id, 
+          ip_address, user_agent, observaciones)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          usuarioId,
+          tipoOperacion,
+          tablaAfectada,
+          usuarioModificadorId,
+          ipAddress,
+          userAgent,
+          observaciones
+        ]
+      );
+    }
+  } catch (error) {
+    console.error('Error al registrar historial:', error);
+    // No lanzar error para no interrumpir la operación principal
+  }
+}
+
 router.post("/reserva", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -1206,16 +1259,10 @@ router.post("/reserva", verifyToken, async (req, res) => {
         // Procesar firma si existe
         let firmaArchivo = null;
         if (firma) {
-          // Generar nombre único para el archivo
           const firmaFileName = `firma_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.png`;
-
-          // Remover el prefijo data:image si existe
           const base64Data = firma.replace(/^data:image\/[a-z]+;base64,/, '');
-
-          // Guardar archivo en carpeta imagenes
           const firmaPath = path.join(__dirname, '../../imagenes', firmaFileName);
           fs.writeFileSync(firmaPath, base64Data, 'base64');
-
           firmaArchivo = firmaFileName;
         }
 
@@ -1231,7 +1278,6 @@ router.post("/reserva", verifyToken, async (req, res) => {
           let currentUserId = usuarioCreador[0].id;
           let currentUserFamiliarId = usuarioCreador[0].usuario_familiar_id;
 
-          // Buscar el usuario principal de la familia (el que tiene usuario_familiar_id NULL)
           while (currentUserFamiliarId !== null) {
             const [nextUser] = await connection.query(
               "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
@@ -1252,7 +1298,6 @@ router.post("/reserva", verifyToken, async (req, res) => {
         // Crear o buscar usuarios para cada persona
         const usuariosIds = [];
         for (const persona of personas) {
-          // Verificar si el usuario ya existe por documento
           const [existeUsuario] = await connection.query(
             "SELECT id FROM usuario WHERE documento = ?",
             [persona.dni]
@@ -1272,7 +1317,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
                 documento, telefono, password, usuario_familiar_id
               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
               [
-                rolId, // Rol basado en tipo_persona_id
+                rolId,
                 persona.parentesco_id,
                 persona.tipo_persona_id,
                 persona.nombre,
@@ -1284,6 +1329,18 @@ router.post("/reserva", verifyToken, async (req, res) => {
               ]
             );
             usuarioId = nuevoUsuario.insertId;
+
+            // Registrar creación del usuario en el historial
+            await registrarHistorial(
+              connection,
+              usuarioId,
+              'CREATE',
+              'usuario',
+              cabecera.id,
+              req,
+              null,
+              `Usuario creado durante reserva. Datos: ${persona.nombre} ${persona.apellido}, DNI: ${persona.dni}`
+            );
           }
           usuariosIds.push({
             ...persona,
@@ -1291,7 +1348,6 @@ router.post("/reserva", verifyToken, async (req, res) => {
           });
         }
 
-        // ...existing code...
         // Insertar reserva principal
         const [reservaResult] = await connection.query(
           `INSERT INTO reserva (
@@ -1301,7 +1357,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
           [
             regimen_id,
             recurso_id,
-            cabecera.id, // Usuario que hace la reserva
+            cabecera.id,
             firmaArchivo,
             total_tarifa,
             fecha_inicio,
@@ -1347,7 +1403,6 @@ router.post("/reserva", verifyToken, async (req, res) => {
             fechaActual.setDate(fechaInicioDate.getDate() + dia);
             const fechaString = fechaActual.toISOString().split('T')[0];
 
-            // Buscar tarifa correspondiente para esta persona en esta fecha
             const [tarifas] = await connection.query(
               `SELECT id
                FROM tarifa 
@@ -1389,8 +1444,6 @@ router.post("/reserva", verifyToken, async (req, res) => {
         // Confirmar transacción
         await connection.commit();
 
-        // Generar número de reserva
-        // const numeroReserva = `RES-${reservaId.toString().padStart(6, '0')}`;
         const numeroReserva = `${reservaId}`;
 
         res.status(201).json({
@@ -1402,7 +1455,6 @@ router.post("/reserva", verifyToken, async (req, res) => {
         });
 
       } catch (transactionError) {
-        // Rollback en caso de error
         if (connection) {
           await connection.rollback();
         }
@@ -1481,16 +1533,10 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         // Procesar firma si existe
         let firmaArchivo = null;
         if (firma_base64) {
-          // Generar nombre único para el archivo
           const firmaFileName = `firma_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.png`;
-
-          // Remover el prefijo data:image si existe
           const base64Data = firma_base64.replace(/^data:image\/[a-z]+;base64,/, '');
-
-          // Guardar archivo en carpeta imagenes
           const firmaPath = path.join(__dirname, '../../imagenes', firmaFileName);
           fs.writeFileSync(firmaPath, base64Data, 'base64');
-
           firmaArchivo = firmaFileName;
         }
 
@@ -1506,7 +1552,6 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           let currentUserId = usuarioCreador[0].id;
           let currentUserFamiliarId = usuarioCreador[0].usuario_familiar_id;
 
-          // Buscar el usuario principal de la familia (el que tiene usuario_familiar_id NULL)
           while (currentUserFamiliarId !== null) {
             const [nextUser] = await connection.query(
               "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
@@ -1578,12 +1623,72 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           // Si la persona tiene ID, verificar si existe
           if (persona.id) {
             const [usuarioExistente] = await connection.query(
-              "SELECT id FROM usuario WHERE id = ?",
+              "SELECT * FROM usuario WHERE id = ?",
               [persona.id]
             );
 
             if (usuarioExistente.length > 0) {
               usuarioId = persona.id;
+              const usuarioAnterior = usuarioExistente[0];
+
+              // Preparar campos para comparar cambios
+              const cambios = [];
+              
+              if (usuarioAnterior.nombre !== persona.nombre) {
+                cambios.push({
+                  campo: 'nombre',
+                  valorAnterior: usuarioAnterior.nombre,
+                  valorNuevo: persona.nombre
+                });
+              }
+              
+              if (usuarioAnterior.apellido !== persona.apellido) {
+                cambios.push({
+                  campo: 'apellido',
+                  valorAnterior: usuarioAnterior.apellido,
+                  valorNuevo: persona.apellido
+                });
+              }
+              
+              if (usuarioAnterior.fecha_nacimiento !== persona.fecha_nacimiento) {
+                cambios.push({
+                  campo: 'fecha_nacimiento',
+                  valorAnterior: usuarioAnterior.fecha_nacimiento,
+                  valorNuevo: persona.fecha_nacimiento
+                });
+              }
+              
+              if (usuarioAnterior.telefono !== (persona.telefono || null)) {
+                cambios.push({
+                  campo: 'telefono',
+                  valorAnterior: usuarioAnterior.telefono,
+                  valorNuevo: persona.telefono || null
+                });
+              }
+              
+              if (usuarioAnterior.email !== (persona.email || null)) {
+                cambios.push({
+                  campo: 'email',
+                  valorAnterior: usuarioAnterior.email,
+                  valorNuevo: persona.email || null
+                });
+              }
+              
+              if (usuarioAnterior.parentesco_id !== persona.parentesco_id) {
+                cambios.push({
+                  campo: 'parentesco_id',
+                  valorAnterior: usuarioAnterior.parentesco_id,
+                  valorNuevo: persona.parentesco_id
+                });
+              }
+              
+              if (usuarioAnterior.tipo_persona_id !== persona.tipo_persona_id) {
+                cambios.push({
+                  campo: 'tipo_persona_id',
+                  valorAnterior: usuarioAnterior.tipo_persona_id,
+                  valorNuevo: persona.tipo_persona_id
+                });
+              }
 
               // Actualizar datos del usuario existente
               await connection.query(
@@ -1602,6 +1707,20 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                   persona.id
                 ]
               );
+
+              // Registrar cambios en el historial si hubo modificaciones
+              if (cambios.length > 0) {
+                await registrarHistorial(
+                  connection,
+                  usuarioId,
+                  'UPDATE',
+                  'usuario',
+                  cabecera.id,
+                  req,
+                  cambios,
+                  `Usuario modificado durante edición de reserva ${reservaId}`
+                );
+              }
             } else {
               // El ID no existe, buscar por documento
               const [existeUsuarioPorDni] = await connection.query(
@@ -1622,7 +1741,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                     documento, telefono, email, password, usuario_familiar_id
                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
                   [
-                    rolId, // Rol basado en tipo_persona_id
+                    rolId,
                     persona.parentesco_id,
                     persona.tipo_persona_id,
                     persona.nombre,
@@ -1635,6 +1754,18 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                   ]
                 );
                 usuarioId = nuevoUsuario.insertId;
+
+                // Registrar creación del usuario en el historial
+                await registrarHistorial(
+                  connection,
+                  usuarioId,
+                  'CREATE',
+                  'usuario',
+                  cabecera.id,
+                  req,
+                  null,
+                  `Usuario creado durante edición de reserva ${reservaId}. Datos: ${persona.nombre} ${persona.apellido}, DNI: ${persona.dni}`
+                );
               }
             }
           } else {
@@ -1657,7 +1788,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                   documento, telefono, email, password, usuario_familiar_id
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
                 [
-                  rolId, // Rol basado en tipo_persona_id
+                  rolId,
                   persona.parentesco_id,
                   persona.tipo_persona_id,
                   persona.nombre,
@@ -1670,6 +1801,18 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                 ]
               );
               usuarioId = nuevoUsuario.insertId;
+
+              // Registrar creación del usuario en el historial
+              await registrarHistorial(
+                connection,
+                usuarioId,
+                'CREATE',
+                'usuario',
+                cabecera.id,
+                req,
+                null,
+                `Usuario creado durante edición de reserva ${reservaId}. Datos: ${persona.nombre} ${persona.apellido}, DNI: ${persona.dni}`
+              );
             }
           }
 
@@ -1679,7 +1822,6 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           });
         }
 
-        // ...existing code...
         // Insertar nuevos registros de reserva_familiar
         const reservasFamiliaresIds = [];
         for (const persona of usuariosIds) {
@@ -1715,7 +1857,6 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
             fechaActual.setDate(fechaInicioDate.getDate() + dia);
             const fechaString = fechaActual.toISOString().split('T')[0];
 
-            // Buscar tarifa correspondiente para esta persona en esta fecha
             const [tarifas] = await connection.query(
               `SELECT id
                FROM tarifa 
@@ -1757,7 +1898,6 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         // Confirmar transacción
         await connection.commit();
 
-        // Generar número de reserva
         const numeroReserva = `RES-${reservaId.toString().padStart(6, '0')}`;
 
         res.status(200).json({
@@ -1768,7 +1908,6 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         });
 
       } catch (transactionError) {
-        // Rollback en caso de error
         if (connection) {
           await connection.rollback();
         }
@@ -2450,18 +2589,15 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
       cabecera.rol === "departamental"
     ) {
       const { usuarioId, personas } = req.body;
-      const specific_id = req.params.id; // ID específico opcional
+      const specific_id = req.params.id;
 
       // Si viene un ID específico, actualizar directamente ese usuario
       if (specific_id) {
-        // Determinar si el cuerpo es un objeto directo o tiene el array personas
         let persona;
 
         if (req.body.nombre && req.body.apellido) {
-          // El cuerpo es el objeto Acompaniante directamente
           persona = req.body;
         } else if (personas && Array.isArray(personas) && personas.length > 0) {
-          // El cuerpo tiene el array personas
           persona = personas[0];
         } else {
           return res.status(400).json({
@@ -2477,7 +2613,6 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
           });
         }
 
-        // Función para convertir fecha ISO a formato YYYY-MM-DD
         const formatearFecha = (fecha) => {
           if (!fecha) return null;
           try {
@@ -2494,6 +2629,73 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
           connection = await mysqlConnection.promise().getConnection();
           await connection.beginTransaction();
 
+          // Obtener datos anteriores del usuario para el historial
+          const [usuarioAnterior] = await connection.query(
+            "SELECT * FROM usuario WHERE id = ?",
+            [parseInt(specific_id)]
+          );
+
+          if (usuarioAnterior.length === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "Usuario no encontrado"
+            });
+          }
+
+          const datosAnteriores = usuarioAnterior[0];
+
+          // Preparar campos para comparar cambios
+          const cambios = [];
+          
+          if (datosAnteriores.nombre !== persona.nombre) {
+            cambios.push({
+              campo: 'nombre',
+              valorAnterior: datosAnteriores.nombre,
+              valorNuevo: persona.nombre
+            });
+          }
+          
+          if (datosAnteriores.apellido !== persona.apellido) {
+            cambios.push({
+              campo: 'apellido',
+              valorAnterior: datosAnteriores.apellido,
+              valorNuevo: persona.apellido
+            });
+          }
+          
+          const fechaFormateada = formatearFecha(persona.fecha_nacimiento);
+          if (datosAnteriores.fecha_nacimiento !== fechaFormateada) {
+            cambios.push({
+              campo: 'fecha_nacimiento',
+              valorAnterior: datosAnteriores.fecha_nacimiento,
+              valorNuevo: fechaFormateada
+            });
+          }
+          
+          if (datosAnteriores.telefono !== (persona.telefono || null)) {
+            cambios.push({
+              campo: 'telefono',
+              valorAnterior: datosAnteriores.telefono,
+              valorNuevo: persona.telefono || null
+            });
+          }
+          
+          if (datosAnteriores.parentesco_id !== (persona.parentesco_id || null)) {
+            cambios.push({
+              campo: 'parentesco_id',
+              valorAnterior: datosAnteriores.parentesco_id,
+              valorNuevo: persona.parentesco_id || null
+            });
+          }
+          
+          if (datosAnteriores.tipo_persona_id !== (persona.tipo_persona_id || null)) {
+            cambios.push({
+              campo: 'tipo_persona_id',
+              valorAnterior: datosAnteriores.tipo_persona_id,
+              valorNuevo: persona.tipo_persona_id || null
+            });
+          }
+
           // Preparar los campos para actualizar
           let updateFields = [
             "nombre = ?",
@@ -2507,7 +2709,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
           let updateValues = [
             persona.nombre,
             persona.apellido,
-            formatearFecha(persona.fecha_nacimiento),
+            fechaFormateada,
             persona.telefono || null,
             persona.parentesco_id || null,
             persona.tipo_persona_id || null
@@ -2518,16 +2720,32 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
             let passwordHash = await bcryptjs.hash(persona.password, 8);
             updateFields.push("password = ?");
             updateValues.push(passwordHash);
+            
+            cambios.push({
+              campo: 'password',
+              valorAnterior: '[OCULTO]',
+              valorNuevo: '[MODIFICADO]'
+            });
           }
 
-          // Agregar el ID al final para el WHERE
           updateValues.push(parseInt(specific_id));
-
-          // Construir la query dinámicamente
           const updateQuery = `UPDATE usuario SET ${updateFields.join(', ')} WHERE id = ?`;
 
-          // Actualizar directamente el usuario por ID
           const [result] = await connection.query(updateQuery, updateValues);
+
+          // Registrar cambios en el historial si hubo modificaciones
+          if (cambios.length > 0) {
+            await registrarHistorial(
+              connection,
+              parseInt(specific_id),
+              'UPDATE',
+              'usuario',
+              cabecera.id,
+              req,
+              cambios,
+              'Usuario actualizado directamente por ID'
+            );
+          }
 
           await connection.commit();
 
@@ -2556,7 +2774,6 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
         });
       }
 
-      // Verificar que el usuario que ejecuta el endpoint tiene permisos para modificar al usuarioId
       if (cabecera.id !== usuarioId && cabecera.rol !== "admin") {
         return res.status(403).json({
           success: false,
@@ -2580,9 +2797,9 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
               continue;
             }
 
-            // Buscar usuario por documento
+            // Buscar usuario por documento y obtener todos sus datos para el historial
             const [usuarioExistente] = await connection.query(
-              `SELECT id, nombre, apellido, documento, fecha_nacimiento, telefono, parentesco_id, usuario_familiar_id, tipo_persona_id FROM usuario WHERE documento = ?`,
+              `SELECT * FROM usuario WHERE documento = ?`,
               [persona.dni]
             );
 
@@ -2592,19 +2809,14 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
 
             const usuario = usuarioExistente[0];
 
-            // Verificar permisos: solo dos condiciones permitidas
+            // Verificar permisos
             let tienePermisos = false;
-
-            // Condición 1: El usuario a modificar tiene como usuario_familiar_id el id del ejecutor
             if (usuario.usuario_familiar_id === cabecera.id) {
               tienePermisos = true;
-            }
-            // Condición 2: El id del usuario a modificar es el mismo que el id del usuario que ejecuta
-            else if (usuario.id === cabecera.id) {
+            } else if (usuario.id === cabecera.id) {
               tienePermisos = true;
             }
 
-            // Caso especial: Si el usuario ejecutor es admin, puede modificar cualquier usuario
             if (cabecera.rol === "admin") {
               tienePermisos = true;
             }
@@ -2626,16 +2838,59 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
               return String(telefono || '').trim();
             };
 
-            // Verificar si hay cambios
-            const hayCambios =
-              usuario.nombre !== persona.nombre ||
-              usuario.apellido !== persona.apellido ||
-              normalizarFecha(usuario.fecha_nacimiento) !== normalizarFecha(persona.fechaNacimiento) ||
-              normalizarTelefono(usuario.telefono) !== normalizarTelefono(persona.telefono) ||
-              usuario.parentesco_id !== persona.parentescoId ||
-              usuario.tipo_persona_id !== persona.tipoPersonaId;
+            // Preparar campos para comparar cambios
+            const cambios = [];
+            
+            if (usuario.nombre !== persona.nombre) {
+              cambios.push({
+                campo: 'nombre',
+                valorAnterior: usuario.nombre,
+                valorNuevo: persona.nombre
+              });
+            }
+            
+            if (usuario.apellido !== persona.apellido) {
+              cambios.push({
+                campo: 'apellido',
+                valorAnterior: usuario.apellido,
+                valorNuevo: persona.apellido
+              });
+            }
+            
+            if (normalizarFecha(usuario.fecha_nacimiento) !== normalizarFecha(persona.fechaNacimiento)) {
+              cambios.push({
+                campo: 'fecha_nacimiento',
+                valorAnterior: normalizarFecha(usuario.fecha_nacimiento),
+                valorNuevo: normalizarFecha(persona.fechaNacimiento)
+              });
+            }
+            
+            if (normalizarTelefono(usuario.telefono) !== normalizarTelefono(persona.telefono)) {
+              cambios.push({
+                campo: 'telefono',
+                valorAnterior: usuario.telefono,
+                valorNuevo: persona.telefono || null
+              });
+            }
+            
+            if (usuario.parentesco_id !== persona.parentescoId) {
+              cambios.push({
+                campo: 'parentesco_id',
+                valorAnterior: usuario.parentesco_id,
+                valorNuevo: persona.parentescoId
+              });
+            }
+            
+            if (usuario.tipo_persona_id !== persona.tipoPersonaId) {
+              cambios.push({
+                campo: 'tipo_persona_id',
+                valorAnterior: usuario.tipo_persona_id,
+                valorNuevo: persona.tipoPersonaId
+              });
+            }
 
-            if (hayCambios) {
+            // Verificar si hay cambios
+            if (cambios.length > 0) {
               // Actualizar el usuario
               await connection.query(
                 `UPDATE usuario SET 
@@ -2655,6 +2910,18 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
                   persona.tipoPersonaId,
                   usuario.id
                 ]
+              );
+
+              // Registrar cambios en el historial
+              await registrarHistorial(
+                connection,
+                usuario.id,
+                'UPDATE',
+                'usuario',
+                cabecera.id,
+                req,
+                cambios,
+                'Usuario actualizado mediante gestión de acompañantes'
               );
 
               usuariosModificados++;
@@ -3095,6 +3362,103 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error interno");
+  }
+});
+
+router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "departamental"
+    ) {
+      const userId = req.params.id;
+      const page = req.query.page ? Number(req.query.page) : 1;
+      const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 20;
+      const start = (page - 1) * resultsPerPage;
+      
+      const tipoOperacion = req.query.tipo_operacion;
+      const fechaDesde = req.query.fecha_desde;
+      const fechaHasta = req.query.fecha_hasta;
+
+      let whereClause = "";
+      let params = [];
+
+      if (userId) {
+        whereClause += " WHERE h.usuario_id = ?";
+        params.push(userId);
+      }
+
+      if (tipoOperacion) {
+        whereClause += whereClause ? " AND" : " WHERE";
+        whereClause += " h.tipo_operacion = ?";
+        params.push(tipoOperacion);
+      }
+
+      if (fechaDesde) {
+        whereClause += whereClause ? " AND" : " WHERE";
+        whereClause += " h.fecha_modificacion >= ?";
+        params.push(fechaDesde);
+      }
+
+      if (fechaHasta) {
+        whereClause += whereClause ? " AND" : " WHERE";
+        whereClause += " h.fecha_modificacion <= ?";
+        params.push(fechaHasta + ' 23:59:59');
+      }
+
+      const query = `
+        SELECT 
+          h.id,
+          h.usuario_id,
+          CONCAT(u.nombre, ' ', u.apellido) as usuario_nombre,
+          u.documento as usuario_documento,
+          h.tipo_operacion,
+          h.campo_modificado,
+          h.valor_anterior,
+          h.valor_nuevo,
+          h.tabla_afectada,
+          h.usuario_modificador_id,
+          CONCAT(um.nombre, ' ', um.apellido) as modificador_nombre,
+          h.ip_address,
+          h.fecha_modificacion,
+          h.observaciones
+        FROM historial_usuario h
+        INNER JOIN usuario u ON h.usuario_id = u.id
+        LEFT JOIN usuario um ON h.usuario_modificador_id = um.id
+        ${whereClause}
+        ORDER BY h.fecha_modificacion DESC
+        LIMIT ${start}, ${resultsPerPage}
+      `;
+
+      const [rows] = await mysqlConnection.promise().execute(query, params);
+
+      // Consulta para el total de registros
+      const countQuery = `
+        SELECT COUNT(*) as total
+        FROM historial_usuario h
+        INNER JOIN usuario u ON h.usuario_id = u.id
+        ${whereClause}
+      `;
+
+      const [countRows] = await mysqlConnection.promise().execute(countQuery, params);
+      const total = countRows[0].total;
+      const numOfPages = Math.ceil(total / resultsPerPage);
+
+      res.status(200).json({
+        results: rows,
+        numOfPages,
+        totalItems: total,
+        page: page - 1,
+        pageSize: resultsPerPage
+      });
+
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener el historial de usuarios");
   }
 });
 
