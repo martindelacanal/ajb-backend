@@ -51,10 +51,10 @@ router.post("/signin", async (req, res) => {
   }
 
   const query = `
-    SELECT usuario.id, usuario.nombre, usuario.apellido, usuario.documento, usuario.email, usuario.password, usuario.departamental_id, rol.nombre AS rol, usuario.habilitado
-    FROM usuario
-    INNER JOIN rol ON rol.id = usuario.rol_id
-    WHERE usuario.documento = ? AND usuario.password IS NOT NULL AND usuario.rol_id <> 4
+    SELECT u.id, u.nombre, u.apellido, u.documento, u.email, u.password, u.departamental_id, rol.nombre AS rol, u.habilitado
+    FROM usuario as u
+    INNER JOIN rol ON rol.id = u.rol_id
+    WHERE u.documento = ? AND u.password IS NOT NULL AND u.rol_id <> 4
   `;
   const queryParams = [documento];
 
@@ -162,7 +162,7 @@ router.get("/credencial-digital", verifyToken, async (req, res) => {
 
       if (rows.length > 0) {
         const usuario = rows[0];
-        
+
         // Formatear la fecha de nacimiento a string (YYYY-MM-DD)
         if (usuario.fecha_nacimiento) {
           usuario.fecha_nacimiento = usuario.fecha_nacimiento.toISOString().split('T')[0];
@@ -218,7 +218,7 @@ router.get("/credencial-digital/verificacion/:hash", async (req, res) => {
     const usuario = rows[0];
     const fechaHash = new Date(usuario.fecha_hash_credencial);
     const fechaActual = new Date();
-    
+
     // Calcular la diferencia en milisegundos y convertir a días
     const diferenciaDias = (fechaActual - fechaHash) / (1000 * 60 * 60 * 24);
 
@@ -739,11 +739,11 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         if (todasPersonasTienenTarifa) {
           // Aplicar filtro de precio si se especifica
           let cumpleFiltroPrecios = true;
-          
+
           if (precio_minimo !== undefined && precio_minimo !== null && tarifaTotal < precio_minimo) {
             cumpleFiltroPrecios = false;
           }
-          
+
           if (precio_maximo !== undefined && precio_maximo !== null && tarifaTotal > precio_maximo) {
             cumpleFiltroPrecios = false;
           }
@@ -829,7 +829,7 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
-      
+
       const { fecha_inicio, fecha_fin, servicio_id, personas, recurso_id, filtros } = req.body;
 
       if (!fecha_inicio || !fecha_fin || !servicio_id || !personas || personas.length === 0) {
@@ -1169,8 +1169,8 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
 // Función auxiliar para registrar cambios en el historial
 async function registrarHistorial(connection, usuarioId, tipoOperacion, tablaAfectada, usuarioModificadorId, req, campos = null, observaciones = null) {
   try {
-    const ipAddress = req.ip || req.connection.remoteAddress || req.socket.remoteAddress || 
-                     (req.connection.socket ? req.connection.socket.remoteAddress : null);
+    const ipAddress = req.ip || req.connection.remoteAddress || req.socket.remoteAddress ||
+      (req.connection.socket ? req.connection.socket.remoteAddress : null);
     const userAgent = req.get('User-Agent') || null;
 
     if (campos && Array.isArray(campos)) {
@@ -1268,31 +1268,36 @@ router.post("/reserva", verifyToken, async (req, res) => {
 
         // Obtener el usuario familiar principal del usuario que crea la reserva
         const [usuarioCreador] = await connection.query(
-          "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
+          "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
           [cabecera.id]
         );
 
         let usuarioFamiliarPrincipalId = cabecera.id;
+        let departamentalId = usuarioCreador[0]?.departamental_id || null;
 
         if (usuarioCreador.length > 0) {
           let currentUserId = usuarioCreador[0].id;
           let currentUserFamiliarId = usuarioCreador[0].usuario_familiar_id;
+          let currentDepartamentalId = usuarioCreador[0].departamental_id;
 
           while (currentUserFamiliarId !== null) {
             const [nextUser] = await connection.query(
-              "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
+              "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
               [currentUserFamiliarId]
             );
 
             if (nextUser.length > 0) {
               currentUserId = nextUser[0].id;
               currentUserFamiliarId = nextUser[0].usuario_familiar_id;
+              currentDepartamentalId = nextUser[0].departamental_id;
             } else {
               break;
             }
           }
 
           usuarioFamiliarPrincipalId = currentUserId;
+          // Usar el departamental_id del usuario principal de la familia
+          departamentalId = currentDepartamentalId;
         }
 
         // Crear o buscar usuarios para cada persona
@@ -1309,13 +1314,13 @@ router.post("/reserva", verifyToken, async (req, res) => {
           } else {
             // Determinar el rol_id basado en tipo_persona_id
             const rolId = persona.tipo_persona_id === 1 ? 2 : 4;
-            
-            // Crear nuevo usuario con usuario_familiar_id establecido
+
+            // Crear nuevo usuario con usuario_familiar_id y departamental_id establecidos
             const [nuevoUsuario] = await connection.query(
               `INSERT INTO usuario (
-                rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento, 
-                documento, telefono, password, usuario_familiar_id
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+              rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento, 
+              documento, telefono, password, usuario_familiar_id, departamental_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
               [
                 rolId,
                 persona.parentesco_id,
@@ -1325,7 +1330,8 @@ router.post("/reserva", verifyToken, async (req, res) => {
                 persona.fecha_nacimiento,
                 persona.dni,
                 persona.telefono || null,
-                usuarioFamiliarPrincipalId
+                usuarioFamiliarPrincipalId,
+                departamentalId
               ]
             );
             usuarioId = nuevoUsuario.insertId;
@@ -1542,31 +1548,36 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
 
         // Obtener el usuario familiar principal del usuario que edita la reserva
         const [usuarioCreador] = await connection.query(
-          "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
+          "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
           [cabecera.id]
         );
 
         let usuarioFamiliarPrincipalId = cabecera.id;
+        let departamentalId = usuarioCreador[0]?.departamental_id || null;
 
         if (usuarioCreador.length > 0) {
           let currentUserId = usuarioCreador[0].id;
           let currentUserFamiliarId = usuarioCreador[0].usuario_familiar_id;
+          let currentDepartamentalId = usuarioCreador[0].departamental_id;
 
           while (currentUserFamiliarId !== null) {
             const [nextUser] = await connection.query(
-              "SELECT id, usuario_familiar_id FROM usuario WHERE id = ?",
+              "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
               [currentUserFamiliarId]
             );
 
             if (nextUser.length > 0) {
               currentUserId = nextUser[0].id;
               currentUserFamiliarId = nextUser[0].usuario_familiar_id;
+              currentDepartamentalId = nextUser[0].departamental_id;
             } else {
               break;
             }
           }
 
           usuarioFamiliarPrincipalId = currentUserId;
+          // Usar el departamental_id del usuario principal de la familia
+          departamentalId = currentDepartamentalId;
         }
 
         // Calcular tarifa total
@@ -1633,7 +1644,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
 
               // Preparar campos para comparar cambios
               const cambios = [];
-              
+
               if (usuarioAnterior.nombre !== persona.nombre) {
                 cambios.push({
                   campo: 'nombre',
@@ -1641,7 +1652,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                   valorNuevo: persona.nombre
                 });
               }
-              
+
               if (usuarioAnterior.apellido !== persona.apellido) {
                 cambios.push({
                   campo: 'apellido',
@@ -1649,7 +1660,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                   valorNuevo: persona.apellido
                 });
               }
-              
+
               if (usuarioAnterior.fecha_nacimiento !== persona.fecha_nacimiento) {
                 cambios.push({
                   campo: 'fecha_nacimiento',
@@ -1657,7 +1668,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                   valorNuevo: persona.fecha_nacimiento
                 });
               }
-              
+
               if (usuarioAnterior.telefono !== (persona.telefono || null)) {
                 cambios.push({
                   campo: 'telefono',
@@ -1665,7 +1676,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                   valorNuevo: persona.telefono || null
                 });
               }
-              
+
               if (usuarioAnterior.email !== (persona.email || null)) {
                 cambios.push({
                   campo: 'email',
@@ -1673,7 +1684,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                   valorNuevo: persona.email || null
                 });
               }
-              
+
               if (usuarioAnterior.parentesco_id !== persona.parentesco_id) {
                 cambios.push({
                   campo: 'parentesco_id',
@@ -1681,7 +1692,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                   valorNuevo: persona.parentesco_id
                 });
               }
-              
+
               if (usuarioAnterior.tipo_persona_id !== persona.tipo_persona_id) {
                 cambios.push({
                   campo: 'tipo_persona_id',
@@ -1733,13 +1744,13 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
               } else {
                 // Determinar el rol_id basado en tipo_persona_id
                 const rolId = persona.tipo_persona_id === 1 ? 2 : 4;
-                
-                // Crear nuevo usuario
+
+                // Crear nuevo usuario con departamental_id
                 const [nuevoUsuario] = await connection.query(
                   `INSERT INTO usuario (
-                    rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento, 
-                    documento, telefono, email, password, usuario_familiar_id
-                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+                  rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento, 
+                  documento, telefono, email, password, usuario_familiar_id, departamental_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
                   [
                     rolId,
                     persona.parentesco_id,
@@ -1750,7 +1761,8 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                     persona.dni,
                     persona.telefono || null,
                     persona.email || null,
-                    usuarioFamiliarPrincipalId
+                    usuarioFamiliarPrincipalId,
+                    departamentalId
                   ]
                 );
                 usuarioId = nuevoUsuario.insertId;
@@ -1780,13 +1792,13 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
             } else {
               // Determinar el rol_id basado en tipo_persona_id
               const rolId = persona.tipo_persona_id === 1 ? 2 : 4;
-              
-              // Crear nuevo usuario
+
+              // Crear nuevo usuario con departamental_id
               const [nuevoUsuario] = await connection.query(
                 `INSERT INTO usuario (
-                  rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento, 
-                  documento, telefono, email, password, usuario_familiar_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+                rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento, 
+                documento, telefono, email, password, usuario_familiar_id, departamental_id
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
                 [
                   rolId,
                   persona.parentesco_id,
@@ -1797,7 +1809,8 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                   persona.dni,
                   persona.telefono || null,
                   persona.email || null,
-                  usuarioFamiliarPrincipalId
+                  usuarioFamiliarPrincipalId,
+                  departamentalId
                 ]
               );
               usuarioId = nuevoUsuario.insertId;
@@ -2646,7 +2659,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
 
           // Preparar campos para comparar cambios
           const cambios = [];
-          
+
           if (datosAnteriores.nombre !== persona.nombre) {
             cambios.push({
               campo: 'nombre',
@@ -2654,7 +2667,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
               valorNuevo: persona.nombre
             });
           }
-          
+
           if (datosAnteriores.apellido !== persona.apellido) {
             cambios.push({
               campo: 'apellido',
@@ -2662,7 +2675,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
               valorNuevo: persona.apellido
             });
           }
-          
+
           const fechaFormateada = formatearFecha(persona.fecha_nacimiento);
           if (datosAnteriores.fecha_nacimiento !== fechaFormateada) {
             cambios.push({
@@ -2671,7 +2684,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
               valorNuevo: fechaFormateada
             });
           }
-          
+
           if (datosAnteriores.telefono !== (persona.telefono || null)) {
             cambios.push({
               campo: 'telefono',
@@ -2679,7 +2692,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
               valorNuevo: persona.telefono || null
             });
           }
-          
+
           if (datosAnteriores.parentesco_id !== (persona.parentesco_id || null)) {
             cambios.push({
               campo: 'parentesco_id',
@@ -2687,7 +2700,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
               valorNuevo: persona.parentesco_id || null
             });
           }
-          
+
           if (datosAnteriores.tipo_persona_id !== (persona.tipo_persona_id || null)) {
             cambios.push({
               campo: 'tipo_persona_id',
@@ -2720,7 +2733,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
             let passwordHash = await bcryptjs.hash(persona.password, 8);
             updateFields.push("password = ?");
             updateValues.push(passwordHash);
-            
+
             cambios.push({
               campo: 'password',
               valorAnterior: '[OCULTO]',
@@ -2840,7 +2853,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
 
             // Preparar campos para comparar cambios
             const cambios = [];
-            
+
             if (usuario.nombre !== persona.nombre) {
               cambios.push({
                 campo: 'nombre',
@@ -2848,7 +2861,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
                 valorNuevo: persona.nombre
               });
             }
-            
+
             if (usuario.apellido !== persona.apellido) {
               cambios.push({
                 campo: 'apellido',
@@ -2856,7 +2869,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
                 valorNuevo: persona.apellido
               });
             }
-            
+
             if (normalizarFecha(usuario.fecha_nacimiento) !== normalizarFecha(persona.fechaNacimiento)) {
               cambios.push({
                 campo: 'fecha_nacimiento',
@@ -2864,7 +2877,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
                 valorNuevo: normalizarFecha(persona.fechaNacimiento)
               });
             }
-            
+
             if (normalizarTelefono(usuario.telefono) !== normalizarTelefono(persona.telefono)) {
               cambios.push({
                 campo: 'telefono',
@@ -2872,7 +2885,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
                 valorNuevo: persona.telefono || null
               });
             }
-            
+
             if (usuario.parentesco_id !== persona.parentescoId) {
               cambios.push({
                 campo: 'parentesco_id',
@@ -2880,7 +2893,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
                 valorNuevo: persona.parentescoId
               });
             }
-            
+
             if (usuario.tipo_persona_id !== persona.tipoPersonaId) {
               cambios.push({
                 campo: 'tipo_persona_id',
@@ -3376,7 +3389,7 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
       const page = req.query.page ? Number(req.query.page) : 1;
       const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 20;
       const start = (page - 1) * resultsPerPage;
-      
+
       const tipoOperacion = req.query.tipo_operacion;
       const fechaDesde = req.query.fecha_desde;
       const fechaHasta = req.query.fecha_hasta;
@@ -3471,7 +3484,7 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
     ) {
       let buscar = req.query.search;
       const filters = req.body;
-      
+
       // Paginación
       const page = req.query.page ? Number(req.query.page) : 1;
       const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 10;
@@ -3512,6 +3525,15 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
       // Construcción de filtros específicos
       let whereConditions = [];
       let queryParams = [];
+
+      // Filtro por rol departamental
+      if (cabecera.rol === "departamental") {
+        // Solo usuarios con departamental_id igual al del token y roles 2 y 4
+        whereConditions.push(`u.departamental_id = ?`);
+        queryParams.push(cabecera.departamental_id);
+
+        whereConditions.push(`u.rol_id IN (2, 4)`);
+      }
 
       // Filtro por roles
       if (filters.roles && Array.isArray(filters.roles) && filters.roles.length > 0) {
@@ -3630,17 +3652,31 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
 router.get("/rol", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    // Permitir solo a usuarios autenticados
-    if (cabecera) {
+    if (cabecera.rol === "admin") {
       const [rows] = await mysqlConnection
         .promise()
         .query("SELECT id, nombre FROM rol ORDER BY id ASC");
 
-      // Mapear los nombres de rol según lo solicitado
       const rolesMap = {
         admin: "Admin",
         afiliado: "Afiliado",
         departamental: "Departamental",
+        noafiliado: "No afiliado"
+      };
+
+      const roles = rows.map(r => ({
+        id: r.id,
+        nombre: rolesMap[r.nombre] || r.nombre
+      }));
+
+      res.status(200).json(roles);
+    } else if (cabecera.rol === "departamental") {
+      const [rows] = await mysqlConnection
+        .promise()
+        .query("SELECT id, nombre FROM rol WHERE nombre IN ('afiliado', 'noafiliado') ORDER BY id ASC");
+
+      const rolesMap = {
+        afiliado: "Afiliado",
         noafiliado: "No afiliado"
       };
 
@@ -3731,7 +3767,7 @@ router.post("/temporada", verifyToken, async (req, res) => {
             for (const recurso of regimen.recursos) {
               // Procesar cada fecha del recurso
               for (const fecha of recurso.fechas) {
-                
+
                 // Verificar si el precio es por persona o por recurso
                 if (recurso.precio_por_persona) {
                   // Procesar cada tipo de persona de la fecha
