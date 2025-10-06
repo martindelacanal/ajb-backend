@@ -3068,6 +3068,121 @@ router.get("/parentesco", verifyToken, async (req, res) => {
   }
 });
 
+router.get("/departamental", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const query = `
+      SELECT 
+        id,
+        nombre,
+        direccion,
+        localidad,
+        provincia,
+        ST_Y(coordenadas) AS latitud,
+        ST_X(coordenadas) AS longitud,
+        habilitado,
+        DATE_FORMAT(fecha_creacion, '%d/%m/%Y %T') AS fecha_creacion,
+        DATE_FORMAT(fecha_modificacion, '%d/%m/%Y %T') AS fecha_modificacion
+      FROM departamental
+    `;
+
+    const [rows] = await mysqlConnection.promise().query(query);
+
+    res.status(200).json(rows);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error interno");
+  }
+});
+
+router.post("/tabla/departamentales", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+
+    // Solo admin puede consultar la tabla completa
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    let buscar = req.query.search;
+    const page = req.query.page ? Number(req.query.page) : 1;
+    const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 10;
+    const start = (page - 1) * resultsPerPage;
+
+    let orderBy = req.query.orderBy ? req.query.orderBy : "fecha_creacion";
+    const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
+
+    // Mapeo de columnas para ordenamiento
+    if (orderBy === "nombre") orderBy = "d.nombre";
+    else if (orderBy === "direccion") orderBy = "d.direccion";
+    else if (orderBy === "localidad") orderBy = "d.localidad";
+    else if (orderBy === "provincia") orderBy = "d.provincia";
+    else if (orderBy === "habilitado") orderBy = "d.habilitado";
+    else if (orderBy === "fecha_creacion") orderBy = "d.fecha_creacion";
+    else if (orderBy === "fecha_modificacion") orderBy = "d.fecha_modificacion";
+    else orderBy = "d.fecha_creacion";
+
+    const queryOrderBy = `${orderBy} ${orderType}`;
+
+    let queryBuscar = "";
+    if (buscar) {
+      buscar = "%" + buscar + "%";
+      queryBuscar = `AND (d.id LIKE '${buscar}' OR d.nombre LIKE '${buscar}' OR d.direccion LIKE '${buscar}' OR d.localidad LIKE '${buscar}' OR d.provincia LIKE '${buscar}')`;
+    }
+
+    let query = `
+      SELECT 
+        d.id,
+        d.nombre,
+        d.direccion,
+        d.localidad,
+        d.provincia,
+        ST_Y(d.coordenadas) AS latitud,
+        ST_X(d.coordenadas) AS longitud,
+        d.habilitado,
+        DATE_FORMAT(d.fecha_creacion, '%d/%m/%Y %T') AS fecha_creacion,
+        DATE_FORMAT(d.fecha_modificacion, '%d/%m/%Y %T') AS fecha_modificacion
+      FROM departamental d
+      WHERE 1=1
+        ${queryBuscar}
+      ORDER BY ${queryOrderBy}
+      LIMIT ?, ?
+    `;
+
+    const queryParams = [start, resultsPerPage];
+
+    const [rows] = await mysqlConnection.promise().execute(query, queryParams);
+
+    // Query para contar el total de registros
+    let countQuery = `
+      SELECT COUNT(*) AS count
+      FROM departamental d
+      WHERE 1=1
+      ${queryBuscar}
+    `;
+    const [countRows] = await mysqlConnection.promise().execute(countQuery);
+
+    const numOfResults = countRows[0].count;
+    const numOfPages = Math.ceil(numOfResults / resultsPerPage);
+
+    res.json({
+      results: rows,
+      numOfPages,
+      totalItems: numOfResults,
+      page: page - 1,
+      orderBy: req.query.orderBy || "fecha_creacion",
+      orderType,
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error interno");
+  }
+});
+
 router.post("/tabla/temporadas", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   let buscar = req.query.search;
@@ -3528,7 +3643,6 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
 
       // Filtro por rol departamental
       if (cabecera.rol === "departamental") {
-        // Solo usuarios con departamental_id igual al del token y roles 2 y 4
         whereConditions.push(`u.departamental_id = ?`);
         queryParams.push(cabecera.departamental_id);
 
@@ -3579,6 +3693,18 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
       if (filters.fecha_creacion_maxima) {
         whereConditions.push(`DATE(u.fecha_creacion) <= ?`);
         queryParams.push(filters.fecha_creacion_maxima);
+      }
+
+      // Filtro departamentales_ids (solo admin)
+      if (
+        cabecera.rol === "admin" &&
+        filters.departamentales_ids &&
+        Array.isArray(filters.departamentales_ids) &&
+        filters.departamentales_ids.length > 0
+      ) {
+        const placeholders = filters.departamentales_ids.map(() => '?').join(',');
+        whereConditions.push(`u.departamental_id IN (${placeholders})`);
+        queryParams.push(...filters.departamentales_ids);
       }
 
       // Construcción de la cláusula WHERE
