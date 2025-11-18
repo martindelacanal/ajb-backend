@@ -4610,10 +4610,16 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
             regimen.recursos.push(recurso);
           }
 
+          // Normalizar fechas para evitar duplicados por comparar objetos Date diferentes
+          const tarifaFechaInicioMs = new Date(tarifa.fecha_inicio).getTime();
+          const tarifaFechaFinMs = new Date(tarifa.fecha_fin).getTime();
+
           // Buscar o crear fecha en el recurso
-          let fecha = recurso.fechas.find(
-            f => f.fecha_inicio === tarifa.fecha_inicio && f.fecha_fin === tarifa.fecha_fin
-          );
+          let fecha = recurso.fechas.find(f => {
+            const fechaInicioMs = new Date(f.fecha_inicio).getTime();
+            const fechaFinMs = new Date(f.fecha_fin).getTime();
+            return fechaInicioMs === tarifaFechaInicioMs && fechaFinMs === tarifaFechaFinMs;
+          });
           if (!fecha) {
             fecha = {
               id: tarifa.tarifa_id,
