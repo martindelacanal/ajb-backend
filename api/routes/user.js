@@ -3253,8 +3253,24 @@ router.get("/departamental/:id", verifyToken, async (req, res) => {
   }
 });
 
+// Función auxiliar para guardar historial de cambios en departamentales
+async function guardarHistorialDepartamental(connection, departamentalId, usuarioId, operacion, campoAfectado, valorAnterior, valorNuevo) {
+  try {
+    await connection.query(
+      `INSERT INTO historial_departamental
+       (departamental_id, usuario_id, operacion, campo_afectado, valor_anterior, valor_nuevo, fecha_cambio)
+       VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+      [departamentalId, usuarioId, operacion, campoAfectado, valorAnterior, valorNuevo]
+    );
+  } catch (error) {
+    console.error("Error al guardar historial departamental:", error);
+    // No lanzamos el error para que no afecte la operación principal
+  }
+}
+
 // POST /departamental - Crea una nueva departamental
 router.post("/departamental", verifyToken, async (req, res) => {
+  let connection;
   try {
     const cabecera = JSON.parse(req.data.data);
     if (cabecera.rol !== "admin") {
@@ -3272,42 +3288,78 @@ router.post("/departamental", verifyToken, async (req, res) => {
       return res.status(400).json("El campo habilitado debe ser 'Y' o 'N'");
     }
 
-    const query = `
-      INSERT INTO departamental (nombre, direccion, localidad, provincia, coordenadas, habilitado, fecha_creacion, fecha_modificacion)
-      VALUES (?, ?, ?, ?, POINT(?, ?), ?, NOW(), NOW())
-    `;
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
 
-    const [result] = await mysqlConnection.promise().execute(query, [
-      nombre,
-      direccion,
-      localidad,
-      provincia,
-      longitud,
-      latitud,
-      habilitado
-    ]);
+    try {
+      const query = `
+        INSERT INTO departamental (nombre, direccion, localidad, provincia, coordenadas, habilitado, fecha_creacion, fecha_modificacion)
+        VALUES (?, ?, ?, ?, POINT(?, ?), ?, NOW(), NOW())
+      `;
 
-    // Obtener la departamental recién creada
-    const selectQuery = `
-      SELECT
-        id,
+      const [result] = await connection.query(query, [
         nombre,
         direccion,
         localidad,
         provincia,
-        ST_Y(coordenadas) AS latitud,
-        ST_X(coordenadas) AS longitud,
-        habilitado,
-        DATE_FORMAT(fecha_creacion, '%d/%m/%Y %T') AS fecha_creacion,
-        DATE_FORMAT(fecha_modificacion, '%d/%m/%Y %T') AS fecha_modificacion
-      FROM departamental
-      WHERE id = ?
-    `;
+        longitud,
+        latitud,
+        habilitado
+      ]);
 
-    const [rows] = await mysqlConnection.promise().execute(selectQuery, [result.insertId]);
+      const departamentalId = result.insertId;
 
-    res.status(201).json(rows[0]);
+      // Guardar historial de creación
+      await guardarHistorialDepartamental(
+        connection,
+        departamentalId,
+        cabecera.id,
+        'CREATE',
+        'departamental',
+        null,
+        JSON.stringify({
+          nombre,
+          direccion,
+          localidad,
+          provincia,
+          latitud,
+          longitud,
+          habilitado
+        })
+      );
+
+      // Obtener la departamental recién creada
+      const selectQuery = `
+        SELECT
+          id,
+          nombre,
+          direccion,
+          localidad,
+          provincia,
+          ST_Y(coordenadas) AS latitud,
+          ST_X(coordenadas) AS longitud,
+          habilitado,
+          DATE_FORMAT(fecha_creacion, '%d/%m/%Y %T') AS fecha_creacion,
+          DATE_FORMAT(fecha_modificacion, '%d/%m/%Y %T') AS fecha_modificacion
+        FROM departamental
+        WHERE id = ?
+      `;
+
+      const [rows] = await connection.query(selectQuery, [departamentalId]);
+
+      await connection.commit();
+      connection.release();
+
+      res.status(201).json(rows[0]);
+    } catch (error) {
+      await connection.rollback();
+      connection.release();
+      throw error;
+    }
   } catch (error) {
+    if (connection) {
+      connection.release();
+    }
     console.log(error);
     res.status(500).json("Error interno");
   }
@@ -3315,6 +3367,7 @@ router.post("/departamental", verifyToken, async (req, res) => {
 
 // PUT /departamental/:id - Actualiza una departamental existente
 router.put("/departamental/:id", verifyToken, async (req, res) => {
+  let connection;
   try {
     const cabecera = JSON.parse(req.data.data);
     if (cabecera.rol !== "admin") {
@@ -3333,58 +3386,165 @@ router.put("/departamental/:id", verifyToken, async (req, res) => {
       return res.status(400).json("El campo habilitado debe ser 'Y' o 'N'");
     }
 
-    // Verificar que la departamental existe
-    const checkQuery = `SELECT id FROM departamental WHERE id = ?`;
-    const [existing] = await mysqlConnection.promise().execute(checkQuery, [id]);
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
 
-    if (existing.length === 0) {
-      return res.status(404).json("Departamental no encontrada");
-    }
+    try {
+      // Verificar que la departamental existe y obtener datos anteriores
+      const checkQuery = `
+        SELECT
+          nombre,
+          direccion,
+          localidad,
+          provincia,
+          ST_Y(coordenadas) AS latitud,
+          ST_X(coordenadas) AS longitud,
+          habilitado
+        FROM departamental
+        WHERE id = ?
+      `;
+      const [existing] = await connection.query(checkQuery, [id]);
 
-    const query = `
-      UPDATE departamental
-      SET nombre = ?,
-          direccion = ?,
-          localidad = ?,
-          provincia = ?,
-          coordenadas = POINT(?, ?),
-          habilitado = ?,
-          fecha_modificacion = NOW()
-      WHERE id = ?
-    `;
+      if (existing.length === 0) {
+        connection.release();
+        return res.status(404).json("Departamental no encontrada");
+      }
 
-    await mysqlConnection.promise().execute(query, [
-      nombre,
-      direccion,
-      localidad,
-      provincia,
-      longitud,
-      latitud,
-      habilitado,
-      id
-    ]);
+      const datosAnteriores = existing[0];
 
-    // Obtener la departamental actualizada
-    const selectQuery = `
-      SELECT
-        id,
+      // Actualizar la departamental
+      const query = `
+        UPDATE departamental
+        SET nombre = ?,
+            direccion = ?,
+            localidad = ?,
+            provincia = ?,
+            coordenadas = POINT(?, ?),
+            habilitado = ?,
+            fecha_modificacion = NOW()
+        WHERE id = ?
+      `;
+
+      await connection.query(query, [
         nombre,
         direccion,
         localidad,
         provincia,
-        ST_Y(coordenadas) AS latitud,
-        ST_X(coordenadas) AS longitud,
+        longitud,
+        latitud,
         habilitado,
-        DATE_FORMAT(fecha_creacion, '%d/%m/%Y %T') AS fecha_creacion,
-        DATE_FORMAT(fecha_modificacion, '%d/%m/%Y %T') AS fecha_modificacion
-      FROM departamental
-      WHERE id = ?
-    `;
+        id
+      ]);
 
-    const [rows] = await mysqlConnection.promise().execute(selectQuery, [id]);
+      // Registrar cambios individuales en el historial
+      if (datosAnteriores.nombre !== nombre) {
+        await guardarHistorialDepartamental(
+          connection,
+          id,
+          cabecera.id,
+          'UPDATE',
+          'nombre',
+          datosAnteriores.nombre,
+          nombre
+        );
+      }
 
-    res.status(200).json(rows[0]);
+      if (datosAnteriores.direccion !== direccion) {
+        await guardarHistorialDepartamental(
+          connection,
+          id,
+          cabecera.id,
+          'UPDATE',
+          'direccion',
+          datosAnteriores.direccion,
+          direccion
+        );
+      }
+
+      if (datosAnteriores.localidad !== localidad) {
+        await guardarHistorialDepartamental(
+          connection,
+          id,
+          cabecera.id,
+          'UPDATE',
+          'localidad',
+          datosAnteriores.localidad,
+          localidad
+        );
+      }
+
+      if (datosAnteriores.provincia !== provincia) {
+        await guardarHistorialDepartamental(
+          connection,
+          id,
+          cabecera.id,
+          'UPDATE',
+          'provincia',
+          datosAnteriores.provincia,
+          provincia
+        );
+      }
+
+      if (parseFloat(datosAnteriores.latitud) !== parseFloat(latitud) ||
+          parseFloat(datosAnteriores.longitud) !== parseFloat(longitud)) {
+        await guardarHistorialDepartamental(
+          connection,
+          id,
+          cabecera.id,
+          'UPDATE',
+          'coordenadas',
+          JSON.stringify({
+            latitud: datosAnteriores.latitud,
+            longitud: datosAnteriores.longitud
+          }),
+          JSON.stringify({ latitud, longitud })
+        );
+      }
+
+      if (datosAnteriores.habilitado !== habilitado) {
+        await guardarHistorialDepartamental(
+          connection,
+          id,
+          cabecera.id,
+          'UPDATE',
+          'habilitado',
+          datosAnteriores.habilitado,
+          habilitado
+        );
+      }
+
+      // Obtener la departamental actualizada
+      const selectQuery = `
+        SELECT
+          id,
+          nombre,
+          direccion,
+          localidad,
+          provincia,
+          ST_Y(coordenadas) AS latitud,
+          ST_X(coordenadas) AS longitud,
+          habilitado,
+          DATE_FORMAT(fecha_creacion, '%d/%m/%Y %T') AS fecha_creacion,
+          DATE_FORMAT(fecha_modificacion, '%d/%m/%Y %T') AS fecha_modificacion
+        FROM departamental
+        WHERE id = ?
+      `;
+
+      const [rows] = await connection.query(selectQuery, [id]);
+
+      await connection.commit();
+      connection.release();
+
+      res.status(200).json(rows[0]);
+    } catch (error) {
+      await connection.rollback();
+      connection.release();
+      throw error;
+    }
   } catch (error) {
+    if (connection) {
+      connection.release();
+    }
     console.log(error);
     res.status(500).json("Error interno");
   }
