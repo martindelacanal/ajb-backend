@@ -4799,11 +4799,90 @@ async function guardarHistorialTemporada(connection, temporadaId, usuarioId, ope
   }
 }
 
+function normalizarBanderaPorcentaje(valor) {
+  if (valor === undefined || valor === null) {
+    return false;
+  }
+  if (typeof valor === "string") {
+    const normalizado = valor.trim().toLowerCase();
+    return normalizado === "1" || normalizado === "true" || normalizado === "y" || normalizado === "yes";
+  }
+  return Boolean(valor);
+}
+
+function normalizarValorPorcentaje(valor) {
+  if (valor === undefined || valor === null || valor === "") {
+    return null;
+  }
+  const numero = Number(valor);
+  return Number.isNaN(numero) ? null : numero;
+}
+
+function construirMapaPreciosParticulares(tiposPersona) {
+  const mapa = new Map();
+  if (!Array.isArray(tiposPersona)) {
+    return mapa;
+  }
+
+  for (const tipoPersona of tiposPersona) {
+    const tipoPersonaId = tipoPersona?.tipoPersonaId ?? tipoPersona?.tipo_persona_id;
+    if (Number(tipoPersonaId) !== 4 || !Array.isArray(tipoPersona?.rangosEdad)) {
+      continue;
+    }
+
+    for (const rango of tipoPersona.rangosEdad) {
+      const edadMin = rango?.edadMinima ?? rango?.edad_minima ?? "";
+      const edadMax = rango?.edadMaxima ?? rango?.edad_maxima ?? "";
+      const key = `${edadMin}-${edadMax}`;
+      const precio = Number(rango?.precio ?? 0);
+      if (!Number.isNaN(precio)) {
+        mapa.set(key, precio);
+      }
+    }
+  }
+
+  return mapa;
+}
+
+function calcularPrecioRangoConPorcentaje(rangoEdad, tipoPersonaId, mapaPreciosParticulares) {
+  const usaPorcentaje = normalizarBanderaPorcentaje(rangoEdad?.usa_porcentaje ?? rangoEdad?.usaPorcentaje);
+  const porcentajeDescuento = normalizarValorPorcentaje(
+    rangoEdad?.porcentaje_descuento ??
+      rangoEdad?.porcentaje ??
+      rangoEdad?.porcentajeDescuento
+  );
+
+  let precioTarifa = Number(rangoEdad?.precio ?? 0);
+  if (Number.isNaN(precioTarifa)) {
+    precioTarifa = 0;
+  }
+
+  if (usaPorcentaje && Number(tipoPersonaId) !== 4) {
+    const edadMin = rangoEdad?.edadMinima ?? rangoEdad?.edad_minima ?? "";
+    const edadMax = rangoEdad?.edadMaxima ?? rangoEdad?.edad_maxima ?? "";
+    const key = `${edadMin}-${edadMax}`;
+    const precioBase = mapaPreciosParticulares?.get
+      ? mapaPreciosParticulares.get(key)
+      : undefined;
+
+    if (typeof precioBase === "number" && !Number.isNaN(precioBase)) {
+      const factor = porcentajeDescuento !== null ? 1 - porcentajeDescuento / 100 : 1;
+      precioTarifa = Number((precioBase * factor).toFixed(2));
+    }
+  }
+
+  return {
+    precioTarifa,
+    usaPorcentaje,
+    porcentajeDescuento,
+  };
+}
+
 router.post("/temporada", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (cabecera.rol === "admin") {
-      const { nombre_campania, fecha_inicio, fecha_fin, configuracion_servicios } = req.body;
+      const { nombre_campania, fecha_inicio, fecha_fin, configuracion_servicios, porcentajes_tipo_persona } = req.body;
 
       if (!nombre_campania || !fecha_inicio || !fecha_fin || !configuracion_servicios) {
         return res.status(400).json("Faltan campos requeridos");
@@ -4823,6 +4902,7 @@ router.post("/temporada", verifyToken, async (req, res) => {
 
         const temporadaId = temporadaResult.insertId;
         const adicionalesPorTemporada = [];
+        const porcentajesRegistrados = [];
 
         // Guardar historial de creación
         await guardarHistorialTemporada(
@@ -4834,6 +4914,46 @@ router.post("/temporada", verifyToken, async (req, res) => {
           null,
           JSON.stringify({ nombre_campania, fecha_inicio, fecha_fin })
         );
+
+        if (Array.isArray(porcentajes_tipo_persona) && porcentajes_tipo_persona.length > 0) {
+          for (const porcentaje of porcentajes_tipo_persona) {
+            const tipoPersonaId = porcentaje?.tipo_persona_id ?? porcentaje?.tipoPersonaId;
+            const porcentajeValor = normalizarValorPorcentaje(
+              porcentaje?.porcentaje ??
+              porcentaje?.valor ??
+              porcentaje?.porcentaje_descuento ??
+              porcentaje?.porcentajeDescuento
+            );
+
+            if (!tipoPersonaId || porcentajeValor === null) {
+              continue;
+            }
+
+            await connection.query(
+              `INSERT INTO temporada_tipo_persona_porcentaje
+                (temporada_tarifa_id, tipo_persona_id, porcentaje)
+               VALUES (?, ?, ?)`,
+              [temporadaId, tipoPersonaId, porcentajeValor]
+            );
+
+            porcentajesRegistrados.push({
+              tipo_persona_id: Number(tipoPersonaId),
+              porcentaje: porcentajeValor
+            });
+          }
+
+          if (porcentajesRegistrados.length > 0) {
+            await guardarHistorialTemporada(
+              connection,
+              temporadaId,
+              cabecera.id,
+              'CREATE',
+              'porcentajes_tipo_persona',
+              null,
+              JSON.stringify(porcentajesRegistrados)
+            );
+          }
+        }
 
         // 2. Procesar cada servicio
         for (const servicio of configuracion_servicios) {
@@ -4876,33 +4996,48 @@ router.post("/temporada", verifyToken, async (req, res) => {
                   }
                 }
 
+
                 // Verificar si el precio es por persona o por recurso
                 if (recurso.precio_por_persona) {
+                  const mapaPreciosParticulares = construirMapaPreciosParticulares(fecha.tiposPersona);
                   // Procesar cada tipo de persona de la fecha
                   for (const tipoPersona of fecha.tiposPersona) {
+                    const tipoPersonaId = tipoPersona?.tipoPersonaId ?? tipoPersona?.tipo_persona_id;
+                    if (!tipoPersonaId || !Array.isArray(tipoPersona?.rangosEdad)) {
+                      continue;
+                    }
+
                     // Procesar cada rango de edad del tipo de persona
                     for (const rangoEdad of tipoPersona.rangosEdad) {
+                      const { precioTarifa, usaPorcentaje, porcentajeDescuento } = calcularPrecioRangoConPorcentaje(
+                        rangoEdad,
+                        tipoPersonaId,
+                        mapaPreciosParticulares
+                      );
+
                       // Insertar tarifa individual con tipos de persona
                       const [tarifaResult] = await connection.query(
                         `INSERT INTO tarifa
                          (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
-                          edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                          edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona, usa_porcentaje, porcentaje_descuento)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                         [
                           recurso.id,
-                          tipoPersona.tipoPersonaId,
+                          tipoPersonaId,
                           regimen.id,
                           temporadaId,
                           rangoEdad.edadMinima,
                           rangoEdad.edadMaxima,
-                          rangoEdad.precio,
+                          precioTarifa,
                           fecha.fecha_inicio,
                           fecha.fecha_fin,
-                          'Y' // precio_por_persona como 'Y'
+                          'Y', // precio_por_persona como 'Y'
+                          usaPorcentaje ? 1 : 0,
+                          porcentajeDescuento
                         ]
                       );
 
-                      // Guardar historial de creación de tarifa
+                      // Guardar historial de creacion de tarifa
                       await guardarHistorialTemporada(
                         connection,
                         temporadaId,
@@ -4912,9 +5047,11 @@ router.post("/temporada", verifyToken, async (req, res) => {
                         null,
                         JSON.stringify({
                           recurso_id: recurso.id,
-                          tipo_persona_id: tipoPersona.tipoPersonaId,
+                          tipo_persona_id: tipoPersonaId,
                           regimen_id: regimen.id,
-                          precio: rangoEdad.precio
+                          precio: precioTarifa,
+                          usa_porcentaje: usaPorcentaje ? 1 : 0,
+                          porcentaje_descuento: porcentajeDescuento
                         })
                       );
                     }
@@ -4924,8 +5061,8 @@ router.post("/temporada", verifyToken, async (req, res) => {
                   const [tarifaResult] = await connection.query(
                     `INSERT INTO tarifa
                      (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
-                      edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                      edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona, usa_porcentaje, porcentaje_descuento)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                     [
                       recurso.id,
                       null, // tipo_persona_id como null
@@ -4936,11 +5073,13 @@ router.post("/temporada", verifyToken, async (req, res) => {
                       fecha.precio, // usar el precio del recurso desde FechaTemporada
                       fecha.fecha_inicio,
                       fecha.fecha_fin,
-                      'N' // precio_por_persona como 'N'
+                      'N', // precio_por_persona como 'N'
+                      0,
+                      null
                     ]
                   );
 
-                  // Guardar historial de creación de tarifa
+                  // Guardar historial de creacion de tarifa
                   await guardarHistorialTemporada(
                     connection,
                     temporadaId,
@@ -4951,10 +5090,12 @@ router.post("/temporada", verifyToken, async (req, res) => {
                     JSON.stringify({
                       recurso_id: recurso.id,
                       regimen_id: regimen.id,
-                      precio: fecha.precio
+                      precio: fecha.precio,
+                      usa_porcentaje: 0
                     })
                   );
                 }
+
               }
             }
           }
@@ -5026,6 +5167,8 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
             t.fecha_inicio,
             t.fecha_fin,
             t.precio_por_persona,
+            t.usa_porcentaje,
+            t.porcentaje_descuento,
             r.nombre as recurso_nombre,
             r.servicio_id,
             s.nombre as servicio_nombre,
@@ -5118,11 +5261,18 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
               fecha.tiposPersona.push(tipoPersona);
             }
 
+            const usaPorcentaje = tarifa.usa_porcentaje === 1 || tarifa.usa_porcentaje === '1';
+            const porcentajeDescuento = tarifa.porcentaje_descuento !== null && tarifa.porcentaje_descuento !== undefined
+              ? Number(tarifa.porcentaje_descuento)
+              : null;
+
             tipoPersona.rangosEdad.push({
               id: tarifa.tarifa_id,
               edadMinima: tarifa.edad_minima,
               edadMaxima: tarifa.edad_maxima,
-              precio: tarifa.precio
+              precio: tarifa.precio,
+              usa_porcentaje: usaPorcentaje,
+              porcentaje_descuento: porcentajeDescuento
             });
           }
         }
@@ -5166,12 +5316,32 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
           });
         }
 
+        const [porcentajesTipoPersonaRows] = await connection.query(
+          `
+            SELECT tipo_persona_id, porcentaje
+            FROM temporada_tipo_persona_porcentaje
+            WHERE temporada_tarifa_id = ?
+          `,
+          [id]
+        );
+
+        const porcentajesTipoPersona = porcentajesTipoPersonaRows.map(row => {
+          const porcentajeValor = row.porcentaje !== null && row.porcentaje !== undefined
+            ? Number(row.porcentaje)
+            : null;
+          return {
+            tipo_persona_id: row.tipo_persona_id,
+            porcentaje: porcentajeValor
+          };
+        });
+
         // 4. Construir respuesta final
         const response = {
           nombre_campania: temporada.nombre,
           fecha_inicio: temporada.fecha_inicio,
           fecha_fin: temporada.fecha_fin,
-          configuracion_servicios: Array.from(serviciosMap.values())
+          configuracion_servicios: Array.from(serviciosMap.values()),
+          porcentajes_tipo_persona: porcentajesTipoPersona
         };
 
         connection.release();
@@ -5199,7 +5369,7 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
     const cabecera = JSON.parse(req.data.data);
     if (cabecera.rol === "admin") {
       const { id } = req.params;
-      const { nombre_campania, fecha_inicio, fecha_fin, configuracion_servicios } = req.body;
+      const { nombre_campania, fecha_inicio, fecha_fin, configuracion_servicios, porcentajes_tipo_persona } = req.body;
 
       if (!nombre_campania || !fecha_inicio || !fecha_fin || !configuracion_servicios) {
         return res.status(400).json("Faltan campos requeridos");
@@ -5292,6 +5462,69 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
           [id]
         );
 
+        const [porcentajesAnteriores] = await connection.query(
+          "SELECT tipo_persona_id, porcentaje FROM temporada_tipo_persona_porcentaje WHERE temporada_tarifa_id = ?",
+          [id]
+        );
+
+        if (porcentajesAnteriores.length > 0) {
+          await guardarHistorialTemporada(
+            connection,
+            id,
+            cabecera.id,
+            'DELETE',
+            'porcentajes_tipo_persona',
+            JSON.stringify(porcentajesAnteriores),
+            null
+          );
+        }
+
+        await connection.query(
+          "DELETE FROM temporada_tipo_persona_porcentaje WHERE temporada_tarifa_id = ?",
+          [id]
+        );
+
+        const porcentajesRegistrados = [];
+        if (Array.isArray(porcentajes_tipo_persona) && porcentajes_tipo_persona.length > 0) {
+          for (const porcentaje of porcentajes_tipo_persona) {
+            const tipoPersonaId = porcentaje?.tipo_persona_id ?? porcentaje?.tipoPersonaId;
+            const porcentajeValor = normalizarValorPorcentaje(
+              porcentaje?.porcentaje ??
+              porcentaje?.valor ??
+              porcentaje?.porcentaje_descuento ??
+              porcentaje?.porcentajeDescuento
+            );
+
+            if (!tipoPersonaId || porcentajeValor === null) {
+              continue;
+            }
+
+            await connection.query(
+              `INSERT INTO temporada_tipo_persona_porcentaje
+                (temporada_tarifa_id, tipo_persona_id, porcentaje)
+               VALUES (?, ?, ?)`,
+              [id, tipoPersonaId, porcentajeValor]
+            );
+
+            porcentajesRegistrados.push({
+              tipo_persona_id: Number(tipoPersonaId),
+              porcentaje: porcentajeValor
+            });
+          }
+        }
+
+        if (porcentajesRegistrados.length > 0) {
+          await guardarHistorialTemporada(
+            connection,
+            id,
+            cabecera.id,
+            'CREATE',
+            'porcentajes_tipo_persona',
+            null,
+            JSON.stringify(porcentajesRegistrados)
+          );
+        }
+
         // 4. Insertar las nuevas tarifas (mismo código que POST)
         for (const servicio of configuracion_servicios) {
           for (const regimen of servicio.regimenes) {
@@ -5330,80 +5563,101 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
                     }
                   }
 
+
                   if (recurso.precio_por_persona) {
-                  for (const tipoPersona of fecha.tiposPersona) {
-                    for (const rangoEdad of tipoPersona.rangosEdad) {
-                      const [tarifaResult] = await connection.query(
-                        `INSERT INTO tarifa
-                         (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
-                          edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                        [
-                          recurso.id,
-                          tipoPersona.tipoPersonaId,
-                          regimen.id,
+                    const mapaPreciosParticulares = construirMapaPreciosParticulares(fecha.tiposPersona);
+                    for (const tipoPersona of fecha.tiposPersona) {
+                      const tipoPersonaId = tipoPersona?.tipoPersonaId ?? tipoPersona?.tipo_persona_id;
+                      if (!tipoPersonaId || !Array.isArray(tipoPersona?.rangosEdad)) {
+                        continue;
+                      }
+
+                      for (const rangoEdad of tipoPersona.rangosEdad) {
+                        const { precioTarifa, usaPorcentaje, porcentajeDescuento } = calcularPrecioRangoConPorcentaje(
+                          rangoEdad,
+                          tipoPersonaId,
+                          mapaPreciosParticulares
+                        );
+
+                        const [tarifaResult] = await connection.query(
+                          `INSERT INTO tarifa
+                           (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
+                            edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona, usa_porcentaje, porcentaje_descuento)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                          [
+                            recurso.id,
+                            tipoPersonaId,
+                            regimen.id,
+                            id,
+                            rangoEdad.edadMinima,
+                            rangoEdad.edadMaxima,
+                            precioTarifa,
+                            fecha.fecha_inicio,
+                            fecha.fecha_fin,
+                            'Y',
+                            usaPorcentaje ? 1 : 0,
+                            porcentajeDescuento
+                          ]
+                        );
+
+                        // Guardar historial de creacion de nueva tarifa
+                        await guardarHistorialTemporada(
+                          connection,
                           id,
-                          rangoEdad.edadMinima,
-                          rangoEdad.edadMaxima,
-                          rangoEdad.precio,
-                          fecha.fecha_inicio,
-                          fecha.fecha_fin,
-                          'Y'
-                        ]
-                      );
-
-                      // Guardar historial de creación de nueva tarifa
-                      await guardarHistorialTemporada(
-                        connection,
-                        id,
-                        cabecera.id,
-                        'CREATE',
-                        `tarifa_${tarifaResult.insertId}`,
-                        null,
-                        JSON.stringify({
-                          recurso_id: recurso.id,
-                          tipo_persona_id: tipoPersona.tipoPersonaId,
-                          regimen_id: regimen.id,
-                          precio: rangoEdad.precio
-                        })
-                      );
+                          cabecera.id,
+                          'CREATE',
+                          `tarifa_${tarifaResult.insertId}`,
+                          null,
+                          JSON.stringify({
+                            recurso_id: recurso.id,
+                            tipo_persona_id: tipoPersonaId,
+                            regimen_id: regimen.id,
+                            precio: precioTarifa,
+                            usa_porcentaje: usaPorcentaje ? 1 : 0,
+                            porcentaje_descuento: porcentajeDescuento
+                          })
+                        );
+                      }
                     }
-                  }
-                } else {
-                  const [tarifaResult] = await connection.query(
-                    `INSERT INTO tarifa
-                     (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
-                      edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    [
-                      recurso.id,
-                      null,
-                      regimen.id,
-                      id,
-                      null,
-                      null,
-                      fecha.precio,
-                      fecha.fecha_inicio,
-                      fecha.fecha_fin,
-                      'N'
-                    ]
-                  );
+                  } else {
+                    const [tarifaResult] = await connection.query(
+                      `INSERT INTO tarifa
+                       (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
+                        edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona, usa_porcentaje, porcentaje_descuento)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                      [
+                        recurso.id,
+                        null,
+                        regimen.id,
+                        id,
+                        null,
+                        null,
+                        fecha.precio,
+                        fecha.fecha_inicio,
+                        fecha.fecha_fin,
+                        'N',
+                        0,
+                        null
+                      ]
+                    );
 
-                  // Guardar historial de creación de nueva tarifa
-                  await guardarHistorialTemporada(
-                    connection,
-                    id,
-                    cabecera.id,
-                    'CREATE',
-                    `tarifa_${tarifaResult.insertId}`,
-                    null,
-                    JSON.stringify({
-                      recurso_id: recurso.id,
-                      regimen_id: regimen.id,
-                      precio: fecha.precio
-                    })
-                  );
-                }
+                    // Guardar historial de creacion de nueva tarifa
+                    await guardarHistorialTemporada(
+                      connection,
+                      id,
+                      cabecera.id,
+                      'CREATE',
+                      `tarifa_${tarifaResult.insertId}`,
+                      null,
+                      JSON.stringify({
+                        recurso_id: recurso.id,
+                        regimen_id: regimen.id,
+                        precio: fecha.precio,
+                        usa_porcentaje: 0
+                      })
+                    );
+                  }
+
               }
             }
           }
