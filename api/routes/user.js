@@ -2501,8 +2501,23 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
         };
 
         const adicionalesReserva = await obtenerAdicionalesReserva(connection, reservaId);
+        const adicionalesFormateados = adicionalesReserva.map(adicional => ({
+          id: adicional.id,
+          adicional_id: adicional.adicional_id,
+          nombre: adicional.nombre,
+          cantidad: adicional.cantidad,
+          precio_unitario: Number(adicional.precio_unitario),
+          dias: adicional.dias,
+          subtotal: Number(adicional.subtotal),
+          fechas: adicional.fechas.map(fecha => ({
+            fecha: fecha.fecha,
+            cantidad: fecha.cantidad,
+            precio_unitario: Number(fecha.precio_unitario),
+            subtotal: Number(fecha.subtotal)
+          }))
+        }));
 
-        respuesta.adicionales = adicionalesReserva;
+        respuesta.adicionales = adicionalesFormateados;
         respuesta.monto_adicionales = reserva.monto_adicionales || 0;
 
         res.status(200).json(respuesta);
@@ -2652,6 +2667,21 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
         }));
 
         const adicionalesReserva = await obtenerAdicionalesReserva(connection, reservaId);
+        const adicionalesFormateados = adicionalesReserva.map(adicional => ({
+          id: adicional.id,
+          adicional_id: adicional.adicional_id,
+          nombre: adicional.nombre,
+          cantidad: adicional.cantidad,
+          precio_unitario: Number(adicional.precio_unitario),
+          dias: adicional.dias,
+          subtotal: Number(adicional.subtotal),
+          fechas: adicional.fechas.map(fecha => ({
+            fecha: fecha.fecha,
+            cantidad: fecha.cantidad,
+            precio_unitario: Number(fecha.precio_unitario),
+            subtotal: Number(fecha.subtotal)
+          }))
+        }));
 
         // Generar número de reserva
         const numeroReserva = `${reserva.id}`;
@@ -2693,7 +2723,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           ninos: ninos,
           bebes: bebes,
           monto_adicionales: reserva.monto_adicionales || 0,
-          adicionales: adicionalesReserva
+          adicionales: adicionalesFormateados
         };
 
         res.status(200).json(respuesta);
