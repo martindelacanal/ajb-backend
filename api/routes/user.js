@@ -82,6 +82,7 @@ router.post("/signin", async (req, res) => {
     }
   });
 });
+
 router.get("/new/token", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   if (cabecera.rol === "admin" || cabecera.rol === "cliente") {
@@ -3880,6 +3881,7 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
   }
 });
 
+// GET /tabla/historial-usuario/:id? - Obtiene el historial de cambios de usuarios
 router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -3923,7 +3925,7 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
       }
 
       const query = `
-        SELECT 
+        SELECT
           h.id,
           h.usuario_id,
           CONCAT(u.nombre, ' ', u.apellido) as usuario_nombre,
@@ -3974,6 +3976,106 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener el historial de usuarios");
+  }
+});
+
+// GET /tabla/historial-departamental/:id? - Obtiene el historial de cambios de departamentales
+router.get("/tabla/historial-departamental/:id?", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const departamentalId = req.params.id;
+    const page = req.query.page ? Number(req.query.page) : 1;
+    const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 20;
+    const start = (page - 1) * resultsPerPage;
+
+    const operacion = req.query.operacion;
+    const campoAfectado = req.query.campo_afectado;
+    const fechaDesde = req.query.fecha_desde;
+    const fechaHasta = req.query.fecha_hasta;
+
+    let whereClause = "";
+    let params = [];
+
+    if (departamentalId) {
+      whereClause += " WHERE h.departamental_id = ?";
+      params.push(departamentalId);
+    }
+
+    if (operacion) {
+      whereClause += whereClause ? " AND" : " WHERE";
+      whereClause += " h.operacion = ?";
+      params.push(operacion);
+    }
+
+    if (campoAfectado) {
+      whereClause += whereClause ? " AND" : " WHERE";
+      whereClause += " h.campo_afectado = ?";
+      params.push(campoAfectado);
+    }
+
+    if (fechaDesde) {
+      whereClause += whereClause ? " AND" : " WHERE";
+      whereClause += " h.fecha_cambio >= ?";
+      params.push(fechaDesde);
+    }
+
+    if (fechaHasta) {
+      whereClause += whereClause ? " AND" : " WHERE";
+      whereClause += " h.fecha_cambio <= ?";
+      params.push(fechaHasta + ' 23:59:59');
+    }
+
+    const query = `
+      SELECT
+        h.id,
+        h.departamental_id,
+        d.nombre as departamental_nombre,
+        d.direccion as departamental_direccion,
+        d.localidad as departamental_localidad,
+        h.operacion,
+        h.campo_afectado,
+        h.valor_anterior,
+        h.valor_nuevo,
+        h.usuario_id,
+        CONCAT(u.nombre, ' ', u.apellido) as usuario_nombre,
+        DATE_FORMAT(h.fecha_cambio, '%d/%m/%Y %H:%i:%s') as fecha_cambio
+      FROM historial_departamental h
+      INNER JOIN departamental d ON h.departamental_id = d.id
+      LEFT JOIN usuario u ON h.usuario_id = u.id
+      ${whereClause}
+      ORDER BY h.fecha_cambio DESC
+      LIMIT ${start}, ${resultsPerPage}
+    `;
+
+    const [rows] = await mysqlConnection.promise().execute(query, params);
+
+    // Consulta para el total de registros
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM historial_departamental h
+      INNER JOIN departamental d ON h.departamental_id = d.id
+      ${whereClause}
+    `;
+
+    const [countRows] = await mysqlConnection.promise().execute(countQuery, params);
+    const total = countRows[0].total;
+    const numOfPages = Math.ceil(total / resultsPerPage);
+
+    res.status(200).json({
+      results: rows,
+      numOfPages,
+      totalItems: total,
+      page: page - 1,
+      pageSize: resultsPerPage
+    });
+
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener el historial de departamentales");
   }
 });
 
@@ -4874,7 +4976,7 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
         usuarioData.foto_data = null;
       }
     }
-
+    
     res.status(200).json({
       success: true,
       data: usuarioData
@@ -5218,6 +5320,338 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
     res.status(500).json({
       success: false,
       message: "Error al actualizar el usuario"
+    });
+  }
+});
+
+// POST /configuracion/usuario - Crear nuevo usuario
+router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto'), async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+
+    // Verificar permisos - solo admin y departamental pueden crear usuarios
+    if (cabecera.rol !== "admin" && cabecera.rol !== "departamental") {
+      return res.status(403).json({
+        success: false,
+        message: "No tienes permisos para crear usuarios"
+      });
+    }
+
+    // Validar campos requeridos
+    if (!req.body.nombre || !req.body.apellido || !req.body.email || !req.body.documento) {
+      return res.status(400).json({
+        success: false,
+        message: "Faltan campos requeridos: nombre, apellido, email y documento son obligatorios"
+      });
+    }
+
+    let connection;
+    try {
+      connection = await mysqlConnection.promise().getConnection();
+      await connection.beginTransaction();
+
+      // Determinar qué campos puede asignar según el rol
+      let camposPermitidos = [];
+      let valorDefectoRol = null;
+      let valorDefectoDepartamental = null;
+
+      if (cabecera.rol === "admin") {
+        camposPermitidos = [
+          'rol_id', 'departamental_id', 'tipo_persona_id', 'nombre', 'apellido',
+          'fecha_nacimiento', 'documento', 'password', 'email', 'telefono',
+          'legajo', 'foto_archivo', 'habilitado'
+        ];
+      } else if (cabecera.rol === "departamental") {
+        // Departamental puede crear usuarios pero con restricciones
+        camposPermitidos = [
+          'tipo_persona_id', 'nombre', 'apellido', 'fecha_nacimiento',
+          'documento', 'password', 'email', 'telefono', 'legajo',
+          'foto_archivo', 'habilitado'
+        ];
+        // Asignar automáticamente rol afiliado y su departamento
+        const [rolAfiliado] = await connection.query(
+          "SELECT id FROM rol WHERE nombre = 'afiliado' LIMIT 1"
+        );
+        if (rolAfiliado.length > 0) {
+          valorDefectoRol = rolAfiliado[0].id;
+        }
+        valorDefectoDepartamental = cabecera.id;
+      }
+
+      // Preparar campos para insertar
+      const insertFields = [];
+      const insertPlaceholders = [];
+      const insertValues = [];
+      const cambios = [];
+
+      // Función auxiliar para formatear fechas
+      const formatearFecha = (fecha) => {
+        if (!fecha) return null;
+        try {
+          const fechaObj = new Date(fecha);
+          if (isNaN(fechaObj.getTime())) return null;
+          return fechaObj.toISOString().split('T')[0];
+        } catch (error) {
+          return null;
+        }
+      };
+
+      // Procesar rol_id
+      if (camposPermitidos.includes('rol_id') && req.body.rol_id !== undefined) {
+        const nuevoValor = req.body.rol_id ? parseInt(req.body.rol_id) : null;
+        insertFields.push('rol_id');
+        insertPlaceholders.push('?');
+        insertValues.push(nuevoValor);
+        cambios.push({
+          campo: 'rol_id',
+          valorAnterior: null,
+          valorNuevo: nuevoValor
+        });
+      } else if (valorDefectoRol !== null) {
+        insertFields.push('rol_id');
+        insertPlaceholders.push('?');
+        insertValues.push(valorDefectoRol);
+        cambios.push({
+          campo: 'rol_id',
+          valorAnterior: null,
+          valorNuevo: valorDefectoRol
+        });
+      }
+
+      // Procesar departamental_id
+      if (camposPermitidos.includes('departamental_id') && req.body.departamental_id !== undefined) {
+        const nuevoValor = req.body.departamental_id ? parseInt(req.body.departamental_id) : null;
+        insertFields.push('departamental_id');
+        insertPlaceholders.push('?');
+        insertValues.push(nuevoValor);
+        cambios.push({
+          campo: 'departamental_id',
+          valorAnterior: null,
+          valorNuevo: nuevoValor
+        });
+      } else if (valorDefectoDepartamental !== null) {
+        insertFields.push('departamental_id');
+        insertPlaceholders.push('?');
+        insertValues.push(valorDefectoDepartamental);
+        cambios.push({
+          campo: 'departamental_id',
+          valorAnterior: null,
+          valorNuevo: valorDefectoDepartamental
+        });
+      }
+
+      // Procesar tipo_persona_id
+      if (camposPermitidos.includes('tipo_persona_id') && req.body.tipo_persona_id !== undefined) {
+        const nuevoValor = req.body.tipo_persona_id ? parseInt(req.body.tipo_persona_id) : null;
+        insertFields.push('tipo_persona_id');
+        insertPlaceholders.push('?');
+        insertValues.push(nuevoValor);
+        cambios.push({
+          campo: 'tipo_persona_id',
+          valorAnterior: null,
+          valorNuevo: nuevoValor
+        });
+      }
+
+      // Procesar nombre (requerido)
+      insertFields.push('nombre');
+      insertPlaceholders.push('?');
+      insertValues.push(req.body.nombre);
+      cambios.push({
+        campo: 'nombre',
+        valorAnterior: null,
+        valorNuevo: req.body.nombre
+      });
+
+      // Procesar apellido (requerido)
+      insertFields.push('apellido');
+      insertPlaceholders.push('?');
+      insertValues.push(req.body.apellido);
+      cambios.push({
+        campo: 'apellido',
+        valorAnterior: null,
+        valorNuevo: req.body.apellido
+      });
+
+      // Procesar fecha_nacimiento
+      if (camposPermitidos.includes('fecha_nacimiento') && req.body.fecha_nacimiento !== undefined) {
+        const fechaFormateada = formatearFecha(req.body.fecha_nacimiento);
+        insertFields.push('fecha_nacimiento');
+        insertPlaceholders.push('?');
+        insertValues.push(fechaFormateada);
+        cambios.push({
+          campo: 'fecha_nacimiento',
+          valorAnterior: null,
+          valorNuevo: fechaFormateada
+        });
+      }
+
+      // Procesar documento (requerido)
+      const documentoValor = req.body.documento ? parseInt(req.body.documento) : null;
+      insertFields.push('documento');
+      insertPlaceholders.push('?');
+      insertValues.push(documentoValor);
+      cambios.push({
+        campo: 'documento',
+        valorAnterior: null,
+        valorNuevo: documentoValor
+      });
+
+      // Procesar email (requerido)
+      insertFields.push('email');
+      insertPlaceholders.push('?');
+      insertValues.push(req.body.email);
+      cambios.push({
+        campo: 'email',
+        valorAnterior: null,
+        valorNuevo: req.body.email
+      });
+
+      // Verificar si el email ya existe
+      const [emailExistente] = await connection.query(
+        "SELECT id FROM usuario WHERE email = ?",
+        [req.body.email]
+      );
+
+      if (emailExistente.length > 0) {
+        await connection.rollback();
+        return res.status(400).json({
+          success: false,
+          message: "Ya existe un usuario con este email"
+        });
+      }
+
+      // Procesar telefono
+      if (camposPermitidos.includes('telefono') && req.body.telefono !== undefined) {
+        insertFields.push('telefono');
+        insertPlaceholders.push('?');
+        insertValues.push(req.body.telefono || null);
+        cambios.push({
+          campo: 'telefono',
+          valorAnterior: null,
+          valorNuevo: req.body.telefono || null
+        });
+      }
+
+      // Procesar legajo
+      if (camposPermitidos.includes('legajo') && req.body.legajo !== undefined) {
+        insertFields.push('legajo');
+        insertPlaceholders.push('?');
+        insertValues.push(req.body.legajo || null);
+        cambios.push({
+          campo: 'legajo',
+          valorAnterior: null,
+          valorNuevo: req.body.legajo || null
+        });
+      }
+
+      // Procesar habilitado (por defecto true)
+      if (camposPermitidos.includes('habilitado')) {
+        const habilitadoValor = req.body.habilitado !== undefined ? req.body.habilitado : true;
+        insertFields.push('habilitado');
+        insertPlaceholders.push('?');
+        insertValues.push(habilitadoValor);
+        cambios.push({
+          campo: 'habilitado',
+          valorAnterior: null,
+          valorNuevo: habilitadoValor
+        });
+      }
+
+      // Procesar password (si viene, sino generar una por defecto o dejarla opcional)
+      if (camposPermitidos.includes('password')) {
+        const passwordTexto = req.body.password && req.body.password.trim() !== ''
+          ? req.body.password
+          : req.body.documento ? req.body.documento.toString() : '123456';
+
+        const passwordHash = await bcryptjs.hash(passwordTexto, 8);
+        insertFields.push('password');
+        insertPlaceholders.push('?');
+        insertValues.push(passwordHash);
+        cambios.push({
+          campo: 'password',
+          valorAnterior: null,
+          valorNuevo: '[ESTABLECIDO]'
+        });
+      }
+
+      // Procesar foto si viene
+      let nombreArchivo = null;
+      if (camposPermitidos.includes('foto_archivo') && req.file) {
+        try {
+          // Generar nombre único para la foto
+          const fotoHash = crypto.randomBytes(16).toString('hex');
+          const extension = req.file.originalname.split('.').pop();
+          nombreArchivo = `perfil_${fotoHash}.${extension}`;
+          const rutaArchivo = path.join(__dirname, '../../imagenes', nombreArchivo);
+
+          // Guardar archivo en disco
+          fs.writeFileSync(rutaArchivo, req.file.buffer);
+
+          insertFields.push('foto_archivo');
+          insertPlaceholders.push('?');
+          insertValues.push(nombreArchivo);
+          cambios.push({
+            campo: 'foto_archivo',
+            valorAnterior: null,
+            valorNuevo: nombreArchivo
+          });
+        } catch (fotoError) {
+          console.error('Error guardando foto:', fotoError);
+          await connection.rollback();
+          return res.status(500).json({
+            success: false,
+            message: "Error al guardar la foto"
+          });
+        }
+      }
+
+      // Ejecutar inserción
+      const insertQuery = `INSERT INTO usuario (${insertFields.join(', ')}) VALUES (${insertPlaceholders.join(', ')})`;
+      const [result] = await connection.query(insertQuery, insertValues);
+
+      const nuevoUsuarioId = result.insertId;
+
+      // Registrar en el historial
+      if (cambios.length > 0) {
+        await registrarHistorial(
+          connection,
+          nuevoUsuarioId,
+          'CREATE',
+          'usuario',
+          cabecera.id,
+          req,
+          cambios,
+          'Creación de nuevo usuario'
+        );
+      }
+
+      await connection.commit();
+
+      res.status(201).json({
+        success: true,
+        message: "Usuario creado correctamente",
+        data: {
+          id: nuevoUsuarioId
+        }
+      });
+
+    } catch (createError) {
+      if (connection) {
+        await connection.rollback();
+      }
+      throw createError;
+    } finally {
+      if (connection) {
+        connection.release();
+      }
+    }
+
+  } catch (error) {
+    console.log(error);
+    res.status(500).json({
+      success: false,
+      message: "Error al crear el usuario"
     });
   }
 });
