@@ -1094,7 +1094,15 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
-      const { fecha_inicio, fecha_fin, servicio_id, recurso_id, personas } = req.body;
+      const {
+        fecha_inicio,
+        fecha_fin,
+        servicio_id,
+        recurso_id,
+        personas,
+        regimen_id,
+        adicionales
+      } = req.body;
 
       if (!fecha_inicio || !fecha_fin || !servicio_id || !recurso_id || !personas || personas.length === 0) {
         return res.status(400).json("Faltan campos requeridos");
@@ -1110,16 +1118,34 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
         return res.status(400).json("El rango de fechas no es válido");
       }
 
+      const pool = mysqlConnection.promise();
+      const regimenIdSolicitud = regimen_id || (Array.isArray(personas) && personas.length > 0 ? personas[0].regimen_id : null);
+      const adicionalesSeleccionados = Array.isArray(adicionales)
+        ? adicionales
+            .map(adicional => ({
+              adicional_id: adicional.adicional_id,
+              cantidad: Number(adicional.cantidad)
+            }))
+            .filter(adicional => adicional.adicional_id && adicional.cantidad > 0)
+        : [];
+
+      if (adicionalesSeleccionados.length > 0 && !regimenIdSolicitud) {
+        return res.status(400).json("Se requiere el régimen para calcular los adicionales");
+      }
+
+      const cacheAdicionales = new Map();
+
       // Array para almacenar el resultado
       const fechasConTarifa = [];
 
       // Verificar que el recurso pertenezca al servicio
-      const [recursoValido] = await mysqlConnection
-        .promise()
-        .query(`
+      const [recursoValido] = await pool.query(
+        `
           SELECT id FROM recurso 
           WHERE id = ? AND servicio_id = ?
-        `, [recurso_id, servicio_id]);
+        `,
+        [recurso_id, servicio_id]
+      );
 
       if (recursoValido.length === 0) {
         return res.status(404).json("El recurso no pertenece al servicio especificado");
@@ -1131,15 +1157,14 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
         fechaActual.setDate(fechaInicioSolicitud.getDate() + dia);
 
         const fechaString = fechaActual.toISOString().split('T')[0];
-        let precioTotalDia = 0;
+        let precioBaseDia = 0;
         let todasPersonasTienenTarifa = true;
 
         // Calcular tarifa por cada persona para este día específico
         for (const persona of personas) {
           // Buscar tarifa válida para esta persona en este día específico
-          const [tarifasPersona] = await mysqlConnection
-            .promise()
-            .query(`
+          const [tarifasPersona] = await pool.query(
+            `
               SELECT precio
               FROM tarifa 
               WHERE recurso_id = ? 
@@ -1151,7 +1176,8 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
                 AND fecha_fin >= ?
               ORDER BY fecha_inicio ASC
               LIMIT 1
-            `, [
+            `,
+            [
               recurso_id,
               persona.tipo_persona_id,
               persona.regimen_id,
@@ -1159,7 +1185,8 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
               persona.edad,
               fechaString,
               fechaString
-            ]);
+            ]
+          );
 
           if (tarifasPersona.length === 0) {
             // No hay tarifa válida para esta persona en este día
@@ -1167,14 +1194,48 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
             break;
           }
 
-          precioTotalDia += tarifasPersona[0].precio;
+          precioBaseDia += tarifasPersona[0].precio;
         }
 
-        // Agregar el resultado para este día
-        fechasConTarifa.push({
+        let totalExtrasDia = 0;
+        const extrasDia = [];
+
+        if (todasPersonasTienenTarifa && adicionalesSeleccionados.length > 0 && regimenIdSolicitud) {
+          for (const adicional of adicionalesSeleccionados) {
+            const precioVigente = await obtenerPrecioAdicional(
+              pool,
+              cacheAdicionales,
+              recurso_id,
+              regimenIdSolicitud,
+              adicional.adicional_id,
+              fechaString
+            );
+
+            if (precioVigente === null) {
+              continue;
+            }
+
+            const subtotalExtra = precioVigente * adicional.cantidad;
+            totalExtrasDia += subtotalExtra;
+            extrasDia.push({
+              adicional_id: adicional.adicional_id,
+              cantidad: adicional.cantidad,
+              precio_unitario: precioVigente,
+              subtotal: subtotalExtra
+            });
+          }
+        }
+
+        const respuestaDia = {
           fecha: fechaString,
-          precio: todasPersonasTienenTarifa ? precioTotalDia : null
-        });
+          precio: todasPersonasTienenTarifa ? precioBaseDia + totalExtrasDia : null
+        };
+
+        if (extrasDia.length > 0) {
+          respuestaDia.extras = extrasDia;
+        }
+
+        fechasConTarifa.push(respuestaDia);
       }
 
       res.status(200).json(fechasConTarifa);
@@ -1184,6 +1245,51 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener las tarifas por fecha");
+  }
+});
+
+router.post("/reserva/adicionales", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const { recurso_id, regimen_id, fecha_inicio, fecha_fin } = req.body;
+
+      if (!recurso_id || !regimen_id || !fecha_inicio || !fecha_fin) {
+        return res.status(400).json("Faltan campos requeridos");
+      }
+
+      const [adicionales] = await mysqlConnection
+        .promise()
+        .query(
+          `
+            SELECT 
+              ta.adicional_id,
+              a.nombre,
+              ta.precio,
+              ta.fecha_inicio,
+              ta.fecha_fin
+            FROM tarifa_adicional ta
+            INNER JOIN adicional a ON a.id = ta.adicional_id
+            WHERE ta.recurso_id = ?
+              AND ta.regimen_id = ?
+              AND ta.fecha_inicio <= ?
+              AND ta.fecha_fin >= ?
+            ORDER BY ta.fecha_inicio ASC
+          `,
+          [recurso_id, regimen_id, fecha_inicio, fecha_fin]
+        );
+        
+      res.status(200).json(adicionales);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los adicionales para la reserva");
   }
 });
 
@@ -1240,6 +1346,205 @@ async function registrarHistorial(connection, usuarioId, tipoOperacion, tablaAfe
   }
 }
 
+const DIA_EN_MS = 1000 * 60 * 60 * 24;
+
+async function obtenerPrecioAdicional(db, cache, recursoId, regimenId, adicionalId, fecha) {
+  const cacheKey = `${recursoId}-${regimenId}-${adicionalId}-${fecha}`;
+  if (cache.has(cacheKey)) {
+    return cache.get(cacheKey);
+  }
+
+  const [rows] = await db.query(
+    `
+      SELECT precio
+      FROM tarifa_adicional
+      WHERE recurso_id = ?
+        AND regimen_id = ?
+        AND adicional_id = ?
+        AND fecha_inicio <= ?
+        AND fecha_fin >= ?
+      ORDER BY fecha_inicio DESC
+      LIMIT 1
+    `,
+    [recursoId, regimenId, adicionalId, fecha, fecha]
+  );
+
+  const precio = rows.length > 0 ? Number(rows[0].precio) : null;
+  cache.set(cacheKey, precio);
+  return precio;
+}
+
+async function obtenerNombreAdicional(connection, cache, adicionalId) {
+  if (cache.has(adicionalId)) {
+    return cache.get(adicionalId);
+  }
+
+  const [rows] = await connection.query(
+    "SELECT nombre FROM adicional WHERE id = ? LIMIT 1",
+    [adicionalId]
+  );
+
+  const nombre = rows.length > 0 ? rows[0].nombre : "Adicional";
+  cache.set(adicionalId, nombre);
+  return nombre;
+}
+
+async function calcularAdicionalesReserva(connection, adicionales, recursoId, regimenId, fechaInicio, fechaFin) {
+  if (!Array.isArray(adicionales) || adicionales.length === 0) {
+    return { total: 0, items: [] };
+  }
+
+  const fechaInicioDate = new Date(fechaInicio);
+  const fechaFinDate = new Date(fechaFin);
+  const diasTotales = Math.ceil((fechaFinDate - fechaInicioDate) / DIA_EN_MS);
+
+  if (diasTotales <= 0) {
+    return { total: 0, items: [] };
+  }
+
+  const cachePrecios = new Map();
+  const cacheNombres = new Map();
+  const items = [];
+  let total = 0;
+
+  for (const adicional of adicionales) {
+    if (!adicional) {
+      continue;
+    }
+
+    const adicionalId = adicional.adicional_id || adicional.adicionalId;
+    const cantidad = Number(adicional.cantidad);
+
+    if (!adicionalId || !cantidad || cantidad <= 0) {
+      continue;
+    }
+
+    const nombreAdicional = await obtenerNombreAdicional(connection, cacheNombres, adicionalId);
+    const detalles = [];
+    let subtotal = 0;
+
+    for (let dia = 0; dia < diasTotales; dia++) {
+      const fechaActual = new Date(fechaInicioDate);
+      fechaActual.setDate(fechaInicioDate.getDate() + dia);
+      const fechaString = fechaActual.toISOString().split('T')[0];
+
+      const precioDia = await obtenerPrecioAdicional(connection, cachePrecios, recursoId, regimenId, adicionalId, fechaString);
+
+      if (precioDia === null) {
+        throw new Error(`No hay una tarifa de adicional vigente para la fecha ${fechaString}`);
+      }
+
+      const subtotalDia = precioDia * cantidad;
+      subtotal += subtotalDia;
+      detalles.push({
+        fecha: fechaString,
+        cantidad,
+        precio_unitario: precioDia,
+        subtotal: subtotalDia
+      });
+    }
+
+    items.push({
+      adicional_id: adicionalId,
+      nombre_adicional: nombreAdicional,
+      cantidad,
+      dias: detalles.length,
+      precio_referencia: detalles.length > 0 ? detalles[0].precio_unitario : 0,
+      subtotal,
+      detalles
+    });
+
+    total += subtotal;
+  }
+
+  return { total, items };
+}
+
+async function guardarAdicionalesReserva(connection, reservaId, adicionalesProcesados) {
+  if (!Array.isArray(adicionalesProcesados) || adicionalesProcesados.length === 0) {
+    return;
+  }
+
+  for (const adicional of adicionalesProcesados) {
+    const [resultado] = await connection.query(
+      `INSERT INTO reserva_adicional
+        (reserva_id, adicional_id, nombre_adicional, cantidad, precio_unitario, dias, subtotal)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        reservaId,
+        adicional.adicional_id,
+        adicional.nombre_adicional,
+        adicional.cantidad,
+        adicional.precio_referencia,
+        adicional.dias,
+        adicional.subtotal
+      ]
+    );
+
+    const reservaAdicionalId = resultado.insertId;
+    for (const detalle of adicional.detalles) {
+      await connection.query(
+        `INSERT INTO reserva_adicional_detalle
+          (reserva_adicional_id, fecha, cantidad, precio_unitario, subtotal)
+         VALUES (?, ?, ?, ?, ?)`,
+        [
+          reservaAdicionalId,
+          detalle.fecha,
+          detalle.cantidad,
+          detalle.precio_unitario,
+          detalle.subtotal
+        ]
+      );
+    }
+  }
+}
+
+async function obtenerAdicionalesReserva(connection, reservaId) {
+  const [adicionales] = await connection.query(
+    `SELECT id, adicional_id, nombre_adicional, cantidad, precio_unitario, dias, subtotal
+     FROM reserva_adicional
+     WHERE reserva_id = ?`,
+    [reservaId]
+  );
+
+  if (adicionales.length === 0) {
+    return [];
+  }
+
+  const ids = adicionales.map(a => a.id);
+  const [detalles] = await connection.query(
+    `SELECT reserva_adicional_id, fecha, cantidad, precio_unitario, subtotal
+     FROM reserva_adicional_detalle
+     WHERE reserva_adicional_id IN (?)
+     ORDER BY fecha ASC`,
+    [ids]
+  );
+
+  const detallesMap = new Map();
+  for (const detalle of detalles) {
+    if (!detallesMap.has(detalle.reserva_adicional_id)) {
+      detallesMap.set(detalle.reserva_adicional_id, []);
+    }
+    detallesMap.get(detalle.reserva_adicional_id).push({
+      fecha: detalle.fecha,
+      cantidad: detalle.cantidad,
+      precio_unitario: Number(detalle.precio_unitario),
+      subtotal: Number(detalle.subtotal)
+    });
+  }
+
+  return adicionales.map(adicional => ({
+    id: adicional.id,
+    adicional_id: adicional.adicional_id,
+    nombre: adicional.nombre_adicional,
+    cantidad: adicional.cantidad,
+    precio_unitario: Number(adicional.precio_unitario),
+    dias: adicional.dias,
+    subtotal: Number(adicional.subtotal),
+    fechas: detallesMap.get(adicional.id) || []
+  }));
+}
+
 router.post("/reserva", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -1262,13 +1567,19 @@ router.post("/reserva", verifyToken, async (req, res) => {
         ninos,
         bebes,
         total_tarifa,
-        firma
+        firma,
+        adicionales
       } = req.body;
 
       // Validar campos requeridos
       if (!nombre || !fecha_inicio || !fecha_fin || !servicio_id || !recurso_id ||
         !regimen_id || !personas || personas.length === 0 || !total_tarifa) {
         return res.status(400).json("Faltan campos requeridos");
+      }
+
+      const totalTarifaBase = Number(total_tarifa);
+      if (Number.isNaN(totalTarifaBase)) {
+        return res.status(400).json("El total de la tarifa no es válido");
       }
 
       let connection;
@@ -1319,6 +1630,28 @@ router.post("/reserva", verifyToken, async (req, res) => {
           usuarioFamiliarPrincipalId = currentUserId;
           // Usar el departamental_id del usuario principal de la familia
           departamentalId = currentDepartamentalId;
+        }
+
+        const adicionalesSeleccionados = Array.isArray(adicionales) ? adicionales : [];
+        let montoAdicionales = 0;
+        let adicionalesProcesados = [];
+
+        if (adicionalesSeleccionados.length > 0) {
+          try {
+            const resultadoAdicionales = await calcularAdicionalesReserva(
+              connection,
+              adicionalesSeleccionados,
+              recurso_id,
+              regimen_id,
+              fecha_inicio,
+              fecha_fin
+            );
+            montoAdicionales = resultadoAdicionales.total;
+            adicionalesProcesados = resultadoAdicionales.items;
+          } catch (adicionalError) {
+            await connection.rollback();
+            return res.status(400).json(adicionalError.message || "No se pudieron calcular los adicionales");
+          }
         }
 
         // Crear o buscar usuarios para cada persona
@@ -1376,24 +1709,31 @@ router.post("/reserva", verifyToken, async (req, res) => {
         }
 
         // Insertar reserva principal
+        const precioTotalReserva = totalTarifaBase + montoAdicionales;
+
         const [reservaResult] = await connection.query(
           `INSERT INTO reserva (
             regimen_id, recurso_id, usuario_id,
-            firma_archivo, precio_total, fecha_inicio, fecha_fin, observaciones
-          ) VALUES ( ?, ?, ?, ?, ?, ?, ?, ?)`,
+            firma_archivo, precio_total, fecha_inicio, fecha_fin, observaciones, monto_adicionales
+          ) VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             regimen_id,
             recurso_id,
             cabecera.id,
             firmaArchivo,
-            total_tarifa,
+            precioTotalReserva,
             fecha_inicio,
             fecha_fin,
-            observaciones || null
+            observaciones || null,
+            montoAdicionales
           ]
         );
 
         const reservaId = reservaResult.insertId;
+
+        if (adicionalesProcesados.length > 0) {
+          await guardarAdicionalesReserva(connection, reservaId, adicionalesProcesados);
+        }
 
         // Insertar reserva_familiar para cada persona
         const reservasFamiliaresIds = [];
@@ -1478,7 +1818,8 @@ router.post("/reserva", verifyToken, async (req, res) => {
           numero_reserva: numeroReserva,
           estado: "Confirmada",
           mensaje: "Reserva creada exitosamente",
-          fecha_creacion: new Date().toISOString()
+          fecha_creacion: new Date().toISOString(),
+          monto_adicionales: montoAdicionales
         });
 
       } catch (transactionError) {
@@ -1518,7 +1859,9 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         regimen_id,
         personas,
         viaja_titular,
-        firma_base64
+        firma_base64,
+        total_tarifa,
+        adicionales
       } = req.body;
 
       // Validar campos requeridos
@@ -1528,6 +1871,17 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           success: false,
           message: "Faltan campos requeridos"
         });
+      }
+
+      let tarifaBaseDesdeRequest = null;
+      if (total_tarifa !== undefined) {
+        tarifaBaseDesdeRequest = Number(total_tarifa);
+        if (Number.isNaN(tarifaBaseDesdeRequest)) {
+          return res.status(400).json({
+            success: false,
+            message: "El total de la tarifa no es válido"
+          });
+        }
       }
 
       let connection;
@@ -1601,6 +1955,31 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           departamentalId = currentDepartamentalId;
         }
 
+        const adicionalesSeleccionados = Array.isArray(adicionales) ? adicionales : [];
+        let montoAdicionales = 0;
+        let adicionalesProcesados = [];
+
+        if (adicionalesSeleccionados.length > 0) {
+          try {
+            const resultadoAdicionales = await calcularAdicionalesReserva(
+              connection,
+              adicionalesSeleccionados,
+              recurso_id,
+              regimen_id,
+              fecha_inicio,
+              fecha_fin
+            );
+            montoAdicionales = resultadoAdicionales.total;
+            adicionalesProcesados = resultadoAdicionales.items;
+          } catch (adicionalError) {
+            await connection.rollback();
+            return res.status(400).json({
+              success: false,
+              message: adicionalError.message || "No se pudieron calcular los adicionales"
+            });
+          }
+        }
+
         // Calcular tarifa total
         let tarifaTotal = 0;
         for (const persona of personas) {
@@ -1608,6 +1987,9 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
             tarifaTotal += persona.tarifa_individual;
           }
         }
+
+        const tarifaBase = tarifaBaseDesdeRequest !== null ? tarifaBaseDesdeRequest : tarifaTotal;
+        const precioTotalReserva = tarifaBase + montoAdicionales;
 
         // Actualizar reserva principal
         const updateReservaQuery = `
@@ -1619,6 +2001,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
             fecha_inicio = ?, 
             fecha_fin = ?, 
             observaciones = ?,
+            monto_adicionales = ?,
             estado_reserva_id = 1
           WHERE id = ?
         `;
@@ -1627,10 +2010,11 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           regimen_id,
           recurso_id,
           ...(firmaArchivo ? [firmaArchivo] : []),
-          tarifaTotal,
+          precioTotalReserva,
           fecha_inicio,
           fecha_fin,
           observaciones || null,
+          montoAdicionales,
           reservaId
         ];
 
@@ -1644,6 +2028,11 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
 
         await connection.query(
           "DELETE FROM reserva_familiar WHERE reserva_id = ?",
+          [reservaId]
+        );
+
+        await connection.query(
+          "DELETE FROM reserva_adicional WHERE reserva_id = ?",
           [reservaId]
         );
 
@@ -1929,6 +2318,10 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           }
         }
 
+        if (adicionalesProcesados.length > 0) {
+          await guardarAdicionalesReserva(connection, reservaId, adicionalesProcesados);
+        }
+
         // Confirmar transacción
         await connection.commit();
 
@@ -1938,7 +2331,8 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           success: true,
           message: "Reserva actualizada correctamente",
           numero_reserva: numeroReserva,
-          id: parseInt(reservaId)
+          id: parseInt(reservaId),
+          monto_adicionales: montoAdicionales
         });
 
       } catch (transactionError) {
@@ -1990,6 +2384,7 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
           SELECT 
             r.id,
             r.precio_total as total_tarifa,
+            r.monto_adicionales,
             r.fecha_inicio,
             r.fecha_fin,
             r.observaciones,
@@ -2105,6 +2500,11 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
           viaja_titular: viaja_titular
         };
 
+        const adicionalesReserva = await obtenerAdicionalesReserva(connection, reservaId);
+
+        respuesta.adicionales = adicionalesReserva;
+        respuesta.monto_adicionales = reserva.monto_adicionales || 0;
+
         res.status(200).json(respuesta);
 
       } catch (queryError) {
@@ -2147,6 +2547,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           SELECT 
             r.id,
             r.precio_total as total_tarifa,
+            r.monto_adicionales,
             r.fecha_inicio,
             r.fecha_fin,
             r.observaciones,
@@ -2250,6 +2651,8 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           tarifa_individual: persona.tarifa_individual
         }));
 
+        const adicionalesReserva = await obtenerAdicionalesReserva(connection, reservaId);
+
         // Generar número de reserva
         const numeroReserva = `${reserva.id}`;
 
@@ -2288,7 +2691,9 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           viaja_titular: viaja_titular,
           adultos: adultos,
           ninos: ninos,
-          bebes: bebes
+          bebes: bebes,
+          monto_adicionales: reserva.monto_adicionales || 0,
+          adicionales: adicionalesReserva
         };
 
         res.status(200).json(respuesta);
@@ -4387,6 +4792,7 @@ router.post("/temporada", verifyToken, async (req, res) => {
         );
 
         const temporadaId = temporadaResult.insertId;
+        const adicionalesPorTemporada = [];
 
         // Guardar historial de creación
         await guardarHistorialTemporada(
@@ -4407,6 +4813,38 @@ router.post("/temporada", verifyToken, async (req, res) => {
             for (const recurso of regimen.recursos) {
               // Procesar cada fecha del recurso
               for (const fecha of recurso.fechas) {
+                if (Array.isArray(fecha.adicionales) && fecha.adicionales.length > 0) {
+                  for (const adicional of fecha.adicionales) {
+                    if (!adicional || !adicional.adicionalId || adicional.precio === undefined || adicional.precio === null) {
+                      continue;
+                    }
+
+                    await connection.query(
+                      `
+                        INSERT INTO tarifa_adicional
+                          (temporada_tarifa_id, recurso_id, regimen_id, adicional_id, fecha_inicio, fecha_fin, precio)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                      `,
+                      [
+                        temporadaId,
+                        recurso.id,
+                        regimen.id,
+                        adicional.adicionalId,
+                        fecha.fecha_inicio,
+                        fecha.fecha_fin,
+                        adicional.precio
+                      ]
+                    );
+
+                    adicionalesPorTemporada.push({
+                      adicional_id: adicional.adicionalId,
+                      recurso_id: recurso.id,
+                      regimen_id: regimen.id,
+                      fecha_inicio: fecha.fecha_inicio,
+                      fecha_fin: fecha.fecha_fin
+                    });
+                  }
+                }
 
                 // Verificar si el precio es por persona o por recurso
                 if (recurso.precio_por_persona) {
@@ -4573,6 +5011,7 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
 
         // 3. Estructurar la respuesta según el formato requerido
         const serviciosMap = new Map();
+        const recursoRegimenMap = new Map();
 
         for (const tarifa of tarifasRows) {
           // Crear o obtener servicio
@@ -4609,6 +5048,9 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
             };
             regimen.recursos.push(recurso);
           }
+
+          const recursoKey = `${tarifa.regimen_id}-${tarifa.recurso_id}`;
+          recursoRegimenMap.set(recursoKey, recurso);
 
           // Normalizar fechas para evitar duplicados por comparar objetos Date diferentes
           const tarifaFechaInicioMs = new Date(tarifa.fecha_inicio).getTime();
@@ -4653,6 +5095,45 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
               precio: tarifa.precio
             });
           }
+        }
+
+        const [adicionalRows] = await connection.query(
+          `
+            SELECT recurso_id, regimen_id, adicional_id, fecha_inicio, fecha_fin, precio
+            FROM tarifa_adicional
+            WHERE temporada_tarifa_id = ?
+          `,
+          [id]
+        );
+
+        for (const adicional of adicionalRows) {
+          const recursoKey = `${adicional.regimen_id}-${adicional.recurso_id}`;
+          const recurso = recursoRegimenMap.get(recursoKey);
+          if (!recurso) {
+            continue;
+          }
+
+          const adicionalFechaInicio = new Date(adicional.fecha_inicio).getTime();
+          const adicionalFechaFin = new Date(adicional.fecha_fin).getTime();
+
+          const fecha = recurso.fechas.find(f => {
+            const fechaInicioMs = new Date(f.fecha_inicio).getTime();
+            const fechaFinMs = new Date(f.fecha_fin).getTime();
+            return fechaInicioMs === adicionalFechaInicio && fechaFinMs === adicionalFechaFin;
+          });
+
+          if (!fecha) {
+            continue;
+          }
+
+          if (!Array.isArray(fecha.adicionales)) {
+            fecha.adicionales = [];
+          }
+
+          fecha.adicionales.push({
+            adicionalId: adicional.adicional_id,
+            precio: Number(adicional.precio)
+          });
         }
 
         // 4. Construir respuesta final
@@ -4718,6 +5199,8 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
           [nombre_campania, fecha_inicio, fecha_fin, id]
         );
 
+        const adicionalesPorTemporada = [];
+
         // Guardar historial de actualización de temporada
         if (datosAnteriores.nombre !== nombre_campania ||
             datosAnteriores.fecha_inicio !== fecha_inicio ||
@@ -4757,13 +5240,67 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
           );
         }
 
+        const [adicionalesAnteriores] = await connection.query(
+          "SELECT id FROM tarifa_adicional WHERE temporada_tarifa_id = ?",
+          [id]
+        );
+
+        if (adicionalesAnteriores.length > 0) {
+          await guardarHistorialTemporada(
+            connection,
+            id,
+            cabecera.id,
+            'DELETE',
+            'tarifa_adicional',
+            JSON.stringify({ cantidad: adicionalesAnteriores.length }),
+            null
+          );
+        }
+
+        await connection.query(
+          "DELETE FROM tarifa_adicional WHERE temporada_tarifa_id = ?",
+          [id]
+        );
+
         // 4. Insertar las nuevas tarifas (mismo código que POST)
         for (const servicio of configuracion_servicios) {
           for (const regimen of servicio.regimenes) {
-            for (const recurso of regimen.recursos) {
-              for (const fecha of recurso.fechas) {
+              for (const recurso of regimen.recursos) {
+                for (const fecha of recurso.fechas) {
+                  if (Array.isArray(fecha.adicionales) && fecha.adicionales.length > 0) {
+                    for (const adicional of fecha.adicionales) {
+                      if (!adicional || !adicional.adicionalId || adicional.precio === undefined || adicional.precio === null) {
+                        continue;
+                      }
 
-                if (recurso.precio_por_persona) {
+                      await connection.query(
+                        `
+                          INSERT INTO tarifa_adicional
+                            (temporada_tarifa_id, recurso_id, regimen_id, adicional_id, fecha_inicio, fecha_fin, precio)
+                          VALUES (?, ?, ?, ?, ?, ?, ?)
+                        `,
+                        [
+                          id,
+                          recurso.id,
+                          regimen.id,
+                          adicional.adicionalId,
+                          fecha.fecha_inicio,
+                          fecha.fecha_fin,
+                          adicional.precio
+                        ]
+                      );
+
+                      adicionalesPorTemporada.push({
+                        adicional_id: adicional.adicionalId,
+                        recurso_id: recurso.id,
+                        regimen_id: regimen.id,
+                        fecha_inicio: fecha.fecha_inicio,
+                        fecha_fin: fecha.fecha_fin
+                      });
+                    }
+                  }
+
+                  if (recurso.precio_por_persona) {
                   for (const tipoPersona of fecha.tiposPersona) {
                     for (const rangoEdad of tipoPersona.rangosEdad) {
                       const [tarifaResult] = await connection.query(
@@ -4840,6 +5377,18 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
               }
             }
           }
+        }
+
+        if (adicionalesPorTemporada.length > 0) {
+          await guardarHistorialTemporada(
+            connection,
+            id,
+            cabecera.id,
+            'CREATE',
+            'tarifa_adicional',
+            null,
+            JSON.stringify({ registros: adicionalesPorTemporada.length })
+          );
         }
 
         // 5. Confirmar transacción
