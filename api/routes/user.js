@@ -3861,6 +3861,21 @@ router.get("/usuario", verifyToken, async (req, res) => {
   }
 });
 
+// Función auxiliar para guardar historial de cambios
+async function guardarHistorialTemporada(connection, temporadaId, usuarioId, operacion, campoAfectado, valorAnterior, valorNuevo) {
+  try {
+    await connection.query(
+      `INSERT INTO historial_temporada
+       (temporada_id, usuario_id, operacion, campo_afectado, valor_anterior, valor_nuevo, fecha_cambio)
+       VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+      [temporadaId, usuarioId, operacion, campoAfectado, valorAnterior, valorNuevo]
+    );
+  } catch (error) {
+    console.error("Error al guardar historial:", error);
+    // No lanzamos el error para que no afecte la operación principal
+  }
+}
+
 router.post("/temporada", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -3885,6 +3900,17 @@ router.post("/temporada", verifyToken, async (req, res) => {
 
         const temporadaId = temporadaResult.insertId;
 
+        // Guardar historial de creación
+        await guardarHistorialTemporada(
+          connection,
+          temporadaId,
+          cabecera.id,
+          'CREATE',
+          'temporada',
+          null,
+          JSON.stringify({ nombre_campania, fecha_inicio, fecha_fin })
+        );
+
         // 2. Procesar cada servicio
         for (const servicio of configuracion_servicios) {
           // Procesar cada régimen del servicio
@@ -3901,10 +3927,10 @@ router.post("/temporada", verifyToken, async (req, res) => {
                     // Procesar cada rango de edad del tipo de persona
                     for (const rangoEdad of tipoPersona.rangosEdad) {
                       // Insertar tarifa individual con tipos de persona
-                      await connection.query(
-                        `INSERT INTO tarifa 
-                         (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id, 
-                          edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona) 
+                      const [tarifaResult] = await connection.query(
+                        `INSERT INTO tarifa
+                         (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
+                          edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona)
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                         [
                           recurso.id,
@@ -3919,14 +3945,30 @@ router.post("/temporada", verifyToken, async (req, res) => {
                           'Y' // precio_por_persona como 'Y'
                         ]
                       );
+
+                      // Guardar historial de creación de tarifa
+                      await guardarHistorialTemporada(
+                        connection,
+                        temporadaId,
+                        cabecera.id,
+                        'CREATE',
+                        `tarifa_${tarifaResult.insertId}`,
+                        null,
+                        JSON.stringify({
+                          recurso_id: recurso.id,
+                          tipo_persona_id: tipoPersona.tipoPersonaId,
+                          regimen_id: regimen.id,
+                          precio: rangoEdad.precio
+                        })
+                      );
                     }
                   }
                 } else {
                   // Precio por recurso: insertar tarifa sin tipos de persona
-                  await connection.query(
-                    `INSERT INTO tarifa 
-                     (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id, 
-                      edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona) 
+                  const [tarifaResult] = await connection.query(
+                    `INSERT INTO tarifa
+                     (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
+                      edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                     [
                       recurso.id,
@@ -3940,6 +3982,21 @@ router.post("/temporada", verifyToken, async (req, res) => {
                       fecha.fecha_fin,
                       'N' // precio_por_persona como 'N'
                     ]
+                  );
+
+                  // Guardar historial de creación de tarifa
+                  await guardarHistorialTemporada(
+                    connection,
+                    temporadaId,
+                    cabecera.id,
+                    'CREATE',
+                    `tarifa_${tarifaResult.insertId}`,
+                    null,
+                    JSON.stringify({
+                      recurso_id: recurso.id,
+                      regimen_id: regimen.id,
+                      precio: fecha.precio
+                    })
                   );
                 }
               }
@@ -3973,6 +4030,349 @@ router.post("/temporada", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al crear la temporada");
+  }
+});
+
+// GET /temporada/:id - Obtener una temporada con toda su configuración
+router.get("/temporada/:id", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol === "admin") {
+      const { id } = req.params;
+
+      let connection;
+      connection = await mysqlConnection.promise().getConnection();
+
+      try {
+        // 1. Obtener datos de la temporada principal
+        const [temporadaRows] = await connection.query(
+          "SELECT id, nombre, fecha_inicio, fecha_fin FROM temporada_tarifa WHERE id = ?",
+          [id]
+        );
+
+        if (temporadaRows.length === 0) {
+          connection.release();
+          return res.status(404).json("Temporada no encontrada");
+        }
+
+        const temporada = temporadaRows[0];
+
+        // 2. Obtener todas las tarifas de la temporada con información relacionada
+        const [tarifasRows] = await connection.query(
+          `SELECT
+            t.id as tarifa_id,
+            t.recurso_id,
+            t.tipo_persona_id,
+            t.regimen_id,
+            t.edad_minima,
+            t.edad_maxima,
+            t.precio,
+            t.fecha_inicio,
+            t.fecha_fin,
+            t.precio_por_persona,
+            r.nombre as recurso_nombre,
+            r.servicio_id,
+            s.nombre as servicio_nombre,
+            reg.nombre as regimen_nombre
+          FROM tarifa t
+          JOIN recurso r ON t.recurso_id = r.id
+          JOIN servicio s ON r.servicio_id = s.id
+          JOIN regimen reg ON t.regimen_id = reg.id
+          WHERE t.temporada_tarifa_id = ?
+          ORDER BY s.id, reg.id, r.id, t.fecha_inicio`,
+          [id]
+        );
+
+        // 3. Estructurar la respuesta según el formato requerido
+        const serviciosMap = new Map();
+
+        for (const tarifa of tarifasRows) {
+          // Crear o obtener servicio
+          if (!serviciosMap.has(tarifa.servicio_id)) {
+            serviciosMap.set(tarifa.servicio_id, {
+              id: tarifa.servicio_id,
+              nombre: tarifa.servicio_nombre,
+              regimenes: []
+            });
+          }
+          const servicio = serviciosMap.get(tarifa.servicio_id);
+
+          // Buscar o crear régimen en el servicio
+          let regimen = servicio.regimenes.find(r => r.id === tarifa.regimen_id);
+          if (!regimen) {
+            regimen = {
+              id: tarifa.regimen_id,
+              nombre: tarifa.regimen_nombre,
+              recursos: []
+            };
+            servicio.regimenes.push(regimen);
+          }
+
+          // Buscar o crear recurso en el régimen
+          let recurso = regimen.recursos.find(r => r.id === tarifa.recurso_id);
+          if (!recurso) {
+            recurso = {
+              id: tarifa.recurso_id,
+              recurso: tarifa.recurso_nombre,
+              id_servicio: tarifa.servicio_id,
+              id_regimen: tarifa.regimen_id,
+              precio_por_persona: tarifa.precio_por_persona === 'Y',
+              fechas: []
+            };
+            regimen.recursos.push(recurso);
+          }
+
+          // Buscar o crear fecha en el recurso
+          let fecha = recurso.fechas.find(
+            f => f.fecha_inicio === tarifa.fecha_inicio && f.fecha_fin === tarifa.fecha_fin
+          );
+          if (!fecha) {
+            fecha = {
+              id: tarifa.tarifa_id,
+              fecha_inicio: tarifa.fecha_inicio,
+              fecha_fin: tarifa.fecha_fin,
+              precio: tarifa.precio_por_persona === 'N' ? tarifa.precio : null,
+              tiposPersona: [],
+              adicionales: [] // Los adicionales se pueden agregar después si es necesario
+            };
+            recurso.fechas.push(fecha);
+          }
+
+          // Si es precio por persona, agregar tipo de persona y rango de edad
+          if (tarifa.precio_por_persona === 'Y' && tarifa.tipo_persona_id) {
+            let tipoPersona = fecha.tiposPersona.find(
+              tp => tp.tipoPersonaId === tarifa.tipo_persona_id
+            );
+            if (!tipoPersona) {
+              tipoPersona = {
+                id: tarifa.tarifa_id,
+                tipoPersonaId: tarifa.tipo_persona_id,
+                rangosEdad: []
+              };
+              fecha.tiposPersona.push(tipoPersona);
+            }
+
+            tipoPersona.rangosEdad.push({
+              id: tarifa.tarifa_id,
+              edadMinima: tarifa.edad_minima,
+              edadMaxima: tarifa.edad_maxima,
+              precio: tarifa.precio
+            });
+          }
+        }
+
+        // 4. Construir respuesta final
+        const response = {
+          nombre_campania: temporada.nombre,
+          fecha_inicio: temporada.fecha_inicio,
+          fecha_fin: temporada.fecha_fin,
+          configuracion_servicios: Array.from(serviciosMap.values())
+        };
+
+        connection.release();
+        res.status(200).json(response);
+
+      } catch (queryError) {
+        if (connection) {
+          connection.release();
+        }
+        throw queryError;
+      }
+
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener la temporada");
+  }
+});
+
+// PUT /temporada/:id - Actualizar una temporada
+router.put("/temporada/:id", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol === "admin") {
+      const { id } = req.params;
+      const { nombre_campania, fecha_inicio, fecha_fin, configuracion_servicios } = req.body;
+
+      if (!nombre_campania || !fecha_inicio || !fecha_fin || !configuracion_servicios) {
+        return res.status(400).json("Faltan campos requeridos");
+      }
+
+      let connection;
+      connection = await mysqlConnection.promise().getConnection();
+      await connection.beginTransaction();
+
+      try {
+        // 1. Verificar que la temporada existe y obtener datos anteriores
+        const [temporadaAnterior] = await connection.query(
+          "SELECT nombre, fecha_inicio, fecha_fin FROM temporada_tarifa WHERE id = ?",
+          [id]
+        );
+
+        if (temporadaAnterior.length === 0) {
+          connection.release();
+          return res.status(404).json("Temporada no encontrada");
+        }
+
+        const datosAnteriores = temporadaAnterior[0];
+
+        // 2. Actualizar la temporada principal
+        await connection.query(
+          "UPDATE temporada_tarifa SET nombre = ?, fecha_inicio = ?, fecha_fin = ? WHERE id = ?",
+          [nombre_campania, fecha_inicio, fecha_fin, id]
+        );
+
+        // Guardar historial de actualización de temporada
+        if (datosAnteriores.nombre !== nombre_campania ||
+            datosAnteriores.fecha_inicio !== fecha_inicio ||
+            datosAnteriores.fecha_fin !== fecha_fin) {
+          await guardarHistorialTemporada(
+            connection,
+            id,
+            cabecera.id,
+            'UPDATE',
+            'temporada',
+            JSON.stringify(datosAnteriores),
+            JSON.stringify({ nombre_campania, fecha_inicio, fecha_fin })
+          );
+        }
+
+        // 3. Eliminar todas las tarifas existentes de esta temporada
+        const [tarifasAnteriores] = await connection.query(
+          "SELECT id FROM tarifa WHERE temporada_tarifa_id = ?",
+          [id]
+        );
+
+        if (tarifasAnteriores.length > 0) {
+          await connection.query(
+            "DELETE FROM tarifa WHERE temporada_tarifa_id = ?",
+            [id]
+          );
+
+          // Guardar historial de eliminación
+          await guardarHistorialTemporada(
+            connection,
+            id,
+            cabecera.id,
+            'DELETE',
+            'tarifas',
+            JSON.stringify({ cantidad: tarifasAnteriores.length }),
+            null
+          );
+        }
+
+        // 4. Insertar las nuevas tarifas (mismo código que POST)
+        for (const servicio of configuracion_servicios) {
+          for (const regimen of servicio.regimenes) {
+            for (const recurso of regimen.recursos) {
+              for (const fecha of recurso.fechas) {
+
+                if (recurso.precio_por_persona) {
+                  for (const tipoPersona of fecha.tiposPersona) {
+                    for (const rangoEdad of tipoPersona.rangosEdad) {
+                      const [tarifaResult] = await connection.query(
+                        `INSERT INTO tarifa
+                         (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
+                          edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                        [
+                          recurso.id,
+                          tipoPersona.tipoPersonaId,
+                          regimen.id,
+                          id,
+                          rangoEdad.edadMinima,
+                          rangoEdad.edadMaxima,
+                          rangoEdad.precio,
+                          fecha.fecha_inicio,
+                          fecha.fecha_fin,
+                          'Y'
+                        ]
+                      );
+
+                      // Guardar historial de creación de nueva tarifa
+                      await guardarHistorialTemporada(
+                        connection,
+                        id,
+                        cabecera.id,
+                        'CREATE',
+                        `tarifa_${tarifaResult.insertId}`,
+                        null,
+                        JSON.stringify({
+                          recurso_id: recurso.id,
+                          tipo_persona_id: tipoPersona.tipoPersonaId,
+                          regimen_id: regimen.id,
+                          precio: rangoEdad.precio
+                        })
+                      );
+                    }
+                  }
+                } else {
+                  const [tarifaResult] = await connection.query(
+                    `INSERT INTO tarifa
+                     (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
+                      edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                      recurso.id,
+                      null,
+                      regimen.id,
+                      id,
+                      null,
+                      null,
+                      fecha.precio,
+                      fecha.fecha_inicio,
+                      fecha.fecha_fin,
+                      'N'
+                    ]
+                  );
+
+                  // Guardar historial de creación de nueva tarifa
+                  await guardarHistorialTemporada(
+                    connection,
+                    id,
+                    cabecera.id,
+                    'CREATE',
+                    `tarifa_${tarifaResult.insertId}`,
+                    null,
+                    JSON.stringify({
+                      recurso_id: recurso.id,
+                      regimen_id: regimen.id,
+                      precio: fecha.precio
+                    })
+                  );
+                }
+              }
+            }
+          }
+        }
+
+        // 5. Confirmar transacción
+        await connection.commit();
+
+        res.status(200).json({
+          message: "Temporada actualizada correctamente",
+          temporadaId: id
+        });
+
+      } catch (transactionError) {
+        if (connection) {
+          await connection.rollback();
+        }
+        throw transactionError;
+      } finally {
+        if (connection) {
+          connection.release();
+        }
+      }
+
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al actualizar la temporada");
   }
 });
 
