@@ -3116,6 +3116,10 @@ router.post("/tabla/departamentales", verifyToken, async (req, res) => {
     let orderBy = req.query.orderBy ? req.query.orderBy : "fecha_creacion";
     const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
 
+    // Obtener filtros del body
+    const filters = req.body || {};
+    const { habilitado, fecha_creacion_minima, fecha_creacion_maxima } = filters;
+
     // Mapeo de columnas para ordenamiento
     if (orderBy === "nombre") orderBy = "d.nombre";
     else if (orderBy === "direccion") orderBy = "d.direccion";
@@ -3128,32 +3132,57 @@ router.post("/tabla/departamentales", verifyToken, async (req, res) => {
 
     const queryOrderBy = `${orderBy} ${orderType}`;
 
+    // Filtro de búsqueda general
     let queryBuscar = "";
     if (buscar) {
       buscar = "%" + buscar + "%";
       queryBuscar = `AND (d.id LIKE '${buscar}' OR d.nombre LIKE '${buscar}' OR d.direccion LIKE '${buscar}' OR d.localidad LIKE '${buscar}' OR d.provincia LIKE '${buscar}')`;
     }
 
+    // Construcción de filtros específicos
+    let whereConditions = [];
+    let queryParams = [];
+
+    // Filtro por habilitado
+    if (habilitado === 'Y' || habilitado === 'N') {
+      whereConditions.push(`d.habilitado = ?`);
+      queryParams.push(habilitado);
+    }
+
+    // Filtro por fecha de creación mínima
+    if (fecha_creacion_minima) {
+      whereConditions.push(`DATE(d.fecha_creacion) >= ?`);
+      queryParams.push(fecha_creacion_minima);
+    }
+
+    // Filtro por fecha de creación máxima
+    if (fecha_creacion_maxima) {
+      whereConditions.push(`DATE(d.fecha_creacion) <= ?`);
+      queryParams.push(fecha_creacion_maxima);
+    }
+
+    // Construcción de la cláusula WHERE
+    let whereClause = "";
+    if (whereConditions.length > 0) {
+      whereClause = "AND " + whereConditions.join(" AND ");
+    }
+
     let query = `
-      SELECT 
+      SELECT
         d.id,
         d.nombre,
         d.direccion,
         d.localidad,
         d.provincia,
-        ST_Y(d.coordenadas) AS latitud,
-        ST_X(d.coordenadas) AS longitud,
         d.habilitado,
-        DATE_FORMAT(d.fecha_creacion, '%d/%m/%Y %T') AS fecha_creacion,
-        DATE_FORMAT(d.fecha_modificacion, '%d/%m/%Y %T') AS fecha_modificacion
+        DATE_FORMAT(d.fecha_creacion, '%d/%m/%Y %T') AS fecha_creacion
       FROM departamental d
       WHERE 1=1
         ${queryBuscar}
+        ${whereClause}
       ORDER BY ${queryOrderBy}
-      LIMIT ?, ?
+      LIMIT ${start}, ${resultsPerPage}
     `;
-
-    const queryParams = [start, resultsPerPage];
 
     const [rows] = await mysqlConnection.promise().execute(query, queryParams);
 
@@ -3162,9 +3191,11 @@ router.post("/tabla/departamentales", verifyToken, async (req, res) => {
       SELECT COUNT(*) AS count
       FROM departamental d
       WHERE 1=1
-      ${queryBuscar}
+        ${queryBuscar}
+        ${whereClause}
     `;
-    const [countRows] = await mysqlConnection.promise().execute(countQuery);
+
+    const [countRows] = await mysqlConnection.promise().execute(countQuery, queryParams);
 
     const numOfResults = countRows[0].count;
     const numOfPages = Math.ceil(numOfResults / resultsPerPage);
@@ -3177,6 +3208,182 @@ router.post("/tabla/departamentales", verifyToken, async (req, res) => {
       orderBy: req.query.orderBy || "fecha_creacion",
       orderType,
     });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error interno");
+  }
+});
+
+// GET /departamental/:id - Obtiene una departamental por ID
+router.get("/departamental/:id", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const { id } = req.params;
+
+    const query = `
+      SELECT
+        id,
+        nombre,
+        direccion,
+        localidad,
+        provincia,
+        ST_Y(coordenadas) AS latitud,
+        ST_X(coordenadas) AS longitud,
+        habilitado,
+        DATE_FORMAT(fecha_creacion, '%d/%m/%Y %T') AS fecha_creacion,
+        DATE_FORMAT(fecha_modificacion, '%d/%m/%Y %T') AS fecha_modificacion
+      FROM departamental
+      WHERE id = ?
+    `;
+
+    const [rows] = await mysqlConnection.promise().execute(query, [id]);
+
+    if (rows.length === 0) {
+      return res.status(404).json("Departamental no encontrada");
+    }
+
+    res.status(200).json(rows[0]);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error interno");
+  }
+});
+
+// POST /departamental - Crea una nueva departamental
+router.post("/departamental", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const { nombre, direccion, localidad, provincia, latitud, longitud, habilitado } = req.body;
+
+    // Validaciones
+    if (!nombre || !direccion || !localidad || !provincia || latitud === undefined || longitud === undefined || !habilitado) {
+      return res.status(400).json("Faltan campos obligatorios");
+    }
+
+    if (habilitado !== 'Y' && habilitado !== 'N') {
+      return res.status(400).json("El campo habilitado debe ser 'Y' o 'N'");
+    }
+
+    const query = `
+      INSERT INTO departamental (nombre, direccion, localidad, provincia, coordenadas, habilitado, fecha_creacion, fecha_modificacion)
+      VALUES (?, ?, ?, ?, POINT(?, ?), ?, NOW(), NOW())
+    `;
+
+    const [result] = await mysqlConnection.promise().execute(query, [
+      nombre,
+      direccion,
+      localidad,
+      provincia,
+      longitud,
+      latitud,
+      habilitado
+    ]);
+
+    // Obtener la departamental recién creada
+    const selectQuery = `
+      SELECT
+        id,
+        nombre,
+        direccion,
+        localidad,
+        provincia,
+        ST_Y(coordenadas) AS latitud,
+        ST_X(coordenadas) AS longitud,
+        habilitado,
+        DATE_FORMAT(fecha_creacion, '%d/%m/%Y %T') AS fecha_creacion,
+        DATE_FORMAT(fecha_modificacion, '%d/%m/%Y %T') AS fecha_modificacion
+      FROM departamental
+      WHERE id = ?
+    `;
+
+    const [rows] = await mysqlConnection.promise().execute(selectQuery, [result.insertId]);
+
+    res.status(201).json(rows[0]);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error interno");
+  }
+});
+
+// PUT /departamental/:id - Actualiza una departamental existente
+router.put("/departamental/:id", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const { id } = req.params;
+    const { nombre, direccion, localidad, provincia, latitud, longitud, habilitado } = req.body;
+
+    // Validaciones
+    if (!nombre || !direccion || !localidad || !provincia || latitud === undefined || longitud === undefined || !habilitado) {
+      return res.status(400).json("Faltan campos obligatorios");
+    }
+
+    if (habilitado !== 'Y' && habilitado !== 'N') {
+      return res.status(400).json("El campo habilitado debe ser 'Y' o 'N'");
+    }
+
+    // Verificar que la departamental existe
+    const checkQuery = `SELECT id FROM departamental WHERE id = ?`;
+    const [existing] = await mysqlConnection.promise().execute(checkQuery, [id]);
+
+    if (existing.length === 0) {
+      return res.status(404).json("Departamental no encontrada");
+    }
+
+    const query = `
+      UPDATE departamental
+      SET nombre = ?,
+          direccion = ?,
+          localidad = ?,
+          provincia = ?,
+          coordenadas = POINT(?, ?),
+          habilitado = ?,
+          fecha_modificacion = NOW()
+      WHERE id = ?
+    `;
+
+    await mysqlConnection.promise().execute(query, [
+      nombre,
+      direccion,
+      localidad,
+      provincia,
+      longitud,
+      latitud,
+      habilitado,
+      id
+    ]);
+
+    // Obtener la departamental actualizada
+    const selectQuery = `
+      SELECT
+        id,
+        nombre,
+        direccion,
+        localidad,
+        provincia,
+        ST_Y(coordenadas) AS latitud,
+        ST_X(coordenadas) AS longitud,
+        habilitado,
+        DATE_FORMAT(fecha_creacion, '%d/%m/%Y %T') AS fecha_creacion,
+        DATE_FORMAT(fecha_modificacion, '%d/%m/%Y %T') AS fecha_modificacion
+      FROM departamental
+      WHERE id = ?
+    `;
+
+    const [rows] = await mysqlConnection.promise().execute(selectQuery, [id]);
+
+    res.status(200).json(rows[0]);
   } catch (error) {
     console.log(error);
     res.status(500).json("Error interno");
