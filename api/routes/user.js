@@ -148,14 +148,15 @@ router.get("/credencial-digital", verifyToken, async (req, res) => {
       const [rows] = await mysqlConnection
         .promise()
         .query(
-          `SELECT 
+          `SELECT
             id,
             nombre,
             apellido,
             fecha_nacimiento,
             hash_credencial as hash,
-            documento as dni
-          FROM usuario 
+            documento as dni,
+            foto_archivo
+          FROM usuario
           WHERE id = ?`,
           [userId]
         );
@@ -166,6 +167,25 @@ router.get("/credencial-digital", verifyToken, async (req, res) => {
         // Formatear la fecha de nacimiento a string (YYYY-MM-DD)
         if (usuario.fecha_nacimiento) {
           usuario.fecha_nacimiento = usuario.fecha_nacimiento.toISOString().split('T')[0];
+        }
+
+        // Si tiene foto, prepararla para envío (como base64)
+        if (usuario.foto_archivo) {
+          const fotoPath = path.join(__dirname, '../../imagenes', usuario.foto_archivo);
+          if (fs.existsSync(fotoPath)) {
+            try {
+              const fotoBuffer = fs.readFileSync(fotoPath);
+              const fotoBase64 = fotoBuffer.toString('base64');
+              const mimeType = usuario.foto_archivo.match(/\.(jpg|jpeg|png|gif)$/i);
+              const mimeTypeStr = mimeType ? `image/${mimeType[1].toLowerCase()}` : 'image/jpeg';
+              usuario.foto_data = `data:${mimeTypeStr};base64,${fotoBase64}`;
+            } catch (readError) {
+              console.error('Error leyendo foto:', readError);
+              usuario.foto_data = null;
+            }
+          } else {
+            usuario.foto_data = null;
+          }
         }
 
         res.status(200).json(usuario);
@@ -4740,6 +4760,465 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al actualizar la temporada");
+  }
+});
+
+// Configuración de multer para fotos de perfil
+const uploadFotoPerfil = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB máximo
+  },
+  fileFilter: (req, file, cb) => {
+    // Aceptar solo imágenes
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Solo se permiten archivos de imagen'), false);
+    }
+  }
+});
+
+// GET /configuracion/usuario/:id? - Obtener datos del usuario
+router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    const userId = req.params.id ? parseInt(req.params.id) : cabecera.id;
+
+    // Verificar permisos
+    let tienePermisos = false;
+
+    if (cabecera.rol === "admin") {
+      tienePermisos = true;
+    } else if (cabecera.rol === "departamental") {
+      // Departamental puede ver usuarios de su departamento o a sí mismo
+      if (userId === cabecera.id) {
+        tienePermisos = true;
+      } else {
+        const [usuarioTarget] = await mysqlConnection
+          .promise()
+          .query(
+            "SELECT departamental_id FROM usuario WHERE id = ?",
+            [userId]
+          );
+
+        if (usuarioTarget.length > 0 && usuarioTarget[0].departamental_id === cabecera.id) {
+          tienePermisos = true;
+        }
+      }
+    } else if (cabecera.rol === "afiliado") {
+      // Afiliado solo puede verse a sí mismo
+      tienePermisos = userId === cabecera.id;
+    }
+
+    if (!tienePermisos) {
+      return res.status(403).json({
+        success: false,
+        message: "No tienes permisos para ver este usuario"
+      });
+    }
+
+    // Obtener datos del usuario
+    const [usuario] = await mysqlConnection
+      .promise()
+      .query(
+        `SELECT
+          u.id,
+          u.rol_id,
+          u.departamental_id,
+          d.nombre as departamental_nombre,
+          u.tipo_persona_id,
+          tp.nombre as tipo_persona_nombre,
+          u.nombre,
+          u.apellido,
+          u.fecha_nacimiento,
+          u.documento,
+          u.email,
+          u.telefono,
+          u.legajo,
+          u.foto_archivo,
+          u.habilitado,
+          r.nombre as rol_nombre
+        FROM usuario u
+        LEFT JOIN rol r ON r.id = u.rol_id
+        LEFT JOIN tipo_persona tp ON tp.id = u.tipo_persona_id
+        LEFT JOIN departamental d ON d.id = u.departamental_id
+        WHERE u.id = ?`,
+        [userId]
+      );
+
+    if (usuario.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Usuario no encontrado"
+      });
+    }
+
+    const usuarioData = usuario[0];
+
+    // Si tiene foto, prepararla para envío (como base64 o URL)
+    if (usuarioData.foto_archivo) {
+      const fotoPath = path.join(__dirname, '../../imagenes', usuarioData.foto_archivo);
+      if (fs.existsSync(fotoPath)) {
+        try {
+          const fotoBuffer = fs.readFileSync(fotoPath);
+          const fotoBase64 = fotoBuffer.toString('base64');
+          const mimeType = usuarioData.foto_archivo.match(/\.(jpg|jpeg|png|gif)$/i);
+          const mimeTypeStr = mimeType ? `image/${mimeType[1].toLowerCase()}` : 'image/jpeg';
+          usuarioData.foto_data = `data:${mimeTypeStr};base64,${fotoBase64}`;
+        } catch (readError) {
+          console.error('Error leyendo foto:', readError);
+          usuarioData.foto_data = null;
+        }
+      } else {
+        usuarioData.foto_data = null;
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      data: usuarioData
+    });
+
+  } catch (error) {
+    console.log(error);
+    res.status(500).json({
+      success: false,
+      message: "Error al obtener datos del usuario"
+    });
+  }
+});
+
+// PUT /configuracion/usuario/:id - Actualizar datos del usuario
+router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('foto'), async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    const userId = parseInt(req.params.id);
+
+    // Validar que el ID sea válido
+    if (!userId || isNaN(userId)) {
+      return res.status(400).json({
+        success: false,
+        message: "ID de usuario inválido"
+      });
+    }
+
+    let connection;
+    try {
+      connection = await mysqlConnection.promise().getConnection();
+      await connection.beginTransaction();
+
+      // Obtener datos actuales del usuario
+      const [usuarioActual] = await connection.query(
+        "SELECT * FROM usuario WHERE id = ?",
+        [userId]
+      );
+
+      if (usuarioActual.length === 0) {
+        await connection.rollback();
+        return res.status(404).json({
+          success: false,
+          message: "Usuario no encontrado"
+        });
+      }
+
+      const datosAnteriores = usuarioActual[0];
+
+      // Verificar permisos y determinar qué campos puede editar
+      let camposPermitidos = [];
+      let tienePermisos = false;
+
+      if (cabecera.rol === "admin") {
+        tienePermisos = true;
+        camposPermitidos = [
+          'rol_id', 'departamental_id', 'tipo_persona_id', 'nombre', 'apellido',
+          'fecha_nacimiento', 'documento', 'password', 'email', 'telefono',
+          'legajo', 'foto_archivo', 'habilitado'
+        ];
+      } else if (cabecera.rol === "departamental") {
+        // Verificar que el usuario pertenezca a su departamento o sea él mismo
+        if (userId === cabecera.id) {
+          tienePermisos = true;
+        } else if (datosAnteriores.departamental_id === cabecera.id) {
+          tienePermisos = true;
+        }
+        camposPermitidos = [
+          'tipo_persona_id', 'nombre', 'apellido', 'fecha_nacimiento',
+          'documento', 'password', 'email', 'telefono', 'legajo',
+          'foto_archivo', 'habilitado'
+        ];
+      } else if (cabecera.rol === "afiliado") {
+        // Solo puede editarse a sí mismo
+        if (userId === cabecera.id) {
+          tienePermisos = true;
+        }
+        camposPermitidos = [
+          'tipo_persona_id', 'nombre', 'apellido', 'fecha_nacimiento',
+          'documento', 'password', 'email', 'telefono', 'legajo', 'foto_archivo'
+        ];
+      }
+
+      if (!tienePermisos) {
+        await connection.rollback();
+        return res.status(403).json({
+          success: false,
+          message: "No tienes permisos para modificar este usuario"
+        });
+      }
+
+      // Preparar campos para actualizar
+      const updateFields = [];
+      const updateValues = [];
+      const cambios = [];
+
+      // Función auxiliar para formatear fechas
+      const formatearFecha = (fecha) => {
+        if (!fecha) return null;
+        try {
+          const fechaObj = new Date(fecha);
+          if (isNaN(fechaObj.getTime())) return null;
+          return fechaObj.toISOString().split('T')[0];
+        } catch (error) {
+          return null;
+        }
+      };
+
+      // Procesar cada campo permitido
+      if (camposPermitidos.includes('rol_id') && req.body.rol_id !== undefined) {
+        const nuevoValor = req.body.rol_id ? parseInt(req.body.rol_id) : null;
+        if (datosAnteriores.rol_id !== nuevoValor) {
+          updateFields.push('rol_id = ?');
+          updateValues.push(nuevoValor);
+          cambios.push({
+            campo: 'rol_id',
+            valorAnterior: datosAnteriores.rol_id,
+            valorNuevo: nuevoValor
+          });
+        }
+      }
+
+      if (camposPermitidos.includes('departamental_id') && req.body.departamental_id !== undefined) {
+        const nuevoValor = req.body.departamental_id ? parseInt(req.body.departamental_id) : null;
+        if (datosAnteriores.departamental_id !== nuevoValor) {
+          updateFields.push('departamental_id = ?');
+          updateValues.push(nuevoValor);
+          cambios.push({
+            campo: 'departamental_id',
+            valorAnterior: datosAnteriores.departamental_id,
+            valorNuevo: nuevoValor
+          });
+        }
+      }
+
+      if (camposPermitidos.includes('tipo_persona_id') && req.body.tipo_persona_id !== undefined) {
+        const nuevoValor = req.body.tipo_persona_id ? parseInt(req.body.tipo_persona_id) : null;
+        if (datosAnteriores.tipo_persona_id !== nuevoValor) {
+          updateFields.push('tipo_persona_id = ?');
+          updateValues.push(nuevoValor);
+          cambios.push({
+            campo: 'tipo_persona_id',
+            valorAnterior: datosAnteriores.tipo_persona_id,
+            valorNuevo: nuevoValor
+          });
+        }
+      }
+
+      if (camposPermitidos.includes('nombre') && req.body.nombre !== undefined) {
+        if (datosAnteriores.nombre !== req.body.nombre) {
+          updateFields.push('nombre = ?');
+          updateValues.push(req.body.nombre);
+          cambios.push({
+            campo: 'nombre',
+            valorAnterior: datosAnteriores.nombre,
+            valorNuevo: req.body.nombre
+          });
+        }
+      }
+
+      if (camposPermitidos.includes('apellido') && req.body.apellido !== undefined) {
+        if (datosAnteriores.apellido !== req.body.apellido) {
+          updateFields.push('apellido = ?');
+          updateValues.push(req.body.apellido);
+          cambios.push({
+            campo: 'apellido',
+            valorAnterior: datosAnteriores.apellido,
+            valorNuevo: req.body.apellido
+          });
+        }
+      }
+
+      if (camposPermitidos.includes('fecha_nacimiento') && req.body.fecha_nacimiento !== undefined) {
+        const fechaFormateada = formatearFecha(req.body.fecha_nacimiento);
+        const fechaAnteriorFormateada = formatearFecha(datosAnteriores.fecha_nacimiento);
+        if (fechaAnteriorFormateada !== fechaFormateada) {
+          updateFields.push('fecha_nacimiento = ?');
+          updateValues.push(fechaFormateada);
+          cambios.push({
+            campo: 'fecha_nacimiento',
+            valorAnterior: fechaAnteriorFormateada,
+            valorNuevo: fechaFormateada
+          });
+        }
+      }
+
+      if (camposPermitidos.includes('documento') && req.body.documento !== undefined) {
+        const nuevoValor = req.body.documento ? parseInt(req.body.documento) : null;
+        if (datosAnteriores.documento !== nuevoValor) {
+          updateFields.push('documento = ?');
+          updateValues.push(nuevoValor);
+          cambios.push({
+            campo: 'documento',
+            valorAnterior: datosAnteriores.documento,
+            valorNuevo: nuevoValor
+          });
+        }
+      }
+
+      if (camposPermitidos.includes('email') && req.body.email !== undefined) {
+        if (datosAnteriores.email !== req.body.email) {
+          updateFields.push('email = ?');
+          updateValues.push(req.body.email);
+          cambios.push({
+            campo: 'email',
+            valorAnterior: datosAnteriores.email,
+            valorNuevo: req.body.email
+          });
+        }
+      }
+
+      if (camposPermitidos.includes('telefono') && req.body.telefono !== undefined) {
+        if (datosAnteriores.telefono !== req.body.telefono) {
+          updateFields.push('telefono = ?');
+          updateValues.push(req.body.telefono || null);
+          cambios.push({
+            campo: 'telefono',
+            valorAnterior: datosAnteriores.telefono,
+            valorNuevo: req.body.telefono || null
+          });
+        }
+      }
+
+      if (camposPermitidos.includes('legajo') && req.body.legajo !== undefined) {
+        if (datosAnteriores.legajo !== req.body.legajo) {
+          updateFields.push('legajo = ?');
+          updateValues.push(req.body.legajo || null);
+          cambios.push({
+            campo: 'legajo',
+            valorAnterior: datosAnteriores.legajo,
+            valorNuevo: req.body.legajo || null
+          });
+        }
+      }
+
+      if (camposPermitidos.includes('habilitado') && req.body.habilitado !== undefined) {
+        if (datosAnteriores.habilitado !== req.body.habilitado) {
+          updateFields.push('habilitado = ?');
+          updateValues.push(req.body.habilitado);
+          cambios.push({
+            campo: 'habilitado',
+            valorAnterior: datosAnteriores.habilitado,
+            valorNuevo: req.body.habilitado
+          });
+        }
+      }
+
+      // Procesar password si viene
+      if (camposPermitidos.includes('password') && req.body.password && req.body.password.trim() !== '') {
+        const passwordHash = await bcryptjs.hash(req.body.password, 8);
+        updateFields.push('password = ?');
+        updateValues.push(passwordHash);
+        cambios.push({
+          campo: 'password',
+          valorAnterior: '[OCULTO]',
+          valorNuevo: '[MODIFICADO]'
+        });
+      }
+
+      // Procesar foto si viene
+      if (camposPermitidos.includes('foto_archivo') && req.file) {
+        try {
+          // Generar nombre único para la foto
+          const fotoHash = crypto.randomBytes(16).toString('hex');
+          const extension = req.file.originalname.split('.').pop();
+          const nombreArchivo = `perfil_${fotoHash}.${extension}`;
+          const rutaArchivo = path.join(__dirname, '../../imagenes', nombreArchivo);
+
+          // Guardar archivo en disco
+          fs.writeFileSync(rutaArchivo, req.file.buffer);
+
+          // Actualizar campo en base de datos
+          updateFields.push('foto_archivo = ?');
+          updateValues.push(nombreArchivo);
+          cambios.push({
+            campo: 'foto_archivo',
+            valorAnterior: datosAnteriores.foto_archivo,
+            valorNuevo: nombreArchivo
+          });
+
+          // Nota: NO borramos la foto anterior según requerimiento
+        } catch (fotoError) {
+          console.error('Error guardando foto:', fotoError);
+          await connection.rollback();
+          return res.status(500).json({
+            success: false,
+            message: "Error al guardar la foto"
+          });
+        }
+      }
+
+      // Si no hay cambios, retornar
+      if (updateFields.length === 0) {
+        await connection.rollback();
+        return res.status(200).json({
+          success: true,
+          message: "No hay cambios para actualizar"
+        });
+      }
+
+      // Ejecutar actualización
+      updateValues.push(userId);
+      const updateQuery = `UPDATE usuario SET ${updateFields.join(', ')} WHERE id = ?`;
+
+      const [result] = await connection.query(updateQuery, updateValues);
+
+      // Registrar cambios en el historial
+      if (cambios.length > 0) {
+        await registrarHistorial(
+          connection,
+          userId,
+          'UPDATE',
+          'usuario',
+          cabecera.id,
+          req,
+          cambios,
+          'Actualización de configuración de usuario'
+        );
+      }
+
+      await connection.commit();
+
+      res.status(200).json({
+        success: true,
+        message: "Usuario actualizado correctamente"
+      });
+
+    } catch (updateError) {
+      if (connection) {
+        await connection.rollback();
+      }
+      throw updateError;
+    } finally {
+      if (connection) {
+        connection.release();
+      }
+    }
+
+  } catch (error) {
+    console.log(error);
+    res.status(500).json({
+      success: false,
+      message: "Error al actualizar el usuario"
+    });
   }
 });
 
