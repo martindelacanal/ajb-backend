@@ -3937,8 +3937,7 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
           h.tabla_afectada,
           h.usuario_modificador_id,
           CONCAT(um.nombre, ' ', um.apellido) as modificador_nombre,
-          h.ip_address,
-          h.fecha_modificacion,
+          DATE_FORMAT(h.fecha_modificacion, '%d/%m/%Y %H:%i:%s') as fecha_modificacion,
           h.observaciones
         FROM historial_usuario h
         INNER JOIN usuario u ON h.usuario_id = u.id
