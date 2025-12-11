@@ -4846,11 +4846,22 @@ function construirMapaPreciosParticulares(tiposPersona) {
 
 function calcularPrecioRangoConPorcentaje(rangoEdad, tipoPersonaId, mapaPreciosParticulares) {
   const usaPorcentaje = normalizarBanderaPorcentaje(rangoEdad?.usa_porcentaje ?? rangoEdad?.usaPorcentaje);
-  const porcentajeDescuento = normalizarValorPorcentaje(
-    rangoEdad?.porcentaje_descuento ??
+  
+  let rawPorcentaje = rangoEdad?.porcentaje_descuento ??
       rangoEdad?.porcentaje ??
-      rangoEdad?.porcentajeDescuento
-  );
+      rangoEdad?.porcentajeDescuento;
+
+  // Si usa porcentaje y no viene el campo explicito, asumimos que el precio es el porcentaje
+  if (usaPorcentaje && (rawPorcentaje === undefined || rawPorcentaje === null)) {
+    rawPorcentaje = rangoEdad?.precio;
+  }
+
+  let porcentajeDescuento = normalizarValorPorcentaje(rawPorcentaje);
+
+  // Si no usa porcentaje, forzamos 0 si es null
+  if (!usaPorcentaje && porcentajeDescuento === null) {
+    porcentajeDescuento = 0;
+  }
 
   let precioTarifa = Number(rangoEdad?.precio ?? 0);
   if (Number.isNaN(precioTarifa)) {
@@ -4866,7 +4877,8 @@ function calcularPrecioRangoConPorcentaje(rangoEdad, tipoPersonaId, mapaPreciosP
       : undefined;
 
     if (typeof precioBase === "number" && !Number.isNaN(precioBase)) {
-      const factor = porcentajeDescuento !== null ? 1 - porcentajeDescuento / 100 : 1;
+      const pDescuento = porcentajeDescuento !== null ? porcentajeDescuento : 0;
+      const factor = 1 - pDescuento / 100;
       precioTarifa = Number((precioBase * factor).toFixed(2));
     }
   }
