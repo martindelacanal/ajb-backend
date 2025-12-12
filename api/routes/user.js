@@ -1446,7 +1446,41 @@ async function obtenerNombreAdicional(connection, cache, adicionalId) {
   return nombre;
 }
 
-async function calcularAdicionalesReserva(connection, adicionales, recursoId, regimenId, fechaInicio, fechaFin) {
+async function obtenerMejorDescuentoDia(connection, recursoId, regimenId, personas, fecha) {
+  let maxDescuento = 0;
+  let tarifaIdMax = null;
+
+  for (const persona of personas) {
+    if (!persona.tipo_persona_id || persona.edad === undefined) continue;
+
+    const [rows] = await connection.query(
+      `SELECT id, usa_porcentaje, porcentaje_descuento
+       FROM tarifa 
+       WHERE recurso_id = ? 
+         AND tipo_persona_id = ? 
+         AND regimen_id = ?
+         AND (edad_minima IS NULL OR edad_minima <= ?)
+         AND (edad_maxima IS NULL OR edad_maxima >= ?)
+         AND fecha_inicio <= ?
+         AND fecha_fin >= ?
+       ORDER BY fecha_inicio ASC
+       LIMIT 1`,
+      [recursoId, persona.tipo_persona_id, regimenId, persona.edad, persona.edad, fecha, fecha]
+    );
+
+    if (rows.length > 0) {
+      const tarifa = rows[0];
+      if (tarifa.usa_porcentaje === 1 && tarifa.porcentaje_descuento > maxDescuento) {
+        maxDescuento = tarifa.porcentaje_descuento;
+        tarifaIdMax = tarifa.id;
+      }
+    }
+  }
+  
+  return { porcentaje_descuento: maxDescuento, tarifa_id: tarifaIdMax };
+}
+
+async function calcularAdicionalesReserva(connection, adicionales, recursoId, regimenId, fechaInicio, fechaFin, personas) {
   if (!Array.isArray(adicionales) || adicionales.length === 0) {
     return { total: 0, items: [] };
   }
@@ -1463,6 +1497,19 @@ async function calcularAdicionalesReserva(connection, adicionales, recursoId, re
   const cacheNombres = new Map();
   const items = [];
   let total = 0;
+
+  // Pre-calcular descuentos por día si hay personas
+  const descuentosPorDia = new Map();
+  if (Array.isArray(personas) && personas.length > 0) {
+    for (let dia = 0; dia < diasTotales; dia++) {
+      const fechaActual = new Date(fechaInicioDate);
+      fechaActual.setDate(fechaInicioDate.getDate() + dia);
+      const fechaString = fechaActual.toISOString().split('T')[0];
+      
+      const descuento = await obtenerMejorDescuentoDia(connection, recursoId, regimenId, personas, fechaString);
+      descuentosPorDia.set(fechaString, descuento);
+    }
+  }
 
   for (const adicional of adicionales) {
     if (!adicional) {
@@ -1491,14 +1538,23 @@ async function calcularAdicionalesReserva(connection, adicionales, recursoId, re
         throw new Error(`No hay una tarifa de adicional vigente para la fecha ${fechaString}`);
       }
 
-      const subtotalDia = resultadoAdicional.precio * cantidad;
+      let precioUnitario = resultadoAdicional.precio;
+      const descuentoInfo = descuentosPorDia.get(fechaString) || { porcentaje_descuento: 0, tarifa_id: null };
+
+      if (descuentoInfo.porcentaje_descuento > 0) {
+        precioUnitario = precioUnitario * (1 - descuentoInfo.porcentaje_descuento / 100);
+      }
+
+      const subtotalDia = precioUnitario * cantidad;
       subtotal += subtotalDia;
       detalles.push({
         fecha: fechaString,
         cantidad,
-        precio_unitario: resultadoAdicional.precio,
+        precio_unitario: precioUnitario,
         subtotal: subtotalDia,
-        tarifa_adicional_id: resultadoAdicional.tarifa_adicional_id
+        tarifa_adicional_id: resultadoAdicional.tarifa_adicional_id,
+        porcentaje_descuento: descuentoInfo.porcentaje_descuento,
+        tarifa_id: descuentoInfo.tarifa_id
       });
     }
 
@@ -1542,15 +1598,17 @@ async function guardarAdicionalesReserva(connection, reservaId, adicionalesProce
     for (const detalle of adicional.detalles) {
       await connection.query(
         `INSERT INTO reserva_adicional_detalle
-          (reserva_adicional_id, fecha, cantidad, precio_unitario, subtotal, tarifa_adicional_id)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+          (reserva_adicional_id, fecha, cantidad, precio_unitario, subtotal, tarifa_adicional_id, porcentaje_descuento, tarifa_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           reservaAdicionalId,
           detalle.fecha,
           detalle.cantidad,
           detalle.precio_unitario,
           detalle.subtotal,
-          detalle.tarifa_adicional_id
+          detalle.tarifa_adicional_id,
+          detalle.porcentaje_descuento || 0,
+          detalle.tarifa_id || null
         ]
       );
     }
@@ -1571,7 +1629,7 @@ async function obtenerAdicionalesReserva(connection, reservaId) {
 
   const ids = adicionales.map(a => a.id);
   const [detalles] = await connection.query(
-    `SELECT reserva_adicional_id, fecha, cantidad, precio_unitario, subtotal, tarifa_adicional_id
+    `SELECT reserva_adicional_id, fecha, cantidad, precio_unitario, subtotal, tarifa_adicional_id, porcentaje_descuento, tarifa_id
      FROM reserva_adicional_detalle
      WHERE reserva_adicional_id IN (?)
      ORDER BY fecha ASC`,
@@ -1588,7 +1646,9 @@ async function obtenerAdicionalesReserva(connection, reservaId) {
       cantidad: detalle.cantidad,
       precio_unitario: Number(detalle.precio_unitario),
       subtotal: Number(detalle.subtotal),
-      tarifa_adicional_id: detalle.tarifa_adicional_id
+      tarifa_adicional_id: detalle.tarifa_adicional_id,
+      porcentaje_descuento: detalle.porcentaje_descuento,
+      tarifa_id: detalle.tarifa_id
     });
   }
 
@@ -1702,7 +1762,8 @@ router.post("/reserva", verifyToken, async (req, res) => {
               recurso_id,
               regimen_id,
               fecha_inicio,
-              fecha_fin
+              fecha_fin,
+              personas
             );
             montoAdicionales = resultadoAdicionales.total;
             adicionalesProcesados = resultadoAdicionales.items;
@@ -2025,7 +2086,8 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
               recurso_id,
               regimen_id,
               fecha_inicio,
-              fecha_fin
+              fecha_fin,
+              personas
             );
             montoAdicionales = resultadoAdicionales.total;
             adicionalesProcesados = resultadoAdicionales.items;
@@ -2590,7 +2652,9 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
             cantidad: fecha.cantidad,
             precio_unitario: Number(fecha.precio_unitario),
             subtotal: Number(fecha.subtotal),
-            tarifa_adicional_id: fecha.tarifa_adicional_id
+            tarifa_adicional_id: fecha.tarifa_adicional_id,
+            porcentaje_descuento: fecha.porcentaje_descuento,
+            tarifa_id: fecha.tarifa_id
           }))
         }));
 
@@ -2775,7 +2839,9 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
             cantidad: fecha.cantidad,
             precio_unitario: Number(fecha.precio_unitario),
             subtotal: Number(fecha.subtotal),
-            tarifa_adicional_id: fecha.tarifa_adicional_id
+            tarifa_adicional_id: fecha.tarifa_adicional_id,
+            porcentaje_descuento: fecha.porcentaje_descuento,
+            tarifa_id: fecha.tarifa_id
           }))
         }));
 
