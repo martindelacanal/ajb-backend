@@ -676,6 +676,8 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       // Calcular tarifas para cada recurso y aplicar filtro de precio
       for (const recurso of recursos) {
         let tarifaTotal = 0;
+        let tarifaOriginalTotal = 0;
+        let usaPorcentajeEnAlgunaTarifa = false;
         let todasPersonasTienenTarifa = true;
 
         // Calcular tarifa por cada persona
@@ -684,7 +686,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           const [tarifasPersona] = await mysqlConnection
             .promise()
             .query(`
-              SELECT precio, fecha_inicio, fecha_fin
+              SELECT precio, fecha_inicio, fecha_fin, usa_porcentaje, porcentaje_descuento
               FROM tarifa 
               WHERE recurso_id = ? 
                 AND tipo_persona_id = ? 
@@ -711,6 +713,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
 
           // Calcular el precio total para esta persona sumando los rangos de fechas
           let tarifaPersona = 0;
+          let tarifaOriginalPersona = 0;
           const fechaInicioSolicitud = new Date(fecha_inicio);
           const fechaFinSolicitud = new Date(fecha_fin);
 
@@ -735,12 +738,27 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
               // Calcular el día inicial relativo al inicio de la solicitud
               const diaInicioRelativo = Math.floor((inicioInterseccion - fechaInicioSolicitud) / (1000 * 60 * 60 * 24));
 
+              // Calcular precio original
+              let precioOriginal = tarifa.precio;
+              const usaPorcentaje = tarifa.usa_porcentaje === 1 || tarifa.usa_porcentaje === true || tarifa.usa_porcentaje === '1';
+              
+              if (usaPorcentaje) {
+                usaPorcentajeEnAlgunaTarifa = true;
+                if (tarifa.porcentaje_descuento && tarifa.porcentaje_descuento > 0) {
+                  const factor = 1 - (tarifa.porcentaje_descuento / 100);
+                  if (factor > 0) {
+                    precioOriginal = tarifa.precio / factor;
+                  }
+                }
+              }
+
               // Marcar los días como cubiertos y sumar el precio
               for (let i = 0; i < diasInterseccion; i++) {
                 const diaIndex = diaInicioRelativo + i;
                 if (diaIndex >= 0 && diaIndex < diasTotales && !diasCubiertos[diaIndex]) {
                   diasCubiertos[diaIndex] = true;
                   tarifaPersona += tarifa.precio;
+                  tarifaOriginalPersona += precioOriginal;
                 }
               }
             }
@@ -754,6 +772,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           }
 
           tarifaTotal += tarifaPersona;
+          tarifaOriginalTotal += tarifaOriginalPersona;
         }
 
         // Solo incluir recursos que tengan tarifa para todas las personas y todos los días
@@ -790,6 +809,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
               grupo_recurso_id: recurso.grupo_recurso_id,
               nombre: recurso.nombre,
               tarifa: tarifaTotal,
+              tarifa_original: usaPorcentajeEnAlgunaTarifa ? Math.round(tarifaOriginalTotal) : null,
               imagenes: imagenesPorRecurso[recurso.id] || [],
               filtros: filtrosPorRecurso[recurso.id] || [],
               totalCamas: totalCamas,
@@ -831,7 +851,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         const { totalCamas, ambientes, ...recursoLimpio } = recurso;
         return recursoLimpio;
       });
-
+      
       res.status(200).json(recursosLimpios);
     } else {
       res.status(401).json("No autorizado");
@@ -1151,13 +1171,16 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
         return res.status(404).json("El recurso no pertenece al servicio especificado");
       }
 
-      // Procesar cada día del rango
+        // Procesar cada día del rango
       for (let dia = 0; dia < diasTotales; dia++) {
         const fechaActual = new Date(fechaInicioSolicitud);
         fechaActual.setDate(fechaInicioSolicitud.getDate() + dia);
 
         const fechaString = fechaActual.toISOString().split('T')[0];
         let precioBaseDia = 0;
+        let precioBaseSinDescuentoDia = 0;
+        let usaPorcentajeDia = false;
+        let porcentajeDescuentoDia = null;
         let todasPersonasTienenTarifa = true;
 
         // Calcular tarifa por cada persona para este día específico
@@ -1165,7 +1188,7 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
           // Buscar tarifa válida para esta persona en este día específico
           const [tarifasPersona] = await pool.query(
             `
-              SELECT precio
+              SELECT precio, usa_porcentaje, porcentaje_descuento
               FROM tarifa 
               WHERE recurso_id = ? 
                 AND tipo_persona_id = ? 
@@ -1194,7 +1217,33 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
             break;
           }
 
-          precioBaseDia += tarifasPersona[0].precio;
+          const tarifa = tarifasPersona[0];
+          precioBaseDia += tarifa.precio;
+
+          // Calcular precio base sin descuento y capturar datos de porcentaje
+          let precioBasePersona = tarifa.precio;
+          
+          // Normalizar usa_porcentaje (puede venir como 1/0 o true/false)
+          const usaPorcentaje = tarifa.usa_porcentaje === 1 || tarifa.usa_porcentaje === true || tarifa.usa_porcentaje === '1';
+          
+          if (usaPorcentaje) {
+            usaPorcentajeDia = true;
+            // Si hay múltiples personas, nos quedamos con el último porcentaje encontrado (o el primero)
+            // Idealmente deberían ser consistentes si es una reserva grupal con descuento
+            porcentajeDescuentoDia = tarifa.porcentaje_descuento;
+
+            if (tarifa.porcentaje_descuento && tarifa.porcentaje_descuento > 0) {
+              // Revertir el descuento para obtener el precio base
+              // precio = base * (1 - descuento/100)
+              // base = precio / (1 - descuento/100)
+              const factor = 1 - (tarifa.porcentaje_descuento / 100);
+              if (factor > 0) {
+                precioBasePersona = tarifa.precio / factor;
+              }
+            }
+          }
+          
+          precioBaseSinDescuentoDia += precioBasePersona;
         }
 
         let totalExtrasDia = 0;
@@ -1228,7 +1277,10 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
 
         const respuestaDia = {
           fecha: fechaString,
-          precio: todasPersonasTienenTarifa ? precioBaseDia + totalExtrasDia : null
+          precio: todasPersonasTienenTarifa ? precioBaseDia + totalExtrasDia : null,
+          precio_base: todasPersonasTienenTarifa ? Math.round(precioBaseSinDescuentoDia + totalExtrasDia) : null,
+          usa_porcentaje: usaPorcentajeDia,
+          porcentaje_descuento: usaPorcentajeDia ? porcentajeDescuentoDia : 0
         };
 
         if (extrasDia.length > 0) {
@@ -2439,12 +2491,29 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
             u.fecha_nacimiento,
             u.telefono,
             u.email,
+            rf.id as reserva_familiar_id,
             rf.edad,
             rf.precio as tarifa_individual,
             rf.tipo_persona_id,
             rf.parentesco_id,
             tp.nombre as tipo_persona_nombre,
-            p.nombre as parentesco_nombre
+            p.nombre as parentesco_nombre,
+            (
+              SELECT t.usa_porcentaje 
+              FROM reserva_familiar_tarifa rft 
+              JOIN tarifa t ON rft.tarifa_id = t.id 
+              WHERE rft.reserva_familiar_id = rf.id 
+              ORDER BY t.usa_porcentaje DESC 
+              LIMIT 1
+            ) as usa_porcentaje,
+            (
+              SELECT t.porcentaje_descuento 
+              FROM reserva_familiar_tarifa rft 
+              JOIN tarifa t ON rft.tarifa_id = t.id 
+              WHERE rft.reserva_familiar_id = rf.id 
+              ORDER BY t.usa_porcentaje DESC 
+              LIMIT 1
+            ) as porcentaje_descuento
           FROM reserva_familiar rf
           INNER JOIN usuario u ON rf.usuario_id = u.id
           INNER JOIN tipo_persona tp ON rf.tipo_persona_id = tp.id
@@ -2473,7 +2542,9 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
             parentesco_id: persona.parentesco_id,
             regimen_id: reserva.regimen_id, // Todas las personas tienen el mismo régimen
             edad: persona.edad,
-            es_titular: es_titular
+            es_titular: es_titular,
+            usa_porcentaje: persona.usa_porcentaje === 1 || persona.usa_porcentaje === true,
+            porcentaje_descuento: persona.porcentaje_descuento
           };
         });
 
@@ -2617,12 +2688,29 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
             u.documento as dni,
             u.fecha_nacimiento,
             u.telefono,
+            rf.id as reserva_familiar_id,
             rf.edad,
             rf.precio as tarifa_individual,
             tp.id as tipo_persona_id,
             tp.nombre as tipo_persona_nombre,
             p.id as parentesco_id,
-            p.nombre as parentesco_nombre
+            p.nombre as parentesco_nombre,
+            (
+              SELECT t.usa_porcentaje 
+              FROM reserva_familiar_tarifa rft 
+              JOIN tarifa t ON rft.tarifa_id = t.id 
+              WHERE rft.reserva_familiar_id = rf.id 
+              ORDER BY t.usa_porcentaje DESC 
+              LIMIT 1
+            ) as usa_porcentaje,
+            (
+              SELECT t.porcentaje_descuento 
+              FROM reserva_familiar_tarifa rft 
+              JOIN tarifa t ON rft.tarifa_id = t.id 
+              WHERE rft.reserva_familiar_id = rf.id 
+              ORDER BY t.usa_porcentaje DESC 
+              LIMIT 1
+            ) as porcentaje_descuento
           FROM reserva_familiar rf
           INNER JOIN usuario u ON rf.usuario_id = u.id
           INNER JOIN tipo_persona tp ON rf.tipo_persona_id = tp.id
@@ -2669,7 +2757,9 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           fecha_nacimiento: persona.fecha_nacimiento,
           telefono: persona.telefono,
           edad: persona.edad,
-          tarifa_individual: persona.tarifa_individual
+          tarifa_individual: persona.tarifa_individual,
+          usa_porcentaje: persona.usa_porcentaje === 1 || persona.usa_porcentaje === true,
+          porcentaje_descuento: persona.porcentaje_descuento
         }));
 
         const adicionalesReserva = await obtenerAdicionalesReserva(connection, reservaId);
