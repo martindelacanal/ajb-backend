@@ -1202,7 +1202,7 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
 
         if (todasPersonasTienenTarifa && adicionalesSeleccionados.length > 0 && regimenIdSolicitud) {
           for (const adicional of adicionalesSeleccionados) {
-            const precioVigente = await obtenerPrecioAdicional(
+            const resultadoAdicional = await obtenerPrecioAdicional(
               pool,
               cacheAdicionales,
               recurso_id,
@@ -1211,16 +1211,16 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
               fechaString
             );
 
-            if (precioVigente === null) {
+            if (resultadoAdicional === null) {
               continue;
             }
 
-            const subtotalExtra = precioVigente * adicional.cantidad;
+            const subtotalExtra = resultadoAdicional.precio * adicional.cantidad;
             totalExtrasDia += subtotalExtra;
             extrasDia.push({
               adicional_id: adicional.adicional_id,
               cantidad: adicional.cantidad,
-              precio_unitario: precioVigente,
+              precio_unitario: resultadoAdicional.precio,
               subtotal: subtotalExtra
             });
           }
@@ -1267,6 +1267,7 @@ router.post("/reserva/adicionales", verifyToken, async (req, res) => {
         .query(
           `
             SELECT 
+              ta.id as tarifa_adicional_id,
               ta.adicional_id,
               a.nombre,
               ta.precio,
@@ -1280,10 +1281,10 @@ router.post("/reserva/adicionales", verifyToken, async (req, res) => {
               AND ta.fecha_fin >= ?
             ORDER BY ta.fecha_inicio ASC
           `,
-          [recurso_id, regimen_id, fecha_inicio, fecha_fin]
+          [recurso_id, regimen_id, fecha_fin, fecha_inicio]
         );
-        
-      res.status(200).json(adicionales);
+
+        res.status(200).json(adicionales);
     } else {
       res.status(401).json("No autorizado");
     }
@@ -1356,7 +1357,7 @@ async function obtenerPrecioAdicional(db, cache, recursoId, regimenId, adicional
 
   const [rows] = await db.query(
     `
-      SELECT precio
+      SELECT id as tarifa_adicional_id, precio
       FROM tarifa_adicional
       WHERE recurso_id = ?
         AND regimen_id = ?
@@ -1369,9 +1370,13 @@ async function obtenerPrecioAdicional(db, cache, recursoId, regimenId, adicional
     [recursoId, regimenId, adicionalId, fecha, fecha]
   );
 
-  const precio = rows.length > 0 ? Number(rows[0].precio) : null;
-  cache.set(cacheKey, precio);
-  return precio;
+  const resultado = rows.length > 0 ? { 
+    precio: Number(rows[0].precio), 
+    tarifa_adicional_id: rows[0].tarifa_adicional_id 
+  } : null;
+  
+  cache.set(cacheKey, resultado);
+  return resultado;
 }
 
 async function obtenerNombreAdicional(connection, cache, adicionalId) {
@@ -1428,19 +1433,20 @@ async function calcularAdicionalesReserva(connection, adicionales, recursoId, re
       fechaActual.setDate(fechaInicioDate.getDate() + dia);
       const fechaString = fechaActual.toISOString().split('T')[0];
 
-      const precioDia = await obtenerPrecioAdicional(connection, cachePrecios, recursoId, regimenId, adicionalId, fechaString);
+      const resultadoAdicional = await obtenerPrecioAdicional(connection, cachePrecios, recursoId, regimenId, adicionalId, fechaString);
 
-      if (precioDia === null) {
+      if (resultadoAdicional === null) {
         throw new Error(`No hay una tarifa de adicional vigente para la fecha ${fechaString}`);
       }
 
-      const subtotalDia = precioDia * cantidad;
+      const subtotalDia = resultadoAdicional.precio * cantidad;
       subtotal += subtotalDia;
       detalles.push({
         fecha: fechaString,
         cantidad,
-        precio_unitario: precioDia,
-        subtotal: subtotalDia
+        precio_unitario: resultadoAdicional.precio,
+        subtotal: subtotalDia,
+        tarifa_adicional_id: resultadoAdicional.tarifa_adicional_id
       });
     }
 
@@ -1485,14 +1491,15 @@ async function guardarAdicionalesReserva(connection, reservaId, adicionalesProce
     for (const detalle of adicional.detalles) {
       await connection.query(
         `INSERT INTO reserva_adicional_detalle
-          (reserva_adicional_id, fecha, cantidad, precio_unitario, subtotal)
-         VALUES (?, ?, ?, ?, ?)`,
+          (reserva_adicional_id, fecha, cantidad, precio_unitario, subtotal, tarifa_adicional_id)
+         VALUES (?, ?, ?, ?, ?, ?)`,
         [
           reservaAdicionalId,
           detalle.fecha,
           detalle.cantidad,
           detalle.precio_unitario,
-          detalle.subtotal
+          detalle.subtotal,
+          detalle.tarifa_adicional_id
         ]
       );
     }
@@ -1513,7 +1520,7 @@ async function obtenerAdicionalesReserva(connection, reservaId) {
 
   const ids = adicionales.map(a => a.id);
   const [detalles] = await connection.query(
-    `SELECT reserva_adicional_id, fecha, cantidad, precio_unitario, subtotal
+    `SELECT reserva_adicional_id, fecha, cantidad, precio_unitario, subtotal, tarifa_adicional_id
      FROM reserva_adicional_detalle
      WHERE reserva_adicional_id IN (?)
      ORDER BY fecha ASC`,
@@ -1529,7 +1536,8 @@ async function obtenerAdicionalesReserva(connection, reservaId) {
       fecha: detalle.fecha,
       cantidad: detalle.cantidad,
       precio_unitario: Number(detalle.precio_unitario),
-      subtotal: Number(detalle.subtotal)
+      subtotal: Number(detalle.subtotal),
+      tarifa_adicional_id: detalle.tarifa_adicional_id
     });
   }
 
