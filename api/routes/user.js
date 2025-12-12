@@ -1399,6 +1399,56 @@ async function registrarHistorial(connection, usuarioId, tipoOperacion, tablaAfe
   }
 }
 
+// Función auxiliar para registrar cambios en el historial de reservas
+async function registrarHistorialReserva(connection, reservaId, tipoOperacion, usuarioModificadorId, req, campos = null, observaciones = null) {
+  try {
+    const ipAddress = req.ip || req.connection.remoteAddress || req.socket.remoteAddress ||
+      (req.connection.socket ? req.connection.socket.remoteAddress : null);
+    const userAgent = req.get('User-Agent') || null;
+
+    if (campos && Array.isArray(campos)) {
+      // Registrar cambio por cada campo modificado
+      for (const campo of campos) {
+        await connection.query(
+          `INSERT INTO historial_reserva 
+           (reserva_id, tipo_operacion, campo_modificado, valor_anterior, valor_nuevo, 
+            usuario_modificador_id, ip_address, user_agent, observaciones)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            reservaId,
+            tipoOperacion,
+            campo.campo,
+            campo.valorAnterior,
+            campo.valorNuevo,
+            usuarioModificadorId,
+            ipAddress,
+            userAgent,
+            observaciones
+          ]
+        );
+      }
+    } else {
+      // Registrar operación general
+      await connection.query(
+        `INSERT INTO historial_reserva 
+         (reserva_id, tipo_operacion, usuario_modificador_id, 
+          ip_address, user_agent, observaciones)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          reservaId,
+          tipoOperacion,
+          usuarioModificadorId,
+          ipAddress,
+          userAgent,
+          observaciones
+        ]
+      );
+    }
+  } catch (error) {
+    console.error('Error al registrar historial de reserva:', error);
+  }
+}
+
 const DIA_EN_MS = 1000 * 60 * 60 * 24;
 
 async function obtenerPrecioAdicional(db, cache, recursoId, regimenId, adicionalId, fecha) {
@@ -2011,7 +2061,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
 
         // Verificar que la reserva existe
         const [reservaExistente] = await connection.query(
-          "SELECT id, usuario_id FROM reserva WHERE id = ?",
+          "SELECT * FROM reserva WHERE id = ?",
           [reservaId]
         );
 
@@ -2110,6 +2160,53 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
 
         const tarifaBase = tarifaBaseDesdeRequest !== null ? tarifaBaseDesdeRequest : tarifaTotal;
         const precioTotalReserva = tarifaBase + montoAdicionales;
+
+        // Detectar cambios en la reserva
+        const datosAnteriores = reservaExistente[0];
+        const cambiosReserva = [];
+
+        // Función auxiliar para formatear fechas para comparación
+        const formatDate = (date) => {
+            if (!date) return null;
+            try {
+                const d = new Date(date);
+                if (isNaN(d.getTime())) return null;
+                return d.toISOString().split('T')[0];
+            } catch (e) { return null; }
+        };
+
+        if (datosAnteriores.regimen_id !== regimen_id) {
+            cambiosReserva.push({ campo: 'regimen_id', valorAnterior: datosAnteriores.regimen_id, valorNuevo: regimen_id });
+        }
+        if (datosAnteriores.recurso_id !== recurso_id) {
+            cambiosReserva.push({ campo: 'recurso_id', valorAnterior: datosAnteriores.recurso_id, valorNuevo: recurso_id });
+        }
+        if (formatDate(datosAnteriores.fecha_inicio) !== formatDate(fecha_inicio)) {
+            cambiosReserva.push({ campo: 'fecha_inicio', valorAnterior: formatDate(datosAnteriores.fecha_inicio), valorNuevo: formatDate(fecha_inicio) });
+        }
+        if (formatDate(datosAnteriores.fecha_fin) !== formatDate(fecha_fin)) {
+            cambiosReserva.push({ campo: 'fecha_fin', valorAnterior: formatDate(datosAnteriores.fecha_fin), valorNuevo: formatDate(fecha_fin) });
+        }
+        if (Number(datosAnteriores.precio_total) !== Number(precioTotalReserva)) {
+            cambiosReserva.push({ campo: 'precio_total', valorAnterior: datosAnteriores.precio_total, valorNuevo: precioTotalReserva });
+        }
+        
+        const obsAnt = datosAnteriores.observaciones || '';
+        const obsNew = observaciones || '';
+        if (obsAnt !== obsNew) {
+            cambiosReserva.push({ campo: 'observaciones', valorAnterior: obsAnt, valorNuevo: obsNew });
+        }
+        
+        if (Number(datosAnteriores.monto_adicionales) !== Number(montoAdicionales)) {
+            cambiosReserva.push({ campo: 'monto_adicionales', valorAnterior: datosAnteriores.monto_adicionales, valorNuevo: montoAdicionales });
+        }
+        if (firmaArchivo) {
+             cambiosReserva.push({ campo: 'firma_archivo', valorAnterior: datosAnteriores.firma_archivo, valorNuevo: firmaArchivo });
+        }
+
+        if (cambiosReserva.length > 0) {
+            await registrarHistorialReserva(connection, reservaId, 'UPDATE', cabecera.id, req, cambiosReserva, 'Modificación de reserva');
+        }
 
         // Actualizar reserva principal
         const updateReservaQuery = `
@@ -2943,7 +3040,7 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
 
         // Verificar que la reserva existe
         const [reservaExistente] = await connection.query(
-          "SELECT id, estado_reserva_id FROM reserva WHERE id = ?",
+          "SELECT * FROM reserva WHERE id = ?",
           [reservaId]
         );
 
@@ -2963,6 +3060,24 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
         } else if (estado === "Cancelada") {
           estadoId = 4; // Usando "Rechazada" como equivalente a "Cancelada"
           estadoNombre = "Rechazada";
+        }
+
+        // Detectar cambios
+        const datosAnteriores = reservaExistente[0];
+        const cambiosReserva = [];
+
+        if (datosAnteriores.estado_reserva_id !== estadoId) {
+            cambiosReserva.push({ campo: 'estado_reserva_id', valorAnterior: datosAnteriores.estado_reserva_id, valorNuevo: estadoId });
+        }
+        
+        const obsAnt = datosAnteriores.observaciones || '';
+        const obsNew = observaciones || '';
+        if (obsAnt !== obsNew) {
+            cambiosReserva.push({ campo: 'observaciones', valorAnterior: obsAnt, valorNuevo: obsNew });
+        }
+
+        if (cambiosReserva.length > 0) {
+            await registrarHistorialReserva(connection, reservaId, 'UPDATE', cabecera.id, req, cambiosReserva, 'Cambio de estado de reserva');
         }
 
         // Actualizar el estado de la reserva
@@ -4672,6 +4787,98 @@ router.get("/tabla/historial-departamental/:id?", verifyToken, async (req, res) 
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener el historial de departamentales");
+  }
+});
+
+// GET /tabla/historial-reserva/:id? - Obtiene el historial de cambios de reservas
+router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "departamental"
+    ) {
+      const reservaId = req.params.id;
+      const page = req.query.page ? Number(req.query.page) : 1;
+      const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 20;
+      const start = (page - 1) * resultsPerPage;
+
+      const tipoOperacion = req.query.tipo_operacion;
+      const fechaDesde = req.query.fecha_desde;
+      const fechaHasta = req.query.fecha_hasta;
+
+      let whereClause = "";
+      let params = [];
+
+      if (reservaId) {
+        whereClause += " WHERE h.reserva_id = ?";
+        params.push(reservaId);
+      }
+
+      if (tipoOperacion) {
+        whereClause += whereClause ? " AND" : " WHERE";
+        whereClause += " h.tipo_operacion = ?";
+        params.push(tipoOperacion);
+      }
+
+      if (fechaDesde) {
+        whereClause += whereClause ? " AND" : " WHERE";
+        whereClause += " h.fecha_modificacion >= ?";
+        params.push(fechaDesde);
+      }
+
+      if (fechaHasta) {
+        whereClause += whereClause ? " AND" : " WHERE";
+        whereClause += " h.fecha_modificacion <= ?";
+        params.push(fechaHasta + ' 23:59:59');
+      }
+
+      const query = `
+        SELECT
+          h.id,
+          h.reserva_id,
+          h.tipo_operacion,
+          h.campo_modificado,
+          h.valor_anterior,
+          h.valor_nuevo,
+          h.usuario_modificador_id,
+          CONCAT(um.nombre, ' ', um.apellido) as modificador_nombre,
+          DATE_FORMAT(h.fecha_modificacion, '%d/%m/%Y %H:%i:%s') as fecha_modificacion,
+          h.observaciones
+        FROM historial_reserva h
+        LEFT JOIN usuario um ON h.usuario_modificador_id = um.id
+        ${whereClause}
+        ORDER BY h.fecha_modificacion DESC
+        LIMIT ${start}, ${resultsPerPage}
+      `;
+
+      const [rows] = await mysqlConnection.promise().execute(query, params);
+
+      // Consulta para el total de registros
+      const countQuery = `
+        SELECT COUNT(*) as total
+        FROM historial_reserva h
+        ${whereClause}
+      `;
+
+      const [countRows] = await mysqlConnection.promise().execute(countQuery, params);
+      const total = countRows[0].total;
+      const numOfPages = Math.ceil(total / resultsPerPage);
+
+      res.status(200).json({
+        results: rows,
+        numOfPages,
+        totalItems: total,
+        page: page - 1,
+        pageSize: resultsPerPage
+      });
+
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener el historial de reservas");
   }
 });
 
