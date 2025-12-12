@@ -1474,14 +1474,13 @@ async function guardarAdicionalesReserva(connection, reservaId, adicionalesProce
   for (const adicional of adicionalesProcesados) {
     const [resultado] = await connection.query(
       `INSERT INTO reserva_adicional
-        (reserva_id, adicional_id, nombre_adicional, cantidad, precio_unitario, dias, subtotal)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        (reserva_id, adicional_id, nombre_adicional, cantidad, dias, subtotal)
+       VALUES (?, ?, ?, ?, ?, ?)`,
       [
         reservaId,
         adicional.adicional_id,
         adicional.nombre_adicional,
         adicional.cantidad,
-        adicional.precio_referencia,
         adicional.dias,
         adicional.subtotal
       ]
@@ -1508,7 +1507,7 @@ async function guardarAdicionalesReserva(connection, reservaId, adicionalesProce
 
 async function obtenerAdicionalesReserva(connection, reservaId) {
   const [adicionales] = await connection.query(
-    `SELECT id, adicional_id, nombre_adicional, cantidad, precio_unitario, dias, subtotal
+    `SELECT id, adicional_id, nombre_adicional, cantidad, dias, subtotal
      FROM reserva_adicional
      WHERE reserva_id = ?`,
     [reservaId]
@@ -1546,7 +1545,6 @@ async function obtenerAdicionalesReserva(connection, reservaId) {
     adicional_id: adicional.adicional_id,
     nombre: adicional.nombre_adicional,
     cantidad: adicional.cantidad,
-    precio_unitario: Number(adicional.precio_unitario),
     dias: adicional.dias,
     subtotal: Number(adicional.subtotal),
     fechas: detallesMap.get(adicional.id) || []
@@ -2514,20 +2512,20 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
           adicional_id: adicional.adicional_id,
           nombre: adicional.nombre,
           cantidad: adicional.cantidad,
-          precio_unitario: Number(adicional.precio_unitario),
           dias: adicional.dias,
           subtotal: Number(adicional.subtotal),
           fechas: adicional.fechas.map(fecha => ({
             fecha: fecha.fecha,
             cantidad: fecha.cantidad,
             precio_unitario: Number(fecha.precio_unitario),
-            subtotal: Number(fecha.subtotal)
+            subtotal: Number(fecha.subtotal),
+            tarifa_adicional_id: fecha.tarifa_adicional_id
           }))
         }));
 
         respuesta.adicionales = adicionalesFormateados;
         respuesta.monto_adicionales = reserva.monto_adicionales || 0;
-
+        
         res.status(200).json(respuesta);
 
       } catch (queryError) {
@@ -2680,14 +2678,14 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           adicional_id: adicional.adicional_id,
           nombre: adicional.nombre,
           cantidad: adicional.cantidad,
-          precio_unitario: Number(adicional.precio_unitario),
           dias: adicional.dias,
           subtotal: Number(adicional.subtotal),
           fechas: adicional.fechas.map(fecha => ({
             fecha: fecha.fecha,
             cantidad: fecha.cantidad,
             precio_unitario: Number(fecha.precio_unitario),
-            subtotal: Number(fecha.subtotal)
+            subtotal: Number(fecha.subtotal),
+            tarifa_adicional_id: fecha.tarifa_adicional_id
           }))
         }));
 
