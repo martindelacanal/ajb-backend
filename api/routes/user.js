@@ -6084,6 +6084,569 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
   }
 });
 
+const MODOS_SALTO_FLUJO_VALIDOS = new Set(["POR_RANGO", "POR_ANIO"]);
+const SENTIDOS_CALCULO_FLUJO_VALIDOS = new Set(["ASCENDENTE", "DESCENDENTE"]);
+
+function parsearEnteroNoNegativoFlujo(valor, nombreCampo, opciones = {}) {
+  const permiteNull = Boolean(opciones.permiteNull);
+  if (valor === undefined || valor === null || valor === "") {
+    if (permiteNull) {
+      return { value: null };
+    }
+    return { error: `${nombreCampo} es requerido` };
+  }
+
+  const numero = Number(valor);
+  if (!Number.isInteger(numero) || numero < 0) {
+    return { error: `${nombreCampo} debe ser un entero mayor o igual a 0` };
+  }
+
+  return { value: numero };
+}
+
+function parsearDecimalPositivoFlujo(valor, nombreCampo) {
+  if (valor === undefined || valor === null || valor === "") {
+    return { error: `${nombreCampo} es requerido` };
+  }
+
+  const numero = Number(valor);
+  if (!Number.isFinite(numero) || numero <= 0) {
+    return { error: `${nombreCampo} debe ser un numero decimal mayor a 0` };
+  }
+
+  return { value: numero };
+}
+
+function parsearBooleanFlujo(valor, nombreCampo) {
+  if (typeof valor === "boolean") {
+    return { value: valor };
+  }
+
+  if (typeof valor === "number" && (valor === 0 || valor === 1)) {
+    return { value: valor === 1 };
+  }
+
+  if (typeof valor === "string") {
+    const normalizado = valor.trim().toLowerCase();
+    if (["true", "1", "y", "yes", "si", "s"].includes(normalizado)) {
+      return { value: true };
+    }
+    if (["false", "0", "n", "no"].includes(normalizado)) {
+      return { value: false };
+    }
+  }
+
+  return { error: `${nombreCampo} debe ser booleano` };
+}
+
+function validarYNormalizarFlujoDescuentoEscalonado(body) {
+  const reglas = body?.reglas;
+  if (!Array.isArray(reglas) || reglas.length === 0) {
+    return { error: "Debe enviar al menos 1 regla" };
+  }
+
+  const reglasNormalizadas = [];
+
+  for (let i = 0; i < reglas.length; i++) {
+    const regla = reglas[i] || {};
+    const prefijoRegla = `reglas[${i}]`;
+
+    const servicioIdResultado = parsearEnteroNoNegativoFlujo(
+      regla.servicio_id ?? regla.servicioId,
+      `${prefijoRegla}.servicio_id`
+    );
+    if (servicioIdResultado.error) {
+      return servicioIdResultado;
+    }
+
+    const recursoIdResultado = parsearEnteroNoNegativoFlujo(
+      regla.recurso_id ?? regla.recursoId,
+      `${prefijoRegla}.recurso_id`
+    );
+    if (recursoIdResultado.error) {
+      return recursoIdResultado;
+    }
+
+    const tipoPersonaIdResultado = parsearEnteroNoNegativoFlujo(
+      regla.tipo_persona_id ?? regla.tipoPersonaId,
+      `${prefijoRegla}.tipo_persona_id`
+    );
+    if (tipoPersonaIdResultado.error) {
+      return tipoPersonaIdResultado;
+    }
+
+    const saltoResultado = parsearDecimalPositivoFlujo(
+      regla.salto_porcentaje ?? regla.saltoPorcentaje,
+      `${prefijoRegla}.salto_porcentaje`
+    );
+    if (saltoResultado.error) {
+      return saltoResultado;
+    }
+
+    const modoSalto = String(regla.modo_salto ?? regla.modoSalto ?? "")
+      .trim()
+      .toUpperCase();
+    if (!MODOS_SALTO_FLUJO_VALIDOS.has(modoSalto)) {
+      return {
+        error: `${prefijoRegla}.modo_salto debe ser POR_RANGO o POR_ANIO`,
+      };
+    }
+
+    const sentidoCalculo = String(
+      regla.sentido_calculo ?? regla.sentidoCalculo ?? ""
+    )
+      .trim()
+      .toUpperCase();
+    if (!SENTIDOS_CALCULO_FLUJO_VALIDOS.has(sentidoCalculo)) {
+      return {
+        error: `${prefijoRegla}.sentido_calculo debe ser ASCENDENTE o DESCENDENTE`,
+      };
+    }
+
+    const rangoBaseOrdenResultado = parsearEnteroNoNegativoFlujo(
+      regla.rango_base_orden ?? regla.rangoBaseOrden,
+      `${prefijoRegla}.rango_base_orden`
+    );
+    if (rangoBaseOrdenResultado.error) {
+      return rangoBaseOrdenResultado;
+    }
+    const rangoBaseOrden = rangoBaseOrdenResultado.value;
+
+    const usarTopeResultado = parsearBooleanFlujo(
+      regla.usar_tope ?? regla.usarTope,
+      `${prefijoRegla}.usar_tope`
+    );
+    if (usarTopeResultado.error) {
+      return usarTopeResultado;
+    }
+    const usarTope = usarTopeResultado.value;
+
+    const rangosEdad = regla.rangos_edad ?? regla.rangosEdad;
+    if (!Array.isArray(rangosEdad) || rangosEdad.length === 0) {
+      return { error: `${prefijoRegla} debe tener al menos 1 rango de edad` };
+    }
+
+    const rangosNormalizados = [];
+    const ordenesUsados = new Set();
+
+    for (let j = 0; j < rangosEdad.length; j++) {
+      const rango = rangosEdad[j] || {};
+      const prefijoRango = `${prefijoRegla}.rangos_edad[${j}]`;
+
+      const ordenResultado = parsearEnteroNoNegativoFlujo(
+        rango.orden,
+        `${prefijoRango}.orden`
+      );
+      if (ordenResultado.error) {
+        return ordenResultado;
+      }
+      const orden = ordenResultado.value;
+
+      if (ordenesUsados.has(orden)) {
+        return { error: `${prefijoRegla}.rangos_edad contiene ordenes duplicados` };
+      }
+      ordenesUsados.add(orden);
+
+      const edadMinimaResultado = parsearEnteroNoNegativoFlujo(
+        rango.edad_minima ?? rango.edadMinima,
+        `${prefijoRango}.edad_minima`
+      );
+      if (edadMinimaResultado.error) {
+        return edadMinimaResultado;
+      }
+      const edadMinima = edadMinimaResultado.value;
+
+      const edadMaximaRaw = rango.edad_maxima ?? rango.edadMaxima;
+      let edadMaxima = null;
+      if (
+        edadMaximaRaw !== undefined &&
+        edadMaximaRaw !== null &&
+        edadMaximaRaw !== ""
+      ) {
+        const edadMaximaResultado = parsearEnteroNoNegativoFlujo(
+          edadMaximaRaw,
+          `${prefijoRango}.edad_maxima`
+        );
+        if (edadMaximaResultado.error) {
+          return edadMaximaResultado;
+        }
+        edadMaxima = edadMaximaResultado.value;
+
+        if (edadMaxima <= edadMinima) {
+          return {
+            error: `${prefijoRango}.edad_maxima debe ser mayor que edad_minima`,
+          };
+        }
+      }
+
+      rangosNormalizados.push({
+        orden,
+        edad_minima: edadMinima,
+        edad_maxima: edadMaxima,
+      });
+    }
+
+    rangosNormalizados.sort((a, b) => a.orden - b.orden);
+
+    for (let ordenEsperado = 0; ordenEsperado < rangosNormalizados.length; ordenEsperado++) {
+      if (rangosNormalizados[ordenEsperado].orden !== ordenEsperado) {
+        return {
+          error: `${prefijoRegla}.rangos_edad debe ser secuencial desde 0`,
+        };
+      }
+    }
+
+    for (let j = 0; j < rangosNormalizados.length; j++) {
+      const actual = rangosNormalizados[j];
+
+      if (actual.edad_maxima === null && j !== rangosNormalizados.length - 1) {
+        return {
+          error: `${prefijoRegla}.solo el ultimo rango puede tener edad_maxima null`,
+        };
+      }
+
+      if (j === 0) {
+        continue;
+      }
+
+      const anterior = rangosNormalizados[j - 1];
+      if (
+        anterior.edad_maxima !== null &&
+        actual.edad_minima <= anterior.edad_maxima
+      ) {
+        return { error: `${prefijoRegla}.rangos_edad tiene solapamientos` };
+      }
+    }
+
+    const ordenesValidos = new Set(rangosNormalizados.map(rango => rango.orden));
+    if (!ordenesValidos.has(rangoBaseOrden)) {
+      return {
+        error: `${prefijoRegla}.rango_base_orden debe existir en rangos_edad`,
+      };
+    }
+
+    const rangoTopeRaw = regla.rango_tope_orden ?? regla.rangoTopeOrden;
+    let rangoTopeOrden = null;
+
+    if (usarTope) {
+      const rangoTopeResultado = parsearEnteroNoNegativoFlujo(
+        rangoTopeRaw,
+        `${prefijoRegla}.rango_tope_orden`
+      );
+      if (rangoTopeResultado.error) {
+        return rangoTopeResultado;
+      }
+      rangoTopeOrden = rangoTopeResultado.value;
+
+      if (!ordenesValidos.has(rangoTopeOrden)) {
+        return {
+          error: `${prefijoRegla}.rango_tope_orden debe existir en rangos_edad`,
+        };
+      }
+    } else if (
+      rangoTopeRaw !== undefined &&
+      rangoTopeRaw !== null &&
+      rangoTopeRaw !== ""
+    ) {
+      return {
+        error: `${prefijoRegla}.rango_tope_orden debe ser null cuando usar_tope es false`,
+      };
+    }
+
+    reglasNormalizadas.push({
+      servicio_id: servicioIdResultado.value,
+      recurso_id: recursoIdResultado.value,
+      tipo_persona_id: tipoPersonaIdResultado.value,
+      salto_porcentaje: saltoResultado.value,
+      modo_salto: modoSalto,
+      sentido_calculo: sentidoCalculo,
+      rango_base_orden: rangoBaseOrden,
+      usar_tope: usarTope,
+      rango_tope_orden: rangoTopeOrden,
+      rangos_edad: rangosNormalizados,
+    });
+  }
+
+  return { reglas: reglasNormalizadas };
+}
+
+async function insertarReglasFlujoDescuentoEscalonado(connection, flujoId, reglas) {
+  for (const regla of reglas) {
+    const [reglaResult] = await connection.query(
+      `INSERT INTO flujo_descuento_escalonado_regla
+        (flujo_id, servicio_id, recurso_id, tipo_persona_id, salto_porcentaje, modo_salto, sentido_calculo, rango_base_orden, usar_tope, rango_tope_orden)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        flujoId,
+        regla.servicio_id,
+        regla.recurso_id,
+        regla.tipo_persona_id,
+        regla.salto_porcentaje,
+        regla.modo_salto,
+        regla.sentido_calculo,
+        regla.rango_base_orden,
+        regla.usar_tope ? 1 : 0,
+        regla.rango_tope_orden,
+      ]
+    );
+
+    for (const rango of regla.rangos_edad) {
+      await connection.query(
+        `INSERT INTO flujo_descuento_escalonado_rango_edad
+          (regla_id, orden, edad_minima, edad_maxima)
+         VALUES (?, ?, ?, ?)`,
+        [reglaResult.insertId, rango.orden, rango.edad_minima, rango.edad_maxima]
+      );
+    }
+  }
+}
+
+async function obtenerFlujoDescuentoEscalonado(connection, flujoId = null) {
+  const params = [];
+  let flujoQuery = `
+    SELECT id, created_at, updated_at
+    FROM flujo_descuento_escalonado
+  `;
+
+  if (flujoId !== null) {
+    flujoQuery += " WHERE id = ?";
+    params.push(flujoId);
+  }
+
+  flujoQuery += " ORDER BY id ASC LIMIT 1";
+
+  const [flujoRows] = await connection.query(flujoQuery, params);
+  if (flujoRows.length === 0) {
+    return null;
+  }
+
+  const flujo = flujoRows[0];
+  const [reglasRows] = await connection.query(
+    `SELECT
+      id,
+      flujo_id,
+      servicio_id,
+      recurso_id,
+      tipo_persona_id,
+      salto_porcentaje,
+      modo_salto,
+      sentido_calculo,
+      rango_base_orden,
+      usar_tope,
+      rango_tope_orden
+    FROM flujo_descuento_escalonado_regla
+    WHERE flujo_id = ?
+    ORDER BY id ASC`,
+    [flujo.id]
+  );
+
+  let rangosRows = [];
+  if (reglasRows.length > 0) {
+    const reglasIds = reglasRows.map(regla => regla.id);
+    const [rangosResult] = await connection.query(
+      `SELECT id, regla_id, orden, edad_minima, edad_maxima
+       FROM flujo_descuento_escalonado_rango_edad
+       WHERE regla_id IN (?)
+       ORDER BY regla_id ASC, orden ASC`,
+      [reglasIds]
+    );
+    rangosRows = rangosResult;
+  }
+
+  const rangosPorRegla = new Map();
+  for (const rango of rangosRows) {
+    if (!rangosPorRegla.has(rango.regla_id)) {
+      rangosPorRegla.set(rango.regla_id, []);
+    }
+    rangosPorRegla.get(rango.regla_id).push({
+      id: rango.id,
+      orden: rango.orden,
+      edad_minima: rango.edad_minima,
+      edad_maxima: rango.edad_maxima,
+    });
+  }
+
+  return {
+    id: flujo.id,
+    reglas: reglasRows.map(regla => ({
+      id: regla.id,
+      servicio_id: regla.servicio_id,
+      recurso_id: regla.recurso_id,
+      tipo_persona_id: regla.tipo_persona_id,
+      salto_porcentaje:
+        regla.salto_porcentaje !== null ? Number(regla.salto_porcentaje) : null,
+      modo_salto: regla.modo_salto,
+      sentido_calculo: regla.sentido_calculo,
+      rango_base_orden: regla.rango_base_orden,
+      usar_tope: regla.usar_tope === 1 || regla.usar_tope === true,
+      rango_tope_orden: regla.rango_tope_orden,
+      rangos_edad: rangosPorRegla.get(regla.id) || [],
+    })),
+    created_at: flujo.created_at,
+    updated_at: flujo.updated_at,
+  };
+}
+
+router.get("/flujo-descuento-escalonado", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const connection = await mysqlConnection.promise().getConnection();
+    try {
+      const flujo = await obtenerFlujoDescuentoEscalonado(connection);
+      // console.log(flujo);
+      // if (!flujo) {
+      //   return res.status(404).json("Flujo no encontrado");
+      // }
+      res.status(200).json(flujo);
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener el flujo de descuento escalonado");
+  }
+});
+
+router.post("/flujo-descuento-escalonado", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const validacion = validarYNormalizarFlujoDescuentoEscalonado(req.body);
+    if (validacion.error) {
+      return res.status(400).json(validacion.error);
+    }
+
+    let connection;
+    try {
+      connection = await mysqlConnection.promise().getConnection();
+      await connection.beginTransaction();
+
+      const [flujoExistente] = await connection.query(
+        "SELECT id FROM flujo_descuento_escalonado LIMIT 1 FOR UPDATE"
+      );
+      if (flujoExistente.length > 0) {
+        await connection.rollback();
+        return res.status(409).json("Ya existe un flujo de descuento escalonado");
+      }
+
+      const [flujoResult] = await connection.query(
+        "INSERT INTO flujo_descuento_escalonado (created_at, updated_at) VALUES (NOW(), NOW())"
+      );
+
+      await insertarReglasFlujoDescuentoEscalonado(
+        connection,
+        flujoResult.insertId,
+        validacion.reglas
+      );
+
+      const flujo = await obtenerFlujoDescuentoEscalonado(
+        connection,
+        flujoResult.insertId
+      );
+
+      await connection.commit();
+      res.status(201).json(flujo);
+    } catch (transactionError) {
+      if (connection) {
+        await connection.rollback();
+      }
+      throw transactionError;
+    } finally {
+      if (connection) {
+        connection.release();
+      }
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al crear el flujo de descuento escalonado");
+  }
+});
+
+router.put("/flujo-descuento-escalonado/:id", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const idResultado = parsearEnteroNoNegativoFlujo(req.params.id, "id");
+    if (idResultado.error || idResultado.value <= 0) {
+      return res.status(400).json("id invalido");
+    }
+
+    const validacion = validarYNormalizarFlujoDescuentoEscalonado(req.body);
+    if (validacion.error) {
+      return res.status(400).json(validacion.error);
+    }
+
+    let connection;
+    try {
+      connection = await mysqlConnection.promise().getConnection();
+      await connection.beginTransaction();
+
+      const [flujoRows] = await connection.query(
+        "SELECT id FROM flujo_descuento_escalonado WHERE id = ? FOR UPDATE",
+        [idResultado.value]
+      );
+      if (flujoRows.length === 0) {
+        await connection.rollback();
+        return res.status(404).json("Flujo no encontrado");
+      }
+
+      await connection.query(
+        `DELETE frango
+         FROM flujo_descuento_escalonado_rango_edad frango
+         INNER JOIN flujo_descuento_escalonado_regla fregla ON fregla.id = frango.regla_id
+         WHERE fregla.flujo_id = ?`,
+        [idResultado.value]
+      );
+
+      await connection.query(
+        "DELETE FROM flujo_descuento_escalonado_regla WHERE flujo_id = ?",
+        [idResultado.value]
+      );
+
+      await insertarReglasFlujoDescuentoEscalonado(
+        connection,
+        idResultado.value,
+        validacion.reglas
+      );
+
+      await connection.query(
+        "UPDATE flujo_descuento_escalonado SET updated_at = NOW() WHERE id = ?",
+        [idResultado.value]
+      );
+
+      const flujoActualizado = await obtenerFlujoDescuentoEscalonado(
+        connection,
+        idResultado.value
+      );
+
+      await connection.commit();
+      res.status(200).json(flujoActualizado);
+    } catch (transactionError) {
+      if (connection) {
+        await connection.rollback();
+      }
+      throw transactionError;
+    } finally {
+      if (connection) {
+        connection.release();
+      }
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al actualizar el flujo de descuento escalonado");
+  }
+});
+
 // Configuración de multer para fotos de perfil
 const uploadFotoPerfil = multer({
   storage: multer.memoryStorage(),
