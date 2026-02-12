@@ -5013,7 +5013,7 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
             WHEN r.nombre = 'admin' THEN 'Admin'
             WHEN r.nombre = 'afiliado' THEN 'Afiliado'
             WHEN r.nombre = 'departamental' THEN 'Departamental'
-            WHEN r.nombre = 'noafiliado' THEN 'No afiliado'
+            WHEN r.nombre = 'invitado' THEN 'Invitado'
             ELSE r.nombre
           END AS rol,
           u.nombre,
@@ -5079,7 +5079,7 @@ router.get("/rol", verifyToken, async (req, res) => {
         admin: "Admin",
         afiliado: "Afiliado",
         departamental: "Departamental",
-        noafiliado: "No afiliado"
+        invitado: "Invitado"
       };
 
       const roles = rows.map(r => ({
@@ -5091,11 +5091,11 @@ router.get("/rol", verifyToken, async (req, res) => {
     } else if (cabecera.rol === "departamental") {
       const [rows] = await mysqlConnection
         .promise()
-        .query("SELECT id, nombre FROM rol WHERE nombre IN ('afiliado', 'noafiliado') ORDER BY id ASC");
+        .query("SELECT id, nombre FROM rol WHERE nombre IN ('afiliado', 'invitado') ORDER BY id ASC");
 
       const rolesMap = {
         afiliado: "Afiliado",
-        noafiliado: "No afiliado"
+        invitado: "Invitado"
       };
 
       const roles = rows.map(r => ({
@@ -5187,7 +5187,7 @@ function normalizarValorPorcentaje(valor) {
   return Number.isNaN(numero) ? null : numero;
 }
 
-function construirMapaPreciosParticulares(tiposPersona) {
+function construirMapaPreciosDeLista(tiposPersona) {
   const mapa = new Map();
   if (!Array.isArray(tiposPersona)) {
     return mapa;
@@ -5213,7 +5213,7 @@ function construirMapaPreciosParticulares(tiposPersona) {
   return mapa;
 }
 
-function calcularPrecioRangoConPorcentaje(rangoEdad, tipoPersonaId, mapaPreciosParticulares) {
+function calcularPrecioRangoConPorcentaje(rangoEdad, tipoPersonaId, mapaPreciosDeLista) {
   const usaPorcentaje = normalizarBanderaPorcentaje(rangoEdad?.usa_porcentaje ?? rangoEdad?.usaPorcentaje);
   
   let rawPorcentaje = rangoEdad?.porcentaje_descuento ??
@@ -5241,8 +5241,8 @@ function calcularPrecioRangoConPorcentaje(rangoEdad, tipoPersonaId, mapaPreciosP
     const edadMin = rangoEdad?.edadMinima ?? rangoEdad?.edad_minima ?? "";
     const edadMax = rangoEdad?.edadMaxima ?? rangoEdad?.edad_maxima ?? "";
     const key = `${edadMin}-${edadMax}`;
-    const precioBase = mapaPreciosParticulares?.get
-      ? mapaPreciosParticulares.get(key)
+    const precioBase = mapaPreciosDeLista?.get
+      ? mapaPreciosDeLista.get(key)
       : undefined;
 
     if (typeof precioBase === "number" && !Number.isNaN(precioBase)) {
@@ -5380,7 +5380,7 @@ router.post("/temporada", verifyToken, async (req, res) => {
 
                 // Verificar si el precio es por persona o por recurso
                 if (recurso.precio_por_persona) {
-                  const mapaPreciosParticulares = construirMapaPreciosParticulares(fecha.tiposPersona);
+                  const mapaPreciosDeLista = construirMapaPreciosDeLista(fecha.tiposPersona);
                   // Procesar cada tipo de persona de la fecha
                   for (const tipoPersona of fecha.tiposPersona) {
                     const tipoPersonaId = tipoPersona?.tipoPersonaId ?? tipoPersona?.tipo_persona_id;
@@ -5393,7 +5393,7 @@ router.post("/temporada", verifyToken, async (req, res) => {
                       const { precioTarifa, usaPorcentaje, porcentajeDescuento } = calcularPrecioRangoConPorcentaje(
                         rangoEdad,
                         tipoPersonaId,
-                        mapaPreciosParticulares
+                        mapaPreciosDeLista
                       );
 
                       // Insertar tarifa individual con tipos de persona
@@ -5946,7 +5946,7 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
 
 
                   if (recurso.precio_por_persona) {
-                    const mapaPreciosParticulares = construirMapaPreciosParticulares(fecha.tiposPersona);
+                    const mapaPreciosDeLista = construirMapaPreciosDeLista(fecha.tiposPersona);
                     for (const tipoPersona of fecha.tiposPersona) {
                       const tipoPersonaId = tipoPersona?.tipoPersonaId ?? tipoPersona?.tipo_persona_id;
                       if (!tipoPersonaId || !Array.isArray(tipoPersona?.rangosEdad)) {
@@ -5957,7 +5957,7 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
                         const { precioTarifa, usaPorcentaje, porcentajeDescuento } = calcularPrecioRangoConPorcentaje(
                           rangoEdad,
                           tipoPersonaId,
-                          mapaPreciosParticulares
+                          mapaPreciosDeLista
                         );
 
                         const [tarifaResult] = await connection.query(
