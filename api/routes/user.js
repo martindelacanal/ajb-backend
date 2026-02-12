@@ -4305,7 +4305,7 @@ router.post("/tabla/temporadas", verifyToken, async (req, res) => {
     const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 10;
     const start = (page - 1) * resultsPerPage;
 
-    let orderBy = req.query.orderBy ? req.query.orderBy : "fecha_inicio";
+    let orderBy = req.query.orderBy ? req.query.orderBy : "id";
     const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
 
     if (orderBy === "fecha_inicio") {
@@ -4315,7 +4315,7 @@ router.post("/tabla/temporadas", verifyToken, async (req, res) => {
     }
 
     const queryOrderBy = `${orderBy} ${orderType}`;
-
+console.log("queryOrderBy", queryOrderBy);
     if (buscar) {
       buscar = "%" + buscar + "%";
       queryBuscar = `AND (id LIKE '${buscar}' OR nombre LIKE '${buscar}' OR DATE_FORMAT(fecha_inicio, '%d/%m/%Y') LIKE '${buscar}' OR DATE_FORMAT(fecha_fin, '%d/%m/%Y') LIKE '${buscar}')`;
@@ -4342,7 +4342,7 @@ router.post("/tabla/temporadas", verifyToken, async (req, res) => {
       queryParams.push(toDate);
     }
 
-    query += ` ORDER BY ${queryOrderBy}, fecha_inicio DESC LIMIT ${start}, ${resultsPerPage}`;
+    query += ` ORDER BY ${queryOrderBy} LIMIT ${start}, ${resultsPerPage}`;
 
     try {
       const [rows] = await mysqlConnection.promise().execute(query, queryParams);
