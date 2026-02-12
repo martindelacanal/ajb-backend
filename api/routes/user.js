@@ -4315,7 +4315,7 @@ router.post("/tabla/temporadas", verifyToken, async (req, res) => {
     }
 
     const queryOrderBy = `${orderBy} ${orderType}`;
-console.log("queryOrderBy", queryOrderBy);
+    
     if (buscar) {
       buscar = "%" + buscar + "%";
       queryBuscar = `AND (id LIKE '${buscar}' OR nombre LIKE '${buscar}' OR DATE_FORMAT(fecha_inicio, '%d/%m/%Y') LIKE '${buscar}' OR DATE_FORMAT(fecha_fin, '%d/%m/%Y') LIKE '${buscar}')`;
