@@ -14,6 +14,13 @@ const fs = require("fs");
 var path = require("path");
 
 const moment = require("moment"); // para formatear fechas
+const {
+  obtenerCalendarioAlternativoServicio,
+  obtenerSnapshotDisponibilidad,
+  obtenerServicios,
+  parsearParametrosBusquedaDisponibilidad,
+  parsearServicioIdsCsv,
+} = require("../services/servicios-disponibilidad");
 
 // S3 INICIO
 const S3Client = require("@aws-sdk/client-s3").S3Client;
@@ -296,13 +303,28 @@ router.get("/servicios", verifyToken, async (req, res) => {
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
-      // Filtrar por lugar si viene el query param
+      const db = mysqlConnection.promise();
       const lugar = req.query.lugar;
-      const fecha_inicio = req.query.fecha_inicio;
-      const fecha_fin = req.query.fecha_fin;
-      const adultos = parseInt(req.query.adultos) || 0;
-      const ninos = parseInt(req.query.ninos) || 0;
-      const bebes = parseInt(req.query.bebes) || 0;
+      const hayParametrosDisponibilidad =
+        req.query.fecha_inicio !== undefined ||
+        req.query.fecha_fin !== undefined ||
+        req.query.adultos !== undefined ||
+        req.query.ninos !== undefined ||
+        req.query.bebes !== undefined;
+
+      let criteriosDisponibilidad = null;
+      if (hayParametrosDisponibilidad) {
+        const parseo = parsearParametrosBusquedaDisponibilidad(req.query, {
+          requireFechas: true,
+          requirePersonas: true,
+        });
+
+        if (parseo.error) {
+          return res.status(422).json(parseo.error);
+        }
+
+        criteriosDisponibilidad = parseo.value;
+      }
 
       let query = "SELECT id, nombre, lugar, rating FROM servicio";
       let params = [];
@@ -313,14 +335,27 @@ router.get("/servicios", verifyToken, async (req, res) => {
       query += " ORDER BY nombre ASC";
 
       // Obtener los servicios (filtrados o no)
-      const [servicios] = await mysqlConnection
-        .promise()
-        .query(query, params);
+      const [servicios] = await db.query(query, params);
 
       // Obtener todas las imagenes de servicios
-      const [imagenes] = await mysqlConnection
-        .promise()
-        .query("SELECT id, servicio_id, archivo FROM imagen_servicio");
+      const [imagenes] = await db.query("SELECT id, servicio_id, archivo FROM imagen_servicio");
+
+      const disponibilidadPorServicio = new Map();
+      if (criteriosDisponibilidad && servicios.length > 0) {
+        const disponibilidadSnapshot = await obtenerSnapshotDisponibilidad(db, {
+          servicioIds: servicios.map((servicio) => Number(servicio.id)),
+          fechaInicio: criteriosDisponibilidad.fecha_inicio,
+          fechaFin: criteriosDisponibilidad.fecha_fin,
+          adultos: criteriosDisponibilidad.adultos,
+          ninos: criteriosDisponibilidad.ninos,
+          bebes: criteriosDisponibilidad.bebes,
+          totalPersonas: criteriosDisponibilidad.total_personas,
+        });
+
+        disponibilidadSnapshot.forEach((item) => {
+          disponibilidadPorServicio.set(Number(item.servicio_id), item);
+        });
+      }
 
       // Mapear imagenes por servicio_id
       const imagenesPorServicio = {};
@@ -340,7 +375,8 @@ router.get("/servicios", verifyToken, async (req, res) => {
         let precio_maximo = null;
 
         // Calcular precios solo si se proporcionan las fechas y al menos una persona
-        if (fecha_inicio && fecha_fin && (adultos > 0 || ninos > 0 || bebes > 0)) {
+        if (criteriosDisponibilidad) {
+          const { fecha_inicio, fecha_fin, adultos, ninos, bebes } = criteriosDisponibilidad;
           const fechaInicioSolicitud = new Date(fecha_inicio);
           const fechaFinSolicitud = new Date(fecha_fin);
 
@@ -361,9 +397,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
 
             // Procesar adultos (mayores de 5 años)
             if (adultos > 0) {
-              const [tarifasAdultos] = await mysqlConnection
-                .promise()
-                .query(`
+              const [tarifasAdultos] = await db.query(`
       SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
       FROM tarifa t
       INNER JOIN recurso r ON t.recurso_id = r.id
@@ -381,9 +415,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
 
             // Procesar niños (entre 2 y 5 años inclusivo)
             if (ninos > 0) {
-              const [tarifasninos] = await mysqlConnection
-                .promise()
-                .query(`
+              const [tarifasninos] = await db.query(`
       SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
       FROM tarifa t
       INNER JOIN recurso r ON t.recurso_id = r.id
@@ -402,9 +434,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
 
             // Procesar bebés (menores de 2 años)
             if (bebes > 0) {
-              const [tarifasBebes] = await mysqlConnection
-                .promise()
-                .query(`
+              const [tarifasBebes] = await db.query(`
                 SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
                 FROM tarifa t
                 INNER JOIN recurso r ON t.recurso_id = r.id
@@ -429,12 +459,61 @@ router.get("/servicios", verifyToken, async (req, res) => {
           precio_maximo = precios_maximos_totales.reduce((sum, precio) => sum + precio, 0);
         }
 
-        return {
+        const disponibilidadBase = disponibilidadPorServicio.get(Number(servicio.id)) || null;
+        let calendario = null;
+
+        if (criteriosDisponibilidad && disponibilidadBase) {
+          calendario = {
+            fechas_habilitadas: [],
+            rangos_disponibles: [],
+          };
+
+          if (disponibilidadBase.sin_disponibilidad) {
+            calendario = await obtenerCalendarioAlternativoServicio(db, {
+              servicioId: Number(servicio.id),
+              fechaInicio: criteriosDisponibilidad.fecha_inicio,
+              fechaFin: criteriosDisponibilidad.fecha_fin,
+              adultos: criteriosDisponibilidad.adultos,
+              ninos: criteriosDisponibilidad.ninos,
+              bebes: criteriosDisponibilidad.bebes,
+              totalPersonas: criteriosDisponibilidad.total_personas,
+              horizonteDias: 45,
+              maxResultados: 12,
+            });
+          }
+        }
+
+        const respuestaServicio = {
           ...servicio,
           imagenes: imagenesPorServicio[servicio.id] || [],
-          precio_minimo: precio_minimo,
-          precio_maximo: precio_maximo
+          precio_minimo,
+          precio_maximo,
         };
+
+        if (disponibilidadBase) {
+          const disponibilidad = {
+            disponibles: disponibilidadBase.disponibles,
+            lugares_disponibles: disponibilidadBase.disponibles,
+            cupo_disponible: disponibilidadBase.disponibles,
+            total: disponibilidadBase.total,
+            total_disponibles: disponibilidadBase.total,
+            ultimos_lugares: disponibilidadBase.ultimos_lugares,
+            sin_disponibilidad: disponibilidadBase.sin_disponibilidad,
+            actualizado_en: disponibilidadBase.actualizado_en,
+            calendario: calendario || {
+              fechas_habilitadas: [],
+              rangos_disponibles: [],
+            },
+          };
+
+          respuestaServicio.disponibilidad = disponibilidad;
+          respuestaServicio.disponibles = disponibilidad.disponibles;
+          respuestaServicio.lugares_disponibles = disponibilidad.disponibles;
+          respuestaServicio.cupo_disponible = disponibilidad.disponibles;
+          respuestaServicio.total_disponibles = disponibilidad.total;
+        }
+
+        return respuestaServicio;
       }));
       res.status(200).json(serviciosConImagenes);
     } else {
@@ -443,6 +522,98 @@ router.get("/servicios", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener los servicios");
+  }
+});
+
+router.get("/servicios/disponibilidad", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const parseo = parsearParametrosBusquedaDisponibilidad(req.query, {
+        requireFechas: true,
+        requirePersonas: true,
+      });
+
+      if (parseo.error) {
+        return res.status(422).json(parseo.error);
+      }
+
+      const servicioIds = parsearServicioIdsCsv(req.query.servicio_ids);
+      const db = mysqlConnection.promise();
+      const snapshot = await obtenerSnapshotDisponibilidad(db, {
+        lugar: req.query.lugar || null,
+        servicioIds,
+        fechaInicio: parseo.value.fecha_inicio,
+        fechaFin: parseo.value.fecha_fin,
+        adultos: parseo.value.adultos,
+        ninos: parseo.value.ninos,
+        bebes: parseo.value.bebes,
+        totalPersonas: parseo.value.total_personas,
+      });
+
+      res.status(200).json(snapshot);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener disponibilidad de servicios");
+  }
+});
+
+router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) {
+      const servicioId = Number.parseInt(req.params.id, 10);
+      if (!Number.isInteger(servicioId) || servicioId <= 0) {
+        return res.status(404).json("Servicio inexistente");
+      }
+
+      const parseo = parsearParametrosBusquedaDisponibilidad(req.query, {
+        requireFechas: true,
+        requirePersonas: true,
+      });
+
+      if (parseo.error) {
+        return res.status(422).json(parseo.error);
+      }
+
+      const db = mysqlConnection.promise();
+      const servicios = await obtenerServicios(db, { servicioId });
+      if (servicios.length === 0) {
+        return res.status(404).json("Servicio inexistente");
+      }
+
+      const calendario = await obtenerCalendarioAlternativoServicio(db, {
+        servicioId,
+        fechaInicio: parseo.value.fecha_inicio,
+        fechaFin: parseo.value.fecha_fin,
+        adultos: parseo.value.adultos,
+        ninos: parseo.value.ninos,
+        bebes: parseo.value.bebes,
+        totalPersonas: parseo.value.total_personas,
+      });
+
+      if (!calendario.fechas_habilitadas || calendario.fechas_habilitadas.length === 0) {
+        return res.status(409).json("No hay fechas alternativas para la cantidad de personas indicada");
+      }
+
+      res.status(200).json(calendario);
+    } else {
+      res.status(401).json("No autorizado");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener fechas alternativas");
   }
 });
 
@@ -1331,6 +1502,7 @@ router.post("/reserva/adicionales", verifyToken, async (req, res) => {
               AND ta.regimen_id = ?
               AND ta.fecha_inicio <= ?
               AND ta.fecha_fin >= ?
+              AND ta.activo = 1
             ORDER BY ta.fecha_inicio ASC
           `,
           [recurso_id, regimen_id, fecha_fin, fecha_inicio]
@@ -1450,6 +1622,205 @@ async function registrarHistorialReserva(connection, reservaId, tipoOperacion, u
 }
 
 const DIA_EN_MS = 1000 * 60 * 60 * 24;
+const SERVICIO_CAMPING_ID = 4;
+const RECURSO_CAMPING_ID = 1;
+const MAX_PERSONAS_CAMPING = 6;
+const ESTADO_RESERVA_CANCELADA_ID = 4;
+
+function esServicioCamping(servicioId) {
+  return Number(servicioId) === SERVICIO_CAMPING_ID;
+}
+
+function crearErrorReservaCamping(mensaje, statusCode = 422) {
+  const error = new Error(mensaje);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function validarReglasCampingReserva(servicioId, recursoId, personas) {
+  if (!esServicioCamping(servicioId)) {
+    return null;
+  }
+
+  if (Number(recursoId) !== RECURSO_CAMPING_ID) {
+    return "Recurso invalido para servicio Camping";
+  }
+
+  if (Array.isArray(personas) && personas.length > MAX_PERSONAS_CAMPING) {
+    return "Camping permite un maximo de 6 personas";
+  }
+
+  return null;
+}
+
+function obtenerNochesReserva(fechaInicio, fechaFin) {
+  const inicio = new Date(fechaInicio);
+  const fin = new Date(fechaFin);
+
+  if (Number.isNaN(inicio.getTime()) || Number.isNaN(fin.getTime()) || inicio >= fin) {
+    return [];
+  }
+
+  const noches = [];
+  const cursor = new Date(inicio);
+
+  while (cursor < fin) {
+    noches.push(cursor.toISOString().split("T")[0]);
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  return noches;
+}
+
+async function bloquearRecursoCamping(connection, recursoId) {
+  const [recursoRows] = await connection.query(
+    `SELECT id
+     FROM recurso
+     WHERE id = ? AND servicio_id = ?
+     FOR UPDATE`,
+    [recursoId, SERVICIO_CAMPING_ID]
+  );
+
+  if (recursoRows.length === 0) {
+    throw crearErrorReservaCamping("Recurso invalido para servicio Camping", 422);
+  }
+}
+
+async function obtenerMinimoParcelasDisponiblesCamping(connection, recursoId, noches) {
+  let minParcelasDisponibles = null;
+
+  for (const fecha of noches) {
+    const [parcelasDiaRows] = await connection.query(
+      `SELECT MIN(t.parcelas_disponibles) AS parcelas_disponibles
+       FROM tarifa t
+       INNER JOIN recurso r ON t.recurso_id = r.id
+       WHERE t.recurso_id = ?
+         AND r.servicio_id = ?
+         AND t.fecha_inicio <= ?
+         AND t.fecha_fin >= ?
+         AND t.parcelas_disponibles IS NOT NULL`,
+      [recursoId, SERVICIO_CAMPING_ID, fecha, fecha]
+    );
+
+    const parcelasDiaRaw = parcelasDiaRows?.[0]?.parcelas_disponibles;
+    if (parcelasDiaRaw === null || parcelasDiaRaw === undefined) {
+      return null;
+    }
+
+    const parcelasDia = Number(parcelasDiaRaw);
+    if (!Number.isFinite(parcelasDia) || parcelasDia <= 0) {
+      return 0;
+    }
+
+    if (minParcelasDisponibles === null || parcelasDia < minParcelasDisponibles) {
+      minParcelasDisponibles = parcelasDia;
+    }
+  }
+
+  return minParcelasDisponibles;
+}
+
+async function asignarNumeroParcelaCamping(connection, { recursoId, fechaInicio, fechaFin, reservaIdExcluir = null }) {
+  const noches = obtenerNochesReserva(fechaInicio, fechaFin);
+  if (noches.length === 0) {
+    throw crearErrorReservaCamping("El rango de fechas seleccionado no es valido", 422);
+  }
+
+  await bloquearRecursoCamping(connection, recursoId);
+
+  const parcelasDisponibles = await obtenerMinimoParcelasDisponiblesCamping(connection, recursoId, noches);
+  if (!Number.isInteger(parcelasDisponibles) || parcelasDisponibles <= 0) {
+    throw crearErrorReservaCamping("No hay parcelas disponibles para el rango de fechas seleccionado", 409);
+  }
+
+  const params = [
+    recursoId,
+    fechaFin,
+    fechaInicio,
+    ESTADO_RESERVA_CANCELADA_ID
+  ];
+
+  let query = `
+    SELECT id, numero_parcela
+    FROM reserva
+    WHERE recurso_id = ?
+      AND numero_parcela IS NOT NULL
+      AND fecha_inicio < ?
+      AND fecha_fin > ?
+      AND COALESCE(estado_reserva_id, 1) <> ?
+  `;
+
+  if (reservaIdExcluir !== null && reservaIdExcluir !== undefined) {
+    query += " AND id <> ?";
+    params.push(reservaIdExcluir);
+  }
+
+  query += " ORDER BY numero_parcela ASC FOR UPDATE";
+
+  const [reservasSolapadas] = await connection.query(query, params);
+
+  if (reservasSolapadas.length >= parcelasDisponibles) {
+    throw crearErrorReservaCamping("No hay parcelas disponibles para el rango de fechas seleccionado", 409);
+  }
+
+  const parcelasOcupadas = new Set();
+  for (const reserva of reservasSolapadas) {
+    const numeroParcela = Number(reserva.numero_parcela);
+    if (Number.isInteger(numeroParcela) && numeroParcela > 0 && numeroParcela <= parcelasDisponibles) {
+      parcelasOcupadas.add(numeroParcela);
+    }
+  }
+
+  for (let numeroParcela = 1; numeroParcela <= parcelasDisponibles; numeroParcela++) {
+    if (!parcelasOcupadas.has(numeroParcela)) {
+      return numeroParcela;
+    }
+  }
+
+  throw crearErrorReservaCamping("No hay parcelas disponibles para el rango de fechas seleccionado", 409);
+}
+
+async function validarNumeroParcelaCampingExistente(connection, { reservaId, recursoId, fechaInicio, fechaFin, numeroParcela }) {
+  if (!Number.isInteger(Number(numeroParcela)) || Number(numeroParcela) <= 0) {
+    throw crearErrorReservaCamping("No hay parcelas disponibles para el rango de fechas seleccionado", 409);
+  }
+
+  const noches = obtenerNochesReserva(fechaInicio, fechaFin);
+  if (noches.length === 0) {
+    throw crearErrorReservaCamping("El rango de fechas seleccionado no es valido", 422);
+  }
+
+  await bloquearRecursoCamping(connection, recursoId);
+
+  const parcelasDisponibles = await obtenerMinimoParcelasDisponiblesCamping(connection, recursoId, noches);
+  if (!Number.isInteger(parcelasDisponibles) || parcelasDisponibles <= 0 || Number(numeroParcela) > parcelasDisponibles) {
+    throw crearErrorReservaCamping("No hay parcelas disponibles para el rango de fechas seleccionado", 409);
+  }
+
+  const [conflictosParcela] = await connection.query(
+    `SELECT id
+     FROM reserva
+     WHERE id <> ?
+       AND recurso_id = ?
+       AND numero_parcela = ?
+       AND fecha_inicio < ?
+       AND fecha_fin > ?
+       AND COALESCE(estado_reserva_id, 1) <> ?
+     FOR UPDATE`,
+    [
+      reservaId,
+      recursoId,
+      Number(numeroParcela),
+      fechaFin,
+      fechaInicio,
+      ESTADO_RESERVA_CANCELADA_ID
+    ]
+  );
+
+  if (conflictosParcela.length > 0) {
+    throw crearErrorReservaCamping("No hay parcelas disponibles para el rango de fechas seleccionado", 409);
+  }
+}
 
 async function obtenerPrecioAdicional(db, cache, recursoId, regimenId, adicionalId, fecha) {
   const cacheKey = `${recursoId}-${regimenId}-${adicionalId}-${fecha}`;
@@ -1466,6 +1837,7 @@ async function obtenerPrecioAdicional(db, cache, recursoId, regimenId, adicional
         AND adicional_id = ?
         AND fecha_inicio <= ?
         AND fecha_fin >= ?
+        AND activo = 1
       ORDER BY fecha_inicio DESC
       LIMIT 1
     `,
@@ -1750,6 +2122,12 @@ router.post("/reserva", verifyToken, async (req, res) => {
         return res.status(400).json("El total de la tarifa no es válido");
       }
 
+      const esReservaCamping = esServicioCamping(servicio_id);
+      const errorReglasCamping = validarReglasCampingReserva(servicio_id, recurso_id, personas);
+      if (errorReglasCamping) {
+        return res.status(422).json(errorReglasCamping);
+      }
+
       let connection;
       try {
         // Iniciar transacción
@@ -1899,6 +2277,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
         );
 
         const reservaId = reservaResult.insertId;
+        let numeroParcelaAsignada = null;
 
         if (adicionalesProcesados.length > 0) {
           await guardarAdicionalesReserva(connection, reservaId, adicionalesProcesados);
@@ -1978,6 +2357,19 @@ router.post("/reserva", verifyToken, async (req, res) => {
         }
 
         // Confirmar transacción
+        if (esReservaCamping) {
+          numeroParcelaAsignada = await asignarNumeroParcelaCamping(connection, {
+            recursoId: recurso_id,
+            fechaInicio: fecha_inicio,
+            fechaFin: fecha_fin
+          });
+
+          await connection.query(
+            "UPDATE reserva SET numero_parcela = ? WHERE id = ?",
+            [numeroParcelaAsignada, reservaId]
+          );
+        }
+
         await connection.commit();
 
         const numeroReserva = `${reservaId}`;
@@ -1985,6 +2377,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
         res.status(201).json({
           id: reservaId,
           numero_reserva: numeroReserva,
+          numero_parcela: numeroParcelaAsignada,
           estado: "Confirmada",
           mensaje: "Reserva creada exitosamente",
           fecha_creacion: new Date().toISOString(),
@@ -2007,6 +2400,9 @@ router.post("/reserva", verifyToken, async (req, res) => {
     }
   } catch (error) {
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json(error.message);
+    }
     res.status(500).json("Error al procesar la reserva");
   }
 });
@@ -2053,6 +2449,15 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         }
       }
 
+      const esReservaCamping = esServicioCamping(servicio_id);
+      const errorReglasCamping = validarReglasCampingReserva(servicio_id, recurso_id, personas);
+      if (errorReglasCamping) {
+        return res.status(422).json({
+          success: false,
+          message: errorReglasCamping
+        });
+      }
+
       let connection;
       try {
         // Iniciar transacción
@@ -2079,6 +2484,11 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
             message: "No tienes permisos para editar esta reserva"
           });
         }
+
+        const numeroParcelaAnteriorRaw = reservaExistente[0].numero_parcela;
+        let numeroParcelaReserva = numeroParcelaAnteriorRaw !== null && numeroParcelaAnteriorRaw !== undefined
+          ? Number(numeroParcelaAnteriorRaw)
+          : null;
 
         // Procesar firma si existe
         let firmaArchivo = null;
@@ -2540,6 +2950,30 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         }
 
         // Confirmar transacción
+        if (esReservaCamping) {
+          if (Number.isInteger(numeroParcelaReserva) && numeroParcelaReserva > 0) {
+            await validarNumeroParcelaCampingExistente(connection, {
+              reservaId,
+              recursoId: recurso_id,
+              fechaInicio: fecha_inicio,
+              fechaFin: fecha_fin,
+              numeroParcela: numeroParcelaReserva
+            });
+          } else {
+            numeroParcelaReserva = await asignarNumeroParcelaCamping(connection, {
+              recursoId: recurso_id,
+              fechaInicio: fecha_inicio,
+              fechaFin: fecha_fin,
+              reservaIdExcluir: reservaId
+            });
+
+            await connection.query(
+              "UPDATE reserva SET numero_parcela = ? WHERE id = ?",
+              [numeroParcelaReserva, reservaId]
+            );
+          }
+        }
+
         await connection.commit();
 
         const numeroReserva = `RES-${reservaId.toString().padStart(6, '0')}`;
@@ -2548,6 +2982,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           success: true,
           message: "Reserva actualizada correctamente",
           numero_reserva: numeroReserva,
+          numero_parcela: numeroParcelaReserva,
           id: parseInt(reservaId),
           monto_adicionales: montoAdicionales
         });
@@ -2571,6 +3006,12 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
     }
   } catch (error) {
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({
+        success: false,
+        message: error.message
+      });
+    }
     res.status(500).json({
       success: false,
       message: "Error al actualizar la reserva"
@@ -2600,6 +3041,7 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
         const [reservaInfo] = await connection.query(`
           SELECT 
             r.id,
+            r.numero_parcela,
             r.precio_total as total_tarifa,
             r.monto_adicionales,
             r.fecha_inicio,
@@ -2714,6 +3156,9 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
         const respuesta = {
           id: reserva.id,
           numero_reserva: numeroReserva,
+          numero_parcela: reserva.numero_parcela !== null && reserva.numero_parcela !== undefined
+            ? Number(reserva.numero_parcela)
+            : null,
           nombre: reserva.observaciones || `Reserva ${numeroReserva}`,
           fecha_inicio: reserva.fecha_inicio,
           fecha_fin: reserva.fecha_fin,
@@ -2799,6 +3244,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
         const [reservaInfo] = await connection.query(`
           SELECT 
             r.id,
+            r.numero_parcela,
             r.precio_total as total_tarifa,
             r.monto_adicionales,
             r.fecha_inicio,
@@ -2955,6 +3401,9 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
         const respuesta = {
           id: reserva.id,
           numero_reserva: numeroReserva,
+          numero_parcela: reserva.numero_parcela !== null && reserva.numero_parcela !== undefined
+            ? Number(reserva.numero_parcela)
+            : null,
           nombre: reserva.observaciones || `Reserva ${numeroReserva}`,
           estado: reserva.estado || "Confirmada",
           fecha_creacion: reserva.fecha_creacion,
@@ -5790,7 +6239,7 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
           `
             SELECT recurso_id, regimen_id, adicional_id, fecha_inicio, fecha_fin, precio
             FROM tarifa_adicional
-            WHERE temporada_tarifa_id = ?
+            WHERE temporada_tarifa_id = ? AND activo = 1
           `,
           [id]
         );
@@ -5954,27 +6403,29 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
           );
         }
 
+        // Soft delete: marcar como inactivas las tarifas adicionales existentes
+        // en lugar de eliminarlas (para preservar referencias de reservas existentes)
         const [adicionalesAnteriores] = await connection.query(
-          "SELECT id FROM tarifa_adicional WHERE temporada_tarifa_id = ?",
+          "SELECT id FROM tarifa_adicional WHERE temporada_tarifa_id = ? AND activo = 1",
           [id]
         );
 
         if (adicionalesAnteriores.length > 0) {
+          await connection.query(
+            "UPDATE tarifa_adicional SET activo = 0 WHERE temporada_tarifa_id = ?",
+            [id]
+          );
+
           await guardarHistorialTemporada(
             connection,
             id,
             cabecera.id,
-            'DELETE',
+            'UPDATE',
             'tarifa_adicional',
-            JSON.stringify({ cantidad: adicionalesAnteriores.length }),
+            JSON.stringify({ cantidad: adicionalesAnteriores.length, accion: 'desactivar' }),
             null
           );
         }
-
-        await connection.query(
-          "DELETE FROM tarifa_adicional WHERE temporada_tarifa_id = ?",
-          [id]
-        );
 
         const [porcentajesAnteriores] = await connection.query(
           "SELECT tipo_persona_id, porcentaje FROM temporada_tipo_persona_porcentaje WHERE temporada_tarifa_id = ?",
@@ -6055,8 +6506,9 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
                       await connection.query(
                         `
                           INSERT INTO tarifa_adicional
-                            (temporada_tarifa_id, recurso_id, regimen_id, adicional_id, fecha_inicio, fecha_fin, precio)
-                          VALUES (?, ?, ?, ?, ?, ?, ?)
+                            (temporada_tarifa_id, recurso_id, regimen_id, adicional_id, fecha_inicio, fecha_fin, precio, activo)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                          ON DUPLICATE KEY UPDATE precio = VALUES(precio), activo = 1
                         `,
                         [
                           id,
