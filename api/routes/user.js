@@ -5259,6 +5259,70 @@ function calcularPrecioRangoConPorcentaje(rangoEdad, tipoPersonaId, mapaPreciosD
   };
 }
 
+function normalizarParcelasDisponibles(valor, valorPorDefecto = 100) {
+  if (valor === undefined || valor === null || valor === "") {
+    return { value: valorPorDefecto };
+  }
+
+  const numero = Number(valor);
+  if (!Number.isFinite(numero) || !Number.isInteger(numero) || numero < 0) {
+    return { error: "parcelas_disponibles debe ser un numero entero mayor o igual a 0" };
+  }
+
+  return { value: numero };
+}
+
+function validarParcelasDisponiblesEnConfiguracion(configuracionServicios) {
+  if (!Array.isArray(configuracionServicios)) {
+    return null;
+  }
+
+  for (let i = 0; i < configuracionServicios.length; i++) {
+    const servicio = configuracionServicios[i];
+    if (Number(servicio?.id) !== 4 || !Array.isArray(servicio?.regimenes)) {
+      continue;
+    }
+
+    for (let j = 0; j < servicio.regimenes.length; j++) {
+      const regimen = servicio.regimenes[j];
+      if (!Array.isArray(regimen?.recursos)) {
+        continue;
+      }
+
+      for (let k = 0; k < regimen.recursos.length; k++) {
+        const recurso = regimen.recursos[k];
+        if (!Array.isArray(recurso?.fechas)) {
+          continue;
+        }
+
+        for (let l = 0; l < recurso.fechas.length; l++) {
+          const fecha = recurso.fechas[l];
+          const normalizado = normalizarParcelasDisponibles(fecha?.parcelas_disponibles);
+          if (normalizado.error) {
+            return `Servicio 4: recurso ${recurso?.id || "sin_id"}, rango ${l + 1}: ${normalizado.error}`;
+          }
+          fecha.parcelas_disponibles = normalizado.value;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function obtenerParcelasDisponiblesPorFecha(servicioId, fecha) {
+  if (Number(servicioId) !== 4) {
+    return null;
+  }
+
+  const normalizado = normalizarParcelasDisponibles(fecha?.parcelas_disponibles);
+  if (normalizado.error) {
+    return null;
+  }
+
+  return normalizado.value;
+}
+
 router.post("/temporada", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -5267,6 +5331,11 @@ router.post("/temporada", verifyToken, async (req, res) => {
 
       if (!nombre_campania || !fecha_inicio || !fecha_fin || !configuracion_servicios) {
         return res.status(400).json("Faltan campos requeridos");
+      }
+
+      const errorParcelas = validarParcelasDisponiblesEnConfiguracion(configuracion_servicios);
+      if (errorParcelas) {
+        return res.status(400).json(errorParcelas);
       }
 
       // Iniciar transacción
@@ -5344,6 +5413,8 @@ router.post("/temporada", verifyToken, async (req, res) => {
             for (const recurso of regimen.recursos) {
               // Procesar cada fecha del recurso
               for (const fecha of recurso.fechas) {
+                const parcelasDisponibles = obtenerParcelasDisponiblesPorFecha(servicio.id, fecha);
+
                 if (Array.isArray(fecha.adicionales) && fecha.adicionales.length > 0) {
                   for (const adicional of fecha.adicionales) {
                     if (!adicional || !adicional.adicionalId || adicional.precio === undefined || adicional.precio === null) {
@@ -5400,8 +5471,8 @@ router.post("/temporada", verifyToken, async (req, res) => {
                       const [tarifaResult] = await connection.query(
                         `INSERT INTO tarifa
                          (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
-                          edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona, usa_porcentaje, porcentaje_descuento)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                          edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona, usa_porcentaje, porcentaje_descuento, parcelas_disponibles)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                         [
                           recurso.id,
                           tipoPersonaId,
@@ -5414,7 +5485,8 @@ router.post("/temporada", verifyToken, async (req, res) => {
                           fecha.fecha_fin,
                           'Y', // precio_por_persona como 'Y'
                           usaPorcentaje ? 1 : 0,
-                          porcentajeDescuento
+                          porcentajeDescuento,
+                          parcelasDisponibles
                         ]
                       );
 
@@ -5432,7 +5504,8 @@ router.post("/temporada", verifyToken, async (req, res) => {
                           regimen_id: regimen.id,
                           precio: precioTarifa,
                           usa_porcentaje: usaPorcentaje ? 1 : 0,
-                          porcentaje_descuento: porcentajeDescuento
+                          porcentaje_descuento: porcentajeDescuento,
+                          parcelas_disponibles: parcelasDisponibles
                         })
                       );
                     }
@@ -5442,8 +5515,8 @@ router.post("/temporada", verifyToken, async (req, res) => {
                   const [tarifaResult] = await connection.query(
                     `INSERT INTO tarifa
                      (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
-                      edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona, usa_porcentaje, porcentaje_descuento)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                      edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona, usa_porcentaje, porcentaje_descuento, parcelas_disponibles)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                     [
                       recurso.id,
                       null, // tipo_persona_id como null
@@ -5456,7 +5529,8 @@ router.post("/temporada", verifyToken, async (req, res) => {
                       fecha.fecha_fin,
                       'N', // precio_por_persona como 'N'
                       0,
-                      null
+                      null,
+                      parcelasDisponibles
                     ]
                   );
 
@@ -5472,7 +5546,8 @@ router.post("/temporada", verifyToken, async (req, res) => {
                       recurso_id: recurso.id,
                       regimen_id: regimen.id,
                       precio: fecha.precio,
-                      usa_porcentaje: 0
+                      usa_porcentaje: 0,
+                      parcelas_disponibles: parcelasDisponibles
                     })
                   );
                 }
@@ -5508,6 +5583,49 @@ router.post("/temporada", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al crear la temporada");
+  }
+});
+
+router.get("/temporada/rangos", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const excludeTemporadaIdRaw = req.query.exclude_temporada_id;
+    let excludeTemporadaId = null;
+
+    if (excludeTemporadaIdRaw !== undefined) {
+      const excludeTemporadaIdTexto = String(excludeTemporadaIdRaw).trim();
+      if (!/^\d+$/.test(excludeTemporadaIdTexto) || Number(excludeTemporadaIdTexto) <= 0) {
+        return res.status(400).json("exclude_temporada_id invalido");
+      }
+      excludeTemporadaId = Number(excludeTemporadaIdTexto);
+    }
+
+    const queryParams = [];
+    let query = `
+      SELECT
+        id,
+        nombre AS nombre_campania,
+        DATE_FORMAT(fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
+        DATE_FORMAT(fecha_fin, '%Y-%m-%d') AS fecha_fin
+      FROM temporada_tarifa
+    `;
+
+    if (excludeTemporadaId !== null) {
+      query += " WHERE id <> ?";
+      queryParams.push(excludeTemporadaId);
+    }
+
+    query += " ORDER BY fecha_inicio ASC, fecha_fin ASC, id ASC";
+
+    const [rows] = await mysqlConnection.promise().query(query, queryParams);
+    res.status(200).json(rows);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los rangos de temporada");
   }
 });
 
@@ -5550,6 +5668,7 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
             t.precio_por_persona,
             t.usa_porcentaje,
             t.porcentaje_descuento,
+            t.parcelas_disponibles,
             r.nombre as recurso_nombre,
             r.servicio_id,
             s.nombre as servicio_nombre,
@@ -5616,6 +5735,10 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
             const fechaFinMs = new Date(f.fecha_fin).getTime();
             return fechaInicioMs === tarifaFechaInicioMs && fechaFinMs === tarifaFechaFinMs;
           });
+          const esServicioParcelas = Number(tarifa.servicio_id) === 4;
+          const parcelasDisponibles = tarifa.parcelas_disponibles !== null && tarifa.parcelas_disponibles !== undefined
+            ? Number(tarifa.parcelas_disponibles)
+            : 100;
           if (!fecha) {
             fecha = {
               id: tarifa.tarifa_id,
@@ -5625,7 +5748,12 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
               tiposPersona: [],
               adicionales: [] // Los adicionales se pueden agregar después si es necesario
             };
+            if (esServicioParcelas) {
+              fecha.parcelas_disponibles = parcelasDisponibles;
+            }
             recurso.fechas.push(fecha);
+          } else if (esServicioParcelas && (fecha.parcelas_disponibles === undefined || fecha.parcelas_disponibles === null)) {
+            fecha.parcelas_disponibles = parcelasDisponibles;
           }
 
           // Si es precio por persona, agregar tipo de persona y rango de edad
@@ -5754,6 +5882,11 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
 
       if (!nombre_campania || !fecha_inicio || !fecha_fin || !configuracion_servicios) {
         return res.status(400).json("Faltan campos requeridos");
+      }
+
+      const errorParcelas = validarParcelasDisponiblesEnConfiguracion(configuracion_servicios);
+      if (errorParcelas) {
+        return res.status(400).json(errorParcelas);
       }
 
       let connection;
@@ -5911,6 +6044,8 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
           for (const regimen of servicio.regimenes) {
               for (const recurso of regimen.recursos) {
                 for (const fecha of recurso.fechas) {
+                  const parcelasDisponibles = obtenerParcelasDisponiblesPorFecha(servicio.id, fecha);
+
                   if (Array.isArray(fecha.adicionales) && fecha.adicionales.length > 0) {
                     for (const adicional of fecha.adicionales) {
                       if (!adicional || !adicional.adicionalId || adicional.precio === undefined || adicional.precio === null) {
@@ -5963,8 +6098,8 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
                         const [tarifaResult] = await connection.query(
                           `INSERT INTO tarifa
                            (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
-                            edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona, usa_porcentaje, porcentaje_descuento)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona, usa_porcentaje, porcentaje_descuento, parcelas_disponibles)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                           [
                             recurso.id,
                             tipoPersonaId,
@@ -5977,7 +6112,8 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
                             fecha.fecha_fin,
                             'Y',
                             usaPorcentaje ? 1 : 0,
-                            porcentajeDescuento
+                            porcentajeDescuento,
+                            parcelasDisponibles
                           ]
                         );
 
@@ -5995,7 +6131,8 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
                             regimen_id: regimen.id,
                             precio: precioTarifa,
                             usa_porcentaje: usaPorcentaje ? 1 : 0,
-                            porcentaje_descuento: porcentajeDescuento
+                            porcentaje_descuento: porcentajeDescuento,
+                            parcelas_disponibles: parcelasDisponibles
                           })
                         );
                       }
@@ -6004,8 +6141,8 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
                     const [tarifaResult] = await connection.query(
                       `INSERT INTO tarifa
                        (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
-                        edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona, usa_porcentaje, porcentaje_descuento)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                        edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona, usa_porcentaje, porcentaje_descuento, parcelas_disponibles)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                       [
                         recurso.id,
                         null,
@@ -6018,7 +6155,8 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
                         fecha.fecha_fin,
                         'N',
                         0,
-                        null
+                        null,
+                        parcelasDisponibles
                       ]
                     );
 
@@ -6034,7 +6172,8 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
                         recurso_id: recurso.id,
                         regimen_id: regimen.id,
                         precio: fecha.precio,
-                        usa_porcentaje: 0
+                        usa_porcentaje: 0,
+                        parcelas_disponibles: parcelasDisponibles
                       })
                     );
                   }
