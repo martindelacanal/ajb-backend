@@ -8,10 +8,6 @@ const jwt = require("jsonwebtoken");
 const bcryptjs = require("bcryptjs");
 
 const multer = require("multer");
-// Import the filesystem module
-const fs = require("fs");
-
-var path = require("path");
 
 const moment = require("moment"); // para formatear fechas
 const {
@@ -23,12 +19,8 @@ const {
 } = require("../services/servicios-disponibilidad");
 
 // S3 INICIO
-const S3Client = require("@aws-sdk/client-s3").S3Client;
-const PutObjectCommand = require("@aws-sdk/client-s3").PutObjectCommand;
-const GetObjectCommand = require("@aws-sdk/client-s3").GetObjectCommand;
-const { DeleteObjectCommand } = require("@aws-sdk/client-s3");
-const { DeleteObjectsCommand } = require("@aws-sdk/client-s3");
-const getSignedUrl = require("@aws-sdk/s3-request-presigner").getSignedUrl;
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const bucketName = process.env.BUCKET_NAME;
 const bucketRegion = process.env.BUCKET_REGION;
@@ -36,8 +28,26 @@ const accessKey = process.env.ACCESS_KEY;
 const secretAccessKey = process.env.SECRET_ACCESS_KEY;
 
 const crypto = require("crypto");
-const randomImageName = (bytes = 32) =>
-  crypto.randomBytes(bytes).toString("hex");
+
+const S3_SIGNED_URL_EXPIRES_SECONDS = Number.parseInt(
+  process.env.S3_SIGNED_URL_EXPIRES_SECONDS || "3600",
+  10
+);
+
+const MIME_BY_EXTENSION = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  gif: "image/gif",
+  webp: "image/webp",
+};
+
+const EXTENSION_BY_MIME = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/gif": "gif",
+  "image/webp": "webp",
+};
 
 const s3 = new S3Client({
   credentials: {
@@ -46,6 +56,111 @@ const s3 = new S3Client({
   },
   region: bucketRegion,
 });
+
+function getMimeTypeFromFileName(fileName, fallback = "application/octet-stream") {
+  const extension = (fileName || "").split(".").pop().toLowerCase();
+  return MIME_BY_EXTENSION[extension] || fallback;
+}
+
+function getSafeFileExtension(originalName, mimeType) {
+  const extensionFromName = (originalName || "").includes(".")
+    ? originalName.split(".").pop().toLowerCase()
+    : "";
+  const sanitizedExtension = extensionFromName.replace(/[^a-z0-9]/g, "");
+  if (sanitizedExtension) {
+    return sanitizedExtension;
+  }
+
+  return EXTENSION_BY_MIME[mimeType] || "png";
+}
+
+function isS3ObjectNotFound(error) {
+  return (
+    error?.name === "NoSuchKey" ||
+    error?.name === "NotFound" ||
+    error?.$metadata?.httpStatusCode === 404
+  );
+}
+
+async function streamToBuffer(stream) {
+  if (!stream) {
+    return null;
+  }
+
+  if (Buffer.isBuffer(stream)) {
+    return stream;
+  }
+
+  if (stream instanceof Uint8Array) {
+    return Buffer.from(stream);
+  }
+
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+async function uploadBufferToS3({ key, buffer, contentType }) {
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucketName,
+      Key: key,
+      Body: buffer,
+      ContentType: contentType || getMimeTypeFromFileName(key),
+    })
+  );
+}
+
+async function uploadBase64ToS3({ key, value, defaultContentType = "image/png" }) {
+  const dataUriMatch = value.match(/^data:([^;]+);base64,(.+)$/);
+  const contentType = dataUriMatch ? dataUriMatch[1] : defaultContentType;
+  const base64Payload = dataUriMatch ? dataUriMatch[2] : value;
+  const buffer = Buffer.from(base64Payload.replace(/\s/g, ""), "base64");
+
+  await uploadBufferToS3({
+    key,
+    buffer,
+    contentType,
+  });
+}
+
+async function getObjectBufferFromS3(key) {
+  try {
+    const object = await s3.send(
+      new GetObjectCommand({
+        Bucket: bucketName,
+        Key: key,
+      })
+    );
+
+    return {
+      buffer: await streamToBuffer(object.Body),
+      contentType: object.ContentType || getMimeTypeFromFileName(key, "image/jpeg"),
+    };
+  } catch (error) {
+    if (isS3ObjectNotFound(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function getSignedFileUrlFromS3(key) {
+  if (!key) {
+    return null;
+  }
+
+  return getSignedUrl(
+    s3,
+    new GetObjectCommand({
+      Bucket: bucketName,
+      Key: key,
+    }),
+    { expiresIn: Number.isFinite(S3_SIGNED_URL_EXPIRES_SECONDS) ? S3_SIGNED_URL_EXPIRES_SECONDS : 3600 }
+  );
+}
 // S3 FIN
 
 router.post("/signin", async (req, res) => {
@@ -179,19 +294,16 @@ router.get("/credencial-digital", verifyToken, async (req, res) => {
 
         // Si tiene foto, prepararla para envío (como base64)
         if (usuario.foto_archivo) {
-          const fotoPath = path.join(__dirname, '../../imagenes', usuario.foto_archivo);
-          if (fs.existsSync(fotoPath)) {
-            try {
-              const fotoBuffer = fs.readFileSync(fotoPath);
-              const fotoBase64 = fotoBuffer.toString('base64');
-              const mimeType = usuario.foto_archivo.match(/\.(jpg|jpeg|png|gif)$/i);
-              const mimeTypeStr = mimeType ? `image/${mimeType[1].toLowerCase()}` : 'image/jpeg';
-              usuario.foto_data = `data:${mimeTypeStr};base64,${fotoBase64}`;
-            } catch (readError) {
-              console.error('Error leyendo foto:', readError);
+          try {
+            const fotoObject = await getObjectBufferFromS3(usuario.foto_archivo);
+            if (fotoObject?.buffer) {
+              const fotoBase64 = fotoObject.buffer.toString("base64");
+              usuario.foto_data = `data:${fotoObject.contentType};base64,${fotoBase64}`;
+            } else {
               usuario.foto_data = null;
             }
-          } else {
+          } catch (readError) {
+            console.error("Error leyendo foto desde S3:", readError);
             usuario.foto_data = null;
           }
         }
@@ -358,14 +470,31 @@ router.get("/servicios", verifyToken, async (req, res) => {
       }
 
       // Mapear imagenes por servicio_id
+      const imagenesConUrlPorServicio = await Promise.all(
+        imagenes.map(async (img) => {
+          try {
+            return {
+              ...img,
+              archivo_url: await getSignedFileUrlFromS3(img.archivo),
+            };
+          } catch (error) {
+            console.error("Error generando URL firmada para imagen de servicio:", error);
+            return {
+              ...img,
+              archivo_url: null,
+            };
+          }
+        })
+      );
+
       const imagenesPorServicio = {};
-      imagenes.forEach(img => {
+      imagenesConUrlPorServicio.forEach((img) => {
         if (!imagenesPorServicio[img.servicio_id]) {
           imagenesPorServicio[img.servicio_id] = [];
         }
         imagenesPorServicio[img.servicio_id].push({
           id: img.id,
-          archivo: `http://localhost:3000/imagenes/${img.archivo}`
+          archivo: img.archivo_url,
         });
       });
 
@@ -818,14 +947,31 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         `, recursosIds);
 
       // Mapear imagenes por recurso_id
+      const imagenesConUrlPorRecurso = await Promise.all(
+        imagenes.map(async (img) => {
+          try {
+            return {
+              ...img,
+              archivo_url: await getSignedFileUrlFromS3(img.archivo),
+            };
+          } catch (error) {
+            console.error("Error generando URL firmada para imagen de recurso:", error);
+            return {
+              ...img,
+              archivo_url: null,
+            };
+          }
+        })
+      );
+
       const imagenesPorRecurso = {};
-      imagenes.forEach(img => {
+      imagenesConUrlPorRecurso.forEach((img) => {
         if (!imagenesPorRecurso[img.recurso_id]) {
           imagenesPorRecurso[img.recurso_id] = [];
         }
         imagenesPorRecurso[img.recurso_id].push({
           id: img.id,
-          archivo: `http://localhost:3000/imagenes/${img.archivo}`
+          archivo: img.archivo_url,
         });
       });
 
@@ -2138,9 +2284,11 @@ router.post("/reserva", verifyToken, async (req, res) => {
         let firmaArchivo = null;
         if (firma) {
           const firmaFileName = `firma_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.png`;
-          const base64Data = firma.replace(/^data:image\/[a-z]+;base64,/, '');
-          const firmaPath = path.join(__dirname, '../../imagenes', firmaFileName);
-          fs.writeFileSync(firmaPath, base64Data, 'base64');
+          await uploadBase64ToS3({
+            key: firmaFileName,
+            value: firma,
+            defaultContentType: "image/png",
+          });
           firmaArchivo = firmaFileName;
         }
 
@@ -2494,9 +2642,11 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         let firmaArchivo = null;
         if (firma_base64) {
           const firmaFileName = `firma_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.png`;
-          const base64Data = firma_base64.replace(/^data:image\/[a-z]+;base64,/, '');
-          const firmaPath = path.join(__dirname, '../../imagenes', firmaFileName);
-          fs.writeFileSync(firmaPath, base64Data, 'base64');
+          await uploadBase64ToS3({
+            key: firmaFileName,
+            value: firma_base64,
+            defaultContentType: "image/png",
+          });
           firmaArchivo = firmaFileName;
         }
 
@@ -3394,7 +3544,12 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
         // Generar URL de firma si existe
         let firmaUrl = null;
         if (reserva.firma_archivo) {
-          firmaUrl = `http://localhost:3000/imagenes/${reserva.firma_archivo}`;
+          try {
+            firmaUrl = await getSignedFileUrlFromS3(reserva.firma_archivo);
+          } catch (error) {
+            console.error("Error generando URL firmada para firma de reserva:", error);
+            firmaUrl = null;
+          }
         }
 
         // Construir respuesta
@@ -7333,19 +7488,16 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
 
     // Si tiene foto, prepararla para envío (como base64 o URL)
     if (usuarioData.foto_archivo) {
-      const fotoPath = path.join(__dirname, '../../imagenes', usuarioData.foto_archivo);
-      if (fs.existsSync(fotoPath)) {
-        try {
-          const fotoBuffer = fs.readFileSync(fotoPath);
-          const fotoBase64 = fotoBuffer.toString('base64');
-          const mimeType = usuarioData.foto_archivo.match(/\.(jpg|jpeg|png|gif)$/i);
-          const mimeTypeStr = mimeType ? `image/${mimeType[1].toLowerCase()}` : 'image/jpeg';
-          usuarioData.foto_data = `data:${mimeTypeStr};base64,${fotoBase64}`;
-        } catch (readError) {
-          console.error('Error leyendo foto:', readError);
+      try {
+        const fotoObject = await getObjectBufferFromS3(usuarioData.foto_archivo);
+        if (fotoObject?.buffer) {
+          const fotoBase64 = fotoObject.buffer.toString("base64");
+          usuarioData.foto_data = `data:${fotoObject.contentType};base64,${fotoBase64}`;
+        } else {
           usuarioData.foto_data = null;
         }
-      } else {
+      } catch (readError) {
+        console.error("Error leyendo foto desde S3:", readError);
         usuarioData.foto_data = null;
       }
     }
@@ -7614,12 +7766,13 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
         try {
           // Generar nombre único para la foto
           const fotoHash = crypto.randomBytes(16).toString('hex');
-          const extension = req.file.originalname.split('.').pop();
+          const extension = getSafeFileExtension(req.file.originalname, req.file.mimetype);
           const nombreArchivo = `perfil_${fotoHash}.${extension}`;
-          const rutaArchivo = path.join(__dirname, '../../imagenes', nombreArchivo);
-
-          // Guardar archivo en disco
-          fs.writeFileSync(rutaArchivo, req.file.buffer);
+          await uploadBufferToS3({
+            key: nombreArchivo,
+            buffer: req.file.buffer,
+            contentType: req.file.mimetype || getMimeTypeFromFileName(nombreArchivo, "image/jpeg"),
+          });
 
           // Actualizar campo en base de datos
           updateFields.push('foto_archivo = ?');
@@ -7954,12 +8107,13 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
         try {
           // Generar nombre único para la foto
           const fotoHash = crypto.randomBytes(16).toString('hex');
-          const extension = req.file.originalname.split('.').pop();
+          const extension = getSafeFileExtension(req.file.originalname, req.file.mimetype);
           nombreArchivo = `perfil_${fotoHash}.${extension}`;
-          const rutaArchivo = path.join(__dirname, '../../imagenes', nombreArchivo);
-
-          // Guardar archivo en disco
-          fs.writeFileSync(rutaArchivo, req.file.buffer);
+          await uploadBufferToS3({
+            key: nombreArchivo,
+            buffer: req.file.buffer,
+            contentType: req.file.mimetype || getMimeTypeFromFileName(nombreArchivo, "image/jpeg"),
+          });
 
           insertFields.push('foto_archivo');
           insertPlaceholders.push('?');

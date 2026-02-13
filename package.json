@@ -6,7 +6,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "serve": "nodemon server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "migrate:s3": "node scripts/migrate-images-to-s3.js"
   },
   "keywords": [],
   "author": "",
