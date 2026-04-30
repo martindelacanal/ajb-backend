@@ -40,6 +40,7 @@ const MIME_BY_EXTENSION = {
   png: "image/png",
   gif: "image/gif",
   webp: "image/webp",
+  pdf: "application/pdf",
 };
 
 const EXTENSION_BY_MIME = {
@@ -47,6 +48,7 @@ const EXTENSION_BY_MIME = {
   "image/png": "png",
   "image/gif": "gif",
   "image/webp": "webp",
+  "application/pdf": "pdf",
 };
 
 const s3 = new S3Client({
@@ -162,6 +164,37 @@ async function getSignedFileUrlFromS3(key) {
   );
 }
 // S3 FIN
+
+const uploadConvenioHotel = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    files: 11,
+    fileSize: 10 * 1024 * 1024,
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.fieldname === "fotos" && file.mimetype?.startsWith("image/")) {
+      return cb(null, true);
+    }
+    if (file.fieldname === "tarifario_pdf" && file.mimetype === "application/pdf") {
+      return cb(null, true);
+    }
+    return cb(new Error("Solo se permiten fotos de imagen y un PDF tarifario"));
+  },
+});
+
+const procesarUploadConvenioHotel = uploadConvenioHotel.fields([
+  { name: "fotos", maxCount: 10 },
+  { name: "tarifario_pdf", maxCount: 1 },
+]);
+
+function manejarUploadConvenioHotel(req, res, next) {
+  procesarUploadConvenioHotel(req, res, (error) => {
+    if (error) {
+      return res.status(400).json(error.message || "No se pudieron procesar los archivos");
+    }
+    return next();
+  });
+}
 
 router.post("/signin", async (req, res) => {
   const documento = req.body.documento || null;
@@ -393,9 +426,27 @@ router.get("/lugares", verifyToken, async (req, res) => {
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
-      const [rows] = await mysqlConnection
-        .promise()
-        .query("SELECT lugar FROM servicio GROUP BY lugar ORDER BY lugar ASC");
+      let rows;
+      try {
+        [rows] = await mysqlConnection
+          .promise()
+          .query(`
+            SELECT lugar
+            FROM (
+              SELECT lugar FROM servicio WHERE lugar IS NOT NULL AND lugar <> ''
+              UNION
+              SELECT ciudad AS lugar FROM convenio_hotel WHERE activo = 1 AND ciudad IS NOT NULL AND ciudad <> ''
+            ) lugares
+            ORDER BY lugar ASC
+          `);
+      } catch (queryError) {
+        if (!esErrorTemporadaAltaNoMigrada(queryError)) {
+          throw queryError;
+        }
+        [rows] = await mysqlConnection
+          .promise()
+          .query("SELECT lugar FROM servicio GROUP BY lugar ORDER BY lugar ASC");
+      }
       const lugares = rows.map(row => row.lugar);
       res.status(200).json(lugares);
     } else {
@@ -734,6 +785,394 @@ router.get("/servicios", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener los servicios");
+  }
+});
+
+router.get("/admin/convenios-hoteleros", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const db = mysqlConnection.promise();
+    const [hoteles] = await db.query(`
+      SELECT
+        id,
+        nombre,
+        ciudad,
+        provincia,
+        coordenadas_maps,
+        latitud,
+        longitud,
+        descripcion,
+        tarifario_pdf_archivo,
+        activo,
+        fecha_creacion,
+        fecha_modificacion
+      FROM convenio_hotel
+      ORDER BY nombre ASC
+    `);
+
+    const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(db, hoteles.map((hotel) => hotel.id));
+    const respuesta = await Promise.all(hoteles.map((hotel) => (
+      firmarConvenioHotel(hotel, imagenesPorHotel.get(Number(hotel.id)) || [])
+    )));
+
+    res.status(200).json(respuesta);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los convenios hoteleros");
+  }
+});
+
+router.get("/admin/convenios-hoteleros/:id", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const hotelId = normalizarIdPositivo(req.params.id);
+    if (!hotelId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    const db = mysqlConnection.promise();
+    const [hoteles] = await db.query(
+      `
+        SELECT
+          id,
+          nombre,
+          ciudad,
+          provincia,
+          coordenadas_maps,
+          latitud,
+          longitud,
+          descripcion,
+          tarifario_pdf_archivo,
+          activo,
+          fecha_creacion,
+          fecha_modificacion
+        FROM convenio_hotel
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [hotelId]
+    );
+
+    if (hoteles.length === 0) {
+      return res.status(404).json("Convenio hotelero no encontrado");
+    }
+
+    const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(db, [hotelId]);
+    const respuesta = await firmarConvenioHotel(hoteles[0], imagenesPorHotel.get(hotelId) || []);
+
+    res.status(200).json(respuesta);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener el convenio hotelero");
+  }
+});
+
+router.post("/admin/convenios-hoteleros", verifyToken, manejarUploadConvenioHotel, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const nombre = normalizarTexto(req.body.nombre);
+    const ciudad = normalizarTexto(req.body.ciudad);
+    const provincia = normalizarTexto(req.body.provincia);
+    const coordenadasMaps = normalizarTexto(req.body.coordenadas_maps);
+    const descripcion = normalizarTexto(req.body.descripcion);
+    const latitud = normalizarNumeroNullable(req.body.latitud);
+    const longitud = normalizarNumeroNullable(req.body.longitud);
+    const activo = normalizarBooleanActivo(req.body.activo, true);
+    const fotos = req.files?.fotos || [];
+    const pdf = req.files?.tarifario_pdf?.[0] || null;
+
+    if (!nombre || !ciudad || !provincia || !coordenadasMaps) {
+      return res.status(400).json("Nombre, ciudad, provincia y coordenadas son requeridos");
+    }
+    if (fotos.length > 10) {
+      return res.status(400).json("Se pueden subir hasta 10 fotos");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    let tarifarioPdfArchivo = null;
+    if (pdf) {
+      tarifarioPdfArchivo = await subirArchivoConvenioHotel(pdf, "tarifario");
+    }
+
+    const [result] = await connection.query(
+      `
+        INSERT INTO convenio_hotel (
+          nombre,
+          ciudad,
+          provincia,
+          coordenadas_maps,
+          latitud,
+          longitud,
+          descripcion,
+          tarifario_pdf_archivo,
+          activo
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [nombre, ciudad, provincia, coordenadasMaps, latitud, longitud, descripcion || null, tarifarioPdfArchivo, activo]
+    );
+
+    const hotelId = result.insertId;
+    for (let index = 0; index < fotos.length; index++) {
+      const archivo = await subirArchivoConvenioHotel(fotos[index], "foto");
+      await connection.query(
+        "INSERT INTO convenio_hotel_imagen (convenio_hotel_id, archivo, orden) VALUES (?, ?, ?)",
+        [hotelId, archivo, index]
+      );
+    }
+
+    await connection.commit();
+
+    const [hoteles] = await mysqlConnection.promise().query(
+      "SELECT * FROM convenio_hotel WHERE id = ?",
+      [hotelId]
+    );
+    const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(mysqlConnection.promise(), [hotelId]);
+    const respuesta = await firmarConvenioHotel(hoteles[0], imagenesPorHotel.get(hotelId) || []);
+
+    res.status(201).json(respuesta);
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    res.status(500).json("Error al crear el convenio hotelero");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+router.put("/admin/convenios-hoteleros/:id", verifyToken, manejarUploadConvenioHotel, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const hotelId = normalizarIdPositivo(req.params.id);
+    if (!hotelId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    const nombre = normalizarTexto(req.body.nombre);
+    const ciudad = normalizarTexto(req.body.ciudad);
+    const provincia = normalizarTexto(req.body.provincia);
+    const coordenadasMaps = normalizarTexto(req.body.coordenadas_maps);
+    const descripcion = normalizarTexto(req.body.descripcion);
+    const latitud = normalizarNumeroNullable(req.body.latitud);
+    const longitud = normalizarNumeroNullable(req.body.longitud);
+    const activo = normalizarBooleanActivo(req.body.activo, true);
+    const fotos = req.files?.fotos || [];
+    const pdf = req.files?.tarifario_pdf?.[0] || null;
+
+    if (!nombre || !ciudad || !provincia || !coordenadasMaps) {
+      return res.status(400).json("Nombre, ciudad, provincia y coordenadas son requeridos");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const [existentes] = await connection.query(
+      "SELECT * FROM convenio_hotel WHERE id = ? LIMIT 1 FOR UPDATE",
+      [hotelId]
+    );
+    if (existentes.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Convenio hotelero no encontrado");
+    }
+
+    const [imagenesActuales] = await connection.query(
+      "SELECT id FROM convenio_hotel_imagen WHERE convenio_hotel_id = ? ORDER BY orden ASC, id ASC",
+      [hotelId]
+    );
+    const imagenesSolicitadas = parseArrayDesdeFormulario(req.body.imagenes_existentes);
+    const envioListaImagenes = Object.prototype.hasOwnProperty.call(req.body, "imagenes_existentes");
+    const idsSolicitados = imagenesSolicitadas
+      .map((item) => normalizarIdPositivo(typeof item === "object" ? item.id : item))
+      .filter(Boolean);
+    const idsActuales = imagenesActuales.map((imagen) => Number(imagen.id));
+    const idsAConservar = envioListaImagenes
+      ? idsSolicitados.filter((id) => idsActuales.includes(id))
+      : idsActuales;
+
+    if (idsAConservar.length + fotos.length > 10) {
+      await connection.rollback();
+      return res.status(400).json("Se pueden conservar/subir hasta 10 fotos");
+    }
+
+    if (envioListaImagenes) {
+      if (idsAConservar.length > 0) {
+        const placeholders = idsAConservar.map(() => "?").join(",");
+        await connection.query(
+          `DELETE FROM convenio_hotel_imagen WHERE convenio_hotel_id = ? AND id NOT IN (${placeholders})`,
+          [hotelId, ...idsAConservar]
+        );
+      } else {
+        await connection.query(
+          "DELETE FROM convenio_hotel_imagen WHERE convenio_hotel_id = ?",
+          [hotelId]
+        );
+      }
+
+      for (let index = 0; index < idsAConservar.length; index++) {
+        await connection.query(
+          "UPDATE convenio_hotel_imagen SET orden = ? WHERE id = ? AND convenio_hotel_id = ?",
+          [index, idsAConservar[index], hotelId]
+        );
+      }
+    }
+
+    let tarifarioPdfArchivo = existentes[0].tarifario_pdf_archivo || null;
+    if (pdf) {
+      tarifarioPdfArchivo = await subirArchivoConvenioHotel(pdf, "tarifario");
+    }
+
+    await connection.query(
+      `
+        UPDATE convenio_hotel
+        SET nombre = ?,
+            ciudad = ?,
+            provincia = ?,
+            coordenadas_maps = ?,
+            latitud = ?,
+            longitud = ?,
+            descripcion = ?,
+            tarifario_pdf_archivo = ?,
+            activo = ?
+        WHERE id = ?
+      `,
+      [nombre, ciudad, provincia, coordenadasMaps, latitud, longitud, descripcion || null, tarifarioPdfArchivo, activo, hotelId]
+    );
+
+    const ordenInicial = idsAConservar.length;
+    for (let index = 0; index < fotos.length; index++) {
+      const archivo = await subirArchivoConvenioHotel(fotos[index], "foto");
+      await connection.query(
+        "INSERT INTO convenio_hotel_imagen (convenio_hotel_id, archivo, orden) VALUES (?, ?, ?)",
+        [hotelId, archivo, ordenInicial + index]
+      );
+    }
+
+    await connection.commit();
+
+    const [hoteles] = await mysqlConnection.promise().query(
+      "SELECT * FROM convenio_hotel WHERE id = ?",
+      [hotelId]
+    );
+    const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(mysqlConnection.promise(), [hotelId]);
+    const respuesta = await firmarConvenioHotel(hoteles[0], imagenesPorHotel.get(hotelId) || []);
+
+    res.status(200).json(respuesta);
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    res.status(500).json("Error al actualizar el convenio hotelero");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+router.patch("/admin/convenios-hoteleros/:id/activo", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const hotelId = normalizarIdPositivo(req.params.id);
+    if (!hotelId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    const activo = normalizarBooleanActivo(req.body.activo, true);
+    const [result] = await mysqlConnection.promise().query(
+      "UPDATE convenio_hotel SET activo = ? WHERE id = ?",
+      [activo, hotelId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json("Convenio hotelero no encontrado");
+    }
+
+    res.status(200).json({ message: "Convenio hotelero actualizado", activo: activo === 1 });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al actualizar el estado del convenio hotelero");
+  }
+});
+
+router.get("/convenios-hoteleros", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const ciudad = normalizarTexto(req.query.ciudad || req.query.lugar);
+    const params = [];
+    let filtroCiudad = "";
+    if (ciudad) {
+      filtroCiudad = "AND ciudad = ?";
+      params.push(ciudad);
+    }
+
+    const db = mysqlConnection.promise();
+    const [hoteles] = await db.query(
+      `
+        SELECT
+          id,
+          nombre,
+          ciudad,
+          provincia,
+          coordenadas_maps,
+          latitud,
+          longitud,
+          descripcion,
+          tarifario_pdf_archivo,
+          activo,
+          fecha_creacion,
+          fecha_modificacion
+        FROM convenio_hotel
+        WHERE activo = 1
+          ${filtroCiudad}
+        ORDER BY nombre ASC
+      `,
+      params
+    );
+
+    const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(db, hoteles.map((hotel) => hotel.id));
+    const respuesta = await Promise.all(hoteles.map((hotel) => (
+      firmarConvenioHotel(hotel, imagenesPorHotel.get(Number(hotel.id)) || [])
+    )));
+
+    res.status(200).json(respuesta);
+  } catch (error) {
+    console.log(error);
+    if (esErrorTemporadaAltaNoMigrada(error)) {
+      return res.status(200).json([]);
+    }
+    res.status(500).json("Error al obtener los convenios hoteleros");
   }
 });
 
@@ -3715,6 +4154,8 @@ const ESTADO_RESERVA_RECHAZADA_ID = 4;
 const MODALIDAD_FECHA_LIBRE = "FECHA_LIBRE";
 const MODALIDAD_BLOQUE = "BLOQUE";
 const MODALIDAD_SORTEO = "SORTEO";
+const MODALIDAD_CONVENIO = "CONVENIO";
+const TIPO_NOTIFICACION_CONVENIO_PROPUESTA = "CONVENIO_PROPUESTA";
 const ESTADOS_RECURSO_BLOQUE_RESERVABLES = new Set(["DISPONIBLE", "VENTA_DIRECTA"]);
 const ESTADOS_RECURSO_SORTEO_DISPONIBLES = new Set(["DISPONIBLE", "SORTEO"]);
 const ESTADOS_RESERVA_NO_OCUPAN = new Set([ESTADO_RESERVA_CANCELADA_ID, ESTADO_RESERVA_RECHAZADA_ID]);
@@ -3789,7 +4230,7 @@ function normalizarIdPositivo(valor) {
 
 function normalizarModalidad(valor) {
   const modalidad = String(valor || MODALIDAD_FECHA_LIBRE).toUpperCase();
-  if ([MODALIDAD_FECHA_LIBRE, MODALIDAD_BLOQUE, MODALIDAD_SORTEO].includes(modalidad)) {
+  if ([MODALIDAD_FECHA_LIBRE, MODALIDAD_BLOQUE, MODALIDAD_SORTEO, MODALIDAD_CONVENIO].includes(modalidad)) {
     return modalidad;
   }
   return MODALIDAD_FECHA_LIBRE;
@@ -3807,6 +4248,295 @@ function parseJsonSeguro(valor) {
   } catch (error) {
     return null;
   }
+}
+
+function normalizarTexto(valor) {
+  return typeof valor === "string" ? valor.trim() : "";
+}
+
+function normalizarBooleanActivo(valor, valorPorDefecto = true) {
+  if (valor === undefined || valor === null || valor === "") {
+    return valorPorDefecto ? 1 : 0;
+  }
+  if (typeof valor === "string") {
+    const texto = valor.trim().toLowerCase();
+    if (["1", "true", "y", "yes", "si", "s"].includes(texto)) {
+      return 1;
+    }
+    if (["0", "false", "n", "no"].includes(texto)) {
+      return 0;
+    }
+  }
+  return normalizarBoolean(valor) ? 1 : 0;
+}
+
+function normalizarNumeroNullable(valor) {
+  if (valor === undefined || valor === null || valor === "") {
+    return null;
+  }
+  const numero = Number(valor);
+  return Number.isFinite(numero) ? numero : null;
+}
+
+function normalizarImporte(valor) {
+  const numero = Number(valor);
+  return Number.isFinite(numero) && numero >= 0 ? Number(numero.toFixed(2)) : null;
+}
+
+function parseArrayDesdeFormulario(valor) {
+  if (Array.isArray(valor)) {
+    return valor;
+  }
+  if (typeof valor === "string" && valor.trim() !== "") {
+    const parsed = parseJsonSeguro(valor);
+    return Array.isArray(parsed) ? parsed : [];
+  }
+  return [];
+}
+
+async function subirArchivoConvenioHotel(file, prefijo) {
+  const extension = EXTENSION_BY_MIME[file.mimetype] || getSafeFileExtension(file.originalname, file.mimetype);
+  const key = `convenios_hoteleros/${prefijo}_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.${extension}`;
+  await uploadBufferToS3({
+    key,
+    buffer: file.buffer,
+    contentType: file.mimetype,
+  });
+  return key;
+}
+
+async function firmarImagenesConvenio(imagenes = []) {
+  return Promise.all((imagenes || []).map(async (imagen) => {
+    let archivoUrl = null;
+    try {
+      archivoUrl = await getSignedFileUrlFromS3(imagen.archivo);
+    } catch (error) {
+      console.error("Error generando URL firmada para imagen de convenio:", error);
+    }
+
+    return {
+      id: Number(imagen.id),
+      hotel_id: Number(imagen.hotel_id),
+      archivo: archivoUrl,
+      archivo_url: archivoUrl,
+      orden: Number(imagen.orden || 0),
+    };
+  }));
+}
+
+async function firmarConvenioHotel(row, imagenes = []) {
+  let tarifarioPdfUrl = null;
+  if (row?.tarifario_pdf_archivo) {
+    try {
+      tarifarioPdfUrl = await getSignedFileUrlFromS3(row.tarifario_pdf_archivo);
+    } catch (error) {
+      console.error("Error generando URL firmada para PDF de convenio:", error);
+    }
+  }
+
+  return {
+    id: Number(row.id),
+    nombre: row.nombre,
+    ciudad: row.ciudad,
+    provincia: row.provincia,
+    coordenadas_maps: row.coordenadas_maps,
+    latitud: row.latitud !== null && row.latitud !== undefined ? Number(row.latitud) : null,
+    longitud: row.longitud !== null && row.longitud !== undefined ? Number(row.longitud) : null,
+    descripcion: row.descripcion || "",
+    activo: row.activo === 1 || row.activo === true,
+    tarifario_pdf_url: tarifarioPdfUrl,
+    fecha_creacion: row.fecha_creacion,
+    fecha_modificacion: row.fecha_modificacion,
+    imagenes: await firmarImagenesConvenio(imagenes),
+  };
+}
+
+async function obtenerImagenesConvenioPorHotel(connection, hotelIds) {
+  const ids = (hotelIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0);
+  if (ids.length === 0) {
+    return new Map();
+  }
+
+  const placeholders = ids.map(() => "?").join(",");
+  const [rows] = await connection.query(
+    `SELECT id, convenio_hotel_id AS hotel_id, archivo, orden
+     FROM convenio_hotel_imagen
+     WHERE convenio_hotel_id IN (${placeholders})
+     ORDER BY convenio_hotel_id ASC, orden ASC, id ASC`,
+    ids
+  );
+
+  const mapa = new Map();
+  rows.forEach((row) => {
+    const hotelId = Number(row.hotel_id);
+    if (!mapa.has(hotelId)) {
+      mapa.set(hotelId, []);
+    }
+    mapa.get(hotelId).push(row);
+  });
+  return mapa;
+}
+
+async function obtenerUsuarioPrincipalFamilia(connection, usuarioId) {
+  const [usuarioCreador] = await connection.query(
+    "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
+    [usuarioId]
+  );
+
+  let usuarioFamiliarPrincipalId = usuarioId;
+  let departamentalId = usuarioCreador[0]?.departamental_id || null;
+
+  if (usuarioCreador.length > 0) {
+    let currentUserId = usuarioCreador[0].id;
+    let currentUserFamiliarId = usuarioCreador[0].usuario_familiar_id;
+    let currentDepartamentalId = usuarioCreador[0].departamental_id;
+
+    while (currentUserFamiliarId !== null) {
+      const [nextUser] = await connection.query(
+        "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
+        [currentUserFamiliarId]
+      );
+
+      if (nextUser.length === 0) {
+        break;
+      }
+
+      currentUserId = nextUser[0].id;
+      currentUserFamiliarId = nextUser[0].usuario_familiar_id;
+      currentDepartamentalId = nextUser[0].departamental_id;
+    }
+
+    usuarioFamiliarPrincipalId = currentUserId;
+    departamentalId = currentDepartamentalId;
+  }
+
+  return { usuarioFamiliarPrincipalId, departamentalId };
+}
+
+async function crearOBuscarUsuariosReserva(connection, personas, {
+  usuarioFamiliarPrincipalId,
+  departamentalId,
+  usuarioModificadorId,
+  req,
+}) {
+  const usuariosIds = [];
+
+  for (const persona of personas) {
+    const dni = persona.dni || persona.documento;
+    const [existeUsuario] = await connection.query(
+      "SELECT id FROM usuario WHERE documento = ?",
+      [dni]
+    );
+
+    let usuarioId;
+    if (existeUsuario.length > 0) {
+      usuarioId = existeUsuario[0].id;
+    } else {
+      const rolId = Number(persona.tipo_persona_id) === 1 ? 2 : 4;
+
+      const [nuevoUsuario] = await connection.query(
+        `INSERT INTO usuario (
+          rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento,
+          documento, telefono, password, usuario_familiar_id, departamental_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+        [
+          rolId,
+          persona.parentesco_id || null,
+          persona.tipo_persona_id || null,
+          persona.nombre,
+          persona.apellido,
+          persona.fecha_nacimiento || null,
+          dni,
+          persona.telefono || null,
+          usuarioFamiliarPrincipalId,
+          departamentalId,
+        ]
+      );
+      usuarioId = nuevoUsuario.insertId;
+
+      await registrarHistorial(
+        connection,
+        usuarioId,
+        "CREATE",
+        "usuario",
+        usuarioModificadorId,
+        req,
+        null,
+        `Usuario creado durante reserva. Datos: ${persona.nombre} ${persona.apellido}, DNI: ${dni}`
+      );
+    }
+
+    usuariosIds.push({
+      ...persona,
+      dni,
+      usuario_id: usuarioId,
+    });
+  }
+
+  return usuariosIds;
+}
+
+async function obtenerReservaConvenioParaAcceso(connection, reservaId, { forUpdate = false } = {}) {
+  const lockSql = forUpdate ? " FOR UPDATE" : "";
+  const [rows] = await connection.query(
+    `
+      SELECT
+        r.*,
+        u.departamental_id AS usuario_departamental_id,
+        ch.nombre AS convenio_nombre,
+        ch.ciudad AS convenio_ciudad,
+        ch.provincia AS convenio_provincia
+      FROM reserva r
+      INNER JOIN usuario u ON u.id = r.usuario_id
+      LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
+      WHERE r.id = ?
+        AND r.modalidad = ?
+      LIMIT 1${lockSql}
+    `,
+    [reservaId, MODALIDAD_CONVENIO]
+  );
+
+  return rows.length > 0 ? rows[0] : null;
+}
+
+let columnaUsuarioDepartamentalPropuestaCache;
+async function obtenerColumnaUsuarioDepartamentalPropuesta(connection) {
+  if (columnaUsuarioDepartamentalPropuestaCache !== undefined) {
+    return columnaUsuarioDepartamentalPropuestaCache;
+  }
+
+  const [rows] = await connection.query(
+    `
+      SELECT COLUMN_NAME
+      FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'reserva_convenio_propuesta'
+        AND COLUMN_NAME IN ('departamental_usuario_id', 'usuario_departamental_id')
+    `
+  );
+
+  const columnas = rows.map((row) => row.COLUMN_NAME);
+  columnaUsuarioDepartamentalPropuestaCache = columnas.includes("departamental_usuario_id")
+    ? "departamental_usuario_id"
+    : (columnas.includes("usuario_departamental_id") ? "usuario_departamental_id" : null);
+
+  return columnaUsuarioDepartamentalPropuestaCache;
+}
+
+function puedeGestionarReservaConvenio(cabecera, reserva) {
+  if (!reserva) {
+    return false;
+  }
+  if (cabecera.rol === "admin") {
+    return true;
+  }
+  if (cabecera.rol === "afiliado") {
+    return Number(reserva.usuario_id) === Number(cabecera.id);
+  }
+  if (cabecera.rol === "departamental") {
+    return Number(reserva.usuario_departamental_id) === Number(cabecera.departamental_id);
+  }
+  return false;
 }
 
 function mapearPremioSorteo(row) {
@@ -5768,6 +6498,147 @@ router.post("/reserva", verifyToken, async (req, res) => {
   }
 });
 
+router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "departamental", "afiliado"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const hotelId = normalizarIdPositivo(req.params.id);
+    const {
+      fecha_inicio,
+      fecha_fin,
+      personas,
+      firma,
+      observaciones,
+    } = req.body;
+
+    if (!hotelId || !fecha_inicio || !fecha_fin || !Array.isArray(personas) || personas.length === 0 || !firma) {
+      return res.status(400).json("Faltan campos requeridos");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const [hoteles] = await connection.query(
+      "SELECT id, nombre FROM convenio_hotel WHERE id = ? AND activo = 1 LIMIT 1",
+      [hotelId]
+    );
+    if (hoteles.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Convenio hotelero no disponible");
+    }
+
+    const firmaFileName = `firma_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.png`;
+    await uploadBase64ToS3({
+      key: firmaFileName,
+      value: firma,
+      defaultContentType: "image/png",
+    });
+
+    const { usuarioFamiliarPrincipalId, departamentalId } = await obtenerUsuarioPrincipalFamilia(connection, cabecera.id);
+    const usuariosIds = await crearOBuscarUsuariosReserva(connection, personas, {
+      usuarioFamiliarPrincipalId,
+      departamentalId,
+      usuarioModificadorId: cabecera.id,
+      req,
+    });
+
+    const estadoSolicitudConvenioId = await obtenerEstadoReservaId(
+      connection,
+      "Solicitud convenio",
+      ESTADO_RESERVA_INICIADA_ID
+    );
+
+    const [reservaResult] = await connection.query(
+      `
+        INSERT INTO reserva (
+          estado_reserva_id,
+          modalidad,
+          sorteo_id,
+          bloque_fecha_id,
+          servicio_id,
+          regimen_id,
+          recurso_id,
+          convenio_hotel_id,
+          usuario_id,
+          firma_archivo,
+          precio_total,
+          fecha_inicio,
+          fecha_fin,
+          observaciones,
+          monto_adicionales
+        ) VALUES (?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, ?, ?, ?, 0)
+      `,
+      [
+        estadoSolicitudConvenioId,
+        MODALIDAD_CONVENIO,
+        hotelId,
+        cabecera.id,
+        firmaFileName,
+        fecha_inicio,
+        fecha_fin,
+        observaciones || null,
+      ]
+    );
+
+    const reservaId = reservaResult.insertId;
+    for (const persona of usuariosIds) {
+      await connection.query(
+        `
+          INSERT INTO reserva_familiar (
+            reserva_id,
+            usuario_id,
+            tipo_persona_id,
+            parentesco_id,
+            edad,
+            precio
+          ) VALUES (?, ?, ?, ?, ?, 0)
+        `,
+        [
+          reservaId,
+          persona.usuario_id,
+          persona.tipo_persona_id || null,
+          persona.parentesco_id || null,
+          persona.edad || null,
+        ]
+      );
+    }
+
+    await registrarHistorialReserva(
+      connection,
+      reservaId,
+      "CREATE",
+      cabecera.id,
+      req,
+      null,
+      `Solicitud de convenio hotelero creada para ${hoteles[0].nombre}`
+    );
+
+    await connection.commit();
+
+    res.status(201).json({
+      id: reservaId,
+      numero_reserva: `${reservaId}`,
+      estado: "Solicitud convenio",
+      mensaje: "Solicitud de convenio hotelero creada exitosamente",
+      fecha_creacion: new Date().toISOString(),
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    res.status(500).json("Error al crear la solicitud de convenio hotelero");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
 router.put("/reserva/:id", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -6414,23 +7285,35 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
             COALESCE(r.modalidad, 'FECHA_LIBRE') as modalidad,
             r.sorteo_id,
             r.bloque_fecha_id,
+            r.convenio_hotel_id,
             er.nombre as estado,
             s.id as servicio_id,
             s.nombre as servicio_nombre,
             s.lugar,
             rec.id as recurso_id,
             rec.nombre as recurso_nombre,
+            ch.nombre as convenio_nombre,
+            ch.ciudad as convenio_ciudad,
+            ch.provincia as convenio_provincia,
+            ch.coordenadas_maps as convenio_coordenadas_maps,
+            ch.latitud as convenio_latitud,
+            ch.longitud as convenio_longitud,
+            ch.descripcion as convenio_descripcion,
+            ch.tarifario_pdf_archivo as convenio_tarifario_pdf_archivo,
+            ur.departamental_id as usuario_departamental_id,
             bf.nombre as bloque_nombre,
             sorteo.nombre as sorteo_nombre,
             reg.id as regimen_id,
             reg.nombre as regimen_nombre
           FROM reserva r
+          LEFT JOIN usuario ur ON ur.id = r.usuario_id
           LEFT JOIN estado_reserva er ON r.estado_reserva_id = er.id
           LEFT JOIN recurso rec ON r.recurso_id = rec.id
           LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
+          LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
           LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
           LEFT JOIN sorteo ON sorteo.id = r.sorteo_id
-          INNER JOIN regimen reg ON r.regimen_id = reg.id
+          LEFT JOIN regimen reg ON r.regimen_id = reg.id
           WHERE r.id = ?
         `, [reservaId]);
 
@@ -6627,26 +7510,39 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
             r.observaciones,
             r.fecha_creacion,
             r.firma_archivo,
+            r.usuario_id,
             COALESCE(r.modalidad, 'FECHA_LIBRE') as modalidad,
             r.sorteo_id,
             r.bloque_fecha_id,
+            r.convenio_hotel_id,
             er.nombre as estado,
             s.id as servicio_id,
             s.nombre as servicio_nombre,
             s.lugar,
             rec.id as recurso_id,
             rec.nombre as recurso_nombre,
+            ch.nombre as convenio_nombre,
+            ch.ciudad as convenio_ciudad,
+            ch.provincia as convenio_provincia,
+            ch.coordenadas_maps as convenio_coordenadas_maps,
+            ch.latitud as convenio_latitud,
+            ch.longitud as convenio_longitud,
+            ch.descripcion as convenio_descripcion,
+            ch.tarifario_pdf_archivo as convenio_tarifario_pdf_archivo,
+            ur.departamental_id as usuario_departamental_id,
             bf.nombre as bloque_nombre,
             sorteo.nombre as sorteo_nombre,
             reg.id as regimen_id,
             reg.nombre as regimen_nombre
           FROM reserva r
+          LEFT JOIN usuario ur ON ur.id = r.usuario_id
           LEFT JOIN estado_reserva er ON r.estado_reserva_id = er.id
           LEFT JOIN recurso rec ON r.recurso_id = rec.id
           LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
+          LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
           LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
           LEFT JOIN sorteo ON sorteo.id = r.sorteo_id
-          INNER JOIN regimen reg ON r.regimen_id = reg.id
+          LEFT JOIN regimen reg ON r.regimen_id = reg.id
           WHERE r.id = ?
         `, [reservaId]);
 
@@ -6666,6 +7562,14 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           if (usuarioReserva.length === 0 || usuarioReserva[0].usuario_id !== cabecera.id) {
             return res.status(403).json("No tienes permisos para ver esta reserva");
           }
+        }
+
+        if (
+          cabecera.rol === "departamental" &&
+          reserva.modalidad === MODALIDAD_CONVENIO &&
+          Number(reserva.usuario_departamental_id) !== Number(cabecera.departamental_id)
+        ) {
+          return res.status(403).json("No tienes permisos para ver esta reserva");
         }
 
         // Obtener las personas de la reserva
@@ -6746,6 +7650,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           fecha_nacimiento: persona.fecha_nacimiento,
           telefono: persona.telefono,
           edad: persona.edad,
+          reserva_familiar_id: persona.reserva_familiar_id,
           tarifa_individual: persona.tarifa_individual,
           usa_porcentaje: persona.usa_porcentaje === 1 || persona.usa_porcentaje === true,
           porcentaje_descuento: persona.porcentaje_descuento
@@ -6784,6 +7689,66 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           }
         }
 
+        let convenioHotel = null;
+        let convenioPropuesta = null;
+        if (reserva.modalidad === MODALIDAD_CONVENIO && reserva.convenio_hotel_id) {
+          const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(connection, [reserva.convenio_hotel_id]);
+          convenioHotel = await firmarConvenioHotel(
+            {
+              id: reserva.convenio_hotel_id,
+              nombre: reserva.convenio_nombre,
+              ciudad: reserva.convenio_ciudad,
+              provincia: reserva.convenio_provincia,
+              coordenadas_maps: reserva.convenio_coordenadas_maps,
+              latitud: reserva.convenio_latitud,
+              longitud: reserva.convenio_longitud,
+              descripcion: reserva.convenio_descripcion,
+              tarifario_pdf_archivo: reserva.convenio_tarifario_pdf_archivo,
+              activo: 1,
+            },
+            imagenesPorHotel.get(Number(reserva.convenio_hotel_id)) || []
+          );
+
+          const columnaUsuarioDepartamentalPropuesta = await obtenerColumnaUsuarioDepartamentalPropuesta(connection);
+          const selectUsuarioDepartamentalPropuesta = columnaUsuarioDepartamentalPropuesta
+            ? `rcp.${columnaUsuarioDepartamentalPropuesta} AS departamental_usuario_id`
+            : "NULL AS departamental_usuario_id";
+          const [propuestas] = await connection.query(
+            `
+              SELECT
+                rcp.id,
+                rcp.mensaje,
+                rcp.departamental_id,
+                ${selectUsuarioDepartamentalPropuesta},
+                rcp.respuesta,
+                rcp.fecha_propuesta,
+                rcp.fecha_respuesta,
+                d.nombre AS departamental_nombre
+              FROM reserva_convenio_propuesta rcp
+              LEFT JOIN departamental d ON d.id = rcp.departamental_id
+              WHERE rcp.reserva_id = ?
+              LIMIT 1
+            `,
+            [reservaId]
+          );
+
+          if (
+            propuestas.length > 0 &&
+            (propuestas[0].mensaje || propuestas[0].departamental_id || propuestas[0].departamental_usuario_id)
+          ) {
+            convenioPropuesta = {
+              id: Number(propuestas[0].id),
+              mensaje: propuestas[0].mensaje || "",
+              departamental_id: propuestas[0].departamental_id ? Number(propuestas[0].departamental_id) : null,
+              departamental_usuario_id: propuestas[0].departamental_usuario_id ? Number(propuestas[0].departamental_usuario_id) : null,
+              departamental_nombre: propuestas[0].departamental_nombre || null,
+              respuesta: propuestas[0].respuesta || "PENDIENTE",
+              fecha_propuesta: propuestas[0].fecha_propuesta,
+              fecha_respuesta: propuestas[0].fecha_respuesta,
+            };
+          }
+        }
+
         // Construir respuesta
         const respuesta = {
           id: reserva.id,
@@ -6804,11 +7769,11 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           bloque_nombre: reserva.bloque_nombre,
           servicio: {
             id: reserva.servicio_id,
-            nombre: reserva.servicio_nombre
+            nombre: reserva.servicio_nombre || (convenioHotel ? "Convenio hotelero" : null)
           },
           lugar: reserva.lugar,
           recurso: {
-            id: reserva.recurso_id,
+            id: reserva.recurso_id || reserva.convenio_hotel_id || null,
             nombre: reserva.recurso_nombre || "Pendiente de adjudicación"
           },
           regimen: {
@@ -6826,6 +7791,13 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           adicionales: adicionalesFormateados
         };
 
+        respuesta.convenio_hotel = convenioHotel;
+        respuesta.convenio_propuesta = convenioPropuesta;
+        if (convenioHotel) {
+          respuesta.recurso.nombre = convenioHotel.nombre;
+          respuesta.lugar = `${convenioHotel.ciudad}, ${convenioHotel.provincia}`;
+        }
+
         res.status(200).json(respuesta);
 
       } catch (queryError) {
@@ -6842,6 +7814,277 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener el resumen de la reserva");
+  }
+});
+
+router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "departamental"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const reservaId = normalizarIdPositivo(req.params.id);
+    const mensaje = normalizarTexto(req.body.mensaje);
+    const costos = parseArrayDesdeFormulario(req.body.costos);
+
+    if (!reservaId || !mensaje || !Array.isArray(costos) || costos.length === 0) {
+      return res.status(400).json("Mensaje y costos por persona son requeridos");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const reserva = await obtenerReservaConvenioParaAcceso(connection, reservaId, { forUpdate: true });
+    if (!reserva) {
+      await connection.rollback();
+      return res.status(404).json("Reserva de convenio no encontrada");
+    }
+    if (!puedeGestionarReservaConvenio(cabecera, reserva) || cabecera.rol === "afiliado") {
+      await connection.rollback();
+      return res.status(403).json("No tienes permisos para gestionar esta reserva");
+    }
+
+    const [familiares] = await connection.query(
+      "SELECT id FROM reserva_familiar WHERE reserva_id = ?",
+      [reservaId]
+    );
+    const idsFamiliares = familiares.map((row) => Number(row.id));
+    const costosPorFamiliar = new Map();
+
+    for (const item of costos) {
+      const reservaFamiliarId = normalizarIdPositivo(item.reserva_familiar_id || item.id);
+      const precio = normalizarImporte(item.precio);
+      if (!reservaFamiliarId || !idsFamiliares.includes(reservaFamiliarId) || precio === null) {
+        await connection.rollback();
+        return res.status(400).json("Los costos enviados no son validos");
+      }
+      costosPorFamiliar.set(reservaFamiliarId, precio);
+    }
+
+    if (costosPorFamiliar.size !== idsFamiliares.length) {
+      await connection.rollback();
+      return res.status(400).json("Debe cargar un costo para cada persona de la reserva");
+    }
+
+    let precioTotal = 0;
+    for (const familiarId of idsFamiliares) {
+      const precio = costosPorFamiliar.get(familiarId);
+      precioTotal += precio;
+      await connection.query(
+        "UPDATE reserva_familiar SET precio = ? WHERE id = ? AND reserva_id = ?",
+        [precio, familiarId, reservaId]
+      );
+    }
+
+    const estadoPropuestaId = await obtenerEstadoReservaId(
+      connection,
+      "Propuesta convenio",
+      ESTADO_RESERVA_INICIADA_ID
+    );
+
+    const columnaUsuarioDepartamentalPropuesta = await obtenerColumnaUsuarioDepartamentalPropuesta(connection);
+    const columnaUsuarioDepartamentalSql = columnaUsuarioDepartamentalPropuesta
+      ? `, ${columnaUsuarioDepartamentalPropuesta}`
+      : "";
+    const valorUsuarioDepartamentalSql = columnaUsuarioDepartamentalPropuesta ? ", ?" : "";
+    const updateUsuarioDepartamentalSql = columnaUsuarioDepartamentalPropuesta
+      ? `, ${columnaUsuarioDepartamentalPropuesta} = VALUES(${columnaUsuarioDepartamentalPropuesta})`
+      : "";
+    await connection.query(
+      `
+        INSERT INTO reserva_convenio_propuesta (
+          reserva_id,
+          mensaje,
+          departamental_id
+          ${columnaUsuarioDepartamentalSql},
+          respuesta,
+          fecha_propuesta,
+          fecha_respuesta
+        ) VALUES (?, ?, ?${valorUsuarioDepartamentalSql}, 'PENDIENTE', NOW(), NULL)
+        ON DUPLICATE KEY UPDATE
+          mensaje = VALUES(mensaje),
+          departamental_id = VALUES(departamental_id)
+          ${updateUsuarioDepartamentalSql},
+          respuesta = 'PENDIENTE',
+          fecha_propuesta = NOW(),
+          fecha_respuesta = NULL
+      `,
+      [
+        reservaId,
+        mensaje,
+        cabecera.departamental_id || null,
+        ...(columnaUsuarioDepartamentalPropuesta ? [cabecera.id] : [])
+      ]
+    );
+
+    await connection.query(
+      "UPDATE reserva SET precio_total = ?, estado_reserva_id = ? WHERE id = ?",
+      [Number(precioTotal.toFixed(2)), estadoPropuestaId, reservaId]
+    );
+
+    const payload = {
+      reserva_id: reservaId,
+      hotel_id: reserva.convenio_hotel_id,
+      hotel_nombre: reserva.convenio_nombre,
+      total: Number(precioTotal.toFixed(2)),
+    };
+    await connection.query(
+      `
+        INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload)
+        VALUES (?, ?, ?, ?, ?)
+      `,
+      [
+        reserva.usuario_id,
+        TIPO_NOTIFICACION_CONVENIO_PROPUESTA,
+        "Propuesta de convenio hotelero",
+        `Ya tenes una propuesta de costos para ${reserva.convenio_nombre || "tu convenio hotelero"}.`,
+        JSON.stringify(payload),
+      ]
+    );
+
+    await registrarHistorialReserva(
+      connection,
+      reservaId,
+      "UPDATE",
+      cabecera.id,
+      req,
+      [
+        { campo: "precio_total", valorAnterior: reserva.precio_total, valorNuevo: Number(precioTotal.toFixed(2)) },
+        { campo: "estado_reserva_id", valorAnterior: reserva.estado_reserva_id, valorNuevo: estadoPropuestaId },
+        { campo: "reserva_convenio_propuesta.mensaje", valorAnterior: null, valorNuevo: mensaje },
+      ],
+      "Propuesta de convenio hotelero cargada"
+    );
+
+    await connection.commit();
+
+    res.status(200).json({
+      message: "Propuesta enviada",
+      reserva_id: reservaId,
+      precio_total: Number(precioTotal.toFixed(2)),
+      respuesta: "PENDIENTE",
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    res.status(500).json("Error al enviar la propuesta de convenio");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+router.put("/reserva/:id/convenio/respuesta", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "afiliado") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const reservaId = normalizarIdPositivo(req.params.id);
+    const accion = String(req.body.accion || "").toUpperCase();
+    if (!reservaId || !["ACEPTAR", "RECHAZAR"].includes(accion)) {
+      return res.status(400).json("Accion invalida");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const reserva = await obtenerReservaConvenioParaAcceso(connection, reservaId, { forUpdate: true });
+    if (!reserva) {
+      await connection.rollback();
+      return res.status(404).json("Reserva de convenio no encontrada");
+    }
+    if (Number(reserva.usuario_id) !== Number(cabecera.id)) {
+      await connection.rollback();
+      return res.status(403).json("No tienes permisos para responder esta reserva");
+    }
+
+    const [propuestas] = await connection.query(
+      "SELECT * FROM reserva_convenio_propuesta WHERE reserva_id = ? LIMIT 1 FOR UPDATE",
+      [reservaId]
+    );
+    if (propuestas.length === 0 || !propuestas[0].fecha_propuesta) {
+      await connection.rollback();
+      return res.status(409).json("La reserva no tiene una propuesta para responder");
+    }
+    if (propuestas[0].respuesta !== "PENDIENTE") {
+      await connection.rollback();
+      return res.status(409).json("La propuesta ya fue respondida");
+    }
+
+    const respuesta = accion === "ACEPTAR" ? "ACEPTADA" : "RECHAZADA";
+    const estadoNombre = accion === "ACEPTAR" ? "Convenio aceptado" : "Convenio rechazado";
+    const estadoId = await obtenerEstadoReservaId(
+      connection,
+      estadoNombre,
+      accion === "ACEPTAR" ? ESTADO_RESERVA_INICIADA_ID : ESTADO_RESERVA_RECHAZADA_ID
+    );
+
+    await connection.query(
+      `
+        UPDATE reserva_convenio_propuesta
+        SET respuesta = ?,
+            fecha_respuesta = NOW()
+        WHERE reserva_id = ?
+      `,
+      [respuesta, reservaId]
+    );
+
+    await connection.query(
+      "UPDATE reserva SET estado_reserva_id = ? WHERE id = ?",
+      [estadoId, reservaId]
+    );
+
+    await connection.query(
+      `
+        UPDATE notificacion
+        SET leida = 1,
+            fecha_lectura = COALESCE(fecha_lectura, NOW())
+        WHERE usuario_id = ?
+          AND tipo = ?
+          AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.reserva_id')) = ?
+      `,
+      [cabecera.id, TIPO_NOTIFICACION_CONVENIO_PROPUESTA, String(reservaId)]
+    );
+
+    await registrarHistorialReserva(
+      connection,
+      reservaId,
+      "UPDATE",
+      cabecera.id,
+      req,
+      [
+        { campo: "reserva_convenio_propuesta.respuesta", valorAnterior: "PENDIENTE", valorNuevo: respuesta },
+        { campo: "estado_reserva_id", valorAnterior: reserva.estado_reserva_id, valorNuevo: estadoId },
+      ],
+      `Respuesta de propuesta de convenio: ${respuesta}`
+    );
+
+    await connection.commit();
+
+    res.status(200).json({
+      message: accion === "ACEPTAR" ? "Propuesta aceptada" : "Propuesta rechazada",
+      reserva_id: reservaId,
+      respuesta,
+      estado: estadoNombre,
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    res.status(500).json("Error al responder la propuesta de convenio");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
   }
 });
 
@@ -8253,9 +9496,9 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
   } else if (orderBy === "estado") {
     orderBy = "er.nombre";
   } else if (orderBy === "servicio") {
-    orderBy = "s.nombre";
+    orderBy = "COALESCE(s.nombre, ch.nombre)";
   } else if (orderBy === "recurso") {
-    orderBy = "rec.nombre";
+    orderBy = "COALESCE(rec.nombre, ch.nombre)";
   } else if (orderBy === "afiliado") {
     orderBy = "u.documento";
   } else if (orderBy === "modalidad") {
@@ -8266,7 +9509,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
 
   if (buscar) {
     buscar = "%" + buscar + "%";
-    queryBuscar = `AND (r.id LIKE '${buscar}' OR er.nombre LIKE '${buscar}' OR s.nombre LIKE '${buscar}' OR rec.nombre LIKE '${buscar}' OR u.documento LIKE '${buscar}' OR DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') LIKE '${buscar}' OR DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') LIKE '${buscar}' OR r.observaciones LIKE '${buscar}')`;
+    queryBuscar = `AND (r.id LIKE '${buscar}' OR er.nombre LIKE '${buscar}' OR s.nombre LIKE '${buscar}' OR rec.nombre LIKE '${buscar}' OR ch.nombre LIKE '${buscar}' OR ch.ciudad LIKE '${buscar}' OR ch.provincia LIKE '${buscar}' OR u.documento LIKE '${buscar}' OR DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') LIKE '${buscar}' OR DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') LIKE '${buscar}' OR r.observaciones LIKE '${buscar}')`;
   }
 
   const queryParams = [];
@@ -8274,8 +9517,8 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     SELECT 
       r.id,
       COALESCE(er.nombre, 'Sin estado') AS estado,
-      s.nombre AS servicio,
-      COALESCE(rec.nombre, 'Pendiente de adjudicación') AS recurso,
+      COALESCE(s.nombre, 'Convenio hotelero') AS servicio,
+      COALESCE(rec.nombre, ch.nombre, 'Pendiente de adjudicación') AS recurso,
       COALESCE(r.modalidad, 'FECHA_LIBRE') AS modalidad,
       bf.nombre AS bloque,
       u.documento AS afiliado,
@@ -8287,6 +9530,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     INNER JOIN estado_reserva er ON r.estado_reserva_id = er.id
     LEFT JOIN recurso rec ON r.recurso_id = rec.id
     LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
+    LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
     LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
     INNER JOIN usuario u ON r.usuario_id = u.id
     WHERE 1=1 
@@ -8306,6 +9550,9 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
   if (cabecera.rol === "afiliado") {
     query += " AND r.usuario_id = ?";
     queryParams.push(cabecera.id);
+  } else if (cabecera.rol === "departamental") {
+    query += " AND u.departamental_id = ?";
+    queryParams.push(cabecera.departamental_id);
   }
 
   query += ` ORDER BY ${queryOrderBy} LIMIT ${start}, ${resultsPerPage}`;
@@ -8318,6 +9565,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     if (fromDate) countParams.push(fromDate);
     if (toDate) countParams.push(toDate);
     if (cabecera.rol === "afiliado") countParams.push(cabecera.id);
+    if (cabecera.rol === "departamental") countParams.push(cabecera.departamental_id);
 
     let countQuery = `
       SELECT COUNT(*) AS count
@@ -8325,6 +9573,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       INNER JOIN estado_reserva er ON r.estado_reserva_id = er.id
       LEFT JOIN recurso rec ON r.recurso_id = rec.id
       LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
+      LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
       LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
       INNER JOIN usuario u ON r.usuario_id = u.id
       WHERE 1=1 
@@ -8332,6 +9581,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
         ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
         ${toDate ? "AND r.fecha_fin <= ?" : ""}
         ${cabecera.rol === "afiliado" ? "AND r.usuario_id = ?" : ""}
+        ${cabecera.rol === "departamental" ? "AND u.departamental_id = ?" : ""}
     `;
 
     const [countRows] = await mysqlConnection.promise().execute(countQuery, countParams);
