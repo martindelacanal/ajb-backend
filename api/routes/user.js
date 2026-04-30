@@ -1523,6 +1523,7 @@ router.get("/admin/bloques", verifyToken, async (req, res) => {
           bf.id,
           bf.sorteo_id,
           bf.servicio_id,
+          bf.temporada_tarifa_id,
           bf.nombre,
           bf.modalidad,
           bf.fecha_inicio,
@@ -1575,6 +1576,7 @@ router.get("/admin/bloques", verifyToken, async (req, res) => {
       ...row,
       fecha_inicio: formatearFechaSQL(row.fecha_inicio),
       fecha_fin: formatearFechaSQL(row.fecha_fin),
+      temporada_tarifa_id: row.temporada_tarifa_id ? Number(row.temporada_tarifa_id) : null,
       recursos: Number(row.recursos || 0),
       recursos_detalle: recursosPorBloque.get(Number(row.id)) || []
     })));
