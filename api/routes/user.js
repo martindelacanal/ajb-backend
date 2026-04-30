@@ -500,7 +500,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
                 AND bf.modalidad = 'SORTEO'
                 AND s.estado = 'ACTIVO'
                 AND bfr.estado IN ('DISPONIBLE', 'SORTEO')
-                AND CURDATE() BETWEEN s.fecha_inicio_inscripcion AND s.fecha_fin_inscripcion
+                AND s.fecha_fin_inscripcion >= CURDATE()
                 AND bf.fecha_inicio < ?
                 AND bf.fecha_fin > ?
               GROUP BY bf.id, s.id
@@ -815,10 +815,21 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
         totalPersonas: parseo.value.total_personas,
       });
 
+      const horizonteBloquesDiasRaw = Number.parseInt(req.query.horizonte_bloques_dias || "0", 10);
+      const horizonteBloquesDias = Number.isInteger(horizonteBloquesDiasRaw) && horizonteBloquesDiasRaw > 0
+        ? Math.min(horizonteBloquesDiasRaw, 180)
+        : 0;
+      const fechaInicioBloques = horizonteBloquesDias > 0
+        ? sumarDiasFechaSQL(parseo.value.fecha_inicio, -horizonteBloquesDias)
+        : parseo.value.fecha_inicio;
+      const fechaFinBloques = horizonteBloquesDias > 0
+        ? sumarDiasFechaSQL(parseo.value.fecha_fin, horizonteBloquesDias)
+        : parseo.value.fecha_fin;
+
       const bloquesDisponiblesMap = await obtenerBloquesDisponiblesPorServicio(db, {
         servicioId,
-        fechaInicio: parseo.value.fecha_inicio,
-        fechaFin: parseo.value.fecha_fin
+        fechaInicio: fechaInicioBloques,
+        fechaFin: fechaFinBloques
       });
       calendario.bloques_disponibles = bloquesDisponiblesMap.get(servicioId) || [];
 
@@ -929,7 +940,7 @@ router.get("/sorteos/activos", verifyToken, async (req, res) => {
           AND bf.estado = 'ACTIVO'
           AND bf.modalidad = 'SORTEO'
           AND bfr.estado IN ('DISPONIBLE', 'SORTEO')
-          AND CURDATE() BETWEEN s.fecha_inicio_inscripcion AND s.fecha_fin_inscripcion
+          AND s.fecha_fin_inscripcion >= CURDATE()
           ${filtroServicio}
         GROUP BY s.id, bf.id, srv.id
         ORDER BY s.fecha_inicio_inscripcion ASC, bf.fecha_inicio ASC
@@ -971,6 +982,29 @@ router.get("/sorteos/activos", verifyToken, async (req, res) => {
       return res.status(200).json([]);
     }
     res.status(500).json("Error al obtener sorteos activos");
+  }
+});
+
+router.get("/sorteos/inscripcion-activa", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const db = mysqlConnection.promise();
+    const inscripcion = await obtenerInscripcionSorteoActiva(db, cabecera.id);
+
+    res.status(200).json({
+      activa: !!inscripcion,
+      inscripcion
+    });
+  } catch (error) {
+    console.log(error);
+    if (esErrorTemporadaAltaNoMigrada(error)) {
+      return res.status(200).json({ activa: false, inscripcion: null });
+    }
+    res.status(500).json("Error al obtener inscripcion activa");
   }
 });
 
@@ -1773,23 +1807,15 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
     }
     validarBloqueInscripcionAbierta(bloque);
 
-    const [inscripcionExistente] = await connection.query(
-      `
-        SELECT id
-        FROM reserva
-        WHERE sorteo_id = ?
-          AND usuario_id = ?
-          AND modalidad = 'SORTEO'
-          AND COALESCE(estado_reserva_id, ?) <> ?
-        LIMIT 1
-        FOR UPDATE
-      `,
-      [sorteoId, cabecera.id, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
-    );
+    const inscripcionExistente = await obtenerInscripcionSorteoActiva(connection, cabecera.id, { forUpdate: true });
 
-    if (inscripcionExistente.length > 0) {
+    if (inscripcionExistente) {
       await connection.rollback();
-      return res.status(409).json({ message: "Ya tenes una inscripcion para este sorteo", codigo: "UN_TIRO" });
+      return res.status(409).json({
+        message: "Ya tenes una inscripcion activa a un sorteo. Solo podes tener una a la vez.",
+        codigo: "INSCRIPCION_SORTEO_ACTIVA",
+        inscripcion: inscripcionExistente
+      });
     }
 
     const cotizacion = await cotizarBloqueComun(connection, {
@@ -2089,7 +2115,9 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         precio_maximo,
         orden_id,
         modalidad,
-        bloque_fecha_id
+        bloque_fecha_id,
+        solo_fecha_libre,
+        soloFechaLibre
       } = req.body;
 
       if (!fecha_inicio || !fecha_fin || !servicio_id || !personas || personas.length === 0) {
@@ -2099,6 +2127,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       const db = mysqlConnection.promise();
       const modalidadSolicitada = normalizarModalidad(modalidad);
       const bloqueFechaIdSolicitado = normalizarIdPositivo(bloque_fecha_id);
+      const soloFechaLibreSolicitada = normalizarBoolean(solo_fecha_libre ?? soloFechaLibre);
       let temporadaTarifaIdFiltro = null;
       let recursosPermitidosBloqueSet = null;
 
@@ -2373,6 +2402,14 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           if (modalidadRecurso === MODALIDAD_BLOQUE && !rangoCoincideConBloque(fecha_inicio, fecha_fin, bloqueActivo)) {
             continue;
           }
+        }
+
+        if (modalidadRecurso === MODALIDAD_SORTEO) {
+          continue;
+        }
+
+        if (soloFechaLibreSolicitada && modalidadRecurso !== MODALIDAD_FECHA_LIBRE) {
+          continue;
         }
 
         let tarifaTotal = 0;
@@ -3284,6 +3321,25 @@ function formatearFechaSQL(fecha) {
   return new Date(fecha).toISOString().split("T")[0];
 }
 
+function sumarDiasFechaSQL(fecha, dias) {
+  const fechaBase = new Date(fecha);
+  if (Number.isNaN(fechaBase.getTime())) {
+    return fecha;
+  }
+  fechaBase.setDate(fechaBase.getDate() + dias);
+  return formatearFechaSQL(fechaBase);
+}
+
+function normalizarBoolean(valor) {
+  if (valor === true || valor === 1) {
+    return true;
+  }
+  if (typeof valor === "string") {
+    return ["true", "1", "y", "yes", "si"].includes(valor.trim().toLowerCase());
+  }
+  return false;
+}
+
 function fechasSonIguales(fechaA, fechaB) {
   return formatearFechaSQL(fechaA) === formatearFechaSQL(fechaB);
 }
@@ -3526,9 +3582,47 @@ async function ejecutarMantenimientoBloquesAlta(connection) {
       `
         UPDATE bloque_fecha_recurso bfr
         INNER JOIN bloque_fecha bf ON bf.id = bfr.bloque_fecha_id
+        SET bfr.estado = 'DISPONIBLE', bfr.reserva_id = NULL
+        WHERE bf.estado = 'LIBERADO'
+          AND bf.modalidad = 'BLOQUE'
+          AND bf.fecha_inicio <= CURDATE()
+          AND bf.fecha_fin > CURDATE()
+          AND bfr.estado = 'LIBERADO'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM reserva r
+            WHERE r.bloque_fecha_id = bf.id
+              AND r.recurso_id = bfr.recurso_id
+              AND COALESCE(r.estado_reserva_id, ?) <> ?
+          )
+      `,
+      [ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+    );
+
+    await connection.query(
+      `
+        UPDATE bloque_fecha bf
+        SET bf.estado = 'ACTIVO'
+        WHERE bf.estado = 'LIBERADO'
+          AND bf.modalidad = 'BLOQUE'
+          AND bf.fecha_inicio <= CURDATE()
+          AND bf.fecha_fin > CURDATE()
+          AND EXISTS (
+            SELECT 1
+            FROM bloque_fecha_recurso bfr
+            WHERE bfr.bloque_fecha_id = bf.id
+              AND bfr.estado IN ('DISPONIBLE', 'VENTA_DIRECTA')
+          )
+      `
+    );
+
+    await connection.query(
+      `
+        UPDATE bloque_fecha_recurso bfr
+        INNER JOIN bloque_fecha bf ON bf.id = bfr.bloque_fecha_id
         SET bfr.estado = 'LIBERADO', bfr.reserva_id = NULL
         WHERE bf.estado = 'ACTIVO'
-          AND bf.fecha_inicio <= CURDATE()
+          AND bf.fecha_fin <= CURDATE()
           AND bfr.estado IN ('DISPONIBLE', 'SORTEO', 'VENTA_DIRECTA')
           AND NOT EXISTS (
             SELECT 1
@@ -3546,7 +3640,7 @@ async function ejecutarMantenimientoBloquesAlta(connection) {
         UPDATE bloque_fecha bf
         SET bf.estado = 'LIBERADO'
         WHERE bf.estado = 'ACTIVO'
-          AND bf.fecha_inicio <= CURDATE()
+          AND bf.fecha_fin <= CURDATE()
           AND NOT EXISTS (
             SELECT 1
             FROM bloque_fecha_recurso bfr
@@ -3569,6 +3663,67 @@ async function obtenerEstadoReservaId(connection, nombre, fallbackId = ESTADO_RE
   );
 
   return rows.length > 0 ? Number(rows[0].id) : fallbackId;
+}
+
+async function obtenerInscripcionSorteoActiva(connection, usuarioId, { forUpdate = false } = {}) {
+  const usuarioIdNormalizado = normalizarIdPositivo(usuarioId);
+  if (!usuarioIdNormalizado) {
+    return null;
+  }
+
+  const lockSql = forUpdate ? " FOR UPDATE" : "";
+  const [rows] = await connection.query(
+    `
+      SELECT
+        r.id,
+        r.sorteo_id,
+        s.nombre AS sorteo_nombre,
+        r.bloque_fecha_id,
+        bf.nombre AS bloque_nombre,
+        r.servicio_id,
+        srv.nombre AS servicio_nombre,
+        srv.lugar,
+        r.fecha_inicio,
+        r.fecha_fin,
+        r.fecha_creacion,
+        r.estado_reserva_id,
+        er.nombre AS estado
+      FROM reserva r
+      LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+      LEFT JOIN sorteo s ON s.id = r.sorteo_id
+      LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
+      LEFT JOIN servicio srv ON srv.id = r.servicio_id
+      WHERE r.usuario_id = ?
+        AND r.modalidad = 'SORTEO'
+        AND r.recurso_id IS NULL
+        AND COALESCE(r.estado_reserva_id, ?) <> ?
+        AND COALESCE(er.nombre, '') NOT IN ('Adjudicada', 'No adjudicada', 'Cancelada', 'Rechazada')
+      ORDER BY r.fecha_creacion DESC, r.id DESC
+      LIMIT 1${lockSql}
+    `,
+    [usuarioIdNormalizado, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+  );
+
+  if (rows.length === 0) {
+    return null;
+  }
+
+  const row = rows[0];
+  return {
+    id: Number(row.id),
+    sorteo_id: row.sorteo_id ? Number(row.sorteo_id) : null,
+    sorteo_nombre: row.sorteo_nombre || null,
+    bloque_fecha_id: row.bloque_fecha_id ? Number(row.bloque_fecha_id) : null,
+    bloque_nombre: row.bloque_nombre || null,
+    servicio_id: row.servicio_id ? Number(row.servicio_id) : null,
+    servicio_nombre: row.servicio_nombre || null,
+    lugar: row.lugar || null,
+    fecha_inicio: formatearFechaSQL(row.fecha_inicio),
+    fecha_fin: formatearFechaSQL(row.fecha_fin),
+    fecha_creacion: row.fecha_creacion,
+    estado_reserva_id: row.estado_reserva_id ? Number(row.estado_reserva_id) : null,
+    estado: row.estado || null
+  };
 }
 
 function normalizarPersonasParaCotizacion(personas, regimenId) {
@@ -3914,12 +4069,10 @@ function validarBloqueInscripcionAbierta(bloque) {
 
   const hoy = new Date();
   hoy.setHours(0, 0, 0, 0);
-  const inicio = new Date(bloque.fecha_inicio_inscripcion);
   const fin = new Date(bloque.fecha_fin_inscripcion);
-  inicio.setHours(0, 0, 0, 0);
   fin.setHours(0, 0, 0, 0);
 
-  if (hoy < inicio || hoy > fin) {
+  if (hoy > fin) {
     throw crearErrorNegocio("El periodo de inscripcion al sorteo no esta vigente", 409);
   }
 }
@@ -4081,11 +4234,14 @@ async function obtenerBloquesDisponiblesPorServicio(connection, { servicioIds = 
           bf.modalidad AS modalidad_origen,
           bf.fecha_inicio,
           bf.fecha_fin,
+          srv.nombre AS servicio_nombre,
+          srv.lugar,
           s.nombre AS sorteo_nombre,
           s.estado AS sorteo_estado,
           COUNT(bfr.id) AS recursos_disponibles
         FROM bloque_fecha bf
         INNER JOIN bloque_fecha_recurso bfr ON bfr.bloque_fecha_id = bf.id
+        INNER JOIN servicio srv ON srv.id = bf.servicio_id
         LEFT JOIN sorteo s ON s.id = bf.sorteo_id
         WHERE bf.servicio_id IN (${placeholders})
           AND bf.estado = 'ACTIVO'
@@ -4098,7 +4254,7 @@ async function obtenerBloquesDisponiblesPorServicio(connection, { servicioIds = 
             OR (
               bf.modalidad = 'SORTEO'
               AND s.estado = 'ACTIVO'
-              AND CURDATE() BETWEEN s.fecha_inicio_inscripcion AND s.fecha_fin_inscripcion
+              AND s.fecha_fin_inscripcion >= CURDATE()
             )
           )
         GROUP BY bf.id, modalidad_visible, s.id
@@ -4123,6 +4279,8 @@ async function obtenerBloquesDisponiblesPorServicio(connection, { servicioIds = 
         sorteo_nombre: row.sorteo_nombre || null,
         sorteo_estado: row.sorteo_estado || null,
         servicio_id: servicioIdRow,
+        servicio_nombre: row.servicio_nombre || null,
+        lugar: row.lugar || null,
         fecha_inicio: formatearFechaSQL(row.fecha_inicio),
         fecha_fin: formatearFechaSQL(row.fecha_fin),
         recursos_disponibles: Number(row.recursos_disponibles || 0)
@@ -5788,7 +5946,7 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
           },
           recurso: {
             id: reserva.recurso_id,
-            nombre: reserva.recurso_nombre || "Pendiente de adjudicacion",
+            nombre: reserva.recurso_nombre || "Pendiente de adjudicación",
             location: reserva.lugar
           },
           regimen: {
@@ -6053,7 +6211,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           lugar: reserva.lugar,
           recurso: {
             id: reserva.recurso_id,
-            nombre: reserva.recurso_nombre || "Pendiente de adjudicacion"
+            nombre: reserva.recurso_nombre || "Pendiente de adjudicación"
           },
           regimen: {
             id: reserva.regimen_id,
@@ -7519,7 +7677,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       r.id,
       COALESCE(er.nombre, 'Sin estado') AS estado,
       s.nombre AS servicio,
-      COALESCE(rec.nombre, 'Pendiente de adjudicacion') AS recurso,
+      COALESCE(rec.nombre, 'Pendiente de adjudicación') AS recurso,
       COALESCE(r.modalidad, 'FECHA_LIBRE') AS modalidad,
       bf.nombre AS bloque,
       u.documento AS afiliado,
