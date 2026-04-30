@@ -7452,6 +7452,8 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     orderBy = "rec.nombre";
   } else if (orderBy === "afiliado") {
     orderBy = "u.documento";
+  } else if (orderBy === "modalidad") {
+    orderBy = "r.modalidad";
   }
 
   const queryOrderBy = `${orderBy} ${orderType}`;
