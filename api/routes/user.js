@@ -1176,6 +1176,56 @@ router.get("/convenios-hoteleros", verifyToken, async (req, res) => {
   }
 });
 
+router.get("/convenios-hoteleros/:id", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const hotelId = normalizarIdPositivo(req.params.id);
+    if (!hotelId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    const db = mysqlConnection.promise();
+    const [hoteles] = await db.query(
+      `
+        SELECT
+          id,
+          nombre,
+          ciudad,
+          provincia,
+          coordenadas_maps,
+          latitud,
+          longitud,
+          descripcion,
+          tarifario_pdf_archivo,
+          activo,
+          fecha_creacion,
+          fecha_modificacion
+        FROM convenio_hotel
+        WHERE id = ?
+          AND (activo = 1 OR ? = 'admin')
+        LIMIT 1
+      `,
+      [hotelId, cabecera.rol]
+    );
+
+    if (hoteles.length === 0) {
+      return res.status(404).json("Convenio hotelero no encontrado");
+    }
+
+    const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(db, [hotelId]);
+    const respuesta = await firmarConvenioHotel(hoteles[0], imagenesPorHotel.get(hotelId) || []);
+
+    res.status(200).json(respuesta);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener el convenio hotelero");
+  }
+});
+
 router.get("/servicios/disponibilidad", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
