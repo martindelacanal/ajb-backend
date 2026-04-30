@@ -1008,6 +1008,322 @@ router.get("/sorteos/inscripcion-activa", verifyToken, async (req, res) => {
   }
 });
 
+router.get("/notificaciones", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const [rows] = await mysqlConnection.promise().query(
+      `
+        SELECT
+          n.id,
+          n.tipo,
+          n.titulo,
+          n.mensaje,
+          n.leida,
+          n.fecha_creacion,
+          n.fecha_lectura,
+          CAST(n.payload AS CHAR) AS payload,
+          sar.estado AS adjudicacion_estado
+        FROM notificacion n
+        LEFT JOIN sorteo_adjudicacion_respuesta sar ON sar.notificacion_id = n.id
+        WHERE n.usuario_id = ?
+        ORDER BY n.fecha_creacion DESC, n.id DESC
+        LIMIT 40
+      `,
+      [cabecera.id]
+    );
+
+    const notificaciones = rows.map(row => ({
+      id: Number(row.id),
+      tipo: row.tipo,
+      titulo: row.titulo,
+      mensaje: row.mensaje,
+      leida: row.leida === 1 || row.leida === true,
+      fecha_creacion: row.fecha_creacion,
+      fecha_lectura: row.fecha_lectura,
+      payload: parseJsonSeguro(row.payload),
+      adjudicacion_estado: row.adjudicacion_estado || null
+    }));
+
+    const [countRows] = await mysqlConnection.promise().query(
+      "SELECT COUNT(*) AS total FROM notificacion WHERE usuario_id = ? AND leida = 0",
+      [cabecera.id]
+    );
+
+    res.status(200).json({
+      notificaciones,
+      no_leidas: Number(countRows?.[0]?.total || 0)
+    });
+  } catch (error) {
+    console.log(error);
+    if (esErrorTemporadaAltaNoMigrada(error)) {
+      return res.status(200).json({ notificaciones: [], no_leidas: 0 });
+    }
+    res.status(500).json("Error al obtener notificaciones");
+  }
+});
+
+router.put("/notificaciones/:id/leida", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const notificacionId = normalizarIdPositivo(req.params.id);
+    if (!notificacionId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    const [result] = await mysqlConnection.promise().query(
+      `
+        UPDATE notificacion
+        SET leida = 1,
+            fecha_lectura = COALESCE(fecha_lectura, NOW())
+        WHERE id = ? AND usuario_id = ?
+      `,
+      [notificacionId, cabecera.id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json("Notificacion no encontrada");
+    }
+
+    res.status(200).json({ message: "Notificacion marcada como leida" });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al marcar notificacion");
+  }
+});
+
+router.get("/sorteos/adjudicaciones/pendiente", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "afiliado") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const adjudicacion = await obtenerPremioSorteoPendiente(mysqlConnection.promise(), cabecera.id);
+    res.status(200).json({
+      pendiente: !!adjudicacion,
+      adjudicacion
+    });
+  } catch (error) {
+    console.log(error);
+    if (esErrorTemporadaAltaNoMigrada(error)) {
+      return res.status(200).json({ pendiente: false, adjudicacion: null });
+    }
+    res.status(500).json("Error al obtener adjudicacion pendiente");
+  }
+});
+
+router.put("/sorteos/adjudicaciones/:id/aceptar", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "afiliado") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const adjudicacionId = normalizarIdPositivo(req.params.id);
+    if (!adjudicacionId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const adjudicacion = await obtenerPremioSorteoPorAdjudicacion(connection, {
+      adjudicacionId,
+      usuarioId: cabecera.id,
+      forUpdate: true
+    });
+
+    if (!adjudicacion) {
+      await connection.rollback();
+      return res.status(404).json("Adjudicacion no encontrada");
+    }
+
+    if (adjudicacion.estado !== "PENDIENTE") {
+      await connection.rollback();
+      return res.status(409).json("La adjudicacion ya fue respondida");
+    }
+
+    await connection.query(
+      `
+        UPDATE sorteo_adjudicacion_respuesta
+        SET estado = 'ACEPTADA',
+            fecha_respuesta = NOW()
+        WHERE id = ?
+      `,
+      [adjudicacionId]
+    );
+
+    if (adjudicacion.notificacion_id) {
+      await connection.query(
+        `
+          UPDATE notificacion
+          SET leida = 1,
+              fecha_lectura = COALESCE(fecha_lectura, NOW())
+          WHERE id = ? AND usuario_id = ?
+        `,
+        [adjudicacion.notificacion_id, cabecera.id]
+      );
+    }
+
+    await registrarHistorialReserva(
+      connection,
+      adjudicacion.reserva_id,
+      "UPDATE",
+      cabecera.id,
+      req,
+      [{ campo: "sorteo_adjudicacion_respuesta.estado", valorAnterior: "PENDIENTE", valorNuevo: "ACEPTADA" }],
+      "Aceptacion de premio adjudicado por afiliado"
+    );
+
+    await connection.commit();
+    res.status(200).json({ message: "Premio aceptado", reserva_id: adjudicacion.reserva_id });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    res.status(500).json("Error al aceptar premio");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+router.put("/sorteos/adjudicaciones/:id/rechazar", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "afiliado") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const adjudicacionId = normalizarIdPositivo(req.params.id);
+    if (!adjudicacionId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    if (req.body?.confirmacion !== true) {
+      return res.status(400).json("Debe confirmar el rechazo del premio");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const adjudicacion = await obtenerPremioSorteoPorAdjudicacion(connection, {
+      adjudicacionId,
+      usuarioId: cabecera.id,
+      forUpdate: true
+    });
+
+    if (!adjudicacion) {
+      await connection.rollback();
+      return res.status(404).json("Adjudicacion no encontrada");
+    }
+
+    if (adjudicacion.estado !== "PENDIENTE") {
+      await connection.rollback();
+      return res.status(409).json("La adjudicacion ya fue respondida");
+    }
+
+    const [reservaRows] = await connection.query(
+      "SELECT id, estado_reserva_id, recurso_id, observaciones FROM reserva WHERE id = ? FOR UPDATE",
+      [adjudicacion.reserva_id]
+    );
+    if (reservaRows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Reserva no encontrada");
+    }
+
+    const reservaAnterior = reservaRows[0];
+    const observaciones = req.body.observaciones || null;
+    const estadoNoAdjudicadaId = await obtenerEstadoReservaId(connection, "No adjudicada", ESTADO_RESERVA_RECHAZADA_ID);
+
+    await connection.query(
+      `
+        UPDATE sorteo_adjudicacion_respuesta
+        SET estado = 'RECHAZADA',
+            fecha_respuesta = NOW(),
+            observaciones = ?
+        WHERE id = ?
+      `,
+      [observaciones, adjudicacionId]
+    );
+
+    await connection.query(
+      `
+        UPDATE reserva
+        SET estado_reserva_id = ?,
+            recurso_id = NULL,
+            observaciones = COALESCE(?, observaciones),
+            fecha_modificacion = NOW()
+        WHERE id = ?
+      `,
+      [estadoNoAdjudicadaId, observaciones, adjudicacion.reserva_id]
+    );
+
+    await connection.query(
+      `
+        UPDATE bloque_fecha_recurso
+        SET estado = 'SORTEO',
+            reserva_id = NULL
+        WHERE bloque_fecha_id = ?
+          AND recurso_id = ?
+          AND reserva_id = ?
+      `,
+      [adjudicacion.bloque_fecha_id, adjudicacion.recurso_id, adjudicacion.reserva_id]
+    );
+
+    if (adjudicacion.notificacion_id) {
+      await connection.query(
+        `
+          UPDATE notificacion
+          SET leida = 1,
+              fecha_lectura = COALESCE(fecha_lectura, NOW())
+          WHERE id = ? AND usuario_id = ?
+        `,
+        [adjudicacion.notificacion_id, cabecera.id]
+      );
+    }
+
+    await registrarHistorialReserva(
+      connection,
+      adjudicacion.reserva_id,
+      "UPDATE",
+      cabecera.id,
+      req,
+      [
+        { campo: "estado_reserva_id", valorAnterior: reservaAnterior.estado_reserva_id, valorNuevo: estadoNoAdjudicadaId },
+        { campo: "recurso_id", valorAnterior: reservaAnterior.recurso_id, valorNuevo: null },
+        { campo: "sorteo_adjudicacion_respuesta.estado", valorAnterior: "PENDIENTE", valorNuevo: "RECHAZADA" }
+      ],
+      "Rechazo de premio adjudicado por afiliado"
+    );
+
+    await connection.commit();
+    res.status(200).json({ message: "Premio rechazado" });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    res.status(500).json("Error al rechazar premio");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
 router.get("/admin/sorteos", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -1741,6 +2057,65 @@ router.get("/admin/sorteos/:id/inscripciones", verifyToken, async (req, res) => 
   }
 });
 
+router.get("/admin/sorteos/:id/adjudicaciones/historial", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const sorteoId = normalizarIdPositivo(req.params.id);
+    if (!sorteoId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    const [rows] = await mysqlConnection.promise().query(
+      `
+        SELECT
+          sar.id,
+          sar.reserva_id,
+          sar.estado,
+          sar.fecha_adjudicacion,
+          sar.fecha_respuesta,
+          sar.observaciones,
+          u.documento AS afiliado,
+          CONCAT(COALESCE(u.nombre, ''), ' ', COALESCE(u.apellido, '')) AS afiliado_nombre,
+          s.nombre AS sorteo_nombre,
+          bf.nombre AS bloque_nombre,
+          srv.nombre AS servicio_nombre,
+          srv.lugar,
+          rec.nombre AS recurso_nombre,
+          n.leida AS notificacion_leida
+        FROM sorteo_adjudicacion_respuesta sar
+        INNER JOIN usuario u ON u.id = sar.usuario_id
+        LEFT JOIN sorteo s ON s.id = sar.sorteo_id
+        LEFT JOIN bloque_fecha bf ON bf.id = sar.bloque_fecha_id
+        LEFT JOIN servicio srv ON srv.id = bf.servicio_id
+        LEFT JOIN recurso rec ON rec.id = sar.recurso_id
+        LEFT JOIN notificacion n ON n.id = sar.notificacion_id
+        WHERE sar.sorteo_id = ?
+        ORDER BY sar.fecha_adjudicacion DESC, sar.id DESC
+      `,
+      [sorteoId]
+    );
+
+    res.status(200).json(rows.map(row => ({
+      ...row,
+      id: Number(row.id),
+      reserva_id: Number(row.reserva_id),
+      fecha_adjudicacion: row.fecha_adjudicacion,
+      fecha_respuesta: row.fecha_respuesta,
+      notificacion_leida: row.notificacion_leida === 1 || row.notificacion_leida === true
+    })));
+  } catch (error) {
+    console.log(error);
+    if (esErrorTemporadaAltaNoMigrada(error)) {
+      return res.status(200).json([]);
+    }
+    res.status(500).json("Error al obtener historial de adjudicaciones");
+  }
+});
+
 router.post("/sorteos/:id/cotizacion", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -1970,6 +2345,15 @@ router.put("/admin/sorteos/inscripciones/:id/adjudicar", verifyToken, async (req
       return res.status(409).json("El recurso no esta disponible para adjudicar");
     }
 
+    const [adjudicacionExistente] = await connection.query(
+      "SELECT id, estado FROM sorteo_adjudicacion_respuesta WHERE reserva_id = ? LIMIT 1 FOR UPDATE",
+      [reservaId]
+    );
+    if (adjudicacionExistente.length > 0) {
+      await connection.rollback();
+      return res.status(409).json("La inscripcion ya tiene una adjudicacion registrada");
+    }
+
     const [conflictos] = await connection.query(
       `
         SELECT id
@@ -2003,13 +2387,53 @@ router.put("/admin/sorteos/inscripciones/:id/adjudicar", verifyToken, async (req
       [reservaId, bloque.id, recursoId]
     );
 
+    const detallePremioBase = await obtenerDetallePremioParaReserva(connection, reservaId, recursoId);
+    const [notificacionResult] = await connection.query(
+      `
+        INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload)
+        VALUES (?, 'SORTEO_ADJUDICADO', ?, ?, JSON_OBJECT())
+      `,
+      [
+        reserva.usuario_id,
+        "Felicitaciones, fuiste adjudicado",
+        `Ganaste ${detallePremioBase.bloque_nombre || "un bloque"} del sorteo ${detallePremioBase.sorteo_nombre || ""}`.trim()
+      ]
+    );
+
+    const [adjudicacionResult] = await connection.query(
+      `
+        INSERT INTO sorteo_adjudicacion_respuesta
+          (reserva_id, sorteo_id, bloque_fecha_id, recurso_id, usuario_id, notificacion_id, estado)
+        VALUES (?, ?, ?, ?, ?, ?, 'PENDIENTE')
+      `,
+      [
+        reservaId,
+        reserva.sorteo_id,
+        reserva.bloque_fecha_id,
+        recursoId,
+        reserva.usuario_id,
+        notificacionResult.insertId
+      ]
+    );
+
+    const detallePremio = await obtenerPremioSorteoPorAdjudicacion(connection, {
+      adjudicacionId: adjudicacionResult.insertId
+    });
+    await connection.query(
+      "UPDATE notificacion SET payload = ? WHERE id = ?",
+      [JSON.stringify(detallePremio), notificacionResult.insertId]
+    );
+
     await registrarHistorialReserva(
       connection,
       reservaId,
       "UPDATE",
       cabecera.id,
       req,
-      [{ campo: "recurso_id", valorAnterior: null, valorNuevo: recursoId }],
+      [
+        { campo: "recurso_id", valorAnterior: null, valorNuevo: recursoId },
+        { campo: "sorteo_adjudicacion_respuesta.estado", valorAnterior: null, valorNuevo: "PENDIENTE" }
+      ],
       "Adjudicacion manual de sorteo"
     );
 
@@ -3369,6 +3793,180 @@ function normalizarModalidad(valor) {
     return modalidad;
   }
   return MODALIDAD_FECHA_LIBRE;
+}
+
+function parseJsonSeguro(valor) {
+  if (!valor) {
+    return null;
+  }
+  if (typeof valor === "object") {
+    return valor;
+  }
+  try {
+    return JSON.parse(valor);
+  } catch (error) {
+    return null;
+  }
+}
+
+function mapearPremioSorteo(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: Number(row.id),
+    notificacion_id: row.notificacion_id ? Number(row.notificacion_id) : null,
+    reserva_id: Number(row.reserva_id),
+    sorteo_nombre: row.sorteo_nombre || null,
+    bloque_nombre: row.bloque_nombre || null,
+    servicio_nombre: row.servicio_nombre || null,
+    lugar: row.lugar || null,
+    recurso_nombre: row.recurso_nombre || null,
+    fecha_inicio: formatearFechaSQL(row.fecha_inicio),
+    fecha_fin: formatearFechaSQL(row.fecha_fin),
+    precio_total: Number(row.precio_total || 0),
+    monto_adicionales: Number(row.monto_adicionales || 0),
+    cantidad_personas: Number(row.cantidad_personas || 0),
+    estado: row.estado || null,
+    sorteo_id: row.sorteo_id ? Number(row.sorteo_id) : null,
+    bloque_fecha_id: row.bloque_fecha_id ? Number(row.bloque_fecha_id) : null,
+    recurso_id: row.recurso_id ? Number(row.recurso_id) : null,
+    usuario_id: row.usuario_id ? Number(row.usuario_id) : null
+  };
+}
+
+async function obtenerDetallePremioParaReserva(connection, reservaId, recursoId) {
+  const [rows] = await connection.query(
+    `
+      SELECT
+        r.id AS reserva_id,
+        r.usuario_id,
+        r.sorteo_id,
+        r.bloque_fecha_id,
+        ? AS recurso_id,
+        r.precio_total,
+        r.monto_adicionales,
+        r.fecha_inicio,
+        r.fecha_fin,
+        s.nombre AS sorteo_nombre,
+        bf.nombre AS bloque_nombre,
+        srv.nombre AS servicio_nombre,
+        srv.lugar,
+        rec.nombre AS recurso_nombre,
+        (SELECT COUNT(*) FROM reserva_familiar rf WHERE rf.reserva_id = r.id) AS cantidad_personas
+      FROM reserva r
+      LEFT JOIN sorteo s ON s.id = r.sorteo_id
+      LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
+      LEFT JOIN servicio srv ON srv.id = COALESCE(r.servicio_id, bf.servicio_id)
+      LEFT JOIN recurso rec ON rec.id = ?
+      WHERE r.id = ?
+      LIMIT 1
+    `,
+    [recursoId, recursoId, reservaId]
+  );
+
+  return rows.length > 0 ? rows[0] : {};
+}
+
+async function obtenerPremioSorteoPorAdjudicacion(connection, {
+  adjudicacionId,
+  usuarioId = null,
+  forUpdate = false
+} = {}) {
+  const idNormalizado = normalizarIdPositivo(adjudicacionId);
+  if (!idNormalizado) {
+    return null;
+  }
+
+  const params = [idNormalizado];
+  let filtroUsuario = "";
+  const usuarioNormalizado = normalizarIdPositivo(usuarioId);
+  if (usuarioNormalizado) {
+    filtroUsuario = "AND sar.usuario_id = ?";
+    params.push(usuarioNormalizado);
+  }
+
+  const lockSql = forUpdate ? " FOR UPDATE" : "";
+  const [rows] = await connection.query(
+    `
+      SELECT
+        sar.id,
+        sar.notificacion_id,
+        sar.reserva_id,
+        sar.usuario_id,
+        sar.estado,
+        r.sorteo_id,
+        r.bloque_fecha_id,
+        sar.recurso_id,
+        r.precio_total,
+        r.monto_adicionales,
+        r.fecha_inicio,
+        r.fecha_fin,
+        s.nombre AS sorteo_nombre,
+        bf.nombre AS bloque_nombre,
+        srv.nombre AS servicio_nombre,
+        srv.lugar,
+        rec.nombre AS recurso_nombre,
+        (SELECT COUNT(*) FROM reserva_familiar rf WHERE rf.reserva_id = r.id) AS cantidad_personas
+      FROM sorteo_adjudicacion_respuesta sar
+      INNER JOIN reserva r ON r.id = sar.reserva_id
+      LEFT JOIN sorteo s ON s.id = sar.sorteo_id
+      LEFT JOIN bloque_fecha bf ON bf.id = sar.bloque_fecha_id
+      LEFT JOIN servicio srv ON srv.id = COALESCE(r.servicio_id, bf.servicio_id)
+      LEFT JOIN recurso rec ON rec.id = sar.recurso_id
+      WHERE sar.id = ?
+        ${filtroUsuario}
+      LIMIT 1${lockSql}
+    `,
+    params
+  );
+
+  return rows.length > 0 ? mapearPremioSorteo(rows[0]) : null;
+}
+
+async function obtenerPremioSorteoPendiente(connection, usuarioId) {
+  const usuarioNormalizado = normalizarIdPositivo(usuarioId);
+  if (!usuarioNormalizado) {
+    return null;
+  }
+
+  const [rows] = await connection.query(
+    `
+      SELECT
+        sar.id,
+        sar.notificacion_id,
+        sar.reserva_id,
+        sar.usuario_id,
+        sar.estado,
+        r.sorteo_id,
+        r.bloque_fecha_id,
+        sar.recurso_id,
+        r.precio_total,
+        r.monto_adicionales,
+        r.fecha_inicio,
+        r.fecha_fin,
+        s.nombre AS sorteo_nombre,
+        bf.nombre AS bloque_nombre,
+        srv.nombre AS servicio_nombre,
+        srv.lugar,
+        rec.nombre AS recurso_nombre,
+        (SELECT COUNT(*) FROM reserva_familiar rf WHERE rf.reserva_id = r.id) AS cantidad_personas
+      FROM sorteo_adjudicacion_respuesta sar
+      INNER JOIN reserva r ON r.id = sar.reserva_id
+      LEFT JOIN sorteo s ON s.id = sar.sorteo_id
+      LEFT JOIN bloque_fecha bf ON bf.id = sar.bloque_fecha_id
+      LEFT JOIN servicio srv ON srv.id = COALESCE(r.servicio_id, bf.servicio_id)
+      LEFT JOIN recurso rec ON rec.id = sar.recurso_id
+      WHERE sar.usuario_id = ?
+        AND sar.estado = 'PENDIENTE'
+      ORDER BY sar.fecha_adjudicacion DESC, sar.id DESC
+      LIMIT 1
+    `,
+    [usuarioNormalizado]
+  );
+
+  return rows.length > 0 ? mapearPremioSorteo(rows[0]) : null;
 }
 
 function fechaSqlAIndice(fecha) {
