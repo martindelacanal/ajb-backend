@@ -2394,6 +2394,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
                 AND (edad_maxima IS NULL OR edad_maxima >= ?)
                 AND fecha_inicio <= ?
                 AND fecha_fin >= ?
+                ${filtroTemporada}
               ORDER BY fecha_inicio ASC
             `, [
               recurso.id,
@@ -2575,15 +2576,49 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
       cabecera.rol === "departamental"
     ) {
 
-      const { fecha_inicio, fecha_fin, servicio_id, personas, recurso_id, filtros } = req.body;
+      const { fecha_inicio, fecha_fin, servicio_id, personas, recurso_id, filtros, modalidad, bloque_fecha_id } = req.body;
 
       if (!fecha_inicio || !fecha_fin || !servicio_id || !personas || personas.length === 0) {
         return res.status(400).json("Faltan campos requeridos");
       }
 
       // Primero obtenemos solo los recursos que tienen tarifas válidas para el servicio y las personas
+      const db = mysqlConnection.promise();
+      const modalidadSolicitada = normalizarModalidad(modalidad);
+      const bloqueFechaIdSolicitado = normalizarIdPositivo(bloque_fecha_id);
+      let temporadaTarifaIdFiltro = null;
+      let recursosPermitidosBloqueSet = null;
+
+      if (modalidadSolicitada === MODALIDAD_BLOQUE && bloqueFechaIdSolicitado) {
+        const bloqueSeleccionado = await obtenerBloqueConRecursos(db, bloqueFechaIdSolicitado);
+        const modalidadBloqueVisible = bloqueSeleccionado.modalidad === MODALIDAD_SORTEO
+          ? MODALIDAD_BLOQUE
+          : bloqueSeleccionado.modalidad;
+
+        if (
+          bloqueSeleccionado.estado !== "ACTIVO" ||
+          Number(bloqueSeleccionado.servicio_id) !== Number(servicio_id) ||
+          modalidadBloqueVisible !== MODALIDAD_BLOQUE ||
+          !rangoCoincideConBloque(fecha_inicio, fecha_fin, bloqueSeleccionado)
+        ) {
+          return res.status(409).json("El bloque seleccionado no esta disponible para ese servicio y fechas");
+        }
+
+        const recursosDisponiblesBloque = (bloqueSeleccionado.recursos || []).filter((recurso) =>
+          ESTADOS_RECURSO_BLOQUE_RESERVABLES.has(recurso.estado)
+        );
+
+        if (recursosDisponiblesBloque.length === 0) {
+          return res.status(200).json([]);
+        }
+
+        recursosPermitidosBloqueSet = new Set(recursosDisponiblesBloque.map((recurso) => Number(recurso.recurso_id)));
+        temporadaTarifaIdFiltro = bloqueSeleccionado.temporada_tarifa_id || null;
+      }
+
       const recursosValidos = new Set();
       for (const persona of personas) {
+        const filtroTemporada = temporadaTarifaIdFiltro ? "AND tarifa.temporada_tarifa_id = ?" : "";
         const [tarifasPersona] = await mysqlConnection
           .promise()
           .query(`
@@ -2597,6 +2632,7 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
               AND (tarifa.edad_maxima IS NULL OR tarifa.edad_maxima >= ?)
               AND tarifa.fecha_inicio <= ?
               AND tarifa.fecha_fin >= ?
+              ${filtroTemporada}
           `, [
             servicio_id,
             persona.tipo_persona_id,
@@ -2604,13 +2640,23 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
             persona.edad,
             persona.edad,
             fecha_fin,
-            fecha_inicio
+            fecha_inicio,
+            ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])
           ]);
 
         tarifasPersona.forEach(tarifa => {
           recursosValidos.add(tarifa.recurso_id);
         });
       }
+
+      if (recursosPermitidosBloqueSet) {
+        for (const recursoValido of Array.from(recursosValidos)) {
+          if (!recursosPermitidosBloqueSet.has(Number(recursoValido))) {
+            recursosValidos.delete(recursoValido);
+          }
+        }
+      }
+
       if (recursosValidos.size === 0) {
         return res.status(200).json([]); // No hay recursos válidos, retornamos array vacío
       }
@@ -2660,6 +2706,7 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
         // Calcular tarifa por cada persona
         for (const persona of personas) {
           // Buscar todas las tarifas que apliquen para esta persona en este recurso
+          const filtroTemporada = temporadaTarifaIdFiltro ? "AND temporada_tarifa_id = ?" : "";
           const [tarifasPersona] = await mysqlConnection
             .promise()
             .query(`
@@ -2681,7 +2728,8 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
               persona.edad,
               persona.edad,
               fecha_fin,
-              fecha_inicio
+              fecha_inicio,
+              ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])
             ]);
 
           if (tarifasPersona.length === 0) {
