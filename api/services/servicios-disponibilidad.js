@@ -165,6 +165,50 @@ function tarifasCubrenTodasLasNoches(tarifas, noches) {
   return noches.every((noche) => tarifas.some((tarifa) => cubreNoche(tarifa, noche)));
 }
 
+function esErrorTemporadaAltaNoMigrada(error) {
+  return (
+    error?.code === "ER_NO_SUCH_TABLE" ||
+    error?.code === "ER_BAD_FIELD_ERROR" ||
+    error?.errno === 1146 ||
+    error?.errno === 1054
+  );
+}
+
+async function obtenerRecursosBloqueadosPorBloques(connection, { recursoIds, fechaInicio, fechaFin }) {
+  if (!Array.isArray(recursoIds) || recursoIds.length === 0) {
+    return new Set();
+  }
+
+  try {
+    const placeholders = recursoIds.map(() => "?").join(",");
+    const [rows] = await connection.query(
+      `
+        SELECT DISTINCT bfr.recurso_id
+        FROM bloque_fecha_recurso bfr
+        INNER JOIN bloque_fecha bf ON bf.id = bfr.bloque_fecha_id
+        WHERE bfr.recurso_id IN (${placeholders})
+          AND bf.estado = 'ACTIVO'
+          AND bfr.estado IN ('DISPONIBLE', 'SORTEO', 'VENTA_DIRECTA')
+          AND bf.fecha_inicio < ?
+          AND bf.fecha_fin > ?
+          AND NOT (
+            (bf.modalidad = 'BLOQUE' OR bfr.estado = 'VENTA_DIRECTA')
+            AND bf.fecha_inicio = ?
+            AND bf.fecha_fin = ?
+          )
+      `,
+      [...recursoIds, fechaFin, fechaInicio, fechaInicio, fechaFin]
+    );
+
+    return new Set(rows.map((row) => Number(row.recurso_id)));
+  } catch (error) {
+    if (esErrorTemporadaAltaNoMigrada(error)) {
+      return new Set();
+    }
+    throw error;
+  }
+}
+
 function construirPayloadDisponibilidad(disponibles, total, actualizadoEn = new Date().toISOString()) {
   const disponiblesNormalizado = Number.isFinite(disponibles) ? Number(disponibles) : 0;
   const totalNormalizado = Number.isFinite(total) ? Number(total) : 0;
@@ -330,6 +374,11 @@ async function obtenerDisponibilidadNoCamping(connection, { servicioId, fechaIni
   );
 
   const recursoOcupadoSet = new Set(reservasSolapadas.map((r) => Number(r.recurso_id)));
+  const recursoBloqueadoPorBloqueSet = await obtenerRecursosBloqueadosPorBloques(connection, {
+    recursoIds,
+    fechaInicio,
+    fechaFin,
+  });
   const tarifasPorRecurso = new Map();
   for (const tarifa of tarifas) {
     const recursoId = Number(tarifa.recurso_id);
@@ -371,7 +420,8 @@ async function obtenerDisponibilidadNoCamping(connection, { servicioId, fechaIni
   }
 
   const disponibles = recursosCompatibles.reduce((acumulado, recursoId) => {
-    return acumulado + (recursoOcupadoSet.has(recursoId) ? 0 : 1);
+    const noDisponible = recursoOcupadoSet.has(recursoId) || recursoBloqueadoPorBloqueSet.has(recursoId);
+    return acumulado + (noDisponible ? 0 : 1);
   }, 0);
 
   return construirPayloadDisponibilidad(disponibles, total);

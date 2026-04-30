@@ -453,7 +453,11 @@ router.get("/servicios", verifyToken, async (req, res) => {
       const [imagenes] = await db.query("SELECT id, servicio_id, archivo FROM imagen_servicio");
 
       const disponibilidadPorServicio = new Map();
+      const sorteosActivosPorServicio = new Map();
+      let bloquesDisponiblesPorServicio = new Map();
       if (criteriosDisponibilidad && servicios.length > 0) {
+        await ejecutarMantenimientoBloquesAlta(db);
+
         const disponibilidadSnapshot = await obtenerSnapshotDisponibilidad(db, {
           servicioIds: servicios.map((servicio) => Number(servicio.id)),
           fechaInicio: criteriosDisponibilidad.fecha_inicio,
@@ -467,6 +471,64 @@ router.get("/servicios", verifyToken, async (req, res) => {
         disponibilidadSnapshot.forEach((item) => {
           disponibilidadPorServicio.set(Number(item.servicio_id), item);
         });
+
+        bloquesDisponiblesPorServicio = await obtenerBloquesDisponiblesPorServicio(db, {
+          servicioIds: servicios.map((servicio) => Number(servicio.id)),
+          fechaInicio: criteriosDisponibilidad.fecha_inicio,
+          fechaFin: criteriosDisponibilidad.fecha_fin
+        });
+
+        try {
+          const servicioIds = servicios.map((servicio) => Number(servicio.id));
+          const placeholders = servicioIds.map(() => "?").join(",");
+          const [sorteosRows] = await db.query(
+            `
+              SELECT
+                bf.servicio_id,
+                s.id AS sorteo_id,
+                s.nombre AS sorteo_nombre,
+                bf.id AS bloque_fecha_id,
+                bf.nombre AS bloque_nombre,
+                bf.fecha_inicio,
+                bf.fecha_fin,
+                COUNT(bfr.id) AS recursos_disponibles
+              FROM bloque_fecha bf
+              INNER JOIN sorteo s ON s.id = bf.sorteo_id
+              INNER JOIN bloque_fecha_recurso bfr ON bfr.bloque_fecha_id = bf.id
+              WHERE bf.servicio_id IN (${placeholders})
+                AND bf.estado = 'ACTIVO'
+                AND bf.modalidad = 'SORTEO'
+                AND s.estado = 'ACTIVO'
+                AND bfr.estado IN ('DISPONIBLE', 'SORTEO')
+                AND CURDATE() BETWEEN s.fecha_inicio_inscripcion AND s.fecha_fin_inscripcion
+                AND bf.fecha_inicio < ?
+                AND bf.fecha_fin > ?
+              GROUP BY bf.id, s.id
+              ORDER BY bf.fecha_inicio ASC
+            `,
+            [...servicioIds, criteriosDisponibilidad.fecha_fin, criteriosDisponibilidad.fecha_inicio]
+          );
+
+          sorteosRows.forEach((row) => {
+            const servicioId = Number(row.servicio_id);
+            if (!sorteosActivosPorServicio.has(servicioId)) {
+              sorteosActivosPorServicio.set(servicioId, []);
+            }
+            sorteosActivosPorServicio.get(servicioId).push({
+              sorteo_id: Number(row.sorteo_id),
+              nombre: row.sorteo_nombre,
+              bloque_fecha_id: Number(row.bloque_fecha_id),
+              bloque_nombre: row.bloque_nombre,
+              fecha_inicio: formatearFechaSQL(row.fecha_inicio),
+              fecha_fin: formatearFechaSQL(row.fecha_fin),
+              recursos_disponibles: Number(row.recursos_disponibles)
+            });
+          });
+        } catch (error) {
+          if (!esErrorTemporadaAltaNoMigrada(error)) {
+            throw error;
+          }
+        }
       }
 
       // Mapear imagenes por servicio_id
@@ -642,6 +704,27 @@ router.get("/servicios", verifyToken, async (req, res) => {
           respuestaServicio.total_disponibles = disponibilidad.total;
         }
 
+        const sorteosServicio = sorteosActivosPorServicio.get(Number(servicio.id)) || [];
+        const bloquesServicio = bloquesDisponiblesPorServicio.get(Number(servicio.id)) || [];
+        if (bloquesServicio.length > 0) {
+          respuestaServicio.bloques_disponibles = bloquesServicio;
+        }
+
+        if (sorteosServicio.length > 0) {
+          respuestaServicio.sorteo_activo = sorteosServicio[0];
+          respuestaServicio.sorteos_activos = sorteosServicio;
+          respuestaServicio.modalidades_disponibles = Array.from(new Set([
+            "FECHA_LIBRE",
+            ...bloquesServicio.map((bloque) => bloque.modalidad),
+            "SORTEO"
+          ]));
+        } else {
+          respuestaServicio.modalidades_disponibles = Array.from(new Set([
+            "FECHA_LIBRE",
+            ...bloquesServicio.map((bloque) => bloque.modalidad)
+          ]));
+        }
+
         return respuestaServicio;
       }));
       res.status(200).json(serviciosConImagenes);
@@ -732,7 +815,17 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
         totalPersonas: parseo.value.total_personas,
       });
 
-      if (!calendario.fechas_habilitadas || calendario.fechas_habilitadas.length === 0) {
+      const bloquesDisponiblesMap = await obtenerBloquesDisponiblesPorServicio(db, {
+        servicioId,
+        fechaInicio: parseo.value.fecha_inicio,
+        fechaFin: parseo.value.fecha_fin
+      });
+      calendario.bloques_disponibles = bloquesDisponiblesMap.get(servicioId) || [];
+
+      if (
+        (!calendario.fechas_habilitadas || calendario.fechas_habilitadas.length === 0) &&
+        calendario.bloques_disponibles.length === 0
+      ) {
         return res.status(409).json("No hay fechas alternativas para la cantidad de personas indicada");
       }
 
@@ -793,6 +886,1188 @@ router.get("/adicionales", verifyToken, async (req, res) => {
   }
 });
 
+router.get("/sorteos/activos", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const db = mysqlConnection.promise();
+    await ejecutarMantenimientoBloquesAlta(db);
+
+    const servicioId = normalizarIdPositivo(req.query.servicio_id);
+    const params = [];
+    let filtroServicio = "";
+    if (servicioId) {
+      filtroServicio = " AND bf.servicio_id = ?";
+      params.push(servicioId);
+    }
+
+    const [rows] = await db.query(
+      `
+        SELECT
+          s.id AS sorteo_id,
+          s.nombre AS sorteo_nombre,
+          s.descripcion,
+          s.fecha_inicio_inscripcion,
+          s.fecha_fin_inscripcion,
+          s.estado AS sorteo_estado,
+          bf.id AS bloque_fecha_id,
+          bf.servicio_id,
+          bf.nombre AS bloque_nombre,
+          bf.fecha_inicio,
+          bf.fecha_fin,
+          srv.nombre AS servicio_nombre,
+          srv.lugar,
+          COUNT(bfr.id) AS recursos_disponibles
+        FROM sorteo s
+        INNER JOIN bloque_fecha bf ON bf.sorteo_id = s.id
+        INNER JOIN servicio srv ON srv.id = bf.servicio_id
+        INNER JOIN bloque_fecha_recurso bfr ON bfr.bloque_fecha_id = bf.id
+        WHERE s.estado = 'ACTIVO'
+          AND bf.estado = 'ACTIVO'
+          AND bf.modalidad = 'SORTEO'
+          AND bfr.estado IN ('DISPONIBLE', 'SORTEO')
+          AND CURDATE() BETWEEN s.fecha_inicio_inscripcion AND s.fecha_fin_inscripcion
+          ${filtroServicio}
+        GROUP BY s.id, bf.id, srv.id
+        ORDER BY s.fecha_inicio_inscripcion ASC, bf.fecha_inicio ASC
+      `,
+      params
+    );
+
+    const sorteosMap = new Map();
+    rows.forEach((row) => {
+      const sorteoId = Number(row.sorteo_id);
+      if (!sorteosMap.has(sorteoId)) {
+        sorteosMap.set(sorteoId, {
+          id: sorteoId,
+          nombre: row.sorteo_nombre,
+          descripcion: row.descripcion,
+          fecha_inicio_inscripcion: formatearFechaSQL(row.fecha_inicio_inscripcion),
+          fecha_fin_inscripcion: formatearFechaSQL(row.fecha_fin_inscripcion),
+          estado: row.sorteo_estado,
+          bloques: []
+        });
+      }
+
+      sorteosMap.get(sorteoId).bloques.push({
+        id: Number(row.bloque_fecha_id),
+        servicio_id: Number(row.servicio_id),
+        servicio_nombre: row.servicio_nombre,
+        lugar: row.lugar,
+        nombre: row.bloque_nombre,
+        fecha_inicio: formatearFechaSQL(row.fecha_inicio),
+        fecha_fin: formatearFechaSQL(row.fecha_fin),
+        recursos_disponibles: Number(row.recursos_disponibles)
+      });
+    });
+
+    res.status(200).json(Array.from(sorteosMap.values()));
+  } catch (error) {
+    console.log(error);
+    if (esErrorTemporadaAltaNoMigrada(error)) {
+      return res.status(200).json([]);
+    }
+    res.status(500).json("Error al obtener sorteos activos");
+  }
+});
+
+router.get("/admin/sorteos", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const db = mysqlConnection.promise();
+    await ejecutarMantenimientoBloquesAlta(db);
+    const [sorteos] = await db.query(
+      `SELECT id, nombre, descripcion, fecha_inicio_inscripcion, fecha_fin_inscripcion, estado, fecha_creacion
+       FROM sorteo
+       ORDER BY fecha_creacion DESC, id DESC`
+    );
+
+    if (sorteos.length === 0) {
+      return res.status(200).json([]);
+    }
+
+    const sorteoIds = sorteos.map((sorteo) => sorteo.id);
+    const [bloques] = await db.query(
+      `
+        SELECT
+          bf.id,
+          bf.sorteo_id,
+          bf.servicio_id,
+          bf.temporada_tarifa_id,
+          bf.nombre,
+          bf.modalidad,
+          bf.fecha_inicio,
+          bf.fecha_fin,
+          bf.estado,
+          srv.nombre AS servicio_nombre,
+          srv.lugar
+        FROM bloque_fecha bf
+        INNER JOIN servicio srv ON srv.id = bf.servicio_id
+        WHERE bf.sorteo_id IN (?)
+        ORDER BY bf.fecha_inicio ASC, bf.id ASC
+      `,
+      [sorteoIds]
+    );
+
+    const bloqueIds = bloques.map((bloque) => bloque.id);
+    let recursos = [];
+    if (bloqueIds.length > 0) {
+      const [recursosRows] = await db.query(
+        `
+          SELECT bfr.bloque_fecha_id, bfr.recurso_id, bfr.estado, bfr.reserva_id, r.nombre AS recurso_nombre
+          FROM bloque_fecha_recurso bfr
+          INNER JOIN recurso r ON r.id = bfr.recurso_id
+          WHERE bfr.bloque_fecha_id IN (?)
+          ORDER BY r.nombre ASC
+        `,
+        [bloqueIds]
+      );
+      recursos = recursosRows;
+    }
+
+    const recursosPorBloque = new Map();
+    recursos.forEach((recurso) => {
+      if (!recursosPorBloque.has(recurso.bloque_fecha_id)) {
+        recursosPorBloque.set(recurso.bloque_fecha_id, []);
+      }
+      recursosPorBloque.get(recurso.bloque_fecha_id).push({
+        recurso_id: Number(recurso.recurso_id),
+        nombre: recurso.recurso_nombre,
+        estado: recurso.estado,
+        reserva_id: recurso.reserva_id
+      });
+    });
+
+    const bloquesPorSorteo = new Map();
+    bloques.forEach((bloque) => {
+      if (!bloquesPorSorteo.has(bloque.sorteo_id)) {
+        bloquesPorSorteo.set(bloque.sorteo_id, []);
+      }
+      bloquesPorSorteo.get(bloque.sorteo_id).push({
+        id: Number(bloque.id),
+        servicio_id: Number(bloque.servicio_id),
+        servicio_nombre: bloque.servicio_nombre,
+        lugar: bloque.lugar,
+        nombre: bloque.nombre,
+        modalidad: bloque.modalidad,
+        fecha_inicio: formatearFechaSQL(bloque.fecha_inicio),
+        fecha_fin: formatearFechaSQL(bloque.fecha_fin),
+        estado: bloque.estado,
+        recursos: recursosPorBloque.get(bloque.id) || []
+      });
+    });
+
+    res.status(200).json(sorteos.map((sorteo) => ({
+      id: Number(sorteo.id),
+      nombre: sorteo.nombre,
+      descripcion: sorteo.descripcion,
+      fecha_inicio_inscripcion: formatearFechaSQL(sorteo.fecha_inicio_inscripcion),
+      fecha_fin_inscripcion: formatearFechaSQL(sorteo.fecha_fin_inscripcion),
+      estado: sorteo.estado,
+      fecha_creacion: sorteo.fecha_creacion,
+      bloques: bloquesPorSorteo.get(sorteo.id) || []
+    })));
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener sorteos");
+  }
+});
+
+router.post("/admin/sorteos", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const {
+      nombre,
+      descripcion,
+      fecha_inicio_inscripcion,
+      fecha_fin_inscripcion,
+      estado = "BORRADOR",
+      bloques = []
+    } = req.body;
+
+    if (!nombre || !fecha_inicio_inscripcion || !fecha_fin_inscripcion) {
+      return res.status(400).json("Faltan campos requeridos");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const [sorteoResult] = await connection.query(
+      `INSERT INTO sorteo (nombre, descripcion, fecha_inicio_inscripcion, fecha_fin_inscripcion, estado)
+       VALUES (?, ?, ?, ?, ?)`,
+      [nombre, descripcion || null, fecha_inicio_inscripcion, fecha_fin_inscripcion, estado]
+    );
+
+    const sorteoId = sorteoResult.insertId;
+
+    for (const bloque of Array.isArray(bloques) ? bloques : []) {
+      const servicioId = normalizarIdPositivo(bloque.servicio_id);
+      const recursosIds = Array.isArray(bloque.recursos)
+        ? bloque.recursos.map(normalizarIdPositivo).filter(Boolean)
+        : [];
+
+      if (!servicioId || !bloque.nombre || !bloque.fecha_inicio || !bloque.fecha_fin || recursosIds.length === 0) {
+        continue;
+      }
+
+      const [bloqueResult] = await connection.query(
+        `INSERT INTO bloque_fecha
+          (sorteo_id, servicio_id, nombre, modalidad, fecha_inicio, fecha_fin, estado)
+         VALUES (?, ?, ?, 'SORTEO', ?, ?, 'ACTIVO')`,
+        [sorteoId, servicioId, bloque.nombre, bloque.fecha_inicio, bloque.fecha_fin]
+      );
+
+      for (const recursoId of recursosIds) {
+        await connection.query(
+          `INSERT INTO bloque_fecha_recurso (bloque_fecha_id, recurso_id, estado)
+           VALUES (?, ?, 'SORTEO')`,
+          [bloqueResult.insertId, recursoId]
+        );
+      }
+    }
+
+    await connection.commit();
+    res.status(201).json({ id: sorteoId, message: "Sorteo creado correctamente" });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    res.status(500).json("Error al crear sorteo");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+router.put("/admin/sorteos/:id", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const sorteoId = normalizarIdPositivo(req.params.id);
+    const { nombre, descripcion, fecha_inicio_inscripcion, fecha_fin_inscripcion, estado } = req.body;
+    if (!sorteoId || !nombre || !fecha_inicio_inscripcion || !fecha_fin_inscripcion || !estado) {
+      return res.status(400).json("Faltan campos requeridos");
+    }
+
+    await mysqlConnection.promise().query(
+      `UPDATE sorteo
+       SET nombre = ?, descripcion = ?, fecha_inicio_inscripcion = ?, fecha_fin_inscripcion = ?, estado = ?
+       WHERE id = ?`,
+      [nombre, descripcion || null, fecha_inicio_inscripcion, fecha_fin_inscripcion, estado, sorteoId]
+    );
+
+    res.status(200).json({ message: "Sorteo actualizado correctamente" });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al actualizar sorteo");
+  }
+});
+
+router.delete("/admin/sorteos/:id", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const sorteoId = normalizarIdPositivo(req.params.id);
+    if (!sorteoId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    await mysqlConnection.promise().query("UPDATE sorteo SET estado = 'CANCELADO' WHERE id = ?", [sorteoId]);
+    await mysqlConnection.promise().query("UPDATE bloque_fecha SET estado = 'CANCELADO' WHERE sorteo_id = ?", [sorteoId]);
+    res.status(200).json({ message: "Sorteo cancelado correctamente" });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al cancelar sorteo");
+  }
+});
+
+router.post("/admin/bloques", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const {
+      nombre,
+      servicio_id,
+      modalidad = MODALIDAD_BLOQUE,
+      fecha_inicio,
+      fecha_fin,
+      recursos = [],
+      sorteo_id = null,
+      tarifas = null
+    } = req.body;
+    const servicioId = normalizarIdPositivo(servicio_id);
+    const modalidadNormalizada = normalizarModalidad(modalidad);
+    const recursosIds = Array.isArray(recursos) ? recursos.map(normalizarIdPositivo).filter(Boolean) : [];
+
+    if (!nombre || !servicioId || !fecha_inicio || !fecha_fin || recursosIds.length === 0) {
+      return res.status(400).json("Faltan campos requeridos");
+    }
+
+    if (modalidadNormalizada === MODALIDAD_SORTEO && !normalizarIdPositivo(sorteo_id)) {
+      return res.status(400).json("Debe seleccionar un sorteo para bloques de sorteo");
+    }
+
+    if (!tarifas || !Array.isArray(tarifas.configuracion_servicios) || tarifas.configuracion_servicios.length === 0) {
+      return res.status(400).json("Debe cargar tarifas para los recursos del bloque");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const placeholders = recursosIds.map(() => "?").join(",");
+    const [recursosServicio] = await connection.query(
+      `SELECT id FROM recurso WHERE id IN (${placeholders}) AND servicio_id = ? FOR UPDATE`,
+      [...recursosIds, servicioId]
+    );
+
+    if (recursosServicio.length !== recursosIds.length) {
+      await connection.rollback();
+      return res.status(400).json("Todos los recursos seleccionados deben pertenecer al servicio elegido");
+    }
+
+    const [bloquesSolapados] = await connection.query(
+      `
+        SELECT bf.id, bf.nombre
+        FROM bloque_fecha_recurso bfr
+        INNER JOIN bloque_fecha bf ON bf.id = bfr.bloque_fecha_id
+        WHERE bfr.recurso_id IN (${placeholders})
+          AND bf.estado = 'ACTIVO'
+          AND bfr.estado IN ('DISPONIBLE','SORTEO','VENTA_DIRECTA','RESERVADO','ASIGNADO')
+          AND bf.fecha_inicio < ?
+          AND bf.fecha_fin > ?
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [...recursosIds, fecha_fin, fecha_inicio]
+    );
+
+    if (bloquesSolapados.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({
+        message: `Hay recursos seleccionados que ya pertenecen al bloque activo "${bloquesSolapados[0].nombre}"`
+      });
+    }
+
+    const errorCoberturaTarifas = validarCoberturaTarifasBloque(tarifas.configuracion_servicios, {
+      fechaInicio: fecha_inicio,
+      fechaFin: fecha_fin,
+      recursosIds
+    });
+
+    if (errorCoberturaTarifas) {
+      await connection.rollback();
+      return res.status(400).json({ message: errorCoberturaTarifas });
+    }
+
+    await validarSolapamientoTarifasExistentes(connection, {
+      configuracionServicios: tarifas.configuracion_servicios,
+      origenes: ["GENERAL", "BLOQUE"]
+    });
+
+    const temporada = await crearTemporadaTarifasDesdeConfiguracion(connection, {
+      nombre_campania: tarifas.nombre_campania || `Bloque ${nombre}`,
+      fecha_inicio,
+      fecha_fin,
+      configuracion_servicios: tarifas.configuracion_servicios,
+      porcentajes_tipo_persona: tarifas.porcentajes_tipo_persona || [],
+      origen: "BLOQUE",
+      usuario_id: cabecera.id
+    });
+
+    const [bloqueResult] = await connection.query(
+      `INSERT INTO bloque_fecha (sorteo_id, servicio_id, temporada_tarifa_id, nombre, modalidad, fecha_inicio, fecha_fin, estado)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVO')`,
+      [
+        modalidadNormalizada === MODALIDAD_SORTEO ? normalizarIdPositivo(sorteo_id) : null,
+        servicioId,
+        temporada.temporadaId,
+        nombre,
+        modalidadNormalizada,
+        fecha_inicio,
+        fecha_fin
+      ]
+    );
+
+    for (const recursoId of recursosIds) {
+      await connection.query(
+        `INSERT INTO bloque_fecha_recurso (bloque_fecha_id, recurso_id, estado)
+         VALUES (?, ?, ?)`,
+        [bloqueResult.insertId, recursoId, modalidadNormalizada === MODALIDAD_SORTEO ? "SORTEO" : "DISPONIBLE"]
+      );
+    }
+
+    await connection.commit();
+    res.status(201).json({
+      id: bloqueResult.insertId,
+      temporada_tarifa_id: temporada.temporadaId,
+      message: "Bloque creado correctamente"
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+    }
+    res.status(500).json("Error al crear bloque");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+router.put("/admin/bloques/:id", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const bloqueId = normalizarIdPositivo(req.params.id);
+    const {
+      nombre,
+      servicio_id,
+      modalidad = MODALIDAD_BLOQUE,
+      fecha_inicio,
+      fecha_fin,
+      recursos = [],
+      sorteo_id = null,
+      tarifas = null
+    } = req.body;
+    const servicioId = normalizarIdPositivo(servicio_id);
+    const modalidadNormalizada = normalizarModalidad(modalidad);
+    const recursosIds = Array.isArray(recursos) ? recursos.map(normalizarIdPositivo).filter(Boolean) : [];
+
+    if (!bloqueId || !nombre || !servicioId || !fecha_inicio || !fecha_fin || recursosIds.length === 0) {
+      return res.status(400).json("Faltan campos requeridos");
+    }
+
+    if (modalidadNormalizada === MODALIDAD_SORTEO && !normalizarIdPositivo(sorteo_id)) {
+      return res.status(400).json("Debe seleccionar un sorteo para bloques de sorteo");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const [bloques] = await connection.query(
+      "SELECT id, temporada_tarifa_id FROM bloque_fecha WHERE id = ? FOR UPDATE",
+      [bloqueId]
+    );
+    if (bloques.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Bloque no encontrado");
+    }
+
+    const [reservas] = await connection.query(
+      `SELECT id FROM reserva
+       WHERE bloque_fecha_id = ?
+         AND COALESCE(estado_reserva_id, ?) <> ?
+       LIMIT 1
+       FOR UPDATE`,
+      [bloqueId, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+    );
+    if (reservas.length > 0) {
+      await connection.rollback();
+      return res.status(409).json("No se puede editar un bloque con reservas o inscripciones");
+    }
+
+    const placeholders = recursosIds.map(() => "?").join(",");
+    const [recursosServicio] = await connection.query(
+      `SELECT id FROM recurso WHERE id IN (${placeholders}) AND servicio_id = ? FOR UPDATE`,
+      [...recursosIds, servicioId]
+    );
+    if (recursosServicio.length !== recursosIds.length) {
+      await connection.rollback();
+      return res.status(400).json("Todos los recursos seleccionados deben pertenecer al servicio elegido");
+    }
+
+    const [bloquesSolapados] = await connection.query(
+      `
+        SELECT bf.id, bf.nombre
+        FROM bloque_fecha_recurso bfr
+        INNER JOIN bloque_fecha bf ON bf.id = bfr.bloque_fecha_id
+        WHERE bfr.recurso_id IN (${placeholders})
+          AND bf.id <> ?
+          AND bf.estado = 'ACTIVO'
+          AND bfr.estado IN ('DISPONIBLE','SORTEO','VENTA_DIRECTA','RESERVADO','ASIGNADO')
+          AND bf.fecha_inicio < ?
+          AND bf.fecha_fin > ?
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [...recursosIds, bloqueId, fecha_fin, fecha_inicio]
+    );
+    if (bloquesSolapados.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({
+        message: `Hay recursos seleccionados que ya pertenecen al bloque activo "${bloquesSolapados[0].nombre}"`
+      });
+    }
+
+    let temporadaTarifaId = bloques[0].temporada_tarifa_id || null;
+    if (tarifas && Array.isArray(tarifas.configuracion_servicios) && tarifas.configuracion_servicios.length > 0) {
+      const errorCoberturaTarifas = validarCoberturaTarifasBloque(tarifas.configuracion_servicios, {
+        fechaInicio: fecha_inicio,
+        fechaFin: fecha_fin,
+        recursosIds
+      });
+
+      if (errorCoberturaTarifas) {
+        await connection.rollback();
+        return res.status(400).json({ message: errorCoberturaTarifas });
+      }
+
+      await validarSolapamientoTarifasExistentes(connection, {
+        configuracionServicios: tarifas.configuracion_servicios,
+        excludeTemporadaTarifaId: temporadaTarifaId,
+        origenes: ["GENERAL", "BLOQUE"]
+      });
+
+      const temporadaAnteriorId = temporadaTarifaId;
+      const temporada = await crearTemporadaTarifasDesdeConfiguracion(connection, {
+        nombre_campania: tarifas.nombre_campania || `Bloque ${nombre}`,
+        fecha_inicio,
+        fecha_fin,
+        configuracion_servicios: tarifas.configuracion_servicios,
+        porcentajes_tipo_persona: tarifas.porcentajes_tipo_persona || [],
+        origen: "BLOQUE",
+        usuario_id: cabecera.id
+      });
+      temporadaTarifaId = temporada.temporadaId;
+
+      if (temporadaAnteriorId) {
+        await connection.query("DELETE FROM temporada_tarifa WHERE id = ?", [temporadaAnteriorId]);
+      }
+    }
+
+    await connection.query(
+      `UPDATE bloque_fecha
+       SET sorteo_id = ?, servicio_id = ?, temporada_tarifa_id = ?, nombre = ?, modalidad = ?, fecha_inicio = ?, fecha_fin = ?
+       WHERE id = ?`,
+      [
+        modalidadNormalizada === MODALIDAD_SORTEO ? normalizarIdPositivo(sorteo_id) : null,
+        servicioId,
+        temporadaTarifaId,
+        nombre,
+        modalidadNormalizada,
+        fecha_inicio,
+        fecha_fin,
+        bloqueId
+      ]
+    );
+
+    await connection.query("DELETE FROM bloque_fecha_recurso WHERE bloque_fecha_id = ?", [bloqueId]);
+    for (const recursoId of recursosIds) {
+      await connection.query(
+        `INSERT INTO bloque_fecha_recurso (bloque_fecha_id, recurso_id, estado)
+         VALUES (?, ?, ?)`,
+        [bloqueId, recursoId, modalidadNormalizada === MODALIDAD_SORTEO ? "SORTEO" : "DISPONIBLE"]
+      );
+    }
+
+    await connection.commit();
+    res.status(200).json({ message: "Bloque actualizado correctamente" });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+    }
+    res.status(500).json("Error al actualizar bloque");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+router.get("/admin/bloques", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const [rows] = await mysqlConnection.promise().query(
+      `
+        SELECT
+          bf.id,
+          bf.sorteo_id,
+          bf.servicio_id,
+          bf.nombre,
+          bf.modalidad,
+          bf.fecha_inicio,
+          bf.fecha_fin,
+          bf.estado,
+          s.nombre AS servicio_nombre,
+          s.lugar,
+          COUNT(bfr.id) AS recursos
+        FROM bloque_fecha bf
+        INNER JOIN servicio s ON s.id = bf.servicio_id
+        LEFT JOIN bloque_fecha_recurso bfr ON bfr.bloque_fecha_id = bf.id
+        GROUP BY bf.id, s.id
+        ORDER BY bf.fecha_inicio DESC, bf.id DESC
+      `
+    );
+
+    const bloqueIds = rows.map((row) => Number(row.id));
+    let recursosPorBloque = new Map();
+    if (bloqueIds.length > 0) {
+      const placeholders = bloqueIds.map(() => "?").join(",");
+      const [recursosRows] = await mysqlConnection.promise().query(
+        `
+          SELECT
+            bfr.bloque_fecha_id,
+            bfr.recurso_id,
+            bfr.estado,
+            r.nombre
+          FROM bloque_fecha_recurso bfr
+          INNER JOIN recurso r ON r.id = bfr.recurso_id
+          WHERE bfr.bloque_fecha_id IN (${placeholders})
+          ORDER BY r.nombre ASC
+        `,
+        bloqueIds
+      );
+
+      recursosRows.forEach((recurso) => {
+        const bloqueId = Number(recurso.bloque_fecha_id);
+        if (!recursosPorBloque.has(bloqueId)) {
+          recursosPorBloque.set(bloqueId, []);
+        }
+        recursosPorBloque.get(bloqueId).push({
+          recurso_id: Number(recurso.recurso_id),
+          nombre: recurso.nombre,
+          estado: recurso.estado
+        });
+      });
+    }
+
+    res.status(200).json(rows.map((row) => ({
+      ...row,
+      fecha_inicio: formatearFechaSQL(row.fecha_inicio),
+      fecha_fin: formatearFechaSQL(row.fecha_fin),
+      recursos: Number(row.recursos || 0),
+      recursos_detalle: recursosPorBloque.get(Number(row.id)) || []
+    })));
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener bloques");
+  }
+});
+
+router.get("/admin/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const sorteoId = normalizarIdPositivo(req.params.id);
+    if (!sorteoId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    const [rows] = await mysqlConnection.promise().query(
+      `
+        SELECT
+          r.id,
+          r.usuario_id,
+          u.documento AS afiliado,
+          CONCAT(COALESCE(u.nombre, ''), ' ', COALESCE(u.apellido, '')) AS afiliado_nombre,
+          er.nombre AS estado,
+          r.precio_total,
+          r.monto_adicionales,
+          r.fecha_inicio,
+          r.fecha_fin,
+          r.observaciones,
+          r.recurso_id,
+          rec.nombre AS recurso,
+          bf.nombre AS bloque,
+          bf.id AS bloque_fecha_id
+        FROM reserva r
+        INNER JOIN usuario u ON u.id = r.usuario_id
+        LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+        LEFT JOIN recurso rec ON rec.id = r.recurso_id
+        LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
+        WHERE r.sorteo_id = ?
+          AND r.modalidad = 'SORTEO'
+        ORDER BY r.fecha_creacion ASC
+      `,
+      [sorteoId]
+    );
+
+    const inscripciones = [];
+    for (const row of rows) {
+      const [personasRows] = await mysqlConnection.promise().query(
+        `
+          SELECT
+            rf.tipo_persona_id,
+            tp.nombre AS tipo_persona,
+            rf.parentesco_id,
+            p.nombre AS parentesco,
+            u.nombre,
+            u.apellido,
+            u.documento,
+            u.fecha_nacimiento,
+            u.telefono,
+            rf.edad,
+            rf.precio AS tarifa_individual
+          FROM reserva_familiar rf
+          INNER JOIN usuario u ON u.id = rf.usuario_id
+          LEFT JOIN tipo_persona tp ON tp.id = rf.tipo_persona_id
+          LEFT JOIN parentesco p ON p.id = rf.parentesco_id
+          WHERE rf.reserva_id = ?
+          ORDER BY rf.id ASC
+        `,
+        [row.id]
+      );
+
+      const [adicionalesRows] = await mysqlConnection.promise().query(
+        `
+          SELECT adicional_id, nombre_adicional, cantidad, dias, subtotal
+          FROM reserva_adicional
+          WHERE reserva_id = ?
+          ORDER BY id ASC
+        `,
+        [row.id]
+      );
+
+      const [recursosRows] = await mysqlConnection.promise().query(
+        `
+          SELECT bfr.recurso_id, r.nombre, bfr.estado
+          FROM bloque_fecha_recurso bfr
+          INNER JOIN recurso r ON r.id = bfr.recurso_id
+          WHERE bfr.bloque_fecha_id = ?
+          ORDER BY r.nombre ASC
+        `,
+        [row.bloque_fecha_id]
+      );
+
+      inscripciones.push({
+        ...row,
+        fecha_inicio: formatearFechaSQL(row.fecha_inicio),
+        fecha_fin: formatearFechaSQL(row.fecha_fin),
+        precio_total: Number(row.precio_total || 0),
+        monto_adicionales: Number(row.monto_adicionales || 0),
+        personas: personasRows.map((persona) => ({
+          ...persona,
+          fecha_nacimiento: formatearFechaSQL(persona.fecha_nacimiento),
+          tarifa_individual: Number(persona.tarifa_individual || 0)
+        })),
+        adicionales: adicionalesRows.map((adicional) => ({
+          ...adicional,
+          cantidad: Number(adicional.cantidad || 0),
+          dias: Number(adicional.dias || 0),
+          subtotal: Number(adicional.subtotal || 0)
+        })),
+        recursos_elegibles: recursosRows.map((recurso) => ({
+          recurso_id: Number(recurso.recurso_id),
+          nombre: recurso.nombre,
+          estado: recurso.estado,
+          disponible: ESTADOS_RECURSO_SORTEO_DISPONIBLES.has(recurso.estado)
+        }))
+      });
+    }
+
+    res.status(200).json(inscripciones);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener inscripciones");
+  }
+});
+
+router.post("/sorteos/:id/cotizacion", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const sorteoId = normalizarIdPositivo(req.params.id);
+    const bloqueFechaId = normalizarIdPositivo(req.body.bloque_fecha_id);
+    const regimenId = normalizarIdPositivo(req.body.regimen_id);
+    if (!sorteoId || !bloqueFechaId || !regimenId) {
+      return res.status(400).json("Faltan campos requeridos");
+    }
+
+    const db = mysqlConnection.promise();
+    await ejecutarMantenimientoBloquesAlta(db);
+    const bloque = await obtenerBloqueConRecursos(db, bloqueFechaId);
+    if (Number(bloque.sorteo_id) !== sorteoId) {
+      return res.status(404).json("Bloque no encontrado para el sorteo");
+    }
+    validarBloqueInscripcionAbierta(bloque);
+
+    const cotizacion = await cotizarBloqueComun(db, {
+      bloque,
+      regimenId,
+      personas: req.body.personas,
+      adicionales: req.body.adicionales || []
+    });
+
+    res.status(200).json(cotizacion);
+  } catch (error) {
+    console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+    }
+    res.status(500).json("Error al cotizar sorteo");
+  }
+});
+
+router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const sorteoId = normalizarIdPositivo(req.params.id);
+    const bloqueFechaId = normalizarIdPositivo(req.body.bloque_fecha_id);
+    const regimenId = normalizarIdPositivo(req.body.regimen_id);
+    const personas = Array.isArray(req.body.personas) ? req.body.personas : [];
+    if (!sorteoId || !bloqueFechaId || !regimenId || personas.length === 0) {
+      return res.status(400).json("Faltan campos requeridos");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    await ejecutarMantenimientoBloquesAlta(connection);
+
+    const bloque = await obtenerBloqueConRecursos(connection, bloqueFechaId, { forUpdate: true });
+    if (Number(bloque.sorteo_id) !== sorteoId) {
+      await connection.rollback();
+      return res.status(404).json("Bloque no encontrado para el sorteo");
+    }
+    validarBloqueInscripcionAbierta(bloque);
+
+    const [inscripcionExistente] = await connection.query(
+      `
+        SELECT id
+        FROM reserva
+        WHERE sorteo_id = ?
+          AND usuario_id = ?
+          AND modalidad = 'SORTEO'
+          AND COALESCE(estado_reserva_id, ?) <> ?
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [sorteoId, cabecera.id, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+    );
+
+    if (inscripcionExistente.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({ message: "Ya tenes una inscripcion para este sorteo", codigo: "UN_TIRO" });
+    }
+
+    const cotizacion = await cotizarBloqueComun(connection, {
+      bloque,
+      regimenId,
+      personas,
+      adicionales: req.body.adicionales || []
+    });
+
+    let firmaArchivo = null;
+    if (req.body.firma) {
+      const firmaFileName = `firma_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.png`;
+      await uploadBase64ToS3({
+        key: firmaFileName,
+        value: req.body.firma,
+        defaultContentType: "image/png",
+      });
+      firmaArchivo = firmaFileName;
+    }
+
+    const estadoSolicitudId = await obtenerEstadoReservaId(connection, "Solicitud sorteo", ESTADO_RESERVA_INICIADA_ID);
+
+    const [reservaResult] = await connection.query(
+      `INSERT INTO reserva (
+        estado_reserva_id, modalidad, sorteo_id, bloque_fecha_id, servicio_id,
+        regimen_id, recurso_id, usuario_id, firma_archivo, precio_total,
+        fecha_inicio, fecha_fin, observaciones, monto_adicionales
+      ) VALUES (?, 'SORTEO', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        estadoSolicitudId,
+        sorteoId,
+        bloqueFechaId,
+        cotizacion.servicio_id,
+        regimenId,
+        cabecera.id,
+        firmaArchivo,
+        cotizacion.precio_total,
+        cotizacion.fecha_inicio,
+        cotizacion.fecha_fin,
+        req.body.observaciones || null,
+        cotizacion.monto_adicionales
+      ]
+    );
+
+    const reservaId = reservaResult.insertId;
+    if (cotizacion.adicionales.length > 0) {
+      await guardarAdicionalesReserva(connection, reservaId, cotizacion.adicionales);
+    }
+
+    const usuariosIds = await obtenerOCrearUsuariosPersonasReserva(connection, personas, cabecera, req);
+    const reservasFamiliaresIds = [];
+    for (let index = 0; index < usuariosIds.length; index++) {
+      const persona = usuariosIds[index];
+      const personaCotizada = cotizacion.personas[index] || {};
+      const [reservaFamiliarResult] = await connection.query(
+        `INSERT INTO reserva_familiar
+          (reserva_id, usuario_id, tipo_persona_id, parentesco_id, edad, precio)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          reservaId,
+          persona.usuario_id,
+          persona.tipo_persona_id,
+          persona.parentesco_id,
+          persona.edad,
+          personaCotizada.tarifa_individual || persona.tarifa_individual || 0
+        ]
+      );
+
+      reservasFamiliaresIds.push({
+        reserva_familiar_id: reservaFamiliarResult.insertId,
+        tipo_persona_id: persona.tipo_persona_id,
+        edad: persona.edad
+      });
+    }
+
+    await insertarTarifasFamiliaresReserva(
+      connection,
+      reservasFamiliaresIds,
+      cotizacion.recurso_referencia_id,
+      regimenId,
+      cotizacion.fecha_inicio,
+      cotizacion.fecha_fin,
+      cotizacion.temporada_tarifa_id || null
+    );
+
+    await registrarHistorialReserva(
+      connection,
+      reservaId,
+      "CREATE",
+      cabecera.id,
+      req,
+      null,
+      `Inscripcion al sorteo ${sorteoId}, bloque ${bloqueFechaId}`
+    );
+
+    await connection.commit();
+    res.status(201).json({
+      id: reservaId,
+      numero_reserva: `${reservaId}`,
+      estado: "Solicitud sorteo",
+      mensaje: "Inscripcion al sorteo creada correctamente",
+      fecha_creacion: new Date().toISOString(),
+      monto_adicionales: cotizacion.monto_adicionales
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+    }
+    res.status(500).json("Error al crear inscripcion al sorteo");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+router.put("/admin/sorteos/inscripciones/:id/adjudicar", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const reservaId = normalizarIdPositivo(req.params.id);
+    const recursoId = normalizarIdPositivo(req.body.recurso_id);
+    if (!reservaId || !recursoId) {
+      return res.status(400).json("Faltan campos requeridos");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const [reservas] = await connection.query(
+      `SELECT * FROM reserva WHERE id = ? AND modalidad = 'SORTEO' FOR UPDATE`,
+      [reservaId]
+    );
+    if (reservas.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Inscripcion no encontrada");
+    }
+
+    const reserva = reservas[0];
+    const bloque = await obtenerBloqueConRecursos(connection, reserva.bloque_fecha_id, { forUpdate: true });
+    const recursoBloque = bloque.recursos.find((recurso) => Number(recurso.recurso_id) === recursoId);
+    if (!recursoBloque || !ESTADOS_RECURSO_SORTEO_DISPONIBLES.has(recursoBloque.estado)) {
+      await connection.rollback();
+      return res.status(409).json("El recurso no esta disponible para adjudicar");
+    }
+
+    const [conflictos] = await connection.query(
+      `
+        SELECT id
+        FROM reserva
+        WHERE id <> ?
+          AND recurso_id = ?
+          AND fecha_inicio < ?
+          AND fecha_fin > ?
+          AND COALESCE(estado_reserva_id, ?) <> ?
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [reservaId, recursoId, reserva.fecha_fin, reserva.fecha_inicio, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+    );
+    if (conflictos.length > 0) {
+      await connection.rollback();
+      return res.status(409).json("El recurso ya esta ocupado en ese bloque");
+    }
+
+    const estadoAdjudicadaId = await obtenerEstadoReservaId(connection, "Adjudicada", ESTADO_RESERVA_INICIADA_ID);
+    await connection.query(
+      `UPDATE reserva
+       SET recurso_id = ?, servicio_id = ?, estado_reserva_id = ?, observaciones = COALESCE(?, observaciones)
+       WHERE id = ?`,
+      [recursoId, bloque.servicio_id, estadoAdjudicadaId, req.body.observaciones || null, reservaId]
+    );
+    await connection.query(
+      `UPDATE bloque_fecha_recurso
+       SET estado = 'ASIGNADO', reserva_id = ?
+       WHERE bloque_fecha_id = ? AND recurso_id = ?`,
+      [reservaId, bloque.id, recursoId]
+    );
+
+    await registrarHistorialReserva(
+      connection,
+      reservaId,
+      "UPDATE",
+      cabecera.id,
+      req,
+      [{ campo: "recurso_id", valorAnterior: null, valorNuevo: recursoId }],
+      "Adjudicacion manual de sorteo"
+    );
+
+    await connection.commit();
+    res.status(200).json({ message: "Inscripcion adjudicada correctamente" });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    res.status(500).json("Error al adjudicar inscripcion");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+router.put("/admin/sorteos/inscripciones/:id/no-adjudicada", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const reservaId = normalizarIdPositivo(req.params.id);
+    if (!reservaId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    const db = mysqlConnection.promise();
+    const estadoNoAdjudicadaId = await obtenerEstadoReservaId(db, "No adjudicada", ESTADO_RESERVA_RECHAZADA_ID);
+    await db.query(
+      `UPDATE reserva SET estado_reserva_id = ?, observaciones = COALESCE(?, observaciones) WHERE id = ? AND modalidad = 'SORTEO'`,
+      [estadoNoAdjudicadaId, req.body.observaciones || null, reservaId]
+    );
+    res.status(200).json({ message: "Inscripcion marcada como no adjudicada" });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al marcar inscripcion");
+  }
+});
+
+router.put("/admin/sorteos/:id/cerrar", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const sorteoId = normalizarIdPositivo(req.params.id);
+    if (!sorteoId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    await connection.query(
+      `UPDATE bloque_fecha_recurso bfr
+       INNER JOIN bloque_fecha bf ON bf.id = bfr.bloque_fecha_id
+       SET bfr.estado = 'VENTA_DIRECTA'
+       WHERE bf.sorteo_id = ?
+         AND bf.modalidad = 'SORTEO'
+         AND bf.estado = 'ACTIVO'
+         AND bfr.estado IN ('DISPONIBLE', 'SORTEO')`,
+      [sorteoId]
+    );
+    await connection.query("UPDATE sorteo SET estado = 'CERRADO' WHERE id = ?", [sorteoId]);
+
+    await connection.commit();
+    res.status(200).json({ message: "Sorteo cerrado. Excedentes publicados como venta por bloque." });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    res.status(500).json("Error al cerrar sorteo");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
 router.post("/reserva/recursos", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -801,10 +2076,55 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
-      const { fecha_inicio, fecha_fin, servicio_id, personas, recurso_id, filtros, precio_minimo, precio_maximo, orden_id } = req.body;
+      const {
+        fecha_inicio,
+        fecha_fin,
+        servicio_id,
+        personas,
+        recurso_id,
+        filtros,
+        precio_minimo,
+        precio_maximo,
+        orden_id,
+        modalidad,
+        bloque_fecha_id
+      } = req.body;
 
       if (!fecha_inicio || !fecha_fin || !servicio_id || !personas || personas.length === 0) {
         return res.status(400).json("Faltan campos requeridos");
+      }
+
+      const db = mysqlConnection.promise();
+      const modalidadSolicitada = normalizarModalidad(modalidad);
+      const bloqueFechaIdSolicitado = normalizarIdPositivo(bloque_fecha_id);
+      let temporadaTarifaIdFiltro = null;
+      let recursosPermitidosBloqueSet = null;
+
+      if (modalidadSolicitada === MODALIDAD_BLOQUE && bloqueFechaIdSolicitado) {
+        const bloqueSeleccionado = await obtenerBloqueConRecursos(db, bloqueFechaIdSolicitado);
+        const modalidadBloqueVisible = bloqueSeleccionado.modalidad === MODALIDAD_SORTEO
+          ? MODALIDAD_BLOQUE
+          : bloqueSeleccionado.modalidad;
+
+        if (
+          bloqueSeleccionado.estado !== "ACTIVO" ||
+          Number(bloqueSeleccionado.servicio_id) !== Number(servicio_id) ||
+          modalidadBloqueVisible !== MODALIDAD_BLOQUE ||
+          !rangoCoincideConBloque(fecha_inicio, fecha_fin, bloqueSeleccionado)
+        ) {
+          return res.status(409).json("El bloque seleccionado no esta disponible para ese servicio y fechas");
+        }
+
+        const recursosDisponiblesBloque = (bloqueSeleccionado.recursos || []).filter((recurso) =>
+          ESTADOS_RECURSO_BLOQUE_RESERVABLES.has(recurso.estado)
+        );
+
+        if (recursosDisponiblesBloque.length === 0) {
+          return res.status(409).json("No hay recursos disponibles para este bloque");
+        }
+
+        recursosPermitidosBloqueSet = new Set(recursosDisponiblesBloque.map((recurso) => Number(recurso.recurso_id)));
+        temporadaTarifaIdFiltro = bloqueSeleccionado.temporada_tarifa_id || null;
       }
 
       // Primero obtenemos solo los recursos que tienen tarifas válidas para el servicio y las personas
@@ -814,6 +2134,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       const recursosValidos = new Set();
 
       for (const persona of personas) {
+        const filtroTemporada = temporadaTarifaIdFiltro ? "AND tarifa.temporada_tarifa_id = ?" : "";
         const [tarifasPersona] = await mysqlConnection
           .promise()
           .query(`
@@ -827,6 +2148,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
               AND (tarifa.edad_maxima IS NULL OR tarifa.edad_maxima >= ?)
               AND tarifa.fecha_inicio <= ?
               AND tarifa.fecha_fin >= ?
+              ${filtroTemporada}
           `, [
             servicio_id,
             persona.tipo_persona_id,
@@ -834,7 +2156,8 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
             persona.edad,
             persona.edad,
             fecha_fin,
-            fecha_inicio
+            fecha_inicio,
+            ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])
           ]);
 
         tarifasPersona.forEach(tarifa => {
@@ -847,11 +2170,23 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       }
 
       // Si se especifica recurso_id, filtramos solo ese recurso (si está en los válidos)
+      if (recursosPermitidosBloqueSet) {
+        for (const recursoValido of Array.from(recursosValidos)) {
+          if (!recursosPermitidosBloqueSet.has(Number(recursoValido))) {
+            recursosValidos.delete(recursoValido);
+          }
+        }
+
+        if (recursosValidos.size === 0) {
+          return res.status(404).json("No se encontraron recursos disponibles dentro del bloque seleccionado");
+        }
+      }
+
       if (recurso_id) {
-        if (recursosValidos.has(recurso_id)) {
+        if (recursosValidos.has(Number(recurso_id)) || recursosValidos.has(recurso_id)) {
           // Mantener solo el recurso especificado
           recursosValidos.clear();
-          recursosValidos.add(recurso_id);
+          recursosValidos.add(Number(recurso_id));
         } else {
           return res.status(404).json("El recurso especificado no tiene tarifas válidas para las personas especificadas");
         }
@@ -927,6 +2262,25 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         .promise()
         .query(`SELECT id, servicio_id, grupo_recurso_id, nombre FROM recurso WHERE id IN (${placeholders})`, recursosIds);
 
+      const bloquesPorRecurso = await obtenerBloquesActivosParaRecursos(mysqlConnection.promise(), {
+        recursoIds: recursos.map((recurso) => Number(recurso.id)),
+        fechaInicio: fecha_inicio,
+        fechaFin: fecha_fin
+      });
+
+      const [reservasSolapadasRecursos] = await mysqlConnection.promise().query(
+        `
+          SELECT DISTINCT recurso_id
+          FROM reserva
+          WHERE recurso_id IN (${placeholders})
+            AND fecha_inicio < ?
+            AND fecha_fin > ?
+            AND COALESCE(estado_reserva_id, ?) <> ?
+        `,
+        [...recursosIds, fecha_fin, fecha_inicio, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+      );
+      const recursosOcupadosSet = new Set(reservasSolapadasRecursos.map((reserva) => Number(reserva.recurso_id)));
+
       // Obtener imágenes solo para los recursos válidos
       const [imagenes] = await mysqlConnection
         .promise()
@@ -992,6 +2346,33 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
 
       // Calcular tarifas para cada recurso y aplicar filtro de precio
       for (const recurso of recursos) {
+        if (recursosOcupadosSet.has(Number(recurso.id))) {
+          continue;
+        }
+
+        const bloquesActivosRecurso = bloquesPorRecurso.get(Number(recurso.id)) || [];
+        let modalidadRecurso = MODALIDAD_FECHA_LIBRE;
+        let bloqueRecurso = null;
+
+        if (bloquesActivosRecurso.length > 0) {
+          const bloqueActivo = bloquesActivosRecurso[0];
+          const ventaDirectaDesdeSorteo = bloqueActivo.modalidad === MODALIDAD_SORTEO && bloqueActivo.estado_recurso_bloque === "VENTA_DIRECTA";
+          modalidadRecurso = ventaDirectaDesdeSorteo ? MODALIDAD_BLOQUE : bloqueActivo.modalidad;
+          bloqueRecurso = {
+            id: Number(bloqueActivo.bloque_fecha_id),
+            nombre: bloqueActivo.bloque_nombre,
+            modalidad: modalidadRecurso,
+            fecha_inicio: formatearFechaSQL(bloqueActivo.fecha_inicio),
+            fecha_fin: formatearFechaSQL(bloqueActivo.fecha_fin),
+            sorteo_id: bloqueActivo.sorteo_id ? Number(bloqueActivo.sorteo_id) : null,
+            sorteo_nombre: bloqueActivo.sorteo_nombre || null
+          };
+
+          if (modalidadRecurso === MODALIDAD_BLOQUE && !rangoCoincideConBloque(fecha_inicio, fecha_fin, bloqueActivo)) {
+            continue;
+          }
+        }
+
         let tarifaTotal = 0;
         let tarifaOriginalTotal = 0;
         let usaPorcentajeEnAlgunaTarifa = false;
@@ -1000,6 +2381,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         // Calcular tarifa por cada persona
         for (const persona of personas) {
           // Buscar todas las tarifas que apliquen para esta persona en este recurso
+          const filtroTemporada = temporadaTarifaIdFiltro ? "AND temporada_tarifa_id = ?" : "";
           const [tarifasPersona] = await mysqlConnection
             .promise()
             .query(`
@@ -1020,7 +2402,8 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
               persona.edad,
               persona.edad,
               fecha_fin,
-              fecha_inicio
+              fecha_inicio,
+              ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])
             ]);
 
           if (tarifasPersona.length === 0) {
@@ -1127,6 +2510,10 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
               nombre: recurso.nombre,
               tarifa: tarifaTotal,
               tarifa_original: usaPorcentajeEnAlgunaTarifa ? Math.round(tarifaOriginalTotal) : null,
+              modalidad: modalidadRecurso,
+              bloque_fecha: bloqueRecurso,
+              bloque_fecha_id: bloqueRecurso?.id || null,
+              sorteo_id: bloqueRecurso?.sorteo_id || null,
               imagenes: imagenesPorRecurso[recurso.id] || [],
               filtros: filtrosPorRecurso[recurso.id] || [],
               totalCamas: totalCamas,
@@ -1285,6 +2672,7 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
                 AND (edad_maxima IS NULL OR edad_maxima >= ?)
                 AND fecha_inicio <= ?
                 AND fecha_fin >= ?
+                ${filtroTemporada}
               ORDER BY fecha_inicio ASC
             `, [
               recurso.id,
@@ -1438,7 +2826,9 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
         recurso_id,
         personas,
         regimen_id,
-        adicionales
+        adicionales,
+        modalidad,
+        bloque_fecha_id
       } = req.body;
 
       if (!fecha_inicio || !fecha_fin || !servicio_id || !recurso_id || !personas || personas.length === 0) {
@@ -1457,6 +2847,25 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
 
       const pool = mysqlConnection.promise();
       const regimenIdSolicitud = regimen_id || (Array.isArray(personas) && personas.length > 0 ? personas[0].regimen_id : null);
+      const modalidadSolicitada = normalizarModalidad(modalidad);
+      const bloqueFechaIdSolicitado = normalizarIdPositivo(bloque_fecha_id);
+      let temporadaTarifaIdFiltro = null;
+
+      if (modalidadSolicitada === MODALIDAD_BLOQUE && bloqueFechaIdSolicitado) {
+        const bloqueSeleccionado = await obtenerBloqueConRecursos(pool, bloqueFechaIdSolicitado);
+        const recursoBloque = (bloqueSeleccionado.recursos || []).find((recurso) => Number(recurso.recurso_id) === Number(recurso_id));
+        if (
+          bloqueSeleccionado.estado !== "ACTIVO" ||
+          Number(bloqueSeleccionado.servicio_id) !== Number(servicio_id) ||
+          !recursoBloque ||
+          !ESTADOS_RECURSO_BLOQUE_RESERVABLES.has(recursoBloque.estado) ||
+          !rangoCoincideConBloque(fecha_inicio, fecha_fin, bloqueSeleccionado)
+        ) {
+          return res.status(409).json("El bloque seleccionado no esta disponible para ese recurso y fechas");
+        }
+        temporadaTarifaIdFiltro = bloqueSeleccionado.temporada_tarifa_id || null;
+      }
+
       const adicionalesSeleccionados = Array.isArray(adicionales)
         ? adicionales
             .map(adicional => ({
@@ -1503,6 +2912,7 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
         // Calcular tarifa por cada persona para este día específico
         for (const persona of personas) {
           // Buscar tarifa válida para esta persona en este día específico
+          const filtroTemporada = temporadaTarifaIdFiltro ? "AND temporada_tarifa_id = ?" : "";
           const [tarifasPersona] = await pool.query(
             `
               SELECT precio, usa_porcentaje, porcentaje_descuento
@@ -1514,6 +2924,7 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
                 AND (edad_maxima IS NULL OR edad_maxima >= ?)
                 AND fecha_inicio <= ?
                 AND fecha_fin >= ?
+                ${filtroTemporada}
               ORDER BY fecha_inicio ASC
               LIMIT 1
             `,
@@ -1524,7 +2935,8 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
               persona.edad,
               persona.edad,
               fechaString,
-              fechaString
+              fechaString,
+              ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])
             ]
           );
 
@@ -1574,7 +2986,8 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
               recurso_id,
               regimenIdSolicitud,
               adicional.adicional_id,
-              fechaString
+              fechaString,
+              temporadaTarifaIdFiltro
             );
 
             if (resultadoAdicional === null) {
@@ -1625,12 +3038,25 @@ router.post("/reserva/adicionales", verifyToken, async (req, res) => {
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
-      const { recurso_id, regimen_id, fecha_inicio, fecha_fin } = req.body;
+      const { recurso_id, regimen_id, fecha_inicio, fecha_fin, modalidad, bloque_fecha_id } = req.body;
 
       if (!recurso_id || !regimen_id || !fecha_inicio || !fecha_fin) {
         return res.status(400).json("Faltan campos requeridos");
       }
 
+      const modalidadSolicitada = normalizarModalidad(modalidad);
+      const bloqueFechaIdSolicitado = normalizarIdPositivo(bloque_fecha_id);
+      let temporadaTarifaIdFiltro = null;
+      if (modalidadSolicitada === MODALIDAD_BLOQUE && bloqueFechaIdSolicitado) {
+        const bloqueSeleccionado = await obtenerBloqueConRecursos(mysqlConnection.promise(), bloqueFechaIdSolicitado);
+        const recursoBloque = (bloqueSeleccionado.recursos || []).find((recurso) => Number(recurso.recurso_id) === Number(recurso_id));
+        if (!recursoBloque || !rangoCoincideConBloque(fecha_inicio, fecha_fin, bloqueSeleccionado)) {
+          return res.status(409).json("El bloque seleccionado no esta disponible para adicionales");
+        }
+        temporadaTarifaIdFiltro = bloqueSeleccionado.temporada_tarifa_id || null;
+      }
+
+      const filtroTemporada = temporadaTarifaIdFiltro ? "AND ta.temporada_tarifa_id = ?" : "";
       const [adicionales] = await mysqlConnection
         .promise()
         .query(
@@ -1649,9 +3075,10 @@ router.post("/reserva/adicionales", verifyToken, async (req, res) => {
               AND ta.fecha_inicio <= ?
               AND ta.fecha_fin >= ?
               AND ta.activo = 1
+              ${filtroTemporada}
             ORDER BY ta.fecha_inicio ASC
           `,
-          [recurso_id, regimen_id, fecha_fin, fecha_inicio]
+          [recurso_id, regimen_id, fecha_fin, fecha_inicio, ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])]
         );
 
         res.status(200).json(adicionales);
@@ -1772,6 +3199,893 @@ const SERVICIO_CAMPING_ID = 4;
 const RECURSO_CAMPING_ID = 1;
 const MAX_PERSONAS_CAMPING = 6;
 const ESTADO_RESERVA_CANCELADA_ID = 4;
+const ESTADO_RESERVA_INICIADA_ID = 1;
+const ESTADO_RESERVA_RECHAZADA_ID = 4;
+const MODALIDAD_FECHA_LIBRE = "FECHA_LIBRE";
+const MODALIDAD_BLOQUE = "BLOQUE";
+const MODALIDAD_SORTEO = "SORTEO";
+const ESTADOS_RECURSO_BLOQUE_RESERVABLES = new Set(["DISPONIBLE", "VENTA_DIRECTA"]);
+const ESTADOS_RECURSO_SORTEO_DISPONIBLES = new Set(["DISPONIBLE", "SORTEO"]);
+const ESTADOS_RESERVA_NO_OCUPAN = new Set([ESTADO_RESERVA_CANCELADA_ID, ESTADO_RESERVA_RECHAZADA_ID]);
+
+function crearErrorNegocio(mensaje, statusCode = 400, codigo = null) {
+  const error = new Error(mensaje);
+  error.statusCode = statusCode;
+  error.codigo = codigo;
+  return error;
+}
+
+function esErrorTemporadaAltaNoMigrada(error) {
+  return (
+    error?.code === "ER_NO_SUCH_TABLE" ||
+    error?.code === "ER_BAD_FIELD_ERROR" ||
+    error?.errno === 1146 ||
+    error?.errno === 1054
+  );
+}
+
+function formatearFechaSQL(fecha) {
+  if (!fecha) {
+    return null;
+  }
+  if (typeof fecha === "string") {
+    return fecha.slice(0, 10);
+  }
+  return new Date(fecha).toISOString().split("T")[0];
+}
+
+function fechasSonIguales(fechaA, fechaB) {
+  return formatearFechaSQL(fechaA) === formatearFechaSQL(fechaB);
+}
+
+function rangosSolapan(fechaInicioA, fechaFinA, fechaInicioB, fechaFinB) {
+  return formatearFechaSQL(fechaInicioA) < formatearFechaSQL(fechaFinB) &&
+    formatearFechaSQL(fechaFinA) > formatearFechaSQL(fechaInicioB);
+}
+
+function rangosSolapanInclusivo(fechaInicioA, fechaFinA, fechaInicioB, fechaFinB) {
+  return formatearFechaSQL(fechaInicioA) <= formatearFechaSQL(fechaFinB) &&
+    formatearFechaSQL(fechaFinA) >= formatearFechaSQL(fechaInicioB);
+}
+
+function rangoCoincideConBloque(fechaInicio, fechaFin, bloque) {
+  return fechasSonIguales(fechaInicio, bloque.fecha_inicio) && fechasSonIguales(fechaFin, bloque.fecha_fin);
+}
+
+function normalizarIdPositivo(valor) {
+  const numero = Number(valor);
+  return Number.isInteger(numero) && numero > 0 ? numero : null;
+}
+
+function normalizarModalidad(valor) {
+  const modalidad = String(valor || MODALIDAD_FECHA_LIBRE).toUpperCase();
+  if ([MODALIDAD_FECHA_LIBRE, MODALIDAD_BLOQUE, MODALIDAD_SORTEO].includes(modalidad)) {
+    return modalidad;
+  }
+  return MODALIDAD_FECHA_LIBRE;
+}
+
+function fechaSqlAIndice(fecha) {
+  const fechaSql = formatearFechaSQL(fecha);
+  if (!fechaSql || !/^\d{4}-\d{2}-\d{2}$/.test(fechaSql)) {
+    return null;
+  }
+
+  const [anio, mes, dia] = fechaSql.split("-").map(Number);
+  return Math.floor(Date.UTC(anio, mes - 1, dia) / DIA_EN_MS);
+}
+
+function extraerSegmentosTarifasConfiguracion(configuracionServicios) {
+  const segmentos = [];
+
+  if (!Array.isArray(configuracionServicios)) {
+    return segmentos;
+  }
+
+  for (const servicio of configuracionServicios) {
+    if (!servicio || !Array.isArray(servicio.regimenes)) {
+      continue;
+    }
+
+    for (const regimen of servicio.regimenes) {
+      if (!regimen || !Array.isArray(regimen.recursos)) {
+        continue;
+      }
+
+      for (const recurso of regimen.recursos) {
+        if (!recurso || !Array.isArray(recurso.fechas)) {
+          continue;
+        }
+
+        const recursoId = normalizarIdPositivo(recurso.id ?? recurso.recurso_id ?? recurso.recursoId);
+        const servicioId = normalizarIdPositivo(servicio.id ?? servicio.servicio_id ?? servicio.servicioId);
+        const regimenId = normalizarIdPositivo(regimen.id ?? regimen.regimen_id ?? regimen.regimenId);
+
+        for (let indiceFecha = 0; indiceFecha < recurso.fechas.length; indiceFecha++) {
+          const fecha = recurso.fechas[indiceFecha];
+          segmentos.push({
+            servicioId,
+            regimenId,
+            recursoId,
+            fechaInicio: formatearFechaSQL(fecha?.fecha_inicio),
+            fechaFin: formatearFechaSQL(fecha?.fecha_fin),
+            indiceFecha: indiceFecha + 1,
+          });
+        }
+      }
+    }
+  }
+
+  return segmentos;
+}
+
+function validarCoberturaTarifasBloque(configuracionServicios, {
+  fechaInicio,
+  fechaFin,
+  recursosIds,
+}) {
+  const bloqueInicio = fechaSqlAIndice(fechaInicio);
+  const bloqueFin = fechaSqlAIndice(fechaFin);
+
+  if (bloqueInicio === null || bloqueFin === null || bloqueInicio > bloqueFin) {
+    return "El bloque debe tener fechas validas";
+  }
+
+  const recursosRequeridos = new Set((recursosIds || []).map(Number));
+  const segmentos = extraerSegmentosTarifasConfiguracion(configuracionServicios);
+  const segmentosPorRecurso = new Map();
+
+  for (const segmento of segmentos) {
+    if (!segmento.recursoId || !recursosRequeridos.has(Number(segmento.recursoId))) {
+      return "Las tarifas del bloque deben corresponder solo a los recursos seleccionados";
+    }
+
+    const inicio = fechaSqlAIndice(segmento.fechaInicio);
+    const fin = fechaSqlAIndice(segmento.fechaFin);
+
+    if (inicio === null || fin === null || fin < inicio) {
+      return `El recurso ${segmento.recursoId} tiene un rango de tarifa invalido`;
+    }
+
+    if (inicio < bloqueInicio || fin > bloqueFin) {
+      return `El recurso ${segmento.recursoId} tiene tarifas fuera del rango del bloque`;
+    }
+
+    if (!segmentosPorRecurso.has(Number(segmento.recursoId))) {
+      segmentosPorRecurso.set(Number(segmento.recursoId), []);
+    }
+
+    segmentosPorRecurso.get(Number(segmento.recursoId)).push({
+      ...segmento,
+      inicio,
+      fin,
+    });
+  }
+
+  for (const recursoId of recursosRequeridos) {
+    const rangos = segmentosPorRecurso.get(Number(recursoId)) || [];
+    if (rangos.length === 0) {
+      return `Debe cargar tarifas para el recurso ${recursoId}`;
+    }
+
+    rangos.sort((a, b) => a.inicio - b.inicio);
+
+    let cursor = bloqueInicio;
+    let finAnterior = null;
+
+    for (const rango of rangos) {
+      if (finAnterior !== null && rango.inicio <= finAnterior) {
+        return `El recurso ${recursoId} tiene rangos de tarifa solapados dentro del bloque`;
+      }
+
+      if (rango.inicio > cursor) {
+        return `El recurso ${recursoId} no tiene tarifas para todo el rango del bloque`;
+      }
+
+      cursor = Math.max(cursor, rango.fin + 1);
+      finAnterior = rango.fin;
+    }
+
+    if (cursor <= bloqueFin) {
+      return `El recurso ${recursoId} no tiene tarifas para todo el rango del bloque`;
+    }
+  }
+
+  return null;
+}
+
+async function validarSolapamientoTarifasExistentes(connection, {
+  configuracionServicios,
+  excludeTemporadaTarifaId = null,
+  origenes = [],
+}) {
+  const segmentos = extraerSegmentosTarifasConfiguracion(configuracionServicios)
+    .filter((segmento) => segmento.recursoId && segmento.fechaInicio && segmento.fechaFin);
+
+  if (segmentos.length === 0) {
+    return;
+  }
+
+  const recursoIds = Array.from(new Set(segmentos.map((segmento) => Number(segmento.recursoId))));
+  const minFechaInicio = segmentos.reduce((min, segmento) =>
+    !min || segmento.fechaInicio < min ? segmento.fechaInicio : min,
+  null);
+  const maxFechaFin = segmentos.reduce((max, segmento) =>
+    !max || segmento.fechaFin > max ? segmento.fechaFin : max,
+  null);
+
+  const placeholdersRecursos = recursoIds.map(() => "?").join(",");
+  const params = [...recursoIds, maxFechaFin, minFechaInicio];
+  let filtroExclude = "";
+  let filtroOrigen = "";
+
+  if (excludeTemporadaTarifaId) {
+    filtroExclude = "AND t.temporada_tarifa_id <> ?";
+    params.push(excludeTemporadaTarifaId);
+  }
+
+  if (Array.isArray(origenes) && origenes.length > 0) {
+    filtroOrigen = `AND COALESCE(tt.origen, 'GENERAL') IN (${origenes.map(() => "?").join(",")})`;
+    params.push(...origenes);
+  }
+
+  const [tarifasExistentes] = await connection.query(
+    `
+      SELECT
+        t.recurso_id,
+        DATE_FORMAT(t.fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
+        DATE_FORMAT(t.fecha_fin, '%Y-%m-%d') AS fecha_fin,
+        tt.id AS temporada_tarifa_id,
+        tt.nombre AS temporada_nombre,
+        COALESCE(tt.origen, 'GENERAL') AS origen,
+        r.nombre AS recurso_nombre
+      FROM tarifa t
+      INNER JOIN temporada_tarifa tt ON tt.id = t.temporada_tarifa_id
+      INNER JOIN recurso r ON r.id = t.recurso_id
+      WHERE t.recurso_id IN (${placeholdersRecursos})
+        AND t.fecha_inicio <= ?
+        AND t.fecha_fin >= ?
+        ${filtroExclude}
+        ${filtroOrigen}
+    `,
+    params
+  );
+
+  for (const existente of tarifasExistentes) {
+    const segmentoSolapado = segmentos.find((segmento) =>
+      Number(segmento.recursoId) === Number(existente.recurso_id) &&
+      rangosSolapanInclusivo(segmento.fechaInicio, segmento.fechaFin, existente.fecha_inicio, existente.fecha_fin)
+    );
+
+    if (!segmentoSolapado) {
+      continue;
+    }
+
+    const tipoTemporada = existente.origen === "BLOQUE" ? "temporada alta" : "temporada baja";
+    throw crearErrorNegocio(
+      `El recurso "${existente.recurso_nombre}" ya tiene precios cargados para esas fechas en ${tipoTemporada} (${existente.temporada_nombre}).`,
+      409,
+      "TARIFA_RECURSO_SOLAPADA"
+    );
+  }
+}
+
+async function ejecutarMantenimientoBloquesAlta(connection) {
+  try {
+    await connection.query(
+      `
+        UPDATE bloque_fecha_recurso bfr
+        INNER JOIN bloque_fecha bf ON bf.id = bfr.bloque_fecha_id
+        SET bfr.estado = 'LIBERADO', bfr.reserva_id = NULL
+        WHERE bf.estado = 'ACTIVO'
+          AND bf.fecha_inicio <= CURDATE()
+          AND bfr.estado IN ('DISPONIBLE', 'SORTEO', 'VENTA_DIRECTA')
+          AND NOT EXISTS (
+            SELECT 1
+            FROM reserva r
+            WHERE r.bloque_fecha_id = bf.id
+              AND r.recurso_id = bfr.recurso_id
+              AND COALESCE(r.estado_reserva_id, ?) <> ?
+          )
+      `,
+      [ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+    );
+
+    await connection.query(
+      `
+        UPDATE bloque_fecha bf
+        SET bf.estado = 'LIBERADO'
+        WHERE bf.estado = 'ACTIVO'
+          AND bf.fecha_inicio <= CURDATE()
+          AND NOT EXISTS (
+            SELECT 1
+            FROM bloque_fecha_recurso bfr
+            WHERE bfr.bloque_fecha_id = bf.id
+              AND bfr.estado IN ('DISPONIBLE', 'SORTEO', 'VENTA_DIRECTA')
+          )
+      `
+    );
+  } catch (error) {
+    if (!esErrorTemporadaAltaNoMigrada(error)) {
+      console.error("Error ejecutando mantenimiento de bloques:", error);
+    }
+  }
+}
+
+async function obtenerEstadoReservaId(connection, nombre, fallbackId = ESTADO_RESERVA_INICIADA_ID) {
+  const [rows] = await connection.query(
+    "SELECT id FROM estado_reserva WHERE nombre = ? LIMIT 1",
+    [nombre]
+  );
+
+  return rows.length > 0 ? Number(rows[0].id) : fallbackId;
+}
+
+function normalizarPersonasParaCotizacion(personas, regimenId) {
+  if (!Array.isArray(personas) || personas.length === 0) {
+    throw crearErrorNegocio("Debe indicar al menos una persona", 400);
+  }
+
+  return personas.map((persona) => ({
+    ...persona,
+    tipo_persona_id: normalizarIdPositivo(persona.tipo_persona_id ?? persona.tipo),
+    regimen_id: normalizarIdPositivo(persona.regimen_id ?? regimenId),
+    edad: Number(persona.edad)
+  }));
+}
+
+async function calcularTarifaBaseReserva(connection, { recursoId, regimenId, personas, fechaInicio, fechaFin, temporadaTarifaId = null }) {
+  const fechaInicioDate = new Date(fechaInicio);
+  const fechaFinDate = new Date(fechaFin);
+  const diasTotales = Math.ceil((fechaFinDate - fechaInicioDate) / DIA_EN_MS);
+
+  if (!Number.isFinite(diasTotales) || diasTotales <= 0) {
+    throw crearErrorNegocio("El rango de fechas no es valido", 400);
+  }
+
+  const personasNormalizadas = normalizarPersonasParaCotizacion(personas, regimenId);
+  let total = 0;
+  let totalOriginal = 0;
+  const personasResultado = [];
+
+  for (const persona of personasNormalizadas) {
+    if (!persona.tipo_persona_id || !persona.regimen_id || !Number.isFinite(persona.edad)) {
+      throw crearErrorNegocio("Los datos de las personas no son validos", 400);
+    }
+
+    const filtroTemporada = temporadaTarifaId ? "AND temporada_tarifa_id = ?" : "";
+    const [tarifasPersona] = await connection.query(
+      `
+        SELECT id, precio, fecha_inicio, fecha_fin, usa_porcentaje, porcentaje_descuento
+        FROM tarifa
+        WHERE recurso_id = ?
+          AND tipo_persona_id = ?
+          AND regimen_id = ?
+          AND (edad_minima IS NULL OR edad_minima <= ?)
+          AND (edad_maxima IS NULL OR edad_maxima >= ?)
+          AND fecha_inicio <= ?
+          AND fecha_fin >= ?
+          ${filtroTemporada}
+        ORDER BY fecha_inicio ASC
+      `,
+      [
+        recursoId,
+        persona.tipo_persona_id,
+        persona.regimen_id,
+        persona.edad,
+        persona.edad,
+        fechaFin,
+        fechaInicio,
+        ...(temporadaTarifaId ? [temporadaTarifaId] : [])
+      ]
+    );
+
+    if (tarifasPersona.length === 0) {
+      throw crearErrorNegocio("No hay tarifas para todas las personas del bloque", 409, "TARIFA_INCOMPLETA");
+    }
+
+    const diasCubiertos = new Array(diasTotales).fill(false);
+    const tarifasPorFecha = [];
+    let totalPersona = 0;
+    let totalOriginalPersona = 0;
+
+    for (const tarifa of tarifasPersona) {
+      const fechaInicioTarifa = new Date(tarifa.fecha_inicio);
+      const fechaFinTarifa = new Date(tarifa.fecha_fin);
+      const inicioInterseccion = new Date(Math.max(fechaInicioDate.getTime(), fechaInicioTarifa.getTime()));
+      const finInterseccion = new Date(Math.min(fechaFinDate.getTime(), fechaFinTarifa.getTime()));
+
+      if (inicioInterseccion >= finInterseccion) {
+        continue;
+      }
+
+      const diasInterseccion = Math.ceil((finInterseccion - inicioInterseccion) / DIA_EN_MS);
+      const diaInicioRelativo = Math.floor((inicioInterseccion - fechaInicioDate) / DIA_EN_MS);
+      let precioOriginal = Number(tarifa.precio);
+      const usaPorcentaje = tarifa.usa_porcentaje === 1 || tarifa.usa_porcentaje === true || tarifa.usa_porcentaje === "1";
+      const porcentajeDescuento = tarifa.porcentaje_descuento !== null && tarifa.porcentaje_descuento !== undefined
+        ? Number(tarifa.porcentaje_descuento)
+        : 0;
+
+      if (usaPorcentaje && porcentajeDescuento > 0) {
+        const factor = 1 - porcentajeDescuento / 100;
+        if (factor > 0) {
+          precioOriginal = Number(tarifa.precio) / factor;
+        }
+      }
+
+      for (let i = 0; i < diasInterseccion; i++) {
+        const diaIndex = diaInicioRelativo + i;
+        if (diaIndex < 0 || diaIndex >= diasTotales || diasCubiertos[diaIndex]) {
+          continue;
+        }
+
+        const fechaActual = new Date(fechaInicioDate);
+        fechaActual.setDate(fechaInicioDate.getDate() + diaIndex);
+        const fechaString = fechaActual.toISOString().split("T")[0];
+
+        diasCubiertos[diaIndex] = true;
+        const precio = Number(tarifa.precio);
+        totalPersona += precio;
+        totalOriginalPersona += precioOriginal;
+        tarifasPorFecha.push({
+          fecha: fechaString,
+          precio,
+          precio_original: precioOriginal,
+          tarifa_id: tarifa.id,
+          usa_porcentaje: usaPorcentaje,
+          porcentaje_descuento: porcentajeDescuento
+        });
+      }
+    }
+
+    if (!diasCubiertos.every(Boolean)) {
+      throw crearErrorNegocio("No hay tarifas para todas las noches del bloque", 409, "TARIFA_INCOMPLETA");
+    }
+
+    total += totalPersona;
+    totalOriginal += totalOriginalPersona;
+    personasResultado.push({
+      ...persona,
+      tarifa_individual: totalPersona,
+      tarifa_original_individual: totalOriginalPersona,
+      tarifas_por_fecha: tarifasPorFecha.sort((a, b) => a.fecha.localeCompare(b.fecha))
+    });
+  }
+
+  return {
+    total,
+    total_original: totalOriginal,
+    personas: personasResultado
+  };
+}
+
+async function insertarTarifasFamiliaresReserva(connection, reservasFamiliaresIds, recursoId, regimenId, fechaInicio, fechaFin, temporadaTarifaId = null) {
+  const fechaInicioDate = new Date(fechaInicio);
+  const fechaFinDate = new Date(fechaFin);
+  const diasTotales = Math.ceil((fechaFinDate - fechaInicioDate) / DIA_EN_MS);
+
+  for (const reservaFamiliar of reservasFamiliaresIds) {
+    for (let dia = 0; dia < diasTotales; dia++) {
+      const fechaActual = new Date(fechaInicioDate);
+      fechaActual.setDate(fechaInicioDate.getDate() + dia);
+      const fechaString = fechaActual.toISOString().split("T")[0];
+
+      const filtroTemporada = temporadaTarifaId ? "AND temporada_tarifa_id = ?" : "";
+      const [tarifas] = await connection.query(
+        `SELECT id
+         FROM tarifa
+         WHERE recurso_id = ?
+           AND tipo_persona_id = ?
+           AND regimen_id = ?
+           AND (edad_minima IS NULL OR edad_minima <= ?)
+           AND (edad_maxima IS NULL OR edad_maxima >= ?)
+           AND fecha_inicio <= ?
+           AND fecha_fin >= ?
+           ${filtroTemporada}
+         ORDER BY fecha_inicio ASC
+         LIMIT 1`,
+        [
+          recursoId,
+          reservaFamiliar.tipo_persona_id,
+          regimenId,
+          reservaFamiliar.edad,
+          reservaFamiliar.edad,
+          fechaString,
+          fechaString,
+          ...(temporadaTarifaId ? [temporadaTarifaId] : [])
+        ]
+      );
+
+      if (tarifas.length > 0) {
+        await connection.query(
+          `INSERT INTO reserva_familiar_tarifa
+            (reserva_familiar_id, tarifa_id, fecha)
+           VALUES (?, ?, ?)`,
+          [reservaFamiliar.reserva_familiar_id, tarifas[0].id, fechaString]
+        );
+      }
+    }
+  }
+}
+
+async function obtenerDatosFamiliaUsuario(connection, usuarioId) {
+  const [usuarioCreador] = await connection.query(
+    "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
+    [usuarioId]
+  );
+
+  let usuarioFamiliarPrincipalId = usuarioId;
+  let departamentalId = usuarioCreador[0]?.departamental_id || null;
+
+  if (usuarioCreador.length > 0) {
+    let currentUserId = usuarioCreador[0].id;
+    let currentUserFamiliarId = usuarioCreador[0].usuario_familiar_id;
+    let currentDepartamentalId = usuarioCreador[0].departamental_id;
+
+    while (currentUserFamiliarId !== null) {
+      const [nextUser] = await connection.query(
+        "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
+        [currentUserFamiliarId]
+      );
+
+      if (nextUser.length === 0) {
+        break;
+      }
+
+      currentUserId = nextUser[0].id;
+      currentUserFamiliarId = nextUser[0].usuario_familiar_id;
+      currentDepartamentalId = nextUser[0].departamental_id;
+    }
+
+    usuarioFamiliarPrincipalId = currentUserId;
+    departamentalId = currentDepartamentalId;
+  }
+
+  return { usuarioFamiliarPrincipalId, departamentalId };
+}
+
+async function obtenerOCrearUsuariosPersonasReserva(connection, personas, cabecera, req) {
+  const { usuarioFamiliarPrincipalId, departamentalId } = await obtenerDatosFamiliaUsuario(connection, cabecera.id);
+  const usuariosIds = [];
+
+  for (const persona of personas) {
+    const documento = persona.dni ?? persona.documento;
+    const [existeUsuario] = await connection.query(
+      "SELECT id FROM usuario WHERE documento = ?",
+      [documento]
+    );
+
+    let usuarioId;
+    if (existeUsuario.length > 0) {
+      usuarioId = existeUsuario[0].id;
+    } else {
+      const rolId = Number(persona.tipo_persona_id) === 1 ? 2 : 4;
+      const [nuevoUsuario] = await connection.query(
+        `INSERT INTO usuario (
+          rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento,
+          documento, telefono, email, password, usuario_familiar_id, departamental_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+        [
+          rolId,
+          persona.parentesco_id,
+          persona.tipo_persona_id,
+          persona.nombre,
+          persona.apellido,
+          persona.fecha_nacimiento,
+          documento,
+          persona.telefono || null,
+          persona.email || null,
+          usuarioFamiliarPrincipalId,
+          departamentalId
+        ]
+      );
+      usuarioId = nuevoUsuario.insertId;
+
+      await registrarHistorial(
+        connection,
+        usuarioId,
+        "CREATE",
+        "usuario",
+        cabecera.id,
+        req,
+        null,
+        `Usuario creado durante inscripcion/reserva. Datos: ${persona.nombre} ${persona.apellido}, DNI: ${documento}`
+      );
+    }
+
+    usuariosIds.push({
+      ...persona,
+      dni: documento,
+      usuario_id: usuarioId
+    });
+  }
+
+  return usuariosIds;
+}
+
+async function obtenerBloqueConRecursos(connection, bloqueFechaId, { forUpdate = false } = {}) {
+  const lock = forUpdate ? " FOR UPDATE" : "";
+  const [bloqueRows] = await connection.query(
+    `
+      SELECT
+        bf.id,
+        bf.sorteo_id,
+        bf.servicio_id,
+        bf.temporada_tarifa_id,
+        bf.nombre,
+        bf.modalidad,
+        bf.fecha_inicio,
+        bf.fecha_fin,
+        bf.estado,
+        s.nombre AS sorteo_nombre,
+        s.estado AS sorteo_estado,
+        s.fecha_inicio_inscripcion,
+        s.fecha_fin_inscripcion
+      FROM bloque_fecha bf
+      LEFT JOIN sorteo s ON s.id = bf.sorteo_id
+      WHERE bf.id = ?
+      ${lock}
+    `,
+    [bloqueFechaId]
+  );
+
+  if (bloqueRows.length === 0) {
+    throw crearErrorNegocio("Bloque no encontrado", 404);
+  }
+
+  const bloque = bloqueRows[0];
+  const [recursos] = await connection.query(
+    `
+      SELECT bfr.id, bfr.recurso_id, bfr.estado, bfr.reserva_id, r.nombre AS recurso_nombre
+      FROM bloque_fecha_recurso bfr
+      INNER JOIN recurso r ON r.id = bfr.recurso_id
+      WHERE bfr.bloque_fecha_id = ?
+      ORDER BY r.nombre ASC
+      ${lock}
+    `,
+    [bloqueFechaId]
+  );
+
+  bloque.recursos = recursos;
+  return bloque;
+}
+
+function validarBloqueInscripcionAbierta(bloque) {
+  if (bloque.estado !== "ACTIVO") {
+    throw crearErrorNegocio("El bloque no esta activo", 409);
+  }
+  if (bloque.modalidad !== MODALIDAD_SORTEO) {
+    throw crearErrorNegocio("El bloque indicado no corresponde a un sorteo", 400);
+  }
+  if (bloque.sorteo_estado !== "ACTIVO") {
+    throw crearErrorNegocio("El sorteo no esta activo", 409);
+  }
+
+  const hoy = new Date();
+  hoy.setHours(0, 0, 0, 0);
+  const inicio = new Date(bloque.fecha_inicio_inscripcion);
+  const fin = new Date(bloque.fecha_fin_inscripcion);
+  inicio.setHours(0, 0, 0, 0);
+  fin.setHours(0, 0, 0, 0);
+
+  if (hoy < inicio || hoy > fin) {
+    throw crearErrorNegocio("El periodo de inscripcion al sorteo no esta vigente", 409);
+  }
+}
+
+async function cotizarBloqueComun(connection, { bloque, regimenId, personas, adicionales = [] }) {
+  const recursosElegibles = (bloque.recursos || []).filter((recurso) => {
+    if (bloque.modalidad === MODALIDAD_SORTEO) {
+      return ESTADOS_RECURSO_SORTEO_DISPONIBLES.has(recurso.estado);
+    }
+    return ESTADOS_RECURSO_BLOQUE_RESERVABLES.has(recurso.estado);
+  });
+
+  if (recursosElegibles.length === 0) {
+    throw crearErrorNegocio("No hay recursos disponibles para este bloque", 409);
+  }
+
+  const cotizaciones = [];
+  for (const recurso of recursosElegibles) {
+    const tarifaBase = await calcularTarifaBaseReserva(connection, {
+      recursoId: recurso.recurso_id,
+      regimenId,
+      personas,
+      fechaInicio: formatearFechaSQL(bloque.fecha_inicio),
+      fechaFin: formatearFechaSQL(bloque.fecha_fin),
+      temporadaTarifaId: bloque.temporada_tarifa_id || null
+    });
+
+    const adicionalesProcesados = await calcularAdicionalesReserva(
+      connection,
+      adicionales,
+      recurso.recurso_id,
+      regimenId,
+      formatearFechaSQL(bloque.fecha_inicio),
+      formatearFechaSQL(bloque.fecha_fin),
+      personas,
+      bloque.temporada_tarifa_id || null
+    );
+
+    cotizaciones.push({
+      recurso,
+      tarifaBase,
+      adicionalesProcesados,
+      total: tarifaBase.total + adicionalesProcesados.total
+    });
+  }
+
+  const totalReferencia = Math.round(cotizaciones[0].total * 100);
+  const recursoConDiferencia = cotizaciones.find((cotizacion) => Math.round(cotizacion.total * 100) !== totalReferencia);
+
+  if (recursoConDiferencia) {
+    throw crearErrorNegocio(
+      "Los recursos del sorteo/bloque no tienen una tarifa comun para las personas indicadas",
+      409,
+      "TARIFA_COMUN_REQUERIDA"
+    );
+  }
+
+  const referencia = cotizaciones[0];
+  return {
+    bloque_fecha_id: bloque.id,
+    sorteo_id: bloque.sorteo_id,
+    servicio_id: bloque.servicio_id,
+    temporada_tarifa_id: bloque.temporada_tarifa_id || null,
+    modalidad: bloque.modalidad,
+    nombre_bloque: bloque.nombre,
+    fecha_inicio: formatearFechaSQL(bloque.fecha_inicio),
+    fecha_fin: formatearFechaSQL(bloque.fecha_fin),
+    recurso_referencia_id: referencia.recurso.recurso_id,
+    total_tarifa: referencia.tarifaBase.total,
+    total_tarifa_original: referencia.tarifaBase.total_original,
+    monto_adicionales: referencia.adicionalesProcesados.total,
+    precio_total: referencia.total,
+    personas: referencia.tarifaBase.personas,
+    adicionales: referencia.adicionalesProcesados.items,
+    recursos_disponibles: cotizaciones.map((cotizacion) => ({
+      id: cotizacion.recurso.recurso_id,
+      nombre: cotizacion.recurso.recurso_nombre,
+      estado: cotizacion.recurso.estado
+    }))
+  };
+}
+
+async function obtenerBloquesActivosParaRecursos(connection, { recursoIds, fechaInicio, fechaFin }) {
+  if (!Array.isArray(recursoIds) || recursoIds.length === 0) {
+    return new Map();
+  }
+
+  try {
+    await ejecutarMantenimientoBloquesAlta(connection);
+    const placeholders = recursoIds.map(() => "?").join(",");
+    const [rows] = await connection.query(
+      `
+        SELECT
+          bfr.recurso_id,
+          bfr.estado AS estado_recurso_bloque,
+          bf.id AS bloque_fecha_id,
+          bf.sorteo_id,
+          bf.servicio_id,
+          bf.nombre AS bloque_nombre,
+          bf.modalidad,
+          bf.fecha_inicio,
+          bf.fecha_fin,
+          bf.estado AS estado_bloque,
+          s.nombre AS sorteo_nombre,
+          s.estado AS sorteo_estado
+        FROM bloque_fecha_recurso bfr
+        INNER JOIN bloque_fecha bf ON bf.id = bfr.bloque_fecha_id
+        LEFT JOIN sorteo s ON s.id = bf.sorteo_id
+        WHERE bfr.recurso_id IN (${placeholders})
+          AND bf.estado = 'ACTIVO'
+          AND bfr.estado IN ('DISPONIBLE', 'SORTEO', 'VENTA_DIRECTA')
+          AND bf.fecha_inicio < ?
+          AND bf.fecha_fin > ?
+        ORDER BY bf.fecha_inicio ASC, bf.id ASC
+      `,
+      [...recursoIds, fechaFin, fechaInicio]
+    );
+
+    const mapa = new Map();
+    rows.forEach((row) => {
+      const recursoId = Number(row.recurso_id);
+      if (!mapa.has(recursoId)) {
+        mapa.set(recursoId, []);
+      }
+      mapa.get(recursoId).push(row);
+    });
+    return mapa;
+  } catch (error) {
+    if (esErrorTemporadaAltaNoMigrada(error)) {
+      return new Map();
+    }
+    throw error;
+  }
+}
+
+async function obtenerBloquesDisponiblesPorServicio(connection, { servicioIds = [], servicioId = null, fechaInicio, fechaFin }) {
+  const ids = Number.isInteger(servicioId) && servicioId > 0
+    ? [servicioId]
+    : (Array.isArray(servicioIds) ? servicioIds.map(Number).filter((id) => Number.isInteger(id) && id > 0) : []);
+
+  if (ids.length === 0 || !fechaInicio || !fechaFin) {
+    return new Map();
+  }
+
+  try {
+    await ejecutarMantenimientoBloquesAlta(connection);
+    const placeholders = ids.map(() => "?").join(",");
+    const [rows] = await connection.query(
+      `
+        SELECT
+          bf.id,
+          bf.servicio_id,
+          bf.sorteo_id,
+          bf.nombre,
+          CASE
+            WHEN bf.modalidad = 'SORTEO' AND bfr.estado = 'VENTA_DIRECTA' THEN 'BLOQUE'
+            ELSE bf.modalidad
+          END AS modalidad_visible,
+          bf.modalidad AS modalidad_origen,
+          bf.fecha_inicio,
+          bf.fecha_fin,
+          s.nombre AS sorteo_nombre,
+          s.estado AS sorteo_estado,
+          COUNT(bfr.id) AS recursos_disponibles
+        FROM bloque_fecha bf
+        INNER JOIN bloque_fecha_recurso bfr ON bfr.bloque_fecha_id = bf.id
+        LEFT JOIN sorteo s ON s.id = bf.sorteo_id
+        WHERE bf.servicio_id IN (${placeholders})
+          AND bf.estado = 'ACTIVO'
+          AND bfr.estado IN ('DISPONIBLE','SORTEO','VENTA_DIRECTA')
+          AND bf.fecha_inicio < ?
+          AND bf.fecha_fin > ?
+          AND (
+            bf.modalidad = 'BLOQUE'
+            OR bfr.estado = 'VENTA_DIRECTA'
+            OR (
+              bf.modalidad = 'SORTEO'
+              AND s.estado = 'ACTIVO'
+              AND CURDATE() BETWEEN s.fecha_inicio_inscripcion AND s.fecha_fin_inscripcion
+            )
+          )
+        GROUP BY bf.id, modalidad_visible, s.id
+        HAVING recursos_disponibles > 0
+        ORDER BY bf.fecha_inicio ASC, bf.id ASC
+      `,
+      [...ids, fechaFin, fechaInicio]
+    );
+
+    const mapa = new Map();
+    rows.forEach((row) => {
+      const servicioIdRow = Number(row.servicio_id);
+      if (!mapa.has(servicioIdRow)) {
+        mapa.set(servicioIdRow, []);
+      }
+      mapa.get(servicioIdRow).push({
+        id: Number(row.id),
+        nombre: row.nombre,
+        modalidad: row.modalidad_visible,
+        modalidad_origen: row.modalidad_origen,
+        sorteo_id: row.sorteo_id ? Number(row.sorteo_id) : null,
+        sorteo_nombre: row.sorteo_nombre || null,
+        sorteo_estado: row.sorteo_estado || null,
+        servicio_id: servicioIdRow,
+        fecha_inicio: formatearFechaSQL(row.fecha_inicio),
+        fecha_fin: formatearFechaSQL(row.fecha_fin),
+        recursos_disponibles: Number(row.recursos_disponibles || 0)
+      });
+    });
+    return mapa;
+  } catch (error) {
+    if (esErrorTemporadaAltaNoMigrada(error)) {
+      return new Map();
+    }
+    throw error;
+  }
+}
 
 function esServicioCamping(servicioId) {
   return Number(servicioId) === SERVICIO_CAMPING_ID;
@@ -1968,12 +4282,13 @@ async function validarNumeroParcelaCampingExistente(connection, { reservaId, rec
   }
 }
 
-async function obtenerPrecioAdicional(db, cache, recursoId, regimenId, adicionalId, fecha) {
-  const cacheKey = `${recursoId}-${regimenId}-${adicionalId}-${fecha}`;
+async function obtenerPrecioAdicional(db, cache, recursoId, regimenId, adicionalId, fecha, temporadaTarifaId = null) {
+  const cacheKey = `${recursoId}-${regimenId}-${adicionalId}-${fecha}-${temporadaTarifaId || "any"}`;
   if (cache.has(cacheKey)) {
     return cache.get(cacheKey);
   }
 
+  const filtroTemporada = temporadaTarifaId ? "AND temporada_tarifa_id = ?" : "";
   const [rows] = await db.query(
     `
       SELECT id as tarifa_adicional_id, precio
@@ -1984,10 +4299,11 @@ async function obtenerPrecioAdicional(db, cache, recursoId, regimenId, adicional
         AND fecha_inicio <= ?
         AND fecha_fin >= ?
         AND activo = 1
+        ${filtroTemporada}
       ORDER BY fecha_inicio DESC
       LIMIT 1
     `,
-    [recursoId, regimenId, adicionalId, fecha, fecha]
+    [recursoId, regimenId, adicionalId, fecha, fecha, ...(temporadaTarifaId ? [temporadaTarifaId] : [])]
   );
 
   const resultado = rows.length > 0 ? { 
@@ -2014,13 +4330,14 @@ async function obtenerNombreAdicional(connection, cache, adicionalId) {
   return nombre;
 }
 
-async function obtenerMejorDescuentoDia(connection, recursoId, regimenId, personas, fecha) {
+async function obtenerMejorDescuentoDia(connection, recursoId, regimenId, personas, fecha, temporadaTarifaId = null) {
   let maxDescuento = 0;
   let tarifaIdMax = null;
 
   for (const persona of personas) {
     if (!persona.tipo_persona_id || persona.edad === undefined) continue;
 
+    const filtroTemporada = temporadaTarifaId ? "AND temporada_tarifa_id = ?" : "";
     const [rows] = await connection.query(
       `SELECT id, usa_porcentaje, porcentaje_descuento
        FROM tarifa 
@@ -2031,9 +4348,19 @@ async function obtenerMejorDescuentoDia(connection, recursoId, regimenId, person
          AND (edad_maxima IS NULL OR edad_maxima >= ?)
          AND fecha_inicio <= ?
          AND fecha_fin >= ?
+         ${filtroTemporada}
        ORDER BY fecha_inicio ASC
        LIMIT 1`,
-      [recursoId, persona.tipo_persona_id, regimenId, persona.edad, persona.edad, fecha, fecha]
+      [
+        recursoId,
+        persona.tipo_persona_id,
+        regimenId,
+        persona.edad,
+        persona.edad,
+        fecha,
+        fecha,
+        ...(temporadaTarifaId ? [temporadaTarifaId] : [])
+      ]
     );
 
     if (rows.length > 0) {
@@ -2048,7 +4375,7 @@ async function obtenerMejorDescuentoDia(connection, recursoId, regimenId, person
   return { porcentaje_descuento: maxDescuento, tarifa_id: tarifaIdMax };
 }
 
-async function calcularAdicionalesReserva(connection, adicionales, recursoId, regimenId, fechaInicio, fechaFin, personas) {
+async function calcularAdicionalesReserva(connection, adicionales, recursoId, regimenId, fechaInicio, fechaFin, personas, temporadaTarifaId = null) {
   if (!Array.isArray(adicionales) || adicionales.length === 0) {
     return { total: 0, items: [] };
   }
@@ -2074,7 +4401,7 @@ async function calcularAdicionalesReserva(connection, adicionales, recursoId, re
       fechaActual.setDate(fechaInicioDate.getDate() + dia);
       const fechaString = fechaActual.toISOString().split('T')[0];
       
-      const descuento = await obtenerMejorDescuentoDia(connection, recursoId, regimenId, personas, fechaString);
+      const descuento = await obtenerMejorDescuentoDia(connection, recursoId, regimenId, personas, fechaString, temporadaTarifaId);
       descuentosPorDia.set(fechaString, descuento);
     }
   }
@@ -2100,7 +4427,7 @@ async function calcularAdicionalesReserva(connection, adicionales, recursoId, re
       fechaActual.setDate(fechaInicioDate.getDate() + dia);
       const fechaString = fechaActual.toISOString().split('T')[0];
 
-      const resultadoAdicional = await obtenerPrecioAdicional(connection, cachePrecios, recursoId, regimenId, adicionalId, fechaString);
+      const resultadoAdicional = await obtenerPrecioAdicional(connection, cachePrecios, recursoId, regimenId, adicionalId, fechaString, temporadaTarifaId);
 
       if (resultadoAdicional === null) {
         throw new Error(`No hay una tarifa de adicional vigente para la fecha ${fechaString}`);
@@ -2254,7 +4581,9 @@ router.post("/reserva", verifyToken, async (req, res) => {
         bebes,
         total_tarifa,
         firma,
-        adicionales
+        adicionales,
+        modalidad,
+        bloque_fecha_id
       } = req.body;
 
       // Validar campos requeridos
@@ -2274,11 +4603,75 @@ router.post("/reserva", verifyToken, async (req, res) => {
         return res.status(422).json(errorReglasCamping);
       }
 
+      const modalidadSolicitada = normalizarModalidad(modalidad);
+      const bloqueFechaIdSolicitado = normalizarIdPositivo(bloque_fecha_id);
+      let modalidadReserva = MODALIDAD_FECHA_LIBRE;
+      let bloqueFechaIdReserva = null;
+
       let connection;
       try {
         // Iniciar transacción
         connection = await mysqlConnection.promise().getConnection();
         await connection.beginTransaction();
+
+        try {
+          const bloquesPorRecurso = await obtenerBloquesActivosParaRecursos(connection, {
+            recursoIds: [Number(recurso_id)],
+            fechaInicio: fecha_inicio,
+            fechaFin: fecha_fin
+          });
+          const bloquesActivos = bloquesPorRecurso.get(Number(recurso_id)) || [];
+          const bloqueExacto = bloquesActivos.find((bloque) => rangoCoincideConBloque(fecha_inicio, fecha_fin, bloque));
+          const bloqueAplicable = bloqueExacto || bloquesActivos[0] || null;
+
+          if (bloqueAplicable) {
+            const ventaDirectaDesdeSorteo = bloqueAplicable.modalidad === MODALIDAD_SORTEO && bloqueAplicable.estado_recurso_bloque === "VENTA_DIRECTA";
+            const modalidadBloque = ventaDirectaDesdeSorteo ? MODALIDAD_BLOQUE : bloqueAplicable.modalidad;
+
+            if (modalidadBloque === MODALIDAD_SORTEO) {
+              await connection.rollback();
+              return res.status(409).json({
+                message: "Las fechas seleccionadas corresponden a un sorteo. Debe realizar la inscripcion al sorteo.",
+                codigo: "FECHAS_CON_SORTEO",
+                sorteo_id: bloqueAplicable.sorteo_id,
+                bloque_fecha_id: bloqueAplicable.bloque_fecha_id
+              });
+            }
+
+            if (modalidadBloque === MODALIDAD_BLOQUE) {
+              if (!bloqueExacto) {
+                await connection.rollback();
+                return res.status(409).json({
+                  message: "El recurso pertenece a un bloque de fechas y debe reservarse completo.",
+                  codigo: "BLOQUE_COMPLETO_REQUERIDO",
+                  bloque_fecha: {
+                    id: bloqueAplicable.bloque_fecha_id,
+                    nombre: bloqueAplicable.bloque_nombre,
+                    fecha_inicio: formatearFechaSQL(bloqueAplicable.fecha_inicio),
+                    fecha_fin: formatearFechaSQL(bloqueAplicable.fecha_fin)
+                  }
+                });
+              }
+
+              modalidadReserva = MODALIDAD_BLOQUE;
+              bloqueFechaIdReserva = Number(bloqueExacto.bloque_fecha_id);
+            }
+          } else if (modalidadSolicitada === MODALIDAD_BLOQUE && bloqueFechaIdSolicitado) {
+            const bloque = await obtenerBloqueConRecursos(connection, bloqueFechaIdSolicitado, { forUpdate: true });
+            const recursoBloque = bloque.recursos.find((recurso) => Number(recurso.recurso_id) === Number(recurso_id));
+            if (!recursoBloque || !ESTADOS_RECURSO_BLOQUE_RESERVABLES.has(recursoBloque.estado) || !rangoCoincideConBloque(fecha_inicio, fecha_fin, bloque)) {
+              await connection.rollback();
+              return res.status(409).json("El bloque seleccionado no esta disponible para ese recurso y fechas");
+            }
+            modalidadReserva = MODALIDAD_BLOQUE;
+            bloqueFechaIdReserva = bloque.id;
+          }
+        } catch (bloqueError) {
+          if (!esErrorTemporadaAltaNoMigrada(bloqueError)) {
+            await connection.rollback();
+            throw bloqueError;
+          }
+        }
 
         // Procesar firma si existe
         let firmaArchivo = null;
@@ -2408,10 +4801,15 @@ router.post("/reserva", verifyToken, async (req, res) => {
 
         const [reservaResult] = await connection.query(
           `INSERT INTO reserva (
+            estado_reserva_id, modalidad, sorteo_id, bloque_fecha_id, servicio_id,
             regimen_id, recurso_id, usuario_id,
             firma_archivo, precio_total, fecha_inicio, fecha_fin, observaciones, monto_adicionales
-          ) VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
+            ESTADO_RESERVA_INICIADA_ID,
+            modalidadReserva,
+            bloqueFechaIdReserva,
+            servicio_id,
             regimen_id,
             recurso_id,
             cabecera.id,
@@ -2426,6 +4824,15 @@ router.post("/reserva", verifyToken, async (req, res) => {
 
         const reservaId = reservaResult.insertId;
         let numeroParcelaAsignada = null;
+
+        if (modalidadReserva === MODALIDAD_BLOQUE && bloqueFechaIdReserva) {
+          await connection.query(
+            `UPDATE bloque_fecha_recurso
+             SET estado = 'RESERVADO', reserva_id = ?
+             WHERE bloque_fecha_id = ? AND recurso_id = ?`,
+            [reservaId, bloqueFechaIdReserva, recurso_id]
+          );
+        }
 
         if (adicionalesProcesados.length > 0) {
           await guardarAdicionalesReserva(connection, reservaId, adicionalesProcesados);
@@ -3198,18 +5605,25 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
             r.fecha_fin,
             r.observaciones,
             r.fecha_creacion,
+            COALESCE(r.modalidad, 'FECHA_LIBRE') as modalidad,
+            r.sorteo_id,
+            r.bloque_fecha_id,
             er.nombre as estado,
             s.id as servicio_id,
             s.nombre as servicio_nombre,
             s.lugar,
             rec.id as recurso_id,
             rec.nombre as recurso_nombre,
+            bf.nombre as bloque_nombre,
+            sorteo.nombre as sorteo_nombre,
             reg.id as regimen_id,
             reg.nombre as regimen_nombre
           FROM reserva r
           LEFT JOIN estado_reserva er ON r.estado_reserva_id = er.id
-          INNER JOIN recurso rec ON r.recurso_id = rec.id
-          INNER JOIN servicio s ON rec.servicio_id = s.id
+          LEFT JOIN recurso rec ON r.recurso_id = rec.id
+          LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
+          LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
+          LEFT JOIN sorteo ON sorteo.id = r.sorteo_id
           INNER JOIN regimen reg ON r.regimen_id = reg.id
           WHERE r.id = ?
         `, [reservaId]);
@@ -3312,6 +5726,11 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
           nombre: reserva.observaciones || `Reserva ${numeroReserva}`,
           fecha_inicio: reserva.fecha_inicio,
           fecha_fin: reserva.fecha_fin,
+          modalidad: reserva.modalidad || MODALIDAD_FECHA_LIBRE,
+          sorteo_id: reserva.sorteo_id,
+          sorteo_nombre: reserva.sorteo_nombre,
+          bloque_fecha_id: reserva.bloque_fecha_id,
+          bloque_nombre: reserva.bloque_nombre,
           observaciones: reserva.observaciones,
           servicio: {
             id: reserva.servicio_id,
@@ -3319,7 +5738,7 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
           },
           recurso: {
             id: reserva.recurso_id,
-            nombre: reserva.recurso_nombre,
+            nombre: reserva.recurso_nombre || "Pendiente de adjudicacion",
             location: reserva.lugar
           },
           regimen: {
@@ -3402,18 +5821,25 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
             r.observaciones,
             r.fecha_creacion,
             r.firma_archivo,
+            COALESCE(r.modalidad, 'FECHA_LIBRE') as modalidad,
+            r.sorteo_id,
+            r.bloque_fecha_id,
             er.nombre as estado,
             s.id as servicio_id,
             s.nombre as servicio_nombre,
             s.lugar,
             rec.id as recurso_id,
             rec.nombre as recurso_nombre,
+            bf.nombre as bloque_nombre,
+            sorteo.nombre as sorteo_nombre,
             reg.id as regimen_id,
             reg.nombre as regimen_nombre
           FROM reserva r
           LEFT JOIN estado_reserva er ON r.estado_reserva_id = er.id
-          INNER JOIN recurso rec ON r.recurso_id = rec.id
-          INNER JOIN servicio s ON rec.servicio_id = s.id
+          LEFT JOIN recurso rec ON r.recurso_id = rec.id
+          LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
+          LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
+          LEFT JOIN sorteo ON sorteo.id = r.sorteo_id
           INNER JOIN regimen reg ON r.regimen_id = reg.id
           WHERE r.id = ?
         `, [reservaId]);
@@ -3565,6 +5991,11 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           observaciones: reserva.observaciones,
           fecha_inicio: reserva.fecha_inicio,
           fecha_fin: reserva.fecha_fin,
+          modalidad: reserva.modalidad || MODALIDAD_FECHA_LIBRE,
+          sorteo_id: reserva.sorteo_id,
+          sorteo_nombre: reserva.sorteo_nombre,
+          bloque_fecha_id: reserva.bloque_fecha_id,
+          bloque_nombre: reserva.bloque_nombre,
           servicio: {
             id: reserva.servicio_id,
             nombre: reserva.servicio_nombre
@@ -3572,7 +6003,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           lugar: reserva.lugar,
           recurso: {
             id: reserva.recurso_id,
-            nombre: reserva.recurso_nombre
+            nombre: reserva.recurso_nombre || "Pendiente de adjudicacion"
           },
           regimen: {
             id: reserva.regimen_id,
@@ -4933,6 +7364,7 @@ router.post("/tabla/temporadas", verifyToken, async (req, res) => {
              DATE_FORMAT(fecha_fin, '%d/%m/%Y') AS fecha_fin
       FROM temporada_tarifa
       WHERE 1=1 
+        AND COALESCE(origen, 'GENERAL') = 'GENERAL'
         ${queryBuscar}
         ${fromDate ? "AND fecha_inicio >= ?" : ""}
         ${toDate ? "AND fecha_fin <= ?" : ""}
@@ -4956,6 +7388,7 @@ router.post("/tabla/temporadas", verifyToken, async (req, res) => {
         SELECT COUNT(*) AS count
         FROM temporada_tarifa
         WHERE 1=1 
+          AND COALESCE(origen, 'GENERAL') = 'GENERAL'
           ${queryBuscar}
           ${fromDate ? "AND fecha_inicio >= ?" : ""}
           ${toDate ? "AND fecha_fin <= ?" : ""}
@@ -5034,7 +7467,9 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       r.id,
       COALESCE(er.nombre, 'Sin estado') AS estado,
       s.nombre AS servicio,
-      rec.nombre AS recurso,
+      COALESCE(rec.nombre, 'Pendiente de adjudicacion') AS recurso,
+      COALESCE(r.modalidad, 'FECHA_LIBRE') AS modalidad,
+      bf.nombre AS bloque,
       u.documento AS afiliado,
       DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') AS fecha_inicio,
       DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') AS fecha_fin,
@@ -5042,8 +7477,9 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       DATE_FORMAT(r.fecha_creacion, '%d/%m/%Y') AS fecha_creacion
     FROM reserva r
     INNER JOIN estado_reserva er ON r.estado_reserva_id = er.id
-    INNER JOIN recurso rec ON r.recurso_id = rec.id
-    INNER JOIN servicio s ON rec.servicio_id = s.id
+    LEFT JOIN recurso rec ON r.recurso_id = rec.id
+    LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
+    LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
     INNER JOIN usuario u ON r.usuario_id = u.id
     WHERE 1=1 
       ${queryBuscar}
@@ -5079,8 +7515,9 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       SELECT COUNT(*) AS count
       FROM reserva r
       INNER JOIN estado_reserva er ON r.estado_reserva_id = er.id
-      INNER JOIN recurso rec ON r.recurso_id = rec.id
-      INNER JOIN servicio s ON rec.servicio_id = s.id
+      LEFT JOIN recurso rec ON r.recurso_id = rec.id
+      LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
+      LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
       INNER JOIN usuario u ON r.usuario_id = u.id
       WHERE 1=1 
         ${queryBuscar}
@@ -5927,6 +8364,247 @@ function obtenerParcelasDisponiblesPorFecha(servicioId, fecha) {
   return normalizado.value;
 }
 
+async function crearTemporadaTarifasDesdeConfiguracion(connection, {
+  nombre_campania,
+  fecha_inicio,
+  fecha_fin,
+  configuracion_servicios,
+  porcentajes_tipo_persona = [],
+  origen = "GENERAL",
+  usuario_id = null
+}) {
+  if (!nombre_campania || !fecha_inicio || !fecha_fin || !Array.isArray(configuracion_servicios)) {
+    throw crearErrorNegocio("Faltan campos requeridos para crear tarifas", 400);
+  }
+
+  const errorParcelas = validarParcelasDisponiblesEnConfiguracion(configuracion_servicios);
+  if (errorParcelas) {
+    throw crearErrorNegocio(errorParcelas, 400);
+  }
+
+  const [temporadaResult] = await connection.query(
+    "INSERT INTO temporada_tarifa (nombre, fecha_inicio, fecha_fin, origen) VALUES (?, ?, ?, ?)",
+    [nombre_campania, fecha_inicio, fecha_fin, origen]
+  );
+
+  const temporadaId = temporadaResult.insertId;
+  const adicionalesPorTemporada = [];
+  const porcentajesRegistrados = [];
+
+  if (usuario_id) {
+    await guardarHistorialTemporada(
+      connection,
+      temporadaId,
+      usuario_id,
+      "CREATE",
+      "temporada",
+      null,
+      JSON.stringify({ nombre_campania, fecha_inicio, fecha_fin, origen })
+    );
+  }
+
+  if (Array.isArray(porcentajes_tipo_persona) && porcentajes_tipo_persona.length > 0) {
+    for (const porcentaje of porcentajes_tipo_persona) {
+      const tipoPersonaId = porcentaje?.tipo_persona_id ?? porcentaje?.tipoPersonaId;
+      const porcentajeValor = normalizarValorPorcentaje(
+        porcentaje?.porcentaje ??
+        porcentaje?.valor ??
+        porcentaje?.porcentaje_descuento ??
+        porcentaje?.porcentajeDescuento
+      );
+
+      if (!tipoPersonaId || porcentajeValor === null) {
+        continue;
+      }
+
+      await connection.query(
+        `INSERT INTO temporada_tipo_persona_porcentaje
+          (temporada_tarifa_id, tipo_persona_id, porcentaje)
+         VALUES (?, ?, ?)`,
+        [temporadaId, tipoPersonaId, porcentajeValor]
+      );
+
+      porcentajesRegistrados.push({
+        tipo_persona_id: Number(tipoPersonaId),
+        porcentaje: porcentajeValor
+      });
+    }
+
+    if (usuario_id && porcentajesRegistrados.length > 0) {
+      await guardarHistorialTemporada(
+        connection,
+        temporadaId,
+        usuario_id,
+        "CREATE",
+        "porcentajes_tipo_persona",
+        null,
+        JSON.stringify(porcentajesRegistrados)
+      );
+    }
+  }
+
+  for (const servicio of configuracion_servicios) {
+    if (!servicio || !Array.isArray(servicio.regimenes)) {
+      continue;
+    }
+
+    for (const regimen of servicio.regimenes) {
+      if (!regimen || !Array.isArray(regimen.recursos)) {
+        continue;
+      }
+
+      for (const recurso of regimen.recursos) {
+        if (!recurso || !Array.isArray(recurso.fechas)) {
+          continue;
+        }
+
+        for (const fecha of recurso.fechas) {
+          const parcelasDisponibles = obtenerParcelasDisponiblesPorFecha(servicio.id, fecha);
+
+          if (Array.isArray(fecha.adicionales) && fecha.adicionales.length > 0) {
+            for (const adicional of fecha.adicionales) {
+              if (!adicional || !adicional.adicionalId || adicional.precio === undefined || adicional.precio === null) {
+                continue;
+              }
+
+              await connection.query(
+                `
+                  INSERT INTO tarifa_adicional
+                    (temporada_tarifa_id, recurso_id, regimen_id, adicional_id, fecha_inicio, fecha_fin, precio)
+                  VALUES (?, ?, ?, ?, ?, ?, ?)
+                `,
+                [
+                  temporadaId,
+                  recurso.id,
+                  regimen.id,
+                  adicional.adicionalId,
+                  fecha.fecha_inicio,
+                  fecha.fecha_fin,
+                  adicional.precio
+                ]
+              );
+
+              adicionalesPorTemporada.push({
+                adicional_id: adicional.adicionalId,
+                recurso_id: recurso.id,
+                regimen_id: regimen.id,
+                fecha_inicio: fecha.fecha_inicio,
+                fecha_fin: fecha.fecha_fin
+              });
+            }
+          }
+
+          if (recurso.precio_por_persona !== false) {
+            const mapaPreciosDeLista = construirMapaPreciosDeLista(fecha.tiposPersona);
+            for (const tipoPersona of fecha.tiposPersona || []) {
+              const tipoPersonaId = tipoPersona?.tipoPersonaId ?? tipoPersona?.tipo_persona_id;
+              if (!tipoPersonaId || !Array.isArray(tipoPersona?.rangosEdad)) {
+                continue;
+              }
+
+              for (const rangoEdad of tipoPersona.rangosEdad) {
+                const { precioTarifa, usaPorcentaje, porcentajeDescuento } = calcularPrecioRangoConPorcentaje(
+                  rangoEdad,
+                  tipoPersonaId,
+                  mapaPreciosDeLista
+                );
+
+                const [tarifaResult] = await connection.query(
+                  `INSERT INTO tarifa
+                   (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
+                    edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona, usa_porcentaje, porcentaje_descuento, parcelas_disponibles)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  [
+                    recurso.id,
+                    tipoPersonaId,
+                    regimen.id,
+                    temporadaId,
+                    rangoEdad.edadMinima ?? rangoEdad.edad_minima ?? null,
+                    rangoEdad.edadMaxima ?? rangoEdad.edad_maxima ?? null,
+                    precioTarifa,
+                    fecha.fecha_inicio,
+                    fecha.fecha_fin,
+                    "Y",
+                    usaPorcentaje ? 1 : 0,
+                    porcentajeDescuento,
+                    parcelasDisponibles
+                  ]
+                );
+
+                if (usuario_id) {
+                  await guardarHistorialTemporada(
+                    connection,
+                    temporadaId,
+                    usuario_id,
+                    "CREATE",
+                    `tarifa_${tarifaResult.insertId}`,
+                    null,
+                    JSON.stringify({
+                      recurso_id: recurso.id,
+                      tipo_persona_id: tipoPersonaId,
+                      regimen_id: regimen.id,
+                      precio: precioTarifa,
+                      usa_porcentaje: usaPorcentaje ? 1 : 0,
+                      porcentaje_descuento: porcentajeDescuento,
+                      parcelas_disponibles: parcelasDisponibles
+                    })
+                  );
+                }
+              }
+            }
+          } else {
+            const [tarifaResult] = await connection.query(
+              `INSERT INTO tarifa
+               (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
+                edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin, precio_por_persona, usa_porcentaje, porcentaje_descuento, parcelas_disponibles)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                recurso.id,
+                null,
+                regimen.id,
+                temporadaId,
+                null,
+                null,
+                fecha.precio,
+                fecha.fecha_inicio,
+                fecha.fecha_fin,
+                "N",
+                0,
+                null,
+                parcelasDisponibles
+              ]
+            );
+
+            if (usuario_id) {
+              await guardarHistorialTemporada(
+                connection,
+                temporadaId,
+                usuario_id,
+                "CREATE",
+                `tarifa_${tarifaResult.insertId}`,
+                null,
+                JSON.stringify({
+                  recurso_id: recurso.id,
+                  regimen_id: regimen.id,
+                  precio: fecha.precio,
+                  usa_porcentaje: 0,
+                  parcelas_disponibles: parcelasDisponibles
+                })
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    temporadaId,
+    adicionales: adicionalesPorTemporada,
+    porcentajes: porcentajesRegistrados
+  };
+}
+
 router.post("/temporada", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -5948,6 +8626,11 @@ router.post("/temporada", verifyToken, async (req, res) => {
       await connection.beginTransaction();
 
       try {
+        await validarSolapamientoTarifasExistentes(connection, {
+          configuracionServicios: configuracion_servicios,
+          origenes: ["BLOQUE"]
+        });
+
         // 1. Crear la temporada principal
         const [temporadaResult] = await connection.query(
           "INSERT INTO temporada_tarifa (nombre, fecha_inicio, fecha_fin) VALUES (?, ?, ?)",
@@ -6186,6 +8869,9 @@ router.post("/temporada", verifyToken, async (req, res) => {
     }
   } catch (error) {
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+    }
     res.status(500).json("Error al crear la temporada");
   }
 });
@@ -6216,10 +8902,11 @@ router.get("/temporada/rangos", verifyToken, async (req, res) => {
         DATE_FORMAT(fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
         DATE_FORMAT(fecha_fin, '%Y-%m-%d') AS fecha_fin
       FROM temporada_tarifa
+      WHERE COALESCE(origen, 'GENERAL') = 'GENERAL'
     `;
 
     if (excludeTemporadaId !== null) {
-      query += " WHERE id <> ?";
+      query += " AND id <> ?";
       queryParams.push(excludeTemporadaId);
     }
 
@@ -6510,6 +9197,11 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
         }
 
         const datosAnteriores = temporadaAnterior[0];
+
+        await validarSolapamientoTarifasExistentes(connection, {
+          configuracionServicios: configuracion_servicios,
+          origenes: ["BLOQUE"]
+        });
 
         // 2. Actualizar la temporada principal
         await connection.query(
@@ -6826,6 +9518,9 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
     }
   } catch (error) {
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+    }
     res.status(500).json("Error al actualizar la temporada");
   }
 });
