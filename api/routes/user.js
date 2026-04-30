@@ -8230,6 +8230,7 @@ function normalizarValorPorcentaje(valor) {
 
 function construirMapaPreciosDeLista(tiposPersona) {
   const mapa = new Map();
+  const rangosPrecioLista = [];
   if (!Array.isArray(tiposPersona)) {
     return mapa;
   }
@@ -8247,11 +8248,57 @@ function construirMapaPreciosDeLista(tiposPersona) {
       const precio = Number(rango?.precio ?? 0);
       if (!Number.isNaN(precio)) {
         mapa.set(key, precio);
+        rangosPrecioLista.push({
+          edad_minima: edadMin === "" ? null : Number(edadMin),
+          edad_maxima: edadMax === "" || edadMax === null || edadMax === undefined ? null : Number(edadMax),
+          precio,
+        });
       }
     }
   }
 
+  mapa.set("__rangos_precio_lista__", rangosPrecioLista);
   return mapa;
+}
+
+function buscarPrecioListaPorCobertura(mapaPreciosDeLista, edadMin, edadMax) {
+  const rangos = mapaPreciosDeLista?.get
+    ? mapaPreciosDeLista.get("__rangos_precio_lista__")
+    : [];
+
+  if (!Array.isArray(rangos) || rangos.length === 0) {
+    return undefined;
+  }
+
+  const minObjetivo = edadMin === "" || edadMin === null || edadMin === undefined
+    ? null
+    : Number(edadMin);
+  const maxObjetivo = edadMax === "" || edadMax === null || edadMax === undefined
+    ? null
+    : Number(edadMax);
+
+  if (minObjetivo === null || Number.isNaN(minObjetivo)) {
+    return undefined;
+  }
+
+  const rangoContenedor = rangos.find((rango) => {
+    const minBase = Number(rango.edad_minima);
+    const maxBase = rango.edad_maxima === null || rango.edad_maxima === undefined
+      ? null
+      : Number(rango.edad_maxima);
+
+    if (!Number.isFinite(minBase) || minBase > minObjetivo) {
+      return false;
+    }
+
+    if (maxObjetivo === null) {
+      return maxBase === null;
+    }
+
+    return maxBase === null || maxBase >= maxObjetivo;
+  });
+
+  return rangoContenedor ? rangoContenedor.precio : undefined;
 }
 
 function calcularPrecioRangoConPorcentaje(rangoEdad, tipoPersonaId, mapaPreciosDeLista) {
@@ -8282,9 +8329,12 @@ function calcularPrecioRangoConPorcentaje(rangoEdad, tipoPersonaId, mapaPreciosD
     const edadMin = rangoEdad?.edadMinima ?? rangoEdad?.edad_minima ?? "";
     const edadMax = rangoEdad?.edadMaxima ?? rangoEdad?.edad_maxima ?? "";
     const key = `${edadMin}-${edadMax}`;
-    const precioBase = mapaPreciosDeLista?.get
+    let precioBase = mapaPreciosDeLista?.get
       ? mapaPreciosDeLista.get(key)
       : undefined;
+    if (typeof precioBase !== "number" || Number.isNaN(precioBase)) {
+      precioBase = buscarPrecioListaPorCobertura(mapaPreciosDeLista, edadMin, edadMax);
+    }
 
     if (typeof precioBase === "number" && !Number.isNaN(precioBase)) {
       const pDescuento = porcentajeDescuento !== null ? porcentajeDescuento : 0;
@@ -9527,6 +9577,15 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
 
 const MODOS_SALTO_FLUJO_VALIDOS = new Set(["POR_RANGO", "POR_ANIO"]);
 const SENTIDOS_CALCULO_FLUJO_VALIDOS = new Set(["ASCENDENTE", "DESCENDENTE"]);
+const TIPOS_VALORES_PREDETERMINADOS_TEMPORADA = new Set(["BAJA", "ALTA"]);
+
+function normalizarTipoValoresPredeterminados(valor) {
+  const tipo = String(valor || "").trim().toUpperCase();
+  if (!TIPOS_VALORES_PREDETERMINADOS_TEMPORADA.has(tipo)) {
+    return { error: "tipo debe ser BAJA o ALTA" };
+  }
+  return { value: tipo };
+}
 
 function parsearEnteroNoNegativoFlujo(valor, nombreCampo, opciones = {}) {
   const permiteNull = Boolean(opciones.permiteNull);
@@ -9811,6 +9870,68 @@ function validarYNormalizarFlujoDescuentoEscalonado(body) {
   return { reglas: reglasNormalizadas };
 }
 
+function validarYNormalizarPorcentajesPredeterminados(body) {
+  const porcentajesRaw = body?.porcentajes_tipo_persona ?? body?.porcentajesTipoPersona ?? [];
+  if (!Array.isArray(porcentajesRaw)) {
+    return { error: "porcentajes_tipo_persona debe ser un arreglo" };
+  }
+
+  const porcentajes = [];
+  const tiposUsados = new Set();
+
+  for (let i = 0; i < porcentajesRaw.length; i++) {
+    const item = porcentajesRaw[i] || {};
+    const tipoPersonaId = Number(item.tipo_persona_id ?? item.tipoPersonaId);
+    const porcentaje = normalizarValorPorcentaje(
+      item.porcentaje ??
+      item.valor ??
+      item.porcentaje_descuento ??
+      item.porcentajeDescuento
+    );
+
+    if (!Number.isInteger(tipoPersonaId) || tipoPersonaId <= 0) {
+      return { error: `porcentajes_tipo_persona[${i}].tipo_persona_id debe ser un entero positivo` };
+    }
+
+    if (Number(tipoPersonaId) === 4 || Number(tipoPersonaId) === 5) {
+      continue;
+    }
+
+    if (porcentaje === null || porcentaje < 0 || porcentaje > 100) {
+      return { error: `porcentajes_tipo_persona[${i}].porcentaje debe estar entre 0 y 100` };
+    }
+
+    if (tiposUsados.has(tipoPersonaId)) {
+      return { error: `porcentajes_tipo_persona tiene tipo_persona_id duplicado: ${tipoPersonaId}` };
+    }
+
+    tiposUsados.add(tipoPersonaId);
+    porcentajes.push({
+      tipo_persona_id: tipoPersonaId,
+      porcentaje,
+    });
+  }
+
+  return { porcentajes };
+}
+
+function validarYNormalizarValoresPredeterminadosTemporada(body) {
+  const flujo = validarYNormalizarFlujoDescuentoEscalonado(body);
+  if (flujo.error) {
+    return flujo;
+  }
+
+  const porcentajes = validarYNormalizarPorcentajesPredeterminados(body);
+  if (porcentajes.error) {
+    return porcentajes;
+  }
+
+  return {
+    reglas: flujo.reglas,
+    porcentajes: porcentajes.porcentajes,
+  };
+}
+
 async function insertarReglasFlujoDescuentoEscalonado(connection, flujoId, reglas) {
   for (const regla of reglas) {
     const [reglaResult] = await connection.query(
@@ -9842,16 +9963,34 @@ async function insertarReglasFlujoDescuentoEscalonado(connection, flujoId, regla
   }
 }
 
-async function obtenerFlujoDescuentoEscalonado(connection, flujoId = null) {
+async function insertarPorcentajesPredeterminadosTemporada(connection, flujoId, porcentajes) {
+  if (!Array.isArray(porcentajes) || porcentajes.length === 0) {
+    return;
+  }
+
+  for (const porcentaje of porcentajes) {
+    await connection.query(
+      `INSERT INTO flujo_descuento_escalonado_tipo_persona_porcentaje
+        (flujo_id, tipo_persona_id, porcentaje)
+       VALUES (?, ?, ?)`,
+      [flujoId, porcentaje.tipo_persona_id, porcentaje.porcentaje]
+    );
+  }
+}
+
+async function obtenerFlujoDescuentoEscalonado(connection, flujoId = null, tipoTemporada = "BAJA") {
   const params = [];
   let flujoQuery = `
-    SELECT id, created_at, updated_at
+    SELECT id, tipo_temporada, created_at, updated_at
     FROM flujo_descuento_escalonado
   `;
 
   if (flujoId !== null) {
     flujoQuery += " WHERE id = ?";
     params.push(flujoId);
+  } else {
+    flujoQuery += " WHERE tipo_temporada = ?";
+    params.push(tipoTemporada);
   }
 
   flujoQuery += " ORDER BY id ASC LIMIT 1";
@@ -9907,8 +10046,22 @@ async function obtenerFlujoDescuentoEscalonado(connection, flujoId = null) {
     });
   }
 
+  const [porcentajesRows] = await connection.query(
+    `SELECT tipo_persona_id, porcentaje
+     FROM flujo_descuento_escalonado_tipo_persona_porcentaje
+     WHERE flujo_id = ?
+     ORDER BY tipo_persona_id ASC`,
+    [flujo.id]
+  );
+
   return {
     id: flujo.id,
+    tipo: flujo.tipo_temporada || tipoTemporada,
+    tipo_temporada: flujo.tipo_temporada || tipoTemporada,
+    porcentajes_tipo_persona: porcentajesRows.map(row => ({
+      tipo_persona_id: row.tipo_persona_id,
+      porcentaje: row.porcentaje !== null && row.porcentaje !== undefined ? Number(row.porcentaje) : null,
+    })),
     reglas: reglasRows.map(regla => ({
       id: regla.id,
       servicio_id: regla.servicio_id,
@@ -9952,6 +10105,111 @@ router.get("/flujo-descuento-escalonado", verifyToken, async (req, res) => {
   }
 });
 
+router.get("/valores-predeterminados-temporada/:tipo", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const tipoResultado = normalizarTipoValoresPredeterminados(req.params.tipo);
+    if (tipoResultado.error) {
+      return res.status(400).json(tipoResultado.error);
+    }
+
+    const connection = await mysqlConnection.promise().getConnection();
+    try {
+      const valores = await obtenerFlujoDescuentoEscalonado(connection, null, tipoResultado.value);
+      res.status(200).json(valores);
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener valores predeterminados de temporada");
+  }
+});
+
+router.put("/valores-predeterminados-temporada/:tipo", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const tipoResultado = normalizarTipoValoresPredeterminados(req.params.tipo);
+    if (tipoResultado.error) {
+      return res.status(400).json(tipoResultado.error);
+    }
+
+    const validacion = validarYNormalizarValoresPredeterminadosTemporada(req.body);
+    if (validacion.error) {
+      return res.status(400).json(validacion.error);
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const [flujoRows] = await connection.query(
+      "SELECT id FROM flujo_descuento_escalonado WHERE tipo_temporada = ? FOR UPDATE",
+      [tipoResultado.value]
+    );
+
+    let flujoId;
+    if (flujoRows.length === 0) {
+      const [flujoResult] = await connection.query(
+        "INSERT INTO flujo_descuento_escalonado (tipo_temporada, created_at, updated_at) VALUES (?, NOW(), NOW())",
+        [tipoResultado.value]
+      );
+      flujoId = flujoResult.insertId;
+    } else {
+      flujoId = flujoRows[0].id;
+      await connection.query(
+        `DELETE frango
+         FROM flujo_descuento_escalonado_rango_edad frango
+         INNER JOIN flujo_descuento_escalonado_regla fregla ON fregla.id = frango.regla_id
+         WHERE fregla.flujo_id = ?`,
+        [flujoId]
+      );
+      await connection.query(
+        "DELETE FROM flujo_descuento_escalonado_regla WHERE flujo_id = ?",
+        [flujoId]
+      );
+      await connection.query(
+        "DELETE FROM flujo_descuento_escalonado_tipo_persona_porcentaje WHERE flujo_id = ?",
+        [flujoId]
+      );
+    }
+
+    await insertarReglasFlujoDescuentoEscalonado(connection, flujoId, validacion.reglas);
+    await insertarPorcentajesPredeterminadosTemporada(connection, flujoId, validacion.porcentajes);
+    await connection.query(
+      "UPDATE flujo_descuento_escalonado SET updated_at = NOW() WHERE id = ?",
+      [flujoId]
+    );
+
+    const valoresActualizados = await obtenerFlujoDescuentoEscalonado(
+      connection,
+      flujoId,
+      tipoResultado.value
+    );
+
+    await connection.commit();
+    res.status(200).json(valoresActualizados);
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    res.status(500).json("Error al guardar valores predeterminados de temporada");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
 router.post("/flujo-descuento-escalonado", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -9959,7 +10217,7 @@ router.post("/flujo-descuento-escalonado", verifyToken, async (req, res) => {
       return res.status(401).json("No autorizado");
     }
 
-    const validacion = validarYNormalizarFlujoDescuentoEscalonado(req.body);
+    const validacion = validarYNormalizarValoresPredeterminadosTemporada(req.body);
     if (validacion.error) {
       return res.status(400).json(validacion.error);
     }
@@ -9970,7 +10228,7 @@ router.post("/flujo-descuento-escalonado", verifyToken, async (req, res) => {
       await connection.beginTransaction();
 
       const [flujoExistente] = await connection.query(
-        "SELECT id FROM flujo_descuento_escalonado LIMIT 1 FOR UPDATE"
+        "SELECT id FROM flujo_descuento_escalonado WHERE tipo_temporada = 'BAJA' LIMIT 1 FOR UPDATE"
       );
       if (flujoExistente.length > 0) {
         await connection.rollback();
@@ -9978,7 +10236,7 @@ router.post("/flujo-descuento-escalonado", verifyToken, async (req, res) => {
       }
 
       const [flujoResult] = await connection.query(
-        "INSERT INTO flujo_descuento_escalonado (created_at, updated_at) VALUES (NOW(), NOW())"
+        "INSERT INTO flujo_descuento_escalonado (tipo_temporada, created_at, updated_at) VALUES ('BAJA', NOW(), NOW())"
       );
 
       await insertarReglasFlujoDescuentoEscalonado(
@@ -9986,10 +10244,16 @@ router.post("/flujo-descuento-escalonado", verifyToken, async (req, res) => {
         flujoResult.insertId,
         validacion.reglas
       );
+      await insertarPorcentajesPredeterminadosTemporada(
+        connection,
+        flujoResult.insertId,
+        validacion.porcentajes
+      );
 
       const flujo = await obtenerFlujoDescuentoEscalonado(
         connection,
-        flujoResult.insertId
+        flujoResult.insertId,
+        "BAJA"
       );
 
       await connection.commit();
@@ -10022,7 +10286,7 @@ router.put("/flujo-descuento-escalonado/:id", verifyToken, async (req, res) => {
       return res.status(400).json("id invalido");
     }
 
-    const validacion = validarYNormalizarFlujoDescuentoEscalonado(req.body);
+    const validacion = validarYNormalizarValoresPredeterminadosTemporada(req.body);
     if (validacion.error) {
       return res.status(400).json(validacion.error);
     }
@@ -10053,11 +10317,20 @@ router.put("/flujo-descuento-escalonado/:id", verifyToken, async (req, res) => {
         "DELETE FROM flujo_descuento_escalonado_regla WHERE flujo_id = ?",
         [idResultado.value]
       );
+      await connection.query(
+        "DELETE FROM flujo_descuento_escalonado_tipo_persona_porcentaje WHERE flujo_id = ?",
+        [idResultado.value]
+      );
 
       await insertarReglasFlujoDescuentoEscalonado(
         connection,
         idResultado.value,
         validacion.reglas
+      );
+      await insertarPorcentajesPredeterminadosTemporada(
+        connection,
+        idResultado.value,
+        validacion.porcentajes
       );
 
       await connection.query(
@@ -10067,7 +10340,8 @@ router.put("/flujo-descuento-escalonado/:id", verifyToken, async (req, res) => {
 
       const flujoActualizado = await obtenerFlujoDescuentoEscalonado(
         connection,
-        idResultado.value
+        idResultado.value,
+        "BAJA"
       );
 
       await connection.commit();
