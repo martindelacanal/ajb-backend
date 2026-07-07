@@ -9653,6 +9653,214 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// MIS GESTIONES (rol afiliado): vista unificada de las reservas de turismo y
+// las solicitudes de coseguro médico del usuario logueado.
+// Los códigos se devuelven con prefijo por módulo: T-<id> (turismo) y C-<id> (coseguro).
+// ---------------------------------------------------------------------------
+
+// Colores pastel para los estados de reserva (misma estética que coseguro_estado)
+const COLORES_ESTADO_RESERVA = {
+  "Iniciada": { color: "#E3F2FD", color_texto: "#1565C0" },
+  "Verificada": { color: "#FEF9C3", color_texto: "#A16207" },
+  "Aprobada": { color: "#D1FAE5", color_texto: "#047857" },
+  "Rechazada": { color: "#FEE2E2", color_texto: "#B91C1C" },
+  "Utilizada": { color: "#E5E7EB", color_texto: "#374151" },
+  "Solicitud sorteo": { color: "#EDE9FE", color_texto: "#6D28D9" },
+  "Adjudicada": { color: "#DCFCE7", color_texto: "#15803D" },
+  "No adjudicada": { color: "#FFE4E6", color_texto: "#BE123C" },
+  "Solicitud convenio": { color: "#E0E7FF", color_texto: "#4338CA" },
+  "Propuesta convenio": { color: "#FFF1DB", color_texto: "#B45309" },
+  "Convenio aceptado": { color: "#D1FAE5", color_texto: "#047857" },
+  "Convenio rechazado": { color: "#FEE2E2", color_texto: "#B91C1C" },
+};
+const COLOR_ESTADO_GESTION_DEFECTO = { color: "#F3F4F6", color_texto: "#4B5563" };
+
+// El afiliado ve el estado interno de coseguro "Exportado para liquidar" (8)
+// como "Pendiente de acreditación" (9)
+const COSEGURO_ESTADO_EXPORTADO = 8;
+const COSEGURO_ESTADO_PENDIENTE_ACREDITACION = 9;
+
+// Catálogos de estados para armar los filtros del listado unificado
+router.get("/mis-gestiones/catalogos", verifyToken, async (req, res) => {
+  const cabecera = JSON.parse(req.data.data);
+  if (cabecera.rol !== "afiliado") return res.status(401).json("No autorizado");
+  try {
+    const db = mysqlConnection.promise();
+    const [estadosTurismo] = await db.query("SELECT id, nombre FROM estado_reserva ORDER BY id");
+    const [estadosCoseguro] = await db.query(
+      `SELECT id, COALESCE(nombre_afiliado, nombre) AS nombre, color, color_texto
+       FROM coseguro_estado WHERE id <> ? ORDER BY id`,
+      [COSEGURO_ESTADO_EXPORTADO]
+    );
+    res.json({
+      estados_turismo: estadosTurismo.map((estado) => ({
+        ...estado,
+        ...(COLORES_ESTADO_RESERVA[estado.nombre] || COLOR_ESTADO_GESTION_DEFECTO),
+      })),
+      estados_coseguro: estadosCoseguro,
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los catálogos de gestiones");
+  }
+});
+
+// Listado unificado con búsqueda, filtros, orden y paginación
+router.get("/mis-gestiones", verifyToken, async (req, res) => {
+  const cabecera = JSON.parse(req.data.data);
+  if (cabecera.rol !== "afiliado") return res.status(401).json("No autorizado");
+
+  try {
+    const db = mysqlConnection.promise();
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 10));
+    const orderType = String(req.query.orderType).toLowerCase() === "asc" ? "ASC" : "DESC";
+    const COLUMNAS_ORDEN_GESTIONES = {
+      fecha_creacion: "g.fecha_creacion",
+      tipo: "g.tipo",
+      estado: "g.estado",
+      importe: "g.importe",
+    };
+    const orderBy = COLUMNAS_ORDEN_GESTIONES[req.query.orderBy] || "g.fecha_creacion";
+
+    // Vista unificada: ambos módulos proyectados a las mismas columnas
+    const unionSql = `
+      SELECT
+        r.id,
+        'turismo' AS tipo,
+        CONCAT('T-', r.id) AS codigo,
+        er.id AS estado_id,
+        er.nombre AS estado,
+        NULL AS estado_color,
+        NULL AS estado_color_texto,
+        COALESCE(s.nombre, ch.nombre, 'Convenio hotelero') AS titulo,
+        COALESCE(rec.nombre, ch.nombre, 'Pendiente de adjudicación') AS subtitulo,
+        COALESCE(r.modalidad, 'FECHA_LIBRE') AS modalidad,
+        DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') AS fecha_inicio,
+        DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') AS fecha_fin,
+        NULL AS importe,
+        NULL AS comprobante,
+        NULL AS beneficiario,
+        r.fecha_creacion
+      FROM reserva r
+        INNER JOIN estado_reserva er ON er.id = r.estado_reserva_id
+        LEFT JOIN recurso rec ON rec.id = r.recurso_id
+        LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
+        LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
+      WHERE r.usuario_id = ?
+      UNION ALL
+      SELECT
+        cs.id,
+        'coseguro' AS tipo,
+        CONCAT('C-', cs.id) AS codigo,
+        e.id AS estado_id,
+        COALESCE(e.nombre_afiliado, e.nombre) AS estado,
+        e.color AS estado_color,
+        e.color_texto AS estado_color_texto,
+        COALESCE(t.nombre, 'Reintegro') AS titulo,
+        COALESCE(c.nombre, cs.emisor_nombre) AS subtitulo,
+        NULL AS modalidad,
+        NULL AS fecha_inicio,
+        NULL AS fecha_fin,
+        COALESCE(cs.importe_autorizado, cs.importe) AS importe,
+        CONCAT(COALESCE(CONCAT(cs.comprobante_pto_venta, '-'), ''), cs.comprobante_numero) AS comprobante,
+        CASE WHEN cs.familiar_usuario_id IS NOT NULL THEN CONCAT(fam.nombre, ' ', fam.apellido) ELSE NULL END AS beneficiario,
+        cs.fecha_creacion
+      FROM coseguro_solicitud cs
+        INNER JOIN coseguro_estado e ON e.id = cs.estado_id
+        LEFT JOIN usuario fam ON fam.id = cs.familiar_usuario_id
+        LEFT JOIN coseguro_tipo_reintegro t ON t.id = cs.tipo_reintegro_id
+        LEFT JOIN coseguro_concepto c ON c.id = cs.concepto_id
+      WHERE cs.usuario_id = ? AND cs.eliminado = 0
+    `;
+    const unionParams = [cabecera.id, cabecera.id];
+
+    // Filtros comunes (el tipo se aplica aparte para poder devolver los
+    // contadores de ambos módulos calculados con estos mismos filtros)
+    const condiciones = [];
+    const params = [];
+
+    const search = String(req.query.search || "").trim();
+    if (search) {
+      condiciones.push(`(g.codigo LIKE ? OR g.titulo LIKE ? OR g.subtitulo LIKE ? OR g.estado LIKE ?
+        OR g.comprobante LIKE ? OR g.beneficiario LIKE ? OR g.fecha_inicio LIKE ? OR g.fecha_fin LIKE ?)`);
+      const like = `%${search}%`;
+      params.push(like, like, like, like, like, like, like, like);
+    }
+
+    // estados=T1,T3,C7 → cada token filtra dentro de su propio módulo
+    const tokens = String(req.query.estados || "")
+      .split(",")
+      .map((token) => token.trim().toUpperCase())
+      .filter(Boolean);
+    const estadosTurismo = tokens.filter((t) => /^T\d+$/.test(t)).map((t) => Number(t.slice(1)));
+    const estadosCoseguro = tokens.filter((t) => /^C\d+$/.test(t)).map((t) => Number(t.slice(1)));
+    if (estadosCoseguro.includes(COSEGURO_ESTADO_PENDIENTE_ACREDITACION) && !estadosCoseguro.includes(COSEGURO_ESTADO_EXPORTADO)) {
+      estadosCoseguro.push(COSEGURO_ESTADO_EXPORTADO);
+    }
+    if (estadosTurismo.length > 0 || estadosCoseguro.length > 0) {
+      const ramas = [];
+      if (estadosTurismo.length > 0) {
+        ramas.push(`(g.tipo = 'turismo' AND g.estado_id IN (${estadosTurismo.map(() => "?").join(",")}))`);
+        params.push(...estadosTurismo);
+      }
+      if (estadosCoseguro.length > 0) {
+        ramas.push(`(g.tipo = 'coseguro' AND g.estado_id IN (${estadosCoseguro.map(() => "?").join(",")}))`);
+        params.push(...estadosCoseguro);
+      }
+      condiciones.push(`(${ramas.join(" OR ")})`);
+    }
+
+    const esFechaValida = (valor) => /^\d{4}-\d{2}-\d{2}$/.test(String(valor || ""));
+    if (esFechaValida(req.query.fecha_desde)) {
+      condiciones.push("DATE(g.fecha_creacion) >= ?");
+      params.push(req.query.fecha_desde);
+    }
+    if (esFechaValida(req.query.fecha_hasta)) {
+      condiciones.push("DATE(g.fecha_creacion) <= ?");
+      params.push(req.query.fecha_hasta);
+    }
+
+    const whereComun = condiciones.length > 0 ? `WHERE ${condiciones.join(" AND ")}` : "";
+
+    // Contadores por módulo (para los chips "Turismo" / "Coseguro médico")
+    const [conteoRows] = await db.query(
+      `SELECT g.tipo, COUNT(*) AS total FROM (${unionSql}) g ${whereComun} GROUP BY g.tipo`,
+      [...unionParams, ...params]
+    );
+    const conteos = { turismo: 0, coseguro: 0 };
+    conteoRows.forEach((row) => (conteos[row.tipo] = Number(row.total)));
+
+    const tipo = ["turismo", "coseguro"].includes(req.query.tipo) ? req.query.tipo : null;
+    const totalItems = tipo ? conteos[tipo] : conteos.turismo + conteos.coseguro;
+
+    const condicionesFinal = tipo ? [...condiciones, "g.tipo = ?"] : condiciones;
+    const paramsFinal = tipo ? [...params, tipo] : params;
+    const where = condicionesFinal.length > 0 ? `WHERE ${condicionesFinal.join(" AND ")}` : "";
+
+    const [rows] = await db.query(
+      `SELECT g.* FROM (${unionSql}) g ${where}
+       ORDER BY ${orderBy} ${orderType}, g.fecha_creacion DESC
+       LIMIT ? OFFSET ?`,
+      [...unionParams, ...paramsFinal, pageSize, (page - 1) * pageSize]
+    );
+
+    const results = rows.map((row) => {
+      if (row.tipo === "turismo") {
+        const colores = COLORES_ESTADO_RESERVA[row.estado] || COLOR_ESTADO_GESTION_DEFECTO;
+        return { ...row, estado_color: colores.color, estado_color_texto: colores.color_texto };
+      }
+      return row;
+    });
+
+    res.json({ results, totalItems, page, pageSize, conteos });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener las gestiones");
+  }
+});
+
 router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
 
