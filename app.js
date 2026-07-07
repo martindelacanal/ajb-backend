@@ -18,7 +18,9 @@ require('dotenv').config({path: './.env'}); // variables de entorno
 // ROUTES
 
 const userRoute = require('./api/routes/user');
+const coseguroRoute = require('./api/routes/coseguro');
 app.use('/api',userRoute);
+app.use('/api',coseguroRoute);
 app.use('/imagenes', express.static(path.join(__dirname, 'imagenes')));
 
 module.exports = app;

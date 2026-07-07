@@ -7,6 +7,9 @@
 /logs/*
 /imagenes/*
 
+# Certificados de ARCA (claves privadas y tickets de acceso: NUNCA subirlos al repositorio)
+/certificados/
+
 # compiled output
 /dist
 /tmp

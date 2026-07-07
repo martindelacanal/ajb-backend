@@ -1500,7 +1500,7 @@ router.get("/sorteos/inscripcion-activa", verifyToken, async (req, res) => {
 router.get("/notificaciones", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+    if (!["admin", "afiliado", "departamental", "admin-central", "auditor"].includes(cabecera.rol)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -1558,7 +1558,7 @@ router.get("/notificaciones", verifyToken, async (req, res) => {
 router.put("/notificaciones/:id/leida", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+    if (!["admin", "afiliado", "departamental", "admin-central", "auditor"].includes(cabecera.rol)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -12516,6 +12516,9 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
     } else if (cabecera.rol === "afiliado") {
       // Afiliado solo puede verse a sí mismo
       tienePermisos = userId === cabecera.id;
+    } else if (["admin-central", "auditor"].includes(cabecera.rol)) {
+      // Roles del módulo de coseguro: solo pueden ver su propio perfil
+      tienePermisos = userId === cabecera.id;
     }
 
     if (!tienePermisos) {
@@ -12543,6 +12546,8 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
           u.email,
           u.telefono,
           u.legajo,
+          u.cuil,
+          u.cbu,
           u.foto_archivo,
           u.habilitado,
           r.nombre as rol_nombre
@@ -12637,7 +12642,7 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
         camposPermitidos = [
           'rol_id', 'departamental_id', 'tipo_persona_id', 'nombre', 'apellido',
           'fecha_nacimiento', 'documento', 'password', 'email', 'telefono',
-          'legajo', 'foto_archivo', 'habilitado'
+          'legajo', 'cuil', 'cbu', 'foto_archivo', 'habilitado'
         ];
       } else if (cabecera.rol === "departamental") {
         // Verificar que el usuario pertenezca a su departamento o sea él mismo
@@ -12649,7 +12654,7 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
         camposPermitidos = [
           'tipo_persona_id', 'nombre', 'apellido', 'fecha_nacimiento',
           'documento', 'password', 'email', 'telefono', 'legajo',
-          'foto_archivo', 'habilitado'
+          'cuil', 'cbu', 'foto_archivo', 'habilitado'
         ];
       } else if (cabecera.rol === "afiliado") {
         // Solo puede editarse a sí mismo
@@ -12658,7 +12663,17 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
         }
         camposPermitidos = [
           'tipo_persona_id', 'nombre', 'apellido', 'fecha_nacimiento',
-          'documento', 'password', 'email', 'telefono', 'legajo', 'foto_archivo'
+          'documento', 'password', 'email', 'telefono', 'legajo',
+          'cuil', 'cbu', 'foto_archivo'
+        ];
+      } else if (["admin-central", "auditor"].includes(cabecera.rol)) {
+        // Roles del módulo de coseguro: solo editan su propio perfil (datos personales)
+        if (userId === cabecera.id) {
+          tienePermisos = true;
+        }
+        camposPermitidos = [
+          'nombre', 'apellido', 'fecha_nacimiento', 'documento',
+          'password', 'email', 'telefono', 'cuil', 'cbu', 'foto_archivo'
         ];
       }
 
@@ -12826,6 +12841,46 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
         }
       }
 
+      if (camposPermitidos.includes('cuil') && req.body.cuil !== undefined) {
+        const nuevoValor = String(req.body.cuil || '').replace(/\D/g, '').slice(0, 11) || null;
+        if (nuevoValor && nuevoValor.length !== 11) {
+          await connection.rollback();
+          return res.status(400).json({
+            success: false,
+            message: "El CUIL debe tener 11 dígitos (sin guiones)"
+          });
+        }
+        if (datosAnteriores.cuil !== nuevoValor) {
+          updateFields.push('cuil = ?');
+          updateValues.push(nuevoValor);
+          cambios.push({
+            campo: 'cuil',
+            valorAnterior: datosAnteriores.cuil,
+            valorNuevo: nuevoValor
+          });
+        }
+      }
+
+      if (camposPermitidos.includes('cbu') && req.body.cbu !== undefined) {
+        const nuevoValor = String(req.body.cbu || '').replace(/\D/g, '').slice(0, 22) || null;
+        if (nuevoValor && nuevoValor.length !== 22) {
+          await connection.rollback();
+          return res.status(400).json({
+            success: false,
+            message: "El CBU debe tener 22 dígitos"
+          });
+        }
+        if (datosAnteriores.cbu !== nuevoValor) {
+          updateFields.push('cbu = ?');
+          updateValues.push(nuevoValor);
+          cambios.push({
+            campo: 'cbu',
+            valorAnterior: datosAnteriores.cbu,
+            valorNuevo: nuevoValor
+          });
+        }
+      }
+
       // Procesar password si viene
       if (camposPermitidos.includes('password') && req.body.password && req.body.password.trim() !== '') {
         const passwordHash = await bcryptjs.hash(req.body.password, 8);
@@ -12962,14 +13017,14 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
         camposPermitidos = [
           'rol_id', 'departamental_id', 'tipo_persona_id', 'nombre', 'apellido',
           'fecha_nacimiento', 'documento', 'password', 'email', 'telefono',
-          'legajo', 'foto_archivo', 'habilitado'
+          'legajo', 'cuil', 'cbu', 'foto_archivo', 'habilitado'
         ];
       } else if (cabecera.rol === "departamental") {
         // Departamental puede crear usuarios pero con restricciones
         camposPermitidos = [
           'tipo_persona_id', 'nombre', 'apellido', 'fecha_nacimiento',
           'documento', 'password', 'email', 'telefono', 'legajo',
-          'foto_archivo', 'habilitado'
+          'cuil', 'cbu', 'foto_archivo', 'habilitado'
         ];
         // Asignar automáticamente rol afiliado y su departamento
         const [rolAfiliado] = await connection.query(
