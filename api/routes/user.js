@@ -196,6 +196,52 @@ function manejarUploadConvenioHotel(req, res, next) {
   });
 }
 
+const uploadTurismoPropuesta = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    files: 1,
+    fileSize: 8 * 1024 * 1024,
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.fieldname === "imagen" && file.mimetype?.startsWith("image/")) {
+      return cb(null, true);
+    }
+    return cb(new Error("Solo se permite una imagen"));
+  },
+}).single("imagen");
+
+function manejarUploadTurismoPropuesta(req, res, next) {
+  uploadTurismoPropuesta(req, res, (error) => {
+    if (error) {
+      return res.status(400).json(error.message || "No se pudo procesar la imagen");
+    }
+    return next();
+  });
+}
+
+const uploadTurismoTestimonio = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    files: 1,
+    fileSize: 5 * 1024 * 1024,
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.fieldname === "foto" && file.mimetype?.startsWith("image/")) {
+      return cb(null, true);
+    }
+    return cb(new Error("Solo se permite una imagen de perfil"));
+  },
+}).single("foto");
+
+function manejarUploadTurismoTestimonio(req, res, next) {
+  uploadTurismoTestimonio(req, res, (error) => {
+    if (error) {
+      return res.status(400).json(error.message || "No se pudo procesar la foto");
+    }
+    return next();
+  });
+}
+
 router.post("/signin", async (req, res) => {
   const documento = req.body.documento || null;
   const password = req.body.password || null;
@@ -785,6 +831,265 @@ router.get("/servicios", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener los servicios");
+  }
+});
+
+router.get("/turismo/propuestas", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const propuestas = await obtenerPropuestasTurismo(mysqlConnection.promise());
+    res.status(200).json(propuestas);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener las propuestas de turismo");
+  }
+});
+
+router.get("/admin/turismo/propuestas", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const propuestas = await obtenerPropuestasTurismo(mysqlConnection.promise());
+    res.status(200).json(propuestas);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener las propuestas de turismo");
+  }
+});
+
+router.put("/admin/turismo/propuestas/:id", verifyToken, manejarUploadTurismoPropuesta, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const propuestaId = normalizarIdPositivo(req.params.id);
+    if (!propuestaId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    const titulo = normalizarTexto(req.body.titulo);
+    const link = normalizarTexto(req.body.link);
+    if (!titulo || !link) {
+      return res.status(400).json("Titulo y link son requeridos");
+    }
+    if (!/^https?:\/\//i.test(link)) {
+      return res.status(400).json("El link debe comenzar con http:// o https://");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const [existentes] = await connection.query(
+      "SELECT * FROM turismo_propuesta WHERE id = ? LIMIT 1 FOR UPDATE",
+      [propuestaId]
+    );
+    if (existentes.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Propuesta de turismo no encontrada");
+    }
+
+    let imagenArchivo = existentes[0].imagen_archivo;
+    if (req.file) {
+      imagenArchivo = await subirImagenTurismoPropuesta(req.file);
+    }
+
+    await connection.query(
+      `
+        UPDATE turismo_propuesta
+        SET titulo = ?,
+            link = ?,
+            imagen_archivo = ?
+        WHERE id = ?
+      `,
+      [titulo, link, imagenArchivo, propuestaId]
+    );
+
+    await connection.commit();
+
+    const propuestas = await obtenerPropuestasTurismo(mysqlConnection.promise(), propuestaId);
+    res.status(200).json(propuestas[0]);
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    res.status(500).json("Error al actualizar la propuesta de turismo");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+router.get("/turismo/testimonios", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const testimonios = await obtenerTestimoniosTurismo(mysqlConnection.promise(), { soloActivos: true });
+    res.status(200).json(testimonios);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los testimonios de turismo");
+  }
+});
+
+router.get("/admin/turismo/testimonios", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const testimonios = await obtenerTestimoniosTurismo(mysqlConnection.promise());
+    res.status(200).json(testimonios);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los testimonios de turismo");
+  }
+});
+
+router.post("/admin/turismo/testimonios", verifyToken, manejarUploadTurismoTestimonio, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const datos = validarDatosTestimonioTurismo(req.body);
+    if (datos.error) {
+      return res.status(400).json(datos.error);
+    }
+
+    let fotoArchivo = null;
+    if (req.file) {
+      fotoArchivo = await subirFotoTurismoTestimonio(req.file);
+    }
+
+    const db = mysqlConnection.promise();
+    const [resultado] = await db.query(
+      `
+        INSERT INTO turismo_testimonio (nombre, localidad, estrellas, comentario, foto_archivo, activo, orden)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `,
+      [datos.nombre, datos.localidad, datos.estrellas, datos.comentario, fotoArchivo, datos.activo, datos.orden]
+    );
+
+    const testimonios = await obtenerTestimoniosTurismo(db, { testimonioId: resultado.insertId });
+    res.status(201).json(testimonios[0]);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al crear el testimonio de turismo");
+  }
+});
+
+router.put("/admin/turismo/testimonios/:id", verifyToken, manejarUploadTurismoTestimonio, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const testimonioId = normalizarIdPositivo(req.params.id);
+    if (!testimonioId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    const datos = validarDatosTestimonioTurismo(req.body);
+    if (datos.error) {
+      return res.status(400).json(datos.error);
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const [existentes] = await connection.query(
+      "SELECT * FROM turismo_testimonio WHERE id = ? LIMIT 1 FOR UPDATE",
+      [testimonioId]
+    );
+    if (existentes.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Testimonio de turismo no encontrado");
+    }
+
+    let fotoArchivo = existentes[0].foto_archivo;
+    if (req.file) {
+      fotoArchivo = await subirFotoTurismoTestimonio(req.file);
+    } else if (normalizarBoolean(req.body.quitar_foto)) {
+      fotoArchivo = null;
+    }
+
+    await connection.query(
+      `
+        UPDATE turismo_testimonio
+        SET nombre = ?,
+            localidad = ?,
+            estrellas = ?,
+            comentario = ?,
+            foto_archivo = ?,
+            activo = ?,
+            orden = ?
+        WHERE id = ?
+      `,
+      [datos.nombre, datos.localidad, datos.estrellas, datos.comentario, fotoArchivo, datos.activo, datos.orden, testimonioId]
+    );
+
+    await connection.commit();
+
+    const testimonios = await obtenerTestimoniosTurismo(mysqlConnection.promise(), { testimonioId });
+    res.status(200).json(testimonios[0]);
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.log(error);
+    res.status(500).json("Error al actualizar el testimonio de turismo");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+router.delete("/admin/turismo/testimonios/:id", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const testimonioId = normalizarIdPositivo(req.params.id);
+    if (!testimonioId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    const db = mysqlConnection.promise();
+    const [resultado] = await db.query(
+      "DELETE FROM turismo_testimonio WHERE id = ?",
+      [testimonioId]
+    );
+
+    if (resultado.affectedRows === 0) {
+      return res.status(404).json("Testimonio de turismo no encontrado");
+    }
+
+    res.status(200).json({ id: testimonioId });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al eliminar el testimonio de turismo");
   }
 });
 
@@ -4353,6 +4658,173 @@ async function subirArchivoConvenioHotel(file, prefijo) {
     contentType: file.mimetype,
   });
   return key;
+}
+
+async function subirImagenTurismoPropuesta(file) {
+  const extension = EXTENSION_BY_MIME[file.mimetype] || getSafeFileExtension(file.originalname, file.mimetype);
+  const key = `turismo_propuestas/propuesta_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.${extension}`;
+  await uploadBufferToS3({
+    key,
+    buffer: file.buffer,
+    contentType: file.mimetype,
+  });
+  return key;
+}
+
+async function firmarTurismoPropuesta(row) {
+  let imagenUrl = null;
+  if (row?.imagen_archivo) {
+    try {
+      imagenUrl = await getSignedFileUrlFromS3(row.imagen_archivo);
+    } catch (error) {
+      console.error("Error generando URL firmada para propuesta de turismo:", error);
+    }
+  }
+
+  return {
+    id: Number(row.id),
+    titulo: row.titulo,
+    name: row.titulo,
+    link: row.link,
+    imagen_archivo: row.imagen_archivo,
+    imagen_url: imagenUrl,
+    image: imagenUrl,
+    orden: Number(row.orden || 0),
+    fecha_creacion: row.fecha_creacion,
+    fecha_modificacion: row.fecha_modificacion,
+  };
+}
+
+async function obtenerPropuestasTurismo(connection, propuestaId = null) {
+  const params = [];
+  let filtro = "";
+  if (propuestaId) {
+    filtro = "WHERE id = ?";
+    params.push(propuestaId);
+  }
+
+  const [rows] = await connection.query(
+    `
+      SELECT
+        id,
+        titulo,
+        imagen_archivo,
+        link,
+        orden,
+        fecha_creacion,
+        fecha_modificacion
+      FROM turismo_propuesta
+      ${filtro}
+      ORDER BY orden ASC, id ASC
+    `,
+    params
+  );
+
+  return Promise.all(rows.map((row) => firmarTurismoPropuesta(row)));
+}
+
+function validarDatosTestimonioTurismo(body) {
+  const nombre = normalizarTexto(body.nombre);
+  const localidad = normalizarTexto(body.localidad);
+  const comentario = normalizarTexto(body.comentario);
+  const estrellas = Number(body.estrellas);
+
+  if (!nombre || nombre.length > 80) {
+    return { error: "El nombre es requerido (maximo 80 caracteres)" };
+  }
+  if (!localidad || localidad.length > 120) {
+    return { error: "La localidad es requerida (maximo 120 caracteres)" };
+  }
+  if (!comentario || comentario.length > 500) {
+    return { error: "El comentario es requerido (maximo 500 caracteres)" };
+  }
+  if (!Number.isInteger(estrellas) || estrellas < 1 || estrellas > 5) {
+    return { error: "Las estrellas deben ser un entero entre 1 y 5" };
+  }
+
+  const orden = normalizarNumeroNullable(body.orden);
+
+  return {
+    nombre,
+    localidad,
+    comentario,
+    estrellas,
+    activo: normalizarBooleanActivo(body.activo),
+    orden: orden !== null ? Math.trunc(orden) : 0,
+  };
+}
+
+async function subirFotoTurismoTestimonio(file) {
+  const extension = EXTENSION_BY_MIME[file.mimetype] || getSafeFileExtension(file.originalname, file.mimetype);
+  const key = `turismo_testimonios/testimonio_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.${extension}`;
+  await uploadBufferToS3({
+    key,
+    buffer: file.buffer,
+    contentType: file.mimetype,
+  });
+  return key;
+}
+
+async function firmarTurismoTestimonio(row) {
+  let fotoUrl = null;
+  if (row?.foto_archivo) {
+    try {
+      fotoUrl = await getSignedFileUrlFromS3(row.foto_archivo);
+    } catch (error) {
+      console.error("Error generando URL firmada para testimonio de turismo:", error);
+    }
+  }
+
+  return {
+    id: Number(row.id),
+    nombre: row.nombre,
+    localidad: row.localidad,
+    estrellas: Number(row.estrellas),
+    comentario: row.comentario,
+    foto_archivo: row.foto_archivo,
+    foto_url: fotoUrl,
+    activo: row.activo === 1 || row.activo === true,
+    orden: Number(row.orden || 0),
+    fecha_creacion: row.fecha_creacion,
+    fecha_modificacion: row.fecha_modificacion,
+  };
+}
+
+async function obtenerTestimoniosTurismo(connection, { soloActivos = false, testimonioId = null } = {}) {
+  const condiciones = [];
+  const params = [];
+
+  if (soloActivos) {
+    condiciones.push("activo = 1");
+  }
+  if (testimonioId) {
+    condiciones.push("id = ?");
+    params.push(testimonioId);
+  }
+
+  const filtro = condiciones.length > 0 ? `WHERE ${condiciones.join(" AND ")}` : "";
+
+  const [rows] = await connection.query(
+    `
+      SELECT
+        id,
+        nombre,
+        localidad,
+        estrellas,
+        comentario,
+        foto_archivo,
+        activo,
+        orden,
+        fecha_creacion,
+        fecha_modificacion
+      FROM turismo_testimonio
+      ${filtro}
+      ORDER BY orden ASC, id ASC
+    `,
+    params
+  );
+
+  return Promise.all(rows.map((row) => firmarTurismoTestimonio(row)));
 }
 
 async function firmarImagenesConvenio(imagenes = []) {
