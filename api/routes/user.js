@@ -13604,6 +13604,20 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
             message: "Error al guardar la foto"
           });
         }
+      } else if (
+        camposPermitidos.includes('foto_archivo') &&
+        normalizarBoolean(req.body.quitar_foto) &&
+        datosAnteriores.foto_archivo
+      ) {
+        // Quitar la foto de perfil (el objeto en S3 se conserva, igual que al
+        // reemplazarla)
+        updateFields.push('foto_archivo = ?');
+        updateValues.push(null);
+        cambios.push({
+          campo: 'foto_archivo',
+          valorAnterior: datosAnteriores.foto_archivo,
+          valorNuevo: null
+        });
       }
 
       // Si no hay cambios, retornar
