@@ -794,7 +794,7 @@ router.get("/coseguro/perfil", verifyToken, async (req, res) => {
       `SELECT u.id, u.nombre, u.apellido, u.documento, u.fecha_nacimiento, u.parentesco_id, p.nombre AS parentesco,
               TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) AS edad
        FROM usuario u LEFT JOIN parentesco p ON p.id = u.parentesco_id
-       WHERE u.usuario_familiar_id = ? AND u.habilitado = 'Y'
+       WHERE u.usuario_familiar_id = ? AND u.es_familiar = 'S' AND u.habilitado = 'Y'
        ORDER BY u.apellido, u.nombre`,
       [usuarioId]
     );
@@ -1057,7 +1057,7 @@ async function validarDatosSolicitud(db, cabecera, body, opciones) {
     : null;
   if (familiarId) {
     const [familiares] = await db.query(
-      "SELECT id, documento, nombre, apellido FROM usuario WHERE id = ? AND usuario_familiar_id = ?",
+      "SELECT id, documento, nombre, apellido FROM usuario WHERE id = ? AND usuario_familiar_id = ? AND es_familiar = 'S'",
       [familiarId, opciones.usuarioId]
     );
     if (familiares.length === 0) {

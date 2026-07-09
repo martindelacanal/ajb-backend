@@ -4899,6 +4899,13 @@ async function obtenerImagenesConvenioPorHotel(connection, hotelIds) {
   return mapa;
 }
 
+// Vínculo por defecto de una persona creada durante una reserva: si el
+// parentesco declarado es Pareja (2), Hijo (3) o Familiar (4) integra el grupo
+// familiar; el resto queda como acompañante de viaje.
+function esFamiliarPorParentesco(parentescoId) {
+  return [2, 3, 4].includes(Number(parentescoId)) ? "S" : "N";
+}
+
 async function obtenerUsuarioPrincipalFamilia(connection, usuarioId) {
   const [usuarioCreador] = await connection.query(
     "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
@@ -4959,8 +4966,8 @@ async function crearOBuscarUsuariosReserva(connection, personas, {
       const [nuevoUsuario] = await connection.query(
         `INSERT INTO usuario (
           rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento,
-          documento, telefono, password, usuario_familiar_id, departamental_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+          documento, telefono, password, usuario_familiar_id, es_familiar, departamental_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
         [
           rolId,
           persona.parentesco_id || null,
@@ -4971,6 +4978,7 @@ async function crearOBuscarUsuariosReserva(connection, personas, {
           dni,
           persona.telefono || null,
           usuarioFamiliarPrincipalId,
+          esFamiliarPorParentesco(persona.parentesco_id),
           departamentalId,
         ]
       );
@@ -5819,8 +5827,8 @@ async function obtenerOCrearUsuariosPersonasReserva(connection, personas, cabece
       const [nuevoUsuario] = await connection.query(
         `INSERT INTO usuario (
           rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento,
-          documento, telefono, email, password, usuario_familiar_id, departamental_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+          documento, telefono, email, password, usuario_familiar_id, es_familiar, departamental_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
         [
           rolId,
           persona.parentesco_id,
@@ -5832,6 +5840,7 @@ async function obtenerOCrearUsuariosPersonasReserva(connection, personas, cabece
           persona.telefono || null,
           persona.email || null,
           usuarioFamiliarPrincipalId,
+          esFamiliarPorParentesco(persona.parentesco_id),
           departamentalId
         ]
       );
@@ -6818,9 +6827,9 @@ router.post("/reserva", verifyToken, async (req, res) => {
             // Crear nuevo usuario con usuario_familiar_id y departamental_id establecidos
             const [nuevoUsuario] = await connection.query(
               `INSERT INTO usuario (
-              rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento, 
-              documento, telefono, password, usuario_familiar_id, departamental_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+              rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento,
+              documento, telefono, password, usuario_familiar_id, es_familiar, departamental_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
               [
                 rolId,
                 persona.parentesco_id,
@@ -6831,6 +6840,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
                 persona.dni,
                 persona.telefono || null,
                 usuarioFamiliarPrincipalId,
+                esFamiliarPorParentesco(persona.parentesco_id),
                 departamentalId
               ]
             );
@@ -7541,9 +7551,9 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                 // Crear nuevo usuario con departamental_id
                 const [nuevoUsuario] = await connection.query(
                   `INSERT INTO usuario (
-                  rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento, 
-                  documento, telefono, email, password, usuario_familiar_id, departamental_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+                  rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento,
+                  documento, telefono, email, password, usuario_familiar_id, es_familiar, departamental_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
                   [
                     rolId,
                     persona.parentesco_id,
@@ -7555,6 +7565,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                     persona.telefono || null,
                     persona.email || null,
                     usuarioFamiliarPrincipalId,
+                    esFamiliarPorParentesco(persona.parentesco_id),
                     departamentalId
                   ]
                 );
@@ -7589,9 +7600,9 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
               // Crear nuevo usuario con departamental_id
               const [nuevoUsuario] = await connection.query(
                 `INSERT INTO usuario (
-                rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento, 
-                documento, telefono, email, password, usuario_familiar_id, departamental_id
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+                rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento,
+                documento, telefono, email, password, usuario_familiar_id, es_familiar, departamental_id
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
                 [
                   rolId,
                   persona.parentesco_id,
@@ -7603,6 +7614,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                   persona.telefono || null,
                   persona.email || null,
                   usuarioFamiliarPrincipalId,
+                  esFamiliarPorParentesco(persona.parentesco_id),
                   departamentalId
                 ]
               );
@@ -10333,6 +10345,11 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
   }
 });
 
+// POST /tabla/acompaniantes - Tabla unificada de "Familiares y acompañantes" del afiliado.
+// Devuelve en una sola lista los familiares del grupo familiar (es_familiar = 'S',
+// los que usa el coseguro médico) y los acompañantes de viaje sin cuenta propia
+// (personas creadas en reservas o que compartieron reservas con el afiliado).
+// Body (filtros): { vinculo: 'FAMILIAR'|'ACOMPANIANTE', parentesco_id, dni: 'con'|'sin' }
 router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
 
@@ -10340,85 +10357,409 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
     return res.status(401).json("No autorizado");
   }
 
-  let buscar = req.query.search;
-  const page = req.query.page ? Number(req.query.page) : 1;
-  const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 10;
+  const usuarioId = Number(cabecera.id);
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const resultsPerPage = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 10));
   const start = (page - 1) * resultsPerPage;
 
-  let orderBy = req.query.orderBy ? req.query.orderBy : "fecha_creacion";
+  const ordenColumnas = {
+    nombre: "base.nombre",
+    apellido: "base.apellido",
+    documento: "base.documento",
+    parentesco: "base.parentesco",
+    edad: "base.edad",
+    vinculo: "base.vinculo",
+    viajes_compartidos: "base.viajes_compartidos",
+    fecha_creacion: "base.fecha_creacion_orden",
+  };
+  const orderBy = ordenColumnas[req.query.orderBy] ? req.query.orderBy : "fecha_creacion";
   const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
 
-  // Map orderBy to correct SQL columns
-  if (orderBy === "nombre") {
-    orderBy = "u.nombre";
-  } else if (orderBy === "apellido") {
-    orderBy = "u.apellido";
-  } else if (orderBy === "documento") {
-    orderBy = "u.documento";
-  } else if (orderBy === "parentesco") {
-    orderBy = "p.nombre";
-  } else if (orderBy === "tipo_persona") {
-    orderBy = "tp.nombre";
-  } else if (orderBy === "fecha_creacion") {
-    orderBy = "u.fecha_creacion";
-  }
+  const filtros = req.body || {};
+  const filtroVinculo = ["FAMILIAR", "ACOMPANIANTE"].includes(filtros.vinculo) ? filtros.vinculo : null;
+  const filtroParentesco = filtros.parentesco_id ? Number(filtros.parentesco_id) : null;
+  const filtroDni = ["con", "sin"].includes(filtros.dni) ? filtros.dni : null;
 
-  const queryOrderBy = `${orderBy} ${orderType}`;
-
-  let queryBuscar = "";
-  if (buscar) {
-    buscar = "%" + buscar + "%";
-    queryBuscar = `AND (u.nombre LIKE '${buscar}' OR u.apellido LIKE '${buscar}' OR u.documento LIKE '${buscar}' OR p.nombre LIKE '${buscar}' OR tp.nombre LIKE '${buscar}' OR DATE_FORMAT(u.fecha_creacion, '%d/%m/%Y') LIKE '${buscar}')`;
-  }
-
-  const queryParams = [cabecera.id];
-  let query = `
-    SELECT 
+  // Universo del afiliado: familiares del grupo + acompañantes de viaje sin
+  // cuenta propia (vinculados directamente o a través de reservas compartidas).
+  const baseQuery = `
+    SELECT
       u.id,
       u.nombre,
       u.apellido,
       u.documento,
-      u.tipo_persona_id,
+      u.fecha_nacimiento,
+      TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) AS edad,
+      u.telefono,
+      u.parentesco_id,
       p.nombre AS parentesco,
+      u.tipo_persona_id,
       tp.nombre AS tipo_persona,
-      DATE_FORMAT(u.fecha_creacion, '%d/%m/%Y') AS fecha_creacion
+      CASE WHEN u.usuario_familiar_id = ? AND u.es_familiar = 'S' THEN 'FAMILIAR' ELSE 'ACOMPANIANTE' END AS vinculo,
+      (u.password IS NOT NULL OR (u.email IS NOT NULL AND u.email <> '')) AS tiene_usuario,
+      (SELECT COUNT(DISTINCT rf.reserva_id)
+         FROM reserva_familiar rf
+        WHERE rf.usuario_id = u.id
+          AND rf.reserva_id IN (SELECT rf2.reserva_id FROM reserva_familiar rf2 WHERE rf2.usuario_id = ?)) AS viajes_compartidos,
+      (SELECT MAX(r.fecha_inicio)
+         FROM reserva r
+        INNER JOIN reserva_familiar rf3 ON rf3.reserva_id = r.id
+        WHERE rf3.usuario_id = u.id
+          AND r.id IN (SELECT rf4.reserva_id FROM reserva_familiar rf4 WHERE rf4.usuario_id = ?)) AS ultimo_viaje_fecha,
+      DATE_FORMAT(u.fecha_creacion, '%d/%m/%Y') AS fecha_creacion,
+      u.fecha_creacion AS fecha_creacion_orden
     FROM usuario u
     LEFT JOIN parentesco p ON u.parentesco_id = p.id
     LEFT JOIN tipo_persona tp ON u.tipo_persona_id = tp.id
-    WHERE u.usuario_familiar_id = ?
-      ${queryBuscar}
-    ORDER BY ${queryOrderBy}
-    LIMIT ${start}, ${resultsPerPage}
+    WHERE u.id <> ?
+      AND COALESCE(u.habilitado, 'Y') = 'Y'
+      AND (
+        (u.usuario_familiar_id = ? AND u.es_familiar = 'S')
+        OR (
+          u.password IS NULL AND (u.email IS NULL OR u.email = '')
+          AND (
+            (u.usuario_familiar_id = ? AND (u.es_familiar IS NULL OR u.es_familiar = 'N'))
+            OR u.id IN (
+              SELECT rf5.usuario_id
+              FROM reserva_familiar rf5
+              WHERE rf5.reserva_id IN (SELECT rf6.reserva_id FROM reserva_familiar rf6 WHERE rf6.usuario_id = ?)
+            )
+          )
+        )
+      )
   `;
+  const baseParams = [usuarioId, usuarioId, usuarioId, usuarioId, usuarioId, usuarioId, usuarioId];
+
+  const condiciones = [];
+  const paramsFiltro = [];
+  if (req.query.search) {
+    const buscar = `%${req.query.search}%`;
+    condiciones.push(`(
+      base.nombre LIKE ? OR base.apellido LIKE ?
+      OR CONCAT(base.nombre, ' ', base.apellido) LIKE ?
+      OR CONCAT(base.apellido, ' ', base.nombre) LIKE ?
+      OR CAST(base.documento AS CHAR) LIKE ?
+      OR base.parentesco LIKE ?
+    )`);
+    paramsFiltro.push(buscar, buscar, buscar, buscar, buscar, buscar);
+  }
+  if (filtroVinculo) {
+    condiciones.push("base.vinculo = ?");
+    paramsFiltro.push(filtroVinculo);
+  }
+  if (filtroParentesco) {
+    condiciones.push("base.parentesco_id = ?");
+    paramsFiltro.push(filtroParentesco);
+  }
+  if (filtroDni === "con") {
+    condiciones.push("base.documento IS NOT NULL AND base.documento > 0");
+  } else if (filtroDni === "sin") {
+    condiciones.push("(base.documento IS NULL OR base.documento <= 0)");
+  }
+  const whereFiltros = condiciones.length > 0 ? `WHERE ${condiciones.join(" AND ")}` : "";
 
   try {
-    const [rows] = await mysqlConnection.promise().execute(query, queryParams);
+    const db = mysqlConnection.promise();
 
-    // Count total items for pagination
-    let countQuery = `
-      SELECT COUNT(*) AS count
-      FROM usuario u
-      LEFT JOIN parentesco p ON u.parentesco_id = p.id
-      LEFT JOIN tipo_persona tp ON u.tipo_persona_id = tp.id
-      WHERE u.usuario_familiar_id = ?
-      ${queryBuscar}
-    `;
-    const [countRows] = await mysqlConnection.promise().execute(countQuery, queryParams);
+    const [rows] = await db.query(
+      `SELECT base.* FROM (${baseQuery}) base
+       ${whereFiltros}
+       ORDER BY ${ordenColumnas[orderBy]} ${orderType}, base.apellido ASC, base.nombre ASC
+       LIMIT ${start}, ${resultsPerPage}`,
+      [...baseParams, ...paramsFiltro]
+    );
+
+    const [countRows] = await db.query(
+      `SELECT COUNT(*) AS count FROM (${baseQuery}) base ${whereFiltros}`,
+      [...baseParams, ...paramsFiltro]
+    );
+
+    // Stats del universo completo (sin filtros): alimentan chips y tarjetas.
+    const [statsRows] = await db.query(
+      `SELECT
+         COUNT(*) AS total,
+         COALESCE(SUM(base.vinculo = 'FAMILIAR'), 0) AS familiares,
+         COALESCE(SUM(base.vinculo = 'ACOMPANIANTE'), 0) AS acompaniantes,
+         COALESCE(SUM(base.vinculo = 'FAMILIAR' AND base.documento IS NOT NULL AND base.documento > 0), 0) AS listos_coseguro
+       FROM (${baseQuery}) base`,
+      baseParams
+    );
+
+    const formatearFecha = (fecha) => {
+      if (!fecha) return null;
+      const f = new Date(fecha);
+      if (isNaN(f.getTime())) return null;
+      return f.toLocaleDateString("es-AR", { day: "2-digit", month: "2-digit", year: "numeric" });
+    };
 
     const numOfResults = countRows[0].count;
-    const numOfPages = Math.ceil(numOfResults / resultsPerPage);
 
     res.json({
-      results: rows,
-      numOfPages,
+      results: rows.map((row) => ({
+        id: row.id,
+        nombre: row.nombre,
+        apellido: row.apellido,
+        documento: row.documento,
+        fecha_nacimiento: row.fecha_nacimiento,
+        edad: row.edad,
+        telefono: row.telefono,
+        parentesco_id: row.parentesco_id,
+        parentesco: row.parentesco,
+        tipo_persona_id: row.tipo_persona_id,
+        tipo_persona: row.tipo_persona,
+        vinculo: row.vinculo,
+        tiene_usuario: Boolean(row.tiene_usuario),
+        viajes_compartidos: Number(row.viajes_compartidos) || 0,
+        ultimo_viaje: formatearFecha(row.ultimo_viaje_fecha),
+        fecha_creacion: row.fecha_creacion,
+      })),
+      numOfPages: Math.ceil(numOfResults / resultsPerPage),
       totalItems: numOfResults,
       page: page - 1,
-      orderBy: req.query.orderBy || "fecha_creacion",
+      orderBy,
       orderType,
+      stats: {
+        total: Number(statsRows[0].total) || 0,
+        familiares: Number(statsRows[0].familiares) || 0,
+        acompaniantes: Number(statsRows[0].acompaniantes) || 0,
+        listos_coseguro: Number(statsRows[0].listos_coseguro) || 0,
+      },
     });
   } catch (error) {
     console.log(error);
     res.status(500).json("Error interno");
+  }
+});
+
+// POST /familiares - Alta de un familiar del grupo familiar (rol afiliado).
+// El familiar queda vinculado con usuario_familiar_id + es_familiar = 'S' y por
+// eso también queda disponible como "familiar a cargo" en el coseguro médico.
+router.post("/familiares", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "afiliado") {
+      return res.status(401).json({ success: false, message: "No autorizado" });
+    }
+
+    const { nombre, apellido, parentesco_id, fecha_nacimiento, documento, telefono } = req.body || {};
+
+    if (!nombre || !apellido) {
+      return res.status(400).json({ success: false, message: "Nombre y apellido son requeridos" });
+    }
+    const parentescoId = Number(parentesco_id);
+    if (![2, 3, 4].includes(parentescoId)) {
+      return res.status(400).json({ success: false, message: "El parentesco debe ser Pareja, Hijo o Familiar" });
+    }
+    const fechaNacimiento = new Date(fecha_nacimiento);
+    if (!fecha_nacimiento || isNaN(fechaNacimiento.getTime())) {
+      return res.status(400).json({ success: false, message: "La fecha de nacimiento es requerida" });
+    }
+    const documentoNormalizado = documento !== undefined && documento !== null && String(documento).trim() !== ""
+      ? String(documento).replace(/\D/g, "")
+      : null;
+    if (documentoNormalizado !== null && (documentoNormalizado.length < 6 || documentoNormalizado.length > 9)) {
+      return res.status(400).json({ success: false, message: "El DNI debe tener entre 6 y 9 dígitos" });
+    }
+
+    const edad = Math.floor((Date.now() - fechaNacimiento.getTime()) / (365.25 * 24 * 60 * 60 * 1000));
+    // Menores de 2 años (5); resto: invitados familiares AJB (2)
+    const tipoPersonaId = edad < 2 ? 5 : 2;
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const [titular] = await connection.query(
+      "SELECT id, departamental_id FROM usuario WHERE id = ?",
+      [cabecera.id]
+    );
+    if (titular.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ success: false, message: "Usuario no encontrado" });
+    }
+
+    if (documentoNormalizado !== null) {
+      const [existente] = await connection.query(
+        "SELECT id, usuario_familiar_id, es_familiar, password, email FROM usuario WHERE documento = ?",
+        [Number(documentoNormalizado)]
+      );
+
+      if (existente.length > 0) {
+        const persona = existente[0];
+        const esDelGrupo = Number(persona.usuario_familiar_id) === Number(cabecera.id);
+        const sinCuenta = persona.password === null && (persona.email === null || persona.email === "");
+
+        if (esDelGrupo && persona.es_familiar === "S") {
+          await connection.rollback();
+          return res.status(409).json({ success: false, message: "Esa persona ya está cargada como familiar" });
+        }
+
+        // Si ya viajó con el afiliado (o quedó vinculada como acompañante) y no
+        // tiene cuenta propia, se la promueve a familiar en lugar de duplicarla.
+        if (esDelGrupo && sinCuenta) {
+          await connection.query(
+            "UPDATE usuario SET es_familiar = 'S', parentesco_id = ? WHERE id = ?",
+            [parentescoId, persona.id]
+          );
+          await registrarHistorial(
+            connection,
+            persona.id,
+            "UPDATE",
+            "usuario",
+            cabecera.id,
+            req,
+            [{ campo: "es_familiar", valorAnterior: persona.es_familiar, valorNuevo: "S" }],
+            "Acompañante de viaje promovido a familiar del grupo familiar"
+          );
+          await connection.commit();
+          return res.status(200).json({
+            success: true,
+            id: persona.id,
+            promovido: true,
+            message: "Esa persona ya te acompañó en viajes: la sumamos a tu grupo familiar",
+          });
+        }
+
+        await connection.rollback();
+        return res.status(409).json({ success: false, message: "Ya existe otra persona registrada con ese DNI" });
+      }
+    }
+
+    const [nuevoFamiliar] = await connection.query(
+      `INSERT INTO usuario (
+        rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento,
+        documento, telefono, password, usuario_familiar_id, es_familiar, departamental_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'S', ?)`,
+      [
+        4, // rol invitado: familiar sin cuenta propia
+        parentescoId,
+        tipoPersonaId,
+        String(nombre).trim(),
+        String(apellido).trim(),
+        fechaNacimiento.toISOString().split("T")[0],
+        documentoNormalizado !== null ? Number(documentoNormalizado) : null,
+        telefono || null,
+        cabecera.id,
+        titular[0].departamental_id || null,
+      ]
+    );
+
+    await registrarHistorial(
+      connection,
+      nuevoFamiliar.insertId,
+      "CREATE",
+      "usuario",
+      cabecera.id,
+      req,
+      null,
+      `Familiar cargado por el afiliado. Datos: ${String(nombre).trim()} ${String(apellido).trim()}${documentoNormalizado ? `, DNI: ${documentoNormalizado}` : ""}`
+    );
+
+    await connection.commit();
+    res.status(201).json({ success: true, id: nuevoFamiliar.insertId, message: "Familiar agregado a tu grupo familiar" });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    if (error && error.code === "ER_DUP_ENTRY") {
+      return res.status(409).json({ success: false, message: "Ya existe otra persona registrada con ese DNI" });
+    }
+    console.log(error);
+    res.status(500).json({ success: false, message: "Error al agregar el familiar" });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+// PUT /familiares/:id/vinculo - Cambia el vínculo de una persona con el afiliado.
+// Body: { es_familiar: 'S' | 'N', parentesco_id? } — 'S' suma la persona al grupo
+// familiar (coseguro), 'N' la deja solo como acompañante de viaje.
+router.put("/familiares/:id/vinculo", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "afiliado") {
+      return res.status(401).json({ success: false, message: "No autorizado" });
+    }
+
+    const personaId = Number(req.params.id);
+    const esFamiliar = req.body && req.body.es_familiar === "S" ? "S" : "N";
+    const parentescoId = req.body && [2, 3, 4].includes(Number(req.body.parentesco_id))
+      ? Number(req.body.parentesco_id)
+      : null;
+
+    if (!personaId || personaId === Number(cabecera.id)) {
+      return res.status(400).json({ success: false, message: "ID inválido" });
+    }
+
+    const db = mysqlConnection.promise();
+    const [personas] = await db.query(
+      "SELECT id, usuario_familiar_id, es_familiar, parentesco_id, password, email FROM usuario WHERE id = ?",
+      [personaId]
+    );
+    if (personas.length === 0) {
+      return res.status(404).json({ success: false, message: "Persona no encontrada" });
+    }
+
+    const persona = personas[0];
+    const esDelGrupo = Number(persona.usuario_familiar_id) === Number(cabecera.id);
+    const sinCuenta = persona.password === null && (persona.email === null || persona.email === "");
+
+    if (!esDelGrupo) {
+      // Solo se puede sumar al grupo a alguien sin cuenta propia que haya
+      // compartido al menos una reserva con el afiliado.
+      const [comparte] = await db.query(
+        `SELECT COUNT(*) AS c
+         FROM reserva_familiar rf
+         WHERE rf.usuario_id = ?
+           AND rf.reserva_id IN (SELECT rf2.reserva_id FROM reserva_familiar rf2 WHERE rf2.usuario_id = ?)`,
+        [personaId, cabecera.id]
+      );
+      if (!sinCuenta || Number(comparte[0].c) === 0) {
+        return res.status(401).json({ success: false, message: "No autorizado" });
+      }
+    }
+
+    const cambios = [{ campo: "es_familiar", valorAnterior: persona.es_familiar, valorNuevo: esFamiliar }];
+    if (esFamiliar === "S" && parentescoId && parentescoId !== persona.parentesco_id) {
+      cambios.push({ campo: "parentesco_id", valorAnterior: persona.parentesco_id, valorNuevo: parentescoId });
+    }
+
+    await db.query(
+      `UPDATE usuario
+       SET es_familiar = ?,
+           usuario_familiar_id = ?,
+           parentesco_id = COALESCE(?, parentesco_id)
+       WHERE id = ?`,
+      [
+        esFamiliar,
+        esFamiliar === "S" ? cabecera.id : persona.usuario_familiar_id,
+        esFamiliar === "S" ? parentescoId : null,
+        personaId,
+      ]
+    );
+
+    await registrarHistorial(
+      mysqlConnection.promise(),
+      personaId,
+      "UPDATE",
+      "usuario",
+      cabecera.id,
+      req,
+      cambios,
+      esFamiliar === "S"
+        ? "Persona sumada al grupo familiar por el afiliado"
+        : "Persona quitada del grupo familiar por el afiliado"
+    );
+
+    res.status(200).json({
+      success: true,
+      message: esFamiliar === "S" ? "Persona sumada a tu grupo familiar" : "Persona quitada de tu grupo familiar",
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json({ success: false, message: "Error al actualizar el vínculo" });
   }
 });
 
