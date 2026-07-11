@@ -10003,6 +10003,11 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   let buscar = req.query.search;
   const filters = req.body;
+  // Filtro por estado de reserva (nombre en estado_reserva). "Todas" = sin filtro.
+  const estadoFiltro =
+    typeof filters.estado === "string" && filters.estado.trim() !== "" && filters.estado !== "Todas"
+      ? filters.estado.trim()
+      : null;
   const fecha_incio = filters.startDate || "2023-01-01";
   const fecha_fin = filters.endDate || "2070-12-31";
   let fromDate = new Date(fecha_incio);
@@ -10014,8 +10019,10 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
   toDate = toDate.toISOString().split("T")[0];
 
   let queryBuscar = "";
-  const page = req.query.page ? Number(req.query.page) : 1;
-  const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 10;
+  // La página es 1-based; se clampa para que un page=0 o inválido nunca
+  // genere un LIMIT negativo (error de sintaxis SQL).
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const resultsPerPage = Math.max(1, Number(req.query.pageSize) || 10);
   const start = (page - 1) * resultsPerPage;
 
   let orderBy = req.query.orderBy ? req.query.orderBy : "fecha_inicio";
@@ -10067,10 +10074,11 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
     LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
     INNER JOIN usuario u ON r.usuario_id = u.id
-    WHERE 1=1 
+    WHERE 1=1
       ${queryBuscar}
       ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
       ${toDate ? "AND r.fecha_fin <= ?" : ""}
+      ${estadoFiltro ? "AND er.nombre = ?" : ""}
   `;
 
   if (fromDate) {
@@ -10078,6 +10086,9 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
   }
   if (toDate) {
     queryParams.push(toDate);
+  }
+  if (estadoFiltro) {
+    queryParams.push(estadoFiltro);
   }
 
   // Si el rol es afiliado, filtrar por usuario_id
@@ -10098,6 +10109,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     const countParams = [];
     if (fromDate) countParams.push(fromDate);
     if (toDate) countParams.push(toDate);
+    if (estadoFiltro) countParams.push(estadoFiltro);
     if (cabecera.rol === "afiliado") countParams.push(cabecera.id);
     if (cabecera.rol === "departamental") countParams.push(cabecera.departamental_id);
 
@@ -10110,10 +10122,11 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
       LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
       INNER JOIN usuario u ON r.usuario_id = u.id
-      WHERE 1=1 
+      WHERE 1=1
         ${queryBuscar}
         ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
         ${toDate ? "AND r.fecha_fin <= ?" : ""}
+        ${estadoFiltro ? "AND er.nombre = ?" : ""}
         ${cabecera.rol === "afiliado" ? "AND r.usuario_id = ?" : ""}
         ${cabecera.rol === "departamental" ? "AND u.departamental_id = ?" : ""}
     `;
@@ -11062,9 +11075,10 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
       let buscar = req.query.search;
       const filters = req.body;
 
-      // Paginación
-      const page = req.query.page ? Number(req.query.page) : 1;
-      const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 10;
+      // Paginación (1-based, clampada: un page=0 o inválido no debe generar
+      // un LIMIT negativo, que es error de sintaxis en MySQL)
+      const page = Math.max(1, Number(req.query.page) || 1);
+      const resultsPerPage = Math.max(1, Number(req.query.pageSize) || 10);
       const start = (page - 1) * resultsPerPage;
 
       // Ordenamiento
