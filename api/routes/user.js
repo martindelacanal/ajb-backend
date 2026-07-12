@@ -59,6 +59,18 @@ const s3 = new S3Client({
   region: bucketRegion,
 });
 
+// Áreas por usuario: los roles departamental y admin-central pueden estar limitados a
+// Turismo y/o Coseguro (usuario.area_turismo / usuario.area_coseguro, asignadas por el
+// admin). Acá solo importa el área Turismo: un empleado "departamental con coseguro"
+// no puede manipular reservas turísticas regulares. Los tokens emitidos antes de la
+// migración no traen los flags y se tratan como habilitados (default 1).
+const ROLES_CON_AREA = ["departamental", "admin-central"];
+
+function tieneAreaTurismo(cabecera) {
+  if (!ROLES_CON_AREA.includes(cabecera.rol)) return true;
+  return cabecera.area_turismo === undefined || cabecera.area_turismo === null || Number(cabecera.area_turismo) === 1;
+}
+
 function getMimeTypeFromFileName(fileName, fallback = "application/octet-stream") {
   const extension = (fileName || "").split(".").pop().toLowerCase();
   return MIME_BY_EXTENSION[extension] || fallback;
@@ -252,7 +264,8 @@ router.post("/signin", async (req, res) => {
   }
 
   const query = `
-    SELECT u.id, u.nombre, u.apellido, u.documento, u.email, u.password, u.departamental_id, rol.nombre AS rol, u.habilitado
+    SELECT u.id, u.nombre, u.apellido, u.documento, u.email, u.password, u.departamental_id, rol.nombre AS rol, u.habilitado,
+           u.area_turismo, u.area_coseguro
     FROM usuario as u
     INNER JOIN rol ON rol.id = u.rol_id
     WHERE u.documento = ? AND u.password IS NOT NULL AND u.rol_id <> 4
@@ -6625,13 +6638,72 @@ async function obtenerAdicionalesReserva(connection, reservaId) {
   }));
 }
 
+// ---------------------------------------------------------------------------
+// Reserva por motivos de salud (cruce Turismo ↔ Servicios Sociales).
+// Marca la reserva y crea el trámite de subsidio (reserva_salud) que valida
+// el área de coseguro en dos pasos (departamental → admin-central) desde
+// /coseguro/subsidios-salud. El afiliado queda obligado a cargar certificados
+// médicos; hasta la aprobación final la reserva mantiene su tarifa normal.
+// ---------------------------------------------------------------------------
+function normalizarPorSalud(body) {
+  const marcado = String(body.por_salud) === "1" || body.por_salud === true || body.por_salud === "true";
+  if (!marcado) return null;
+  const motivo = String(body.salud_motivo || "").trim();
+  const centroMedico = String(body.salud_centro_medico || "").trim() || null;
+  if (!motivo) {
+    const error = new Error("Indicá el motivo médico del viaje para solicitar el subsidio por salud");
+    error.statusCode = 400;
+    throw error;
+  }
+  return { motivo, centro_medico: centroMedico };
+}
+
+async function crearReservaSalud(connection, { reservaId, usuarioId, salud, usuarioNombre }) {
+  await connection.query("UPDATE reserva SET es_por_salud = 1 WHERE id = ?", [reservaId]);
+  const [resultado] = await connection.query(
+    "INSERT INTO reserva_salud (reserva_id, usuario_id, motivo, centro_medico) VALUES (?, ?, ?, ?)",
+    [reservaId, usuarioId, salud.motivo, salud.centro_medico]
+  );
+  const reservaSaludId = resultado.insertId;
+
+  await connection.query(
+    `INSERT INTO historial_reserva (reserva_id, tipo_operacion, campo_modificado, valor_anterior, valor_nuevo, usuario_modificador_id, observaciones)
+     VALUES (?, 'UPDATE', 'Subsidio por salud', NULL, 'PENDIENTE', ?, ?)`,
+    [reservaId, usuarioId, `Reserva marcada como viaje por motivos de salud. Motivo: ${salud.motivo}`]
+  );
+
+  // Avisar al staff de Servicios Sociales (área coseguro) de la departamental del afiliado
+  const [staff] = await connection.query(
+    `SELECT u.id FROM usuario u
+     INNER JOIN rol r ON r.id = u.rol_id
+     INNER JOIN usuario afiliado ON afiliado.id = ?
+     WHERE u.habilitado = 'Y' AND u.area_coseguro = 1
+       AND ((r.nombre = 'departamental' AND u.departamental_id = afiliado.departamental_id) OR r.nombre = 'admin-central')`,
+    [usuarioId]
+  );
+  for (const u of staff) {
+    await connection.query(
+      "INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, ?, ?, ?, ?)",
+      [
+        u.id,
+        "RESERVA_SALUD_NUEVA",
+        `Nueva reserva por salud #${reservaId}`,
+        `${usuarioNombre} solicitó el subsidio de alojamiento por salud. Revisá los certificados médicos en Servicios Sociales.`,
+        JSON.stringify({ reserva_id: reservaId, reserva_salud_id: reservaSaludId, estado: "PENDIENTE" }),
+      ]
+    );
+  }
+  return reservaSaludId;
+}
+
 router.post("/reserva", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      cabecera.rol === "admin" ||
-      cabecera.rol === "departamental" ||
-      cabecera.rol === "afiliado"
+      (cabecera.rol === "admin" ||
+        cabecera.rol === "departamental" ||
+        cabecera.rol === "afiliado") &&
+      tieneAreaTurismo(cabecera)
     ) {
       const {
         nombre,
@@ -6663,6 +6735,8 @@ router.post("/reserva", verifyToken, async (req, res) => {
       if (Number.isNaN(totalTarifaBase)) {
         return res.status(400).json("El total de la tarifa no es válido");
       }
+
+      const porSalud = normalizarPorSalud(req.body);
 
       const esReservaCamping = esServicioCamping(servicio_id);
       const errorReglasCamping = validarReglasCampingReserva(servicio_id, recurso_id, personas);
@@ -6979,6 +7053,17 @@ router.post("/reserva", verifyToken, async (req, res) => {
           }
         }
 
+        // Viaje por motivos de salud: crea el trámite de subsidio para Servicios Sociales
+        let reservaSaludId = null;
+        if (porSalud) {
+          reservaSaludId = await crearReservaSalud(connection, {
+            reservaId,
+            usuarioId: cabecera.id,
+            salud: porSalud,
+            usuarioNombre: `${cabecera.apellido}, ${cabecera.nombre}`,
+          });
+        }
+
         // Confirmar transacción
         if (esReservaCamping) {
           numeroParcelaAsignada = await asignarNumeroParcelaCamping(connection, {
@@ -7004,7 +7089,8 @@ router.post("/reserva", verifyToken, async (req, res) => {
           estado: "Confirmada",
           mensaje: "Reserva creada exitosamente",
           fecha_creacion: new Date().toISOString(),
-          monto_adicionales: montoAdicionales
+          monto_adicionales: montoAdicionales,
+          reserva_salud_id: reservaSaludId
         });
 
       } catch (transactionError) {
@@ -7050,6 +7136,8 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
     if (!hotelId || !fecha_inicio || !fecha_fin || !Array.isArray(personas) || personas.length === 0 || !firma) {
       return res.status(400).json("Faltan campos requeridos");
     }
+
+    const porSalud = normalizarPorSalud(req.body);
 
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
@@ -7149,6 +7237,17 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
       `Solicitud de convenio hotelero creada para ${hoteles[0].nombre}`
     );
 
+    // Viaje por motivos de salud: crea el trámite de subsidio para Servicios Sociales
+    let reservaSaludId = null;
+    if (porSalud) {
+      reservaSaludId = await crearReservaSalud(connection, {
+        reservaId,
+        usuarioId: cabecera.id,
+        salud: porSalud,
+        usuarioNombre: `${cabecera.apellido}, ${cabecera.nombre}`,
+      });
+    }
+
     await connection.commit();
 
     res.status(201).json({
@@ -7157,12 +7256,16 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
       estado: "Solicitud convenio",
       mensaje: "Solicitud de convenio hotelero creada exitosamente",
       fecha_creacion: new Date().toISOString(),
+      reserva_salud_id: reservaSaludId,
     });
   } catch (error) {
     if (connection) {
       await connection.rollback();
     }
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json(error.message);
+    }
     res.status(500).json("Error al crear la solicitud de convenio hotelero");
   } finally {
     if (connection) {
@@ -7175,7 +7278,8 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      cabecera.rol === "admin" || cabecera.rol === "departamental" || cabecera.rol === "afiliado"
+      (cabecera.rol === "admin" || cabecera.rol === "departamental" || cabecera.rol === "afiliado") &&
+      tieneAreaTurismo(cabecera)
     ) {
       const reservaId = req.params.id;
       const {
@@ -7791,9 +7895,10 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      cabecera.rol === "admin" ||
-      cabecera.rol === "afiliado" ||
-      cabecera.rol === "departamental"
+      (cabecera.rol === "admin" ||
+        cabecera.rol === "afiliado" ||
+        cabecera.rol === "departamental") &&
+      tieneAreaTurismo(cabecera)
     ) {
       const reservaId = req.params.id;
 
@@ -8045,6 +8150,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
             r.fecha_creacion,
             r.firma_archivo,
             r.usuario_id,
+            r.es_por_salud,
             COALESCE(r.modalidad, 'FECHA_LIBRE') as modalidad,
             r.sorteo_id,
             r.bloque_fecha_id,
@@ -8209,6 +8315,34 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           }))
         }));
 
+        // Subsidio por salud (viaje por motivos de salud validado por Servicios Sociales)
+        let salud = null;
+        if (Number(reserva.es_por_salud) === 1) {
+          const [saludRows] = await connection.query(
+            `SELECT rs.id, rs.motivo, rs.centro_medico, rs.estado, rs.precio_cubierto, rs.observacion_resolucion,
+                    rs.fecha_aprobacion_departamental, rs.fecha_resolucion, rs.fecha_creacion
+             FROM reserva_salud rs WHERE rs.reserva_id = ?`,
+            [reservaId]
+          );
+          if (saludRows.length > 0) {
+            const [archivosSalud] = await connection.query(
+              "SELECT id, archivo, nombre_original, mime, tamanio, fecha_creacion FROM reserva_salud_archivo WHERE reserva_salud_id = ? ORDER BY id",
+              [saludRows[0].id]
+            );
+            const archivosFirmados = [];
+            for (const archivo of archivosSalud) {
+              let url = null;
+              try {
+                url = await getSignedFileUrlFromS3(archivo.archivo);
+              } catch (error) {
+                url = null;
+              }
+              archivosFirmados.push({ ...archivo, url });
+            }
+            salud = { ...saludRows[0], archivos: archivosFirmados };
+          }
+        }
+
         // Generar número de reserva
         const numeroReserva = `${reserva.id}`;
 
@@ -8322,7 +8456,9 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           ninos: ninos,
           bebes: bebes,
           monto_adicionales: reserva.monto_adicionales || 0,
-          adicionales: adicionalesFormateados
+          adicionales: adicionalesFormateados,
+          es_por_salud: Number(reserva.es_por_salud) === 1,
+          salud
         };
 
         respuesta.convenio_hotel = convenioHotel;
@@ -8355,7 +8491,7 @@ router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
   let connection;
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "departamental"].includes(cabecera.rol)) {
+    if (!["admin", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -8626,9 +8762,10 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      cabecera.rol === "admin" ||
-      cabecera.rol === "departamental" ||
-      cabecera.rol === "afiliado"
+      (cabecera.rol === "admin" ||
+        cabecera.rol === "departamental" ||
+        cabecera.rol === "afiliado") &&
+      tieneAreaTurismo(cabecera)
     ) {
       const reservaId = req.params.id;
       const { estado, observaciones, usuario_admin_id } = req.body;
@@ -10001,6 +10138,7 @@ router.post("/tabla/temporadas", verifyToken, async (req, res) => {
 
 router.post("/tabla/reservas", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
+  if (!tieneAreaTurismo(cabecera)) return res.status(401).json("No autorizado");
   let buscar = req.query.search;
   const filters = req.body;
   // Filtro por estado de reserva (nombre en estado_reserva). "Todas" = sin filtro.
@@ -10239,12 +10377,15 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         NULL AS importe,
         NULL AS comprobante,
         NULL AS beneficiario,
+        r.es_por_salud,
+        rs.estado AS salud_estado,
         r.fecha_creacion
       FROM reserva r
         INNER JOIN estado_reserva er ON er.id = r.estado_reserva_id
         LEFT JOIN recurso rec ON rec.id = r.recurso_id
         LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
         LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
+        LEFT JOIN reserva_salud rs ON rs.reserva_id = r.id
       WHERE r.usuario_id = ?
       UNION ALL
       SELECT
@@ -10260,9 +10401,11 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         NULL AS modalidad,
         NULL AS fecha_inicio,
         NULL AS fecha_fin,
-        COALESCE(cs.importe_autorizado, cs.importe) AS importe,
+        COALESCE(cs.importe_autorizado, cs.importe_estimado, cs.importe) AS importe,
         CONCAT(COALESCE(CONCAT(cs.comprobante_pto_venta, '-'), ''), cs.comprobante_numero) AS comprobante,
         CASE WHEN cs.familiar_usuario_id IS NOT NULL THEN CONCAT(fam.nombre, ' ', fam.apellido) ELSE NULL END AS beneficiario,
+        0 AS es_por_salud,
+        NULL AS salud_estado,
         cs.fecha_creacion
       FROM coseguro_solicitud cs
         INNER JOIN coseguro_estado e ON e.id = cs.estado_id
@@ -10978,8 +11121,9 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      cabecera.rol === "admin" ||
-      cabecera.rol === "departamental"
+      (cabecera.rol === "admin" ||
+        cabecera.rol === "departamental") &&
+      tieneAreaTurismo(cabecera)
     ) {
       const reservaId = req.params.id;
       const page = req.query.page ? Number(req.query.page) : 1;
@@ -13570,6 +13714,8 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
         `SELECT
           u.id,
           u.rol_id,
+          u.area_turismo,
+          u.area_coseguro,
           u.departamental_id,
           d.nombre as departamental_nombre,
           u.tipo_persona_id,
@@ -13675,7 +13821,7 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
       if (cabecera.rol === "admin") {
         tienePermisos = true;
         camposPermitidos = [
-          'rol_id', 'departamental_id', 'tipo_persona_id', 'nombre', 'apellido',
+          'rol_id', 'area_turismo', 'area_coseguro', 'departamental_id', 'tipo_persona_id', 'nombre', 'apellido',
           'fecha_nacimiento', 'documento', 'password', 'email', 'telefono',
           'legajo', 'cuil', 'cbu', 'foto_archivo', 'habilitado'
         ];
@@ -13761,6 +13907,22 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
             valorAnterior: datosAnteriores.departamental_id,
             valorNuevo: nuevoValor
           });
+        }
+      }
+
+      // Áreas habilitadas (solo staff departamental / admin-central): "1"/"0" desde el FormData
+      for (const campoArea of ['area_turismo', 'area_coseguro']) {
+        if (camposPermitidos.includes(campoArea) && req.body[campoArea] !== undefined) {
+          const nuevoValor = ["1", "true", 1, true].includes(req.body[campoArea]) ? 1 : 0;
+          if (Number(datosAnteriores[campoArea]) !== nuevoValor) {
+            updateFields.push(`${campoArea} = ?`);
+            updateValues.push(nuevoValor);
+            cambios.push({
+              campo: campoArea,
+              valorAnterior: datosAnteriores[campoArea],
+              valorNuevo: nuevoValor
+            });
+          }
         }
       }
 
@@ -14064,7 +14226,7 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
 
       if (cabecera.rol === "admin") {
         camposPermitidos = [
-          'rol_id', 'departamental_id', 'tipo_persona_id', 'nombre', 'apellido',
+          'rol_id', 'area_turismo', 'area_coseguro', 'departamental_id', 'tipo_persona_id', 'nombre', 'apellido',
           'fecha_nacimiento', 'documento', 'password', 'email', 'telefono',
           'legajo', 'cuil', 'cbu', 'foto_archivo', 'habilitado'
         ];
@@ -14158,6 +14320,21 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
           valorAnterior: null,
           valorNuevo: nuevoValor
         });
+      }
+
+      // Procesar áreas habilitadas (solo staff departamental / admin-central)
+      for (const campoArea of ['area_turismo', 'area_coseguro']) {
+        if (camposPermitidos.includes(campoArea) && req.body[campoArea] !== undefined) {
+          const nuevoValor = ["1", "true", 1, true].includes(req.body[campoArea]) ? 1 : 0;
+          insertFields.push(campoArea);
+          insertPlaceholders.push('?');
+          insertValues.push(nuevoValor);
+          cambios.push({
+            campo: campoArea,
+            valorAnterior: null,
+            valorNuevo: nuevoValor
+          });
+        }
       }
 
       // Procesar nombre (requerido)

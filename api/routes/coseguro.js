@@ -168,6 +168,18 @@ function getCabecera(req) {
 const ROLES_STAFF = ["admin", "departamental", "admin-central", "auditor"];
 const ROLES_GESTION = ["admin", "departamental", "admin-central"];
 
+// Áreas por usuario: los roles departamental y admin-central pueden estar limitados a
+// Turismo y/o Coseguro (usuario.area_turismo / usuario.area_coseguro, asignadas por el
+// admin). Acá solo importa el área Coseguro: un empleado "departamental con turismo"
+// no puede gestionar reintegros ni subsidios de Servicios Sociales. Los tokens emitidos
+// antes de la migración no traen los flags y se tratan como habilitados (default 1).
+const ROLES_CON_AREA = ["departamental", "admin-central"];
+
+function tieneAreaCoseguro(cabecera) {
+  if (!ROLES_CON_AREA.includes(cabecera.rol)) return true;
+  return cabecera.area_coseguro === undefined || cabecera.area_coseguro === null || Number(cabecera.area_coseguro) === 1;
+}
+
 // ---------------------------------------------------------------------------
 // Estados y permisos
 // ---------------------------------------------------------------------------
@@ -198,7 +210,9 @@ const ESTADOS_ELIMINACION_POR_ROL = {
   admin: [ESTADO.INICIADA, ESTADO.REVISAR, ESTADO.REVISADA, ESTADO.APROBADA_DEPTO, ESTADO.RECHAZADA_DEPTO, ESTADO.CANCELADA],
 };
 
-function transicionesDisponibles(rol, estadoId, esPropia) {
+function transicionesDisponibles(cabecera, estadoId, esPropia) {
+  if (!tieneAreaCoseguro(cabecera)) return [];
+  const rol = cabecera.rol;
   switch (rol) {
     case "afiliado":
       return esPropia && [ESTADO.INICIADA, ESTADO.REVISAR, ESTADO.REVISADA].includes(estadoId) ? [ESTADO.CANCELADA] : [];
@@ -236,6 +250,7 @@ function transicionesDisponibles(rol, estadoId, esPropia) {
 }
 
 function puedeVerSolicitud(cabecera, solicitud) {
+  if (!tieneAreaCoseguro(cabecera)) return false;
   switch (cabecera.rol) {
     case "admin":
     case "admin-central":
@@ -252,6 +267,7 @@ function puedeVerSolicitud(cabecera, solicitud) {
 }
 
 function puedeEditarSolicitud(cabecera, solicitud) {
+  if (!tieneAreaCoseguro(cabecera)) return false;
   const estados = ESTADOS_EDICION_POR_ROL[cabecera.rol] || [];
   if (!estados.includes(solicitud.estado_id)) return false;
   if (cabecera.rol === "afiliado") return Number(solicitud.usuario_id) === Number(cabecera.id);
@@ -260,6 +276,7 @@ function puedeEditarSolicitud(cabecera, solicitud) {
 }
 
 function puedeEliminarSolicitud(cabecera, solicitud) {
+  if (!tieneAreaCoseguro(cabecera)) return false;
   const estados = ESTADOS_ELIMINACION_POR_ROL[cabecera.rol] || [];
   if (!estados.includes(solicitud.estado_id)) return false;
   if (cabecera.rol === "departamental") return Number(solicitud.departamental_id) === Number(cabecera.departamental_id);
@@ -312,6 +329,21 @@ function normalizarImporte(valor) {
   if (valor === undefined || valor === null || valor === "") return null;
   const numero = Number(String(valor).replace(",", "."));
   return Number.isFinite(numero) ? Math.round(numero * 100) / 100 : null;
+}
+
+// Cobertura automática: cada tipo de reintegro puede definir un porcentaje de cobertura
+// (con tope opcional en pesos). Devuelve la foto {porcentaje, estimado} que se guarda en
+// la solicitud para que cambios posteriores de configuración no alteren trámites en curso.
+// En tipos con modo MANUAL no hay estimación: el importe lo define Servicios Sociales.
+function calcularReintegroEstimado(tipo, importe) {
+  const sinEstimacion = { porcentaje: null, estimado: null };
+  if (!tipo || tipo.modo_cobertura !== "PORCENTAJE" || importe === null || importe === undefined) return sinEstimacion;
+  const porcentaje = Number(tipo.porcentaje_cobertura);
+  if (!Number.isFinite(porcentaje) || porcentaje <= 0) return sinEstimacion;
+  let estimado = Math.round(((importe * porcentaje) / 100) * 100) / 100;
+  const tope = tipo.tope_reintegro === null || tipo.tope_reintegro === undefined ? null : Number(tipo.tope_reintegro);
+  if (tope !== null && Number.isFinite(tope) && tope > 0 && estimado > tope) estimado = tope;
+  return { porcentaje: Math.round(porcentaje * 100) / 100, estimado };
 }
 
 function normalizarFecha(valor) {
@@ -728,7 +760,8 @@ router.get("/coseguro/catalogos", verifyToken, async (req, res) => {
     const [estados] = await db.query("SELECT * FROM coseguro_estado ORDER BY orden");
     const [tipos] = await db.query(
       `SELECT t.id, t.nombre, t.icono, t.imputacion_id, t.imputacion_detalle_id, t.requiere_pto_venta,
-              CAST(t.adjuntos_config AS CHAR) AS adjuntos_config, i.codigo AS cic_codigo
+              CAST(t.adjuntos_config AS CHAR) AS adjuntos_config, i.codigo AS cic_codigo,
+              t.modo_cobertura, t.porcentaje_cobertura, t.tope_reintegro
        FROM coseguro_tipo_reintegro t
        LEFT JOIN coseguro_imputacion i ON i.id = t.imputacion_id
        WHERE t.activo = 1 ORDER BY t.orden`
@@ -770,13 +803,94 @@ router.get("/coseguro/catalogos", verifyToken, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Cobertura del reintegro por tipo (pantalla "Cobertura de reintegros").
+// Igual que los valores predeterminados de temporadas: admin y admin-central
+// configuran porcentajes que después se precargan (editables) en cada trámite.
+// ---------------------------------------------------------------------------
+const ROLES_COBERTURA = ["admin", "admin-central"];
+
+router.get("/coseguro/cobertura", verifyToken, async (req, res) => {
+  try {
+    const cabecera = getCabecera(req);
+    if (!ROLES_COBERTURA.includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
+
+    const [tipos] = await mysqlConnection.promise().query(
+      `SELECT t.id, t.nombre, t.icono, t.orden, t.activo, t.modo_cobertura, t.porcentaje_cobertura, t.tope_reintegro,
+              (SELECT COUNT(*) FROM coseguro_solicitud s WHERE s.tipo_reintegro_id = t.id AND s.eliminado = 0) AS solicitudes
+       FROM coseguro_tipo_reintegro t
+       WHERE t.activo = 1
+       ORDER BY t.orden`
+    );
+    res.status(200).json({ tipos });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener la configuración de cobertura");
+  }
+});
+
+router.put("/coseguro/cobertura", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = getCabecera(req);
+    if (!ROLES_COBERTURA.includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
+
+    const items = Array.isArray(req.body.tipos) ? req.body.tipos : [];
+    if (items.length === 0) return res.status(400).json("No se recibieron tipos de reintegro para actualizar");
+
+    const errores = [];
+    const normalizados = [];
+    for (const item of items) {
+      const id = Number(item.id);
+      if (!id) continue;
+      const modo = String(item.modo_cobertura || "").toUpperCase() === "PORCENTAJE" ? "PORCENTAJE" : "MANUAL";
+      let porcentaje = null;
+      let tope = null;
+      if (modo === "PORCENTAJE") {
+        porcentaje = normalizarImporte(item.porcentaje_cobertura);
+        if (porcentaje === null || porcentaje <= 0 || porcentaje > 100) {
+          errores.push(`El porcentaje de "${normalizarTexto(item.nombre) || `tipo #${id}`}" debe estar entre 0,01 y 100`);
+        }
+        tope = normalizarImporte(item.tope_reintegro);
+        if (tope !== null && tope <= 0) errores.push(`El tope de "${normalizarTexto(item.nombre) || `tipo #${id}`}" debe ser mayor a 0 (o quedar vacío)`);
+      }
+      normalizados.push({ id, modo, porcentaje, tope });
+    }
+    if (errores.length > 0) return res.status(400).json(errores.join(" | "));
+    if (normalizados.length === 0) return res.status(400).json("No se recibieron tipos de reintegro válidos");
+
+    const db = mysqlConnection.promise();
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    for (const item of normalizados) {
+      await connection.query(
+        "UPDATE coseguro_tipo_reintegro SET modo_cobertura = ?, porcentaje_cobertura = ?, tope_reintegro = ? WHERE id = ?",
+        [item.modo, item.porcentaje, item.tope, item.id]
+      );
+    }
+    await connection.commit();
+
+    const [tipos] = await db.query(
+      `SELECT id, nombre, icono, orden, activo, modo_cobertura, porcentaje_cobertura, tope_reintegro
+       FROM coseguro_tipo_reintegro WHERE activo = 1 ORDER BY orden`
+    );
+    res.status(200).json({ success: true, message: "Cobertura actualizada correctamente", tipos });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.log(error);
+    res.status(500).json("Error al actualizar la configuración de cobertura");
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // GET /coseguro/perfil — CUIL/CBU guardados del afiliado (+ familiares)
 // ---------------------------------------------------------------------------
 router.get("/coseguro/perfil", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     let usuarioId = Number(cabecera.id);
-    if (ROLES_STAFF.includes(cabecera.rol) && req.query.usuario_id) usuarioId = Number(req.query.usuario_id);
+    if (ROLES_STAFF.includes(cabecera.rol) && tieneAreaCoseguro(cabecera) && req.query.usuario_id) usuarioId = Number(req.query.usuario_id);
 
     const db = mysqlConnection.promise();
     const [usuarios] = await db.query(
@@ -826,7 +940,7 @@ router.put("/coseguro/familiares/:id/documento", verifyToken, async (req, res) =
 
     const esPropio = Number(familiares[0].usuario_familiar_id) === Number(cabecera.id);
     if (cabecera.rol === "afiliado" && !esPropio) return res.status(401).json("No autorizado");
-    if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol)) return res.status(401).json("No autorizado");
+    if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
 
     try {
       await db.query("UPDATE usuario SET documento = ? WHERE id = ?", [Number(documento), familiarId]);
@@ -849,7 +963,7 @@ router.put("/coseguro/familiares/:id/documento", verifyToken, async (req, res) =
 router.get("/coseguro/afiliados-buscar", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!ROLES_GESTION.includes(cabecera.rol)) return res.status(401).json("No autorizado");
+    if (!ROLES_GESTION.includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
 
     const q = normalizarTexto(req.query.q);
     if (!q || q.length < 2) return res.status(200).json([]);
@@ -886,7 +1000,7 @@ router.get("/coseguro/afiliados-buscar", verifyToken, async (req, res) => {
 router.post("/coseguro/extraer-comprobante", verifyToken, manejarUploadCoseguro, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol)) return res.status(401).json("No autorizado");
+    if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
 
     const files = req.files || [];
     if (files.length === 0) return res.status(400).json("No se recibió ningún archivo");
@@ -915,7 +1029,7 @@ router.post("/coseguro/extraer-comprobante", verifyToken, manejarUploadCoseguro,
 router.post("/coseguro/verificar-duplicados", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol)) return res.status(401).json("No autorizado");
+    if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const db = mysqlConnection.promise();
 
     const comprobantes = await buscarDuplicadosComprobante(db, {
@@ -948,7 +1062,7 @@ router.post("/coseguro/verificar-duplicados", verifyToken, async (req, res) => {
 router.post("/coseguro/verificar-archivo", verifyToken, manejarUploadCoseguro, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol)) return res.status(401).json("No autorizado");
+    if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const file = (req.files || [])[0];
     if (!file) return res.status(400).json("No se recibió ningún archivo");
 
@@ -987,7 +1101,7 @@ async function validarDatosSolicitud(db, cabecera, body, opciones) {
   let tipo = null;
   if (tipoReintegroId) {
     const [tipos] = await db.query(
-      "SELECT id, nombre, requiere_pto_venta, CAST(adjuntos_config AS CHAR) AS adjuntos_config, imputacion_id, imputacion_detalle_id FROM coseguro_tipo_reintegro WHERE id = ? AND activo = 1",
+      "SELECT id, nombre, requiere_pto_venta, CAST(adjuntos_config AS CHAR) AS adjuntos_config, imputacion_id, imputacion_detalle_id, modo_cobertura, porcentaje_cobertura, tope_reintegro FROM coseguro_tipo_reintegro WHERE id = ? AND activo = 1",
       [tipoReintegroId]
     );
     if (tipos.length === 0) errores.push("Tipo de reintegro inválido");
@@ -1113,7 +1227,7 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
   let connection;
   try {
     const cabecera = getCabecera(req);
-    if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol)) return res.status(401).json("No autorizado");
+    if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const db = mysqlConnection.promise();
 
     // ¿Para qué afiliado es la solicitud?
@@ -1205,17 +1319,22 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
     let firmaArchivo = null;
     if (firmaBase64) firmaArchivo = await subirFirmaBase64(firmaBase64);
 
+    // Foto de la cobertura vigente: el afiliado ve desde el inicio cuánto se le reintegraría
+    const cobertura = calcularReintegroEstimado(validacion.tipo, datos.importe);
+
     const [resultado] = await connection.query(
       `INSERT INTO coseguro_solicitud
         (usuario_id, familiar_usuario_id, departamental_id, creado_por_usuario_id, estado_id,
          tipo_reintegro_id, concepto_id, fecha_comprobante, comprobante_pto_venta, comprobante_numero,
-         emisor_nombre, emisor_cuit, importe, cuil_afiliado, cbu, observaciones, cantidad_sesiones,
+         emisor_nombre, emisor_cuit, importe, porcentaje_cobertura_aplicado, importe_estimado,
+         cuil_afiliado, cbu, observaciones, cantidad_sesiones,
          periodo_prestacion, firma_archivo, extraccion_ia, verificacion)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         usuarioId, datos.familiar_usuario_id, departamentalId, cabecera.id, ESTADO.INICIADA,
         datos.tipo_reintegro_id, datos.concepto_id, datos.fecha_comprobante, datos.comprobante_pto_venta,
-        datos.comprobante_numero, datos.emisor_nombre, datos.emisor_cuit, datos.importe, datos.cuil_afiliado,
+        datos.comprobante_numero, datos.emisor_nombre, datos.emisor_cuit, datos.importe,
+        cobertura.porcentaje, cobertura.estimado, datos.cuil_afiliado,
         datos.cbu, datos.observaciones, datos.cantidad_sesiones, datos.periodo_prestacion, firmaArchivo,
         extraccionIA ? JSON.stringify(extraccionIA) : null, JSON.stringify(verificacion),
       ]
@@ -1285,7 +1404,7 @@ const COLUMNAS_ORDEN = {
 router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!["afiliado", ...ROLES_STAFF].includes(cabecera.rol)) return res.status(401).json("No autorizado");
+    if (!["afiliado", ...ROLES_STAFF].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const db = mysqlConnection.promise();
 
     const page = Math.max(1, Number(req.query.page) || 1);
@@ -1406,6 +1525,7 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
       `SELECT s.id, s.usuario_id, s.familiar_usuario_id, s.departamental_id, s.estado_id,
               s.tipo_reintegro_id, s.concepto_id, s.fecha_comprobante, s.comprobante_pto_venta,
               s.comprobante_numero, s.emisor_nombre, s.emisor_cuit, s.importe, s.importe_autorizado,
+              s.porcentaje_cobertura_aplicado, s.importe_estimado,
               s.cantidad_sesiones, s.cic_codigo, s.fecha_creacion, s.fecha_modificacion, s.fecha_pago,
               u.nombre AS afiliado_nombre, u.apellido AS afiliado_apellido, u.documento AS afiliado_documento,
               fam.nombre AS familiar_nombre, fam.apellido AS familiar_apellido,
@@ -1434,7 +1554,7 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
       estado_visible: cabecera.rol === "afiliado" && row.estado_nombre_afiliado ? row.estado_nombre_afiliado : row.estado,
       puede_editar: puedeEditarSolicitud(cabecera, row),
       puede_eliminar: puedeEliminarSolicitud(cabecera, row),
-      transiciones: transicionesDisponibles(cabecera.rol, row.estado_id, Number(row.usuario_id) === Number(cabecera.id)),
+      transiciones: transicionesDisponibles(cabecera, row.estado_id, Number(row.usuario_id) === Number(cabecera.id)),
     }));
 
     res.status(200).json({ results, totalItems, page, pageSize });
@@ -1563,7 +1683,7 @@ router.get("/coseguro/solicitudes/:id", verifyToken, async (req, res) => {
       duplicados,
       puede_editar: puedeEditarSolicitud(cabecera, solicitud),
       puede_eliminar: puedeEliminarSolicitud(cabecera, solicitud),
-      transiciones: transicionesDisponibles(cabecera.rol, solicitud.estado_id, Number(solicitud.usuario_id) === Number(cabecera.id)),
+      transiciones: transicionesDisponibles(cabecera, solicitud.estado_id, Number(solicitud.usuario_id) === Number(cabecera.id)),
     });
   } catch (error) {
     console.log(error);
@@ -1583,6 +1703,8 @@ const ETIQUETAS_CAMPOS = {
   emisor_nombre: "Emisor",
   emisor_cuit: "CUIT emisor",
   importe: "Importe",
+  porcentaje_cobertura_aplicado: "Porcentaje de cobertura",
+  importe_estimado: "Reintegro estimado",
   cuil_afiliado: "CUIL",
   cbu: "CBU",
   observaciones: "Observaciones",
@@ -1689,6 +1811,10 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
 
     // Diff de campos para el historial
     const camposEditables = { ...datos };
+    // La estimación de cobertura acompaña al importe/tipo vigentes de la solicitud
+    const cobertura = calcularReintegroEstimado(validacion.tipo, datos.importe);
+    camposEditables.porcentaje_cobertura_aplicado = cobertura.porcentaje;
+    camposEditables.importe_estimado = cobertura.estimado;
     if (!("periodo_prestacion" in camposCentral)) {
       // si central no lo tocó, se mantiene el derivado de la fecha de comprobante
       camposEditables.periodo_prestacion = datos.periodo_prestacion;
@@ -1887,7 +2013,7 @@ router.put("/coseguro/solicitudes/:id/estado", verifyToken, async (req, res) => 
     if (!puedeVerSolicitud(cabecera, solicitud)) return res.status(401).json("No autorizado");
 
     const esPropia = Number(solicitud.usuario_id) === Number(cabecera.id);
-    const permitidas = transicionesDisponibles(cabecera.rol, solicitud.estado_id, esPropia);
+    const permitidas = transicionesDisponibles(cabecera, solicitud.estado_id, esPropia);
     if (!permitidas.includes(estadoNuevo)) {
       return res.status(400).json("Transición de estado no permitida para tu rol en el estado actual");
     }
@@ -1908,6 +2034,25 @@ router.put("/coseguro/solicitudes/:id/estado", verifyToken, async (req, res) => 
     if (estadoNuevo === ESTADO.APROBADA_CENTRAL) {
       sets.push("fecha_aprobacion_central = NOW()", "aprobado_central_usuario_id = ?");
       params.push(cabecera.id);
+      // Cobertura automática: si Servicios Sociales no fijó un importe manual, al aprobar
+      // se autoriza el estimado (importe * porcentaje del tipo, con tope). Sigue siendo
+      // editable después desde el formulario de edición.
+      const importeAutorizadoActual = normalizarImporte(solicitud.importe_autorizado);
+      const importeEstimado = normalizarImporte(solicitud.importe_estimado);
+      if (importeAutorizadoActual === null && importeEstimado !== null) {
+        sets.push("importe_autorizado = ?");
+        params.push(importeEstimado);
+        await registrarHistorial(connection, {
+          solicitud_id: solicitudId,
+          usuario_id: cabecera.id,
+          usuario_rol: cabecera.rol,
+          tipo_operacion: "UPDATE",
+          campo_modificado: ETIQUETAS_CAMPOS.importe_autorizado,
+          valor_anterior: null,
+          valor_nuevo: importeEstimado,
+          observacion: `Aplicado automáticamente por cobertura del ${Number(solicitud.porcentaje_cobertura_aplicado)}%`,
+        });
+      }
     }
     if (estadoNuevo === ESTADO.LIQUIDADO) {
       const fechaPago = parsearFechaFlexible(req.body.fecha_pago) || moment().format("YYYY-MM-DD HH:mm:ss");
@@ -2120,7 +2265,7 @@ router.get("/coseguro/afiliado/:usuarioId/historial", verifyToken, async (req, r
   try {
     const cabecera = getCabecera(req);
     // El auditor no participa de la revisión de duplicados: no accede al historial completo del afiliado
-    if (!ROLES_GESTION.includes(cabecera.rol)) return res.status(401).json("No autorizado");
+    if (!ROLES_GESTION.includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const usuarioId = Number(req.params.usuarioId);
     if (!usuarioId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
@@ -2358,7 +2503,7 @@ function generarCsvSolicitudes(rows) {
 router.post("/coseguro/exportar", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!["auditor", "admin", "admin-central"].includes(cabecera.rol)) return res.status(401).json("No autorizado");
+    if (!["auditor", "admin", "admin-central"].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const db = mysqlConnection.promise();
 
     const rows = await consultarSolicitudesParaExportar(db, cabecera, req.body || {});
@@ -2439,7 +2584,7 @@ router.post("/coseguro/estado-masivo", verifyToken, async (req, res) => {
   let connection;
   try {
     const cabecera = getCabecera(req);
-    if (!["admin", "admin-central", "auditor"].includes(cabecera.rol)) return res.status(401).json("No autorizado");
+    if (!["admin", "admin-central", "auditor"].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const ids = (Array.isArray(req.body.ids) ? req.body.ids : []).map(Number).filter((n) => n > 0);
     const estadoNuevo = Number(req.body.estado_id);
     if (ids.length === 0) return res.status(400).json("No se indicaron solicitudes");
@@ -2699,7 +2844,7 @@ function filtrosEstadisticas(cabecera, query) {
 router.get("/coseguro/estadisticas", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!ROLES_GESTION.includes(cabecera.rol) && cabecera.rol !== "auditor") return res.status(401).json("No autorizado");
+    if ((!ROLES_GESTION.includes(cabecera.rol) && cabecera.rol !== "auditor") || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const db = mysqlConnection.promise();
     const { where, params } = filtrosEstadisticas(cabecera, req.query);
 
@@ -2811,7 +2956,7 @@ router.get("/coseguro/estadisticas", verifyToken, async (req, res) => {
 router.get("/coseguro/arca/estado", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!ROLES_GESTION.includes(cabecera.rol)) return res.status(401).json("No autorizado");
+    if (!ROLES_GESTION.includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const config = arca.configuracion();
     res.status(200).json({
       configurado: config.configurado,
@@ -2829,7 +2974,7 @@ router.get("/coseguro/arca/estado", verifyToken, async (req, res) => {
 router.post("/coseguro/solicitudes/:id/constatar-arca", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!ROLES_GESTION.includes(cabecera.rol)) return res.status(401).json("No autorizado");
+    if (!ROLES_GESTION.includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const solicitudId = Number(req.params.id);
     if (!solicitudId) return res.status(400).json("ID inválido");
 
@@ -2905,7 +3050,7 @@ router.post("/coseguro/solicitudes/:id/constatar-arca", verifyToken, async (req,
 router.get("/coseguro/estadisticas/export", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!ROLES_GESTION.includes(cabecera.rol) && cabecera.rol !== "auditor") return res.status(401).json("No autorizado");
+    if ((!ROLES_GESTION.includes(cabecera.rol) && cabecera.rol !== "auditor") || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const db = mysqlConnection.promise();
 
     const filtros = {
@@ -2920,6 +3065,336 @@ router.get("/coseguro/estadisticas/export", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al exportar las estadísticas");
+  }
+});
+
+// ===========================================================================
+// SUBSIDIOS DE ALOJAMIENTO POR SALUD (cruce Turismo ↔ Servicios Sociales)
+//
+// Cuando un afiliado viaja por un tratamiento médico marca su reserva de
+// turismo como "por salud" y adjunta certificados médicos. Turismo procesa la
+// reserva física con su flujo normal; acá Servicios Sociales valida el
+// subsidio del 100% en dos pasos (departamental → admin-central) y asume el
+// costo operativo de la estadía (reserva_salud.precio_cubierto).
+// La separación de áreas aplica igual que en los reintegros: solo staff con
+// área coseguro puede tocar estos endpoints.
+// ===========================================================================
+const SUBSIDIO_ESTADO = {
+  PENDIENTE: "PENDIENTE",
+  APROBADA_DEPARTAMENTAL: "APROBADA_DEPARTAMENTAL",
+  APROBADA: "APROBADA",
+  RECHAZADA: "RECHAZADA",
+};
+
+const SUBSIDIO_ESTADO_NOMBRE = {
+  PENDIENTE: "En validación de Servicios Sociales",
+  APROBADA_DEPARTAMENTAL: "Aprobado por departamental",
+  APROBADA: "Subsidio aprobado (100%)",
+  RECHAZADA: "Subsidio rechazado",
+};
+
+function transicionesSubsidioSalud(cabecera, estado) {
+  if (!tieneAreaCoseguro(cabecera)) return [];
+  const porRol = {
+    departamental: {
+      [SUBSIDIO_ESTADO.PENDIENTE]: [SUBSIDIO_ESTADO.APROBADA_DEPARTAMENTAL, SUBSIDIO_ESTADO.RECHAZADA],
+    },
+    "admin-central": {
+      [SUBSIDIO_ESTADO.APROBADA_DEPARTAMENTAL]: [SUBSIDIO_ESTADO.APROBADA, SUBSIDIO_ESTADO.RECHAZADA],
+    },
+    admin: {
+      [SUBSIDIO_ESTADO.PENDIENTE]: [SUBSIDIO_ESTADO.APROBADA_DEPARTAMENTAL, SUBSIDIO_ESTADO.RECHAZADA],
+      [SUBSIDIO_ESTADO.APROBADA_DEPARTAMENTAL]: [SUBSIDIO_ESTADO.APROBADA, SUBSIDIO_ESTADO.RECHAZADA],
+    },
+  };
+  return (porRol[cabecera.rol] || {})[estado] || [];
+}
+
+function puedeVerSubsidio(cabecera, subsidio) {
+  if (cabecera.rol === "afiliado") return Number(subsidio.usuario_id) === Number(cabecera.id);
+  if (!ROLES_STAFF.includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return false;
+  if (cabecera.rol === "departamental") return Number(subsidio.afiliado_departamental_id) === Number(cabecera.departamental_id);
+  return true;
+}
+
+async function notificarStaffCoseguroPorRol(connection, rolNombre, tipo, titulo, mensaje, payload) {
+  const [usuarios] = await connection.query(
+    `SELECT u.id FROM usuario u INNER JOIN rol r ON r.id = u.rol_id
+     WHERE r.nombre = ? AND u.habilitado = 'Y' AND u.area_coseguro = 1`,
+    [rolNombre]
+  );
+  for (const u of usuarios) await insertarNotificacion(connection, u.id, tipo, titulo, mensaje, payload);
+}
+
+const SQL_SUBSIDIO_BASE = `
+  SELECT rs.*, r.modalidad, r.fecha_inicio, r.fecha_fin, r.precio_total, r.estado_reserva_id,
+         er.nombre AS estado_reserva,
+         COALESCE(sv.nombre, ch.nombre) AS alojamiento,
+         CASE WHEN r.convenio_hotel_id IS NOT NULL THEN 'CONVENIO' ELSE 'PROPIO' END AS tipo_alojamiento,
+         u.nombre AS afiliado_nombre, u.apellido AS afiliado_apellido, u.documento AS afiliado_documento,
+         u.departamental_id AS afiliado_departamental_id, d.nombre AS departamental_nombre,
+         aprdep.nombre AS aprobo_departamental_nombre, aprdep.apellido AS aprobo_departamental_apellido,
+         resol.nombre AS resolvio_nombre, resol.apellido AS resolvio_apellido,
+         imp.codigo AS imputacion_codigo, imp.descripcion AS imputacion_descripcion,
+         (SELECT COUNT(*) FROM reserva_salud_archivo a WHERE a.reserva_salud_id = rs.id) AS certificados
+  FROM reserva_salud rs
+  INNER JOIN reserva r ON r.id = rs.reserva_id
+  LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+  LEFT JOIN servicio sv ON sv.id = r.servicio_id
+  LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
+  INNER JOIN usuario u ON u.id = rs.usuario_id
+  LEFT JOIN departamental d ON d.id = u.departamental_id
+  LEFT JOIN usuario aprdep ON aprdep.id = rs.aprobado_departamental_usuario_id
+  LEFT JOIN usuario resol ON resol.id = rs.resuelto_usuario_id
+  LEFT JOIN coseguro_imputacion imp ON imp.id = rs.imputacion_id`;
+
+function mapearSubsidio(cabecera, row) {
+  return {
+    ...row,
+    estado_nombre: SUBSIDIO_ESTADO_NOMBRE[row.estado] || row.estado,
+    transiciones: transicionesSubsidioSalud(cabecera, row.estado),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// GET /coseguro/subsidios-salud — bandeja de validación (staff con área coseguro)
+// ---------------------------------------------------------------------------
+router.get("/coseguro/subsidios-salud", verifyToken, async (req, res) => {
+  try {
+    const cabecera = getCabecera(req);
+    if (!ROLES_STAFF.includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
+    const db = mysqlConnection.promise();
+
+    const condiciones = ["1=1"];
+    const params = [];
+    if (cabecera.rol === "departamental") {
+      condiciones.push("u.departamental_id = ?");
+      params.push(cabecera.departamental_id);
+    }
+    if (req.query.estado) {
+      const estados = String(req.query.estado).split(",").filter((e) => SUBSIDIO_ESTADO[e]);
+      if (estados.length > 0) {
+        condiciones.push(`rs.estado IN (${estados.map(() => "?").join(",")})`);
+        params.push(...estados);
+      }
+    }
+    const search = normalizarTexto(req.query.search);
+    if (search) {
+      condiciones.push(`(CAST(rs.reserva_id AS CHAR) LIKE ? OR u.nombre LIKE ? OR u.apellido LIKE ? OR CAST(u.documento AS CHAR) LIKE ? OR COALESCE(sv.nombre, ch.nombre) LIKE ?)`);
+      const like = `%${search}%`;
+      params.push(like, like, like, like, like);
+    }
+
+    const [rows] = await db.query(
+      `${SQL_SUBSIDIO_BASE}
+       WHERE ${condiciones.join(" AND ")}
+       ORDER BY FIELD(rs.estado, 'PENDIENTE', 'APROBADA_DEPARTAMENTAL', 'APROBADA', 'RECHAZADA'), rs.fecha_creacion DESC`,
+      params
+    );
+
+    const [conteos] = await db.query(
+      `SELECT rs.estado, COUNT(*) AS cantidad
+       FROM reserva_salud rs INNER JOIN usuario u ON u.id = rs.usuario_id
+       ${cabecera.rol === "departamental" ? "WHERE u.departamental_id = ?" : ""}
+       GROUP BY rs.estado`,
+      cabecera.rol === "departamental" ? [cabecera.departamental_id] : []
+    );
+
+    res.status(200).json({
+      results: rows.map((row) => mapearSubsidio(cabecera, row)),
+      conteos: Object.fromEntries(conteos.map((c) => [c.estado, Number(c.cantidad)])),
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener los subsidios por salud");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /coseguro/subsidios-salud/:id — detalle (staff con área coseguro o afiliado dueño)
+// ---------------------------------------------------------------------------
+router.get("/coseguro/subsidios-salud/:id", verifyToken, async (req, res) => {
+  try {
+    const cabecera = getCabecera(req);
+    const subsidioId = Number(req.params.id);
+    if (!subsidioId) return res.status(400).json("ID inválido");
+    const db = mysqlConnection.promise();
+
+    const [rows] = await db.query(`${SQL_SUBSIDIO_BASE} WHERE rs.id = ?`, [subsidioId]);
+    if (rows.length === 0) return res.status(404).json("Subsidio no encontrado");
+    const subsidio = rows[0];
+    if (!puedeVerSubsidio(cabecera, subsidio)) return res.status(401).json("No autorizado");
+
+    const [archivos] = await db.query(
+      "SELECT id, archivo, nombre_original, mime, tamanio, fecha_creacion FROM reserva_salud_archivo WHERE reserva_salud_id = ? ORDER BY id",
+      [subsidioId]
+    );
+    const archivosFirmados = await Promise.all(
+      archivos.map(async (a) => ({ ...a, url: await getSignedFileUrlFromS3(a.archivo).catch(() => null) }))
+    );
+
+    res.status(200).json({ ...mapearSubsidio(cabecera, subsidio), archivos: archivosFirmados });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener el subsidio por salud");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /coseguro/subsidios-salud/:id/archivos — carga de certificados médicos
+// (afiliado dueño mientras no esté resuelto, o staff de gestión con área coseguro)
+// ---------------------------------------------------------------------------
+router.post("/coseguro/subsidios-salud/:id/archivos", verifyToken, manejarUploadCoseguro, async (req, res) => {
+  try {
+    const cabecera = getCabecera(req);
+    const subsidioId = Number(req.params.id);
+    if (!subsidioId) return res.status(400).json("ID inválido");
+    const db = mysqlConnection.promise();
+
+    const [rows] = await db.query(`${SQL_SUBSIDIO_BASE} WHERE rs.id = ?`, [subsidioId]);
+    if (rows.length === 0) return res.status(404).json("Subsidio no encontrado");
+    const subsidio = rows[0];
+
+    const esDuenio = cabecera.rol === "afiliado" && Number(subsidio.usuario_id) === Number(cabecera.id);
+    const esGestion = ROLES_GESTION.includes(cabecera.rol) && tieneAreaCoseguro(cabecera) && puedeVerSubsidio(cabecera, subsidio);
+    if (!esDuenio && !esGestion) return res.status(401).json("No autorizado");
+    if ([SUBSIDIO_ESTADO.APROBADA, SUBSIDIO_ESTADO.RECHAZADA].includes(subsidio.estado) && !esGestion) {
+      return res.status(400).json("El subsidio ya fue resuelto: no se pueden agregar certificados");
+    }
+
+    const files = req.files || [];
+    if (files.length === 0) return res.status(400).json("Adjuntá al menos un certificado médico");
+
+    for (const file of files) {
+      const key = await subirArchivoCoseguro(file, `salud${subsidioId}_certificado`);
+      await db.query(
+        `INSERT INTO reserva_salud_archivo (reserva_salud_id, archivo, nombre_original, mime, tamanio, subido_por_usuario_id)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [subsidioId, key, file.originalname || null, file.mimetype || null, file.size || null, cabecera.id]
+      );
+    }
+    res.status(201).json({ success: true, message: "Certificados cargados correctamente", cantidad: files.length });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al cargar los certificados médicos");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PUT /coseguro/subsidios-salud/:id/estado — doble validación del subsidio.
+// departamental (área coseguro): PENDIENTE → APROBADA_DEPARTAMENTAL | RECHAZADA
+// admin-central (área coseguro): APROBADA_DEPARTAMENTAL → APROBADA | RECHAZADA
+// Al aprobar, Servicios Sociales asume el costo (precio_cubierto) y la reserva
+// queda con precio_total = 0 (100% de descuento para el afiliado).
+// ---------------------------------------------------------------------------
+router.put("/coseguro/subsidios-salud/:id/estado", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = getCabecera(req);
+    const subsidioId = Number(req.params.id);
+    const estadoNuevo = String(req.body.estado || "").toUpperCase();
+    const observacion = normalizarTexto(req.body.observacion);
+    if (!subsidioId || !SUBSIDIO_ESTADO[estadoNuevo]) return res.status(400).json("Datos inválidos");
+
+    const db = mysqlConnection.promise();
+    const [rows] = await db.query(`${SQL_SUBSIDIO_BASE} WHERE rs.id = ?`, [subsidioId]);
+    if (rows.length === 0) return res.status(404).json("Subsidio no encontrado");
+    const subsidio = rows[0];
+    if (!puedeVerSubsidio(cabecera, subsidio)) return res.status(401).json("No autorizado");
+
+    const permitidas = transicionesSubsidioSalud(cabecera, subsidio.estado);
+    if (!permitidas.includes(estadoNuevo)) {
+      return res.status(400).json("Transición no permitida para tu rol en el estado actual del subsidio");
+    }
+    if (estadoNuevo === SUBSIDIO_ESTADO.RECHAZADA && !observacion) {
+      return res.status(400).json("Ingresá una observación para el afiliado explicando el motivo del rechazo");
+    }
+    if ([SUBSIDIO_ESTADO.APROBADA_DEPARTAMENTAL, SUBSIDIO_ESTADO.APROBADA].includes(estadoNuevo) && Number(subsidio.certificados) === 0) {
+      return res.status(400).json("No se puede aprobar un subsidio sin certificados médicos cargados");
+    }
+
+    // Imputación contable opcional al aprobar (igual que en los reintegros)
+    let imputacionId = null;
+    let imputacionDetalleId = null;
+    let cicCodigo = null;
+    if (estadoNuevo === SUBSIDIO_ESTADO.APROBADA) {
+      imputacionId = Number(req.body.imputacion_id) || null;
+      imputacionDetalleId = Number(req.body.imputacion_detalle_id) || null;
+      if (imputacionId) {
+        const [imps] = await db.query("SELECT codigo FROM coseguro_imputacion WHERE id = ? AND tipo = 'CUENTA'", [imputacionId]);
+        if (imps.length === 0) return res.status(400).json("Imputación inválida");
+        cicCodigo = imps[0].codigo;
+      }
+    }
+
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const sets = ["estado = ?", "observacion_resolucion = ?"];
+    const params = [estadoNuevo, observacion];
+    if (estadoNuevo === SUBSIDIO_ESTADO.APROBADA_DEPARTAMENTAL) {
+      sets.push("fecha_aprobacion_departamental = NOW()", "aprobado_departamental_usuario_id = ?");
+      params.push(cabecera.id);
+    }
+    if ([SUBSIDIO_ESTADO.APROBADA, SUBSIDIO_ESTADO.RECHAZADA].includes(estadoNuevo)) {
+      sets.push("fecha_resolucion = NOW()", "resuelto_usuario_id = ?");
+      params.push(cabecera.id);
+    }
+    if (estadoNuevo === SUBSIDIO_ESTADO.APROBADA) {
+      // Foto del costo operativo que asume Servicios Sociales para pagarle al hotel
+      sets.push("precio_cubierto = ?", "imputacion_id = ?", "imputacion_detalle_id = ?", "cic_codigo = ?");
+      params.push(normalizarImporte(subsidio.precio_total) || 0, imputacionId, imputacionDetalleId, cicCodigo);
+    }
+    params.push(subsidioId);
+    await connection.query(`UPDATE reserva_salud SET ${sets.join(", ")} WHERE id = ?`, params);
+
+    if (estadoNuevo === SUBSIDIO_ESTADO.APROBADA) {
+      // 100% de descuento para el afiliado: la reserva queda en $0
+      await connection.query("UPDATE reserva SET precio_total = 0 WHERE id = ?", [subsidio.reserva_id]);
+      await connection.query(
+        `INSERT INTO historial_reserva (reserva_id, tipo_operacion, campo_modificado, valor_anterior, valor_nuevo, usuario_modificador_id, observaciones)
+         VALUES (?, 'UPDATE', 'Subsidio por salud (100%)', ?, '0', ?, ?)`,
+        [subsidio.reserva_id, String(subsidio.precio_total ?? ""), cabecera.id,
+         `Servicios Sociales aprobó el subsidio de alojamiento por salud y asume el costo operativo ($${normalizarImporte(subsidio.precio_total) || 0}).${observacion ? " " + observacion : ""}`]
+      );
+    } else {
+      await connection.query(
+        `INSERT INTO historial_reserva (reserva_id, tipo_operacion, campo_modificado, valor_anterior, valor_nuevo, usuario_modificador_id, observaciones)
+         VALUES (?, 'UPDATE', 'Subsidio por salud', ?, ?, ?, ?)`,
+        [subsidio.reserva_id, subsidio.estado, estadoNuevo, cabecera.id, observacion]
+      );
+    }
+
+    // Notificaciones: siempre al afiliado; al aprobar la departamental, a Servicios Sociales
+    const titulo = `Subsidio por salud de tu reserva #${subsidio.reserva_id}`;
+    let mensaje;
+    if (estadoNuevo === SUBSIDIO_ESTADO.APROBADA_DEPARTAMENTAL) {
+      mensaje = "Tu departamental validó los certificados. Falta la aprobación final de Servicios Sociales.";
+    } else if (estadoNuevo === SUBSIDIO_ESTADO.APROBADA) {
+      mensaje = "Servicios Sociales aprobó el subsidio: tu alojamiento queda bonificado al 100%.";
+    } else {
+      mensaje = `El subsidio fue rechazado. Motivo: ${observacion}. La reserva mantiene la tarifa normal: podés continuarla o cancelarla desde Mis gestiones.`;
+    }
+    await insertarNotificacion(connection, subsidio.usuario_id, "RESERVA_SALUD", titulo, mensaje, {
+      reserva_id: subsidio.reserva_id,
+      reserva_salud_id: subsidioId,
+      estado: estadoNuevo,
+    });
+    if (estadoNuevo === SUBSIDIO_ESTADO.APROBADA_DEPARTAMENTAL) {
+      await notificarStaffCoseguroPorRol(connection, "admin-central", "RESERVA_SALUD_PARA_CONTROL",
+        `Subsidio por salud de la reserva #${subsidio.reserva_id} para aprobar`,
+        `${subsidio.afiliado_apellido}, ${subsidio.afiliado_nombre}: la departamental validó los certificados médicos. Falta la aprobación final de Servicios Sociales.`,
+        { reserva_id: subsidio.reserva_id, reserva_salud_id: subsidioId, estado: estadoNuevo });
+    }
+
+    await connection.commit();
+    res.status(200).json({ success: true, message: "Subsidio actualizado correctamente", estado: estadoNuevo });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.log(error);
+    res.status(500).json("Error al cambiar el estado del subsidio por salud");
+  } finally {
+    if (connection) connection.release();
   }
 });
 
