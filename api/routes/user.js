@@ -19,7 +19,7 @@ const {
 } = require("../services/servicios-disponibilidad");
 
 // S3 INICIO
-const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const bucketName = process.env.BUCKET_NAME;
@@ -175,6 +175,19 @@ async function getSignedFileUrlFromS3(key) {
     { expiresIn: Number.isFinite(S3_SIGNED_URL_EXPIRES_SECONDS) ? S3_SIGNED_URL_EXPIRES_SECONDS : 3600 }
   );
 }
+
+async function deleteFileFromS3(key) {
+  if (!key) {
+    return;
+  }
+
+  await s3.send(
+    new DeleteObjectCommand({
+      Bucket: bucketName,
+      Key: key,
+    })
+  );
+}
 // S3 FIN
 
 const uploadConvenioHotel = multer({
@@ -253,6 +266,208 @@ function manejarUploadTurismoTestimonio(req, res, next) {
     return next();
   });
 }
+
+const uploadLoginImagen = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    files: 1,
+    fileSize: 15 * 1024 * 1024,
+  },
+  fileFilter: (req, file, cb) => {
+    if (
+      file.fieldname === "imagen" &&
+      ["image/jpeg", "image/png", "image/webp"].includes(file.mimetype)
+    ) {
+      return cb(null, true);
+    }
+    return cb(new Error("Solo se permiten imagenes JPG, PNG o WebP"));
+  },
+}).single("imagen");
+
+function manejarUploadLoginImagen(req, res, next) {
+  uploadLoginImagen(req, res, (error) => {
+    if (error) {
+      return res.status(400).json(error.message || "No se pudo procesar la imagen");
+    }
+    return next();
+  });
+}
+
+router.get("/login/imagenes", async (req, res) => {
+  try {
+    const imagenes = await obtenerImagenesLogin(mysqlConnection.promise(), { soloActivas: true });
+    res.status(200).json(imagenes);
+  } catch (error) {
+    console.error("Error al obtener las imagenes del login:", error);
+    res.status(500).json("Error al obtener las imagenes del login");
+  }
+});
+
+router.get("/admin/login/imagenes", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const imagenes = await obtenerImagenesLogin(mysqlConnection.promise());
+    res.status(200).json(imagenes);
+  } catch (error) {
+    console.error("Error al obtener la galeria del login:", error);
+    res.status(500).json("Error al obtener la galeria del login");
+  }
+});
+
+router.post("/admin/login/imagenes", verifyToken, manejarUploadLoginImagen, async (req, res) => {
+  let archivo = null;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+    if (!req.file) {
+      return res.status(400).json("La imagen es requerida");
+    }
+
+    const datos = validarDatosImagenLogin(req.body);
+    if (datos.error) {
+      return res.status(400).json(datos.error);
+    }
+
+    archivo = await subirImagenLogin(req.file);
+    const db = mysqlConnection.promise();
+    const [resultado] = await db.query(
+      `
+        INSERT INTO login_imagen
+          (archivo, nombre_original, titulo, texto_alternativo, activo, orden)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `,
+      [archivo, req.file.originalname, datos.titulo, datos.textoAlternativo, datos.activo, datos.orden]
+    );
+
+    const imagenes = await obtenerImagenesLogin(db, { imagenId: resultado.insertId });
+    res.status(201).json(imagenes[0]);
+  } catch (error) {
+    if (archivo) {
+      try {
+        await deleteFileFromS3(archivo);
+      } catch (deleteError) {
+        console.error("No se pudo limpiar el archivo de login luego del error:", deleteError);
+      }
+    }
+    console.error("Error al crear la imagen del login:", error);
+    res.status(500).json("Error al crear la imagen del login");
+  }
+});
+
+router.put("/admin/login/imagenes/:id", verifyToken, manejarUploadLoginImagen, async (req, res) => {
+  let connection;
+  let archivoNuevo = null;
+  let archivoAnterior = null;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const imagenId = normalizarIdPositivo(req.params.id);
+    if (!imagenId) {
+      return res.status(400).json("ID invalido");
+    }
+    const datos = validarDatosImagenLogin(req.body);
+    if (datos.error) {
+      return res.status(400).json(datos.error);
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const [existentes] = await connection.query(
+      "SELECT * FROM login_imagen WHERE id = ? LIMIT 1 FOR UPDATE",
+      [imagenId]
+    );
+    if (existentes.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Imagen del login no encontrada");
+    }
+
+    archivoAnterior = existentes[0].archivo;
+    archivoNuevo = req.file ? await subirImagenLogin(req.file) : archivoAnterior;
+    const nombreOriginal = req.file ? req.file.originalname : existentes[0].nombre_original;
+
+    await connection.query(
+      `
+        UPDATE login_imagen
+        SET archivo = ?, nombre_original = ?, titulo = ?, texto_alternativo = ?, activo = ?, orden = ?
+        WHERE id = ?
+      `,
+      [archivoNuevo, nombreOriginal, datos.titulo, datos.textoAlternativo, datos.activo, datos.orden, imagenId]
+    );
+    await connection.commit();
+
+    if (req.file && archivoAnterior && archivoAnterior !== archivoNuevo) {
+      try {
+        await deleteFileFromS3(archivoAnterior);
+      } catch (deleteError) {
+        console.error("No se pudo borrar la version anterior de la imagen del login:", deleteError);
+      }
+    }
+
+    const imagenes = await obtenerImagenesLogin(mysqlConnection.promise(), { imagenId });
+    res.status(200).json(imagenes[0]);
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    if (req.file && archivoNuevo && archivoNuevo !== archivoAnterior) {
+      try {
+        await deleteFileFromS3(archivoNuevo);
+      } catch (deleteError) {
+        console.error("No se pudo limpiar la nueva imagen del login:", deleteError);
+      }
+    }
+    console.error("Error al actualizar la imagen del login:", error);
+    res.status(500).json("Error al actualizar la imagen del login");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+router.delete("/admin/login/imagenes/:id", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const imagenId = normalizarIdPositivo(req.params.id);
+    if (!imagenId) {
+      return res.status(400).json("ID invalido");
+    }
+
+    const db = mysqlConnection.promise();
+    const [existentes] = await db.query(
+      "SELECT archivo FROM login_imagen WHERE id = ? LIMIT 1",
+      [imagenId]
+    );
+    if (existentes.length === 0) {
+      return res.status(404).json("Imagen del login no encontrada");
+    }
+
+    await db.query("DELETE FROM login_imagen WHERE id = ?", [imagenId]);
+    try {
+      await deleteFileFromS3(existentes[0].archivo);
+    } catch (deleteError) {
+      console.error("No se pudo borrar de S3 la imagen eliminada del login:", deleteError);
+    }
+
+    res.status(200).json({ id: imagenId });
+  } catch (error) {
+    console.error("Error al eliminar la imagen del login:", error);
+    res.status(500).json("Error al eliminar la imagen del login");
+  }
+});
 
 router.post("/signin", async (req, res) => {
   const documento = req.body.documento || null;
@@ -4651,6 +4866,84 @@ function normalizarImporte(valor) {
   return Number.isFinite(numero) && numero >= 0 ? Number(numero.toFixed(2)) : null;
 }
 
+function validarDatosImagenLogin(body = {}) {
+  const titulo = normalizarTexto(body.titulo);
+  const textoAlternativo = normalizarTexto(body.texto_alternativo);
+  const orden = normalizarNumeroNullable(body.orden);
+
+  if (titulo.length > 120) {
+    return { error: "El titulo no puede superar los 120 caracteres" };
+  }
+  if (textoAlternativo.length > 255) {
+    return { error: "El texto alternativo no puede superar los 255 caracteres" };
+  }
+
+  return {
+    titulo: titulo || null,
+    textoAlternativo: textoAlternativo || null,
+    activo: normalizarBooleanActivo(body.activo),
+    orden: orden !== null ? Math.trunc(orden) : 0,
+  };
+}
+
+async function subirImagenLogin(file) {
+  const extension = EXTENSION_BY_MIME[file.mimetype] || getSafeFileExtension(file.originalname, file.mimetype);
+  const key = `login/fondos/fondo_${Date.now()}_${crypto.randomBytes(8).toString("hex")}.${extension}`;
+  await uploadBufferToS3({
+    key,
+    buffer: file.buffer,
+    contentType: file.mimetype,
+  });
+  return key;
+}
+
+async function firmarImagenLogin(row) {
+  let imagenUrl = null;
+  try {
+    imagenUrl = await getSignedFileUrlFromS3(row.archivo);
+  } catch (error) {
+    console.error("Error generando URL firmada para una imagen del login:", error);
+  }
+
+  return {
+    id: Number(row.id),
+    archivo: row.archivo,
+    nombre_original: row.nombre_original,
+    titulo: row.titulo,
+    texto_alternativo: row.texto_alternativo,
+    activo: Number(row.activo) === 1,
+    orden: Number(row.orden || 0),
+    imagen_url: imagenUrl,
+    fecha_creacion: row.fecha_creacion,
+    fecha_actualizacion: row.fecha_actualizacion,
+  };
+}
+
+async function obtenerImagenesLogin(connection, { soloActivas = false, imagenId = null } = {}) {
+  const filtros = [];
+  const params = [];
+  if (soloActivas) {
+    filtros.push("activo = 1");
+  }
+  if (imagenId) {
+    filtros.push("id = ?");
+    params.push(imagenId);
+  }
+
+  const where = filtros.length > 0 ? `WHERE ${filtros.join(" AND ")}` : "";
+  const [rows] = await connection.query(
+    `
+      SELECT id, archivo, nombre_original, titulo, texto_alternativo, activo, orden,
+             fecha_creacion, fecha_actualizacion
+      FROM login_imagen
+      ${where}
+      ORDER BY orden ASC, id ASC
+    `,
+    params
+  );
+  return Promise.all(rows.map((row) => firmarImagenLogin(row)));
+}
+
 function parseArrayDesdeFormulario(valor) {
   if (Array.isArray(valor)) {
     return valor;
@@ -6658,7 +6951,13 @@ function normalizarPorSalud(body) {
   return { motivo, centro_medico: centroMedico };
 }
 
-async function crearReservaSalud(connection, { reservaId, usuarioId, salud, usuarioNombre }) {
+async function crearReservaSalud(connection, {
+  reservaId,
+  usuarioId,
+  salud,
+  usuarioNombre,
+  usuarioModificadorId = usuarioId,
+}) {
   await connection.query("UPDATE reserva SET es_por_salud = 1 WHERE id = ?", [reservaId]);
   const [resultado] = await connection.query(
     "INSERT INTO reserva_salud (reserva_id, usuario_id, motivo, centro_medico) VALUES (?, ?, ?, ?)",
@@ -6669,7 +6968,7 @@ async function crearReservaSalud(connection, { reservaId, usuarioId, salud, usua
   await connection.query(
     `INSERT INTO historial_reserva (reserva_id, tipo_operacion, campo_modificado, valor_anterior, valor_nuevo, usuario_modificador_id, observaciones)
      VALUES (?, 'UPDATE', 'Subsidio por salud', NULL, 'PENDIENTE', ?, ?)`,
-    [reservaId, usuarioId, `Reserva marcada como viaje por motivos de salud. Motivo: ${salud.motivo}`]
+    [reservaId, usuarioModificadorId, `Reserva marcada como viaje por motivos de salud. Motivo: ${salud.motivo}`]
   );
 
   // Avisar al staff de Servicios Sociales (área coseguro) de la departamental del afiliado
@@ -6814,6 +7113,46 @@ router.post("/reserva", verifyToken, async (req, res) => {
           }
         }
 
+        // El rol admin puede crear la reserva en nombre de un afiliado. Para el
+        // resto de los roles el titular siempre es el usuario autenticado, aunque
+        // intenten enviar otro usuario_id en el payload.
+        const usuarioIdSolicitado = normalizarIdPositivo(req.body.usuario_id);
+        if (cabecera.rol === "admin" && req.body.usuario_id && !usuarioIdSolicitado) {
+          await connection.rollback();
+          return res.status(400).json("El usuario titular indicado no es valido");
+        }
+
+        const usuarioReservaId = cabecera.rol === "admin" && usuarioIdSolicitado
+          ? usuarioIdSolicitado
+          : Number(cabecera.id);
+        const [usuariosTitulares] = await connection.query(
+          `
+            SELECT u.id, u.nombre, u.apellido, u.usuario_familiar_id, u.departamental_id,
+                   u.habilitado, r.nombre AS rol
+            FROM usuario u
+            INNER JOIN rol r ON r.id = u.rol_id
+            WHERE u.id = ?
+            LIMIT 1
+          `,
+          [usuarioReservaId]
+        );
+        if (usuariosTitulares.length === 0) {
+          await connection.rollback();
+          return res.status(404).json("El usuario titular indicado no existe");
+        }
+
+        const usuarioTitular = usuariosTitulares[0];
+        const esAsignacionAdmin = cabecera.rol === "admin" && usuarioReservaId !== Number(cabecera.id);
+        if (esAsignacionAdmin && (usuarioTitular.habilitado !== "Y" || usuarioTitular.rol !== "afiliado")) {
+          await connection.rollback();
+          return res.status(422).json("El titular debe ser un afiliado habilitado");
+        }
+
+        const { usuarioFamiliarPrincipalId, departamentalId } = await obtenerUsuarioPrincipalFamilia(
+          connection,
+          usuarioReservaId
+        );
+
         // Procesar firma si existe
         let firmaArchivo = null;
         if (firma) {
@@ -6824,40 +7163,6 @@ router.post("/reserva", verifyToken, async (req, res) => {
             defaultContentType: "image/png",
           });
           firmaArchivo = firmaFileName;
-        }
-
-        // Obtener el usuario familiar principal del usuario que crea la reserva
-        const [usuarioCreador] = await connection.query(
-          "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
-          [cabecera.id]
-        );
-
-        let usuarioFamiliarPrincipalId = cabecera.id;
-        let departamentalId = usuarioCreador[0]?.departamental_id || null;
-
-        if (usuarioCreador.length > 0) {
-          let currentUserId = usuarioCreador[0].id;
-          let currentUserFamiliarId = usuarioCreador[0].usuario_familiar_id;
-          let currentDepartamentalId = usuarioCreador[0].departamental_id;
-
-          while (currentUserFamiliarId !== null) {
-            const [nextUser] = await connection.query(
-              "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
-              [currentUserFamiliarId]
-            );
-
-            if (nextUser.length > 0) {
-              currentUserId = nextUser[0].id;
-              currentUserFamiliarId = nextUser[0].usuario_familiar_id;
-              currentDepartamentalId = nextUser[0].departamental_id;
-            } else {
-              break;
-            }
-          }
-
-          usuarioFamiliarPrincipalId = currentUserId;
-          // Usar el departamental_id del usuario principal de la familia
-          departamentalId = currentDepartamentalId;
         }
 
         const adicionalesSeleccionados = Array.isArray(adicionales) ? adicionales : [];
@@ -6954,7 +7259,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
             servicio_id,
             regimen_id,
             recurso_id,
-            cabecera.id,
+            usuarioReservaId,
             firmaArchivo,
             precioTotalReserva,
             fecha_inicio,
@@ -7058,9 +7363,10 @@ router.post("/reserva", verifyToken, async (req, res) => {
         if (porSalud) {
           reservaSaludId = await crearReservaSalud(connection, {
             reservaId,
-            usuarioId: cabecera.id,
+            usuarioId: usuarioReservaId,
             salud: porSalud,
-            usuarioNombre: `${cabecera.apellido}, ${cabecera.nombre}`,
+            usuarioNombre: `${usuarioTitular.apellido}, ${usuarioTitular.nombre}`,
+            usuarioModificadorId: cabecera.id,
           });
         }
 

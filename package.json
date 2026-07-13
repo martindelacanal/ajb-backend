@@ -9,7 +9,8 @@
     "start": "node server.js",
     "migrate:s3": "node scripts/migrate-images-to-s3.js",
     "migrate:coseguro": "node scripts/migrar-coseguro.js",
-    "migrate:turismo-propuestas": "node scripts/migrar-propuestas-turismo.js"
+    "migrate:turismo-propuestas": "node scripts/migrar-propuestas-turismo.js",
+    "seed:login-gallery": "node scripts/seed-login-gallery.js"
   },
   "keywords": [],
   "author": "",
