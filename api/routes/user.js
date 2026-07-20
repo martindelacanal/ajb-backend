@@ -4727,6 +4727,34 @@ async function registrarHistorialReserva(connection, reservaId, tipoOperacion, u
   }
 }
 
+// ---------------------------------------------------------------------------
+// Notificaciones del chat de reservas de turismo
+// (mismo patrón que coseguro/traslados/olimpiadas)
+// ---------------------------------------------------------------------------
+async function insertarNotificacion(connection, usuarioId, tipo, titulo, mensaje, payload) {
+  await connection.query(
+    `INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, ?, ?, ?, ?)`,
+    [usuarioId, tipo, titulo, mensaje, JSON.stringify(payload || {})]
+  );
+}
+
+// Staff de turismo involucrado en una reserva: admins globales + usuarios
+// departamentales (con el área Turismo habilitada) de la departamental del afiliado.
+async function notificarStaffTurismo(connection, departamentalId, tipo, titulo, mensaje, payload, excluirUsuarioId) {
+  const [usuarios] = await connection.query(
+    `SELECT u.id FROM usuario u INNER JOIN rol r ON r.id = u.rol_id
+     WHERE u.habilitado = 'Y'
+       AND (r.nombre = 'admin'
+         OR (r.nombre = 'departamental' AND u.departamental_id = ?
+             AND (u.area_turismo IS NULL OR u.area_turismo = 1)))`,
+    [departamentalId || 0]
+  );
+  for (const u of usuarios) {
+    if (excluirUsuarioId && Number(u.id) === Number(excluirUsuarioId)) continue;
+    await insertarNotificacion(connection, u.id, tipo, titulo, mensaje, payload);
+  }
+}
+
 const DIA_EN_MS = 1000 * 60 * 60 * 24;
 const SERVICIO_CAMPING_ID = 4;
 const RECURSO_CAMPING_ID = 1;
@@ -8649,6 +8677,18 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           }
         }
 
+        // Hilo de mensajes de la reserva (chat afiliado ↔ departamental/admin)
+        const [observacionesHilo] = await connection.query(
+          `SELECT o.id, o.usuario_id, o.usuario_rol, o.mensaje, o.estado_reserva_id, o.fecha_creacion,
+                  u.nombre AS usuario_nombre, u.apellido AS usuario_apellido, er.nombre AS estado_nombre
+           FROM reserva_observacion o
+           LEFT JOIN usuario u ON u.id = o.usuario_id
+           LEFT JOIN estado_reserva er ON er.id = o.estado_reserva_id
+           WHERE o.reserva_id = ?
+           ORDER BY o.fecha_creacion ASC, o.id ASC`,
+          [reservaId]
+        );
+
         // Generar número de reserva
         const numeroReserva = `${reserva.id}`;
 
@@ -8764,7 +8804,8 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           monto_adicionales: reserva.monto_adicionales || 0,
           adicionales: adicionalesFormateados,
           es_por_salud: Number(reserva.es_por_salud) === 1,
-          salud
+          salud,
+          observaciones_hilo: observacionesHilo
         };
 
         respuesta.convenio_hotel = convenioHotel;
@@ -8790,6 +8831,90 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener el resumen de la reserva");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /reserva/:id/observaciones — hilo de chat de la reserva
+// (mismo patrón que coseguro/traslados/olimpiadas)
+// ---------------------------------------------------------------------------
+router.post("/reserva/:id/observaciones", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const reservaId = normalizarIdPositivo(req.params.id);
+    const mensaje = normalizarTexto(req.body.mensaje);
+    if (!reservaId || !mensaje) {
+      return res.status(400).json("El mensaje es obligatorio");
+    }
+
+    const db = mysqlConnection.promise();
+    const [rows] = await db.query(
+      `SELECT r.id, r.usuario_id, r.estado_reserva_id, ur.departamental_id AS usuario_departamental_id
+       FROM reserva r
+       LEFT JOIN usuario ur ON ur.id = r.usuario_id
+       WHERE r.id = ?`,
+      [reservaId]
+    );
+    if (rows.length === 0) return res.status(404).json("Reserva no encontrada");
+    const reserva = rows[0];
+
+    if (cabecera.rol === "afiliado" && Number(reserva.usuario_id) !== Number(cabecera.id)) {
+      return res.status(403).json("No tienes permisos sobre esta reserva");
+    }
+    if (
+      cabecera.rol === "departamental" &&
+      Number(reserva.usuario_departamental_id) !== Number(cabecera.departamental_id)
+    ) {
+      return res.status(403).json("No tienes permisos sobre esta reserva");
+    }
+
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    await connection.query(
+      "INSERT INTO reserva_observacion (reserva_id, usuario_id, usuario_rol, mensaje, estado_reserva_id) VALUES (?, ?, ?, ?, ?)",
+      [reservaId, cabecera.id, cabecera.rol, mensaje, reserva.estado_reserva_id]
+    );
+
+    await registrarHistorialReserva(connection, reservaId, "OBSERVACION", cabecera.id, req, null, mensaje);
+
+    const autorEsAfiliado = cabecera.rol === "afiliado";
+    const resumenMensaje = `${autorEsAfiliado ? "El afiliado" : "El equipo de la AJB"} escribió: ${mensaje}`;
+    const payload = { reserva_id: reservaId, estado_reserva_id: reserva.estado_reserva_id };
+
+    if (Number(reserva.usuario_id) !== Number(cabecera.id)) {
+      await insertarNotificacion(
+        connection,
+        reserva.usuario_id,
+        "RESERVA_OBSERVACION",
+        `Nuevo mensaje en tu reserva #${reservaId}`,
+        resumenMensaje,
+        payload
+      );
+    }
+    await notificarStaffTurismo(
+      connection,
+      reserva.usuario_departamental_id,
+      "RESERVA_OBSERVACION",
+      `Nuevo mensaje en la reserva #${reservaId}`,
+      resumenMensaje,
+      payload,
+      cabecera.id
+    );
+
+    await connection.commit();
+    res.status(201).json({ success: true, message: "Mensaje enviado" });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    console.log(error);
+    res.status(500).json("Error al enviar el mensaje");
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -10510,7 +10635,8 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') AS fecha_inicio,
       DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') AS fecha_fin,
       COALESCE(r.observaciones, '') AS observaciones,
-      DATE_FORMAT(r.fecha_creacion, '%d/%m/%Y') AS fecha_creacion
+      DATE_FORMAT(r.fecha_creacion, '%d/%m/%Y') AS fecha_creacion,
+      (SELECT COUNT(*) FROM reserva_observacion ro WHERE ro.reserva_id = r.id) AS mensajes
     FROM reserva r
     INNER JOIN estado_reserva er ON r.estado_reserva_id = er.id
     LEFT JOIN recurso rec ON r.recurso_id = rec.id
