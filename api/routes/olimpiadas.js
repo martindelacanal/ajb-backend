@@ -62,6 +62,7 @@ const EXTENSION_POR_MIME = {
   "image/png": "png",
   "image/webp": "webp",
   "image/heic": "heic",
+  "image/svg+xml": "svg",
   "application/pdf": "pdf",
 };
 
@@ -222,10 +223,20 @@ const SQL_OLIMPIADA_VIGENTE = `
   ORDER BY o.fecha_fin_inscripcion ASC, o.id DESC
   LIMIT 1`;
 
+// Agrega la URL firmada del ícono a una lista de disciplinas
+async function firmarIconosDisciplinas(disciplinas) {
+  return Promise.all(
+    disciplinas.map(async (d) => ({
+      ...d,
+      icono_url: await getSignedFileUrlFromS3(d.icono_archivo).catch(() => null),
+    }))
+  );
+}
+
 // Disciplinas de una olimpiada con cupo y ocupación por departamental
 async function obtenerDisciplinasOlimpiada(db, olimpiadaId, departamentalId) {
   const [disciplinas] = await db.query(
-    `SELECT c.disciplina_id AS id, d.nombre, d.tipo_id, t.nombre AS tipo_nombre,
+    `SELECT c.disciplina_id AS id, d.nombre, d.tipo_id, t.nombre AS tipo_nombre, d.icono_archivo,
             c.max_por_departamental,
             (SELECT COUNT(*)
              FROM olimpiada_inscripcion_disciplina idp
@@ -240,10 +251,10 @@ async function obtenerDisciplinasOlimpiada(db, olimpiadaId, departamentalId) {
      ORDER BY t.nombre ASC, d.nombre ASC`,
     [departamentalId ?? null, departamentalId ?? null, olimpiadaId]
   );
-  return disciplinas.map((d) => ({
+  return firmarIconosDisciplinas(disciplinas.map((d) => ({
     ...d,
     cupo_disponible: d.max_por_departamental === null ? null : Math.max(0, d.max_por_departamental - d.inscriptos_departamental),
-  }));
+  })));
 }
 
 // ===========================================================================
@@ -256,11 +267,16 @@ router.get("/olimpiadas/catalogos", verifyToken, async (req, res) => {
     const [datosSanitarios] = await db.query("SELECT id, nombre FROM olimpiada_dato_sanitario ORDER BY orden, id");
     const [tipos] = await db.query("SELECT id, nombre FROM olimpiada_disciplina_tipo WHERE habilitado = 'Y' ORDER BY nombre");
     const [disciplinas] = await db.query(
-      `SELECT d.id, d.nombre, d.tipo_id, t.nombre AS tipo_nombre, d.max_por_departamental
+      `SELECT d.id, d.nombre, d.tipo_id, t.nombre AS tipo_nombre, d.max_por_departamental, d.icono_archivo
        FROM olimpiada_disciplina d INNER JOIN olimpiada_disciplina_tipo t ON t.id = d.tipo_id
        WHERE d.habilitado = 'Y' ORDER BY t.nombre, d.nombre`
     );
-    res.status(200).json({ grupos_sanguineos: gruposSanguineos, datos_sanitarios: datosSanitarios, tipos, disciplinas });
+    res.status(200).json({
+      grupos_sanguineos: gruposSanguineos,
+      datos_sanitarios: datosSanitarios,
+      tipos,
+      disciplinas: await firmarIconosDisciplinas(disciplinas),
+    });
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener los catálogos de olimpiadas");
@@ -368,19 +384,30 @@ router.get("/olimpiadas/disciplinas", verifyToken, async (req, res) => {
     if (!esStaff(cabecera)) return res.status(401).json("No autorizado");
     const db = mysqlConnection.promise();
     const [disciplinas] = await db.query(
-      `SELECT d.id, d.nombre, d.tipo_id, t.nombre AS tipo_nombre, d.max_por_departamental, d.fecha_creacion
+      `SELECT d.id, d.nombre, d.tipo_id, t.nombre AS tipo_nombre, d.max_por_departamental, d.icono_archivo, d.fecha_creacion
        FROM olimpiada_disciplina d INNER JOIN olimpiada_disciplina_tipo t ON t.id = d.tipo_id
        WHERE d.habilitado = 'Y'
        ORDER BY t.nombre, d.nombre`
     );
-    res.status(200).json(disciplinas);
+    res.status(200).json(await firmarIconosDisciplinas(disciplinas));
   } catch (error) {
     console.log(error);
     res.status(500).json("Error al obtener las disciplinas");
   }
 });
 
-router.post("/olimpiadas/disciplinas", verifyToken, async (req, res) => {
+// Ícono de disciplina: imagen svg/png adjunta en el slot ICONO (opcional)
+function obtenerArchivoIcono(req, res) {
+  const archivo = (req.files || []).find((f) => f.fieldname === "ICONO");
+  if (!archivo) return { archivo: null };
+  if (!archivo.mimetype?.startsWith("image/")) {
+    res.status(400).json("El ícono debe ser una imagen (SVG o PNG)");
+    return { error: true };
+  }
+  return { archivo };
+}
+
+router.post("/olimpiadas/disciplinas", verifyToken, manejarUploadOlimpiadas, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
@@ -391,16 +418,22 @@ router.post("/olimpiadas/disciplinas", verifyToken, async (req, res) => {
       : Number(req.body.max_por_departamental);
     if (!nombre || !tipoId) return res.status(400).json("Nombre y tipo son obligatorios");
     if (max !== null && (!Number.isFinite(max) || max < 0)) return res.status(400).json("El máximo por departamental es inválido");
+
+    const icono = obtenerArchivoIcono(req, res);
+    if (icono.error) return;
+    let iconoArchivo = null;
+    if (icono.archivo) iconoArchivo = await subirArchivoOlimpiadas(icono.archivo, "disciplinas/icono");
+
     const db = mysqlConnection.promise();
     const [resultado] = await db.query(
-      "INSERT INTO olimpiada_disciplina (nombre, tipo_id, max_por_departamental) VALUES (?, ?, ?)",
-      [nombre, tipoId, max]
+      "INSERT INTO olimpiada_disciplina (nombre, tipo_id, max_por_departamental, icono_archivo) VALUES (?, ?, ?, ?)",
+      [nombre, tipoId, max, iconoArchivo]
     );
     await registrarHistorial(db, {
       entidad: "DISCIPLINA", entidad_id: resultado.insertId,
       usuario_id: cabecera.id, usuario_rol: cabecera.rol,
       tipo_operacion: "CREATE",
-      valor_nuevo: `${nombre} (tipo ${tipoId}, máx ${max === null ? "ilimitado" : max})`,
+      valor_nuevo: `${nombre} (tipo ${tipoId}, máx ${max === null ? "ilimitado" : max}${iconoArchivo ? ", con ícono" : ""})`,
     });
     res.status(201).json({ success: true, id: resultado.insertId, message: "Disciplina creada" });
   } catch (error) {
@@ -409,7 +442,7 @@ router.post("/olimpiadas/disciplinas", verifyToken, async (req, res) => {
   }
 });
 
-router.put("/olimpiadas/disciplinas/:id", verifyToken, async (req, res) => {
+router.put("/olimpiadas/disciplinas/:id", verifyToken, manejarUploadOlimpiadas, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
@@ -424,14 +457,27 @@ router.put("/olimpiadas/disciplinas/:id", verifyToken, async (req, res) => {
     const db = mysqlConnection.promise();
     const [rows] = await db.query("SELECT * FROM olimpiada_disciplina WHERE id = ? AND habilitado = 'Y'", [disciplinaId]);
     if (rows.length === 0) return res.status(404).json("Disciplina no encontrada");
-    await db.query(
-      "UPDATE olimpiada_disciplina SET nombre = ?, tipo_id = ?, max_por_departamental = ? WHERE id = ?",
-      [nombre, tipoId, max, disciplinaId]
-    );
     const anterior = rows[0];
+
+    const icono = obtenerArchivoIcono(req, res);
+    if (icono.error) return;
+    let iconoArchivo = anterior.icono_archivo;
+    if (icono.archivo) {
+      iconoArchivo = await subirArchivoOlimpiadas(icono.archivo, "disciplinas/icono");
+    } else if (String(req.body.quitar_icono) === "1") {
+      iconoArchivo = null;
+    }
+
+    await db.query(
+      "UPDATE olimpiada_disciplina SET nombre = ?, tipo_id = ?, max_por_departamental = ?, icono_archivo = ? WHERE id = ?",
+      [nombre, tipoId, max, iconoArchivo, disciplinaId]
+    );
     const cambios = [];
     if (anterior.nombre !== nombre) cambios.push({ campo: "nombre", anterior: anterior.nombre, nuevo: nombre });
     if (Number(anterior.tipo_id) !== tipoId) cambios.push({ campo: "tipo_id", anterior: anterior.tipo_id, nuevo: tipoId });
+    if ((anterior.icono_archivo ?? null) !== (iconoArchivo ?? null)) {
+      cambios.push({ campo: "icono_archivo", anterior: anterior.icono_archivo, nuevo: iconoArchivo });
+    }
     if ((anterior.max_por_departamental ?? null) !== max) {
       cambios.push({
         campo: "max_por_departamental",
@@ -1174,7 +1220,7 @@ router.get("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, async (req, res) 
     if (!puedeVerInscripcion(cabecera, inscripcion)) return res.status(401).json("No autorizado");
 
     const [disciplinas] = await db.query(
-      `SELECT d.id, d.nombre, t.nombre AS tipo_nombre
+      `SELECT d.id, d.nombre, t.nombre AS tipo_nombre, d.icono_archivo
        FROM olimpiada_inscripcion_disciplina idp
        INNER JOIN olimpiada_disciplina d ON d.id = idp.disciplina_id
        INNER JOIN olimpiada_disciplina_tipo t ON t.id = d.tipo_id
@@ -1227,7 +1273,7 @@ router.get("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, async (req, res) 
 
     res.status(200).json({
       ...inscripcion,
-      disciplinas,
+      disciplinas: await firmarIconosDisciplinas(disciplinas),
       datos_sanitarios: datosSanitarios,
       observaciones_hilo: observaciones,
       historial,
