@@ -10634,12 +10634,16 @@ router.get("/mis-gestiones/catalogos", verifyToken, async (req, res) => {
        FROM coseguro_estado WHERE id <> ? ORDER BY id`,
       [COSEGURO_ESTADO_EXPORTADO]
     );
+    const [estadosTraslados] = await db.query(
+      "SELECT id, nombre, color, color_texto FROM traslado_estado ORDER BY orden"
+    );
     res.json({
       estados_turismo: estadosTurismo.map((estado) => ({
         ...estado,
         ...(COLORES_ESTADO_RESERVA[estado.nombre] || COLOR_ESTADO_GESTION_DEFECTO),
       })),
       estados_coseguro: estadosCoseguro,
+      estados_traslados: estadosTraslados,
     });
   } catch (error) {
     console.log(error);
@@ -10719,8 +10723,33 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         LEFT JOIN coseguro_tipo_reintegro t ON t.id = cs.tipo_reintegro_id
         LEFT JOIN coseguro_concepto c ON c.id = cs.concepto_id
       WHERE cs.usuario_id = ? AND cs.eliminado = 0
+      UNION ALL
+      SELECT
+        ts.id,
+        'traslado' AS tipo,
+        CONCAT('TR-', ts.id) AS codigo,
+        te.id AS estado_id,
+        te.nombre AS estado,
+        te.color AS estado_color,
+        te.color_texto AS estado_color_texto,
+        CONCAT('Traslado a ', ddes.nombre) AS titulo,
+        CONCAT('Desde ', dori.nombre) AS subtitulo,
+        NULL AS modalidad,
+        NULL AS fecha_inicio,
+        NULL AS fecha_fin,
+        NULL AS importe,
+        NULL AS comprobante,
+        NULL AS beneficiario,
+        0 AS es_por_salud,
+        NULL AS salud_estado,
+        ts.fecha_creacion
+      FROM traslado_solicitud ts
+        INNER JOIN traslado_estado te ON te.id = ts.estado_id
+        INNER JOIN departamental dori ON dori.id = ts.departamental_origen_id
+        INNER JOIN departamental ddes ON ddes.id = ts.departamental_destino_id
+      WHERE ts.usuario_id = ? AND ts.eliminado = 0
     `;
-    const unionParams = [cabecera.id, cabecera.id];
+    const unionParams = [cabecera.id, cabecera.id, cabecera.id];
 
     // Filtros comunes (el tipo se aplica aparte para poder devolver los
     // contadores de ambos módulos calculados con estos mismos filtros)
@@ -10742,10 +10771,11 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
       .filter(Boolean);
     const estadosTurismo = tokens.filter((t) => /^T\d+$/.test(t)).map((t) => Number(t.slice(1)));
     const estadosCoseguro = tokens.filter((t) => /^C\d+$/.test(t)).map((t) => Number(t.slice(1)));
+    const estadosTraslados = tokens.filter((t) => /^R\d+$/.test(t)).map((t) => Number(t.slice(1)));
     if (estadosCoseguro.includes(COSEGURO_ESTADO_PENDIENTE_ACREDITACION) && !estadosCoseguro.includes(COSEGURO_ESTADO_EXPORTADO)) {
       estadosCoseguro.push(COSEGURO_ESTADO_EXPORTADO);
     }
-    if (estadosTurismo.length > 0 || estadosCoseguro.length > 0) {
+    if (estadosTurismo.length > 0 || estadosCoseguro.length > 0 || estadosTraslados.length > 0) {
       const ramas = [];
       if (estadosTurismo.length > 0) {
         ramas.push(`(g.tipo = 'turismo' AND g.estado_id IN (${estadosTurismo.map(() => "?").join(",")}))`);
@@ -10754,6 +10784,10 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
       if (estadosCoseguro.length > 0) {
         ramas.push(`(g.tipo = 'coseguro' AND g.estado_id IN (${estadosCoseguro.map(() => "?").join(",")}))`);
         params.push(...estadosCoseguro);
+      }
+      if (estadosTraslados.length > 0) {
+        ramas.push(`(g.tipo = 'traslado' AND g.estado_id IN (${estadosTraslados.map(() => "?").join(",")}))`);
+        params.push(...estadosTraslados);
       }
       condiciones.push(`(${ramas.join(" OR ")})`);
     }
@@ -10775,11 +10809,11 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
       `SELECT g.tipo, COUNT(*) AS total FROM (${unionSql}) g ${whereComun} GROUP BY g.tipo`,
       [...unionParams, ...params]
     );
-    const conteos = { turismo: 0, coseguro: 0 };
+    const conteos = { turismo: 0, coseguro: 0, traslado: 0 };
     conteoRows.forEach((row) => (conteos[row.tipo] = Number(row.total)));
 
-    const tipo = ["turismo", "coseguro"].includes(req.query.tipo) ? req.query.tipo : null;
-    const totalItems = tipo ? conteos[tipo] : conteos.turismo + conteos.coseguro;
+    const tipo = ["turismo", "coseguro", "traslado"].includes(req.query.tipo) ? req.query.tipo : null;
+    const totalItems = tipo ? conteos[tipo] : conteos.turismo + conteos.coseguro + conteos.traslado;
 
     const condicionesFinal = tipo ? [...condiciones, "g.tipo = ?"] : condiciones;
     const paramsFinal = tipo ? [...params, tipo] : params;
