@@ -4,6 +4,7 @@
 /api/public/imagenes/*
 /api/public/uploads/*
 .env
+/scripts/seed-olimpiadas-disciplinas.js
 /logs/*
 /imagenes/*
 
