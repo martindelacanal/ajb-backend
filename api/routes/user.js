@@ -2121,6 +2121,62 @@ router.put("/notificaciones/:id/leida", verifyToken, async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Lectura de los hilos de chat (badge de "no leídos" del chat flotante).
+// Guarda, por usuario y entidad, el id del último mensaje visto.
+// ---------------------------------------------------------------------------
+const MODULOS_OBSERVACION = ["turismo", "coseguro", "traslados", "olimpiadas"];
+
+router.get("/observaciones/:modulo/:entidadId/lectura", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "afiliado", "departamental", "admin-central", "auditor"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+    const modulo = req.params.modulo;
+    const entidadId = normalizarIdPositivo(req.params.entidadId);
+    if (!MODULOS_OBSERVACION.includes(modulo) || !entidadId) {
+      return res.status(400).json("Parámetros inválidos");
+    }
+
+    const [rows] = await mysqlConnection.promise().query(
+      "SELECT ultima_observacion_id FROM observacion_lectura WHERE usuario_id = ? AND modulo = ? AND entidad_id = ?",
+      [cabecera.id, modulo, entidadId]
+    );
+    res.status(200).json({ ultima_observacion_id: rows.length ? Number(rows[0].ultima_observacion_id) : 0 });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al obtener la lectura del chat");
+  }
+});
+
+router.put("/observaciones/:modulo/:entidadId/lectura", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "afiliado", "departamental", "admin-central", "auditor"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+    const modulo = req.params.modulo;
+    const entidadId = normalizarIdPositivo(req.params.entidadId);
+    const ultimaObservacionId = normalizarIdPositivo(req.body.ultima_observacion_id);
+    if (!MODULOS_OBSERVACION.includes(modulo) || !entidadId || !ultimaObservacionId) {
+      return res.status(400).json("Parámetros inválidos");
+    }
+
+    await mysqlConnection.promise().query(
+      `INSERT INTO observacion_lectura (usuario_id, modulo, entidad_id, ultima_observacion_id)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         ultima_observacion_id = GREATEST(ultima_observacion_id, VALUES(ultima_observacion_id))`,
+      [cabecera.id, modulo, entidadId, ultimaObservacionId]
+    );
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al marcar el chat como leído");
+  }
+});
+
 router.get("/sorteos/adjudicaciones/pendiente", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
