@@ -387,7 +387,7 @@ router.get("/olimpiadas/disciplinas", verifyToken, async (req, res) => {
       `SELECT d.id, d.nombre, d.tipo_id, t.nombre AS tipo_nombre, d.max_por_departamental, d.icono_archivo, d.fecha_creacion
        FROM olimpiada_disciplina d INNER JOIN olimpiada_disciplina_tipo t ON t.id = d.tipo_id
        WHERE d.habilitado = 'Y'
-       ORDER BY t.nombre, d.nombre`
+       ORDER BY d.nombre, d.id`
     );
     res.status(200).json(await firmarIconosDisciplinas(disciplinas));
   } catch (error) {
