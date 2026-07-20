@@ -19,8 +19,10 @@ require('dotenv').config({path: './.env'}); // variables de entorno
 
 const userRoute = require('./api/routes/user');
 const coseguroRoute = require('./api/routes/coseguro');
+const olimpiadasRoute = require('./api/routes/olimpiadas');
 app.use('/api',userRoute);
 app.use('/api',coseguroRoute);
+app.use('/api',olimpiadasRoute);
 app.use('/imagenes', express.static(path.join(__dirname, 'imagenes')));
 
 module.exports = app;
