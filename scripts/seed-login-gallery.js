@@ -32,8 +32,6 @@ async function ensureTable(connection) {
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
       archivo VARCHAR(512) NOT NULL,
       nombre_original VARCHAR(255) NULL,
-      titulo VARCHAR(120) NULL,
-      texto_alternativo VARCHAR(255) NULL,
       activo TINYINT(1) NOT NULL DEFAULT 1,
       orden INT NOT NULL DEFAULT 0,
       fecha_creacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -43,13 +41,6 @@ async function ensureTable(connection) {
       KEY idx_login_imagen_publicacion (activo, orden, id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
-}
-
-function titleFromFileName(fileName) {
-  const base = path.basename(fileName, path.extname(fileName));
-  return base
-    .replace(/[_-]+/g, " ")
-    .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 async function run() {
@@ -103,14 +94,13 @@ async function run() {
       }));
 
       try {
-        const title = titleFromFileName(fileName);
         await connection.query(
           `
             INSERT INTO login_imagen
-              (archivo, nombre_original, titulo, texto_alternativo, activo, orden)
-            VALUES (?, ?, ?, ?, 1, ?)
+              (archivo, nombre_original, activo, orden)
+            VALUES (?, ?, 1, ?)
           `,
-          [key, fileName, title, `Paisaje de ${title} para el acceso a MiAJB`, index]
+          [key, fileName, index]
         );
         uploaded.push(fileName);
       } catch (error) {

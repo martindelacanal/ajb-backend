@@ -870,10 +870,18 @@ router.get("/traslados/solicitudes", verifyToken, async (req, res) => {
     }
     const search = normalizarTexto(req.query.search);
     if (search) {
-      condiciones.push(`(CAST(s.id AS CHAR) LIKE ? OR u.nombre LIKE ? OR u.apellido LIKE ?
-        OR CAST(u.documento AS CHAR) LIKE ? OR CONCAT(u.apellido, ', ', u.nombre) LIKE ?)`);
+      condiciones.push(`(CONCAT('TR-', s.id) LIKE ? OR dor.nombre LIKE ? OR des.nombre LIKE ?
+        OR u.nombre LIKE ? OR u.apellido LIKE ? OR CONCAT(u.apellido, ', ', u.nombre) LIKE ?
+        OR CAST(u.documento AS CHAR) LIKE ? OR DATE_FORMAT(s.fecha_creacion, '%d/%m/%Y') LIKE ?
+        OR e.nombre LIKE ? OR s.observaciones LIKE ?
+        OR EXISTS (
+          SELECT 1 FROM traslado_solicitud_localidad sl_busqueda
+          INNER JOIN departamental_localidad l_busqueda ON l_busqueda.id = sl_busqueda.localidad_id
+          WHERE sl_busqueda.solicitud_id = s.id AND l_busqueda.nombre LIKE ?
+        )
+        OR CAST((SELECT COUNT(*) FROM traslado_observacion o_busqueda WHERE o_busqueda.solicitud_id = s.id) AS CHAR) LIKE ?)`);
       const like = `%${search}%`;
-      params.push(like, like, like, like, like);
+      params.push(...Array(12).fill(like));
     }
 
     const where = condiciones.join(" AND ");
@@ -944,6 +952,9 @@ router.get("/traslados/solicitudes", verifyToken, async (req, res) => {
       `SELECT s.estado_id, COUNT(*) AS total
        FROM traslado_solicitud s
        INNER JOIN usuario u ON u.id = s.usuario_id
+       INNER JOIN departamental dor ON dor.id = s.departamental_origen_id
+       INNER JOIN departamental des ON des.id = s.departamental_destino_id
+       INNER JOIN traslado_estado e ON e.id = s.estado_id
        WHERE ${condicionesResumen.join(" AND ")}
        GROUP BY s.estado_id`,
       paramsResumen

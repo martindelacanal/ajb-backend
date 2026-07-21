@@ -339,10 +339,10 @@ router.post("/admin/login/imagenes", verifyToken, manejarUploadLoginImagen, asyn
     const [resultado] = await db.query(
       `
         INSERT INTO login_imagen
-          (archivo, nombre_original, titulo, texto_alternativo, activo, orden)
-        VALUES (?, ?, ?, ?, ?, ?)
+          (archivo, nombre_original, activo, orden)
+        VALUES (?, ?, ?, ?)
       `,
-      [archivo, req.file.originalname, datos.titulo, datos.textoAlternativo, datos.activo, datos.orden]
+      [archivo, req.file.originalname, datos.activo, datos.orden]
     );
 
     const imagenes = await obtenerImagenesLogin(db, { imagenId: resultado.insertId });
@@ -397,10 +397,10 @@ router.put("/admin/login/imagenes/:id", verifyToken, manejarUploadLoginImagen, a
     await connection.query(
       `
         UPDATE login_imagen
-        SET archivo = ?, nombre_original = ?, titulo = ?, texto_alternativo = ?, activo = ?, orden = ?
+        SET archivo = ?, nombre_original = ?, activo = ?, orden = ?
         WHERE id = ?
       `,
-      [archivoNuevo, nombreOriginal, datos.titulo, datos.textoAlternativo, datos.activo, datos.orden, imagenId]
+      [archivoNuevo, nombreOriginal, datos.activo, datos.orden, imagenId]
     );
     await connection.commit();
 
@@ -5093,20 +5093,9 @@ function normalizarImporte(valor) {
 }
 
 function validarDatosImagenLogin(body = {}) {
-  const titulo = normalizarTexto(body.titulo);
-  const textoAlternativo = normalizarTexto(body.texto_alternativo);
   const orden = normalizarNumeroNullable(body.orden);
 
-  if (titulo.length > 120) {
-    return { error: "El titulo no puede superar los 120 caracteres" };
-  }
-  if (textoAlternativo.length > 255) {
-    return { error: "El texto alternativo no puede superar los 255 caracteres" };
-  }
-
   return {
-    titulo: titulo || null,
-    textoAlternativo: textoAlternativo || null,
     activo: normalizarBooleanActivo(body.activo),
     orden: orden !== null ? Math.trunc(orden) : 0,
   };
@@ -5135,8 +5124,6 @@ async function firmarImagenLogin(row) {
     id: Number(row.id),
     archivo: row.archivo,
     nombre_original: row.nombre_original,
-    titulo: row.titulo,
-    texto_alternativo: row.texto_alternativo,
     activo: Number(row.activo) === 1,
     orden: Number(row.orden || 0),
     imagen_url: imagenUrl,
@@ -5159,7 +5146,7 @@ async function obtenerImagenesLogin(connection, { soloActivas = false, imagenId 
   const where = filtros.length > 0 ? `WHERE ${filtros.join(" AND ")}` : "";
   const [rows] = await connection.query(
     `
-      SELECT id, archivo, nombre_original, titulo, texto_alternativo, activo, orden,
+      SELECT id, archivo, nombre_original, activo, orden,
              fecha_creacion, fecha_actualizacion
       FROM login_imagen
       ${where}
@@ -10251,9 +10238,11 @@ router.post("/tabla/departamentales", verifyToken, async (req, res) => {
 
     // Filtro de búsqueda general
     let queryBuscar = "";
+    const queryBuscarParams = [];
     if (buscar) {
-      buscar = "%" + buscar + "%";
-      queryBuscar = `AND (d.id LIKE '${buscar}' OR d.nombre LIKE '${buscar}' OR d.direccion LIKE '${buscar}' OR d.localidad LIKE '${buscar}' OR d.provincia LIKE '${buscar}')`;
+      const like = `%${buscar}%`;
+      queryBuscar = `AND (CAST(d.id AS CHAR) LIKE ? OR d.nombre LIKE ? OR d.direccion LIKE ? OR d.localidad LIKE ? OR d.provincia LIKE ?)`;
+      queryBuscarParams.push(...Array(5).fill(like));
     }
 
     // Construcción de filtros específicos
@@ -10301,7 +10290,7 @@ router.post("/tabla/departamentales", verifyToken, async (req, res) => {
       LIMIT ${start}, ${resultsPerPage}
     `;
 
-    const [rows] = await mysqlConnection.promise().execute(query, queryParams);
+    const [rows] = await mysqlConnection.promise().execute(query, [...queryBuscarParams, ...queryParams]);
 
     // Query para contar el total de registros
     let countQuery = `
@@ -10312,7 +10301,7 @@ router.post("/tabla/departamentales", verifyToken, async (req, res) => {
         ${whereClause}
     `;
 
-    const [countRows] = await mysqlConnection.promise().execute(countQuery, queryParams);
+    const [countRows] = await mysqlConnection.promise().execute(countQuery, [...queryBuscarParams, ...queryParams]);
 
     const numOfResults = countRows[0].count;
     const numOfPages = Math.ceil(numOfResults / resultsPerPage);
@@ -10700,12 +10689,16 @@ router.post("/tabla/temporadas", verifyToken, async (req, res) => {
 
     const queryOrderBy = `${orderBy} ${orderType}`;
     
+    const querySearchParams = [];
     if (buscar) {
-      buscar = "%" + buscar + "%";
-      queryBuscar = `AND (id LIKE '${buscar}' OR nombre LIKE '${buscar}' OR DATE_FORMAT(fecha_inicio, '%d/%m/%Y') LIKE '${buscar}' OR DATE_FORMAT(fecha_fin, '%d/%m/%Y') LIKE '${buscar}')`;
+      const like = `%${buscar}%`;
+      queryBuscar = `AND (CAST(id AS CHAR) LIKE ? OR nombre LIKE ? OR DATE_FORMAT(fecha_inicio, '%d/%m/%Y') LIKE ?
+        OR DATE_FORMAT(fecha_fin, '%d/%m/%Y') LIKE ?
+        OR (CASE WHEN fecha_fin < CURDATE() THEN 'Finalizada' WHEN fecha_inicio > CURDATE() THEN 'Futura' ELSE 'Activa' END) LIKE ?)`;
+      querySearchParams.push(...Array(5).fill(like));
     }
 
-    const queryParams = [];
+    const queryParams = [...querySearchParams];
     let query = `
       SELECT DATE_FORMAT(fecha_inicio, '%d/%m/%Y') AS fecha_inicio, 
              nombre AS nombre, 
@@ -10815,12 +10808,19 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
 
   const queryOrderBy = `${orderBy} ${orderType}`;
 
+  const querySearchParams = [];
   if (buscar) {
-    buscar = "%" + buscar + "%";
-    queryBuscar = `AND (r.id LIKE '${buscar}' OR er.nombre LIKE '${buscar}' OR s.nombre LIKE '${buscar}' OR rec.nombre LIKE '${buscar}' OR ch.nombre LIKE '${buscar}' OR ch.ciudad LIKE '${buscar}' OR ch.provincia LIKE '${buscar}' OR u.documento LIKE '${buscar}' OR DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') LIKE '${buscar}' OR DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') LIKE '${buscar}' OR r.observaciones LIKE '${buscar}')`;
+    const like = `%${buscar}%`;
+    queryBuscar = `AND (CAST(r.id AS CHAR) LIKE ? OR er.nombre LIKE ? OR r.modalidad LIKE ?
+      OR s.nombre LIKE ? OR rec.nombre LIKE ? OR ch.nombre LIKE ? OR ch.ciudad LIKE ? OR ch.provincia LIKE ?
+      OR bf.nombre LIKE ? OR CAST(u.documento AS CHAR) LIKE ? OR DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') LIKE ?
+      OR DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') LIKE ? OR DATE_FORMAT(r.fecha_creacion, '%d/%m/%Y') LIKE ?
+      OR r.observaciones LIKE ?
+      OR CAST((SELECT COUNT(*) FROM reserva_observacion ro_busqueda WHERE ro_busqueda.reserva_id = r.id) AS CHAR) LIKE ?)`;
+    querySearchParams.push(...Array(15).fill(like));
   }
 
-  const queryParams = [];
+  const queryParams = [...querySearchParams];
   let query = `
     SELECT 
       r.id,
@@ -10874,7 +10874,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     const [rows] = await mysqlConnection.promise().execute(query, queryParams);
 
     // Construye los parámetros para el countQuery de forma independiente
-    const countParams = [];
+    const countParams = [...querySearchParams];
     if (fromDate) countParams.push(fromDate);
     if (toDate) countParams.push(toDate);
     if (estadoFiltro) countParams.push(estadoFiltro);
@@ -11082,10 +11082,13 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
 
     const search = String(req.query.search || "").trim();
     if (search) {
-      condiciones.push(`(g.codigo LIKE ? OR g.titulo LIKE ? OR g.subtitulo LIKE ? OR g.estado LIKE ?
-        OR g.comprobante LIKE ? OR g.beneficiario LIKE ? OR g.fecha_inicio LIKE ? OR g.fecha_fin LIKE ?)`);
+      condiciones.push(`(g.codigo LIKE ? OR g.tipo LIKE ? OR g.titulo LIKE ? OR g.subtitulo LIKE ? OR g.estado LIKE ?
+        OR g.comprobante LIKE ? OR g.beneficiario LIKE ? OR g.fecha_inicio LIKE ? OR g.fecha_fin LIKE ?
+        OR REPLACE(g.modalidad, '_', ' ') LIKE ? OR CAST(g.importe AS CHAR) LIKE ?
+        OR DATE_FORMAT(g.fecha_creacion, '%d/%m/%Y %H:%i') LIKE ?
+        OR (CASE WHEN g.es_por_salud = 1 THEN 'Por salud' ELSE '' END) LIKE ? OR g.salud_estado LIKE ?)`);
       const like = `%${search}%`;
-      params.push(like, like, like, like, like, like, like, like);
+      params.push(...Array(14).fill(like));
     }
 
     // estados=T1,T3,C7 → cada token filtra dentro de su propio módulo
@@ -11260,8 +11263,14 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
       OR CONCAT(base.apellido, ' ', base.nombre) LIKE ?
       OR CAST(base.documento AS CHAR) LIKE ?
       OR base.parentesco LIKE ?
+      OR base.vinculo LIKE ?
+      OR base.tipo_persona LIKE ?
+      OR CAST(base.edad AS CHAR) LIKE ?
+      OR CAST(base.viajes_compartidos AS CHAR) LIKE ?
+      OR DATE_FORMAT(base.ultimo_viaje_fecha, '%d/%m/%Y') LIKE ?
+      OR DATE_FORMAT(base.fecha_creacion_orden, '%d/%m/%Y') LIKE ?
     )`);
-    paramsFiltro.push(buscar, buscar, buscar, buscar, buscar, buscar);
+    paramsFiltro.push(...Array(12).fill(buscar));
   }
   if (filtroVinculo) {
     condiciones.push("base.vinculo = ?");
@@ -11626,6 +11635,17 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
         params.push(fechaHasta + ' 23:59:59');
       }
 
+      const search = String(req.query.search || "").trim();
+      if (search) {
+        const like = `%${search}%`;
+        whereClause += whereClause ? " AND" : " WHERE";
+        whereClause += ` (DATE_FORMAT(h.fecha_modificacion, '%d/%m/%Y %H:%i:%s') LIKE ?
+          OR h.tipo_operacion LIKE ? OR h.campo_modificado LIKE ? OR h.valor_anterior LIKE ?
+          OR h.valor_nuevo LIKE ? OR h.tabla_afectada LIKE ?
+          OR CONCAT(um.nombre, ' ', um.apellido) LIKE ? OR h.observaciones LIKE ?)`;
+        params.push(...Array(8).fill(like));
+      }
+
       const query = `
         SELECT
           h.id,
@@ -11656,6 +11676,7 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
         SELECT COUNT(*) as total
         FROM historial_usuario h
         INNER JOIN usuario u ON h.usuario_id = u.id
+        LEFT JOIN usuario um ON h.usuario_modificador_id = um.id
         ${whereClause}
       `;
 
@@ -11730,6 +11751,16 @@ router.get("/tabla/historial-departamental/:id?", verifyToken, async (req, res) 
       params.push(fechaHasta + ' 23:59:59');
     }
 
+    const search = String(req.query.search || "").trim();
+    if (search) {
+      const like = `%${search}%`;
+      whereClause += whereClause ? " AND" : " WHERE";
+      whereClause += ` (DATE_FORMAT(h.fecha_cambio, '%d/%m/%Y %H:%i:%s') LIKE ? OR h.operacion LIKE ?
+        OR h.campo_afectado LIKE ? OR h.valor_anterior LIKE ? OR h.valor_nuevo LIKE ?
+        OR CONCAT(u.nombre, ' ', u.apellido) LIKE ?)`;
+      params.push(...Array(6).fill(like));
+    }
+
     const query = `
       SELECT
         h.id,
@@ -11759,6 +11790,7 @@ router.get("/tabla/historial-departamental/:id?", verifyToken, async (req, res) 
       SELECT COUNT(*) as total
       FROM historial_departamental h
       INNER JOIN departamental d ON h.departamental_id = d.id
+      LEFT JOIN usuario u ON h.usuario_id = u.id
       ${whereClause}
     `;
 
@@ -11824,6 +11856,16 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
         params.push(fechaHasta + ' 23:59:59');
       }
 
+      const search = String(req.query.search || "").trim();
+      if (search) {
+        const like = `%${search}%`;
+        whereClause += whereClause ? " AND" : " WHERE";
+        whereClause += ` (DATE_FORMAT(h.fecha_modificacion, '%d/%m/%Y %H:%i:%s') LIKE ?
+          OR h.tipo_operacion LIKE ? OR h.campo_modificado LIKE ? OR h.valor_anterior LIKE ?
+          OR h.valor_nuevo LIKE ? OR CONCAT(um.nombre, ' ', um.apellido) LIKE ? OR h.observaciones LIKE ?)`;
+        params.push(...Array(7).fill(like));
+      }
+
       const query = `
         SELECT
           h.id,
@@ -11849,6 +11891,7 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
       const countQuery = `
         SELECT COUNT(*) as total
         FROM historial_reserva h
+        LEFT JOIN usuario um ON h.usuario_modificador_id = um.id
         ${whereClause}
       `;
 
@@ -11916,9 +11959,13 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
 
       // Filtro de búsqueda general
       let queryBuscar = "";
+      const queryBuscarParams = [];
       if (buscar) {
-        buscar = "%" + buscar + "%";
-        queryBuscar = `AND (u.id LIKE '${buscar}' OR u.nombre LIKE '${buscar}' OR u.apellido LIKE '${buscar}' OR u.documento LIKE '${buscar}' OR u.legajo LIKE '${buscar}' OR r.nombre LIKE '${buscar}' OR DATE_FORMAT(u.fecha_nacimiento, '%d/%m/%Y') LIKE '${buscar}' OR DATE_FORMAT(u.fecha_creacion, '%d/%m/%Y') LIKE '${buscar}')`;
+        const like = `%${buscar}%`;
+        queryBuscar = `AND (CAST(u.id AS CHAR) LIKE ? OR u.nombre LIKE ? OR u.apellido LIKE ?
+          OR CAST(u.documento AS CHAR) LIKE ? OR u.legajo LIKE ? OR r.nombre LIKE ?
+          OR DATE_FORMAT(u.fecha_nacimiento, '%d/%m/%Y') LIKE ? OR DATE_FORMAT(u.fecha_creacion, '%d/%m/%Y') LIKE ?)`;
+        queryBuscarParams.push(...Array(8).fill(like));
       }
 
       // Construcción de filtros específicos
@@ -12024,7 +12071,7 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
         LIMIT ${start}, ${resultsPerPage}
       `;
 
-      const [rows] = await mysqlConnection.promise().execute(query, queryParams);
+      const [rows] = await mysqlConnection.promise().execute(query, [...queryBuscarParams, ...queryParams]);
 
       // Query para contar el total de registros
       let countQuery = `
@@ -12036,7 +12083,7 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
           ${whereClause}
       `;
 
-      const [countRows] = await mysqlConnection.promise().execute(countQuery, queryParams);
+      const [countRows] = await mysqlConnection.promise().execute(countQuery, [...queryBuscarParams, ...queryParams]);
 
       const numOfResults = countRows[0].count;
       const numOfPages = Math.ceil(numOfResults / resultsPerPage);

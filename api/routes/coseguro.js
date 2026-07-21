@@ -1483,10 +1483,16 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
     }
     const search = normalizarTexto(req.query.search);
     if (search) {
-      condiciones.push(`(CAST(s.id AS CHAR) LIKE ? OR u.nombre LIKE ? OR u.apellido LIKE ? OR CAST(u.documento AS CHAR) LIKE ?
-        OR s.comprobante_numero LIKE ? OR s.emisor_nombre LIKE ? OR s.emisor_cuit LIKE ?)`);
+      condiciones.push(`(CONCAT('#', s.id) LIKE ? OR DATE_FORMAT(s.fecha_creacion, '%d/%m/%Y') LIKE ?
+        OR u.nombre LIKE ? OR u.apellido LIKE ? OR CAST(u.documento AS CHAR) LIKE ?
+        OR CONCAT(u.apellido, ', ', u.nombre) LIKE ? OR fam.nombre LIKE ? OR fam.apellido LIKE ?
+        OR CONCAT(fam.apellido, ', ', fam.nombre) LIKE ? OR d.nombre LIKE ? OR t.nombre LIKE ? OR c.nombre LIKE ?
+        OR CONCAT_WS('-', s.comprobante_pto_venta, s.comprobante_numero) LIKE ? OR s.comprobante_numero LIKE ?
+        OR s.emisor_nombre LIKE ? OR s.emisor_cuit LIKE ? OR CAST(s.importe AS CHAR) LIKE ?
+        OR CAST(s.importe_autorizado AS CHAR) LIKE ? OR CAST(s.importe_estimado AS CHAR) LIKE ?
+        OR e.nombre LIKE ? OR e.nombre_afiliado LIKE ?)`);
       const like = `%${search}%`;
-      params.push(like, like, like, like, like, like, like);
+      params.push(...Array(21).fill(like));
     }
 
     // Marca de posibles duplicados (mismo comprobante o mismo archivo en otra solicitud activa).
@@ -1512,6 +1518,7 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
       `SELECT COUNT(*) AS total
        FROM coseguro_solicitud s
        INNER JOIN usuario u ON u.id = s.usuario_id
+       LEFT JOIN usuario fam ON fam.id = s.familiar_usuario_id
        LEFT JOIN departamental d ON d.id = s.departamental_id
        LEFT JOIN coseguro_tipo_reintegro t ON t.id = s.tipo_reintegro_id
        LEFT JOIN coseguro_concepto c ON c.id = s.concepto_id
@@ -3180,9 +3187,13 @@ router.get("/coseguro/subsidios-salud", verifyToken, async (req, res) => {
     }
     const search = normalizarTexto(req.query.search);
     if (search) {
-      condiciones.push(`(CAST(rs.reserva_id AS CHAR) LIKE ? OR u.nombre LIKE ? OR u.apellido LIKE ? OR CAST(u.documento AS CHAR) LIKE ? OR COALESCE(sv.nombre, ch.nombre) LIKE ?)`);
+      condiciones.push(`(CAST(rs.reserva_id AS CHAR) LIKE ? OR u.nombre LIKE ? OR u.apellido LIKE ?
+        OR CONCAT(u.apellido, ', ', u.nombre) LIKE ? OR CAST(u.documento AS CHAR) LIKE ?
+        OR COALESCE(sv.nombre, ch.nombre) LIKE ? OR d.nombre LIKE ? OR rs.estado LIKE ?
+        OR DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') LIKE ? OR DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') LIKE ?
+        OR CAST(r.precio_total AS CHAR) LIKE ? OR rs.motivo LIKE ? OR rs.centro_medico LIKE ?)`);
       const like = `%${search}%`;
-      params.push(like, like, like, like, like);
+      params.push(...Array(13).fill(like));
     }
 
     const [rows] = await db.query(

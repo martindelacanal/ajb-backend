@@ -9,6 +9,7 @@
     "start": "node server.js",
     "migrate:s3": "node scripts/migrate-images-to-s3.js",
     "migrate:coseguro": "node scripts/migrar-coseguro.js",
+    "migrate:login-gallery-schema": "node scripts/migrate-login-gallery-schema.js",
     "migrate:turismo-propuestas": "node scripts/migrar-propuestas-turismo.js",
     "seed:login-gallery": "node scripts/seed-login-gallery.js"
   },
