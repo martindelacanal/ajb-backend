@@ -2030,6 +2030,55 @@ router.get("/sorteos/inscripcion-activa", verifyToken, async (req, res) => {
   }
 });
 
+// Agrupación de tipos de notificación por módulo de origen (filtro `modulo`).
+// Los prefijos siguen la misma convención que usa el frontend para iconos/navegación.
+const MODULOS_NOTIFICACION = {
+  coseguro: { prefijos: ["COSEGURO"] },
+  salud: { prefijos: ["RESERVA_SALUD"] },
+  turismo: { tipos: ["CONVENIO_PROPUESTA", "RESERVA_OBSERVACION", "SORTEO_ADJUDICADO"] },
+  traslados: { prefijos: ["TRASLADO"] },
+  olimpiadas: { prefijos: ["OLIMPIADA"] }
+};
+
+// El query parser de Express puede entregar arrays (?leida=0&leida=0):
+// siempre se toma el primer valor escalar.
+function primerValorQuery(valor) {
+  return Array.isArray(valor) ? valor[0] : valor;
+}
+
+function condicionModuloNotificacion(modulo) {
+  const construir = def => {
+    const partes = [];
+    const params = [];
+    (def.prefijos || []).forEach(prefijo => {
+      partes.push("n.tipo LIKE ?");
+      params.push(`${prefijo}%`);
+    });
+    if (def.tipos && def.tipos.length) {
+      partes.push(`n.tipo IN (${def.tipos.map(() => "?").join(", ")})`);
+      params.push(...def.tipos);
+    }
+    return { sql: `(${partes.join(" OR ")})`, params };
+  };
+
+  // hasOwnProperty: un lookup directo aceptaría claves del prototipo
+  // (__proto__, constructor…) y generaría SQL inválido.
+  if (Object.prototype.hasOwnProperty.call(MODULOS_NOTIFICACION, modulo)) {
+    return construir(MODULOS_NOTIFICACION[modulo]);
+  }
+
+  if (modulo === "otras") {
+    // Todo lo que no pertenece a ningún módulo conocido.
+    const conocidos = Object.values(MODULOS_NOTIFICACION).map(construir);
+    return {
+      sql: `NOT (${conocidos.map(c => c.sql).join(" OR ")})`,
+      params: conocidos.flatMap(c => c.params)
+    };
+  }
+
+  return null;
+}
+
 router.get("/notificaciones", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -2037,7 +2086,63 @@ router.get("/notificaciones", verifyToken, async (req, res) => {
       return res.status(401).json("No autorizado");
     }
 
-    const [rows] = await mysqlConnection.promise().query(
+    // Paginación (por defecto se comporta como la versión histórica: primeras 40).
+    // El tope de página evita que el OFFSET se serialice en notación exponencial.
+    const limite = Math.min(100, Math.max(1, parseInt(primerValorQuery(req.query.limit), 10) || 40));
+    const pagina = Math.min(100000, Math.max(1, parseInt(primerValorQuery(req.query.page), 10) || 1));
+    const offset = (pagina - 1) * limite;
+
+    const condiciones = ["n.usuario_id = ?"];
+    const params = [cabecera.id];
+
+    const leidaParam = primerValorQuery(req.query.leida);
+    if (leidaParam === "0" || leidaParam === "1") {
+      condiciones.push("n.leida = ?");
+      params.push(Number(leidaParam));
+    }
+
+    const moduloParam = primerValorQuery(req.query.modulo);
+    if (typeof moduloParam === "string" && moduloParam) {
+      const condicionModulo = condicionModuloNotificacion(moduloParam);
+      if (!condicionModulo) {
+        return res.status(400).json("Módulo inválido");
+      }
+      condiciones.push(condicionModulo.sql);
+      params.push(...condicionModulo.params);
+    }
+
+    const buscarParam = primerValorQuery(req.query.buscar);
+    const buscar = typeof buscarParam === "string" ? buscarParam.trim() : "";
+    if (buscar) {
+      condiciones.push("(n.titulo LIKE ? OR n.mensaje LIKE ?)");
+      params.push(`%${buscar}%`, `%${buscar}%`);
+    }
+
+    // El regex solo valida formato; el chequeo con Date descarta fechas
+    // inexistentes (2026-02-30) que MySQL rechazaría con error.
+    const esFechaValida = valor => {
+      if (typeof valor !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(valor)) {
+        return false;
+      }
+      const [anio, mes, dia] = valor.split("-").map(Number);
+      const fecha = new Date(anio, mes - 1, dia);
+      return fecha.getFullYear() === anio && fecha.getMonth() === mes - 1 && fecha.getDate() === dia;
+    };
+    const desdeParam = primerValorQuery(req.query.desde);
+    const hastaParam = primerValorQuery(req.query.hasta);
+    if (esFechaValida(desdeParam)) {
+      condiciones.push("n.fecha_creacion >= ?");
+      params.push(`${desdeParam} 00:00:00`);
+    }
+    if (esFechaValida(hastaParam)) {
+      condiciones.push("n.fecha_creacion < DATE_ADD(?, INTERVAL 1 DAY)");
+      params.push(`${hastaParam} 00:00:00`);
+    }
+
+    const where = condiciones.join(" AND ");
+    const db = mysqlConnection.promise();
+
+    const [rows] = await db.query(
       `
         SELECT
           n.id,
@@ -2051,11 +2156,11 @@ router.get("/notificaciones", verifyToken, async (req, res) => {
           sar.estado AS adjudicacion_estado
         FROM notificacion n
         LEFT JOIN sorteo_adjudicacion_respuesta sar ON sar.notificacion_id = n.id
-        WHERE n.usuario_id = ?
+        WHERE ${where}
         ORDER BY n.fecha_creacion DESC, n.id DESC
-        LIMIT 40
+        LIMIT ? OFFSET ?
       `,
-      [cabecera.id]
+      [...params, limite, offset]
     );
 
     const notificaciones = rows.map(row => ({
@@ -2070,21 +2175,58 @@ router.get("/notificaciones", verifyToken, async (req, res) => {
       adjudicacion_estado: row.adjudicacion_estado || null
     }));
 
-    const [countRows] = await mysqlConnection.promise().query(
+    const [totalRows] = await db.query(
+      `SELECT COUNT(*) AS total FROM notificacion n WHERE ${where}`,
+      params
+    );
+    const total = Number(totalRows?.[0]?.total || 0);
+
+    const [countRows] = await db.query(
       "SELECT COUNT(*) AS total FROM notificacion WHERE usuario_id = ? AND leida = 0",
       [cabecera.id]
     );
 
     res.status(200).json({
       notificaciones,
-      no_leidas: Number(countRows?.[0]?.total || 0)
+      no_leidas: Number(countRows?.[0]?.total || 0),
+      total,
+      pagina,
+      paginas: Math.max(1, Math.ceil(total / limite)),
+      hay_mas: offset + rows.length < total
     });
   } catch (error) {
     console.log(error);
     if (esErrorTemporadaAltaNoMigrada(error)) {
-      return res.status(200).json({ notificaciones: [], no_leidas: 0 });
+      return res.status(200).json({ notificaciones: [], no_leidas: 0, total: 0, pagina: 1, paginas: 1, hay_mas: false });
     }
     res.status(500).json("Error al obtener notificaciones");
+  }
+});
+
+router.put("/notificaciones/leidas", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "afiliado", "departamental", "admin-central", "auditor"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const [result] = await mysqlConnection.promise().query(
+      `
+        UPDATE notificacion
+        SET leida = 1,
+            fecha_lectura = COALESCE(fecha_lectura, NOW())
+        WHERE usuario_id = ? AND leida = 0
+      `,
+      [cabecera.id]
+    );
+
+    res.status(200).json({
+      message: "Notificaciones marcadas como leidas",
+      actualizadas: Number(result.affectedRows || 0)
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json("Error al marcar notificaciones");
   }
 });
 
