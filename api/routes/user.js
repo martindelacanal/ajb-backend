@@ -10766,7 +10766,17 @@ router.post("/tabla/temporadas", verifyToken, async (req, res) => {
 
 router.post("/tabla/reservas", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
-  if (!tieneAreaTurismo(cabecera)) return res.status(401).json("No autorizado");
+  const rolesPermitidos = ["admin", "departamental"];
+  if (!rolesPermitidos.includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
+    return res.status(403).json("No autorizado");
+  }
+
+  const departamentalId =
+    cabecera.rol === "departamental" ? normalizarIdPositivo(cabecera.departamental_id) : null;
+  if (cabecera.rol === "departamental" && !departamentalId) {
+    return res.status(403).json("No autorizado");
+  }
+
   let buscar = req.query.search;
   const filters = req.body;
   // Filtro por estado de reserva (nombre en estado_reserva). "Todas" = sin filtro.
@@ -10862,13 +10872,9 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     queryParams.push(estadoFiltro);
   }
 
-  // Si el rol es afiliado, filtrar por usuario_id
-  if (cabecera.rol === "afiliado") {
-    query += " AND r.usuario_id = ?";
-    queryParams.push(cabecera.id);
-  } else if (cabecera.rol === "departamental") {
+  if (cabecera.rol === "departamental") {
     query += " AND u.departamental_id = ?";
-    queryParams.push(cabecera.departamental_id);
+    queryParams.push(departamentalId);
   }
 
   query += ` ORDER BY ${queryOrderBy}, r.id DESC LIMIT ${start}, ${resultsPerPage}`;
@@ -10881,8 +10887,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     if (fromDate) countParams.push(fromDate);
     if (toDate) countParams.push(toDate);
     if (estadoFiltro) countParams.push(estadoFiltro);
-    if (cabecera.rol === "afiliado") countParams.push(cabecera.id);
-    if (cabecera.rol === "departamental") countParams.push(cabecera.departamental_id);
+    if (cabecera.rol === "departamental") countParams.push(departamentalId);
 
     let countQuery = `
       SELECT COUNT(*) AS count
@@ -10898,7 +10903,6 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
         ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
         ${toDate ? "AND r.fecha_fin <= ?" : ""}
         ${estadoFiltro ? "AND er.nombre = ?" : ""}
-        ${cabecera.rol === "afiliado" ? "AND r.usuario_id = ?" : ""}
         ${cabecera.rol === "departamental" ? "AND u.departamental_id = ?" : ""}
     `;
 
@@ -11603,7 +11607,37 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
       cabecera.rol === "admin" ||
       cabecera.rol === "departamental"
     ) {
-      const userId = req.params.id;
+      const userId = req.params.id === undefined ? null : normalizarIdPositivo(req.params.id);
+      if (req.params.id !== undefined && !userId) {
+        return res.status(400).json("ID de usuario invalido");
+      }
+
+      const esDepartamental = cabecera.rol === "departamental";
+      const departamentalId = esDepartamental
+        ? normalizarIdPositivo(cabecera.departamental_id)
+        : null;
+
+      if (esDepartamental) {
+        if (!userId) {
+          return res.status(400).json("El ID de usuario es requerido");
+        }
+        if (!departamentalId) {
+          return res.status(403).json("No autorizado");
+        }
+
+        const [usuariosPermitidos] = await mysqlConnection.promise().execute(
+          `SELECT id
+           FROM usuario
+           WHERE id = ?
+             AND departamental_id = ?
+           LIMIT 1`,
+          [userId, departamentalId]
+        );
+        if (usuariosPermitidos.length === 0) {
+          return res.status(403).json("No autorizado");
+        }
+      }
+
       const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
       const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 20));
       const start = (page - 1) * resultsPerPage;
@@ -11635,6 +11669,12 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
       if (userId) {
         whereClause += " WHERE h.usuario_id = ?";
         params.push(userId);
+      }
+
+      if (esDepartamental) {
+        whereClause += whereClause ? " AND" : " WHERE";
+        whereClause += " u.departamental_id = ?";
+        params.push(departamentalId);
       }
 
       if (tipoOperacion) {
@@ -11715,7 +11755,7 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
       });
 
     } else {
-      res.status(401).json("No autorizado");
+      res.status(403).json("No autorizado");
     }
   } catch (error) {
     console.log(error);
@@ -11860,7 +11900,38 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
         cabecera.rol === "departamental") &&
       tieneAreaTurismo(cabecera)
     ) {
-      const reservaId = req.params.id;
+      const reservaId = req.params.id === undefined ? null : normalizarIdPositivo(req.params.id);
+      if (req.params.id !== undefined && !reservaId) {
+        return res.status(400).json("ID de reserva invalido");
+      }
+
+      const esDepartamental = cabecera.rol === "departamental";
+      const departamentalId = esDepartamental
+        ? normalizarIdPositivo(cabecera.departamental_id)
+        : null;
+
+      if (esDepartamental) {
+        if (!reservaId) {
+          return res.status(400).json("El ID de reserva es requerido");
+        }
+        if (!departamentalId) {
+          return res.status(403).json("No autorizado");
+        }
+
+        const [reservasPermitidas] = await mysqlConnection.promise().execute(
+          `SELECT r.id
+           FROM reserva r
+           INNER JOIN usuario u ON u.id = r.usuario_id
+           WHERE r.id = ?
+             AND u.departamental_id = ?
+           LIMIT 1`,
+          [reservaId, departamentalId]
+        );
+        if (reservasPermitidas.length === 0) {
+          return res.status(403).json("No autorizado");
+        }
+      }
+
       const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
       const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 20));
       const start = (page - 1) * resultsPerPage;
@@ -11892,6 +11963,12 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
         params.push(reservaId);
       }
 
+      if (esDepartamental) {
+        whereClause += whereClause ? " AND" : " WHERE";
+        whereClause += " u.departamental_id = ?";
+        params.push(departamentalId);
+      }
+
       if (tipoOperacion) {
         whereClause += whereClause ? " AND" : " WHERE";
         whereClause += " h.tipo_operacion = ?";
@@ -11920,6 +11997,11 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
         params.push(...Array(7).fill(like));
       }
 
+      const joinsAlcanceDepartamental = esDepartamental
+        ? `INNER JOIN reserva r ON r.id = h.reserva_id
+           INNER JOIN usuario u ON u.id = r.usuario_id`
+        : "";
+
       const query = `
         SELECT
           h.id,
@@ -11933,6 +12015,7 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
           DATE_FORMAT(h.fecha_modificacion, '%d/%m/%Y %H:%i:%s') as fecha_modificacion,
           h.observaciones
         FROM historial_reserva h
+        ${joinsAlcanceDepartamental}
         LEFT JOIN usuario um ON h.usuario_modificador_id = um.id
         ${whereClause}
         ORDER BY ${orderBy} ${orderType}, h.id DESC
@@ -11945,6 +12028,7 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
       const countQuery = `
         SELECT COUNT(*) as total
         FROM historial_reserva h
+        ${joinsAlcanceDepartamental}
         LEFT JOIN usuario um ON h.usuario_modificador_id = um.id
         ${whereClause}
       `;
@@ -11964,7 +12048,7 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
       });
 
     } else {
-      res.status(401).json("No autorizado");
+      res.status(403).json("No autorizado");
     }
   } catch (error) {
     console.log(error);

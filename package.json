@@ -4,7 +4,8 @@
   "description": "",
   "main": "app.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test",
+    "test:security": "node --test test/security/authorization.test.js",
     "serve": "nodemon server.js",
     "start": "node server.js",
     "migrate:s3": "node scripts/migrate-images-to-s3.js",
