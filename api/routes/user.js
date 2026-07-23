@@ -10213,26 +10213,29 @@ router.post("/tabla/departamentales", verifyToken, async (req, res) => {
     }
 
     let buscar = req.query.search;
-    const page = req.query.page ? Number(req.query.page) : 1;
-    const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 10;
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 10));
     const start = (page - 1) * resultsPerPage;
 
-    let orderBy = req.query.orderBy ? req.query.orderBy : "fecha_creacion";
+    const columnasOrdenDepartamentales = {
+      id: "d.id",
+      nombre: "d.nombre",
+      direccion: "d.direccion",
+      localidad: "d.localidad",
+      provincia: "d.provincia",
+      habilitado: "d.habilitado",
+      fecha_creacion: "d.fecha_creacion",
+      fecha_modificacion: "d.fecha_modificacion",
+    };
+    const orderByKey = Object.prototype.hasOwnProperty.call(columnasOrdenDepartamentales, req.query.orderBy)
+      ? req.query.orderBy
+      : "fecha_creacion";
+    const orderBy = columnasOrdenDepartamentales[orderByKey];
     const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
 
     // Obtener filtros del body
     const filters = req.body || {};
     const { habilitado, fecha_creacion_minima, fecha_creacion_maxima } = filters;
-
-    // Mapeo de columnas para ordenamiento
-    if (orderBy === "nombre") orderBy = "d.nombre";
-    else if (orderBy === "direccion") orderBy = "d.direccion";
-    else if (orderBy === "localidad") orderBy = "d.localidad";
-    else if (orderBy === "provincia") orderBy = "d.provincia";
-    else if (orderBy === "habilitado") orderBy = "d.habilitado";
-    else if (orderBy === "fecha_creacion") orderBy = "d.fecha_creacion";
-    else if (orderBy === "fecha_modificacion") orderBy = "d.fecha_modificacion";
-    else orderBy = "d.fecha_creacion";
 
     const queryOrderBy = `${orderBy} ${orderType}`;
 
@@ -10286,7 +10289,7 @@ router.post("/tabla/departamentales", verifyToken, async (req, res) => {
       WHERE 1=1
         ${queryBuscar}
         ${whereClause}
-      ORDER BY ${queryOrderBy}
+      ORDER BY ${queryOrderBy}, d.id DESC
       LIMIT ${start}, ${resultsPerPage}
     `;
 
@@ -10311,7 +10314,7 @@ router.post("/tabla/departamentales", verifyToken, async (req, res) => {
       numOfPages,
       totalItems: numOfResults,
       page: page - 1,
-      orderBy: req.query.orderBy || "fecha_creacion",
+      orderBy: orderByKey,
       orderType,
     });
   } catch (error) {
@@ -10674,18 +10677,21 @@ router.post("/tabla/temporadas", verifyToken, async (req, res) => {
   if (
     cabecera.rol === "admin"
   ) {
-    const page = req.query.page ? Number(req.query.page) : 1;
-    const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 10;
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 10));
     const start = (page - 1) * resultsPerPage;
 
-    let orderBy = req.query.orderBy ? req.query.orderBy : "id";
+    const columnasOrdenTemporadas = {
+      id: "temporada_tarifa.id",
+      nombre: "temporada_tarifa.nombre",
+      fecha_inicio: "temporada_tarifa.fecha_inicio",
+      fecha_fin: "temporada_tarifa.fecha_fin",
+    };
+    const orderByKey = Object.prototype.hasOwnProperty.call(columnasOrdenTemporadas, req.query.orderBy)
+      ? req.query.orderBy
+      : "id";
+    const orderBy = columnasOrdenTemporadas[orderByKey];
     const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
-
-    if (orderBy === "fecha_inicio") {
-      orderBy = "fecha_inicio";
-    } else if (orderBy === "fecha_fin") {
-      orderBy = "fecha_fin";
-    }
 
     const queryOrderBy = `${orderBy} ${orderType}`;
     
@@ -10720,7 +10726,7 @@ router.post("/tabla/temporadas", verifyToken, async (req, res) => {
       queryParams.push(toDate);
     }
 
-    query += ` ORDER BY ${queryOrderBy} LIMIT ${start}, ${resultsPerPage}`;
+    query += ` ORDER BY ${queryOrderBy}, temporada_tarifa.id DESC LIMIT ${start}, ${resultsPerPage}`;
 
     try {
       const [rows] = await mysqlConnection.promise().execute(query, queryParams);
@@ -10746,7 +10752,7 @@ router.post("/tabla/temporadas", verifyToken, async (req, res) => {
         numOfPages,
         totalItems: numOfResults,
         page: page - 1,
-        orderBy,
+        orderBy: orderByKey,
         orderType,
       });
     } catch (error) {
@@ -10781,30 +10787,27 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
   let queryBuscar = "";
   // La página es 1-based; se clampa para que un page=0 o inválido nunca
   // genere un LIMIT negativo (error de sintaxis SQL).
-  const page = Math.max(1, Number(req.query.page) || 1);
-  const resultsPerPage = Math.max(1, Number(req.query.pageSize) || 10);
+  const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+  const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 10));
   const start = (page - 1) * resultsPerPage;
 
-  let orderBy = req.query.orderBy ? req.query.orderBy : "fecha_inicio";
+  const columnasOrdenReservas = {
+    id: "r.id",
+    estado: "er.nombre",
+    modalidad: "COALESCE(r.modalidad, 'FECHA_LIBRE')",
+    servicio: "COALESCE(s.nombre, 'Convenio hotelero')",
+    recurso: "COALESCE(rec.nombre, ch.nombre, 'Pendiente de adjudicación')",
+    afiliado: "u.documento",
+    fecha_inicio: "r.fecha_inicio",
+    fecha_fin: "r.fecha_fin",
+    fecha_creacion: "r.fecha_creacion",
+    observaciones: "COALESCE(r.observaciones, '')",
+  };
+  const orderByKey = Object.prototype.hasOwnProperty.call(columnasOrdenReservas, req.query.orderBy)
+    ? req.query.orderBy
+    : "fecha_inicio";
+  const orderBy = columnasOrdenReservas[orderByKey];
   const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
-
-  if (orderBy === "fecha_inicio") {
-    orderBy = "r.fecha_inicio";
-  } else if (orderBy === "fecha_fin") {
-    orderBy = "r.fecha_fin";
-  } else if (orderBy === "id") {
-    orderBy = "r.id";
-  } else if (orderBy === "estado") {
-    orderBy = "er.nombre";
-  } else if (orderBy === "servicio") {
-    orderBy = "COALESCE(s.nombre, ch.nombre)";
-  } else if (orderBy === "recurso") {
-    orderBy = "COALESCE(rec.nombre, ch.nombre)";
-  } else if (orderBy === "afiliado") {
-    orderBy = "u.documento";
-  } else if (orderBy === "modalidad") {
-    orderBy = "r.modalidad";
-  }
 
   const queryOrderBy = `${orderBy} ${orderType}`;
 
@@ -10868,7 +10871,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     queryParams.push(cabecera.departamental_id);
   }
 
-  query += ` ORDER BY ${queryOrderBy} LIMIT ${start}, ${resultsPerPage}`;
+  query += ` ORDER BY ${queryOrderBy}, r.id DESC LIMIT ${start}, ${resultsPerPage}`;
 
   try {
     const [rows] = await mysqlConnection.promise().execute(query, queryParams);
@@ -10909,7 +10912,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       numOfPages,
       totalItems: numOfResults,
       page: page - 1,
-      orderBy: req.query.orderBy || "fecha_inicio",
+      orderBy: orderByKey,
       orderType,
     });
   } catch (error) {
@@ -10982,8 +10985,8 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
 
   try {
     const db = mysqlConnection.promise();
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 10));
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const pageSize = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 10));
     const orderType = String(req.query.orderType).toLowerCase() === "asc" ? "ASC" : "DESC";
     const COLUMNAS_ORDEN_GESTIONES = {
       fecha_creacion: "g.fecha_creacion",
@@ -11148,7 +11151,7 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
 
     const [rows] = await db.query(
       `SELECT g.* FROM (${unionSql}) g ${where}
-       ORDER BY ${orderBy} ${orderType}, g.fecha_creacion DESC
+       ORDER BY ${orderBy} ${orderType}, g.fecha_creacion DESC, g.tipo ASC, g.id DESC
        LIMIT ? OFFSET ?`,
       [...unionParams, ...paramsFinal, pageSize, (page - 1) * pageSize]
     );
@@ -11181,8 +11184,8 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
   }
 
   const usuarioId = Number(cabecera.id);
-  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-  const resultsPerPage = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 10));
+  const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+  const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 10));
   const start = (page - 1) * resultsPerPage;
 
   const ordenColumnas = {
@@ -11293,7 +11296,7 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
     const [rows] = await db.query(
       `SELECT base.* FROM (${baseQuery}) base
        ${whereFiltros}
-       ORDER BY ${ordenColumnas[orderBy]} ${orderType}, base.apellido ASC, base.nombre ASC
+       ORDER BY ${ordenColumnas[orderBy]} ${orderType}, base.apellido ASC, base.nombre ASC, base.id DESC
        LIMIT ${start}, ${resultsPerPage}`,
       [...baseParams, ...paramsFiltro]
     );
@@ -11601,9 +11604,26 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
       cabecera.rol === "departamental"
     ) {
       const userId = req.params.id;
-      const page = req.query.page ? Number(req.query.page) : 1;
-      const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 20;
+      const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+      const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 20));
       const start = (page - 1) * resultsPerPage;
+
+      const columnasOrdenHistorialUsuario = {
+        fecha_modificacion: "h.fecha_modificacion",
+        tipo_operacion: "h.tipo_operacion",
+        campo_modificado: "h.campo_modificado",
+        valor_anterior: "h.valor_anterior",
+        valor_nuevo: "h.valor_nuevo",
+        tabla_afectada: "h.tabla_afectada",
+        modificador_nombre: "CONCAT_WS(' ', um.nombre, um.apellido)",
+        usuario_nombre: "CONCAT_WS(' ', u.nombre, u.apellido)",
+        observaciones: "h.observaciones",
+      };
+      const orderByKey = Object.prototype.hasOwnProperty.call(columnasOrdenHistorialUsuario, req.query.orderBy)
+        ? req.query.orderBy
+        : "fecha_modificacion";
+      const orderBy = columnasOrdenHistorialUsuario[orderByKey];
+      const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
 
       const tipoOperacion = req.query.tipo_operacion;
       const fechaDesde = req.query.fecha_desde;
@@ -11665,7 +11685,7 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
         INNER JOIN usuario u ON h.usuario_id = u.id
         LEFT JOIN usuario um ON h.usuario_modificador_id = um.id
         ${whereClause}
-        ORDER BY h.fecha_modificacion DESC
+        ORDER BY ${orderBy} ${orderType}, h.id DESC
         LIMIT ${start}, ${resultsPerPage}
       `;
 
@@ -11689,7 +11709,9 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
         numOfPages,
         totalItems: total,
         page: page - 1,
-        pageSize: resultsPerPage
+        pageSize: resultsPerPage,
+        orderBy: orderByKey,
+        orderType
       });
 
     } else {
@@ -11710,9 +11732,24 @@ router.get("/tabla/historial-departamental/:id?", verifyToken, async (req, res) 
     }
 
     const departamentalId = req.params.id;
-    const page = req.query.page ? Number(req.query.page) : 1;
-    const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 20;
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 20));
     const start = (page - 1) * resultsPerPage;
+
+    const columnasOrdenHistorialDepartamental = {
+      fecha_cambio: "h.fecha_cambio",
+      operacion: "h.operacion",
+      campo_afectado: "h.campo_afectado",
+      valor_anterior: "h.valor_anterior",
+      valor_nuevo: "h.valor_nuevo",
+      usuario_nombre: "CONCAT_WS(' ', u.nombre, u.apellido)",
+      departamental_nombre: "d.nombre",
+    };
+    const orderByKey = Object.prototype.hasOwnProperty.call(columnasOrdenHistorialDepartamental, req.query.orderBy)
+      ? req.query.orderBy
+      : "fecha_cambio";
+    const orderBy = columnasOrdenHistorialDepartamental[orderByKey];
+    const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
 
     const operacion = req.query.operacion;
     const campoAfectado = req.query.campo_afectado;
@@ -11779,7 +11816,7 @@ router.get("/tabla/historial-departamental/:id?", verifyToken, async (req, res) 
       INNER JOIN departamental d ON h.departamental_id = d.id
       LEFT JOIN usuario u ON h.usuario_id = u.id
       ${whereClause}
-      ORDER BY h.fecha_cambio DESC
+      ORDER BY ${orderBy} ${orderType}, h.id DESC
       LIMIT ${start}, ${resultsPerPage}
     `;
 
@@ -11803,7 +11840,9 @@ router.get("/tabla/historial-departamental/:id?", verifyToken, async (req, res) 
       numOfPages,
       totalItems: total,
       page: page - 1,
-      pageSize: resultsPerPage
+      pageSize: resultsPerPage,
+      orderBy: orderByKey,
+      orderType
     });
 
   } catch (error) {
@@ -11822,9 +11861,24 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
       tieneAreaTurismo(cabecera)
     ) {
       const reservaId = req.params.id;
-      const page = req.query.page ? Number(req.query.page) : 1;
-      const resultsPerPage = req.query.pageSize ? Number(req.query.pageSize) : 20;
+      const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+      const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 20));
       const start = (page - 1) * resultsPerPage;
+
+      const columnasOrdenHistorialReserva = {
+        fecha_modificacion: "h.fecha_modificacion",
+        tipo_operacion: "h.tipo_operacion",
+        campo_modificado: "h.campo_modificado",
+        valor_anterior: "h.valor_anterior",
+        valor_nuevo: "h.valor_nuevo",
+        modificador_nombre: "CONCAT_WS(' ', um.nombre, um.apellido)",
+        observaciones: "h.observaciones",
+      };
+      const orderByKey = Object.prototype.hasOwnProperty.call(columnasOrdenHistorialReserva, req.query.orderBy)
+        ? req.query.orderBy
+        : "fecha_modificacion";
+      const orderBy = columnasOrdenHistorialReserva[orderByKey];
+      const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
 
       const tipoOperacion = req.query.tipo_operacion;
       const fechaDesde = req.query.fecha_desde;
@@ -11881,7 +11935,7 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
         FROM historial_reserva h
         LEFT JOIN usuario um ON h.usuario_modificador_id = um.id
         ${whereClause}
-        ORDER BY h.fecha_modificacion DESC
+        ORDER BY ${orderBy} ${orderType}, h.id DESC
         LIMIT ${start}, ${resultsPerPage}
       `;
 
@@ -11904,7 +11958,9 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
         numOfPages,
         totalItems: total,
         page: page - 1,
-        pageSize: resultsPerPage
+        pageSize: resultsPerPage,
+        orderBy: orderByKey,
+        orderType
       });
 
     } else {
@@ -11928,32 +11984,27 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
 
       // Paginación (1-based, clampada: un page=0 o inválido no debe generar
       // un LIMIT negativo, que es error de sintaxis en MySQL)
-      const page = Math.max(1, Number(req.query.page) || 1);
-      const resultsPerPage = Math.max(1, Number(req.query.pageSize) || 10);
+      const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+      const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 10));
       const start = (page - 1) * resultsPerPage;
 
       // Ordenamiento
-      let orderBy = req.query.orderBy ? req.query.orderBy : "fecha_creacion";
+      const columnasOrdenUsuarios = {
+        id: "u.id",
+        nombre: "u.nombre",
+        apellido: "u.apellido",
+        rol: "r.nombre",
+        documento: "u.documento",
+        legajo: "u.legajo",
+        fecha_nacimiento: "u.fecha_nacimiento",
+        habilitado: "u.habilitado",
+        fecha_creacion: "u.fecha_creacion",
+      };
+      const orderByKey = Object.prototype.hasOwnProperty.call(columnasOrdenUsuarios, req.query.orderBy)
+        ? req.query.orderBy
+        : "fecha_creacion";
+      const orderBy = columnasOrdenUsuarios[orderByKey];
       const orderType = ["asc", "desc"].includes(req.query.orderType) ? req.query.orderType : "desc";
-
-      // Mapeo de columnas para ordenamiento
-      if (orderBy === "fecha_nacimiento") {
-        orderBy = "u.fecha_nacimiento";
-      } else if (orderBy === "fecha_creacion") {
-        orderBy = "u.fecha_creacion";
-      } else if (orderBy === "nombre") {
-        orderBy = "u.nombre";
-      } else if (orderBy === "apellido") {
-        orderBy = "u.apellido";
-      } else if (orderBy === "documento") {
-        orderBy = "u.documento";
-      } else if (orderBy === "legajo") {
-        orderBy = "u.legajo";
-      } else if (orderBy === "rol") {
-        orderBy = "r.nombre";
-      } else if (orderBy === "habilitado") {
-        orderBy = "u.habilitado";
-      }
 
       const queryOrderBy = `${orderBy} ${orderType}`;
 
@@ -12067,7 +12118,7 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
         WHERE 1=1 
           ${queryBuscar}
           ${whereClause}
-        ORDER BY ${queryOrderBy}
+        ORDER BY ${queryOrderBy}, u.id DESC
         LIMIT ${start}, ${resultsPerPage}
       `;
 
@@ -12093,7 +12144,7 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
         numOfPages,
         totalItems: numOfResults,
         page: page - 1,
-        orderBy: req.query.orderBy || "fecha_creacion",
+        orderBy: orderByKey,
         orderType,
       });
 
