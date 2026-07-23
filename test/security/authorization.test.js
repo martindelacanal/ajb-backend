@@ -296,6 +296,35 @@ test("historial global de usuarios sigue disponible para admin", async () => {
   }
 });
 
+test("historial de usuarios devuelve aliases legibles y los incluye en la busqueda", async () => {
+  setDatabaseHandler(userHistoryResponder(22));
+
+  const response = await request("/api/tabla/historial-usuario?search=Madre", {
+    token: tokenFor({ rol: "admin" }),
+  });
+
+  assert.equal(response.status, 200);
+  const historyQueries = databaseCalls.filter(({ sql }) => /FROM historial_usuario/i.test(sql));
+  assert.equal(historyQueries.length, 2);
+
+  const dataQuery = historyQueries.find(({ sql }) => !/COUNT\(\*\)/i.test(sql));
+  assert.ok(dataQuery);
+  assert.match(dataQuery.sql, /as valor_anterior_legible/i);
+  assert.match(dataQuery.sql, /as valor_nuevo_legible/i);
+  assert.match(dataQuery.sql, /LEFT JOIN parentesco hu_parentesco_anterior/i);
+  assert.match(dataQuery.sql, /LEFT JOIN tipo_persona hu_tipo_persona_nuevo/i);
+  assert.match(dataQuery.sql, /LEFT JOIN rol hu_rol_anterior/i);
+  assert.match(dataQuery.sql, /LEFT JOIN departamental hu_departamental_nuevo/i);
+
+  for (const call of historyQueries) {
+    assert.match(
+      call.sql,
+      /COALESCE\(hu_parentesco_anterior\.nombre, h\.valor_anterior\)[\s\S]+END LIKE \?/i
+    );
+    assert.equal(call.params.filter((param) => param === "%Madre%").length, 10);
+  }
+});
+
 test("historial de reservas devuelve 403 ante un ID de otra departamental", async () => {
   setDatabaseHandler(reservationHistoryResponder(22));
 
@@ -391,5 +420,33 @@ test("historial global de reservas sigue disponible para admin", async () => {
   for (const call of historyQueries) {
     assert.doesNotMatch(call.sql, /u\.departamental_id = \?/);
     assert.doesNotMatch(call.sql, /INNER JOIN reserva r ON r\.id = h\.reserva_id/);
+  }
+});
+
+test("historial de reservas devuelve aliases legibles y los incluye en la busqueda", async () => {
+  setDatabaseHandler(reservationHistoryResponder(22));
+
+  const response = await request("/api/tabla/historial-reserva?search=Caba%C3%B1a", {
+    token: tokenFor({ rol: "admin", area_turismo: 1 }),
+  });
+
+  assert.equal(response.status, 200);
+  const historyQueries = databaseCalls.filter(({ sql }) => /FROM historial_reserva/i.test(sql));
+  assert.equal(historyQueries.length, 2);
+
+  const dataQuery = historyQueries.find(({ sql }) => !/COUNT\(\*\)/i.test(sql));
+  assert.ok(dataQuery);
+  assert.match(dataQuery.sql, /as valor_anterior_legible/i);
+  assert.match(dataQuery.sql, /as valor_nuevo_legible/i);
+  assert.match(dataQuery.sql, /LEFT JOIN estado_reserva hr_estado_reserva_anterior/i);
+  assert.match(dataQuery.sql, /LEFT JOIN recurso hr_recurso_nuevo/i);
+  assert.match(dataQuery.sql, /LEFT JOIN regimen hr_regimen_anterior/i);
+
+  for (const call of historyQueries) {
+    assert.match(
+      call.sql,
+      /COALESCE\(hr_recurso_nuevo\.nombre, h\.valor_nuevo\)[\s\S]+END LIKE \?/i
+    );
+    assert.equal(call.params.filter((param) => param === "%Cabaña%").length, 9);
   }
 });

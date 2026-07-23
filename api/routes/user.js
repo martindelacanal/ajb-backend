@@ -17,6 +17,18 @@ const {
   parsearParametrosBusquedaDisponibilidad,
   parsearServicioIdsCsv,
 } = require("../services/servicios-disponibilidad");
+const {
+  CATALOGOS_HISTORIAL_RESERVA,
+  CATALOGOS_HISTORIAL_USUARIO,
+  crearEnriquecimientoHistorial,
+} = require("../services/historial-legible");
+
+const HISTORIAL_USUARIO_LEGIBLE = crearEnriquecimientoHistorial(
+  CATALOGOS_HISTORIAL_USUARIO
+);
+const HISTORIAL_RESERVA_LEGIBLE = crearEnriquecimientoHistorial(
+  CATALOGOS_HISTORIAL_RESERVA
+);
 
 // S3 INICIO
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
@@ -11702,8 +11714,10 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
         whereClause += ` (DATE_FORMAT(h.fecha_modificacion, '%d/%m/%Y %H:%i:%s') LIKE ?
           OR h.tipo_operacion LIKE ? OR h.campo_modificado LIKE ? OR h.valor_anterior LIKE ?
           OR h.valor_nuevo LIKE ? OR h.tabla_afectada LIKE ?
-          OR CONCAT(um.nombre, ' ', um.apellido) LIKE ? OR h.observaciones LIKE ?)`;
-        params.push(...Array(8).fill(like));
+          OR CONCAT(um.nombre, ' ', um.apellido) LIKE ? OR h.observaciones LIKE ?
+          OR ${HISTORIAL_USUARIO_LEGIBLE.valorAnteriorSql} LIKE ?
+          OR ${HISTORIAL_USUARIO_LEGIBLE.valorNuevoSql} LIKE ?)`;
+        params.push(...Array(10).fill(like));
       }
 
       const query = `
@@ -11716,6 +11730,8 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
           h.campo_modificado,
           h.valor_anterior,
           h.valor_nuevo,
+          ${HISTORIAL_USUARIO_LEGIBLE.valorAnteriorSql} as valor_anterior_legible,
+          ${HISTORIAL_USUARIO_LEGIBLE.valorNuevoSql} as valor_nuevo_legible,
           h.tabla_afectada,
           h.usuario_modificador_id,
           CONCAT(um.nombre, ' ', um.apellido) as modificador_nombre,
@@ -11724,6 +11740,7 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
         FROM historial_usuario h
         INNER JOIN usuario u ON h.usuario_id = u.id
         LEFT JOIN usuario um ON h.usuario_modificador_id = um.id
+        ${HISTORIAL_USUARIO_LEGIBLE.joins}
         ${whereClause}
         ORDER BY ${orderBy} ${orderType}, h.id DESC
         LIMIT ${start}, ${resultsPerPage}
@@ -11737,6 +11754,7 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
         FROM historial_usuario h
         INNER JOIN usuario u ON h.usuario_id = u.id
         LEFT JOIN usuario um ON h.usuario_modificador_id = um.id
+        ${search ? HISTORIAL_USUARIO_LEGIBLE.joins : ""}
         ${whereClause}
       `;
 
@@ -11993,8 +12011,10 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
         whereClause += whereClause ? " AND" : " WHERE";
         whereClause += ` (DATE_FORMAT(h.fecha_modificacion, '%d/%m/%Y %H:%i:%s') LIKE ?
           OR h.tipo_operacion LIKE ? OR h.campo_modificado LIKE ? OR h.valor_anterior LIKE ?
-          OR h.valor_nuevo LIKE ? OR CONCAT(um.nombre, ' ', um.apellido) LIKE ? OR h.observaciones LIKE ?)`;
-        params.push(...Array(7).fill(like));
+          OR h.valor_nuevo LIKE ? OR CONCAT(um.nombre, ' ', um.apellido) LIKE ? OR h.observaciones LIKE ?
+          OR ${HISTORIAL_RESERVA_LEGIBLE.valorAnteriorSql} LIKE ?
+          OR ${HISTORIAL_RESERVA_LEGIBLE.valorNuevoSql} LIKE ?)`;
+        params.push(...Array(9).fill(like));
       }
 
       const joinsAlcanceDepartamental = esDepartamental
@@ -12010,6 +12030,8 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
           h.campo_modificado,
           h.valor_anterior,
           h.valor_nuevo,
+          ${HISTORIAL_RESERVA_LEGIBLE.valorAnteriorSql} as valor_anterior_legible,
+          ${HISTORIAL_RESERVA_LEGIBLE.valorNuevoSql} as valor_nuevo_legible,
           h.usuario_modificador_id,
           CONCAT(um.nombre, ' ', um.apellido) as modificador_nombre,
           DATE_FORMAT(h.fecha_modificacion, '%d/%m/%Y %H:%i:%s') as fecha_modificacion,
@@ -12017,6 +12039,7 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
         FROM historial_reserva h
         ${joinsAlcanceDepartamental}
         LEFT JOIN usuario um ON h.usuario_modificador_id = um.id
+        ${HISTORIAL_RESERVA_LEGIBLE.joins}
         ${whereClause}
         ORDER BY ${orderBy} ${orderType}, h.id DESC
         LIMIT ${start}, ${resultsPerPage}
@@ -12030,6 +12053,7 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
         FROM historial_reserva h
         ${joinsAlcanceDepartamental}
         LEFT JOIN usuario um ON h.usuario_modificador_id = um.id
+        ${search ? HISTORIAL_RESERVA_LEGIBLE.joins : ""}
         ${whereClause}
       `;
 
