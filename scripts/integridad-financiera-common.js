@@ -100,8 +100,30 @@ function databaseConfig() {
   };
 }
 
+function normalizarSqlModeEstricto(valor) {
+  const modos = String(valor || "")
+    .split(",")
+    .map((modo) => modo.trim().toUpperCase())
+    .filter(Boolean);
+  const unicos = new Set(modos);
+  if (!unicos.has("STRICT_TRANS_TABLES") && !unicos.has("STRICT_ALL_TABLES")) {
+    unicos.add("STRICT_TRANS_TABLES");
+  }
+  unicos.add("NO_ENGINE_SUBSTITUTION");
+  return [...unicos].join(",");
+}
+
 async function createConnection() {
-  return mysql.createConnection(databaseConfig());
+  const connection = await mysql.createConnection(databaseConfig());
+  try {
+    const [[session]] = await connection.query("SELECT @@SESSION.sql_mode AS sql_mode");
+    await connection.query("SET SESSION sql_mode = ?", [normalizarSqlModeEstricto(session?.sql_mode)]);
+    await connection.query("SET SESSION time_zone = '-03:00'");
+    return connection;
+  } catch (error) {
+    await connection.end();
+    throw error;
+  }
 }
 
 function redactError(error) {
@@ -790,6 +812,7 @@ module.exports = {
   indexInfo,
   inspectTargetSchema,
   normalizeRow,
+  normalizarSqlModeEstricto,
   parseArguments,
   queryOne,
   redactError,
