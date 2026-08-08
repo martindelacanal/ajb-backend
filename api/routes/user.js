@@ -22,6 +22,37 @@ const {
   CATALOGOS_HISTORIAL_USUARIO,
   crearEnriquecimientoHistorial,
 } = require("../services/historial-legible");
+const {
+  aplicarDescuentoEnPuntosBase,
+  calcularEdadEnFecha,
+  centavosANumero,
+  decimalACentavos,
+  decimalAPuntosBase,
+  diferenciaDiasCivil,
+  fechaCivilAIndice,
+  normalizarFechaCivil,
+  obtenerFechaCivilArgentina,
+  obtenerNochesReserva,
+  revertirDescuentoEnPuntosBase,
+  sumarCentavos,
+  sumarDiasFechaCivil,
+  validarCbu,
+  validarCuitCuil,
+  validarRangoReservaTemporal,
+} = require("../services/valores-dominio");
+const {
+  archivarVersionReservaAntesDeReemplazo,
+  cerrarGuardiaArchivoReserva,
+  limpiarTokenGuardiaArchivoReserva,
+} = require("../services/reserva-version-archivo");
+const {
+  estadoInicialSorteoPermitido,
+  esEstadoReservaTerminal,
+  obtenerEstadoRecursoTrasLiberacion,
+  obtenerEstadoRecursoTrasRechazo,
+  validarAdjudicacionSorteo,
+  validarRespuestaAdjudicacion,
+} = require("../services/sorteos-vigencia");
 
 const HISTORIAL_USUARIO_LEGIBLE = crearEnriquecimientoHistorial(
   CATALOGOS_HISTORIAL_USUARIO
@@ -41,10 +72,12 @@ const secretAccessKey = process.env.SECRET_ACCESS_KEY;
 
 const crypto = require("crypto");
 
-const S3_SIGNED_URL_EXPIRES_SECONDS = Number.parseInt(
-  process.env.S3_SIGNED_URL_EXPIRES_SECONDS || "3600",
-  10
-);
+const s3SignedUrlExpiresConfigurado = Number(process.env.S3_SIGNED_URL_EXPIRES_SECONDS || "3600");
+const S3_SIGNED_URL_EXPIRES_SECONDS = Number.isSafeInteger(s3SignedUrlExpiresConfigurado)
+  && s3SignedUrlExpiresConfigurado >= 60
+  && s3SignedUrlExpiresConfigurado <= 86400
+  ? s3SignedUrlExpiresConfigurado
+  : 3600;
 
 const MIME_BY_EXTENSION = {
   jpg: "image/jpeg",
@@ -62,6 +95,48 @@ const EXTENSION_BY_MIME = {
   "image/webp": "webp",
   "application/pdf": "pdf",
 };
+
+const MIME_IMAGEN_RASTER_PERMITIDO = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+]);
+
+function contenidoCoincideConMime(file) {
+  const buffer = file?.buffer;
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4) return false;
+
+  switch (file.mimetype) {
+    case "image/jpeg":
+      return buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+    case "image/png":
+      return buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    case "image/gif":
+      return buffer.subarray(0, 6).toString("ascii") === "GIF87a" || buffer.subarray(0, 6).toString("ascii") === "GIF89a";
+    case "image/webp":
+      return buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP";
+    case "application/pdf":
+      return buffer.subarray(0, 5).toString("ascii") === "%PDF-";
+    default:
+      return false;
+  }
+}
+
+function archivosSubidos(req) {
+  if (req.file) return [req.file];
+  if (Array.isArray(req.files)) return req.files;
+  if (req.files && typeof req.files === "object") return Object.values(req.files).flat();
+  return [];
+}
+
+function validarContenidoArchivos(req, res, next) {
+  if (archivosSubidos(req).every(contenidoCoincideConMime)) {
+    next();
+    return;
+  }
+  res.status(400).json("El contenido del archivo no coincide con un formato permitido");
+}
 
 const s3 = new S3Client({
   credentials: {
@@ -89,15 +164,7 @@ function getMimeTypeFromFileName(fileName, fallback = "application/octet-stream"
 }
 
 function getSafeFileExtension(originalName, mimeType) {
-  const extensionFromName = (originalName || "").includes(".")
-    ? originalName.split(".").pop().toLowerCase()
-    : "";
-  const sanitizedExtension = extensionFromName.replace(/[^a-z0-9]/g, "");
-  if (sanitizedExtension) {
-    return sanitizedExtension;
-  }
-
-  return EXTENSION_BY_MIME[mimeType] || "png";
+  return EXTENSION_BY_MIME[mimeType] || "bin";
 }
 
 function isS3ObjectNotFound(error) {
@@ -140,10 +207,30 @@ async function uploadBufferToS3({ key, buffer, contentType }) {
 }
 
 async function uploadBase64ToS3({ key, value, defaultContentType = "image/png" }) {
-  const dataUriMatch = value.match(/^data:([^;]+);base64,(.+)$/);
-  const contentType = dataUriMatch ? dataUriMatch[1] : defaultContentType;
-  const base64Payload = dataUriMatch ? dataUriMatch[2] : value;
-  const buffer = Buffer.from(base64Payload.replace(/\s/g, ""), "base64");
+  if (typeof value !== "string" || value.length > 3 * 1024 * 1024) {
+    const error = new Error("La firma es invalida o supera el limite permitido");
+    error.statusCode = 400;
+    throw error;
+  }
+  const dataUriMatch = value.match(/^data:(image\/png);base64,([A-Za-z0-9+/=\s]+)$/i);
+  if (value.startsWith("data:") && !dataUriMatch) {
+    const error = new Error("La firma debe ser una imagen PNG");
+    error.statusCode = 400;
+    throw error;
+  }
+  const contentType = dataUriMatch ? "image/png" : defaultContentType;
+  const base64Payload = (dataUriMatch ? dataUriMatch[2] : value).replace(/\s/g, "");
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(base64Payload)) {
+    const error = new Error("La firma no contiene base64 valido");
+    error.statusCode = 400;
+    throw error;
+  }
+  const buffer = Buffer.from(base64Payload, "base64");
+  if (!contenidoCoincideConMime({ buffer, mimetype: "image/png" })) {
+    const error = new Error("La firma no contiene una imagen PNG valida");
+    error.statusCode = 400;
+    throw error;
+  }
 
   await uploadBufferToS3({
     key,
@@ -209,7 +296,7 @@ const uploadConvenioHotel = multer({
     fileSize: 10 * 1024 * 1024,
   },
   fileFilter: (req, file, cb) => {
-    if (file.fieldname === "fotos" && file.mimetype?.startsWith("image/")) {
+    if (file.fieldname === "fotos" && MIME_IMAGEN_RASTER_PERMITIDO.has(file.mimetype)) {
       return cb(null, true);
     }
     if (file.fieldname === "tarifario_pdf" && file.mimetype === "application/pdf") {
@@ -229,7 +316,7 @@ function manejarUploadConvenioHotel(req, res, next) {
     if (error) {
       return res.status(400).json(error.message || "No se pudieron procesar los archivos");
     }
-    return next();
+    return validarContenidoArchivos(req, res, next);
   });
 }
 
@@ -240,7 +327,7 @@ const uploadTurismoPropuesta = multer({
     fileSize: 8 * 1024 * 1024,
   },
   fileFilter: (req, file, cb) => {
-    if (file.fieldname === "imagen" && file.mimetype?.startsWith("image/")) {
+    if (file.fieldname === "imagen" && MIME_IMAGEN_RASTER_PERMITIDO.has(file.mimetype)) {
       return cb(null, true);
     }
     return cb(new Error("Solo se permite una imagen"));
@@ -252,7 +339,7 @@ function manejarUploadTurismoPropuesta(req, res, next) {
     if (error) {
       return res.status(400).json(error.message || "No se pudo procesar la imagen");
     }
-    return next();
+    return validarContenidoArchivos(req, res, next);
   });
 }
 
@@ -263,7 +350,7 @@ const uploadTurismoTestimonio = multer({
     fileSize: 5 * 1024 * 1024,
   },
   fileFilter: (req, file, cb) => {
-    if (file.fieldname === "foto" && file.mimetype?.startsWith("image/")) {
+    if (file.fieldname === "foto" && MIME_IMAGEN_RASTER_PERMITIDO.has(file.mimetype)) {
       return cb(null, true);
     }
     return cb(new Error("Solo se permite una imagen de perfil"));
@@ -275,7 +362,7 @@ function manejarUploadTurismoTestimonio(req, res, next) {
     if (error) {
       return res.status(400).json(error.message || "No se pudo procesar la foto");
     }
-    return next();
+    return validarContenidoArchivos(req, res, next);
   });
 }
 
@@ -301,7 +388,7 @@ function manejarUploadLoginImagen(req, res, next) {
     if (error) {
       return res.status(400).json(error.message || "No se pudo procesar la imagen");
     }
-    return next();
+    return validarContenidoArchivos(req, res, next);
   });
 }
 
@@ -482,12 +569,12 @@ router.delete("/admin/login/imagenes/:id", verifyToken, async (req, res) => {
 });
 
 router.post("/signin", async (req, res) => {
-  const documento = req.body.documento || null;
-  const password = req.body.password || null;
-  const recordar = req.body.recordar || null;
+  const documento = String(req.body?.documento ?? "").trim();
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  const recordar = req.body?.recordar === true || req.body?.recordar === 1 || req.body?.recordar === "true";
 
-  if (!documento || !password) {
-    return res.status(400).json("Documento y contraseña son requeridos");
+  if (!/^\d{5,12}$/.test(documento) || password.length < 1 || password.length > 128) {
+    return res.status(400).json("Documento o contraseña invalidos");
   }
 
   const query = `
@@ -511,6 +598,11 @@ router.post("/signin", async (req, res) => {
           let tokenData = JSON.stringify(data);
           const expiresIn = recordar ? "7d" : "8h";
           jwt.sign({ data: tokenData }, process.env.JWT_SECRET, { expiresIn }, (err, token) => {
+            if (err || !token) {
+              console.error("Error al emitir token de acceso:", err);
+              res.status(500).json("Error interno");
+              return;
+            }
             res.status(200).json({ token, data });
           });
         }
@@ -608,7 +700,7 @@ router.get("/credencial-digital", verifyToken, async (req, res) => {
 
         // Formatear la fecha de nacimiento a string (YYYY-MM-DD)
         if (usuario.fecha_nacimiento) {
-          usuario.fecha_nacimiento = usuario.fecha_nacimiento.toISOString().split('T')[0];
+          usuario.fecha_nacimiento = formatearFechaSQL(usuario.fecha_nacimiento);
         }
 
         // Si tiene foto, prepararla para envío (como base64)
@@ -837,6 +929,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
                 AND bf.modalidad = 'SORTEO'
                 AND s.estado = 'ACTIVO'
                 AND bfr.estado IN ('DISPONIBLE', 'SORTEO')
+                AND s.fecha_inicio_inscripcion <= CURDATE()
                 AND s.fecha_fin_inscripcion >= CURDATE()
                 AND bf.fecha_inicio < ?
                 AND bf.fecha_fin > ?
@@ -905,23 +998,33 @@ router.get("/servicios", verifyToken, async (req, res) => {
         // Calcular precios solo si se proporcionan las fechas y al menos una persona
         if (criteriosDisponibilidad) {
           const { fecha_inicio, fecha_fin, adultos, ninos, bebes } = criteriosDisponibilidad;
-          const fechaInicioSolicitud = new Date(fecha_inicio);
-          const fechaFinSolicitud = new Date(fecha_fin);
+          const nochesSolicitud = obtenerNochesReserva(fecha_inicio, fecha_fin, 366);
 
-          // Calcular días del rango (NO incluir el día de salida)
-          const diasTotales = Math.ceil((fechaFinSolicitud - fechaInicioSolicitud) / (1000 * 60 * 60 * 24));
-
-          let precios_minimos_totales = [];
-          let precios_maximos_totales = [];
+          const preciosMinimosCentavos = [];
+          const preciosMaximosCentavos = [];
+          let estimacionCompleta = nochesSolicitud.length > 0;
 
           // Procesar cada día del rango
-          for (let dia = 0; dia < diasTotales; dia++) {
-            const fechaActual = new Date(fechaInicioSolicitud);
-            fechaActual.setDate(fechaInicioSolicitud.getDate() + dia);
-            const fechaString = fechaActual.toISOString().split('T')[0];
+          for (const fechaString of nochesSolicitud) {
 
-            let precio_minimo_dia = 0;
-            let precio_maximo_dia = 0;
+            let precioMinimoDiaCentavos = 0;
+            let precioMaximoDiaCentavos = 0;
+            const acumularRangoTarifa = (filas, cantidad) => {
+              if (cantidad === 0) return true;
+              const minimo = decimalACentavos(filas?.[0]?.precio_min);
+              const maximo = decimalACentavos(filas?.[0]?.precio_max);
+              const subtotalMinimo = minimo === null ? null : minimo * cantidad;
+              const subtotalMaximo = maximo === null ? null : maximo * cantidad;
+              if (!Number.isSafeInteger(subtotalMinimo) || !Number.isSafeInteger(subtotalMaximo)) {
+                return false;
+              }
+              const nuevoMinimo = sumarCentavos(precioMinimoDiaCentavos, subtotalMinimo);
+              const nuevoMaximo = sumarCentavos(precioMaximoDiaCentavos, subtotalMaximo);
+              if (nuevoMinimo === null || nuevoMaximo === null) return false;
+              precioMinimoDiaCentavos = nuevoMinimo;
+              precioMaximoDiaCentavos = nuevoMaximo;
+              return true;
+            };
 
             // Procesar adultos (mayores de 5 años)
             if (adultos > 0) {
@@ -935,10 +1038,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
         AND t.fecha_fin >= ?
     `, [servicio.id, fechaString, fechaString]);
 
-              if (tarifasAdultos.length > 0 && tarifasAdultos[0].precio_min !== null) {
-                precio_minimo_dia += tarifasAdultos[0].precio_min * adultos;
-                precio_maximo_dia += tarifasAdultos[0].precio_max * adultos;
-              }
+              estimacionCompleta = acumularRangoTarifa(tarifasAdultos, adultos) && estimacionCompleta;
             }
 
             // Procesar niños (entre 2 y 5 años inclusivo)
@@ -954,10 +1054,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
         AND t.fecha_fin >= ?
     `, [servicio.id, fechaString, fechaString]);
 
-              if (tarifasninos.length > 0 && tarifasninos[0].precio_min !== null) {
-                precio_minimo_dia += tarifasninos[0].precio_min * ninos;
-                precio_maximo_dia += tarifasninos[0].precio_max * ninos;
-              }
+              estimacionCompleta = acumularRangoTarifa(tarifasninos, ninos) && estimacionCompleta;
             }
 
             // Procesar bebés (menores de 2 años)
@@ -972,19 +1069,20 @@ router.get("/servicios", verifyToken, async (req, res) => {
                   AND t.fecha_fin >= ?
               `, [servicio.id, fechaString, fechaString]);
 
-              if (tarifasBebes.length > 0 && tarifasBebes[0].precio_min !== null) {
-                precio_minimo_dia += tarifasBebes[0].precio_min * bebes;
-                precio_maximo_dia += tarifasBebes[0].precio_max * bebes;
-              }
+              estimacionCompleta = acumularRangoTarifa(tarifasBebes, bebes) && estimacionCompleta;
             }
 
-            precios_minimos_totales.push(precio_minimo_dia);
-            precios_maximos_totales.push(precio_maximo_dia);
+            preciosMinimosCentavos.push(precioMinimoDiaCentavos);
+            preciosMaximosCentavos.push(precioMaximoDiaCentavos);
           }
 
           // Sumar todos los días
-          precio_minimo = precios_minimos_totales.reduce((sum, precio) => sum + precio, 0);
-          precio_maximo = precios_maximos_totales.reduce((sum, precio) => sum + precio, 0);
+          const totalMinimoCentavos = sumarCentavos(...preciosMinimosCentavos);
+          const totalMaximoCentavos = sumarCentavos(...preciosMaximosCentavos);
+          if (estimacionCompleta && totalMinimoCentavos !== null && totalMaximoCentavos !== null) {
+            precio_minimo = centavosANumero(totalMinimoCentavos);
+            precio_maximo = centavosANumero(totalMaximoCentavos);
+          }
         }
 
         const disponibilidadBase = disponibilidadPorServicio.get(Number(servicio.id)) || null;
@@ -1079,6 +1177,9 @@ router.get("/turismo/propuestas", verifyToken, async (req, res) => {
     const cabecera = JSON.parse(req.data.data);
     if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
       return res.status(401).json("No autorizado");
+    }
+    if (!tieneAreaTurismo(cabecera)) {
+      return res.status(403).json("No autorizado");
     }
 
     const propuestas = await obtenerPropuestasTurismo(mysqlConnection.promise());
@@ -1435,12 +1536,19 @@ router.post("/admin/convenios-hoteleros", verifyToken, manejarUploadConvenioHote
     const descripcion = normalizarTexto(req.body.descripcion);
     const latitud = normalizarNumeroNullable(req.body.latitud);
     const longitud = normalizarNumeroNullable(req.body.longitud);
-    const activo = normalizarBooleanActivo(req.body.activo, true);
+    const activo = req.body.activo === undefined ? 1 : normalizarBooleanoBinarioEstricto(req.body.activo);
     const fotos = req.files?.fotos || [];
     const pdf = req.files?.tarifario_pdf?.[0] || null;
 
     if (!nombre || !ciudad || !provincia || !coordenadasMaps) {
       return res.status(400).json("Nombre, ciudad, provincia y coordenadas son requeridos");
+    }
+    if (activo === null
+      || (req.body.latitud !== undefined && req.body.latitud !== "" && latitud === null)
+      || (req.body.longitud !== undefined && req.body.longitud !== "" && longitud === null)
+      || (latitud !== null && (latitud < -90 || latitud > 90))
+      || (longitud !== null && (longitud < -180 || longitud > 180))) {
+      return res.status(400).json("Coordenadas o estado activo inválidos");
     }
     if (fotos.length > 10) {
       return res.status(400).json("Se pueden subir hasta 10 fotos");
@@ -1523,12 +1631,19 @@ router.put("/admin/convenios-hoteleros/:id", verifyToken, manejarUploadConvenioH
     const descripcion = normalizarTexto(req.body.descripcion);
     const latitud = normalizarNumeroNullable(req.body.latitud);
     const longitud = normalizarNumeroNullable(req.body.longitud);
-    const activo = normalizarBooleanActivo(req.body.activo, true);
+    const activo = req.body.activo === undefined ? 1 : normalizarBooleanoBinarioEstricto(req.body.activo);
     const fotos = req.files?.fotos || [];
     const pdf = req.files?.tarifario_pdf?.[0] || null;
 
     if (!nombre || !ciudad || !provincia || !coordenadasMaps) {
       return res.status(400).json("Nombre, ciudad, provincia y coordenadas son requeridos");
+    }
+    if (activo === null
+      || (req.body.latitud !== undefined && req.body.latitud !== "" && latitud === null)
+      || (req.body.longitud !== undefined && req.body.longitud !== "" && longitud === null)
+      || (latitud !== null && (latitud < -90 || latitud > 90))
+      || (longitud !== null && (longitud < -180 || longitud > 180))) {
+      return res.status(400).json("Coordenadas o estado activo inválidos");
     }
 
     connection = await mysqlConnection.promise().getConnection();
@@ -1819,8 +1934,8 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
-      const servicioId = Number.parseInt(req.params.id, 10);
-      if (!Number.isInteger(servicioId) || servicioId <= 0) {
+      const servicioId = normalizarIdPositivo(req.params.id);
+      if (servicioId === null) {
         return res.status(404).json("Servicio inexistente");
       }
 
@@ -1849,10 +1964,14 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
         totalPersonas: parseo.value.total_personas,
       });
 
-      const horizonteBloquesDiasRaw = Number.parseInt(req.query.horizonte_bloques_dias || "0", 10);
-      const horizonteBloquesDias = Number.isInteger(horizonteBloquesDiasRaw) && horizonteBloquesDiasRaw > 0
-        ? Math.min(horizonteBloquesDiasRaw, 180)
-        : 0;
+      const horizonteBloquesDiasRaw = normalizarEnteroNoNegativoOpcional(
+        req.query.horizonte_bloques_dias,
+        180
+      );
+      if (horizonteBloquesDiasRaw === undefined) {
+        return res.status(400).json("El horizonte de bloques es inválido");
+      }
+      const horizonteBloquesDias = horizonteBloquesDiasRaw ?? 0;
       const fechaInicioBloques = horizonteBloquesDias > 0
         ? sumarDiasFechaSQL(parseo.value.fecha_inicio, -horizonteBloquesDias)
         : parseo.value.fecha_inicio;
@@ -1942,7 +2061,8 @@ router.get("/sorteos/activos", verifyToken, async (req, res) => {
     await ejecutarMantenimientoBloquesAlta(db);
 
     const servicioId = normalizarIdPositivo(req.query.servicio_id);
-    const params = [];
+    const hoy = obtenerFechaCivilHoyArgentina();
+    const params = [hoy, hoy];
     let filtroServicio = "";
     if (servicioId) {
       filtroServicio = " AND bf.servicio_id = ?";
@@ -1974,7 +2094,8 @@ router.get("/sorteos/activos", verifyToken, async (req, res) => {
           AND bf.estado = 'ACTIVO'
           AND bf.modalidad = 'SORTEO'
           AND bfr.estado IN ('DISPONIBLE', 'SORTEO')
-          AND s.fecha_fin_inscripcion >= CURDATE()
+          AND s.fecha_inicio_inscripcion <= ?
+          AND s.fecha_fin_inscripcion >= ?
           ${filtroServicio}
         GROUP BY s.id, bf.id, srv.id
         ORDER BY s.fecha_inicio_inscripcion ASC, bf.fecha_inicio ASC
@@ -2097,20 +2218,31 @@ router.get("/notificaciones", verifyToken, async (req, res) => {
     if (!["admin", "afiliado", "departamental", "admin-central", "auditor"].includes(cabecera.rol)) {
       return res.status(401).json("No autorizado");
     }
+    const usuarioId = normalizarIdPositivo(cabecera.id);
+    if (!usuarioId) return res.status(401).json("No autorizado");
+    if (["limit", "page", "leida", "modulo", "buscar", "desde", "hasta"]
+      .some((campo) => Array.isArray(req.query[campo]))) {
+      return res.status(400).json("Los filtros de notificaciones son inválidos");
+    }
 
     // Paginación (por defecto se comporta como la versión histórica: primeras 40).
     // El tope de página evita que el OFFSET se serialice en notación exponencial.
-    const limite = Math.min(100, Math.max(1, parseInt(primerValorQuery(req.query.limit), 10) || 40));
-    const pagina = Math.min(100000, Math.max(1, parseInt(primerValorQuery(req.query.page), 10) || 1));
+    const limite = req.query.limit === undefined ? 40 : normalizarIdPositivo(req.query.limit);
+    const pagina = req.query.page === undefined ? 1 : normalizarIdPositivo(req.query.page);
+    if (!limite || limite > 100 || !pagina || pagina > 100_000) {
+      return res.status(400).json("La paginación es inválida");
+    }
     const offset = (pagina - 1) * limite;
 
     const condiciones = ["n.usuario_id = ?"];
-    const params = [cabecera.id];
+    const params = [usuarioId];
 
     const leidaParam = primerValorQuery(req.query.leida);
     if (leidaParam === "0" || leidaParam === "1") {
       condiciones.push("n.leida = ?");
       params.push(Number(leidaParam));
+    } else if (leidaParam !== undefined) {
+      return res.status(400).json("El filtro de lectura es inválido");
     }
 
     const moduloParam = primerValorQuery(req.query.modulo);
@@ -2125,23 +2257,24 @@ router.get("/notificaciones", verifyToken, async (req, res) => {
 
     const buscarParam = primerValorQuery(req.query.buscar);
     const buscar = typeof buscarParam === "string" ? buscarParam.trim() : "";
+    if (buscar.length > 200) return res.status(400).json("La búsqueda es demasiado larga");
     if (buscar) {
       condiciones.push("(n.titulo LIKE ? OR n.mensaje LIKE ?)");
       params.push(`%${buscar}%`, `%${buscar}%`);
     }
 
-    // El regex solo valida formato; el chequeo con Date descarta fechas
-    // inexistentes (2026-02-30) que MySQL rechazaría con error.
-    const esFechaValida = valor => {
-      if (typeof valor !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(valor)) {
-        return false;
-      }
-      const [anio, mes, dia] = valor.split("-").map(Number);
-      const fecha = new Date(anio, mes - 1, dia);
-      return fecha.getFullYear() === anio && fecha.getMonth() === mes - 1 && fecha.getDate() === dia;
-    };
+    const esFechaValida = valor => normalizarFechaCivil(valor) !== null;
     const desdeParam = primerValorQuery(req.query.desde);
     const hastaParam = primerValorQuery(req.query.hasta);
+    if (desdeParam !== undefined && !esFechaValida(desdeParam)) {
+      return res.status(400).json("La fecha desde es inválida");
+    }
+    if (hastaParam !== undefined && !esFechaValida(hastaParam)) {
+      return res.status(400).json("La fecha hasta es inválida");
+    }
+    if (desdeParam && hastaParam && desdeParam > hastaParam) {
+      return res.status(400).json("La fecha desde no puede ser posterior a la fecha hasta");
+    }
     if (esFechaValida(desdeParam)) {
       condiciones.push("n.fecha_creacion >= ?");
       params.push(`${desdeParam} 00:00:00`);
@@ -2195,7 +2328,7 @@ router.get("/notificaciones", verifyToken, async (req, res) => {
 
     const [countRows] = await db.query(
       "SELECT COUNT(*) AS total FROM notificacion WHERE usuario_id = ? AND leida = 0",
-      [cabecera.id]
+      [usuarioId]
     );
 
     res.status(200).json({
@@ -2384,6 +2517,16 @@ router.put("/sorteos/adjudicaciones/:id/aceptar", verifyToken, async (req, res) 
       return res.status(409).json("La adjudicacion ya fue respondida");
     }
 
+    const errorVigencia = validarRespuestaAdjudicacion({
+      estadoBloque: adjudicacion.bloque_estado,
+      estadoSorteo: adjudicacion.sorteo_estado,
+      fechaInicioBloque: adjudicacion.bloque_fecha_inicio,
+      hoy: obtenerFechaCivilHoyArgentina(),
+    });
+    if (errorVigencia) {
+      throw crearErrorNegocio(errorVigencia.mensaje, 409, errorVigencia.codigo);
+    }
+
     await connection.query(
       `
         UPDATE sorteo_adjudicacion_respuesta
@@ -2423,6 +2566,9 @@ router.put("/sorteos/adjudicaciones/:id/aceptar", verifyToken, async (req, res) 
       await connection.rollback();
     }
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+    }
     res.status(500).json("Error al aceptar premio");
   } finally {
     if (connection) {
@@ -2467,6 +2613,20 @@ router.put("/sorteos/adjudicaciones/:id/rechazar", verifyToken, async (req, res)
       return res.status(409).json("La adjudicacion ya fue respondida");
     }
 
+    const errorVigencia = validarRespuestaAdjudicacion({
+      estadoBloque: adjudicacion.bloque_estado,
+      estadoSorteo: adjudicacion.sorteo_estado,
+      fechaInicioBloque: adjudicacion.bloque_fecha_inicio,
+      hoy: obtenerFechaCivilHoyArgentina(),
+    });
+    if (errorVigencia) {
+      throw crearErrorNegocio(errorVigencia.mensaje, 409, errorVigencia.codigo);
+    }
+    const estadoRecursoLiberado = obtenerEstadoRecursoTrasRechazo({
+      estadoBloque: adjudicacion.bloque_estado,
+      estadoSorteo: adjudicacion.sorteo_estado,
+    });
+
     const [reservaRows] = await connection.query(
       "SELECT id, estado_reserva_id, recurso_id, observaciones FROM reserva WHERE id = ? FOR UPDATE",
       [adjudicacion.reserva_id]
@@ -2506,13 +2666,13 @@ router.put("/sorteos/adjudicaciones/:id/rechazar", verifyToken, async (req, res)
     await connection.query(
       `
         UPDATE bloque_fecha_recurso
-        SET estado = 'SORTEO',
+        SET estado = ?,
             reserva_id = NULL
         WHERE bloque_fecha_id = ?
           AND recurso_id = ?
           AND reserva_id = ?
       `,
-      [adjudicacion.bloque_fecha_id, adjudicacion.recurso_id, adjudicacion.reserva_id]
+      [estadoRecursoLiberado, adjudicacion.bloque_fecha_id, adjudicacion.recurso_id, adjudicacion.reserva_id]
     );
 
     if (adjudicacion.notificacion_id) {
@@ -2548,6 +2708,9 @@ router.put("/sorteos/adjudicaciones/:id/rechazar", verifyToken, async (req, res)
       await connection.rollback();
     }
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+    }
     res.status(500).json("Error al rechazar premio");
   } finally {
     if (connection) {
@@ -2682,6 +2845,16 @@ router.post("/admin/sorteos", verifyToken, async (req, res) => {
     if (!nombre || !fecha_inicio_inscripcion || !fecha_fin_inscripcion) {
       return res.status(400).json("Faltan campos requeridos");
     }
+    const nombreSorteo = normalizarTexto(nombre);
+    const inicioInscripcion = formatearFechaSQL(fecha_inicio_inscripcion);
+    const finInscripcion = formatearFechaSQL(fecha_fin_inscripcion);
+    const estadoSorteo = String(estado || "BORRADOR").trim().toUpperCase();
+    if (
+      !nombreSorteo || nombreSorteo.length > 150 || !inicioInscripcion || !finInscripcion ||
+      inicioInscripcion > finInscripcion || !estadoInicialSorteoPermitido(estadoSorteo)
+    ) {
+      return res.status(400).json("Nombre, fechas o estado del sorteo no válidos");
+    }
 
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
@@ -2689,26 +2862,46 @@ router.post("/admin/sorteos", verifyToken, async (req, res) => {
     const [sorteoResult] = await connection.query(
       `INSERT INTO sorteo (nombre, descripcion, fecha_inicio_inscripcion, fecha_fin_inscripcion, estado)
        VALUES (?, ?, ?, ?, ?)`,
-      [nombre, descripcion || null, fecha_inicio_inscripcion, fecha_fin_inscripcion, estado]
+      [nombreSorteo, descripcion || null, inicioInscripcion, finInscripcion, estadoSorteo]
     );
 
     const sorteoId = sorteoResult.insertId;
 
-    for (const bloque of Array.isArray(bloques) ? bloques : []) {
+    const clavesRecursos = new Set();
+    for (let indiceBloque = 0; indiceBloque < (Array.isArray(bloques) ? bloques.length : 0); indiceBloque++) {
+      const bloque = bloques[indiceBloque];
       const servicioId = normalizarIdPositivo(bloque.servicio_id);
       const recursosIds = Array.isArray(bloque.recursos)
         ? bloque.recursos.map(normalizarIdPositivo).filter(Boolean)
         : [];
+      const inicioBloque = formatearFechaSQL(bloque.fecha_inicio);
+      const finBloque = formatearFechaSQL(bloque.fecha_fin);
 
-      if (!servicioId || !bloque.nombre || !bloque.fecha_inicio || !bloque.fecha_fin || recursosIds.length === 0) {
-        continue;
+      if (
+        !servicioId || !normalizarTexto(bloque.nombre) || !inicioBloque || !finBloque ||
+        diferenciaDiasCivil(inicioBloque, finBloque) <= 0 || inicioBloque <= finInscripcion ||
+        recursosIds.length === 0 || new Set(recursosIds).size !== recursosIds.length
+      ) {
+        throw crearErrorNegocio(`El bloque ${indiceBloque + 1} tiene datos, fechas o recursos inválidos`, 400);
+      }
+      const [recursosValidos] = await connection.query(
+        `SELECT id FROM recurso WHERE servicio_id = ? AND id IN (${recursosIds.map(() => "?").join(",")}) FOR UPDATE`,
+        [servicioId, ...recursosIds]
+      );
+      if (recursosValidos.length !== recursosIds.length) {
+        throw crearErrorNegocio(`El bloque ${indiceBloque + 1} contiene recursos ajenos al servicio`, 400);
+      }
+      for (const recursoId of recursosIds) {
+        const clave = `${recursoId}:${inicioBloque}:${finBloque}`;
+        if (clavesRecursos.has(clave)) throw crearErrorNegocio("Un recurso está repetido en el mismo rango de sorteo", 400);
+        clavesRecursos.add(clave);
       }
 
       const [bloqueResult] = await connection.query(
         `INSERT INTO bloque_fecha
           (sorteo_id, servicio_id, nombre, modalidad, fecha_inicio, fecha_fin, estado)
          VALUES (?, ?, ?, 'SORTEO', ?, ?, 'ACTIVO')`,
-        [sorteoId, servicioId, bloque.nombre, bloque.fecha_inicio, bloque.fecha_fin]
+        [sorteoId, servicioId, normalizarTexto(bloque.nombre), inicioBloque, finBloque]
       );
 
       for (const recursoId of recursosIds) {
@@ -2727,6 +2920,9 @@ router.post("/admin/sorteos", verifyToken, async (req, res) => {
       await connection.rollback();
     }
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+    }
     res.status(500).json("Error al crear sorteo");
   } finally {
     if (connection) {
@@ -2736,6 +2932,7 @@ router.post("/admin/sorteos", verifyToken, async (req, res) => {
 });
 
 router.put("/admin/sorteos/:id", verifyToken, async (req, res) => {
+  let connection;
   try {
     const cabecera = JSON.parse(req.data.data);
     if (cabecera.rol !== "admin") {
@@ -2748,21 +2945,49 @@ router.put("/admin/sorteos/:id", verifyToken, async (req, res) => {
       return res.status(400).json("Faltan campos requeridos");
     }
 
-    await mysqlConnection.promise().query(
+    const nombreSorteo = normalizarTexto(nombre);
+    const inicio = formatearFechaSQL(fecha_inicio_inscripcion);
+    const fin = formatearFechaSQL(fecha_fin_inscripcion);
+    const estadoSorteo = String(estado).trim().toUpperCase();
+    if (!nombreSorteo || nombreSorteo.length > 150 || !inicio || !fin || inicio > fin || !["BORRADOR", "ACTIVO", "CERRADO", "CANCELADO"].includes(estadoSorteo)) {
+      return res.status(400).json("Nombre, fechas o estado del sorteo no válidos");
+    }
+    if (estadoSorteo === "CANCELADO") {
+      return res.status(409).json("Usá la operación de cancelación para cerrar también bloques e inscripciones");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const [sorteos] = await connection.query("SELECT id FROM sorteo WHERE id = ? FOR UPDATE", [sorteoId]);
+    if (sorteos.length === 0) throw crearErrorNegocio("Sorteo no encontrado", 404);
+    const [bloquesInvalidos] = await connection.query(
+      "SELECT id FROM bloque_fecha WHERE sorteo_id = ? AND fecha_inicio <= ? LIMIT 1 FOR UPDATE",
+      [sorteoId, fin]
+    );
+    if (bloquesInvalidos.length > 0) {
+      throw crearErrorNegocio("La inscripción debe cerrar antes del inicio de todos los bloques", 409);
+    }
+    await connection.query(
       `UPDATE sorteo
        SET nombre = ?, descripcion = ?, fecha_inicio_inscripcion = ?, fecha_fin_inscripcion = ?, estado = ?
        WHERE id = ?`,
-      [nombre, descripcion || null, fecha_inicio_inscripcion, fecha_fin_inscripcion, estado, sorteoId]
+      [nombreSorteo, descripcion || null, inicio, fin, estadoSorteo, sorteoId]
     );
+    await connection.commit();
 
     res.status(200).json({ message: "Sorteo actualizado correctamente" });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.log(error);
+    if (error?.statusCode) return res.status(error.statusCode).json({ message: error.message });
     res.status(500).json("Error al actualizar sorteo");
+  } finally {
+    if (connection) connection.release();
   }
 });
 
 router.delete("/admin/sorteos/:id", verifyToken, async (req, res) => {
+  let connection;
   try {
     const cabecera = JSON.parse(req.data.data);
     if (cabecera.rol !== "admin") {
@@ -2774,12 +2999,61 @@ router.delete("/admin/sorteos/:id", verifyToken, async (req, res) => {
       return res.status(400).json("ID invalido");
     }
 
-    await mysqlConnection.promise().query("UPDATE sorteo SET estado = 'CANCELADO' WHERE id = ?", [sorteoId]);
-    await mysqlConnection.promise().query("UPDATE bloque_fecha SET estado = 'CANCELADO' WHERE sorteo_id = ?", [sorteoId]);
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const [sorteos] = await connection.query("SELECT id, estado FROM sorteo WHERE id = ? FOR UPDATE", [sorteoId]);
+    if (sorteos.length === 0) throw crearErrorNegocio("Sorteo no encontrado", 404);
+    if (sorteos[0].estado === "CANCELADO") throw crearErrorNegocio("El sorteo ya está cancelado", 409);
+
+    const [reservas] = await connection.query(
+      `SELECT r.id, r.estado_reserva_id
+       FROM reserva r
+       LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+       WHERE r.sorteo_id = ?
+         AND COALESCE(er.nombre, '') NOT IN ('Cancelada', 'Rechazada', 'No adjudicada')
+       FOR UPDATE`,
+      [sorteoId]
+    );
+    const [estadosCancelacion] = await connection.query(
+      "SELECT id FROM estado_reserva WHERE nombre IN ('Cancelada', 'Rechazada') ORDER BY nombre = 'Cancelada' DESC LIMIT 1"
+    );
+    if (estadosCancelacion.length === 0) throw crearErrorNegocio("No existe un estado de cancelación configurado", 409);
+    const estadoCancelacionId = Number(estadosCancelacion[0].id);
+
+    for (const reserva of reservas) {
+      await registrarHistorialReserva(
+        connection,
+        reserva.id,
+        "UPDATE",
+        cabecera.id,
+        req,
+        [{ campo: "estado_reserva_id", valorAnterior: reserva.estado_reserva_id, valorNuevo: estadoCancelacionId }],
+        `Cancelación integral del sorteo ${sorteoId}`
+      );
+    }
+    await connection.query("UPDATE reserva SET estado_reserva_id = ?, fecha_modificacion = NOW() WHERE sorteo_id = ?", [estadoCancelacionId, sorteoId]);
+    await connection.query(
+      `UPDATE bloque_fecha_recurso bfr
+       INNER JOIN bloque_fecha bf ON bf.id = bfr.bloque_fecha_id
+       SET bfr.estado = 'LIBERADO', bfr.reserva_id = NULL
+       WHERE bf.sorteo_id = ?`,
+      [sorteoId]
+    );
+    await connection.query(
+      "UPDATE sorteo_adjudicacion_respuesta SET estado = 'RECHAZADA', fecha_respuesta = COALESCE(fecha_respuesta, NOW()) WHERE sorteo_id = ? AND estado = 'PENDIENTE'",
+      [sorteoId]
+    );
+    await connection.query("UPDATE bloque_fecha SET estado = 'CANCELADO' WHERE sorteo_id = ?", [sorteoId]);
+    await connection.query("UPDATE sorteo SET estado = 'CANCELADO' WHERE id = ?", [sorteoId]);
+    await connection.commit();
     res.status(200).json({ message: "Sorteo cancelado correctamente" });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.log(error);
+    if (error?.statusCode) return res.status(error.statusCode).json({ message: error.message });
     res.status(500).json("Error al cancelar sorteo");
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -3045,7 +3319,10 @@ router.put("/admin/bloques/:id", verifyToken, async (req, res) => {
       temporadaTarifaId = temporada.temporadaId;
 
       if (temporadaAnteriorId) {
-        await connection.query("DELETE FROM temporada_tarifa WHERE id = ?", [temporadaAnteriorId]);
+        const tieneHistoria = await temporadaTieneReferenciasHistoricas(connection, temporadaAnteriorId);
+        if (!tieneHistoria) {
+          await connection.query("DELETE FROM temporada_tarifa WHERE id = ?", [temporadaAnteriorId]);
+        }
       }
     }
 
@@ -3354,6 +3631,9 @@ router.post("/sorteos/:id/cotizacion", verifyToken, async (req, res) => {
     if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
       return res.status(401).json("No autorizado");
     }
+    if (!tieneAreaTurismo(cabecera)) {
+      return res.status(403).json("No autorizado");
+    }
 
     const sorteoId = normalizarIdPositivo(req.params.id);
     const bloqueFechaId = normalizarIdPositivo(req.body.bloque_fecha_id);
@@ -3370,10 +3650,16 @@ router.post("/sorteos/:id/cotizacion", verifyToken, async (req, res) => {
     }
     validarBloqueInscripcionAbierta(bloque);
 
+    const personasAutorizadas = await resolverPersonasCotizacionAutorizadas(db, cabecera, {
+      personas: req.body.personas,
+      usuarioObjetivoId: req.body.usuario_id,
+      fechaIngreso: bloque.fecha_inicio,
+    });
+
     const cotizacion = await cotizarBloqueComun(db, {
       bloque,
       regimenId,
-      personas: req.body.personas,
+      personas: personasAutorizadas,
       adicionales: req.body.adicionales || []
     });
 
@@ -3405,6 +3691,26 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
 
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
+    const usuarioReservaId = cabecera.rol === "afiliado"
+      ? normalizarIdPositivo(cabecera.id)
+      : normalizarIdPositivo(req.body.usuario_id);
+    if (!usuarioReservaId) {
+      throw crearErrorNegocio("Debes indicar un afiliado titular para la inscripción", 400);
+    }
+    const [titulares] = await connection.query(
+      `SELECT u.id, u.habilitado, r.nombre AS rol
+       FROM usuario u
+       INNER JOIN rol r ON r.id = u.rol_id
+       WHERE u.id = ?
+       FOR UPDATE`,
+      [usuarioReservaId]
+    );
+    if (titulares.length === 0 || titulares[0].rol !== "afiliado" || titulares[0].habilitado !== "Y") {
+      throw crearErrorNegocio("El titular debe ser un afiliado habilitado", 422);
+    }
+    if (cabecera.rol === "departamental" && !(await puedeAccederUsuarioRelacionado(connection, cabecera, usuarioReservaId))) {
+      throw crearErrorNegocio("No puedes inscribir afiliados de otra departamental", 403);
+    }
     await ejecutarMantenimientoBloquesAlta(connection);
 
     const bloque = await obtenerBloqueConRecursos(connection, bloqueFechaId, { forUpdate: true });
@@ -3414,7 +3720,7 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
     }
     validarBloqueInscripcionAbierta(bloque);
 
-    const inscripcionExistente = await obtenerInscripcionSorteoActiva(connection, cabecera.id, { forUpdate: true });
+    const inscripcionExistente = await obtenerInscripcionSorteoActiva(connection, usuarioReservaId, { forUpdate: true });
 
     if (inscripcionExistente) {
       await connection.rollback();
@@ -3425,10 +3731,18 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
       });
     }
 
+    const { usuarioFamiliarPrincipalId, departamentalId } = await obtenerUsuarioPrincipalFamilia(connection, usuarioReservaId);
+    const personasAutorizadas = await crearOBuscarUsuariosReserva(connection, personas, {
+      usuarioFamiliarPrincipalId,
+      departamentalId,
+      usuarioModificadorId: cabecera.id,
+      req,
+      fechaIngreso: bloque.fecha_inicio,
+    });
     const cotizacion = await cotizarBloqueComun(connection, {
       bloque,
       regimenId,
-      personas,
+      personas: personasAutorizadas,
       adicionales: req.body.adicionales || []
     });
 
@@ -3457,7 +3771,7 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
         bloqueFechaId,
         cotizacion.servicio_id,
         regimenId,
-        cabecera.id,
+        usuarioReservaId,
         firmaArchivo,
         cotizacion.precio_total,
         cotizacion.fecha_inicio,
@@ -3472,11 +3786,10 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
       await guardarAdicionalesReserva(connection, reservaId, cotizacion.adicionales);
     }
 
-    const usuariosIds = await obtenerOCrearUsuariosPersonasReserva(connection, personas, cabecera, req);
+    const usuariosIds = cotizacion.personas;
     const reservasFamiliaresIds = [];
     for (let index = 0; index < usuariosIds.length; index++) {
       const persona = usuariosIds[index];
-      const personaCotizada = cotizacion.personas[index] || {};
       const [reservaFamiliarResult] = await connection.query(
         `INSERT INTO reserva_familiar
           (reserva_id, usuario_id, tipo_persona_id, parentesco_id, edad, precio)
@@ -3487,26 +3800,17 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
           persona.tipo_persona_id,
           persona.parentesco_id,
           persona.edad,
-          personaCotizada.tarifa_individual || persona.tarifa_individual || 0
+          persona.tarifa_individual
         ]
       );
 
       reservasFamiliaresIds.push({
         reserva_familiar_id: reservaFamiliarResult.insertId,
-        tipo_persona_id: persona.tipo_persona_id,
-        edad: persona.edad
+        ...persona,
       });
     }
 
-    await insertarTarifasFamiliaresReserva(
-      connection,
-      reservasFamiliaresIds,
-      cotizacion.recurso_referencia_id,
-      regimenId,
-      cotizacion.fecha_inicio,
-      cotizacion.fecha_fin,
-      cotizacion.temporada_tarifa_id || null
-    );
+    await insertarTarifasFamiliaresCalculadas(connection, reservasFamiliaresIds);
 
     await registrarHistorialReserva(
       connection,
@@ -3525,6 +3829,8 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
       estado: "Solicitud sorteo",
       mensaje: "Inscripcion al sorteo creada correctamente",
       fecha_creacion: new Date().toISOString(),
+      precio_total: cotizacion.precio_total,
+      total_tarifa: cotizacion.total_tarifa,
       monto_adicionales: cotizacion.monto_adicionales
     });
   } catch (error) {
@@ -3561,7 +3867,11 @@ router.put("/admin/sorteos/inscripciones/:id/adjudicar", verifyToken, async (req
     await connection.beginTransaction();
 
     const [reservas] = await connection.query(
-      `SELECT * FROM reserva WHERE id = ? AND modalidad = 'SORTEO' FOR UPDATE`,
+      `SELECT r.*, er.nombre AS estado_nombre
+       FROM reserva r
+       LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+       WHERE r.id = ? AND r.modalidad = 'SORTEO'
+       FOR UPDATE`,
       [reservaId]
     );
     if (reservas.length === 0) {
@@ -3570,7 +3880,20 @@ router.put("/admin/sorteos/inscripciones/:id/adjudicar", verifyToken, async (req
     }
 
     const reserva = reservas[0];
+    if (reserva.recurso_id || esEstadoReservaTerminal(reserva.estado_nombre)) {
+      throw crearErrorNegocio("La inscripción ya no puede ser adjudicada", 409);
+    }
     const bloque = await obtenerBloqueConRecursos(connection, reserva.bloque_fecha_id, { forUpdate: true });
+    const errorVigencia = validarAdjudicacionSorteo({
+      estadoBloque: bloque.estado,
+      estadoSorteo: bloque.sorteo_estado,
+      fechaFinInscripcion: bloque.fecha_fin_inscripcion,
+      fechaInicioBloque: bloque.fecha_inicio,
+      hoy: obtenerFechaCivilHoyArgentina(),
+    });
+    if (errorVigencia) {
+      throw crearErrorNegocio(errorVigencia.mensaje, 409, errorVigencia.codigo);
+    }
     const recursoBloque = bloque.recursos.find((recurso) => Number(recurso.recurso_id) === recursoId);
     if (!recursoBloque || !ESTADOS_RECURSO_SORTEO_DISPONIBLES.has(recursoBloque.estado)) {
       await connection.rollback();
@@ -3612,12 +3935,15 @@ router.put("/admin/sorteos/inscripciones/:id/adjudicar", verifyToken, async (req
        WHERE id = ?`,
       [recursoId, bloque.servicio_id, estadoAdjudicadaId, req.body.observaciones || null, reservaId]
     );
-    await connection.query(
+    const [asignacionRecurso] = await connection.query(
       `UPDATE bloque_fecha_recurso
        SET estado = 'ASIGNADO', reserva_id = ?
-       WHERE bloque_fecha_id = ? AND recurso_id = ?`,
+       WHERE bloque_fecha_id = ? AND recurso_id = ? AND estado IN ('DISPONIBLE', 'SORTEO') AND reserva_id IS NULL`,
       [reservaId, bloque.id, recursoId]
     );
+    if (asignacionRecurso.affectedRows !== 1) {
+      throw crearErrorNegocio("El recurso acaba de ser adjudicado por otra operación", 409);
+    }
 
     const detallePremioBase = await obtenerDetallePremioParaReserva(connection, reservaId, recursoId);
     const [notificacionResult] = await connection.query(
@@ -3676,6 +4002,7 @@ router.put("/admin/sorteos/inscripciones/:id/adjudicar", verifyToken, async (req
       await connection.rollback();
     }
     console.log(error);
+    if (error?.statusCode) return res.status(error.statusCode).json({ message: error.message });
     res.status(500).json("Error al adjudicar inscripcion");
   } finally {
     if (connection) {
@@ -3685,6 +4012,7 @@ router.put("/admin/sorteos/inscripciones/:id/adjudicar", verifyToken, async (req
 });
 
 router.put("/admin/sorteos/inscripciones/:id/no-adjudicada", verifyToken, async (req, res) => {
+  let connection;
   try {
     const cabecera = JSON.parse(req.data.data);
     if (cabecera.rol !== "admin") {
@@ -3696,16 +4024,43 @@ router.put("/admin/sorteos/inscripciones/:id/no-adjudicada", verifyToken, async 
       return res.status(400).json("ID invalido");
     }
 
-    const db = mysqlConnection.promise();
-    const estadoNoAdjudicadaId = await obtenerEstadoReservaId(db, "No adjudicada", ESTADO_RESERVA_RECHAZADA_ID);
-    await db.query(
-      `UPDATE reserva SET estado_reserva_id = ?, observaciones = COALESCE(?, observaciones) WHERE id = ? AND modalidad = 'SORTEO'`,
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const [reservas] = await connection.query(
+      "SELECT id, estado_reserva_id, recurso_id FROM reserva WHERE id = ? AND modalidad = 'SORTEO' FOR UPDATE",
+      [reservaId]
+    );
+    if (reservas.length === 0) throw crearErrorNegocio("Inscripción no encontrada", 404);
+    if (reservas[0].recurso_id) throw crearErrorNegocio("Una inscripción adjudicada no puede marcarse como no adjudicada", 409);
+    const [adjudicaciones] = await connection.query(
+      "SELECT id FROM sorteo_adjudicacion_respuesta WHERE reserva_id = ? LIMIT 1 FOR UPDATE",
+      [reservaId]
+    );
+    if (adjudicaciones.length > 0) throw crearErrorNegocio("La inscripción ya tiene una adjudicación", 409);
+
+    const estadoNoAdjudicadaId = await obtenerEstadoReservaId(connection, "No adjudicada", ESTADO_RESERVA_RECHAZADA_ID);
+    await connection.query(
+      `UPDATE reserva SET estado_reserva_id = ?, observaciones = COALESCE(?, observaciones) WHERE id = ?`,
       [estadoNoAdjudicadaId, req.body.observaciones || null, reservaId]
     );
+    await registrarHistorialReserva(
+      connection,
+      reservaId,
+      "UPDATE",
+      cabecera.id,
+      req,
+      [{ campo: "estado_reserva_id", valorAnterior: reservas[0].estado_reserva_id, valorNuevo: estadoNoAdjudicadaId }],
+      "Inscripción marcada como no adjudicada"
+    );
+    await connection.commit();
     res.status(200).json({ message: "Inscripcion marcada como no adjudicada" });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.log(error);
+    if (error?.statusCode) return res.status(error.statusCode).json({ message: error.message });
     res.status(500).json("Error al marcar inscripcion");
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -3724,6 +4079,34 @@ router.put("/admin/sorteos/:id/cerrar", verifyToken, async (req, res) => {
 
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
+    const [sorteos] = await connection.query("SELECT id, estado FROM sorteo WHERE id = ? FOR UPDATE", [sorteoId]);
+    if (sorteos.length === 0) throw crearErrorNegocio("Sorteo no encontrado", 404);
+    if (sorteos[0].estado === "CANCELADO") throw crearErrorNegocio("Un sorteo cancelado no puede cerrarse", 409);
+
+    const [inscripcionesNoAdjudicadas] = await connection.query(
+      `SELECT id, estado_reserva_id
+       FROM reserva
+       WHERE sorteo_id = ? AND modalidad = 'SORTEO' AND recurso_id IS NULL
+         AND COALESCE(estado_reserva_id, ?) <> ?
+       FOR UPDATE`,
+      [sorteoId, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+    );
+    const estadoNoAdjudicadaId = await obtenerEstadoReservaId(connection, "No adjudicada", ESTADO_RESERVA_RECHAZADA_ID);
+    for (const inscripcion of inscripcionesNoAdjudicadas) {
+      await registrarHistorialReserva(
+        connection,
+        inscripcion.id,
+        "UPDATE",
+        cabecera.id,
+        req,
+        [{ campo: "estado_reserva_id", valorAnterior: inscripcion.estado_reserva_id, valorNuevo: estadoNoAdjudicadaId }],
+        `Cierre del sorteo ${sorteoId}`
+      );
+    }
+    await connection.query(
+      "UPDATE reserva SET estado_reserva_id = ? WHERE sorteo_id = ? AND modalidad = 'SORTEO' AND recurso_id IS NULL AND COALESCE(estado_reserva_id, ?) <> ?",
+      [estadoNoAdjudicadaId, sorteoId, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+    );
 
     await connection.query(
       `UPDATE bloque_fecha_recurso bfr
@@ -3744,6 +4127,7 @@ router.put("/admin/sorteos/:id/cerrar", verifyToken, async (req, res) => {
       await connection.rollback();
     }
     console.log(error);
+    if (error?.statusCode) return res.status(error.statusCode).json({ message: error.message });
     res.status(500).json("Error al cerrar sorteo");
   } finally {
     if (connection) {
@@ -3760,10 +4144,15 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
+      if (!tieneAreaTurismo(cabecera)) {
+        return res.status(403).json("No autorizado");
+      }
       const {
         fecha_inicio,
         fecha_fin,
         servicio_id,
+        regimen_id,
+        usuario_id,
         personas,
         recurso_id,
         filtros,
@@ -3776,11 +4165,46 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         soloFechaLibre
       } = req.body;
 
-      if (!fecha_inicio || !fecha_fin || !servicio_id || !personas || personas.length === 0) {
+      const fechaInicioSolicitud = formatearFechaSQL(fecha_inicio);
+      const fechaFinSolicitud = formatearFechaSQL(fecha_fin);
+      const servicioIdSolicitud = normalizarIdPositivo(servicio_id);
+      const regimenIdSolicitud = normalizarIdPositivo(regimen_id);
+      const recursoIdFiltro = recurso_id === undefined || recurso_id === null
+        ? null
+        : normalizarIdPositivo(recurso_id);
+      if (
+        !fechaInicioSolicitud || !fechaFinSolicitud ||
+        obtenerNochesReserva(fechaInicioSolicitud, fechaFinSolicitud, 366).length === 0 ||
+        !servicioIdSolicitud || !regimenIdSolicitud ||
+        !Array.isArray(personas) || personas.length === 0 ||
+        ((recurso_id !== undefined && recurso_id !== null) && !recursoIdFiltro)
+      ) {
         return res.status(400).json("Faltan campos requeridos");
       }
 
+      if (!validarRangoReservaTemporal(fechaInicioSolicitud, fechaFinSolicitud).valido) {
+        return res.status(422).json("La fecha de inicio no puede ser anterior a hoy");
+      }
+
       const db = mysqlConnection.promise();
+      const personasAutorizadas = await resolverPersonasCotizacionAutorizadas(db, cabecera, {
+        personas,
+        usuarioObjetivoId: usuario_id,
+        fechaIngreso: fechaInicioSolicitud,
+      });
+      const precioMinimoCentavos = precio_minimo === undefined || precio_minimo === null
+        ? null
+        : decimalACentavos(precio_minimo);
+      const precioMaximoCentavos = precio_maximo === undefined || precio_maximo === null
+        ? null
+        : decimalACentavos(precio_maximo);
+      if (
+        (precio_minimo !== undefined && precio_minimo !== null && precioMinimoCentavos === null) ||
+        (precio_maximo !== undefined && precio_maximo !== null && precioMaximoCentavos === null) ||
+        (precioMinimoCentavos !== null && precioMaximoCentavos !== null && precioMinimoCentavos > precioMaximoCentavos)
+      ) {
+        return res.status(400).json("El rango de precios no es valido");
+      }
       const modalidadSolicitada = normalizarModalidad(modalidad);
       const bloqueFechaIdSolicitado = normalizarIdPositivo(bloque_fecha_id);
       const soloFechaLibreSolicitada = normalizarBoolean(solo_fecha_libre ?? soloFechaLibre);
@@ -3820,7 +4244,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       // Para cada persona, buscamos qué recursos tienen tarifas válidas
       const recursosValidos = new Set();
 
-      for (const persona of personas) {
+      for (const persona of personasAutorizadas) {
         const filtroTemporada = temporadaTarifaIdFiltro ? "AND tarifa.temporada_tarifa_id = ?" : "";
         const [tarifasPersona] = await mysqlConnection
           .promise()
@@ -3837,13 +4261,13 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
               AND tarifa.fecha_fin >= ?
               ${filtroTemporada}
           `, [
-            servicio_id,
+            servicioIdSolicitud,
             persona.tipo_persona_id,
             persona.regimen_id,
             persona.edad,
             persona.edad,
-            fecha_fin,
-            fecha_inicio,
+            fechaFinSolicitud,
+            fechaInicioSolicitud,
             ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])
           ]);
 
@@ -3869,11 +4293,11 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         }
       }
 
-      if (recurso_id) {
-        if (recursosValidos.has(Number(recurso_id)) || recursosValidos.has(recurso_id)) {
+      if (recursoIdFiltro) {
+        if (recursosValidos.has(recursoIdFiltro)) {
           // Mantener solo el recurso especificado
           recursosValidos.clear();
-          recursosValidos.add(Number(recurso_id));
+          recursosValidos.add(recursoIdFiltro);
         } else {
           return res.status(404).json("El recurso especificado no tiene tarifas válidas para las personas especificadas");
         }
@@ -3892,6 +4316,14 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
               continue;
             }
 
+            const filtroIdNormalizado = normalizarIdPositivo(filtroId);
+            const valorNumericoValido = typeof valorFiltro === 'number'
+              && Number.isSafeInteger(valorFiltro)
+              && valorFiltro >= 0;
+            if (!filtroIdNormalizado || (typeof valorFiltro !== 'boolean' && !valorNumericoValido)) {
+              return res.status(400).json("Los filtros de recursos contienen valores invalidos");
+            }
+
             // Obtener información del filtro para este recurso
             const [filtroRecurso] = await mysqlConnection
               .promise()
@@ -3899,7 +4331,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
                       SELECT cantidad, habilitado
                       FROM filtro_recurso
                       WHERE recurso_id = ? AND filtro_id = ?
-                    `, [recursoId, parseInt(filtroId)]);
+                    `, [recursoId, filtroIdNormalizado]);
 
             if (filtroRecurso.length === 0) {
               // Si el recurso no tiene este filtro, no cumple con los criterios
@@ -4068,154 +4500,75 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           continue;
         }
 
-        let tarifaTotal = 0;
-        let tarifaOriginalTotal = 0;
-        let usaPorcentajeEnAlgunaTarifa = false;
-        let todasPersonasTienenTarifa = true;
-
-        // Calcular tarifa por cada persona
-        for (const persona of personas) {
-          // Buscar todas las tarifas que apliquen para esta persona en este recurso
-          const filtroTemporada = temporadaTarifaIdFiltro ? "AND temporada_tarifa_id = ?" : "";
-          const [tarifasPersona] = await mysqlConnection
-            .promise()
-            .query(`
-              SELECT precio, fecha_inicio, fecha_fin, usa_porcentaje, porcentaje_descuento
-              FROM tarifa 
-              WHERE recurso_id = ? 
-                AND tipo_persona_id = ? 
-                AND regimen_id = ?
-                AND (edad_minima IS NULL OR edad_minima <= ?)
-                AND (edad_maxima IS NULL OR edad_maxima >= ?)
-                AND fecha_inicio <= ?
-                AND fecha_fin >= ?
-                ${filtroTemporada}
-              ORDER BY fecha_inicio ASC
-            `, [
-              recurso.id,
-              persona.tipo_persona_id,
-              persona.regimen_id,
-              persona.edad,
-              persona.edad,
-              fecha_fin,
-              fecha_inicio,
-              ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])
-            ]);
-
-          if (tarifasPersona.length === 0) {
-            todasPersonasTienenTarifa = false;
-            break;
+        let cotizacionRecurso;
+        try {
+          cotizacionRecurso = await calcularTarifaBaseReserva(db, {
+            recursoId: recurso.id,
+            regimenId: regimenIdSolicitud,
+            personas: personasAutorizadas,
+            fechaInicio: fechaInicioSolicitud,
+            fechaFin: fechaFinSolicitud,
+            temporadaTarifaId: temporadaTarifaIdFiltro,
+          });
+        } catch (error) {
+          if (["TARIFA_INCOMPLETA", "TARIFA_AMBIGUA"].includes(error?.codigo)) {
+            continue;
           }
-
-          // Calcular el precio total para esta persona sumando los rangos de fechas
-          let tarifaPersona = 0;
-          let tarifaOriginalPersona = 0;
-          const fechaInicioSolicitud = new Date(fecha_inicio);
-          const fechaFinSolicitud = new Date(fecha_fin);
-
-          // Calcular días correctamente: NO incluir el día de salida
-          const diasTotales = Math.ceil((fechaFinSolicitud - fechaInicioSolicitud) / (1000 * 60 * 60 * 24));
-
-          // Crear un array para marcar qué días están cubiertos por tarifas
-          const diasCubiertos = new Array(diasTotales).fill(false);
-
-          for (const tarifa of tarifasPersona) {
-            const fechaInicioTarifa = new Date(tarifa.fecha_inicio);
-            const fechaFinTarifa = new Date(tarifa.fecha_fin);
-
-            // Calcular la intersección entre el rango solicitado y el rango de la tarifa
-            const inicioInterseccion = new Date(Math.max(fechaInicioSolicitud.getTime(), fechaInicioTarifa.getTime()));
-            const finInterseccion = new Date(Math.min(fechaFinSolicitud.getTime(), fechaFinTarifa.getTime()));
-
-            if (inicioInterseccion < finInterseccion) {
-              // Calcular los días de intersección correctamente
-              const diasInterseccion = Math.ceil((finInterseccion - inicioInterseccion) / (1000 * 60 * 60 * 24));
-
-              // Calcular el día inicial relativo al inicio de la solicitud
-              const diaInicioRelativo = Math.floor((inicioInterseccion - fechaInicioSolicitud) / (1000 * 60 * 60 * 24));
-
-              // Calcular precio original
-              let precioOriginal = tarifa.precio;
-              const usaPorcentaje = tarifa.usa_porcentaje === 1 || tarifa.usa_porcentaje === true || tarifa.usa_porcentaje === '1';
-              
-              if (usaPorcentaje) {
-                usaPorcentajeEnAlgunaTarifa = true;
-                if (tarifa.porcentaje_descuento && tarifa.porcentaje_descuento > 0) {
-                  const factor = 1 - (tarifa.porcentaje_descuento / 100);
-                  if (factor > 0) {
-                    precioOriginal = tarifa.precio / factor;
-                  }
-                }
-              }
-
-              // Marcar los días como cubiertos y sumar el precio
-              for (let i = 0; i < diasInterseccion; i++) {
-                const diaIndex = diaInicioRelativo + i;
-                if (diaIndex >= 0 && diaIndex < diasTotales && !diasCubiertos[diaIndex]) {
-                  diasCubiertos[diaIndex] = true;
-                  tarifaPersona += tarifa.precio;
-                  tarifaOriginalPersona += precioOriginal;
-                }
-              }
-            }
-          }
-
-          // Verificar que todos los días estén cubiertos por alguna tarifa
-          const todosDiasCubiertos = diasCubiertos.every(dia => dia === true);
-          if (!todosDiasCubiertos) {
-            todasPersonasTienenTarifa = false;
-            break;
-          }
-
-          tarifaTotal += tarifaPersona;
-          tarifaOriginalTotal += tarifaOriginalPersona;
+          throw error;
         }
 
-        // Solo incluir recursos que tengan tarifa para todas las personas y todos los días
-        if (todasPersonasTienenTarifa) {
-          // Aplicar filtro de precio si se especifica
-          let cumpleFiltroPrecios = true;
+        let tarifaTotal = cotizacionRecurso.total;
+        let tarifaOriginalTotal = cotizacionRecurso.total_original;
+        let usaPorcentajeEnAlgunaTarifa = cotizacionRecurso.personas.some((persona) =>
+          (persona.tarifas_por_fecha || []).some((tarifa) => tarifa.usa_porcentaje)
+        );
 
-          if (precio_minimo !== undefined && precio_minimo !== null && tarifaTotal < precio_minimo) {
-            cumpleFiltroPrecios = false;
-          }
+        // Aplicar filtro de precio si se especifica
+        let cumpleFiltroPrecios = true;
 
-          if (precio_maximo !== undefined && precio_maximo !== null && tarifaTotal > precio_maximo) {
-            cumpleFiltroPrecios = false;
-          }
+        const tarifaTotalCentavos = decimalACentavos(tarifaTotal);
+        if (tarifaTotalCentavos === null) {
+          throw crearErrorNegocio("La tarifa calculada no es valida", 409, "TARIFA_INVALIDA");
+        }
+        if (precioMinimoCentavos !== null && tarifaTotalCentavos < precioMinimoCentavos) {
+          cumpleFiltroPrecios = false;
+        }
 
-          if (cumpleFiltroPrecios) {
-            // Calcular datos adicionales para ordenamiento
-            let totalCamas = 0;
-            let ambientes = 0;
+        if (precioMaximoCentavos !== null && tarifaTotalCentavos > precioMaximoCentavos) {
+          cumpleFiltroPrecios = false;
+        }
 
-            // Buscar camas (filtro_id 3 y 4) y ambientes (filtro_id 2)
-            const filtrosRecurso = filtrosPorRecurso[recurso.id] || [];
-            filtrosRecurso.forEach(filtro => {
-              if (filtro.id === 3 || filtro.id === 4) { // Cama individual (3) y matrimonial (4)
-                totalCamas += filtro.cantidad || 0;
-              } else if (filtro.id === 2) { // Ambientes
-                ambientes = filtro.cantidad || 0;
-              }
-            });
+        if (cumpleFiltroPrecios) {
+          // Calcular datos adicionales para ordenamiento
+          let totalCamas = 0;
+          let ambientes = 0;
 
-            recursosConTarifas.push({
-              id: recurso.id,
-              servicio_id: recurso.servicio_id,
-              grupo_recurso_id: recurso.grupo_recurso_id,
-              nombre: recurso.nombre,
-              tarifa: tarifaTotal,
-              tarifa_original: usaPorcentajeEnAlgunaTarifa ? Math.round(tarifaOriginalTotal) : null,
-              modalidad: modalidadRecurso,
-              bloque_fecha: bloqueRecurso,
-              bloque_fecha_id: bloqueRecurso?.id || null,
-              sorteo_id: bloqueRecurso?.sorteo_id || null,
-              imagenes: imagenesPorRecurso[recurso.id] || [],
-              filtros: filtrosPorRecurso[recurso.id] || [],
-              totalCamas: totalCamas,
-              ambientes: ambientes
-            });
-          }
+          // Buscar camas (filtro_id 3 y 4) y ambientes (filtro_id 2)
+          const filtrosRecurso = filtrosPorRecurso[recurso.id] || [];
+          filtrosRecurso.forEach(filtro => {
+            if (filtro.id === 3 || filtro.id === 4) { // Cama individual (3) y matrimonial (4)
+              totalCamas += filtro.cantidad || 0;
+            } else if (filtro.id === 2) { // Ambientes
+              ambientes = filtro.cantidad || 0;
+            }
+          });
+
+          recursosConTarifas.push({
+            id: recurso.id,
+            servicio_id: recurso.servicio_id,
+            grupo_recurso_id: recurso.grupo_recurso_id,
+            nombre: recurso.nombre,
+            tarifa: tarifaTotal,
+            tarifa_original: usaPorcentajeEnAlgunaTarifa ? tarifaOriginalTotal : null,
+            modalidad: modalidadRecurso,
+            bloque_fecha: bloqueRecurso,
+            bloque_fecha_id: bloqueRecurso?.id || null,
+            sorteo_id: bloqueRecurso?.sorteo_id || null,
+            imagenes: imagenesPorRecurso[recurso.id] || [],
+            filtros: filtrosPorRecurso[recurso.id] || [],
+            totalCamas: totalCamas,
+            ambientes: ambientes
+          });
         }
       }
 
@@ -4258,6 +4611,9 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
     }
   } catch (error) {
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+    }
     res.status(500).json("Error al obtener los recursos con tarifas");
   }
 });
@@ -4270,15 +4626,51 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
+      if (!tieneAreaTurismo(cabecera)) {
+        return res.status(403).json("No autorizado");
+      }
 
-      const { fecha_inicio, fecha_fin, servicio_id, personas, recurso_id, filtros, modalidad, bloque_fecha_id } = req.body;
+      const {
+        fecha_inicio,
+        fecha_fin,
+        servicio_id,
+        regimen_id,
+        usuario_id,
+        personas,
+        recurso_id,
+        filtros,
+        modalidad,
+        bloque_fecha_id,
+      } = req.body;
 
-      if (!fecha_inicio || !fecha_fin || !servicio_id || !personas || personas.length === 0) {
+      const fechaInicioSolicitud = formatearFechaSQL(fecha_inicio);
+      const fechaFinSolicitud = formatearFechaSQL(fecha_fin);
+      const servicioIdSolicitud = normalizarIdPositivo(servicio_id);
+      const regimenIdSolicitud = normalizarIdPositivo(regimen_id);
+      const recursoIdFiltro = recurso_id === undefined || recurso_id === null
+        ? null
+        : normalizarIdPositivo(recurso_id);
+      if (
+        !fechaInicioSolicitud || !fechaFinSolicitud ||
+        obtenerNochesReserva(fechaInicioSolicitud, fechaFinSolicitud, 366).length === 0 ||
+        !servicioIdSolicitud || !regimenIdSolicitud ||
+        !Array.isArray(personas) || personas.length === 0 ||
+        ((recurso_id !== undefined && recurso_id !== null) && !recursoIdFiltro)
+      ) {
         return res.status(400).json("Faltan campos requeridos");
+      }
+
+      if (!validarRangoReservaTemporal(fechaInicioSolicitud, fechaFinSolicitud).valido) {
+        return res.status(422).json("La fecha de inicio no puede ser anterior a hoy");
       }
 
       // Primero obtenemos solo los recursos que tienen tarifas válidas para el servicio y las personas
       const db = mysqlConnection.promise();
+      const personasAutorizadas = await resolverPersonasCotizacionAutorizadas(db, cabecera, {
+        personas,
+        usuarioObjetivoId: usuario_id,
+        fechaIngreso: fechaInicioSolicitud,
+      });
       const modalidadSolicitada = normalizarModalidad(modalidad);
       const bloqueFechaIdSolicitado = normalizarIdPositivo(bloque_fecha_id);
       let temporadaTarifaIdFiltro = null;
@@ -4312,7 +4704,7 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
       }
 
       const recursosValidos = new Set();
-      for (const persona of personas) {
+      for (const persona of personasAutorizadas) {
         const filtroTemporada = temporadaTarifaIdFiltro ? "AND tarifa.temporada_tarifa_id = ?" : "";
         const [tarifasPersona] = await mysqlConnection
           .promise()
@@ -4329,13 +4721,13 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
               AND tarifa.fecha_fin >= ?
               ${filtroTemporada}
           `, [
-            servicio_id,
+            servicioIdSolicitud,
             persona.tipo_persona_id,
             persona.regimen_id,
             persona.edad,
             persona.edad,
-            fecha_fin,
-            fecha_inicio,
+            fechaFinSolicitud,
+            fechaInicioSolicitud,
             ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])
           ]);
 
@@ -4358,9 +4750,9 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
 
       // Si se especifica recurso_id, filtramos solo ese recurso (si está en los válidos)
       let recursosAConsiderar = Array.from(recursosValidos);
-      if (recurso_id) {
-        if (recursosValidos.has(recurso_id)) {
-          recursosAConsiderar = [recurso_id];
+      if (recursoIdFiltro) {
+        if (recursosValidos.has(recursoIdFiltro)) {
+          recursosAConsiderar = [recursoIdFiltro];
         } else {
           return res.status(200).json([]); // El recurso especificado no es válido
         }
@@ -4395,94 +4787,24 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
 
       // Calcular tarifas para cada recurso para obtener el rango de precios
       for (const recurso of recursos) {
-        let tarifaTotal = 0;
-        let todasPersonasTienenTarifa = true;
-
-        // Calcular tarifa por cada persona
-        for (const persona of personas) {
-          // Buscar todas las tarifas que apliquen para esta persona en este recurso
-          const filtroTemporada = temporadaTarifaIdFiltro ? "AND temporada_tarifa_id = ?" : "";
-          const [tarifasPersona] = await mysqlConnection
-            .promise()
-            .query(`
-              SELECT precio, fecha_inicio, fecha_fin
-              FROM tarifa 
-              WHERE recurso_id = ? 
-                AND tipo_persona_id = ? 
-                AND regimen_id = ?
-                AND (edad_minima IS NULL OR edad_minima <= ?)
-                AND (edad_maxima IS NULL OR edad_maxima >= ?)
-                AND fecha_inicio <= ?
-                AND fecha_fin >= ?
-                ${filtroTemporada}
-              ORDER BY fecha_inicio ASC
-            `, [
-              recurso.id,
-              persona.tipo_persona_id,
-              persona.regimen_id,
-              persona.edad,
-              persona.edad,
-              fecha_fin,
-              fecha_inicio,
-              ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])
-            ]);
-
-          if (tarifasPersona.length === 0) {
-            todasPersonasTienenTarifa = false;
-            break;
+        let cotizacionRecurso;
+        try {
+          cotizacionRecurso = await calcularTarifaBaseReserva(db, {
+            recursoId: recurso.id,
+            regimenId: regimenIdSolicitud,
+            personas: personasAutorizadas,
+            fechaInicio: fechaInicioSolicitud,
+            fechaFin: fechaFinSolicitud,
+            temporadaTarifaId: temporadaTarifaIdFiltro,
+          });
+        } catch (error) {
+          if (["TARIFA_INCOMPLETA", "TARIFA_AMBIGUA"].includes(error?.codigo)) {
+            continue;
           }
-
-          // Calcular el precio total para esta persona sumando los rangos de fechas
-          let tarifaPersona = 0;
-          const fechaInicioSolicitud = new Date(fecha_inicio);
-          const fechaFinSolicitud = new Date(fecha_fin);
-
-          // Calcular días correctamente: NO incluir el día de salida
-          const diasTotales = Math.ceil((fechaFinSolicitud - fechaInicioSolicitud) / (1000 * 60 * 60 * 24));
-
-          // Crear un array para marcar qué días están cubiertos por tarifas
-          const diasCubiertos = new Array(diasTotales).fill(false);
-
-          for (const tarifa of tarifasPersona) {
-            const fechaInicioTarifa = new Date(tarifa.fecha_inicio);
-            const fechaFinTarifa = new Date(tarifa.fecha_fin);
-
-            // Calcular la intersección entre el rango solicitado y el rango de la tarifa
-            const inicioInterseccion = new Date(Math.max(fechaInicioSolicitud.getTime(), fechaInicioTarifa.getTime()));
-            const finInterseccion = new Date(Math.min(fechaFinSolicitud.getTime(), fechaFinTarifa.getTime()));
-
-            if (inicioInterseccion < finInterseccion) {
-              // Calcular los días de intersección correctamente
-              const diasInterseccion = Math.ceil((finInterseccion - inicioInterseccion) / (1000 * 60 * 60 * 24));
-
-              // Calcular el día inicial relativo al inicio de la solicitud
-              const diaInicioRelativo = Math.floor((inicioInterseccion - fechaInicioSolicitud) / (1000 * 60 * 60 * 24));
-
-              // Marcar los días como cubiertos y sumar el precio
-              for (let i = 0; i < diasInterseccion; i++) {
-                const diaIndex = diaInicioRelativo + i;
-                if (diaIndex >= 0 && diaIndex < diasTotales && !diasCubiertos[diaIndex]) {
-                  diasCubiertos[diaIndex] = true;
-                  tarifaPersona += tarifa.precio;
-                }
-              }
-            }
-          }
-
-          // Verificar que todos los días estén cubiertos por alguna tarifa
-          const todosDiasCubiertos = diasCubiertos.every(dia => dia === true);
-          if (!todosDiasCubiertos) {
-            todasPersonasTienenTarifa = false;
-            break;
-          }
-
-          tarifaTotal += tarifaPersona;
+          throw error;
         }
-
-        // Solo incluir recursos que tengan tarifa para todas las personas y todos los días
-        if (todasPersonasTienenTarifa) {
-          precios.push(tarifaTotal);
-        }
+        let tarifaTotal = cotizacionRecurso.total;
+        precios.push(tarifaTotal);
       }
 
       // Calcular rango de precios
@@ -4550,9 +4872,75 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
     }
   } catch (error) {
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+    }
     res.status(500).json("Error al obtener los filtros para recursos");
   }
 });
+
+function construirFechasCotizacion(tarifaBase, adicionalesProcesados) {
+  const porFecha = new Map();
+
+  for (const persona of tarifaBase.personas || []) {
+    for (const tarifa of persona.tarifas_por_fecha || []) {
+      const actual = porFecha.get(tarifa.fecha) || {
+        fecha: tarifa.fecha,
+        precioCentavos: 0,
+        precioOriginalCentavos: 0,
+        porcentajeDescuento: 0,
+        usaPorcentaje: false,
+        adicionales: [],
+      };
+      actual.precioCentavos = sumarCentavos(actual.precioCentavos, decimalACentavos(tarifa.precio));
+      actual.precioOriginalCentavos = sumarCentavos(
+        actual.precioOriginalCentavos,
+        decimalACentavos(tarifa.precio_original ?? tarifa.precio)
+      );
+      if (actual.precioCentavos === null || actual.precioOriginalCentavos === null) {
+        throw crearErrorNegocio("El total diario excede el maximo permitido", 409, "TARIFA_INVALIDA");
+      }
+      actual.usaPorcentaje = actual.usaPorcentaje || Boolean(tarifa.usa_porcentaje);
+      actual.porcentajeDescuento = Math.max(actual.porcentajeDescuento, Number(tarifa.porcentaje_descuento || 0));
+      porFecha.set(tarifa.fecha, actual);
+    }
+  }
+
+  for (const adicional of adicionalesProcesados.items || []) {
+    for (const detalle of adicional.detalles || []) {
+      const actual = porFecha.get(detalle.fecha);
+      if (!actual) continue;
+      actual.precioCentavos = sumarCentavos(actual.precioCentavos, decimalACentavos(detalle.subtotal));
+      actual.precioOriginalCentavos = sumarCentavos(
+        actual.precioOriginalCentavos,
+        decimalACentavos(detalle.subtotal_original ?? detalle.subtotal)
+      );
+      if (actual.precioCentavos === null || actual.precioOriginalCentavos === null) {
+        throw crearErrorNegocio("El total diario excede el maximo permitido", 409, "TARIFA_INVALIDA");
+      }
+      actual.usaPorcentaje = actual.usaPorcentaje || Number(detalle.porcentaje_descuento || 0) > 0;
+      actual.porcentajeDescuento = Math.max(actual.porcentajeDescuento, Number(detalle.porcentaje_descuento || 0));
+      actual.adicionales.push({
+        adicional_id: adicional.adicional_id,
+        nombre: adicional.nombre_adicional,
+        cantidad: detalle.cantidad,
+        precio_unitario: detalle.precio_unitario,
+        subtotal: detalle.subtotal,
+      });
+    }
+  }
+
+  return Array.from(porFecha.values())
+    .sort((a, b) => a.fecha.localeCompare(b.fecha))
+    .map((item) => ({
+      fecha: item.fecha,
+      precio: centavosANumero(item.precioCentavos),
+      precio_base: centavosANumero(item.precioOriginalCentavos),
+      usa_porcentaje: item.usaPorcentaje,
+      porcentaje_descuento: item.usaPorcentaje ? item.porcentajeDescuento : 0,
+      adicionales: item.adicionales,
+    }));
+}
 
 router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
   try {
@@ -4562,14 +4950,18 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
+      if (!tieneAreaTurismo(cabecera)) {
+        return res.status(403).json("No autorizado");
+      }
       const {
         fecha_inicio,
         fecha_fin,
         servicio_id,
         recurso_id,
-        personas,
-        regimen_id,
-        adicionales,
+         personas,
+         regimen_id,
+         usuario_id,
+         adicionales,
         modalidad,
         bloque_fecha_id
       } = req.body;
@@ -4578,18 +4970,25 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
         return res.status(400).json("Faltan campos requeridos");
       }
 
-      const fechaInicioSolicitud = new Date(fecha_inicio);
-      const fechaFinSolicitud = new Date(fecha_fin);
+      const fechaInicioSolicitud = formatearFechaSQL(fecha_inicio);
+      const fechaFinSolicitud = formatearFechaSQL(fecha_fin);
 
       // Calcular días correctamente: INCLUIR el día de salida (fecha_fin)
-      const diasTotales = Math.ceil((fechaFinSolicitud - fechaInicioSolicitud) / (1000 * 60 * 60 * 24)) + 1;
+      const diasTotales = diferenciaDiasCivil(fechaInicioSolicitud, fechaFinSolicitud);
 
-      if (diasTotales <= 0) {
+      if (!Number.isInteger(diasTotales) || diasTotales <= 0) {
         return res.status(400).json("El rango de fechas no es válido");
       }
 
+      if (!validarRangoReservaTemporal(fechaInicioSolicitud, fechaFinSolicitud).valido) {
+        return res.status(422).json("La fecha de inicio no puede ser anterior a hoy");
+      }
+
       const pool = mysqlConnection.promise();
-      const regimenIdSolicitud = regimen_id || (Array.isArray(personas) && personas.length > 0 ? personas[0].regimen_id : null);
+      const regimenIdSolicitud = normalizarIdPositivo(regimen_id);
+      if (!regimenIdSolicitud) {
+        return res.status(400).json("El regimen es requerido");
+      }
       const modalidadSolicitada = normalizarModalidad(modalidad);
       const bloqueFechaIdSolicitado = normalizarIdPositivo(bloque_fecha_id);
       let temporadaTarifaIdFiltro = null;
@@ -4609,23 +5008,11 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
         temporadaTarifaIdFiltro = bloqueSeleccionado.temporada_tarifa_id || null;
       }
 
-      const adicionalesSeleccionados = Array.isArray(adicionales)
-        ? adicionales
-            .map(adicional => ({
-              adicional_id: adicional.adicional_id,
-              cantidad: Number(adicional.cantidad)
-            }))
-            .filter(adicional => adicional.adicional_id && adicional.cantidad > 0)
-        : [];
+      const adicionalesSeleccionados = Array.isArray(adicionales) ? adicionales : [];
 
       if (adicionalesSeleccionados.length > 0 && !regimenIdSolicitud) {
         return res.status(400).json("Se requiere el régimen para calcular los adicionales");
       }
-
-      const cacheAdicionales = new Map();
-
-      // Array para almacenar el resultado
-      const fechasConTarifa = [];
 
       // Verificar que el recurso pertenezca al servicio
       const [recursoValido] = await pool.query(
@@ -4640,135 +5027,40 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
         return res.status(404).json("El recurso no pertenece al servicio especificado");
       }
 
-        // Procesar cada día del rango
-      for (let dia = 0; dia < diasTotales; dia++) {
-        const fechaActual = new Date(fechaInicioSolicitud);
-        fechaActual.setDate(fechaInicioSolicitud.getDate() + dia);
+      const personasAutorizadas = await resolverPersonasCotizacionAutorizadas(pool, cabecera, {
+        personas,
+        usuarioObjetivoId: usuario_id,
+        fechaIngreso: fechaInicioSolicitud,
+      });
 
-        const fechaString = fechaActual.toISOString().split('T')[0];
-        let precioBaseDia = 0;
-        let precioBaseSinDescuentoDia = 0;
-        let usaPorcentajeDia = false;
-        let porcentajeDescuentoDia = null;
-        let todasPersonasTienenTarifa = true;
+      const tarifaBase = await calcularTarifaBaseReserva(pool, {
+        recursoId: recurso_id,
+        regimenId: regimenIdSolicitud,
+        personas: personasAutorizadas,
+        fechaInicio: fechaInicioSolicitud,
+        fechaFin: fechaFinSolicitud,
+        temporadaTarifaId: temporadaTarifaIdFiltro,
+      });
+      const adicionalesProcesados = await calcularAdicionalesReserva(
+        pool,
+        adicionalesSeleccionados,
+        recurso_id,
+        regimenIdSolicitud,
+        fechaInicioSolicitud,
+        fechaFinSolicitud,
+        tarifaBase.personas,
+        temporadaTarifaIdFiltro
+      );
 
-        // Calcular tarifa por cada persona para este día específico
-        for (const persona of personas) {
-          // Buscar tarifa válida para esta persona en este día específico
-          const filtroTemporada = temporadaTarifaIdFiltro ? "AND temporada_tarifa_id = ?" : "";
-          const [tarifasPersona] = await pool.query(
-            `
-              SELECT precio, usa_porcentaje, porcentaje_descuento
-              FROM tarifa 
-              WHERE recurso_id = ? 
-                AND tipo_persona_id = ? 
-                AND regimen_id = ?
-                AND (edad_minima IS NULL OR edad_minima <= ?)
-                AND (edad_maxima IS NULL OR edad_maxima >= ?)
-                AND fecha_inicio <= ?
-                AND fecha_fin >= ?
-                ${filtroTemporada}
-              ORDER BY fecha_inicio ASC
-              LIMIT 1
-            `,
-            [
-              recurso_id,
-              persona.tipo_persona_id,
-              persona.regimen_id,
-              persona.edad,
-              persona.edad,
-              fechaString,
-              fechaString,
-              ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])
-            ]
-          );
-
-          if (tarifasPersona.length === 0) {
-            // No hay tarifa válida para esta persona en este día
-            todasPersonasTienenTarifa = false;
-            break;
-          }
-
-          const tarifa = tarifasPersona[0];
-          precioBaseDia += tarifa.precio;
-
-          // Calcular precio base sin descuento y capturar datos de porcentaje
-          let precioBasePersona = tarifa.precio;
-          
-          // Normalizar usa_porcentaje (puede venir como 1/0 o true/false)
-          const usaPorcentaje = tarifa.usa_porcentaje === 1 || tarifa.usa_porcentaje === true || tarifa.usa_porcentaje === '1';
-          
-          if (usaPorcentaje) {
-            usaPorcentajeDia = true;
-            // Si hay múltiples personas, nos quedamos con el último porcentaje encontrado (o el primero)
-            // Idealmente deberían ser consistentes si es una reserva grupal con descuento
-            porcentajeDescuentoDia = tarifa.porcentaje_descuento;
-
-            if (tarifa.porcentaje_descuento && tarifa.porcentaje_descuento > 0) {
-              // Revertir el descuento para obtener el precio base
-              // precio = base * (1 - descuento/100)
-              // base = precio / (1 - descuento/100)
-              const factor = 1 - (tarifa.porcentaje_descuento / 100);
-              if (factor > 0) {
-                precioBasePersona = tarifa.precio / factor;
-              }
-            }
-          }
-          
-          precioBaseSinDescuentoDia += precioBasePersona;
-        }
-
-        let totalExtrasDia = 0;
-        const extrasDia = [];
-
-        if (todasPersonasTienenTarifa && adicionalesSeleccionados.length > 0 && regimenIdSolicitud) {
-          for (const adicional of adicionalesSeleccionados) {
-            const resultadoAdicional = await obtenerPrecioAdicional(
-              pool,
-              cacheAdicionales,
-              recurso_id,
-              regimenIdSolicitud,
-              adicional.adicional_id,
-              fechaString,
-              temporadaTarifaIdFiltro
-            );
-
-            if (resultadoAdicional === null) {
-              continue;
-            }
-
-            const subtotalExtra = resultadoAdicional.precio * adicional.cantidad;
-            totalExtrasDia += subtotalExtra;
-            extrasDia.push({
-              adicional_id: adicional.adicional_id,
-              cantidad: adicional.cantidad,
-              precio_unitario: resultadoAdicional.precio,
-              subtotal: subtotalExtra
-            });
-          }
-        }
-
-        const respuestaDia = {
-          fecha: fechaString,
-          precio: todasPersonasTienenTarifa ? precioBaseDia + totalExtrasDia : null,
-          precio_base: todasPersonasTienenTarifa ? Math.round(precioBaseSinDescuentoDia + totalExtrasDia) : null,
-          usa_porcentaje: usaPorcentajeDia,
-          porcentaje_descuento: usaPorcentajeDia ? porcentajeDescuentoDia : 0
-        };
-
-        if (extrasDia.length > 0) {
-          respuestaDia.extras = extrasDia;
-        }
-
-        fechasConTarifa.push(respuestaDia);
-      }
-
-      res.status(200).json(fechasConTarifa);
+      return res.status(200).json(construirFechasCotizacion(tarifaBase, adicionalesProcesados));
     } else {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json(error.message);
+    }
     res.status(500).json("Error al obtener las tarifas por fecha");
   }
 });
@@ -4787,13 +5079,19 @@ router.post("/reserva/adicionales", verifyToken, async (req, res) => {
         return res.status(400).json("Faltan campos requeridos");
       }
 
+      const fechaInicioSolicitud = formatearFechaSQL(fecha_inicio);
+      const fechaFinSolicitud = formatearFechaSQL(fecha_fin);
+      if (!validarRangoReservaTemporal(fechaInicioSolicitud, fechaFinSolicitud).valido) {
+        return res.status(422).json("El rango debe ser válido y no puede comenzar antes de hoy");
+      }
+
       const modalidadSolicitada = normalizarModalidad(modalidad);
       const bloqueFechaIdSolicitado = normalizarIdPositivo(bloque_fecha_id);
       let temporadaTarifaIdFiltro = null;
       if (modalidadSolicitada === MODALIDAD_BLOQUE && bloqueFechaIdSolicitado) {
         const bloqueSeleccionado = await obtenerBloqueConRecursos(mysqlConnection.promise(), bloqueFechaIdSolicitado);
         const recursoBloque = (bloqueSeleccionado.recursos || []).find((recurso) => Number(recurso.recurso_id) === Number(recurso_id));
-        if (!recursoBloque || !rangoCoincideConBloque(fecha_inicio, fecha_fin, bloqueSeleccionado)) {
+        if (!recursoBloque || !rangoCoincideConBloque(fechaInicioSolicitud, fechaFinSolicitud, bloqueSeleccionado)) {
           return res.status(409).json("El bloque seleccionado no esta disponible para adicionales");
         }
         temporadaTarifaIdFiltro = bloqueSeleccionado.temporada_tarifa_id || null;
@@ -4821,7 +5119,7 @@ router.post("/reserva/adicionales", verifyToken, async (req, res) => {
               ${filtroTemporada}
             ORDER BY ta.fecha_inicio ASC
           `,
-          [recurso_id, regimen_id, fecha_fin, fecha_inicio, ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])]
+          [recurso_id, regimen_id, fechaFinSolicitud, fechaInicioSolicitud, ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])]
         );
 
         res.status(200).json(adicionales);
@@ -4965,7 +5263,6 @@ async function notificarStaffTurismo(connection, departamentalId, tipo, titulo, 
   }
 }
 
-const DIA_EN_MS = 1000 * 60 * 60 * 24;
 const SERVICIO_CAMPING_ID = 4;
 const RECURSO_CAMPING_ID = 1;
 const MAX_PERSONAS_CAMPING = 6;
@@ -4979,7 +5276,6 @@ const MODALIDAD_CONVENIO = "CONVENIO";
 const TIPO_NOTIFICACION_CONVENIO_PROPUESTA = "CONVENIO_PROPUESTA";
 const ESTADOS_RECURSO_BLOQUE_RESERVABLES = new Set(["DISPONIBLE", "VENTA_DIRECTA"]);
 const ESTADOS_RECURSO_SORTEO_DISPONIBLES = new Set(["DISPONIBLE", "SORTEO"]);
-const ESTADOS_RESERVA_NO_OCUPAN = new Set([ESTADO_RESERVA_CANCELADA_ID, ESTADO_RESERVA_RECHAZADA_ID]);
 
 function crearErrorNegocio(mensaje, statusCode = 400, codigo = null) {
   const error = new Error(mensaje);
@@ -5002,18 +5298,17 @@ function formatearFechaSQL(fecha) {
     return null;
   }
   if (typeof fecha === "string") {
-    return fecha.slice(0, 10);
+    return normalizarFechaCivil(fecha.trim());
   }
-  return new Date(fecha).toISOString().split("T")[0];
+  return normalizarFechaCivil(fecha);
 }
 
 function sumarDiasFechaSQL(fecha, dias) {
-  const fechaBase = new Date(fecha);
-  if (Number.isNaN(fechaBase.getTime())) {
-    return fecha;
-  }
-  fechaBase.setDate(fechaBase.getDate() + dias);
-  return formatearFechaSQL(fechaBase);
+  return sumarDiasFechaCivil(formatearFechaSQL(fecha), dias);
+}
+
+function obtenerFechaCivilHoyArgentina() {
+  return obtenerFechaCivilArgentina();
 }
 
 function normalizarBoolean(valor) {
@@ -5027,17 +5322,25 @@ function normalizarBoolean(valor) {
 }
 
 function fechasSonIguales(fechaA, fechaB) {
-  return formatearFechaSQL(fechaA) === formatearFechaSQL(fechaB);
+  const fechaNormalizadaA = formatearFechaSQL(fechaA);
+  const fechaNormalizadaB = formatearFechaSQL(fechaB);
+  return Boolean(fechaNormalizadaA && fechaNormalizadaB && fechaNormalizadaA === fechaNormalizadaB);
 }
 
 function rangosSolapan(fechaInicioA, fechaFinA, fechaInicioB, fechaFinB) {
-  return formatearFechaSQL(fechaInicioA) < formatearFechaSQL(fechaFinB) &&
-    formatearFechaSQL(fechaFinA) > formatearFechaSQL(fechaInicioB);
+  const inicioA = formatearFechaSQL(fechaInicioA);
+  const finA = formatearFechaSQL(fechaFinA);
+  const inicioB = formatearFechaSQL(fechaInicioB);
+  const finB = formatearFechaSQL(fechaFinB);
+  return Boolean(inicioA && finA && inicioB && finB && inicioA < finB && finA > inicioB);
 }
 
 function rangosSolapanInclusivo(fechaInicioA, fechaFinA, fechaInicioB, fechaFinB) {
-  return formatearFechaSQL(fechaInicioA) <= formatearFechaSQL(fechaFinB) &&
-    formatearFechaSQL(fechaFinA) >= formatearFechaSQL(fechaInicioB);
+  const inicioA = formatearFechaSQL(fechaInicioA);
+  const finA = formatearFechaSQL(fechaFinA);
+  const inicioB = formatearFechaSQL(fechaInicioB);
+  const finB = formatearFechaSQL(fechaFinB);
+  return Boolean(inicioA && finA && inicioB && finB && inicioA <= finB && finA >= inicioB);
 }
 
 function rangoCoincideConBloque(fechaInicio, fechaFin, bloque) {
@@ -5045,16 +5348,40 @@ function rangoCoincideConBloque(fechaInicio, fechaFin, bloque) {
 }
 
 function normalizarIdPositivo(valor) {
+  if (typeof valor === "string" && !/^\d+$/.test(valor.trim())) return null;
+  if (typeof valor !== "string" && typeof valor !== "number") return null;
   const numero = Number(valor);
-  return Number.isInteger(numero) && numero > 0 ? numero : null;
+  return Number.isSafeInteger(numero) && numero > 0 ? numero : null;
+}
+
+function normalizarEnteroNoNegativoOpcional(valor, maximo = Number.MAX_SAFE_INTEGER) {
+  if (valor === undefined || valor === null || valor === "") return null;
+  if (typeof valor === "string" && !/^\d+$/.test(valor.trim())) return undefined;
+  if (typeof valor !== "string" && typeof valor !== "number") return undefined;
+  const numero = Number(valor);
+  return Number.isSafeInteger(numero) && numero >= 0 && numero <= maximo ? numero : undefined;
+}
+
+function normalizarPaginacion(query, tamanioPorDefecto = 10) {
+  const page = query?.page === undefined || query?.page === ""
+    ? 1
+    : normalizarIdPositivo(query.page);
+  const pageSize = query?.pageSize === undefined || query?.pageSize === ""
+    ? tamanioPorDefecto
+    : normalizarIdPositivo(query.pageSize);
+  if (page === null || pageSize === null || page > 1_000_000 || pageSize > 100) return null;
+  return { page, pageSize, start: (page - 1) * pageSize };
 }
 
 function normalizarModalidad(valor) {
-  const modalidad = String(valor || MODALIDAD_FECHA_LIBRE).toUpperCase();
+  if (valor === undefined || valor === null || String(valor).trim() === "") {
+    return MODALIDAD_FECHA_LIBRE;
+  }
+  const modalidad = String(valor).trim().toUpperCase();
   if ([MODALIDAD_FECHA_LIBRE, MODALIDAD_BLOQUE, MODALIDAD_SORTEO, MODALIDAD_CONVENIO].includes(modalidad)) {
     return modalidad;
   }
-  return MODALIDAD_FECHA_LIBRE;
+  throw crearErrorNegocio("La modalidad indicada no es valida", 400, "MODALIDAD_INVALIDA");
 }
 
 function parseJsonSeguro(valor) {
@@ -5091,25 +5418,45 @@ function normalizarBooleanActivo(valor, valorPorDefecto = true) {
   return normalizarBoolean(valor) ? 1 : 0;
 }
 
+function normalizarBooleanoBinarioEstricto(valor) {
+  if ([true, 1, "1", "true"].includes(valor)) return 1;
+  if ([false, 0, "0", "false"].includes(valor)) return 0;
+  return null;
+}
+
+function normalizarSiNoEstricto(valor) {
+  if ([true, 1, "1", "true", "Y"].includes(valor)) return "Y";
+  if ([false, 0, "0", "false", "N"].includes(valor)) return "N";
+  return null;
+}
+
 function normalizarNumeroNullable(valor) {
   if (valor === undefined || valor === null || valor === "") {
     return null;
   }
+  if (typeof valor === "string" && !/^[+-]?\d+(?:\.\d+)?$/.test(valor.trim())) return null;
+  if (typeof valor !== "string" && typeof valor !== "number") return null;
   const numero = Number(valor);
   return Number.isFinite(numero) ? numero : null;
 }
 
-function normalizarImporte(valor) {
+function normalizarOrden(valor) {
+  if (valor === undefined || valor === null || valor === "") return 0;
+  if (typeof valor === "string" && !/^-?\d+$/.test(valor.trim())) return null;
+  if (typeof valor !== "string" && typeof valor !== "number") return null;
   const numero = Number(valor);
-  return Number.isFinite(numero) && numero >= 0 ? Number(numero.toFixed(2)) : null;
+  return Number.isSafeInteger(numero) && Math.abs(numero) <= 1_000_000 ? numero : null;
 }
 
 function validarDatosImagenLogin(body = {}) {
-  const orden = normalizarNumeroNullable(body.orden);
+  const orden = normalizarOrden(body.orden);
+  const activo = body.activo === undefined ? 1 : normalizarBooleanoBinarioEstricto(body.activo);
+  if (orden === null) return { error: "El orden debe ser un entero válido" };
+  if (activo === null) return { error: "El estado activo es inválido" };
 
   return {
-    activo: normalizarBooleanActivo(body.activo),
-    orden: orden !== null ? Math.trunc(orden) : 0,
+    activo,
+    orden,
   };
 }
 
@@ -5258,7 +5605,7 @@ function validarDatosTestimonioTurismo(body) {
   const nombre = normalizarTexto(body.nombre);
   const localidad = normalizarTexto(body.localidad);
   const comentario = normalizarTexto(body.comentario);
-  const estrellas = Number(body.estrellas);
+  const estrellas = normalizarIdPositivo(body.estrellas);
 
   if (!nombre || nombre.length > 80) {
     return { error: "El nombre es requerido (maximo 80 caracteres)" };
@@ -5273,15 +5620,18 @@ function validarDatosTestimonioTurismo(body) {
     return { error: "Las estrellas deben ser un entero entre 1 y 5" };
   }
 
-  const orden = normalizarNumeroNullable(body.orden);
+  const orden = normalizarOrden(body.orden);
+  const activo = body.activo === undefined ? 1 : normalizarBooleanoBinarioEstricto(body.activo);
+  if (orden === null) return { error: "El orden debe ser un entero válido" };
+  if (activo === null) return { error: "El estado activo es inválido" };
 
   return {
     nombre,
     localidad,
     comentario,
     estrellas,
-    activo: normalizarBooleanActivo(body.activo),
-    orden: orden !== null ? Math.trunc(orden) : 0,
+    activo,
+    orden,
   };
 }
 
@@ -5450,8 +5800,14 @@ async function obtenerUsuarioPrincipalFamilia(connection, usuarioId) {
     let currentUserId = usuarioCreador[0].id;
     let currentUserFamiliarId = usuarioCreador[0].usuario_familiar_id;
     let currentDepartamentalId = usuarioCreador[0].departamental_id;
+    const usuariosVisitados = new Set([Number(currentUserId)]);
 
     while (currentUserFamiliarId !== null) {
+      const siguienteId = Number(currentUserFamiliarId);
+      if (!Number.isInteger(siguienteId) || usuariosVisitados.has(siguienteId)) {
+        throw crearErrorNegocio("La jerarquia familiar contiene un ciclo o una referencia invalida", 409, "JERARQUIA_FAMILIAR_INVALIDA");
+      }
+      usuariosVisitados.add(siguienteId);
       const [nextUser] = await connection.query(
         "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
         [currentUserFamiliarId]
@@ -5473,62 +5829,249 @@ async function obtenerUsuarioPrincipalFamilia(connection, usuarioId) {
   return { usuarioFamiliarPrincipalId, departamentalId };
 }
 
+async function puedeAccederUsuarioRelacionado(connection, cabecera, usuarioObjetivoId) {
+  const objetivoId = normalizarIdPositivo(usuarioObjetivoId);
+  const actorId = normalizarIdPositivo(cabecera?.id);
+  if (!objetivoId || !actorId) return false;
+  if (cabecera.rol === "admin") return true;
+
+  if (cabecera.rol === "afiliado") {
+    const familiaActor = await obtenerUsuarioPrincipalFamilia(connection, actorId);
+    const familiaObjetivo = await obtenerUsuarioPrincipalFamilia(connection, objetivoId);
+    return Number(familiaActor.usuarioFamiliarPrincipalId) === Number(familiaObjetivo.usuarioFamiliarPrincipalId);
+  }
+
+  if (cabecera.rol === "departamental" && tieneAreaTurismo(cabecera)) {
+    const [usuarios] = await connection.query(
+      "SELECT id, departamental_id FROM usuario WHERE id IN (?, ?)",
+      [actorId, objetivoId]
+    );
+    if (usuarios.length !== (actorId === objetivoId ? 1 : 2)) return false;
+    const porId = new Map(usuarios.map((usuario) => [Number(usuario.id), usuario.departamental_id]));
+    const departamentalActor = normalizarIdPositivo(porId.get(actorId));
+    const departamentalObjetivo = normalizarIdPositivo(porId.get(objetivoId));
+    return Boolean(departamentalActor && departamentalObjetivo && departamentalActor === departamentalObjetivo);
+  }
+
+  return false;
+}
+
+async function resolverPersonasCotizacionAutorizadas(connection, cabecera, {
+  personas,
+  usuarioObjetivoId,
+  fechaIngreso,
+}) {
+  const actorId = normalizarIdPositivo(cabecera?.id);
+  const solicitadoId = normalizarIdPositivo(usuarioObjetivoId);
+  if (!actorId) {
+    throw crearErrorNegocio("No se pudo identificar al usuario autenticado", 401);
+  }
+
+  let titularId = actorId;
+  if (cabecera.rol === "afiliado") {
+    if (usuarioObjetivoId !== undefined && usuarioObjetivoId !== null && solicitadoId !== actorId) {
+      throw crearErrorNegocio("No puedes cotizar para otro afiliado", 403);
+    }
+  } else {
+    if (!solicitadoId) {
+      throw crearErrorNegocio("Debes indicar el afiliado titular de la cotizacion", 400);
+    }
+    titularId = solicitadoId;
+    if (cabecera.rol === "departamental" && !(await puedeAccederUsuarioRelacionado(connection, cabecera, titularId))) {
+      throw crearErrorNegocio("No puedes cotizar para afiliados de otra departamental", 403);
+    }
+  }
+
+  const [titulares] = await connection.query(
+    `SELECT u.id, u.habilitado, r.nombre AS rol
+       FROM usuario u
+       INNER JOIN rol r ON r.id = u.rol_id
+      WHERE u.id = ?
+      LIMIT 1`,
+    [titularId]
+  );
+  if (titulares.length === 0 || titulares[0].rol !== "afiliado" || titulares[0].habilitado !== "Y") {
+    throw crearErrorNegocio("El titular debe ser un afiliado habilitado", 422);
+  }
+
+  const { usuarioFamiliarPrincipalId, departamentalId } = await obtenerUsuarioPrincipalFamilia(
+    connection,
+    titularId
+  );
+  return crearOBuscarUsuariosReserva(connection, personas, {
+    usuarioFamiliarPrincipalId,
+    departamentalId,
+    usuarioModificadorId: actorId,
+    req: null,
+    crearSiNoExiste: false,
+    fechaIngreso,
+  });
+}
+
 async function crearOBuscarUsuariosReserva(connection, personas, {
   usuarioFamiliarPrincipalId,
   departamentalId,
   usuarioModificadorId,
   req,
+  crearSiNoExiste = true,
+  fechaIngreso,
 }) {
+  if (!Array.isArray(personas) || personas.length === 0 || personas.length > 100) {
+    throw crearErrorNegocio("La reserva debe incluir entre 1 y 100 personas", 400);
+  }
   const usuariosIds = [];
+  const documentosIncluidos = new Set();
+  const principalId = normalizarIdPositivo(usuarioFamiliarPrincipalId);
+  const fechaIngresoNormalizada = formatearFechaSQL(fechaIngreso);
+  if (!principalId) {
+    throw crearErrorNegocio("No se pudo determinar el titular del grupo familiar", 409, "TITULAR_INVALIDO");
+  }
+  if (!fechaIngresoNormalizada) {
+    throw crearErrorNegocio("La fecha de ingreso de la reserva no es valida", 400);
+  }
 
-  for (const persona of personas) {
-    const dni = persona.dni || persona.documento;
+  for (let indice = 0; indice < personas.length; indice++) {
+    const persona = personas[indice];
+    const dni = String(persona.dni ?? persona.documento ?? "").trim();
+    if (!/^\d{6,9}$/.test(dni)) {
+      throw crearErrorNegocio(`El documento de personas[${indice}] no es valido`, 400);
+    }
+    if (documentosIncluidos.has(dni)) {
+      throw crearErrorNegocio("No se puede incluir dos veces a la misma persona", 400, "PERSONA_DUPLICADA");
+    }
+    documentosIncluidos.add(dni);
+
+    const personaId = normalizarIdPositivo(persona.id ?? persona.usuario_id);
     const [existeUsuario] = await connection.query(
-      "SELECT id FROM usuario WHERE documento = ?",
-      [dni]
+      personaId
+        ? `SELECT id, documento, nombre, apellido, fecha_nacimiento, tipo_persona_id,
+                  parentesco_id, telefono, email
+           FROM usuario WHERE id = ? LIMIT 1`
+        : `SELECT id, documento, nombre, apellido, fecha_nacimiento, tipo_persona_id,
+                  parentesco_id, telefono, email
+           FROM usuario WHERE documento = ? LIMIT 1`,
+      [personaId || dni]
     );
 
     let usuarioId;
+    let personaAutorizada;
     if (existeUsuario.length > 0) {
-      usuarioId = existeUsuario[0].id;
+      const usuarioExistente = existeUsuario[0];
+      if (personaId && String(usuarioExistente.documento ?? "").trim() !== dni) {
+        throw crearErrorNegocio("El identificador de la persona no coincide con su documento", 409, "PERSONA_INCONSISTENTE");
+      }
+      const familiaExistente = await obtenerUsuarioPrincipalFamilia(connection, usuarioExistente.id);
+      if (Number(familiaExistente.usuarioFamiliarPrincipalId) !== principalId) {
+        throw crearErrorNegocio("La persona indicada pertenece a otro grupo familiar", 403, "PERSONA_FUERA_DEL_GRUPO");
+      }
+      usuarioId = usuarioExistente.id;
+      personaAutorizada = {
+        ...persona,
+        nombre: usuarioExistente.nombre,
+        apellido: usuarioExistente.apellido,
+        fecha_nacimiento: formatearFechaSQL(usuarioExistente.fecha_nacimiento),
+        tipo_persona_id: normalizarIdPositivo(usuarioExistente.tipo_persona_id),
+        parentesco_id: normalizarIdPositivo(usuarioExistente.parentesco_id),
+        telefono: usuarioExistente.telefono || null,
+        email: usuarioExistente.email || null,
+      };
+      personaAutorizada.edad = calcularEdadEnFecha(
+        personaAutorizada.fecha_nacimiento,
+        fechaIngresoNormalizada
+      );
+      if (!Number.isInteger(personaAutorizada.edad) || personaAutorizada.edad < 0 || personaAutorizada.edad > 130) {
+        throw crearErrorNegocio(`La fecha de nacimiento de personas[${indice}] no es valida`, 409);
+      }
     } else {
-      const rolId = Number(persona.tipo_persona_id) === 1 ? 2 : 4;
+      if (personaId) {
+        throw crearErrorNegocio("La persona indicada no existe", 404);
+      }
+      const tipoPersonaId = normalizarIdPositivo(persona.tipo_persona_id ?? persona.tipo);
+      const fechaNacimiento = formatearFechaSQL(persona.fecha_nacimiento ?? persona.fechaNacimiento);
+      const nombrePersona = normalizarTexto(persona.nombre);
+      const apellidoPersona = normalizarTexto(persona.apellido);
+      if (!tipoPersonaId || !fechaNacimiento || !nombrePersona || !apellidoPersona) {
+        throw crearErrorNegocio(`Los datos de personas[${indice}] no son validos`, 400);
+      }
+      const [tiposPersona] = await connection.query("SELECT id FROM tipo_persona WHERE id = ? LIMIT 1", [tipoPersonaId]);
+      if (tiposPersona.length === 0) {
+        throw crearErrorNegocio(`El tipo de personas[${indice}] no existe`, 400);
+      }
+      const edadEnIngreso = calcularEdadEnFecha(fechaNacimiento, fechaIngresoNormalizada);
+      if (!Number.isInteger(edadEnIngreso) || edadEnIngreso < 0 || edadEnIngreso > 130) {
+        throw crearErrorNegocio(`La fecha de nacimiento de personas[${indice}] no es valida`, 400);
+      }
+      if (tipoPersonaId === 1) {
+        throw crearErrorNegocio(
+          "La categoria Afiliado solo puede usarse para una persona ya registrada",
+          422,
+          "TIPO_PERSONA_NO_VERIFICADO"
+        );
+      }
+      if ((edadEnIngreso < 2 && tipoPersonaId !== 5) || (edadEnIngreso >= 2 && tipoPersonaId === 5)) {
+        throw crearErrorNegocio(
+          `El tipo de personas[${indice}] no coincide con su edad al ingreso`,
+          422,
+          "TIPO_PERSONA_EDAD_INCONSISTENTE"
+        );
+      }
+      if (tipoPersonaId === 2 && esFamiliarPorParentesco(persona.parentesco_id) !== "S") {
+        throw crearErrorNegocio(
+          `El tipo familiar de personas[${indice}] requiere un parentesco familiar`,
+          422,
+          "TIPO_PERSONA_PARENTESCO_INCONSISTENTE"
+        );
+      }
+      const rolId = tipoPersonaId === 1 ? 2 : 4;
 
-      const [nuevoUsuario] = await connection.query(
-        `INSERT INTO usuario (
-          rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento,
-          documento, telefono, password, usuario_familiar_id, es_familiar, departamental_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
-        [
-          rolId,
-          persona.parentesco_id || null,
-          persona.tipo_persona_id || null,
-          persona.nombre,
-          persona.apellido,
-          persona.fecha_nacimiento || null,
-          dni,
-          persona.telefono || null,
-          usuarioFamiliarPrincipalId,
-          esFamiliarPorParentesco(persona.parentesco_id),
-          departamentalId,
-        ]
-      );
-      usuarioId = nuevoUsuario.insertId;
+      usuarioId = null;
+      personaAutorizada = {
+        ...persona,
+        nombre: nombrePersona,
+        apellido: apellidoPersona,
+        fecha_nacimiento: fechaNacimiento,
+        edad: edadEnIngreso,
+        tipo_persona_id: tipoPersonaId,
+        parentesco_id: normalizarIdPositivo(persona.parentesco_id),
+      };
 
-      await registrarHistorial(
-        connection,
-        usuarioId,
-        "CREATE",
-        "usuario",
-        usuarioModificadorId,
-        req,
-        null,
-        `Usuario creado durante reserva. Datos: ${persona.nombre} ${persona.apellido}, DNI: ${dni}`
-      );
+      if (crearSiNoExiste) {
+        const [nuevoUsuario] = await connection.query(
+          `INSERT INTO usuario (
+            rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento,
+            documento, telefono, password, usuario_familiar_id, es_familiar, departamental_id
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+          [
+            rolId,
+            persona.parentesco_id || null,
+            tipoPersonaId,
+            nombrePersona,
+            apellidoPersona,
+            fechaNacimiento,
+            dni,
+            persona.telefono || null,
+            principalId,
+            esFamiliarPorParentesco(persona.parentesco_id),
+            departamentalId,
+          ]
+        );
+        usuarioId = nuevoUsuario.insertId;
+
+        await registrarHistorial(
+          connection,
+          usuarioId,
+          "CREATE",
+          "usuario",
+          usuarioModificadorId,
+          req,
+          null,
+          `Usuario creado durante reserva. Datos: ${persona.nombre} ${persona.apellido}, DNI: ${dni}`
+        );
+      }
     }
 
     usuariosIds.push({
-      ...persona,
+      ...personaAutorizada,
       dni,
       usuario_id: usuarioId,
     });
@@ -5621,7 +6164,10 @@ function mapearPremioSorteo(row) {
     cantidad_personas: Number(row.cantidad_personas || 0),
     estado: row.estado || null,
     sorteo_id: row.sorteo_id ? Number(row.sorteo_id) : null,
+    sorteo_estado: row.sorteo_estado || null,
     bloque_fecha_id: row.bloque_fecha_id ? Number(row.bloque_fecha_id) : null,
+    bloque_estado: row.bloque_estado || null,
+    bloque_fecha_inicio: formatearFechaSQL(row.bloque_fecha_inicio),
     recurso_id: row.recurso_id ? Number(row.recurso_id) : null,
     usuario_id: row.usuario_id ? Number(row.usuario_id) : null
   };
@@ -5641,7 +6187,10 @@ async function obtenerDetallePremioParaReserva(connection, reservaId, recursoId)
         r.fecha_inicio,
         r.fecha_fin,
         s.nombre AS sorteo_nombre,
+        s.estado AS sorteo_estado,
         bf.nombre AS bloque_nombre,
+        bf.estado AS bloque_estado,
+        bf.fecha_inicio AS bloque_fecha_inicio,
         srv.nombre AS servicio_nombre,
         srv.lugar,
         rec.nombre AS recurso_nombre,
@@ -5695,7 +6244,10 @@ async function obtenerPremioSorteoPorAdjudicacion(connection, {
         r.fecha_inicio,
         r.fecha_fin,
         s.nombre AS sorteo_nombre,
+        s.estado AS sorteo_estado,
         bf.nombre AS bloque_nombre,
+        bf.estado AS bloque_estado,
+        bf.fecha_inicio AS bloque_fecha_inicio,
         srv.nombre AS servicio_nombre,
         srv.lugar,
         rec.nombre AS recurso_nombre,
@@ -5738,7 +6290,10 @@ async function obtenerPremioSorteoPendiente(connection, usuarioId) {
         r.fecha_inicio,
         r.fecha_fin,
         s.nombre AS sorteo_nombre,
+        s.estado AS sorteo_estado,
         bf.nombre AS bloque_nombre,
+        bf.estado AS bloque_estado,
+        bf.fecha_inicio AS bloque_fecha_inicio,
         srv.nombre AS servicio_nombre,
         srv.lugar,
         rec.nombre AS recurso_nombre,
@@ -5761,13 +6316,7 @@ async function obtenerPremioSorteoPendiente(connection, usuarioId) {
 }
 
 function fechaSqlAIndice(fecha) {
-  const fechaSql = formatearFechaSQL(fecha);
-  if (!fechaSql || !/^\d{4}-\d{2}-\d{2}$/.test(fechaSql)) {
-    return null;
-  }
-
-  const [anio, mes, dia] = fechaSql.split("-").map(Number);
-  return Math.floor(Date.UTC(anio, mes - 1, dia) / DIA_EN_MS);
+  return fechaCivilAIndice(formatearFechaSQL(fecha));
 }
 
 function extraerSegmentosTarifasConfiguracion(configuracionServicios) {
@@ -5940,6 +6489,15 @@ async function validarSolapamientoTarifasExistentes(connection, {
       WHERE t.recurso_id IN (${placeholdersRecursos})
         AND t.fecha_inicio <= ?
         AND t.fecha_fin >= ?
+        AND (
+          COALESCE(tt.origen, 'GENERAL') <> 'BLOQUE'
+          OR EXISTS (
+            SELECT 1
+            FROM bloque_fecha bf_vigente
+            WHERE bf_vigente.temporada_tarifa_id = tt.id
+              AND bf_vigente.estado = 'ACTIVO'
+          )
+        )
         ${filtroExclude}
         ${filtroOrigen}
     `,
@@ -6115,39 +6673,67 @@ async function obtenerInscripcionSorteoActiva(connection, usuarioId, { forUpdate
   };
 }
 
-function normalizarPersonasParaCotizacion(personas, regimenId) {
+function normalizarPersonasParaCotizacion(personas, regimenId, fechaInicio) {
   if (!Array.isArray(personas) || personas.length === 0) {
     throw crearErrorNegocio("Debe indicar al menos una persona", 400);
   }
 
-  return personas.map((persona) => ({
-    ...persona,
-    tipo_persona_id: normalizarIdPositivo(persona.tipo_persona_id ?? persona.tipo),
-    regimen_id: normalizarIdPositivo(persona.regimen_id ?? regimenId),
-    edad: Number(persona.edad)
-  }));
+  return personas.map((persona, indice) => {
+    const tieneFechaNacimiento = persona?.fecha_nacimiento !== undefined || persona?.fechaNacimiento !== undefined;
+    const fechaNacimiento = persona?.fecha_nacimiento ?? persona?.fechaNacimiento;
+    const edad = tieneFechaNacimiento
+      ? calcularEdadEnFecha(formatearFechaSQL(fechaNacimiento), fechaInicio)
+      : Number(persona?.edad);
+
+    if (!Number.isInteger(edad) || edad < 0 || edad > 130) {
+      throw crearErrorNegocio(`La edad de personas[${indice}] no es valida para la fecha de ingreso`, 400);
+    }
+
+    return {
+      ...persona,
+      tipo_persona_id: normalizarIdPositivo(persona?.tipo_persona_id ?? persona?.tipo),
+      // El regimen es una propiedad de la reserva; nunca se acepta uno distinto
+      // por integrante porque produciria una reserva internamente contradictoria.
+      regimen_id: normalizarIdPositivo(regimenId),
+      edad,
+    };
+  });
 }
 
 async function calcularTarifaBaseReserva(connection, { recursoId, regimenId, personas, fechaInicio, fechaFin, temporadaTarifaId = null }) {
-  const fechaInicioDate = new Date(fechaInicio);
-  const fechaFinDate = new Date(fechaFin);
-  const diasTotales = Math.ceil((fechaFinDate - fechaInicioDate) / DIA_EN_MS);
-
-  if (!Number.isFinite(diasTotales) || diasTotales <= 0) {
+  const fechaInicioNormalizada = formatearFechaSQL(fechaInicio);
+  const fechaFinNormalizada = formatearFechaSQL(fechaFin);
+  const noches = obtenerNochesReserva(fechaInicioNormalizada, fechaFinNormalizada);
+  if (noches.length === 0) {
     throw crearErrorNegocio("El rango de fechas no es valido", 400);
   }
 
-  const personasNormalizadas = normalizarPersonasParaCotizacion(personas, regimenId);
-  let total = 0;
-  let totalOriginal = 0;
+  const recursoIdNormalizado = normalizarIdPositivo(recursoId);
+  const regimenIdNormalizado = normalizarIdPositivo(regimenId);
+  if (!recursoIdNormalizado || !regimenIdNormalizado) {
+    throw crearErrorNegocio("El recurso y el regimen son requeridos", 400);
+  }
+
+  const personasNormalizadas = normalizarPersonasParaCotizacion(
+    personas,
+    regimenIdNormalizado,
+    fechaInicioNormalizada
+  );
+  let totalCentavos = 0;
+  let totalOriginalCentavos = 0;
   const personasResultado = [];
+  const ultimaNoche = noches[noches.length - 1];
 
   for (const persona of personasNormalizadas) {
-    if (!persona.tipo_persona_id || !persona.regimen_id || !Number.isFinite(persona.edad)) {
+    if (!persona.tipo_persona_id || !persona.regimen_id) {
       throw crearErrorNegocio("Los datos de las personas no son validos", 400);
     }
 
-    const filtroTemporada = temporadaTarifaId ? "AND temporada_tarifa_id = ?" : "";
+    const filtroTemporada = temporadaTarifaId
+      ? "AND temporada_tarifa_id = ?"
+      : `AND (temporada_tarifa_id IS NULL OR temporada_tarifa_id IN (
+           SELECT id FROM temporada_tarifa WHERE COALESCE(origen, 'GENERAL') = 'GENERAL'
+         ))`;
     const [tarifasPersona] = await connection.query(
       `
         SELECT id, precio, fecha_inicio, fecha_fin, usa_porcentaje, porcentaje_descuento
@@ -6163,13 +6749,13 @@ async function calcularTarifaBaseReserva(connection, { recursoId, regimenId, per
         ORDER BY fecha_inicio ASC
       `,
       [
-        recursoId,
+        recursoIdNormalizado,
         persona.tipo_persona_id,
         persona.regimen_id,
         persona.edad,
         persona.edad,
-        fechaFin,
-        fechaInicio,
+        ultimaNoche,
+        fechaInicioNormalizada,
         ...(temporadaTarifaId ? [temporadaTarifaId] : [])
       ]
     );
@@ -6178,92 +6764,142 @@ async function calcularTarifaBaseReserva(connection, { recursoId, regimenId, per
       throw crearErrorNegocio("No hay tarifas para todas las personas del bloque", 409, "TARIFA_INCOMPLETA");
     }
 
-    const diasCubiertos = new Array(diasTotales).fill(false);
     const tarifasPorFecha = [];
-    let totalPersona = 0;
-    let totalOriginalPersona = 0;
+    let totalPersonaCentavos = 0;
+    let totalOriginalPersonaCentavos = 0;
 
-    for (const tarifa of tarifasPersona) {
-      const fechaInicioTarifa = new Date(tarifa.fecha_inicio);
-      const fechaFinTarifa = new Date(tarifa.fecha_fin);
-      const inicioInterseccion = new Date(Math.max(fechaInicioDate.getTime(), fechaInicioTarifa.getTime()));
-      const finInterseccion = new Date(Math.min(fechaFinDate.getTime(), fechaFinTarifa.getTime()));
+    for (const noche of noches) {
+      const tarifasAplicables = tarifasPersona.filter((tarifa) => {
+        const inicioTarifa = formatearFechaSQL(tarifa.fecha_inicio);
+        const finTarifa = formatearFechaSQL(tarifa.fecha_fin);
+        return inicioTarifa && finTarifa && inicioTarifa <= noche && finTarifa >= noche;
+      });
 
-      if (inicioInterseccion >= finInterseccion) {
-        continue;
+      if (tarifasAplicables.length === 0) {
+        throw crearErrorNegocio("No hay tarifas para todas las noches del bloque", 409, "TARIFA_INCOMPLETA");
+      }
+      if (tarifasAplicables.length > 1) {
+        throw crearErrorNegocio(
+          `Hay mas de una tarifa aplicable para la fecha ${noche}`,
+          409,
+          "TARIFA_AMBIGUA"
+        );
       }
 
-      const diasInterseccion = Math.ceil((finInterseccion - inicioInterseccion) / DIA_EN_MS);
-      const diaInicioRelativo = Math.floor((inicioInterseccion - fechaInicioDate) / DIA_EN_MS);
-      let precioOriginal = Number(tarifa.precio);
+      const tarifa = tarifasAplicables[0];
+      const precioCentavos = decimalACentavos(tarifa.precio);
+      if (precioCentavos === null) {
+        throw crearErrorNegocio(`La tarifa de la fecha ${noche} tiene un importe invalido`, 409, "TARIFA_INVALIDA");
+      }
+
+      let precioOriginalCentavos = precioCentavos;
       const usaPorcentaje = tarifa.usa_porcentaje === 1 || tarifa.usa_porcentaje === true || tarifa.usa_porcentaje === "1";
-      const porcentajeDescuento = tarifa.porcentaje_descuento !== null && tarifa.porcentaje_descuento !== undefined
-        ? Number(tarifa.porcentaje_descuento)
+      const porcentajePuntosBase = tarifa.porcentaje_descuento !== null && tarifa.porcentaje_descuento !== undefined
+        ? decimalAPuntosBase(tarifa.porcentaje_descuento)
         : 0;
 
-      if (usaPorcentaje && porcentajeDescuento > 0) {
-        const factor = 1 - porcentajeDescuento / 100;
-        if (factor > 0) {
-          precioOriginal = Number(tarifa.precio) / factor;
+      if (usaPorcentaje) {
+        if (porcentajePuntosBase === null || porcentajePuntosBase > 10000) {
+          throw crearErrorNegocio(`La tarifa de la fecha ${noche} tiene un porcentaje invalido`, 409, "TARIFA_INVALIDA");
         }
+        // Con bonificación total el precio de lista no puede reconstruirse por
+        // división. El cobro canónico sí es inequívoco: cero centavos.
+        precioOriginalCentavos = porcentajePuntosBase === 10000
+          ? precioCentavos
+          : revertirDescuentoEnPuntosBase(precioCentavos, porcentajePuntosBase);
       }
 
-      for (let i = 0; i < diasInterseccion; i++) {
-        const diaIndex = diaInicioRelativo + i;
-        if (diaIndex < 0 || diaIndex >= diasTotales || diasCubiertos[diaIndex]) {
-          continue;
-        }
-
-        const fechaActual = new Date(fechaInicioDate);
-        fechaActual.setDate(fechaInicioDate.getDate() + diaIndex);
-        const fechaString = fechaActual.toISOString().split("T")[0];
-
-        diasCubiertos[diaIndex] = true;
-        const precio = Number(tarifa.precio);
-        totalPersona += precio;
-        totalOriginalPersona += precioOriginal;
-        tarifasPorFecha.push({
-          fecha: fechaString,
-          precio,
-          precio_original: precioOriginal,
-          tarifa_id: tarifa.id,
-          usa_porcentaje: usaPorcentaje,
-          porcentaje_descuento: porcentajeDescuento
-        });
+      totalPersonaCentavos = sumarCentavos(totalPersonaCentavos, precioCentavos);
+      totalOriginalPersonaCentavos = sumarCentavos(totalOriginalPersonaCentavos, precioOriginalCentavos);
+      if (totalPersonaCentavos === null || totalOriginalPersonaCentavos === null) {
+        throw crearErrorNegocio("El total de la tarifa excede el maximo permitido", 409, "TARIFA_INVALIDA");
       }
+
+      tarifasPorFecha.push({
+        fecha: noche,
+        precio: centavosANumero(precioCentavos),
+        precio_original: centavosANumero(precioOriginalCentavos),
+        tarifa_id: tarifa.id,
+        usa_porcentaje: usaPorcentaje,
+        porcentaje_descuento: porcentajePuntosBase / 100,
+      });
     }
 
-    if (!diasCubiertos.every(Boolean)) {
-      throw crearErrorNegocio("No hay tarifas para todas las noches del bloque", 409, "TARIFA_INCOMPLETA");
+    totalCentavos = sumarCentavos(totalCentavos, totalPersonaCentavos);
+    totalOriginalCentavos = sumarCentavos(totalOriginalCentavos, totalOriginalPersonaCentavos);
+    if (totalCentavos === null || totalOriginalCentavos === null) {
+      throw crearErrorNegocio("El total de la reserva excede el maximo permitido", 409, "TARIFA_INVALIDA");
     }
 
-    total += totalPersona;
-    totalOriginal += totalOriginalPersona;
     personasResultado.push({
       ...persona,
-      tarifa_individual: totalPersona,
-      tarifa_original_individual: totalOriginalPersona,
+      tarifa_individual: centavosANumero(totalPersonaCentavos),
+      tarifa_original_individual: centavosANumero(totalOriginalPersonaCentavos),
       tarifas_por_fecha: tarifasPorFecha.sort((a, b) => a.fecha.localeCompare(b.fecha))
     });
   }
 
   return {
-    total,
-    total_original: totalOriginal,
+    total: centavosANumero(totalCentavos),
+    total_original: centavosANumero(totalOriginalCentavos),
     personas: personasResultado
   };
 }
 
+async function insertarTarifasFamiliaresCalculadas(connection, reservasFamiliares) {
+  for (const persona of reservasFamiliares) {
+    const tarifas = Array.isArray(persona.tarifas_por_fecha) ? persona.tarifas_por_fecha : [];
+    if (tarifas.length === 0) {
+      throw crearErrorNegocio("No se pudo conservar el detalle de las tarifas aplicadas", 409, "TARIFA_INCOMPLETA");
+    }
+    for (const tarifa of tarifas) {
+      const tarifaId = normalizarIdPositivo(tarifa.tarifa_id);
+      const fecha = formatearFechaSQL(tarifa.fecha);
+      if (!tarifaId || !fecha) {
+        throw crearErrorNegocio("El detalle de tarifa calculado es invalido", 409, "TARIFA_INVALIDA");
+      }
+      await connection.query(
+        `INSERT INTO reserva_familiar_tarifa (reserva_familiar_id, tarifa_id, fecha)
+         VALUES (?, ?, ?)`,
+        [persona.reserva_familiar_id, tarifaId, fecha]
+      );
+    }
+  }
+}
+
+async function temporadaTieneReferenciasHistoricas(connection, temporadaTarifaId) {
+  const [rows] = await connection.query(
+    `
+      SELECT EXISTS (
+        SELECT 1
+        FROM tarifa t
+        INNER JOIN reserva_familiar_tarifa rft ON rft.tarifa_id = t.id
+        WHERE t.temporada_tarifa_id = ?
+        UNION ALL
+        SELECT 1
+        FROM tarifa t
+        INNER JOIN reserva_adicional_detalle rad ON rad.tarifa_id = t.id
+        WHERE t.temporada_tarifa_id = ?
+        UNION ALL
+        SELECT 1
+        FROM tarifa_adicional ta
+        INNER JOIN reserva_adicional_detalle rad ON rad.tarifa_adicional_id = ta.id
+        WHERE ta.temporada_tarifa_id = ?
+      ) AS tiene_referencias
+    `,
+    [temporadaTarifaId, temporadaTarifaId, temporadaTarifaId]
+  );
+  return Number(rows[0]?.tiene_referencias) === 1;
+}
+
 async function insertarTarifasFamiliaresReserva(connection, reservasFamiliaresIds, recursoId, regimenId, fechaInicio, fechaFin, temporadaTarifaId = null) {
-  const fechaInicioDate = new Date(fechaInicio);
-  const fechaFinDate = new Date(fechaFin);
-  const diasTotales = Math.ceil((fechaFinDate - fechaInicioDate) / DIA_EN_MS);
+  const noches = obtenerNochesReserva(formatearFechaSQL(fechaInicio), formatearFechaSQL(fechaFin));
+  if (noches.length === 0) {
+    throw crearErrorNegocio("El rango de la reserva no es valido", 400);
+  }
 
   for (const reservaFamiliar of reservasFamiliaresIds) {
-    for (let dia = 0; dia < diasTotales; dia++) {
-      const fechaActual = new Date(fechaInicioDate);
-      fechaActual.setDate(fechaInicioDate.getDate() + dia);
-      const fechaString = fechaActual.toISOString().split("T")[0];
+    for (const fechaString of noches) {
 
       const filtroTemporada = temporadaTarifaId ? "AND temporada_tarifa_id = ?" : "";
       const [tarifas] = await connection.query(
@@ -6277,8 +6913,7 @@ async function insertarTarifasFamiliaresReserva(connection, reservasFamiliaresId
            AND fecha_inicio <= ?
            AND fecha_fin >= ?
            ${filtroTemporada}
-         ORDER BY fecha_inicio ASC
-         LIMIT 1`,
+         ORDER BY fecha_inicio ASC`,
         [
           recursoId,
           reservaFamiliar.tipo_persona_id,
@@ -6291,14 +6926,21 @@ async function insertarTarifasFamiliaresReserva(connection, reservasFamiliaresId
         ]
       );
 
-      if (tarifas.length > 0) {
-        await connection.query(
-          `INSERT INTO reserva_familiar_tarifa
-            (reserva_familiar_id, tarifa_id, fecha)
-           VALUES (?, ?, ?)`,
-          [reservaFamiliar.reserva_familiar_id, tarifas[0].id, fechaString]
+      if (tarifas.length !== 1) {
+        throw crearErrorNegocio(
+          tarifas.length === 0
+            ? `No hay tarifa aplicable para la fecha ${fechaString}`
+            : `Hay mas de una tarifa aplicable para la fecha ${fechaString}`,
+          409,
+          tarifas.length === 0 ? "TARIFA_INCOMPLETA" : "TARIFA_AMBIGUA"
         );
       }
+      await connection.query(
+        `INSERT INTO reserva_familiar_tarifa
+          (reserva_familiar_id, tarifa_id, fecha)
+         VALUES (?, ?, ?)`,
+        [reservaFamiliar.reserva_familiar_id, tarifas[0].id, fechaString]
+      );
     }
   }
 }
@@ -6316,8 +6958,14 @@ async function obtenerDatosFamiliaUsuario(connection, usuarioId) {
     let currentUserId = usuarioCreador[0].id;
     let currentUserFamiliarId = usuarioCreador[0].usuario_familiar_id;
     let currentDepartamentalId = usuarioCreador[0].departamental_id;
+    const usuariosVisitados = new Set([Number(currentUserId)]);
 
     while (currentUserFamiliarId !== null) {
+      const siguienteId = Number(currentUserFamiliarId);
+      if (!Number.isInteger(siguienteId) || usuariosVisitados.has(siguienteId)) {
+        throw crearErrorNegocio("La jerarquia familiar contiene un ciclo o una referencia invalida", 409, "JERARQUIA_FAMILIAR_INVALIDA");
+      }
+      usuariosVisitados.add(siguienteId);
       const [nextUser] = await connection.query(
         "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
         [currentUserFamiliarId]
@@ -6457,13 +7105,15 @@ function validarBloqueInscripcionAbierta(bloque) {
     throw crearErrorNegocio("El sorteo no esta activo", 409);
   }
 
-  const hoy = new Date();
-  hoy.setHours(0, 0, 0, 0);
-  const fin = new Date(bloque.fecha_fin_inscripcion);
-  fin.setHours(0, 0, 0, 0);
+  const hoy = obtenerFechaCivilHoyArgentina();
+  const inicio = formatearFechaSQL(bloque.fecha_inicio_inscripcion);
+  const fin = formatearFechaSQL(bloque.fecha_fin_inscripcion);
 
-  if (hoy > fin) {
+  if (!inicio || !fin || inicio > fin || hoy < inicio || hoy > fin) {
     throw crearErrorNegocio("El periodo de inscripcion al sorteo no esta vigente", 409);
+  }
+  if (!validarRangoReservaTemporal(bloque.fecha_inicio, bloque.fecha_fin, { hoy }).valido) {
+    throw crearErrorNegocio("El bloque del sorteo ya no admite cotizaciones ni inscripciones", 409);
   }
 }
 
@@ -6497,15 +7147,22 @@ async function cotizarBloqueComun(connection, { bloque, regimenId, personas, adi
       regimenId,
       formatearFechaSQL(bloque.fecha_inicio),
       formatearFechaSQL(bloque.fecha_fin),
-      personas,
+      tarifaBase.personas,
       bloque.temporada_tarifa_id || null
     );
+    const totalCentavos = sumarCentavos(
+      decimalACentavos(tarifaBase.total),
+      decimalACentavos(adicionalesProcesados.total)
+    );
+    if (totalCentavos === null) {
+      throw crearErrorNegocio("El total calculado del bloque no es valido", 409, "TARIFA_INVALIDA");
+    }
 
     cotizaciones.push({
       recurso,
       tarifaBase,
       adicionalesProcesados,
-      total: tarifaBase.total + adicionalesProcesados.total
+      total: centavosANumero(totalCentavos)
     });
   }
 
@@ -6561,6 +7218,7 @@ async function obtenerBloquesActivosParaRecursos(connection, { recursoIds, fecha
           bf.id AS bloque_fecha_id,
           bf.sorteo_id,
           bf.servicio_id,
+          bf.temporada_tarifa_id,
           bf.nombre AS bloque_nombre,
           bf.modalidad,
           bf.fecha_inicio,
@@ -6644,6 +7302,7 @@ async function obtenerBloquesDisponiblesPorServicio(connection, { servicioIds = 
             OR (
               bf.modalidad = 'SORTEO'
               AND s.estado = 'ACTIVO'
+              AND s.fecha_inicio_inscripcion <= CURDATE()
               AND s.fecha_fin_inscripcion >= CURDATE()
             )
           )
@@ -6711,23 +7370,111 @@ function validarReglasCampingReserva(servicioId, recursoId, personas) {
   return null;
 }
 
-function obtenerNochesReserva(fechaInicio, fechaFin) {
-  const inicio = new Date(fechaInicio);
-  const fin = new Date(fechaFin);
-
-  if (Number.isNaN(inicio.getTime()) || Number.isNaN(fin.getTime()) || inicio >= fin) {
-    return [];
+async function bloquearYValidarDisponibilidadReserva(connection, {
+  servicioId,
+  recursoId,
+  fechaInicio,
+  fechaFin,
+  reservaIdExcluir = null,
+}) {
+  const servicioIdNormalizado = normalizarIdPositivo(servicioId);
+  const recursoIdNormalizado = normalizarIdPositivo(recursoId);
+  const inicio = formatearFechaSQL(fechaInicio);
+  const fin = formatearFechaSQL(fechaFin);
+  if (!servicioIdNormalizado || !recursoIdNormalizado || !inicio || !fin || diferenciaDiasCivil(inicio, fin) <= 0) {
+    throw crearErrorNegocio("Los datos de disponibilidad no son validos", 400);
   }
 
-  const noches = [];
-  const cursor = new Date(inicio);
-
-  while (cursor < fin) {
-    noches.push(cursor.toISOString().split("T")[0]);
-    cursor.setDate(cursor.getDate() + 1);
+  // La fila del recurso serializa altas y ediciones concurrentes, incluso cuando
+  // todavia no existe ninguna reserva que pueda bloquearse con FOR UPDATE.
+  const [recursos] = await connection.query(
+    "SELECT id FROM recurso WHERE id = ? AND servicio_id = ? FOR UPDATE",
+    [recursoIdNormalizado, servicioIdNormalizado]
+  );
+  if (recursos.length === 0) {
+    throw crearErrorNegocio("El recurso no pertenece al servicio indicado", 422);
   }
 
-  return noches;
+  if (esServicioCamping(servicioIdNormalizado)) {
+    return;
+  }
+
+  const params = [recursoIdNormalizado, fin, inicio];
+  let filtroReserva = "";
+  const reservaExcluirNormalizada = normalizarIdPositivo(reservaIdExcluir);
+  if (reservaExcluirNormalizada) {
+    filtroReserva = "AND r.id <> ?";
+    params.push(reservaExcluirNormalizada);
+  }
+
+  const [conflictos] = await connection.query(
+    `SELECT r.id
+     FROM reserva r
+     LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+     WHERE r.recurso_id = ?
+       AND r.fecha_inicio < ?
+       AND r.fecha_fin > ?
+       ${filtroReserva}
+       AND COALESCE(er.nombre, '') NOT IN ('Cancelada', 'Rechazada', 'No adjudicada')
+       AND COALESCE(r.estado_reserva_id, ?) <> ?
+     LIMIT 1
+     FOR UPDATE`,
+    [...params, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+  );
+  if (conflictos.length > 0) {
+    throw crearErrorNegocio(
+      "El recurso ya tiene una reserva para parte del rango seleccionado",
+      409,
+      "RECURSO_NO_DISPONIBLE"
+    );
+  }
+}
+
+async function reclamarRecursoBloque(connection, { bloqueFechaId, recursoId, reservaId }) {
+  const [resultado] = await connection.query(
+    `UPDATE bloque_fecha_recurso
+     SET estado = 'RESERVADO', reserva_id = ?
+     WHERE bloque_fecha_id = ?
+       AND recurso_id = ?
+       AND estado IN ('DISPONIBLE', 'VENTA_DIRECTA')
+       AND reserva_id IS NULL`,
+    [reservaId, bloqueFechaId, recursoId]
+  );
+  if (resultado.affectedRows !== 1) {
+    throw crearErrorNegocio("El recurso del bloque acaba de ser reservado por otra solicitud", 409, "BLOQUE_NO_DISPONIBLE");
+  }
+}
+
+async function liberarRecursoBloqueReserva(connection, reservaId) {
+  const [recursos] = await connection.query(
+    `SELECT bfr.bloque_fecha_id,
+            bfr.recurso_id,
+            bf.modalidad,
+            bf.estado AS bloque_estado,
+            s.estado AS sorteo_estado
+     FROM bloque_fecha_recurso bfr
+     INNER JOIN bloque_fecha bf ON bf.id = bfr.bloque_fecha_id
+     LEFT JOIN sorteo s ON s.id = bf.sorteo_id
+     WHERE bfr.reserva_id = ?
+     FOR UPDATE`,
+    [reservaId]
+  );
+
+  for (const recurso of recursos) {
+    const estado = obtenerEstadoRecursoTrasLiberacion({
+      modalidad: recurso.modalidad,
+      estadoBloque: recurso.bloque_estado,
+      estadoSorteo: recurso.sorteo_estado,
+    });
+    await connection.query(
+      `UPDATE bloque_fecha_recurso
+       SET estado = ?, reserva_id = NULL
+       WHERE bloque_fecha_id = ?
+         AND recurso_id = ?
+         AND reserva_id = ?`,
+      [estado, recurso.bloque_fecha_id, recurso.recurso_id, reservaId]
+    );
+  }
 }
 
 async function bloquearRecursoCamping(connection, recursoId) {
@@ -6886,7 +7633,11 @@ async function obtenerPrecioAdicional(db, cache, recursoId, regimenId, adicional
     return cache.get(cacheKey);
   }
 
-  const filtroTemporada = temporadaTarifaId ? "AND temporada_tarifa_id = ?" : "";
+  const filtroTemporada = temporadaTarifaId
+    ? "AND temporada_tarifa_id = ?"
+    : `AND (temporada_tarifa_id IS NULL OR temporada_tarifa_id IN (
+         SELECT id FROM temporada_tarifa WHERE COALESCE(origen, 'GENERAL') = 'GENERAL'
+       ))`;
   const [rows] = await db.query(
     `
       SELECT id as tarifa_adicional_id, precio
@@ -6899,12 +7650,14 @@ async function obtenerPrecioAdicional(db, cache, recursoId, regimenId, adicional
         AND activo = 1
         ${filtroTemporada}
       ORDER BY fecha_inicio DESC
-      LIMIT 1
     `,
     [recursoId, regimenId, adicionalId, fecha, fecha, ...(temporadaTarifaId ? [temporadaTarifaId] : [])]
   );
 
-  const resultado = rows.length > 0 ? { 
+  if (rows.length > 1) {
+    throw crearErrorNegocio(`Hay mas de una tarifa de adicional aplicable para la fecha ${fecha}`, 409, "TARIFA_AMBIGUA");
+  }
+  const resultado = rows.length > 0 ? {
     precio: Number(rows[0].precio), 
     tarifa_adicional_id: rows[0].tarifa_adicional_id 
   } : null;
@@ -6929,13 +7682,17 @@ async function obtenerNombreAdicional(connection, cache, adicionalId) {
 }
 
 async function obtenerMejorDescuentoDia(connection, recursoId, regimenId, personas, fecha, temporadaTarifaId = null) {
-  let maxDescuento = 0;
+  let maxDescuentoPuntosBase = 0;
   let tarifaIdMax = null;
 
   for (const persona of personas) {
     if (!persona.tipo_persona_id || persona.edad === undefined) continue;
 
-    const filtroTemporada = temporadaTarifaId ? "AND temporada_tarifa_id = ?" : "";
+    const filtroTemporada = temporadaTarifaId
+      ? "AND temporada_tarifa_id = ?"
+      : `AND (temporada_tarifa_id IS NULL OR temporada_tarifa_id IN (
+           SELECT id FROM temporada_tarifa WHERE COALESCE(origen, 'GENERAL') = 'GENERAL'
+         ))`;
     const [rows] = await connection.query(
       `SELECT id, usa_porcentaje, porcentaje_descuento
        FROM tarifa 
@@ -6947,8 +7704,7 @@ async function obtenerMejorDescuentoDia(connection, recursoId, regimenId, person
          AND fecha_inicio <= ?
          AND fecha_fin >= ?
          ${filtroTemporada}
-       ORDER BY fecha_inicio ASC
-       LIMIT 1`,
+       ORDER BY fecha_inicio ASC`,
       [
         recursoId,
         persona.tipo_persona_id,
@@ -6961,16 +7717,28 @@ async function obtenerMejorDescuentoDia(connection, recursoId, regimenId, person
       ]
     );
 
+    if (rows.length > 1) {
+      throw crearErrorNegocio(`Hay mas de una tarifa aplicable para la fecha ${fecha}`, 409, "TARIFA_AMBIGUA");
+    }
     if (rows.length > 0) {
       const tarifa = rows[0];
-      if (tarifa.usa_porcentaje === 1 && tarifa.porcentaje_descuento > maxDescuento) {
-        maxDescuento = tarifa.porcentaje_descuento;
+      const usaPorcentaje = tarifa.usa_porcentaje === 1 || tarifa.usa_porcentaje === true || tarifa.usa_porcentaje === "1";
+      const puntosBase = decimalAPuntosBase(tarifa.porcentaje_descuento ?? 0);
+      if (usaPorcentaje && puntosBase === null) {
+        throw crearErrorNegocio(`La tarifa de la fecha ${fecha} tiene un porcentaje invalido`, 409, "TARIFA_INVALIDA");
+      }
+      if (usaPorcentaje && puntosBase > maxDescuentoPuntosBase) {
+        maxDescuentoPuntosBase = puntosBase;
         tarifaIdMax = tarifa.id;
       }
     }
   }
   
-  return { porcentaje_descuento: maxDescuento, tarifa_id: tarifaIdMax };
+  return {
+    porcentaje_descuento: maxDescuentoPuntosBase / 100,
+    porcentaje_puntos_base: maxDescuentoPuntosBase,
+    tarifa_id: tarifaIdMax,
+  };
 }
 
 async function calcularAdicionalesReserva(connection, adicionales, recursoId, regimenId, fechaInicio, fechaFin, personas, temporadaTarifaId = null) {
@@ -6978,93 +7746,125 @@ async function calcularAdicionalesReserva(connection, adicionales, recursoId, re
     return { total: 0, items: [] };
   }
 
-  const fechaInicioDate = new Date(fechaInicio);
-  const fechaFinDate = new Date(fechaFin);
-  const diasTotales = Math.ceil((fechaFinDate - fechaInicioDate) / DIA_EN_MS);
-
-  if (diasTotales <= 0) {
-    return { total: 0, items: [] };
+  const fechaInicioNormalizada = formatearFechaSQL(fechaInicio);
+  const fechaFinNormalizada = formatearFechaSQL(fechaFin);
+  const noches = obtenerNochesReserva(fechaInicioNormalizada, fechaFinNormalizada);
+  if (noches.length === 0) {
+    throw crearErrorNegocio("El rango de fechas no es valido", 400);
   }
 
+  const personasNormalizadas = normalizarPersonasParaCotizacion(personas, regimenId, fechaInicioNormalizada);
   const cachePrecios = new Map();
   const cacheNombres = new Map();
-  const items = [];
-  let total = 0;
-
-  // Pre-calcular descuentos por día si hay personas
   const descuentosPorDia = new Map();
-  if (Array.isArray(personas) && personas.length > 0) {
-    for (let dia = 0; dia < diasTotales; dia++) {
-      const fechaActual = new Date(fechaInicioDate);
-      fechaActual.setDate(fechaInicioDate.getDate() + dia);
-      const fechaString = fechaActual.toISOString().split('T')[0];
-      
-      const descuento = await obtenerMejorDescuentoDia(connection, recursoId, regimenId, personas, fechaString, temporadaTarifaId);
-      descuentosPorDia.set(fechaString, descuento);
-    }
+  const items = [];
+  let totalCentavos = 0;
+
+  for (const noche of noches) {
+    descuentosPorDia.set(
+      noche,
+      await obtenerMejorDescuentoDia(
+        connection,
+        recursoId,
+        regimenId,
+        personasNormalizadas,
+        noche,
+        temporadaTarifaId
+      )
+    );
   }
 
-  for (const adicional of adicionales) {
-    if (!adicional) {
-      continue;
+  for (let indice = 0; indice < adicionales.length; indice++) {
+    const adicional = adicionales[indice];
+    const adicionalId = normalizarIdPositivo(adicional?.adicional_id ?? adicional?.adicionalId);
+    const cantidad = normalizarEnteroNoNegativoOpcional(adicional?.cantidad, 10_000);
+    if (!adicionalId || !cantidad) {
+      throw crearErrorNegocio(`adicionales[${indice}] debe tener id y cantidad entera positiva`, 400);
     }
 
-    const adicionalId = adicional.adicional_id || adicional.adicionalId;
-    const cantidad = Number(adicional.cantidad);
-
-    if (!adicionalId || !cantidad || cantidad <= 0) {
-      continue;
-    }
-
-    const nombreAdicional = await obtenerNombreAdicional(connection, cacheNombres, adicionalId);
     const detalles = [];
-    let subtotal = 0;
+    let subtotalCentavos = 0;
+    let subtotalOriginalCentavos = 0;
 
-    for (let dia = 0; dia < diasTotales; dia++) {
-      const fechaActual = new Date(fechaInicioDate);
-      fechaActual.setDate(fechaInicioDate.getDate() + dia);
-      const fechaString = fechaActual.toISOString().split('T')[0];
-
-      const resultadoAdicional = await obtenerPrecioAdicional(connection, cachePrecios, recursoId, regimenId, adicionalId, fechaString, temporadaTarifaId);
-
+    for (const noche of noches) {
+      const resultadoAdicional = await obtenerPrecioAdicional(
+        connection,
+        cachePrecios,
+        recursoId,
+        regimenId,
+        adicionalId,
+        noche,
+        temporadaTarifaId
+      );
       if (resultadoAdicional === null) {
-        throw new Error(`No hay una tarifa de adicional vigente para la fecha ${fechaString}`);
+        throw crearErrorNegocio(
+          `No hay una tarifa de adicional vigente para la fecha ${noche}`,
+          409,
+          "TARIFA_ADICIONAL_INCOMPLETA"
+        );
       }
 
-      let precioUnitario = resultadoAdicional.precio;
-      const descuentoInfo = descuentosPorDia.get(fechaString) || { porcentaje_descuento: 0, tarifa_id: null };
-
-      if (descuentoInfo.porcentaje_descuento > 0) {
-        precioUnitario = precioUnitario * (1 - descuentoInfo.porcentaje_descuento / 100);
+      const precioOriginalCentavos = decimalACentavos(resultadoAdicional.precio);
+      if (precioOriginalCentavos === null) {
+        throw crearErrorNegocio(
+          `La tarifa adicional de la fecha ${noche} tiene un importe invalido`,
+          409,
+          "TARIFA_ADICIONAL_INVALIDA"
+        );
       }
 
-      const subtotalDia = precioUnitario * cantidad;
-      subtotal += subtotalDia;
+      const descuentoInfo = descuentosPorDia.get(noche) || {
+        porcentaje_descuento: 0,
+        porcentaje_puntos_base: 0,
+        tarifa_id: null,
+      };
+      const precioUnitarioCentavos = aplicarDescuentoEnPuntosBase(
+        precioOriginalCentavos,
+        descuentoInfo.porcentaje_puntos_base || 0
+      );
+      const subtotalDiaCentavos = precioUnitarioCentavos * cantidad;
+      const subtotalOriginalDiaCentavos = precioOriginalCentavos * cantidad;
+      if (!Number.isSafeInteger(subtotalDiaCentavos) || !Number.isSafeInteger(subtotalOriginalDiaCentavos)) {
+        throw crearErrorNegocio("El subtotal del adicional excede el maximo permitido", 409, "TARIFA_ADICIONAL_INVALIDA");
+      }
+
+      subtotalCentavos = sumarCentavos(subtotalCentavos, subtotalDiaCentavos);
+      subtotalOriginalCentavos = sumarCentavos(subtotalOriginalCentavos, subtotalOriginalDiaCentavos);
+      if (subtotalCentavos === null || subtotalOriginalCentavos === null) {
+        throw crearErrorNegocio("El total del adicional excede el maximo permitido", 409, "TARIFA_ADICIONAL_INVALIDA");
+      }
+
       detalles.push({
-        fecha: fechaString,
+        fecha: noche,
         cantidad,
-        precio_unitario: precioUnitario,
-        subtotal: subtotalDia,
+        precio_unitario: centavosANumero(precioUnitarioCentavos),
+        precio_unitario_original: centavosANumero(precioOriginalCentavos),
+        subtotal: centavosANumero(subtotalDiaCentavos),
+        subtotal_original: centavosANumero(subtotalOriginalDiaCentavos),
         tarifa_adicional_id: resultadoAdicional.tarifa_adicional_id,
         porcentaje_descuento: descuentoInfo.porcentaje_descuento,
-        tarifa_id: descuentoInfo.tarifa_id
+        tarifa_id: descuentoInfo.tarifa_id,
       });
     }
 
     items.push({
       adicional_id: adicionalId,
-      nombre_adicional: nombreAdicional,
+      nombre_adicional: await obtenerNombreAdicional(connection, cacheNombres, adicionalId),
       cantidad,
       dias: detalles.length,
-      precio_referencia: detalles.length > 0 ? detalles[0].precio_unitario : 0,
-      subtotal,
-      detalles
+      precio_referencia: detalles[0]?.precio_unitario || 0,
+      subtotal: centavosANumero(subtotalCentavos),
+      subtotal_original: centavosANumero(subtotalOriginalCentavos),
+      detalles,
     });
 
-    total += subtotal;
+    totalCentavos = sumarCentavos(totalCentavos, subtotalCentavos);
+    if (totalCentavos === null) {
+      throw crearErrorNegocio("El total de adicionales excede el maximo permitido", 409, "TARIFA_ADICIONAL_INVALIDA");
+    }
   }
 
-  return { total, items };
+  return { total: centavosANumero(totalCentavos), items };
 }
 
 async function guardarAdicionalesReserva(connection, reservaId, adicionalesProcesados) {
@@ -7251,13 +8051,24 @@ router.post("/reserva", verifyToken, async (req, res) => {
 
       // Validar campos requeridos
       if (!nombre || !fecha_inicio || !fecha_fin || !servicio_id || !recurso_id ||
-        !regimen_id || !personas || personas.length === 0 || !total_tarifa) {
+        !regimen_id || !Array.isArray(personas) || personas.length === 0) {
         return res.status(400).json("Faltan campos requeridos");
       }
 
-      const totalTarifaBase = Number(total_tarifa);
-      if (Number.isNaN(totalTarifaBase)) {
-        return res.status(400).json("El total de la tarifa no es válido");
+      const servicioIdReserva = normalizarIdPositivo(servicio_id);
+      const recursoIdReserva = normalizarIdPositivo(recurso_id);
+      const regimenIdReserva = normalizarIdPositivo(regimen_id);
+      const fechaInicioReserva = formatearFechaSQL(fecha_inicio);
+      const fechaFinReserva = formatearFechaSQL(fecha_fin);
+      if (
+        !servicioIdReserva || !recursoIdReserva || !regimenIdReserva ||
+        !fechaInicioReserva || !fechaFinReserva ||
+        diferenciaDiasCivil(fechaInicioReserva, fechaFinReserva) <= 0
+      ) {
+        return res.status(400).json("Los identificadores o el rango de fechas no son válidos");
+      }
+      if (!validarRangoReservaTemporal(fechaInicioReserva, fechaFinReserva).valido) {
+        return res.status(422).json("La fecha de inicio no puede ser anterior a hoy");
       }
 
       const porSalud = normalizarPorSalud(req.body);
@@ -7272,6 +8083,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
       const bloqueFechaIdSolicitado = normalizarIdPositivo(bloque_fecha_id);
       let modalidadReserva = MODALIDAD_FECHA_LIBRE;
       let bloqueFechaIdReserva = null;
+      let temporadaTarifaIdReserva = null;
 
       let connection;
       try {
@@ -7281,12 +8093,12 @@ router.post("/reserva", verifyToken, async (req, res) => {
 
         try {
           const bloquesPorRecurso = await obtenerBloquesActivosParaRecursos(connection, {
-            recursoIds: [Number(recurso_id)],
-            fechaInicio: fecha_inicio,
-            fechaFin: fecha_fin
+            recursoIds: [recursoIdReserva],
+            fechaInicio: fechaInicioReserva,
+            fechaFin: fechaFinReserva
           });
-          const bloquesActivos = bloquesPorRecurso.get(Number(recurso_id)) || [];
-          const bloqueExacto = bloquesActivos.find((bloque) => rangoCoincideConBloque(fecha_inicio, fecha_fin, bloque));
+          const bloquesActivos = bloquesPorRecurso.get(recursoIdReserva) || [];
+          const bloqueExacto = bloquesActivos.find((bloque) => rangoCoincideConBloque(fechaInicioReserva, fechaFinReserva, bloque));
           const bloqueAplicable = bloqueExacto || bloquesActivos[0] || null;
 
           if (bloqueAplicable) {
@@ -7320,16 +8132,18 @@ router.post("/reserva", verifyToken, async (req, res) => {
 
               modalidadReserva = MODALIDAD_BLOQUE;
               bloqueFechaIdReserva = Number(bloqueExacto.bloque_fecha_id);
+              temporadaTarifaIdReserva = normalizarIdPositivo(bloqueExacto.temporada_tarifa_id);
             }
           } else if (modalidadSolicitada === MODALIDAD_BLOQUE && bloqueFechaIdSolicitado) {
             const bloque = await obtenerBloqueConRecursos(connection, bloqueFechaIdSolicitado, { forUpdate: true });
-            const recursoBloque = bloque.recursos.find((recurso) => Number(recurso.recurso_id) === Number(recurso_id));
-            if (!recursoBloque || !ESTADOS_RECURSO_BLOQUE_RESERVABLES.has(recursoBloque.estado) || !rangoCoincideConBloque(fecha_inicio, fecha_fin, bloque)) {
+            const recursoBloque = bloque.recursos.find((recurso) => Number(recurso.recurso_id) === recursoIdReserva);
+            if (!recursoBloque || !ESTADOS_RECURSO_BLOQUE_RESERVABLES.has(recursoBloque.estado) || !rangoCoincideConBloque(fechaInicioReserva, fechaFinReserva, bloque)) {
               await connection.rollback();
               return res.status(409).json("El bloque seleccionado no esta disponible para ese recurso y fechas");
             }
             modalidadReserva = MODALIDAD_BLOQUE;
             bloqueFechaIdReserva = bloque.id;
+            temporadaTarifaIdReserva = normalizarIdPositivo(bloque.temporada_tarifa_id);
           }
         } catch (bloqueError) {
           if (!esErrorTemporadaAltaNoMigrada(bloqueError)) {
@@ -7337,6 +8151,13 @@ router.post("/reserva", verifyToken, async (req, res) => {
             throw bloqueError;
           }
         }
+
+        await bloquearYValidarDisponibilidadReserva(connection, {
+          servicioId: servicioIdReserva,
+          recursoId: recursoIdReserva,
+          fechaInicio: fechaInicioReserva,
+          fechaFin: fechaFinReserva,
+        });
 
         // El rol admin puede crear la reserva en nombre de un afiliado. Para el
         // resto de los roles el titular siempre es el usuario autenticado, aunque
@@ -7378,6 +8199,43 @@ router.post("/reserva", verifyToken, async (req, res) => {
           usuarioReservaId
         );
 
+        const usuariosAutorizados = await crearOBuscarUsuariosReserva(connection, personas, {
+          usuarioFamiliarPrincipalId,
+          departamentalId,
+          usuarioModificadorId: cabecera.id,
+          req,
+          fechaIngreso: fechaInicioReserva,
+        });
+        const tarifaBaseCalculada = await calcularTarifaBaseReserva(connection, {
+          recursoId: recursoIdReserva,
+          regimenId: regimenIdReserva,
+          personas: usuariosAutorizados,
+          fechaInicio: fechaInicioReserva,
+          fechaFin: fechaFinReserva,
+          temporadaTarifaId: temporadaTarifaIdReserva,
+        });
+        const resultadoAdicionales = await calcularAdicionalesReserva(
+          connection,
+          Array.isArray(adicionales) ? adicionales : [],
+          recursoIdReserva,
+          regimenIdReserva,
+          fechaInicioReserva,
+          fechaFinReserva,
+          tarifaBaseCalculada.personas,
+          temporadaTarifaIdReserva
+        );
+        const precioTotalCentavos = sumarCentavos(
+          decimalACentavos(tarifaBaseCalculada.total),
+          decimalACentavos(resultadoAdicionales.total)
+        );
+        if (precioTotalCentavos === null) {
+          throw crearErrorNegocio("El total calculado de la reserva no es valido", 409, "TARIFA_INVALIDA");
+        }
+        const personasCalculadas = tarifaBaseCalculada.personas;
+        const montoAdicionales = resultadoAdicionales.total;
+        const adicionalesProcesados = resultadoAdicionales.items;
+        const precioTotalReserva = centavosANumero(precioTotalCentavos);
+
         // Procesar firma si existe
         let firmaArchivo = null;
         if (firma) {
@@ -7390,86 +8248,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
           firmaArchivo = firmaFileName;
         }
 
-        const adicionalesSeleccionados = Array.isArray(adicionales) ? adicionales : [];
-        let montoAdicionales = 0;
-        let adicionalesProcesados = [];
-
-        if (adicionalesSeleccionados.length > 0) {
-          try {
-            const resultadoAdicionales = await calcularAdicionalesReserva(
-              connection,
-              adicionalesSeleccionados,
-              recurso_id,
-              regimen_id,
-              fecha_inicio,
-              fecha_fin,
-              personas
-            );
-            montoAdicionales = resultadoAdicionales.total;
-            adicionalesProcesados = resultadoAdicionales.items;
-          } catch (adicionalError) {
-            await connection.rollback();
-            return res.status(400).json(adicionalError.message || "No se pudieron calcular los adicionales");
-          }
-        }
-
-        // Crear o buscar usuarios para cada persona
-        const usuariosIds = [];
-        for (const persona of personas) {
-          const [existeUsuario] = await connection.query(
-            "SELECT id FROM usuario WHERE documento = ?",
-            [persona.dni]
-          );
-
-          let usuarioId;
-          if (existeUsuario.length > 0) {
-            usuarioId = existeUsuario[0].id;
-          } else {
-            // Determinar el rol_id basado en tipo_persona_id
-            const rolId = persona.tipo_persona_id === 1 ? 2 : 4;
-
-            // Crear nuevo usuario con usuario_familiar_id y departamental_id establecidos
-            const [nuevoUsuario] = await connection.query(
-              `INSERT INTO usuario (
-              rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento,
-              documento, telefono, password, usuario_familiar_id, es_familiar, departamental_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
-              [
-                rolId,
-                persona.parentesco_id,
-                persona.tipo_persona_id,
-                persona.nombre,
-                persona.apellido,
-                persona.fecha_nacimiento,
-                persona.dni,
-                persona.telefono || null,
-                usuarioFamiliarPrincipalId,
-                esFamiliarPorParentesco(persona.parentesco_id),
-                departamentalId
-              ]
-            );
-            usuarioId = nuevoUsuario.insertId;
-
-            // Registrar creación del usuario en el historial
-            await registrarHistorial(
-              connection,
-              usuarioId,
-              'CREATE',
-              'usuario',
-              cabecera.id,
-              req,
-              null,
-              `Usuario creado durante reserva. Datos: ${persona.nombre} ${persona.apellido}, DNI: ${persona.dni}`
-            );
-          }
-          usuariosIds.push({
-            ...persona,
-            usuario_id: usuarioId
-          });
-        }
-
-        // Insertar reserva principal
-        const precioTotalReserva = totalTarifaBase + montoAdicionales;
+        const usuariosIds = personasCalculadas;
 
         const [reservaResult] = await connection.query(
           `INSERT INTO reserva (
@@ -7481,14 +8260,14 @@ router.post("/reserva", verifyToken, async (req, res) => {
             ESTADO_RESERVA_INICIADA_ID,
             modalidadReserva,
             bloqueFechaIdReserva,
-            servicio_id,
-            regimen_id,
-            recurso_id,
+            servicioIdReserva,
+            regimenIdReserva,
+            recursoIdReserva,
             usuarioReservaId,
             firmaArchivo,
             precioTotalReserva,
-            fecha_inicio,
-            fecha_fin,
+            fechaInicioReserva,
+            fechaFinReserva,
             observaciones || null,
             montoAdicionales
           ]
@@ -7498,12 +8277,11 @@ router.post("/reserva", verifyToken, async (req, res) => {
         let numeroParcelaAsignada = null;
 
         if (modalidadReserva === MODALIDAD_BLOQUE && bloqueFechaIdReserva) {
-          await connection.query(
-            `UPDATE bloque_fecha_recurso
-             SET estado = 'RESERVADO', reserva_id = ?
-             WHERE bloque_fecha_id = ? AND recurso_id = ?`,
-            [reservaId, bloqueFechaIdReserva, recurso_id]
-          );
+          await reclamarRecursoBloque(connection, {
+            bloqueFechaId: bloqueFechaIdReserva,
+            recursoId: recursoIdReserva,
+            reservaId,
+          });
         }
 
         if (adicionalesProcesados.length > 0) {
@@ -7533,55 +8311,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
           });
         }
 
-        // Calcular días del rango de fechas (NO incluir día de salida)
-        const fechaInicioDate = new Date(fecha_inicio);
-        const fechaFinDate = new Date(fecha_fin);
-        const diasTotales = Math.ceil((fechaFinDate - fechaInicioDate) / (1000 * 60 * 60 * 24));
-
-        // Insertar reserva_familiar_tarifa para cada día y cada persona
-        for (const reservaFamiliar of reservasFamiliaresIds) {
-          for (let dia = 0; dia < diasTotales; dia++) {
-            const fechaActual = new Date(fechaInicioDate);
-            fechaActual.setDate(fechaInicioDate.getDate() + dia);
-            const fechaString = fechaActual.toISOString().split('T')[0];
-
-            const [tarifas] = await connection.query(
-              `SELECT id
-               FROM tarifa 
-               WHERE recurso_id = ? 
-                 AND tipo_persona_id = ? 
-                 AND regimen_id = ?
-                 AND (edad_minima IS NULL OR edad_minima <= ?)
-                 AND (edad_maxima IS NULL OR edad_maxima >= ?)
-                 AND fecha_inicio <= ?
-                 AND fecha_fin >= ?
-               ORDER BY fecha_inicio ASC
-               LIMIT 1`,
-              [
-                recurso_id,
-                reservaFamiliar.tipo_persona_id,
-                regimen_id,
-                reservaFamiliar.edad,
-                reservaFamiliar.edad,
-                fechaString,
-                fechaString
-              ]
-            );
-
-            if (tarifas.length > 0) {
-              await connection.query(
-                `INSERT INTO reserva_familiar_tarifa (
-                  reserva_familiar_id, tarifa_id, fecha
-                ) VALUES (?, ?, ?)`,
-                [
-                  reservaFamiliar.reserva_familiar_id,
-                  tarifas[0].id,
-                  fechaString
-                ]
-              );
-            }
-          }
-        }
+        await insertarTarifasFamiliaresCalculadas(connection, reservasFamiliaresIds);
 
         // Viaje por motivos de salud: crea el trámite de subsidio para Servicios Sociales
         let reservaSaludId = null;
@@ -7598,9 +8328,9 @@ router.post("/reserva", verifyToken, async (req, res) => {
         // Confirmar transacción
         if (esReservaCamping) {
           numeroParcelaAsignada = await asignarNumeroParcelaCamping(connection, {
-            recursoId: recurso_id,
-            fechaInicio: fecha_inicio,
-            fechaFin: fecha_fin
+            recursoId: recursoIdReserva,
+            fechaInicio: fechaInicioReserva,
+            fechaFin: fechaFinReserva
           });
 
           await connection.query(
@@ -7617,9 +8347,11 @@ router.post("/reserva", verifyToken, async (req, res) => {
           id: reservaId,
           numero_reserva: numeroReserva,
           numero_parcela: numeroParcelaAsignada,
-          estado: "Confirmada",
+          estado: "Iniciada",
           mensaje: "Reserva creada exitosamente",
           fecha_creacion: new Date().toISOString(),
+          precio_total: precioTotalReserva,
+          total_tarifa: tarifaBaseCalculada.total,
           monto_adicionales: montoAdicionales,
           reserva_salud_id: reservaSaludId
         });
@@ -7667,6 +8399,11 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
     if (!hotelId || !fecha_inicio || !fecha_fin || !Array.isArray(personas) || personas.length === 0 || !firma) {
       return res.status(400).json("Faltan campos requeridos");
     }
+    const fechaInicioReserva = formatearFechaSQL(fecha_inicio);
+    const fechaFinReserva = formatearFechaSQL(fecha_fin);
+    if (!validarRangoReservaTemporal(fechaInicioReserva, fechaFinReserva).valido) {
+      return res.status(422).json("El rango debe ser válido y no puede comenzar antes de hoy");
+    }
 
     const porSalud = normalizarPorSalud(req.body);
 
@@ -7695,6 +8432,7 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
       departamentalId,
       usuarioModificadorId: cabecera.id,
       req,
+      fechaIngreso: fechaInicioReserva,
     });
 
     const estadoSolicitudConvenioId = await obtenerEstadoReservaId(
@@ -7729,8 +8467,8 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
         hotelId,
         cabecera.id,
         firmaFileName,
-        fecha_inicio,
-        fecha_fin,
+        fechaInicioReserva,
+        fechaFinReserva,
         observaciones || null,
       ]
     );
@@ -7812,7 +8550,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
       (cabecera.rol === "admin" || cabecera.rol === "departamental" || cabecera.rol === "afiliado") &&
       tieneAreaTurismo(cabecera)
     ) {
-      const reservaId = req.params.id;
+      const reservaId = normalizarIdPositivo(req.params.id);
       const {
         nombre,
         observaciones,
@@ -7824,32 +8562,33 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         personas,
         viaja_titular,
         firma_base64,
-        total_tarifa,
         adicionales
       } = req.body;
 
       // Validar campos requeridos
       if (!reservaId || !nombre || !fecha_inicio || !fecha_fin || !servicio_id ||
-        !recurso_id || !regimen_id || !personas || personas.length === 0) {
+        !recurso_id || !regimen_id || !Array.isArray(personas) || personas.length === 0) {
         return res.status(400).json({
           success: false,
           message: "Faltan campos requeridos"
         });
       }
 
-      let tarifaBaseDesdeRequest = null;
-      if (total_tarifa !== undefined) {
-        tarifaBaseDesdeRequest = Number(total_tarifa);
-        if (Number.isNaN(tarifaBaseDesdeRequest)) {
-          return res.status(400).json({
-            success: false,
-            message: "El total de la tarifa no es válido"
-          });
-        }
+      const servicioIdReserva = normalizarIdPositivo(servicio_id);
+      const recursoIdReserva = normalizarIdPositivo(recurso_id);
+      const regimenIdReserva = normalizarIdPositivo(regimen_id);
+      const fechaInicioReserva = formatearFechaSQL(fecha_inicio);
+      const fechaFinReserva = formatearFechaSQL(fecha_fin);
+      if (
+        !servicioIdReserva || !recursoIdReserva || !regimenIdReserva ||
+        !fechaInicioReserva || !fechaFinReserva ||
+        diferenciaDiasCivil(fechaInicioReserva, fechaFinReserva) <= 0
+      ) {
+        return res.status(400).json({ success: false, message: "Los identificadores o el rango de fechas no son válidos" });
       }
 
-      const esReservaCamping = esServicioCamping(servicio_id);
-      const errorReglasCamping = validarReglasCampingReserva(servicio_id, recurso_id, personas);
+      const esReservaCamping = esServicioCamping(servicioIdReserva);
+      const errorReglasCamping = validarReglasCampingReserva(servicioIdReserva, recursoIdReserva, personas);
       if (errorReglasCamping) {
         return res.status(422).json({
           success: false,
@@ -7858,6 +8597,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
       }
 
       let connection;
+      let archivoReservaActivo = false;
       try {
         // Iniciar transacción
         connection = await mysqlConnection.promise().getConnection();
@@ -7865,26 +8605,56 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
 
         // Verificar que la reserva existe
         const [reservaExistente] = await connection.query(
-          "SELECT * FROM reserva WHERE id = ?",
+          `SELECT r.*, er.nombre AS estado_nombre,
+                  u.departamental_id AS usuario_departamental_id
+           FROM reserva r
+           LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+           INNER JOIN usuario u ON u.id = r.usuario_id
+           WHERE r.id = ?
+           FOR UPDATE`,
           [reservaId]
         );
 
         if (reservaExistente.length === 0) {
-          return res.status(404).json({
-            success: false,
-            message: "Reserva no encontrada"
-          });
+          throw crearErrorNegocio("Reserva no encontrada", 404);
+        }
+
+        const reservaActual = reservaExistente[0];
+        if ([MODALIDAD_SORTEO, MODALIDAD_CONVENIO].includes(reservaActual.modalidad)) {
+          throw crearErrorNegocio("Esta modalidad no se puede editar desde la reserva general", 409);
+        }
+        if (esEstadoReservaTerminal(reservaActual.estado_nombre)) {
+          throw crearErrorNegocio("Una reserva en estado terminal no se puede editar", 409);
+        }
+        const validacionTemporalEdicion = validarRangoReservaTemporal(fechaInicioReserva, fechaFinReserva, {
+          rangoExistente: {
+            fecha_inicio: formatearFechaSQL(reservaActual.fecha_inicio),
+            fecha_fin: formatearFechaSQL(reservaActual.fecha_fin),
+          },
+        });
+        if (!validacionTemporalEdicion.valido) {
+          throw crearErrorNegocio(
+            "Una reserva histórica solo puede conservar exactamente su rango de fechas existente",
+            422,
+            "RANGO_HISTORICO_NO_EDITABLE"
+          );
         }
 
         // Si el rol es afiliado, verificar que la reserva le pertenezca
-        if (cabecera.rol === "afiliado" && reservaExistente[0].usuario_id !== cabecera.id) {
-          return res.status(403).json({
-            success: false,
-            message: "No tienes permisos para editar esta reserva"
-          });
+        if (cabecera.rol === "afiliado" && Number(reservaActual.usuario_id) !== Number(cabecera.id)) {
+          throw crearErrorNegocio("No tienes permisos para editar esta reserva", 403);
+        }
+        if (cabecera.rol === "departamental") {
+          const [editores] = await connection.query("SELECT departamental_id FROM usuario WHERE id = ? LIMIT 1", [cabecera.id]);
+          if (
+            editores.length === 0 ||
+            Number(editores[0].departamental_id) !== Number(reservaActual.usuario_departamental_id)
+          ) {
+            throw crearErrorNegocio("No tienes permisos para editar reservas de otra departamental", 403);
+          }
         }
 
-        const numeroParcelaAnteriorRaw = reservaExistente[0].numero_parcela;
+        const numeroParcelaAnteriorRaw = reservaActual.numero_parcela;
         let numeroParcelaReserva = numeroParcelaAnteriorRaw !== null && numeroParcelaAnteriorRaw !== undefined
           ? Number(numeroParcelaAnteriorRaw)
           : null;
@@ -7901,102 +8671,95 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           firmaArchivo = firmaFileName;
         }
 
-        // Obtener el usuario familiar principal del usuario que edita la reserva
-        const [usuarioCreador] = await connection.query(
-          "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
-          [cabecera.id]
+        let temporadaTarifaIdReserva = null;
+        if (reservaActual.modalidad === MODALIDAD_BLOQUE) {
+          const bloque = await obtenerBloqueConRecursos(connection, reservaActual.bloque_fecha_id, { forUpdate: true });
+          const recursoBloque = bloque.recursos.find((recurso) => Number(recurso.recurso_id) === recursoIdReserva);
+          if (
+            !recursoBloque || Number(recursoBloque.reserva_id) !== reservaId ||
+            !rangoCoincideConBloque(fechaInicioReserva, fechaFinReserva, bloque)
+          ) {
+            throw crearErrorNegocio("Una reserva de bloque debe conservar su bloque, recurso y rango completos", 409);
+          }
+          temporadaTarifaIdReserva = normalizarIdPositivo(bloque.temporada_tarifa_id);
+        } else {
+          const bloquesPorRecurso = await obtenerBloquesActivosParaRecursos(connection, {
+            recursoIds: [recursoIdReserva],
+            fechaInicio: fechaInicioReserva,
+            fechaFin: fechaFinReserva,
+          });
+          if ((bloquesPorRecurso.get(recursoIdReserva) || []).length > 0) {
+            throw crearErrorNegocio("El nuevo rango corresponde a un bloque y no puede editarse como fecha libre", 409);
+          }
+        }
+
+        await bloquearYValidarDisponibilidadReserva(connection, {
+          servicioId: servicioIdReserva,
+          recursoId: recursoIdReserva,
+          fechaInicio: fechaInicioReserva,
+          fechaFin: fechaFinReserva,
+          reservaIdExcluir: reservaId,
+        });
+
+        const { usuarioFamiliarPrincipalId, departamentalId } = await obtenerUsuarioPrincipalFamilia(
+          connection,
+          reservaActual.usuario_id
         );
-
-        let usuarioFamiliarPrincipalId = cabecera.id;
-        let departamentalId = usuarioCreador[0]?.departamental_id || null;
-
-        if (usuarioCreador.length > 0) {
-          let currentUserId = usuarioCreador[0].id;
-          let currentUserFamiliarId = usuarioCreador[0].usuario_familiar_id;
-          let currentDepartamentalId = usuarioCreador[0].departamental_id;
-
-          while (currentUserFamiliarId !== null) {
-            const [nextUser] = await connection.query(
-              "SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?",
-              [currentUserFamiliarId]
-            );
-
-            if (nextUser.length > 0) {
-              currentUserId = nextUser[0].id;
-              currentUserFamiliarId = nextUser[0].usuario_familiar_id;
-              currentDepartamentalId = nextUser[0].departamental_id;
-            } else {
-              break;
-            }
-          }
-
-          usuarioFamiliarPrincipalId = currentUserId;
-          // Usar el departamental_id del usuario principal de la familia
-          departamentalId = currentDepartamentalId;
+        const usuariosAutorizados = await crearOBuscarUsuariosReserva(connection, personas, {
+          usuarioFamiliarPrincipalId,
+          departamentalId,
+          usuarioModificadorId: cabecera.id,
+          req,
+          fechaIngreso: fechaInicioReserva,
+        });
+        const tarifaBaseCalculada = await calcularTarifaBaseReserva(connection, {
+          recursoId: recursoIdReserva,
+          regimenId: regimenIdReserva,
+          personas: usuariosAutorizados,
+          fechaInicio: fechaInicioReserva,
+          fechaFin: fechaFinReserva,
+          temporadaTarifaId: temporadaTarifaIdReserva,
+        });
+        const resultadoAdicionales = await calcularAdicionalesReserva(
+          connection,
+          Array.isArray(adicionales) ? adicionales : [],
+          recursoIdReserva,
+          regimenIdReserva,
+          fechaInicioReserva,
+          fechaFinReserva,
+          tarifaBaseCalculada.personas,
+          temporadaTarifaIdReserva
+        );
+        const precioTotalCentavos = sumarCentavos(
+          decimalACentavos(tarifaBaseCalculada.total),
+          decimalACentavos(resultadoAdicionales.total)
+        );
+        if (precioTotalCentavos === null) {
+          throw crearErrorNegocio("El total calculado de la reserva no es valido", 409, "TARIFA_INVALIDA");
         }
-
-        const adicionalesSeleccionados = Array.isArray(adicionales) ? adicionales : [];
-        let montoAdicionales = 0;
-        let adicionalesProcesados = [];
-
-        if (adicionalesSeleccionados.length > 0) {
-          try {
-            const resultadoAdicionales = await calcularAdicionalesReserva(
-              connection,
-              adicionalesSeleccionados,
-              recurso_id,
-              regimen_id,
-              fecha_inicio,
-              fecha_fin,
-              personas
-            );
-            montoAdicionales = resultadoAdicionales.total;
-            adicionalesProcesados = resultadoAdicionales.items;
-          } catch (adicionalError) {
-            await connection.rollback();
-            return res.status(400).json({
-              success: false,
-              message: adicionalError.message || "No se pudieron calcular los adicionales"
-            });
-          }
-        }
-
-        // Calcular tarifa total
-        let tarifaTotal = 0;
-        for (const persona of personas) {
-          if (persona.tarifa_individual) {
-            tarifaTotal += persona.tarifa_individual;
-          }
-        }
-
-        const tarifaBase = tarifaBaseDesdeRequest !== null ? tarifaBaseDesdeRequest : tarifaTotal;
-        const precioTotalReserva = tarifaBase + montoAdicionales;
+        const usuariosIds = tarifaBaseCalculada.personas;
+        const montoAdicionales = resultadoAdicionales.total;
+        const adicionalesProcesados = resultadoAdicionales.items;
+        const precioTotalReserva = centavosANumero(precioTotalCentavos);
 
         // Detectar cambios en la reserva
         const datosAnteriores = reservaExistente[0];
         const cambiosReserva = [];
 
-        // Función auxiliar para formatear fechas para comparación
-        const formatDate = (date) => {
-            if (!date) return null;
-            try {
-                const d = new Date(date);
-                if (isNaN(d.getTime())) return null;
-                return d.toISOString().split('T')[0];
-            } catch (e) { return null; }
-        };
-
-        if (datosAnteriores.regimen_id !== regimen_id) {
-            cambiosReserva.push({ campo: 'regimen_id', valorAnterior: datosAnteriores.regimen_id, valorNuevo: regimen_id });
+        if (Number(datosAnteriores.regimen_id) !== regimenIdReserva) {
+            cambiosReserva.push({ campo: 'regimen_id', valorAnterior: datosAnteriores.regimen_id, valorNuevo: regimenIdReserva });
         }
-        if (datosAnteriores.recurso_id !== recurso_id) {
-            cambiosReserva.push({ campo: 'recurso_id', valorAnterior: datosAnteriores.recurso_id, valorNuevo: recurso_id });
+        if (Number(datosAnteriores.servicio_id) !== servicioIdReserva) {
+            cambiosReserva.push({ campo: 'servicio_id', valorAnterior: datosAnteriores.servicio_id, valorNuevo: servicioIdReserva });
         }
-        if (formatDate(datosAnteriores.fecha_inicio) !== formatDate(fecha_inicio)) {
-            cambiosReserva.push({ campo: 'fecha_inicio', valorAnterior: formatDate(datosAnteriores.fecha_inicio), valorNuevo: formatDate(fecha_inicio) });
+        if (Number(datosAnteriores.recurso_id) !== recursoIdReserva) {
+            cambiosReserva.push({ campo: 'recurso_id', valorAnterior: datosAnteriores.recurso_id, valorNuevo: recursoIdReserva });
         }
-        if (formatDate(datosAnteriores.fecha_fin) !== formatDate(fecha_fin)) {
-            cambiosReserva.push({ campo: 'fecha_fin', valorAnterior: formatDate(datosAnteriores.fecha_fin), valorNuevo: formatDate(fecha_fin) });
+        if (formatearFechaSQL(datosAnteriores.fecha_inicio) !== fechaInicioReserva) {
+            cambiosReserva.push({ campo: 'fecha_inicio', valorAnterior: formatearFechaSQL(datosAnteriores.fecha_inicio), valorNuevo: fechaInicioReserva });
+        }
+        if (formatearFechaSQL(datosAnteriores.fecha_fin) !== fechaFinReserva) {
+            cambiosReserva.push({ campo: 'fecha_fin', valorAnterior: formatearFechaSQL(datosAnteriores.fecha_fin), valorNuevo: fechaFinReserva });
         }
         if (Number(datosAnteriores.precio_total) !== Number(precioTotalReserva)) {
             cambiosReserva.push({ campo: 'precio_total', valorAnterior: datosAnteriores.precio_total, valorNuevo: precioTotalReserva });
@@ -8015,6 +8778,14 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
              cambiosReserva.push({ campo: 'firma_archivo', valorAnterior: datosAnteriores.firma_archivo, valorNuevo: firmaArchivo });
         }
 
+        await archivarVersionReservaAntesDeReemplazo(
+          connection,
+          reservaId,
+          { id: cabecera.id, rol: cabecera.rol },
+          "EDICION"
+        );
+        archivoReservaActivo = true;
+
         if (cambiosReserva.length > 0) {
             await registrarHistorialReserva(connection, reservaId, 'UPDATE', cabecera.id, req, cambiosReserva, 'Modificación de reserva');
         }
@@ -8022,6 +8793,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         // Actualizar reserva principal
         const updateReservaQuery = `
           UPDATE reserva SET 
+            servicio_id = ?,
             regimen_id = ?, 
             recurso_id = ?, 
             ${firmaArchivo ? 'firma_archivo = ?,' : ''} 
@@ -8029,18 +8801,18 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
             fecha_inicio = ?, 
             fecha_fin = ?, 
             observaciones = ?,
-            monto_adicionales = ?,
-            estado_reserva_id = 1
+            monto_adicionales = ?
           WHERE id = ?
         `;
 
         const updateReservaParams = [
-          regimen_id,
-          recurso_id,
+          servicioIdReserva,
+          regimenIdReserva,
+          recursoIdReserva,
           ...(firmaArchivo ? [firmaArchivo] : []),
           precioTotalReserva,
-          fecha_inicio,
-          fecha_fin,
+          fechaInicioReserva,
+          fechaFinReserva,
           observaciones || null,
           montoAdicionales,
           reservaId
@@ -8064,216 +8836,6 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           [reservaId]
         );
 
-        // Crear o buscar usuarios para cada persona
-        const usuariosIds = [];
-        for (const persona of personas) {
-          let usuarioId;
-
-          // Si la persona tiene ID, verificar si existe
-          if (persona.id) {
-            const [usuarioExistente] = await connection.query(
-              "SELECT * FROM usuario WHERE id = ?",
-              [persona.id]
-            );
-
-            if (usuarioExistente.length > 0) {
-              usuarioId = persona.id;
-              const usuarioAnterior = usuarioExistente[0];
-
-              // Preparar campos para comparar cambios
-              const cambios = [];
-
-              if (usuarioAnterior.nombre !== persona.nombre) {
-                cambios.push({
-                  campo: 'nombre',
-                  valorAnterior: usuarioAnterior.nombre,
-                  valorNuevo: persona.nombre
-                });
-              }
-
-              if (usuarioAnterior.apellido !== persona.apellido) {
-                cambios.push({
-                  campo: 'apellido',
-                  valorAnterior: usuarioAnterior.apellido,
-                  valorNuevo: persona.apellido
-                });
-              }
-
-              if (usuarioAnterior.fecha_nacimiento !== persona.fecha_nacimiento) {
-                cambios.push({
-                  campo: 'fecha_nacimiento',
-                  valorAnterior: usuarioAnterior.fecha_nacimiento,
-                  valorNuevo: persona.fecha_nacimiento
-                });
-              }
-
-              if (usuarioAnterior.telefono !== (persona.telefono || null)) {
-                cambios.push({
-                  campo: 'telefono',
-                  valorAnterior: usuarioAnterior.telefono,
-                  valorNuevo: persona.telefono || null
-                });
-              }
-
-              if (usuarioAnterior.email !== (persona.email || null)) {
-                cambios.push({
-                  campo: 'email',
-                  valorAnterior: usuarioAnterior.email,
-                  valorNuevo: persona.email || null
-                });
-              }
-
-              if (usuarioAnterior.parentesco_id !== persona.parentesco_id) {
-                cambios.push({
-                  campo: 'parentesco_id',
-                  valorAnterior: usuarioAnterior.parentesco_id,
-                  valorNuevo: persona.parentesco_id
-                });
-              }
-
-              if (usuarioAnterior.tipo_persona_id !== persona.tipo_persona_id) {
-                cambios.push({
-                  campo: 'tipo_persona_id',
-                  valorAnterior: usuarioAnterior.tipo_persona_id,
-                  valorNuevo: persona.tipo_persona_id
-                });
-              }
-
-              // Actualizar datos del usuario existente
-              await connection.query(
-                `UPDATE usuario SET 
-                   nombre = ?, apellido = ?, fecha_nacimiento = ?, 
-                   telefono = ?, email = ?, parentesco_id = ?, tipo_persona_id = ?
-                 WHERE id = ?`,
-                [
-                  persona.nombre,
-                  persona.apellido,
-                  persona.fecha_nacimiento,
-                  persona.telefono || null,
-                  persona.email || null,
-                  persona.parentesco_id,
-                  persona.tipo_persona_id,
-                  persona.id
-                ]
-              );
-
-              // Registrar cambios en el historial si hubo modificaciones
-              if (cambios.length > 0) {
-                await registrarHistorial(
-                  connection,
-                  usuarioId,
-                  'UPDATE',
-                  'usuario',
-                  cabecera.id,
-                  req,
-                  cambios,
-                  `Usuario modificado durante edición de reserva ${reservaId}`
-                );
-              }
-            } else {
-              // El ID no existe, buscar por documento
-              const [existeUsuarioPorDni] = await connection.query(
-                "SELECT id FROM usuario WHERE documento = ?",
-                [persona.dni]
-              );
-
-              if (existeUsuarioPorDni.length > 0) {
-                usuarioId = existeUsuarioPorDni[0].id;
-              } else {
-                // Determinar el rol_id basado en tipo_persona_id
-                const rolId = persona.tipo_persona_id === 1 ? 2 : 4;
-
-                // Crear nuevo usuario con departamental_id
-                const [nuevoUsuario] = await connection.query(
-                  `INSERT INTO usuario (
-                  rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento,
-                  documento, telefono, email, password, usuario_familiar_id, es_familiar, departamental_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
-                  [
-                    rolId,
-                    persona.parentesco_id,
-                    persona.tipo_persona_id,
-                    persona.nombre,
-                    persona.apellido,
-                    persona.fecha_nacimiento,
-                    persona.dni,
-                    persona.telefono || null,
-                    persona.email || null,
-                    usuarioFamiliarPrincipalId,
-                    esFamiliarPorParentesco(persona.parentesco_id),
-                    departamentalId
-                  ]
-                );
-                usuarioId = nuevoUsuario.insertId;
-
-                // Registrar creación del usuario en el historial
-                await registrarHistorial(
-                  connection,
-                  usuarioId,
-                  'CREATE',
-                  'usuario',
-                  cabecera.id,
-                  req,
-                  null,
-                  `Usuario creado durante edición de reserva ${reservaId}. Datos: ${persona.nombre} ${persona.apellido}, DNI: ${persona.dni}`
-                );
-              }
-            }
-          } else {
-            // No tiene ID, verificar si existe por documento
-            const [existeUsuario] = await connection.query(
-              "SELECT id FROM usuario WHERE documento = ?",
-              [persona.dni]
-            );
-
-            if (existeUsuario.length > 0) {
-              usuarioId = existeUsuario[0].id;
-            } else {
-              // Determinar el rol_id basado en tipo_persona_id
-              const rolId = persona.tipo_persona_id === 1 ? 2 : 4;
-
-              // Crear nuevo usuario con departamental_id
-              const [nuevoUsuario] = await connection.query(
-                `INSERT INTO usuario (
-                rol_id, parentesco_id, tipo_persona_id, nombre, apellido, fecha_nacimiento,
-                documento, telefono, email, password, usuario_familiar_id, es_familiar, departamental_id
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
-                [
-                  rolId,
-                  persona.parentesco_id,
-                  persona.tipo_persona_id,
-                  persona.nombre,
-                  persona.apellido,
-                  persona.fecha_nacimiento,
-                  persona.dni,
-                  persona.telefono || null,
-                  persona.email || null,
-                  usuarioFamiliarPrincipalId,
-                  esFamiliarPorParentesco(persona.parentesco_id),
-                  departamentalId
-                ]
-              );
-              usuarioId = nuevoUsuario.insertId;
-
-              // Registrar creación del usuario en el historial
-              await registrarHistorial(
-                connection,
-                usuarioId,
-                'CREATE',
-                'usuario',
-                cabecera.id,
-                req,
-                null,
-                `Usuario creado durante edición de reserva ${reservaId}. Datos: ${persona.nombre} ${persona.apellido}, DNI: ${persona.dni}`
-              );
-            }
-          }
-
-          usuariosIds.push({
-            ...persona,
-            usuario_id: usuarioId
-          });
-        }
 
         // Insertar nuevos registros de reserva_familiar
         const reservasFamiliaresIds = [];
@@ -8288,7 +8850,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
               persona.tipo_persona_id,
               persona.parentesco_id,
               persona.edad,
-              persona.tarifa_individual || 0
+              persona.tarifa_individual
             ]
           );
 
@@ -8298,55 +8860,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           });
         }
 
-        // Calcular días del rango de fechas (NO incluir día de salida)
-        const fechaInicioDate = new Date(fecha_inicio);
-        const fechaFinDate = new Date(fecha_fin);
-        const diasTotales = Math.ceil((fechaFinDate - fechaInicioDate) / (1000 * 60 * 60 * 24));
-
-        // Insertar reserva_familiar_tarifa para cada día y cada persona
-        for (const reservaFamiliar of reservasFamiliaresIds) {
-          for (let dia = 0; dia < diasTotales; dia++) {
-            const fechaActual = new Date(fechaInicioDate);
-            fechaActual.setDate(fechaInicioDate.getDate() + dia);
-            const fechaString = fechaActual.toISOString().split('T')[0];
-
-            const [tarifas] = await connection.query(
-              `SELECT id
-               FROM tarifa 
-               WHERE recurso_id = ? 
-                 AND tipo_persona_id = ? 
-                 AND regimen_id = ?
-                 AND (edad_minima IS NULL OR edad_minima <= ?)
-                 AND (edad_maxima IS NULL OR edad_maxima >= ?)
-                 AND fecha_inicio <= ?
-                 AND fecha_fin >= ?
-               ORDER BY fecha_inicio ASC
-               LIMIT 1`,
-              [
-                recurso_id,
-                reservaFamiliar.tipo_persona_id,
-                regimen_id,
-                reservaFamiliar.edad,
-                reservaFamiliar.edad,
-                fechaString,
-                fechaString
-              ]
-            );
-
-            if (tarifas.length > 0) {
-              await connection.query(
-                `INSERT INTO reserva_familiar_tarifa (
-                  reserva_familiar_id, tarifa_id, fecha
-                ) VALUES (?, ?, ?)`,
-                [
-                  reservaFamiliar.reserva_familiar_id,
-                  tarifas[0].id,
-                  fechaString
-                ]
-              );
-            }
-          }
-        }
+        await insertarTarifasFamiliaresCalculadas(connection, reservasFamiliaresIds);
 
         if (adicionalesProcesados.length > 0) {
           await guardarAdicionalesReserva(connection, reservaId, adicionalesProcesados);
@@ -8357,16 +8871,16 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           if (Number.isInteger(numeroParcelaReserva) && numeroParcelaReserva > 0) {
             await validarNumeroParcelaCampingExistente(connection, {
               reservaId,
-              recursoId: recurso_id,
-              fechaInicio: fecha_inicio,
-              fechaFin: fecha_fin,
+              recursoId: recursoIdReserva,
+              fechaInicio: fechaInicioReserva,
+              fechaFin: fechaFinReserva,
               numeroParcela: numeroParcelaReserva
             });
           } else {
             numeroParcelaReserva = await asignarNumeroParcelaCamping(connection, {
-              recursoId: recurso_id,
-              fechaInicio: fecha_inicio,
-              fechaFin: fecha_fin,
+              recursoId: recursoIdReserva,
+              fechaInicio: fechaInicioReserva,
+              fechaFin: fechaFinReserva,
               reservaIdExcluir: reservaId
             });
 
@@ -8375,8 +8889,13 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
               [numeroParcelaReserva, reservaId]
             );
           }
+        } else if (numeroParcelaReserva !== null) {
+          numeroParcelaReserva = null;
+          await connection.query("UPDATE reserva SET numero_parcela = NULL WHERE id = ?", [reservaId]);
         }
 
+        await cerrarGuardiaArchivoReserva(connection, reservaId);
+        archivoReservaActivo = false;
         await connection.commit();
 
         const numeroReserva = `RES-${reservaId.toString().padStart(6, '0')}`;
@@ -8387,12 +8906,21 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           numero_reserva: numeroReserva,
           numero_parcela: numeroParcelaReserva,
           id: parseInt(reservaId),
+          precio_total: precioTotalReserva,
+          total_tarifa: tarifaBaseCalculada.total,
           monto_adicionales: montoAdicionales
         });
 
       } catch (transactionError) {
         if (connection) {
           await connection.rollback();
+          if (archivoReservaActivo) {
+            try {
+              await limpiarTokenGuardiaArchivoReserva(connection);
+            } catch (_) {
+              // La guardia de tabla y el archivo ya fueron revertidos con la transacción.
+            }
+          }
         }
         throw transactionError;
       } finally {
@@ -8431,7 +8959,7 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
         cabecera.rol === "departamental") &&
       tieneAreaTurismo(cabecera)
     ) {
-      const reservaId = req.params.id;
+      const reservaId = normalizarIdPositivo(req.params.id);
 
       if (!reservaId) {
         return res.status(400).json("ID de reserva requerido");
@@ -9117,6 +9645,7 @@ router.post("/reserva/:id/observaciones", verifyToken, async (req, res) => {
 
 router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
   let connection;
+  let archivoReservaActivo = false;
   try {
     const cabecera = JSON.parse(req.data.data);
     if (!["admin", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
@@ -9153,12 +9682,17 @@ router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
 
     for (const item of costos) {
       const reservaFamiliarId = normalizarIdPositivo(item.reserva_familiar_id || item.id);
-      const precio = normalizarImporte(item.precio);
-      if (!reservaFamiliarId || !idsFamiliares.includes(reservaFamiliarId) || precio === null) {
+      const precioCentavos = decimalACentavos(item.precio);
+      if (
+        !reservaFamiliarId ||
+        !idsFamiliares.includes(reservaFamiliarId) ||
+        precioCentavos === null ||
+        costosPorFamiliar.has(reservaFamiliarId)
+      ) {
         await connection.rollback();
         return res.status(400).json("Los costos enviados no son validos");
       }
-      costosPorFamiliar.set(reservaFamiliarId, precio);
+      costosPorFamiliar.set(reservaFamiliarId, precioCentavos);
     }
 
     if (costosPorFamiliar.size !== idsFamiliares.length) {
@@ -9166,15 +9700,27 @@ router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
       return res.status(400).json("Debe cargar un costo para cada persona de la reserva");
     }
 
-    let precioTotal = 0;
+    await archivarVersionReservaAntesDeReemplazo(
+      connection,
+      reservaId,
+      { id: cabecera.id, rol: cabecera.rol },
+      "EDICION"
+    );
+    archivoReservaActivo = true;
+
+    let precioTotalCentavos = 0;
     for (const familiarId of idsFamiliares) {
-      const precio = costosPorFamiliar.get(familiarId);
-      precioTotal += precio;
+      const precioCentavos = costosPorFamiliar.get(familiarId);
+      precioTotalCentavos = sumarCentavos(precioTotalCentavos, precioCentavos);
+      if (precioTotalCentavos === null) {
+        throw crearErrorNegocio("El total de la propuesta excede el máximo permitido", 422);
+      }
       await connection.query(
         "UPDATE reserva_familiar SET precio = ? WHERE id = ? AND reserva_id = ?",
-        [precio, familiarId, reservaId]
+        [centavosANumero(precioCentavos), familiarId, reservaId]
       );
     }
+    const precioTotal = centavosANumero(precioTotalCentavos);
 
     const estadoPropuestaId = await obtenerEstadoReservaId(
       connection,
@@ -9219,14 +9765,14 @@ router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
 
     await connection.query(
       "UPDATE reserva SET precio_total = ?, estado_reserva_id = ? WHERE id = ?",
-      [Number(precioTotal.toFixed(2)), estadoPropuestaId, reservaId]
+      [precioTotal, estadoPropuestaId, reservaId]
     );
 
     const payload = {
       reserva_id: reservaId,
       hotel_id: reserva.convenio_hotel_id,
       hotel_nombre: reserva.convenio_nombre,
-      total: Number(precioTotal.toFixed(2)),
+      total: precioTotal,
     };
     await connection.query(
       `
@@ -9249,26 +9795,38 @@ router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
       cabecera.id,
       req,
       [
-        { campo: "precio_total", valorAnterior: reserva.precio_total, valorNuevo: Number(precioTotal.toFixed(2)) },
+        { campo: "precio_total", valorAnterior: reserva.precio_total, valorNuevo: precioTotal },
         { campo: "estado_reserva_id", valorAnterior: reserva.estado_reserva_id, valorNuevo: estadoPropuestaId },
         { campo: "reserva_convenio_propuesta.mensaje", valorAnterior: null, valorNuevo: mensaje },
       ],
       "Propuesta de convenio hotelero cargada"
     );
 
+    await cerrarGuardiaArchivoReserva(connection, reservaId);
+    archivoReservaActivo = false;
     await connection.commit();
 
     res.status(200).json({
       message: "Propuesta enviada",
       reserva_id: reservaId,
-      precio_total: Number(precioTotal.toFixed(2)),
+      precio_total: precioTotal,
       respuesta: "PENDIENTE",
     });
   } catch (error) {
     if (connection) {
       await connection.rollback();
+      if (archivoReservaActivo) {
+        try {
+          await limpiarTokenGuardiaArchivoReserva(connection);
+        } catch (_) {
+          // La transacción ya revirtió el archivo y su guardia.
+        }
+      }
     }
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+    }
     res.status(500).json("Error al enviar la propuesta de convenio");
   } finally {
     if (connection) {
@@ -9395,8 +9953,8 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
         cabecera.rol === "afiliado") &&
       tieneAreaTurismo(cabecera)
     ) {
-      const reservaId = req.params.id;
-      const { estado, observaciones, usuario_admin_id } = req.body;
+      const reservaId = normalizarIdPositivo(req.params.id);
+      const { estado, observaciones } = req.body;
 
       // Validar campos requeridos
       if (!reservaId || !estado) {
@@ -9415,6 +9973,16 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
         });
       }
 
+      if (observaciones !== undefined && observaciones !== null && typeof observaciones !== "string") {
+        return res.status(400).json({ success: false, message: "Las observaciones deben ser texto" });
+      }
+      const observacionesNormalizadas = typeof observaciones === "string" && observaciones.trim()
+        ? observaciones.trim()
+        : null;
+      if (observacionesNormalizadas && Buffer.byteLength(observacionesNormalizadas, "utf8") > 65535) {
+        return res.status(400).json({ success: false, message: "Las observaciones son demasiado extensas" });
+      }
+
       let connection;
       try {
         // Iniciar transacción
@@ -9423,26 +9991,53 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
 
         // Verificar que la reserva existe
         const [reservaExistente] = await connection.query(
-          "SELECT * FROM reserva WHERE id = ?",
+          `SELECT r.*, er.nombre AS estado_nombre,
+                  u.departamental_id AS usuario_departamental_id
+           FROM reserva r
+           LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+           INNER JOIN usuario u ON u.id = r.usuario_id
+           WHERE r.id = ?
+           FOR UPDATE`,
           [reservaId]
         );
 
         if (reservaExistente.length === 0) {
-          return res.status(404).json({
-            success: false,
-            message: "Reserva no encontrada"
-          });
+          throw crearErrorNegocio("Reserva no encontrada", 404);
+        }
+
+        const reservaActual = reservaExistente[0];
+        if (cabecera.rol === "afiliado") {
+          if (Number(reservaActual.usuario_id) !== Number(cabecera.id) || estado !== "Cancelada") {
+            throw crearErrorNegocio("Solo puedes cancelar una reserva propia", 403);
+          }
+        }
+        if (cabecera.rol === "departamental") {
+          const [editores] = await connection.query("SELECT departamental_id FROM usuario WHERE id = ? LIMIT 1", [cabecera.id]);
+          const departamentalEditorId = normalizarIdPositivo(editores[0]?.departamental_id);
+          const departamentalReservaId = normalizarIdPositivo(reservaActual.usuario_departamental_id);
+          if (!departamentalEditorId || !departamentalReservaId || departamentalEditorId !== departamentalReservaId) {
+            throw crearErrorNegocio("No puedes gestionar reservas de otra departamental", 403);
+          }
+        }
+        if (esEstadoReservaTerminal(reservaActual.estado_nombre)) {
+          throw crearErrorNegocio("La reserva ya se encuentra en un estado terminal", 409);
         }
 
         // Mapear estado a ID numérico
         let estadoId;
         let estadoNombre;
         if (estado === "Verificada") {
-          estadoId = 2;
+          estadoId = await obtenerEstadoReservaId(connection, "Verificada", 2);
           estadoNombre = "Verificada";
         } else if (estado === "Cancelada") {
-          estadoId = 4; // Usando "Rechazada" como equivalente a "Cancelada"
-          estadoNombre = "Rechazada";
+          const [estadoCancelacion] = await connection.query(
+            "SELECT id, nombre FROM estado_reserva WHERE nombre IN ('Cancelada', 'Rechazada') ORDER BY nombre = 'Cancelada' DESC LIMIT 1"
+          );
+          if (estadoCancelacion.length === 0) {
+            throw crearErrorNegocio("No existe un estado de cancelacion configurado", 409);
+          }
+          estadoId = Number(estadoCancelacion[0].id);
+          estadoNombre = estadoCancelacion[0].nombre;
         }
 
         // Detectar cambios
@@ -9454,7 +10049,7 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
         }
         
         const obsAnt = datosAnteriores.observaciones || '';
-        const obsNew = observaciones || '';
+        const obsNew = observacionesNormalizadas || '';
         if (obsAnt !== obsNew) {
             cambiosReserva.push({ campo: 'observaciones', valorAnterior: obsAnt, valorNuevo: obsNew });
         }
@@ -9470,14 +10065,21 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
             observaciones = ?,
             fecha_modificacion = NOW()
           WHERE id = ?`,
-          [estadoId, observaciones || null, reservaId]
+          [estadoId, observacionesNormalizadas, reservaId]
         );
 
         if (updateResult.affectedRows === 0) {
-          return res.status(500).json({
-            success: false,
-            message: "No se pudo actualizar la reserva"
-          });
+          throw crearErrorNegocio("No se pudo actualizar la reserva", 409);
+        }
+
+        if (estado === "Cancelada") {
+          await liberarRecursoBloqueReserva(connection, reservaId);
+          await connection.query(
+            `UPDATE sorteo_adjudicacion_respuesta
+             SET estado = 'RECHAZADA', fecha_respuesta = COALESCE(fecha_respuesta, NOW())
+             WHERE reserva_id = ? AND estado = 'PENDIENTE'`,
+            [reservaId]
+          );
         }
 
         // Insertar registro de auditoría si se proporciona usuario_admin_id
@@ -9527,6 +10129,9 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
     }
   } catch (error) {
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ success: false, message: error.message });
+    }
     res.status(500).json({
       success: false,
       message: "Error interno del servidor al actualizar el estado de la reserva"
@@ -9540,16 +10145,22 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
     if (
       cabecera.rol === "admin" ||
       cabecera.rol === "afiliado" ||
-      cabecera.rol === "departamental"
+      (cabecera.rol === "departamental" && tieneAreaTurismo(cabecera))
     ) {
-      const usuario_id = req.query.usuario_id;
-      const specific_id = req.params.id; // ID específico opcional
+      const db = mysqlConnection.promise();
+      const usuario_id = normalizarIdPositivo(req.query.usuario_id);
+      const specific_id = normalizarIdPositivo(req.params.id); // ID específico opcional
+
+      if (req.params.id !== undefined && specific_id === null) {
+        return res.status(400).json("ID de acompañante inválido");
+      }
 
       // Si viene un ID específico, devolver directamente ese usuario
       if (specific_id) {
-        const [usuario] = await mysqlConnection
-          .promise()
-          .query(
+        if (!(await puedeAccederUsuarioRelacionado(db, cabecera, specific_id))) {
+          return res.status(403).json("No autorizado para consultar esta persona");
+        }
+        const [usuario] = await db.query(
             `SELECT 
               u.id,
               u.nombre,
@@ -9562,7 +10173,7 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
               TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) as edad
             FROM usuario u
             WHERE u.id = ?`,
-            [parseInt(specific_id)]
+            [specific_id]
           );
 
         if (usuario.length === 0) {
@@ -9573,12 +10184,18 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
       }
 
       // Lógica original cuando no viene ID específico
-      const adultos = parseInt(req.query.adultos) || null;
-      const ninos = parseInt(req.query.ninos) || null;
-      const bebes = parseInt(req.query.bebes) || null;
+      const adultos = normalizarEnteroNoNegativoOpcional(req.query.adultos, 100);
+      const ninos = normalizarEnteroNoNegativoOpcional(req.query.ninos, 100);
+      const bebes = normalizarEnteroNoNegativoOpcional(req.query.bebes, 100);
+      if ([adultos, ninos, bebes].some((cantidad) => cantidad === undefined)) {
+        return res.status(400).json("Las cantidades de personas son inválidas");
+      }
 
       if (!usuario_id) {
         return res.status(400).json("Falta el parámetro 'usuario_id'");
+      }
+      if (!(await puedeAccederUsuarioRelacionado(db, cabecera, usuario_id))) {
+        return res.status(403).json("No autorizado para consultar este grupo familiar");
       }
 
       // Construir filtros de edad basados en fecha de nacimiento
@@ -9715,10 +10332,10 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
     if (
       cabecera.rol === "admin" ||
       cabecera.rol === "afiliado" ||
-      cabecera.rol === "departamental"
+      (cabecera.rol === "departamental" && tieneAreaTurismo(cabecera))
     ) {
       const { usuarioId, personas } = req.body;
-      const specific_id = req.params.id;
+      const specific_id = normalizarIdPositivo(req.params.id);
 
       // Si viene un ID específico, actualizar directamente ese usuario
       if (specific_id) {
@@ -9742,16 +10359,12 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
           });
         }
 
-        const formatearFecha = (fecha) => {
-          if (!fecha) return null;
-          try {
-            const fechaObj = new Date(fecha);
-            if (isNaN(fechaObj.getTime())) return null;
-            return fechaObj.toISOString().split('T')[0];
-          } catch (error) {
-            return null;
-          }
-        };
+        let fechaFormateada = formatearFechaSQL(persona.fecha_nacimiento);
+        let tipoPersonaId = normalizarIdPositivo(persona.tipo_persona_id);
+        let parentescoId = persona.parentesco_id ? normalizarIdPositivo(persona.parentesco_id) : null;
+        if (!fechaFormateada || !tipoPersonaId || (persona.parentesco_id && !parentescoId)) {
+          return res.status(400).json({ success: false, message: "Fecha, parentesco o tipo de persona no válido" });
+        }
 
         let connection;
         try {
@@ -9760,18 +10373,23 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
 
           // Obtener datos anteriores del usuario para el historial
           const [usuarioAnterior] = await connection.query(
-            "SELECT * FROM usuario WHERE id = ?",
-            [parseInt(specific_id)]
+            "SELECT * FROM usuario WHERE id = ? FOR UPDATE",
+            [specific_id]
           );
 
           if (usuarioAnterior.length === 0) {
-            return res.status(404).json({
-              success: false,
-              message: "Usuario no encontrado"
-            });
+            throw crearErrorNegocio("Usuario no encontrado", 404);
+          }
+          if (!(await puedeAccederUsuarioRelacionado(connection, cabecera, specific_id))) {
+            throw crearErrorNegocio("No tienes permisos para modificar esta persona", 403);
           }
 
           const datosAnteriores = usuarioAnterior[0];
+          if (cabecera.rol === "afiliado") {
+            fechaFormateada = formatearFechaSQL(datosAnteriores.fecha_nacimiento);
+            tipoPersonaId = normalizarIdPositivo(datosAnteriores.tipo_persona_id);
+            parentescoId = normalizarIdPositivo(datosAnteriores.parentesco_id);
+          }
 
           // Preparar campos para comparar cambios
           const cambios = [];
@@ -9792,7 +10410,6 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
             });
           }
 
-          const fechaFormateada = formatearFecha(persona.fecha_nacimiento);
           if (datosAnteriores.fecha_nacimiento !== fechaFormateada) {
             cambios.push({
               campo: 'fecha_nacimiento',
@@ -9809,19 +10426,19 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
             });
           }
 
-          if (datosAnteriores.parentesco_id !== (persona.parentesco_id || null)) {
+          if (Number(datosAnteriores.parentesco_id || 0) !== Number(parentescoId || 0)) {
             cambios.push({
               campo: 'parentesco_id',
               valorAnterior: datosAnteriores.parentesco_id,
-              valorNuevo: persona.parentesco_id || null
+              valorNuevo: parentescoId
             });
           }
 
-          if (datosAnteriores.tipo_persona_id !== (persona.tipo_persona_id || null)) {
+          if (Number(datosAnteriores.tipo_persona_id) !== tipoPersonaId) {
             cambios.push({
               campo: 'tipo_persona_id',
               valorAnterior: datosAnteriores.tipo_persona_id,
-              valorNuevo: persona.tipo_persona_id || null
+              valorNuevo: tipoPersonaId
             });
           }
 
@@ -9840,12 +10457,12 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
             persona.apellido,
             fechaFormateada,
             persona.telefono || null,
-            persona.parentesco_id || null,
-            persona.tipo_persona_id || null
+            parentescoId,
+            tipoPersonaId
           ];
 
           // Si viene password, hashearlo y agregarlo a la actualización
-          if (persona.password) {
+          if (persona.password && (cabecera.rol === "admin" || Number(cabecera.id) === specific_id)) {
             let passwordHash = await bcryptjs.hash(persona.password, 8);
             updateFields.push("password = ?");
             updateValues.push(passwordHash);
@@ -9857,7 +10474,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
             });
           }
 
-          updateValues.push(parseInt(specific_id));
+          updateValues.push(specific_id);
           const updateQuery = `UPDATE usuario SET ${updateFields.join(', ')} WHERE id = ?`;
 
           const [result] = await connection.query(updateQuery, updateValues);
@@ -9866,7 +10483,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
           if (cambios.length > 0) {
             await registrarHistorial(
               connection,
-              parseInt(specific_id),
+              specific_id,
               'UPDATE',
               'usuario',
               cabecera.id,
@@ -9903,7 +10520,11 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
         });
       }
 
-      if (cabecera.id !== usuarioId && cabecera.rol !== "admin") {
+      const usuarioObjetivoId = normalizarIdPositivo(usuarioId);
+      if (!usuarioObjetivoId) {
+        return res.status(400).json({ success: false, message: "El usuario indicado no es válido" });
+      }
+      if (cabecera.rol === "afiliado" && Number(cabecera.id) !== usuarioObjetivoId) {
         return res.status(403).json({
           success: false,
           message: "No tienes permisos para modificar los datos de este usuario"
@@ -9914,6 +10535,9 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
       try {
         connection = await mysqlConnection.promise().getConnection();
         await connection.beginTransaction();
+        if (!(await puedeAccederUsuarioRelacionado(connection, cabecera, usuarioObjetivoId))) {
+          throw crearErrorNegocio("No tienes permisos para modificar este grupo familiar", 403);
+        }
 
         let usuariosModificados = 0;
         const errores = [];
@@ -9939,16 +10563,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
             const usuario = usuarioExistente[0];
 
             // Verificar permisos
-            let tienePermisos = false;
-            if (usuario.usuario_familiar_id === cabecera.id) {
-              tienePermisos = true;
-            } else if (usuario.id === cabecera.id) {
-              tienePermisos = true;
-            }
-
-            if (cabecera.rol === "admin") {
-              tienePermisos = true;
-            }
+            const tienePermisos = await puedeAccederUsuarioRelacionado(connection, cabecera, usuario.id);
 
             if (!tienePermisos) {
               errores.push(`Persona ${persona.nombre} ${persona.apellido}: No tienes permisos para modificar este usuario`);
@@ -9956,11 +10571,19 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
             }
 
             // Función auxiliar para normalizar fechas
-            const normalizarFecha = (fecha) => {
-              if (!fecha) return null;
-              if (fecha instanceof Date) return fecha.toISOString().split('T')[0];
-              return fecha;
-            };
+            const normalizarFecha = (fecha) => formatearFechaSQL(fecha);
+            let fechaNacimiento = normalizarFecha(persona.fechaNacimiento);
+            let parentescoId = persona.parentescoId ? normalizarIdPositivo(persona.parentescoId) : null;
+            let tipoPersonaId = normalizarIdPositivo(persona.tipoPersonaId);
+            if (!fechaNacimiento || !tipoPersonaId || (persona.parentescoId && !parentescoId)) {
+              errores.push(`Persona ${persona.nombre} ${persona.apellido}: fecha, parentesco o tipo inválido`);
+              continue;
+            }
+            if (cabecera.rol === "afiliado") {
+              fechaNacimiento = normalizarFecha(usuario.fecha_nacimiento);
+              parentescoId = normalizarIdPositivo(usuario.parentesco_id);
+              tipoPersonaId = normalizarIdPositivo(usuario.tipo_persona_id);
+            }
 
             // Función auxiliar para normalizar teléfonos
             const normalizarTelefono = (telefono) => {
@@ -9986,11 +10609,11 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
               });
             }
 
-            if (normalizarFecha(usuario.fecha_nacimiento) !== normalizarFecha(persona.fechaNacimiento)) {
+            if (normalizarFecha(usuario.fecha_nacimiento) !== fechaNacimiento) {
               cambios.push({
                 campo: 'fecha_nacimiento',
                 valorAnterior: normalizarFecha(usuario.fecha_nacimiento),
-                valorNuevo: normalizarFecha(persona.fechaNacimiento)
+                valorNuevo: fechaNacimiento
               });
             }
 
@@ -10002,19 +10625,19 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
               });
             }
 
-            if (usuario.parentesco_id !== persona.parentescoId) {
+            if (Number(usuario.parentesco_id || 0) !== Number(parentescoId || 0)) {
               cambios.push({
                 campo: 'parentesco_id',
                 valorAnterior: usuario.parentesco_id,
-                valorNuevo: persona.parentescoId
+                valorNuevo: parentescoId
               });
             }
 
-            if (usuario.tipo_persona_id !== persona.tipoPersonaId) {
+            if (Number(usuario.tipo_persona_id) !== tipoPersonaId) {
               cambios.push({
                 campo: 'tipo_persona_id',
                 valorAnterior: usuario.tipo_persona_id,
-                valorNuevo: persona.tipoPersonaId
+                valorNuevo: tipoPersonaId
               });
             }
 
@@ -10033,10 +10656,10 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
                 [
                   persona.nombre,
                   persona.apellido,
-                  persona.fechaNacimiento || null,
+                  fechaNacimiento,
                   persona.telefono || null,
-                  persona.parentescoId,
-                  persona.tipoPersonaId,
+                  parentescoId,
+                  tipoPersonaId,
                   usuario.id
                 ]
               );
@@ -10103,6 +10726,9 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
     }
   } catch (error) {
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ success: false, message: error.message });
+    }
     res.status(500).json({
       success: false,
       message: "Error interno del servidor"
@@ -10225,9 +10851,9 @@ router.post("/tabla/departamentales", verifyToken, async (req, res) => {
     }
 
     let buscar = req.query.search;
-    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
-    const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 10));
-    const start = (page - 1) * resultsPerPage;
+    const paginacion = normalizarPaginacion(req.query, 10);
+    if (!paginacion) return res.status(400).json("La paginación es inválida");
+    const { page, pageSize: resultsPerPage, start } = paginacion;
 
     const columnasOrdenDepartamentales = {
       id: "d.id",
@@ -10674,24 +11300,22 @@ router.put("/departamental/:id", verifyToken, async (req, res) => {
 router.post("/tabla/temporadas", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   let buscar = req.query.search;
-  const filters = req.body;
+  const filters = req.body || {};
   const fecha_incio = filters.startDate || "2023-01-01";
   const fecha_fin = filters.endDate || "2070-12-31";
-  let fromDate = new Date(fecha_incio);
-  let toDate = new Date(fecha_fin);
-
-  // Format for SQL comparison (MySQL format)
-  fromDate = fromDate.toISOString().split("T")[0];
-  toDate.setDate(toDate.getDate() + 1);
-  toDate = toDate.toISOString().split("T")[0];
+  const fromDate = normalizarFechaCivil(fecha_incio);
+  const toDate = normalizarFechaCivil(fecha_fin);
+  if (!fromDate || !toDate || fromDate > toDate) {
+    return res.status(422).json("El rango de fechas no es valido");
+  }
 
   let queryBuscar = "";
   if (
     cabecera.rol === "admin"
   ) {
-    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
-    const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 10));
-    const start = (page - 1) * resultsPerPage;
+    const paginacion = normalizarPaginacion(req.query, 10);
+    if (!paginacion) return res.status(400).json("La paginación es inválida");
+    const { page, pageSize: resultsPerPage, start } = paginacion;
 
     const columnasOrdenTemporadas = {
       id: "temporada_tarifa.id",
@@ -10790,7 +11414,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
   }
 
   let buscar = req.query.search;
-  const filters = req.body;
+  const filters = req.body || {};
   // Filtro por estado de reserva (nombre en estado_reserva). "Todas" = sin filtro.
   const estadoFiltro =
     typeof filters.estado === "string" && filters.estado.trim() !== "" && filters.estado !== "Todas"
@@ -10798,20 +11422,18 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       : null;
   const fecha_incio = filters.startDate || "2023-01-01";
   const fecha_fin = filters.endDate || "2070-12-31";
-  let fromDate = new Date(fecha_incio);
-  let toDate = new Date(fecha_fin);
-
-  // Format for SQL comparison (MySQL format)
-  fromDate = fromDate.toISOString().split("T")[0];
-  toDate.setDate(toDate.getDate() + 1);
-  toDate = toDate.toISOString().split("T")[0];
+  const fromDate = normalizarFechaCivil(fecha_incio);
+  const toDate = normalizarFechaCivil(fecha_fin);
+  if (!fromDate || !toDate || fromDate > toDate) {
+    return res.status(422).json("El rango de fechas no es valido");
+  }
 
   let queryBuscar = "";
   // La página es 1-based; se clampa para que un page=0 o inválido nunca
   // genere un LIMIT negativo (error de sintaxis SQL).
-  const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
-  const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 10));
-  const start = (page - 1) * resultsPerPage;
+  const paginacion = normalizarPaginacion(req.query, 10);
+  if (!paginacion) return res.status(400).json("La paginación es inválida");
+  const { page, pageSize: resultsPerPage, start } = paginacion;
 
   const columnasOrdenReservas = {
     id: "r.id",
@@ -11001,8 +11623,9 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
 
   try {
     const db = mysqlConnection.promise();
-    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
-    const pageSize = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 10));
+    const paginacion = normalizarPaginacion(req.query, 10);
+    if (!paginacion) return res.status(400).json("La paginación es inválida");
+    const { page, pageSize } = paginacion;
     const orderType = String(req.query.orderType).toLowerCase() === "asc" ? "ASC" : "DESC";
     const COLUMNAS_ORDEN_GESTIONES = {
       fecha_creacion: "g.fecha_creacion",
@@ -11199,10 +11822,11 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
     return res.status(401).json("No autorizado");
   }
 
-  const usuarioId = Number(cabecera.id);
-  const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
-  const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 10));
-  const start = (page - 1) * resultsPerPage;
+  const usuarioId = normalizarIdPositivo(cabecera.id);
+  if (!usuarioId) return res.status(401).json("No autorizado");
+  const paginacion = normalizarPaginacion(req.query, 10);
+  if (!paginacion) return res.status(400).json("La paginación es inválida");
+  const { page, pageSize: resultsPerPage, start } = paginacion;
 
   const ordenColumnas = {
     nombre: "base.nombre",
@@ -11219,8 +11843,20 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
 
   const filtros = req.body || {};
   const filtroVinculo = ["FAMILIAR", "ACOMPANIANTE"].includes(filtros.vinculo) ? filtros.vinculo : null;
-  const filtroParentesco = filtros.parentesco_id ? Number(filtros.parentesco_id) : null;
+  const filtroParentesco = filtros.parentesco_id === undefined || filtros.parentesco_id === null || filtros.parentesco_id === ""
+    ? null
+    : normalizarIdPositivo(filtros.parentesco_id);
   const filtroDni = ["con", "sin"].includes(filtros.dni) ? filtros.dni : null;
+  if (filtros.vinculo !== undefined && filtros.vinculo !== null && filtros.vinculo !== "" && !filtroVinculo) {
+    return res.status(400).json("El filtro de vínculo es inválido");
+  }
+  if (filtros.parentesco_id !== undefined && filtros.parentesco_id !== null
+    && filtros.parentesco_id !== "" && !filtroParentesco) {
+    return res.status(400).json("El filtro de parentesco es inválido");
+  }
+  if (filtros.dni !== undefined && filtros.dni !== null && filtros.dni !== "" && !filtroDni) {
+    return res.status(400).json("El filtro de DNI es inválido");
+  }
 
   // Universo del afiliado: familiares del grupo + acompañantes de viaje sin
   // cuenta propia (vinculados directamente o a través de reservas compartidas).
@@ -11275,7 +11911,10 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
   const condiciones = [];
   const paramsFiltro = [];
   if (req.query.search) {
-    const buscar = `%${req.query.search}%`;
+    if (typeof req.query.search !== "string" || req.query.search.length > 200) {
+      return res.status(400).json("La búsqueda es inválida");
+    }
+    const buscar = `%${req.query.search.trim()}%`;
     condiciones.push(`(
       base.nombre LIKE ? OR base.apellido LIKE ?
       OR CONCAT(base.nombre, ' ', base.apellido) LIKE ?
@@ -11335,9 +11974,10 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
 
     const formatearFecha = (fecha) => {
       if (!fecha) return null;
-      const f = new Date(fecha);
-      if (isNaN(f.getTime())) return null;
-      return f.toLocaleDateString("es-AR", { day: "2-digit", month: "2-digit", year: "numeric" });
+      const fechaCivil = formatearFechaSQL(fecha);
+      if (!fechaCivil) return null;
+      const [anio, mes, dia] = fechaCivil.split("-");
+      return `${dia}/${mes}/${anio}`;
     };
 
     const numOfResults = countRows[0].count;
@@ -11391,26 +12031,37 @@ router.post("/familiares", verifyToken, async (req, res) => {
     }
 
     const { nombre, apellido, parentesco_id, fecha_nacimiento, documento, telefono } = req.body || {};
+    const actorId = normalizarIdPositivo(cabecera.id);
+    const nombreNormalizado = normalizarTexto(nombre);
+    const apellidoNormalizado = normalizarTexto(apellido);
+    const telefonoNormalizado = telefono === undefined || telefono === null || telefono === ""
+      ? null
+      : normalizarTexto(telefono);
 
-    if (!nombre || !apellido) {
+    if (!actorId) return res.status(401).json({ success: false, message: "No autorizado" });
+    if (!nombreNormalizado || nombreNormalizado.length > 45
+      || !apellidoNormalizado || apellidoNormalizado.length > 45) {
       return res.status(400).json({ success: false, message: "Nombre y apellido son requeridos" });
     }
-    const parentescoId = Number(parentesco_id);
+    if (telefonoNormalizado && telefonoNormalizado.length > 15) {
+      return res.status(400).json({ success: false, message: "El teléfono es inválido" });
+    }
+    const parentescoId = normalizarIdPositivo(parentesco_id);
     if (![2, 3, 4].includes(parentescoId)) {
       return res.status(400).json({ success: false, message: "El parentesco debe ser Pareja, Hijo o Familiar" });
     }
-    const fechaNacimiento = new Date(fecha_nacimiento);
-    if (!fecha_nacimiento || isNaN(fechaNacimiento.getTime())) {
+    const fechaNacimiento = normalizarFechaCivil(fecha_nacimiento);
+    const edad = calcularEdadEnFecha(fechaNacimiento, obtenerFechaCivilHoyArgentina());
+    if (!fechaNacimiento || edad === null) {
       return res.status(400).json({ success: false, message: "La fecha de nacimiento es requerida" });
     }
     const documentoNormalizado = documento !== undefined && documento !== null && String(documento).trim() !== ""
-      ? String(documento).replace(/\D/g, "")
+      ? normalizarTexto(documento)
       : null;
-    if (documentoNormalizado !== null && (documentoNormalizado.length < 6 || documentoNormalizado.length > 9)) {
+    if (documentoNormalizado !== null && !/^\d{6,9}$/.test(documentoNormalizado)) {
       return res.status(400).json({ success: false, message: "El DNI debe tener entre 6 y 9 dígitos" });
     }
 
-    const edad = Math.floor((Date.now() - fechaNacimiento.getTime()) / (365.25 * 24 * 60 * 60 * 1000));
     // Menores de 2 años (5); resto: invitados familiares AJB (2)
     const tipoPersonaId = edad < 2 ? 5 : 2;
 
@@ -11418,23 +12069,32 @@ router.post("/familiares", verifyToken, async (req, res) => {
     await connection.beginTransaction();
 
     const [titular] = await connection.query(
-      "SELECT id, departamental_id FROM usuario WHERE id = ?",
-      [cabecera.id]
+      "SELECT id, departamental_id FROM usuario WHERE id = ? AND habilitado = 'Y' FOR UPDATE",
+      [actorId]
     );
     if (titular.length === 0) {
       await connection.rollback();
       return res.status(404).json({ success: false, message: "Usuario no encontrado" });
     }
+    const titularDepartamentalId = normalizarIdPositivo(titular[0].departamental_id);
+    if (!titularDepartamentalId) {
+      await connection.rollback();
+      return res.status(409).json({
+        success: false,
+        message: "El titular no tiene una departamental valida asignada",
+      });
+    }
 
     if (documentoNormalizado !== null) {
       const [existente] = await connection.query(
-        "SELECT id, usuario_familiar_id, es_familiar, password, email FROM usuario WHERE documento = ?",
+        `SELECT id, usuario_familiar_id, es_familiar, parentesco_id, departamental_id, password, email
+         FROM usuario WHERE documento = ? FOR UPDATE`,
         [Number(documentoNormalizado)]
       );
 
       if (existente.length > 0) {
         const persona = existente[0];
-        const esDelGrupo = Number(persona.usuario_familiar_id) === Number(cabecera.id);
+        const esDelGrupo = normalizarIdPositivo(persona.usuario_familiar_id) === actorId;
         const sinCuenta = persona.password === null && (persona.email === null || persona.email === "");
 
         if (esDelGrupo && persona.es_familiar === "S") {
@@ -11446,17 +12106,30 @@ router.post("/familiares", verifyToken, async (req, res) => {
         // tiene cuenta propia, se la promueve a familiar en lugar de duplicarla.
         if (esDelGrupo && sinCuenta) {
           await connection.query(
-            "UPDATE usuario SET es_familiar = 'S', parentesco_id = ? WHERE id = ?",
-            [parentescoId, persona.id]
+            "UPDATE usuario SET es_familiar = 'S', parentesco_id = ?, departamental_id = ? WHERE id = ?",
+            [parentescoId, titularDepartamentalId, persona.id]
           );
+          const cambios = [
+            { campo: "es_familiar", valorAnterior: persona.es_familiar, valorNuevo: "S" },
+          ];
+          if (Number(persona.parentesco_id) !== parentescoId) {
+            cambios.push({ campo: "parentesco_id", valorAnterior: persona.parentesco_id, valorNuevo: parentescoId });
+          }
+          if (Number(persona.departamental_id) !== titularDepartamentalId) {
+            cambios.push({
+              campo: "departamental_id",
+              valorAnterior: persona.departamental_id,
+              valorNuevo: titularDepartamentalId,
+            });
+          }
           await registrarHistorial(
             connection,
             persona.id,
             "UPDATE",
             "usuario",
-            cabecera.id,
+            actorId,
             req,
-            [{ campo: "es_familiar", valorAnterior: persona.es_familiar, valorNuevo: "S" }],
+            cambios,
             "Acompañante de viaje promovido a familiar del grupo familiar"
           );
           await connection.commit();
@@ -11482,13 +12155,13 @@ router.post("/familiares", verifyToken, async (req, res) => {
         4, // rol invitado: familiar sin cuenta propia
         parentescoId,
         tipoPersonaId,
-        String(nombre).trim(),
-        String(apellido).trim(),
-        fechaNacimiento.toISOString().split("T")[0],
+        nombreNormalizado,
+        apellidoNormalizado,
+        fechaNacimiento,
         documentoNormalizado !== null ? Number(documentoNormalizado) : null,
-        telefono || null,
-        cabecera.id,
-        titular[0].departamental_id || null,
+        telefonoNormalizado,
+        actorId,
+        titularDepartamentalId,
       ]
     );
 
@@ -11497,10 +12170,10 @@ router.post("/familiares", verifyToken, async (req, res) => {
       nuevoFamiliar.insertId,
       "CREATE",
       "usuario",
-      cabecera.id,
+      actorId,
       req,
       null,
-      `Familiar cargado por el afiliado. Datos: ${String(nombre).trim()} ${String(apellido).trim()}${documentoNormalizado ? `, DNI: ${documentoNormalizado}` : ""}`
+      `Familiar cargado por el afiliado. Datos: ${nombreNormalizado} ${apellidoNormalizado}${documentoNormalizado ? `, DNI: ${documentoNormalizado}` : ""}`
     );
 
     await connection.commit();
@@ -11525,46 +12198,77 @@ router.post("/familiares", verifyToken, async (req, res) => {
 // Body: { es_familiar: 'S' | 'N', parentesco_id? } — 'S' suma la persona al grupo
 // familiar (coseguro), 'N' la deja solo como acompañante de viaje.
 router.put("/familiares/:id/vinculo", verifyToken, async (req, res) => {
+  let connection;
   try {
     const cabecera = JSON.parse(req.data.data);
     if (cabecera.rol !== "afiliado") {
       return res.status(401).json({ success: false, message: "No autorizado" });
     }
 
-    const personaId = Number(req.params.id);
-    const esFamiliar = req.body && req.body.es_familiar === "S" ? "S" : "N";
-    const parentescoId = req.body && [2, 3, 4].includes(Number(req.body.parentesco_id))
-      ? Number(req.body.parentesco_id)
-      : null;
+    const actorId = normalizarIdPositivo(cabecera.id);
+    const personaId = normalizarIdPositivo(req.params.id);
+    const esFamiliar = req.body?.es_familiar;
+    const parentescoId = normalizarIdPositivo(req.body?.parentesco_id);
 
-    if (!personaId || personaId === Number(cabecera.id)) {
+    if (!actorId || !personaId || personaId === actorId) {
       return res.status(400).json({ success: false, message: "ID inválido" });
     }
+    if (!["S", "N"].includes(esFamiliar)) {
+      return res.status(400).json({ success: false, message: "El tipo de vínculo es inválido" });
+    }
+    if (esFamiliar === "S" && ![2, 3, 4].includes(parentescoId)) {
+      return res.status(400).json({ success: false, message: "El parentesco es inválido" });
+    }
 
-    const db = mysqlConnection.promise();
-    const [personas] = await db.query(
-      "SELECT id, usuario_familiar_id, es_familiar, parentesco_id, password, email FROM usuario WHERE id = ?",
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const [titulares] = await connection.query(
+      "SELECT id, departamental_id FROM usuario WHERE id = ? AND habilitado = 'Y' FOR UPDATE",
+      [actorId]
+    );
+    if (titulares.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ success: false, message: "Usuario no encontrado" });
+    }
+    const titularDepartamentalId = normalizarIdPositivo(titulares[0].departamental_id);
+    if (!titularDepartamentalId) {
+      await connection.rollback();
+      return res.status(409).json({
+        success: false,
+        message: "El titular no tiene una departamental valida asignada",
+      });
+    }
+    const [personas] = await connection.query(
+      `SELECT id, usuario_familiar_id, es_familiar, parentesco_id, departamental_id, password, email
+       FROM usuario WHERE id = ? FOR UPDATE`,
       [personaId]
     );
     if (personas.length === 0) {
+      await connection.rollback();
       return res.status(404).json({ success: false, message: "Persona no encontrada" });
     }
 
     const persona = personas[0];
-    const esDelGrupo = Number(persona.usuario_familiar_id) === Number(cabecera.id);
+    const esDelGrupo = normalizarIdPositivo(persona.usuario_familiar_id) === actorId;
     const sinCuenta = persona.password === null && (persona.email === null || persona.email === "");
+
+    if (esFamiliar === "N" && !esDelGrupo) {
+      await connection.rollback();
+      return res.status(401).json({ success: false, message: "No autorizado" });
+    }
 
     if (!esDelGrupo) {
       // Solo se puede sumar al grupo a alguien sin cuenta propia que haya
       // compartido al menos una reserva con el afiliado.
-      const [comparte] = await db.query(
+      const [comparte] = await connection.query(
         `SELECT COUNT(*) AS c
          FROM reserva_familiar rf
          WHERE rf.usuario_id = ?
            AND rf.reserva_id IN (SELECT rf2.reserva_id FROM reserva_familiar rf2 WHERE rf2.usuario_id = ?)`,
-        [personaId, cabecera.id]
+        [personaId, actorId]
       );
       if (!sinCuenta || Number(comparte[0].c) === 0) {
+        await connection.rollback();
         return res.status(401).json({ success: false, message: "No autorizado" });
       }
     }
@@ -11573,27 +12277,45 @@ router.put("/familiares/:id/vinculo", verifyToken, async (req, res) => {
     if (esFamiliar === "S" && parentescoId && parentescoId !== persona.parentesco_id) {
       cambios.push({ campo: "parentesco_id", valorAnterior: persona.parentesco_id, valorNuevo: parentescoId });
     }
+    const usuarioFamiliarIdNuevo = esFamiliar === "S" ? actorId : null;
+    if (normalizarIdPositivo(persona.usuario_familiar_id) !== usuarioFamiliarIdNuevo) {
+      cambios.push({
+        campo: "usuario_familiar_id",
+        valorAnterior: persona.usuario_familiar_id,
+        valorNuevo: usuarioFamiliarIdNuevo,
+      });
+    }
+    if (esFamiliar === "S" && Number(persona.departamental_id) !== titularDepartamentalId) {
+      cambios.push({
+        campo: "departamental_id",
+        valorAnterior: persona.departamental_id,
+        valorNuevo: titularDepartamentalId,
+      });
+    }
 
-    await db.query(
+    await connection.query(
       `UPDATE usuario
        SET es_familiar = ?,
            usuario_familiar_id = ?,
-           parentesco_id = COALESCE(?, parentesco_id)
+           parentesco_id = COALESCE(?, parentesco_id),
+           departamental_id = CASE WHEN ? = 'S' THEN ? ELSE departamental_id END
        WHERE id = ?`,
       [
         esFamiliar,
-        esFamiliar === "S" ? cabecera.id : persona.usuario_familiar_id,
+        usuarioFamiliarIdNuevo,
         esFamiliar === "S" ? parentescoId : null,
+        esFamiliar,
+        titularDepartamentalId,
         personaId,
       ]
     );
 
     await registrarHistorial(
-      mysqlConnection.promise(),
+      connection,
       personaId,
       "UPDATE",
       "usuario",
-      cabecera.id,
+      actorId,
       req,
       cambios,
       esFamiliar === "S"
@@ -11601,13 +12323,18 @@ router.put("/familiares/:id/vinculo", verifyToken, async (req, res) => {
         : "Persona quitada del grupo familiar por el afiliado"
     );
 
+    await connection.commit();
+
     res.status(200).json({
       success: true,
       message: esFamiliar === "S" ? "Persona sumada a tu grupo familiar" : "Persona quitada de tu grupo familiar",
     });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.log(error);
     res.status(500).json({ success: false, message: "Error al actualizar el vínculo" });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -11650,9 +12377,9 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
         }
       }
 
-      const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
-      const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 20));
-      const start = (page - 1) * resultsPerPage;
+      const paginacion = normalizarPaginacion(req.query, 20);
+      if (!paginacion) return res.status(400).json("La paginación es inválida");
+      const { page, pageSize: resultsPerPage, start } = paginacion;
 
       const columnasOrdenHistorialUsuario = {
         fecha_modificacion: "h.fecha_modificacion",
@@ -11790,9 +12517,9 @@ router.get("/tabla/historial-departamental/:id?", verifyToken, async (req, res) 
     }
 
     const departamentalId = req.params.id;
-    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
-    const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 20));
-    const start = (page - 1) * resultsPerPage;
+    const paginacion = normalizarPaginacion(req.query, 20);
+    if (!paginacion) return res.status(400).json("La paginación es inválida");
+    const { page, pageSize: resultsPerPage, start } = paginacion;
 
     const columnasOrdenHistorialDepartamental = {
       fecha_cambio: "h.fecha_cambio",
@@ -11950,9 +12677,9 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
         }
       }
 
-      const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
-      const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 20));
-      const start = (page - 1) * resultsPerPage;
+      const paginacion = normalizarPaginacion(req.query, 20);
+      if (!paginacion) return res.status(400).json("La paginación es inválida");
+      const { page, pageSize: resultsPerPage, start } = paginacion;
 
       const columnasOrdenHistorialReserva = {
         fecha_modificacion: "h.fecha_modificacion",
@@ -12092,9 +12819,9 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
 
       // Paginación (1-based, clampada: un page=0 o inválido no debe generar
       // un LIMIT negativo, que es error de sintaxis en MySQL)
-      const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
-      const resultsPerPage = Math.min(100, Math.max(1, Number.parseInt(req.query.pageSize, 10) || 10));
-      const start = (page - 1) * resultsPerPage;
+      const paginacion = normalizarPaginacion(req.query, 10);
+      if (!paginacion) return res.status(400).json("La paginación es inválida");
+      const { page, pageSize: resultsPerPage, start } = paginacion;
 
       // Ordenamiento
       const columnasOrdenUsuarios = {
@@ -12382,7 +13109,9 @@ function normalizarValorPorcentaje(valor) {
     return null;
   }
   const numero = Number(valor);
-  return Number.isNaN(numero) ? null : numero;
+  if (!Number.isFinite(numero)) return null;
+  const puntosBase = decimalAPuntosBase(numero);
+  return puntosBase !== null && puntosBase <= 10000 ? puntosBase / 100 : null;
 }
 
 function construirMapaPreciosDeLista(tiposPersona) {
@@ -12494,9 +13223,14 @@ function calcularPrecioRangoConPorcentaje(rangoEdad, tipoPersonaId, mapaPreciosD
     }
 
     if (typeof precioBase === "number" && !Number.isNaN(precioBase)) {
-      const pDescuento = porcentajeDescuento !== null ? porcentajeDescuento : 0;
-      const factor = 1 - pDescuento / 100;
-      precioTarifa = Number((precioBase * factor).toFixed(2));
+      const precioBaseCentavos = decimalACentavos(precioBase);
+      const descuentoPuntosBase = decimalAPuntosBase(porcentajeDescuento !== null ? porcentajeDescuento : 0);
+      const precioFinalCentavos = precioBaseCentavos !== null && descuentoPuntosBase !== null
+        ? aplicarDescuentoEnPuntosBase(precioBaseCentavos, descuentoPuntosBase)
+        : null;
+      if (precioFinalCentavos !== null) {
+        precioTarifa = centavosANumero(precioFinalCentavos);
+      }
     }
   }
 
@@ -12518,6 +13252,236 @@ function normalizarParcelasDisponibles(valor, valorPorDefecto = 100) {
   }
 
   return { value: numero };
+}
+
+function esPrecioPorPersonaConfiguracion(valor) {
+  return valor === true || valor === 1 || ["1", "true", "y", "yes", "s", "si"].includes(String(valor || "").trim().toLowerCase());
+}
+
+function validarConfiguracionTemporada({
+  nombreCampania,
+  fechaInicio,
+  fechaFin,
+  configuracionServicios,
+  porcentajesTipoPersona = [],
+}) {
+  const nombre = normalizarTexto(nombreCampania);
+  const inicioTemporada = formatearFechaSQL(fechaInicio);
+  const finTemporada = formatearFechaSQL(fechaFin);
+  if (!nombre || nombre.length > 150) return "El nombre de campaña es requerido y admite hasta 150 caracteres";
+  if (!inicioTemporada || !finTemporada || inicioTemporada > finTemporada) return "El rango de la temporada no es válido";
+  if (!Array.isArray(configuracionServicios) || configuracionServicios.length === 0 || configuracionServicios.length > 100) {
+    return "La temporada debe incluir entre 1 y 100 servicios";
+  }
+
+  let cantidadRangos = 0;
+  const rangosPorRecursoRegimen = new Map();
+  for (let indiceServicio = 0; indiceServicio < configuracionServicios.length; indiceServicio++) {
+    const servicio = configuracionServicios[indiceServicio];
+    const servicioId = normalizarIdPositivo(servicio?.id ?? servicio?.servicio_id);
+    if (!servicioId || !Array.isArray(servicio?.regimenes) || servicio.regimenes.length === 0) {
+      return `El servicio ${indiceServicio + 1} no tiene un identificador o regímenes válidos`;
+    }
+
+    for (let indiceRegimen = 0; indiceRegimen < servicio.regimenes.length; indiceRegimen++) {
+      const regimen = servicio.regimenes[indiceRegimen];
+      const regimenId = normalizarIdPositivo(regimen?.id ?? regimen?.regimen_id);
+      if (!regimenId || !Array.isArray(regimen?.recursos) || regimen.recursos.length === 0) {
+        return `El régimen ${indiceRegimen + 1} del servicio ${servicioId} no es válido`;
+      }
+
+      for (let indiceRecurso = 0; indiceRecurso < regimen.recursos.length; indiceRecurso++) {
+        const recurso = regimen.recursos[indiceRecurso];
+        const recursoId = normalizarIdPositivo(recurso?.id ?? recurso?.recurso_id);
+        if (!recursoId || !Array.isArray(recurso?.fechas) || recurso.fechas.length === 0) {
+          return `El recurso ${indiceRecurso + 1} del servicio ${servicioId} no tiene rangos válidos`;
+        }
+        recurso.precio_por_persona = esPrecioPorPersonaConfiguracion(recurso.precio_por_persona);
+        const claveRecurso = `${recursoId}:${regimenId}`;
+        const rangosRecurso = rangosPorRecursoRegimen.get(claveRecurso) || [];
+
+        for (let indiceFecha = 0; indiceFecha < recurso.fechas.length; indiceFecha++) {
+          cantidadRangos += 1;
+          if (cantidadRangos > 10000) return "La configuración supera el máximo de 10.000 rangos";
+          const fecha = recurso.fechas[indiceFecha];
+          const inicio = formatearFechaSQL(fecha?.fecha_inicio);
+          const fin = formatearFechaSQL(fecha?.fecha_fin);
+          if (!inicio || !fin || inicio > fin || inicio < inicioTemporada || fin > finTemporada) {
+            return `El rango ${indiceFecha + 1} del recurso ${recursoId} es inválido o queda fuera de la temporada`;
+          }
+          fecha.fecha_inicio = inicio;
+          fecha.fecha_fin = fin;
+          if (rangosRecurso.some((rango) => inicio <= rango.fin && fin >= rango.inicio)) {
+            return `El recurso ${recursoId} tiene rangos de fechas solapados para el mismo régimen`;
+          }
+          rangosRecurso.push({ inicio, fin });
+
+          const adicionalesVistos = new Set();
+          for (const adicional of Array.isArray(fecha.adicionales) ? fecha.adicionales : []) {
+            const adicionalId = normalizarIdPositivo(adicional?.adicionalId ?? adicional?.adicional_id);
+            const precioCentavos = decimalACentavos(adicional?.precio);
+            if (!adicionalId || precioCentavos === null || adicionalesVistos.has(adicionalId)) {
+              return `El rango ${indiceFecha + 1} del recurso ${recursoId} contiene un adicional inválido o repetido`;
+            }
+            adicionalesVistos.add(adicionalId);
+            adicional.adicionalId = adicionalId;
+            adicional.precio = centavosANumero(precioCentavos);
+          }
+
+          if (!recurso.precio_por_persona) {
+            const precioCentavos = decimalACentavos(fecha?.precio);
+            if (precioCentavos === null) return `El rango ${indiceFecha + 1} del recurso ${recursoId} tiene un precio inválido`;
+            fecha.precio = centavosANumero(precioCentavos);
+            continue;
+          }
+
+          if (!Array.isArray(fecha?.tiposPersona) || fecha.tiposPersona.length === 0) {
+            return `El rango ${indiceFecha + 1} del recurso ${recursoId} no tiene tipos de persona`;
+          }
+          const tiposVistos = new Set();
+          for (const tipoPersona of fecha.tiposPersona) {
+            const tipoPersonaId = normalizarIdPositivo(tipoPersona?.tipoPersonaId ?? tipoPersona?.tipo_persona_id);
+            if (!tipoPersonaId || tiposVistos.has(tipoPersonaId) || !Array.isArray(tipoPersona?.rangosEdad) || tipoPersona.rangosEdad.length === 0) {
+              return `El rango ${indiceFecha + 1} del recurso ${recursoId} contiene un tipo de persona inválido o repetido`;
+            }
+            tiposVistos.add(tipoPersonaId);
+            tipoPersona.tipoPersonaId = tipoPersonaId;
+            const edades = [];
+            for (const rangoEdad of tipoPersona.rangosEdad) {
+              const minimoRaw = rangoEdad?.edadMinima ?? rangoEdad?.edad_minima;
+              const maximoRaw = rangoEdad?.edadMaxima ?? rangoEdad?.edad_maxima;
+              const minimo = minimoRaw === "" || minimoRaw === null || minimoRaw === undefined ? 0 : Number(minimoRaw);
+              const maximo = maximoRaw === "" || maximoRaw === null || maximoRaw === undefined ? null : Number(maximoRaw);
+              if (!Number.isInteger(minimo) || minimo < 0 || minimo > 130 || (maximo !== null && (!Number.isInteger(maximo) || maximo < minimo || maximo > 130))) {
+                return `El recurso ${recursoId} tiene un rango de edad inválido`;
+              }
+              const maximoComparacion = maximo === null ? 130 : maximo;
+              if (edades.some((rango) => minimo <= rango.maximo && maximoComparacion >= rango.minimo)) {
+                return `El recurso ${recursoId} tiene rangos de edad solapados para el tipo ${tipoPersonaId}`;
+              }
+              edades.push({ minimo, maximo: maximoComparacion });
+              rangoEdad.edadMinima = minimo;
+              rangoEdad.edadMaxima = maximo;
+
+              const usaPorcentaje = normalizarBanderaPorcentaje(rangoEdad?.usa_porcentaje ?? rangoEdad?.usaPorcentaje);
+              if (tipoPersonaId === 4 && usaPorcentaje) {
+                return `El precio de lista del recurso ${recursoId} no puede definirse como porcentaje`;
+              }
+              const porcentajeRaw = rangoEdad?.porcentaje_descuento ?? rangoEdad?.porcentaje ?? rangoEdad?.porcentajeDescuento ?? (usaPorcentaje ? rangoEdad?.precio : 0);
+              const porcentajePuntosBase = decimalAPuntosBase(porcentajeRaw);
+              if (porcentajePuntosBase === null || porcentajePuntosBase > 10000) {
+                return `El recurso ${recursoId} tiene un porcentaje fuera del rango 0 a 100`;
+              }
+              rangoEdad.usa_porcentaje = usaPorcentaje;
+              rangoEdad.porcentaje_descuento = usaPorcentaje ? porcentajePuntosBase / 100 : 0;
+              if (!usaPorcentaje && decimalACentavos(rangoEdad?.precio) === null) {
+                return `El recurso ${recursoId} tiene un precio por persona inválido`;
+              }
+              if (!usaPorcentaje) rangoEdad.precio = centavosANumero(decimalACentavos(rangoEdad.precio));
+            }
+          }
+
+          const mapaPreciosLista = construirMapaPreciosDeLista(fecha.tiposPersona);
+          for (const tipoPersona of fecha.tiposPersona) {
+            if (Number(tipoPersona.tipoPersonaId) === 4) continue;
+            for (const rangoEdad of tipoPersona.rangosEdad) {
+              if (!rangoEdad.usa_porcentaje) continue;
+              const base = buscarPrecioListaPorCobertura(mapaPreciosLista, rangoEdad.edadMinima, rangoEdad.edadMaxima);
+              if (!Number.isFinite(base) || decimalACentavos(base) === null) {
+                return `Falta un precio de lista que cubra el rango porcentual del recurso ${recursoId}`;
+              }
+            }
+          }
+        }
+        rangosPorRecursoRegimen.set(claveRecurso, rangosRecurso);
+      }
+    }
+  }
+
+  const porcentajesVistos = new Set();
+  for (const porcentaje of Array.isArray(porcentajesTipoPersona) ? porcentajesTipoPersona : []) {
+    const tipoPersonaId = normalizarIdPositivo(porcentaje?.tipo_persona_id ?? porcentaje?.tipoPersonaId);
+    const valor = porcentaje?.porcentaje ?? porcentaje?.valor ?? porcentaje?.porcentaje_descuento ?? porcentaje?.porcentajeDescuento;
+    const puntosBase = decimalAPuntosBase(valor);
+    if (!tipoPersonaId || puntosBase === null || puntosBase > 10000 || porcentajesVistos.has(tipoPersonaId)) {
+      return "Los porcentajes generales por tipo de persona son inválidos o están repetidos";
+    }
+    porcentajesVistos.add(tipoPersonaId);
+  }
+
+  return null;
+}
+
+async function validarReferenciasConfiguracionTemporada(connection, configuracionServicios) {
+  const recursosEsperados = new Map();
+  const paresServicioRegimen = new Set();
+  const tiposPersona = new Set();
+  const adicionales = new Set();
+
+  for (const servicio of configuracionServicios) {
+    const servicioId = normalizarIdPositivo(servicio.id ?? servicio.servicio_id);
+    for (const regimen of servicio.regimenes) {
+      const regimenId = normalizarIdPositivo(regimen.id ?? regimen.regimen_id);
+      paresServicioRegimen.add(`${servicioId}:${regimenId}`);
+      for (const recurso of regimen.recursos) {
+        const recursoId = normalizarIdPositivo(recurso.id ?? recurso.recurso_id);
+        const servicioAnterior = recursosEsperados.get(recursoId);
+        if (servicioAnterior && servicioAnterior !== servicioId) {
+          throw crearErrorNegocio(`El recurso ${recursoId} fue asociado a dos servicios distintos`, 400);
+        }
+        recursosEsperados.set(recursoId, servicioId);
+        for (const fecha of recurso.fechas) {
+          for (const adicional of Array.isArray(fecha.adicionales) ? fecha.adicionales : []) {
+            adicionales.add(normalizarIdPositivo(adicional.adicionalId ?? adicional.adicional_id));
+          }
+          for (const tipo of Array.isArray(fecha.tiposPersona) ? fecha.tiposPersona : []) {
+            tiposPersona.add(normalizarIdPositivo(tipo.tipoPersonaId ?? tipo.tipo_persona_id));
+          }
+        }
+      }
+    }
+  }
+
+  const recursoIds = Array.from(recursosEsperados.keys());
+  const servicioIds = Array.from(new Set(Array.from(recursosEsperados.values())));
+  const regimenIds = Array.from(new Set(Array.from(paresServicioRegimen).map((par) => Number(par.split(":")[1]))));
+  const placeholders = (valores) => valores.map(() => "?").join(",");
+
+  const [recursos] = await connection.query(
+    `SELECT id, servicio_id FROM recurso WHERE id IN (${placeholders(recursoIds)})`,
+    recursoIds
+  );
+  const recursosValidos = new Set(
+    recursos
+      .filter((recurso) => Number(recursosEsperados.get(Number(recurso.id))) === Number(recurso.servicio_id))
+      .map((recurso) => Number(recurso.id))
+  );
+  if (recursosValidos.size !== recursoIds.length) {
+    throw crearErrorNegocio("Hay recursos que no existen o no pertenecen al servicio indicado", 400);
+  }
+
+  const [regimenes] = await connection.query(
+    `SELECT servicio_id, regimen_id
+     FROM servicio_regimen
+     WHERE servicio_id IN (${placeholders(servicioIds)})
+       AND regimen_id IN (${placeholders(regimenIds)})`,
+    [...servicioIds, ...regimenIds]
+  );
+  const paresValidos = new Set(regimenes.map((fila) => `${Number(fila.servicio_id)}:${Number(fila.regimen_id)}`));
+  if (Array.from(paresServicioRegimen).some((par) => !paresValidos.has(par))) {
+    throw crearErrorNegocio("Hay regímenes que no pertenecen al servicio indicado", 400);
+  }
+
+  if (tiposPersona.size > 0) {
+    const ids = Array.from(tiposPersona);
+    const [rows] = await connection.query(`SELECT id FROM tipo_persona WHERE id IN (${placeholders(ids)})`, ids);
+    if (rows.length !== ids.length) throw crearErrorNegocio("Hay tipos de persona inexistentes", 400);
+  }
+  if (adicionales.size > 0) {
+    const ids = Array.from(adicionales);
+    const [rows] = await connection.query(`SELECT id FROM adicional WHERE id IN (${placeholders(ids)})`, ids);
+    if (rows.length !== ids.length) throw crearErrorNegocio("Hay adicionales inexistentes", 400);
+  }
 }
 
 function validarParcelasDisponiblesEnConfiguracion(configuracionServicios) {
@@ -12584,10 +13548,23 @@ async function crearTemporadaTarifasDesdeConfiguracion(connection, {
     throw crearErrorNegocio("Faltan campos requeridos para crear tarifas", 400);
   }
 
+  const errorConfiguracion = validarConfiguracionTemporada({
+    nombreCampania: nombre_campania,
+    fechaInicio: fecha_inicio,
+    fechaFin: fecha_fin,
+    configuracionServicios: configuracion_servicios,
+    porcentajesTipoPersona: porcentajes_tipo_persona,
+  });
+  if (errorConfiguracion) {
+    throw crearErrorNegocio(errorConfiguracion, 400);
+  }
+
   const errorParcelas = validarParcelasDisponiblesEnConfiguracion(configuracion_servicios);
   if (errorParcelas) {
     throw crearErrorNegocio(errorParcelas, 400);
   }
+
+  await validarReferenciasConfiguracionTemporada(connection, configuracion_servicios);
 
   const [temporadaResult] = await connection.query(
     "INSERT INTO temporada_tarifa (nombre, fecha_inicio, fecha_fin, origen) VALUES (?, ?, ?, ?)",
@@ -12822,6 +13799,17 @@ router.post("/temporada", verifyToken, async (req, res) => {
         return res.status(400).json("Faltan campos requeridos");
       }
 
+      const errorConfiguracion = validarConfiguracionTemporada({
+        nombreCampania: nombre_campania,
+        fechaInicio: fecha_inicio,
+        fechaFin: fecha_fin,
+        configuracionServicios: configuracion_servicios,
+        porcentajesTipoPersona: porcentajes_tipo_persona,
+      });
+      if (errorConfiguracion) {
+        return res.status(400).json(errorConfiguracion);
+      }
+
       const errorParcelas = validarParcelasDisponiblesEnConfiguracion(configuracion_servicios);
       if (errorParcelas) {
         return res.status(400).json(errorParcelas);
@@ -12833,9 +13821,10 @@ router.post("/temporada", verifyToken, async (req, res) => {
       await connection.beginTransaction();
 
       try {
+        await validarReferenciasConfiguracionTemporada(connection, configuracion_servicios);
         await validarSolapamientoTarifasExistentes(connection, {
           configuracionServicios: configuracion_servicios,
-          origenes: ["BLOQUE"]
+          origenes: ["GENERAL", "BLOQUE"]
         });
 
         // 1. Crear la temporada principal
@@ -13223,15 +14212,16 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
           const recursoKey = `${tarifa.regimen_id}-${tarifa.recurso_id}`;
           recursoRegimenMap.set(recursoKey, recurso);
 
-          // Normalizar fechas para evitar duplicados por comparar objetos Date diferentes
-          const tarifaFechaInicioMs = new Date(tarifa.fecha_inicio).getTime();
-          const tarifaFechaFinMs = new Date(tarifa.fecha_fin).getTime();
+          const tarifaFechaInicio = formatearFechaSQL(tarifa.fecha_inicio);
+          const tarifaFechaFin = formatearFechaSQL(tarifa.fecha_fin);
+          if (!tarifaFechaInicio || !tarifaFechaFin || tarifaFechaInicio > tarifaFechaFin) {
+            throw crearErrorNegocio("La temporada contiene un rango de tarifa invalido", 409, "TARIFA_INVALIDA");
+          }
 
           // Buscar o crear fecha en el recurso
           let fecha = recurso.fechas.find(f => {
-            const fechaInicioMs = new Date(f.fecha_inicio).getTime();
-            const fechaFinMs = new Date(f.fecha_fin).getTime();
-            return fechaInicioMs === tarifaFechaInicioMs && fechaFinMs === tarifaFechaFinMs;
+            return formatearFechaSQL(f.fecha_inicio) === tarifaFechaInicio &&
+              formatearFechaSQL(f.fecha_fin) === tarifaFechaFin;
           });
           const esServicioParcelas = Number(tarifa.servicio_id) === 4;
           const parcelasDisponibles = tarifa.parcelas_disponibles !== null && tarifa.parcelas_disponibles !== undefined
@@ -13300,13 +14290,15 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
             continue;
           }
 
-          const adicionalFechaInicio = new Date(adicional.fecha_inicio).getTime();
-          const adicionalFechaFin = new Date(adicional.fecha_fin).getTime();
+          const adicionalFechaInicio = formatearFechaSQL(adicional.fecha_inicio);
+          const adicionalFechaFin = formatearFechaSQL(adicional.fecha_fin);
+          if (!adicionalFechaInicio || !adicionalFechaFin || adicionalFechaInicio > adicionalFechaFin) {
+            throw crearErrorNegocio("La temporada contiene un rango de adicional invalido", 409, "TARIFA_ADICIONAL_INVALIDA");
+          }
 
           const fecha = recurso.fechas.find(f => {
-            const fechaInicioMs = new Date(f.fecha_inicio).getTime();
-            const fechaFinMs = new Date(f.fecha_fin).getTime();
-            return fechaInicioMs === adicionalFechaInicio && fechaFinMs === adicionalFechaFin;
+            return formatearFechaSQL(f.fecha_inicio) === adicionalFechaInicio &&
+              formatearFechaSQL(f.fecha_fin) === adicionalFechaFin;
           });
 
           if (!fecha) {
@@ -13382,6 +14374,18 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
         return res.status(400).json("Faltan campos requeridos");
       }
 
+
+      const errorConfiguracion = validarConfiguracionTemporada({
+        nombreCampania: nombre_campania,
+        fechaInicio: fecha_inicio,
+        fechaFin: fecha_fin,
+        configuracionServicios: configuracion_servicios,
+        porcentajesTipoPersona: porcentajes_tipo_persona,
+      });
+      if (errorConfiguracion) {
+        return res.status(400).json(errorConfiguracion);
+      }
+
       const errorParcelas = validarParcelasDisponiblesEnConfiguracion(configuracion_servicios);
       if (errorParcelas) {
         return res.status(400).json(errorParcelas);
@@ -13392,22 +14396,23 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
       await connection.beginTransaction();
 
       try {
+        await validarReferenciasConfiguracionTemporada(connection, configuracion_servicios);
         // 1. Verificar que la temporada existe y obtener datos anteriores
         const [temporadaAnterior] = await connection.query(
-          "SELECT nombre, fecha_inicio, fecha_fin FROM temporada_tarifa WHERE id = ?",
+          "SELECT nombre, fecha_inicio, fecha_fin FROM temporada_tarifa WHERE id = ? FOR UPDATE",
           [id]
         );
 
         if (temporadaAnterior.length === 0) {
-          connection.release();
-          return res.status(404).json("Temporada no encontrada");
+          throw crearErrorNegocio("Temporada no encontrada", 404);
         }
 
         const datosAnteriores = temporadaAnterior[0];
 
         await validarSolapamientoTarifasExistentes(connection, {
           configuracionServicios: configuracion_servicios,
-          origenes: ["BLOQUE"]
+          excludeTemporadaTarifaId: normalizarIdPositivo(id),
+          origenes: ["GENERAL", "BLOQUE"]
         });
 
         // 2. Actualizar la temporada principal
@@ -13440,6 +14445,20 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
         );
 
         if (tarifasAnteriores.length > 0) {
+          const [referenciasTarifas] = await connection.query(
+            `SELECT COUNT(*) AS cantidad
+             FROM reserva_familiar_tarifa rft
+             INNER JOIN tarifa t ON t.id = rft.tarifa_id
+             WHERE t.temporada_tarifa_id = ?`,
+            [id]
+          );
+          if (Number(referenciasTarifas[0]?.cantidad || 0) > 0) {
+            throw crearErrorNegocio(
+              "La temporada ya fue utilizada por reservas y no puede reemplazar sus tarifas históricas; crea una nueva temporada",
+              409,
+              "TEMPORADA_CON_HISTORIAL"
+            );
+          }
           await connection.query(
             "DELETE FROM tarifa WHERE temporada_tarifa_id = ?",
             [id]
@@ -14526,8 +15545,9 @@ const uploadFotoPerfil = multer({
     fileSize: 5 * 1024 * 1024 // 5MB máximo
   },
   fileFilter: (req, file, cb) => {
-    // Aceptar solo imágenes
-    if (file.mimetype.startsWith('image/')) {
+    // Solo formatos raster conocidos; SVG y tipos arbitrarios pueden ejecutar
+    // contenido activo cuando se muestran desde una URL firmada.
+    if (["image/jpeg", "image/png", "image/webp", "image/gif"].includes(file.mimetype)) {
       cb(null, true);
     } else {
       cb(new Error('Solo se permiten archivos de imagen'), false);
@@ -14535,11 +15555,25 @@ const uploadFotoPerfil = multer({
   }
 });
 
+function manejarUploadFotoPerfil(req, res, next) {
+  uploadFotoPerfil.single('foto')(req, res, (error) => {
+    if (error) {
+      res.status(400).json(error.message || 'No se pudo procesar la foto');
+      return;
+    }
+    validarContenidoArchivos(req, res, next);
+  });
+}
+
 // GET /configuracion/usuario/:id? - Obtener datos del usuario
 router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    const userId = req.params.id ? parseInt(req.params.id) : cabecera.id;
+    const userId = req.params.id ? normalizarIdPositivo(req.params.id) : normalizarIdPositivo(cabecera.id);
+    if (!userId) {
+      return res.status(400).json({ success: false, message: "ID de usuario inválido" });
+    }
+    const db = mysqlConnection.promise();
 
     // Verificar permisos
     let tienePermisos = false;
@@ -14547,27 +15581,13 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
     if (cabecera.rol === "admin") {
       tienePermisos = true;
     } else if (cabecera.rol === "departamental") {
-      // Departamental puede ver usuarios de su departamento o a sí mismo
-      if (userId === cabecera.id) {
-        tienePermisos = true;
-      } else {
-        const [usuarioTarget] = await mysqlConnection
-          .promise()
-          .query(
-            "SELECT departamental_id FROM usuario WHERE id = ?",
-            [userId]
-          );
-
-        if (usuarioTarget.length > 0 && usuarioTarget[0].departamental_id === cabecera.id) {
-          tienePermisos = true;
-        }
-      }
+      tienePermisos = await puedeAccederUsuarioRelacionado(db, cabecera, userId);
     } else if (cabecera.rol === "afiliado") {
       // Afiliado solo puede verse a sí mismo
-      tienePermisos = userId === cabecera.id;
+      tienePermisos = userId === normalizarIdPositivo(cabecera.id);
     } else if (["admin-central", "auditor"].includes(cabecera.rol)) {
       // Roles del módulo de coseguro: solo pueden ver su propio perfil
-      tienePermisos = userId === cabecera.id;
+      tienePermisos = userId === normalizarIdPositivo(cabecera.id);
     }
 
     if (!tienePermisos) {
@@ -14650,10 +15670,10 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
 });
 
 // PUT /configuracion/usuario/:id - Actualizar datos del usuario
-router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('foto'), async (req, res) => {
+router.put("/configuracion/usuario/:id", verifyToken, manejarUploadFotoPerfil, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    const userId = parseInt(req.params.id);
+    const userId = normalizarIdPositivo(req.params.id);
 
     // Validar que el ID sea válido
     if (!userId || isNaN(userId)) {
@@ -14664,22 +15684,19 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
     }
 
     let connection;
+    let fotoNuevaSubida = null;
     try {
       connection = await mysqlConnection.promise().getConnection();
       await connection.beginTransaction();
 
       // Obtener datos actuales del usuario
       const [usuarioActual] = await connection.query(
-        "SELECT * FROM usuario WHERE id = ?",
+        "SELECT * FROM usuario WHERE id = ? FOR UPDATE",
         [userId]
       );
 
       if (usuarioActual.length === 0) {
-        await connection.rollback();
-        return res.status(404).json({
-          success: false,
-          message: "Usuario no encontrado"
-        });
+        throw crearErrorNegocio("Usuario no encontrado", 404);
       }
 
       const datosAnteriores = usuarioActual[0];
@@ -14696,12 +15713,7 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
           'legajo', 'cuil', 'cbu', 'foto_archivo', 'habilitado'
         ];
       } else if (cabecera.rol === "departamental") {
-        // Verificar que el usuario pertenezca a su departamento o sea él mismo
-        if (userId === cabecera.id) {
-          tienePermisos = true;
-        } else if (datosAnteriores.departamental_id === cabecera.id) {
-          tienePermisos = true;
-        }
+        tienePermisos = await puedeAccederUsuarioRelacionado(connection, cabecera, userId);
         camposPermitidos = [
           'tipo_persona_id', 'nombre', 'apellido', 'fecha_nacimiento',
           'documento', 'password', 'email', 'telefono', 'legajo',
@@ -14709,53 +15721,48 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
         ];
       } else if (cabecera.rol === "afiliado") {
         // Solo puede editarse a sí mismo
-        if (userId === cabecera.id) {
+        if (userId === normalizarIdPositivo(cabecera.id)) {
           tienePermisos = true;
         }
         camposPermitidos = [
-          'tipo_persona_id', 'nombre', 'apellido', 'fecha_nacimiento',
-          'documento', 'password', 'email', 'telefono', 'legajo',
+          'nombre', 'apellido',
+          'password', 'email', 'telefono',
           'cuil', 'cbu', 'foto_archivo'
         ];
       } else if (["admin-central", "auditor"].includes(cabecera.rol)) {
         // Roles del módulo de coseguro: solo editan su propio perfil (datos personales)
-        if (userId === cabecera.id) {
+        if (userId === normalizarIdPositivo(cabecera.id)) {
           tienePermisos = true;
         }
         camposPermitidos = [
-          'nombre', 'apellido', 'fecha_nacimiento', 'documento',
+          'nombre', 'apellido',
           'password', 'email', 'telefono', 'cuil', 'cbu', 'foto_archivo'
         ];
       }
 
       if (!tienePermisos) {
-        await connection.rollback();
-        return res.status(403).json({
-          success: false,
-          message: "No tienes permisos para modificar este usuario"
-        });
+        throw crearErrorNegocio("No tienes permisos para modificar este usuario", 403);
       }
 
       // Preparar campos para actualizar
       const updateFields = [];
       const updateValues = [];
       const cambios = [];
+      let rolFinalId = normalizarIdPositivo(datosAnteriores.rol_id);
+      let departamentalFinalId = normalizarIdPositivo(datosAnteriores.departamental_id);
+      let tipoPersonaFinalId = normalizarIdPositivo(datosAnteriores.tipo_persona_id);
+      let fechaNacimientoFinal = formatearFechaSQL(datosAnteriores.fecha_nacimiento);
 
       // Función auxiliar para formatear fechas
-      const formatearFecha = (fecha) => {
-        if (!fecha) return null;
-        try {
-          const fechaObj = new Date(fecha);
-          if (isNaN(fechaObj.getTime())) return null;
-          return fechaObj.toISOString().split('T')[0];
-        } catch (error) {
-          return null;
-        }
-      };
+      const formatearFecha = (fecha) => formatearFechaSQL(fecha);
 
       // Procesar cada campo permitido
       if (camposPermitidos.includes('rol_id') && req.body.rol_id !== undefined) {
-        const nuevoValor = req.body.rol_id ? parseInt(req.body.rol_id) : null;
+        const nuevoValor = normalizarIdPositivo(req.body.rol_id);
+        if (!nuevoValor) throw crearErrorNegocio("Rol inválido", 400);
+        const [rolesValidos] = await connection.query("SELECT id FROM rol WHERE id = ?", [nuevoValor]);
+        if (rolesValidos.length === 0) throw crearErrorNegocio("Rol inexistente", 400);
+        rolFinalId = nuevoValor;
         if (datosAnteriores.rol_id !== nuevoValor) {
           updateFields.push('rol_id = ?');
           updateValues.push(nuevoValor);
@@ -14768,7 +15775,16 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
       }
 
       if (camposPermitidos.includes('departamental_id') && req.body.departamental_id !== undefined) {
-        const nuevoValor = req.body.departamental_id ? parseInt(req.body.departamental_id) : null;
+        const nuevoValor = req.body.departamental_id === "" ? null : normalizarIdPositivo(req.body.departamental_id);
+        if (req.body.departamental_id !== "" && !nuevoValor) throw crearErrorNegocio("Departamental inválida", 400);
+        if (nuevoValor !== null) {
+          const [departamentalesValidas] = await connection.query(
+            "SELECT id FROM departamental WHERE id = ? AND habilitado = 'Y'",
+            [nuevoValor]
+          );
+          if (departamentalesValidas.length === 0) throw crearErrorNegocio("Departamental inexistente o deshabilitada", 400);
+        }
+        departamentalFinalId = nuevoValor;
         if (datosAnteriores.departamental_id !== nuevoValor) {
           updateFields.push('departamental_id = ?');
           updateValues.push(nuevoValor);
@@ -14783,7 +15799,8 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
       // Áreas habilitadas (solo staff departamental / admin-central): "1"/"0" desde el FormData
       for (const campoArea of ['area_turismo', 'area_coseguro']) {
         if (camposPermitidos.includes(campoArea) && req.body[campoArea] !== undefined) {
-          const nuevoValor = ["1", "true", 1, true].includes(req.body[campoArea]) ? 1 : 0;
+          const nuevoValor = normalizarBooleanoBinarioEstricto(req.body[campoArea]);
+          if (nuevoValor === null) throw crearErrorNegocio(`El valor de ${campoArea} es inválido`, 400);
           if (Number(datosAnteriores[campoArea]) !== nuevoValor) {
             updateFields.push(`${campoArea} = ?`);
             updateValues.push(nuevoValor);
@@ -14797,7 +15814,13 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
       }
 
       if (camposPermitidos.includes('tipo_persona_id') && req.body.tipo_persona_id !== undefined) {
-        const nuevoValor = req.body.tipo_persona_id ? parseInt(req.body.tipo_persona_id) : null;
+        const nuevoValor = req.body.tipo_persona_id === "" ? null : normalizarIdPositivo(req.body.tipo_persona_id);
+        if (req.body.tipo_persona_id !== "" && !nuevoValor) throw crearErrorNegocio("Tipo de persona inválido", 400);
+        if (nuevoValor !== null) {
+          const [tiposValidos] = await connection.query("SELECT id FROM tipo_persona WHERE id = ?", [nuevoValor]);
+          if (tiposValidos.length === 0) throw crearErrorNegocio("Tipo de persona inexistente", 400);
+        }
+        tipoPersonaFinalId = nuevoValor;
         if (datosAnteriores.tipo_persona_id !== nuevoValor) {
           updateFields.push('tipo_persona_id = ?');
           updateValues.push(nuevoValor);
@@ -14810,25 +15833,29 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
       }
 
       if (camposPermitidos.includes('nombre') && req.body.nombre !== undefined) {
-        if (datosAnteriores.nombre !== req.body.nombre) {
+        const nuevoValor = normalizarTexto(req.body.nombre);
+        if (!nuevoValor || nuevoValor.length > 45) throw crearErrorNegocio("Nombre inválido", 400);
+        if (datosAnteriores.nombre !== nuevoValor) {
           updateFields.push('nombre = ?');
-          updateValues.push(req.body.nombre);
+          updateValues.push(nuevoValor);
           cambios.push({
             campo: 'nombre',
             valorAnterior: datosAnteriores.nombre,
-            valorNuevo: req.body.nombre
+            valorNuevo: nuevoValor
           });
         }
       }
 
       if (camposPermitidos.includes('apellido') && req.body.apellido !== undefined) {
-        if (datosAnteriores.apellido !== req.body.apellido) {
+        const nuevoValor = normalizarTexto(req.body.apellido);
+        if (!nuevoValor || nuevoValor.length > 45) throw crearErrorNegocio("Apellido inválido", 400);
+        if (datosAnteriores.apellido !== nuevoValor) {
           updateFields.push('apellido = ?');
-          updateValues.push(req.body.apellido);
+          updateValues.push(nuevoValor);
           cambios.push({
             campo: 'apellido',
             valorAnterior: datosAnteriores.apellido,
-            valorNuevo: req.body.apellido
+            valorNuevo: nuevoValor
           });
         }
       }
@@ -14836,6 +15863,9 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
       if (camposPermitidos.includes('fecha_nacimiento') && req.body.fecha_nacimiento !== undefined) {
         const fechaFormateada = formatearFecha(req.body.fecha_nacimiento);
         const fechaAnteriorFormateada = formatearFecha(datosAnteriores.fecha_nacimiento);
+        if (!fechaFormateada || calcularEdadEnFecha(fechaFormateada, obtenerFechaCivilHoyArgentina()) === null) {
+          throw crearErrorNegocio("Fecha de nacimiento inválida", 400);
+        }
         if (fechaAnteriorFormateada !== fechaFormateada) {
           updateFields.push('fecha_nacimiento = ?');
           updateValues.push(fechaFormateada);
@@ -14845,11 +15875,14 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
             valorNuevo: fechaFormateada
           });
         }
+        fechaNacimientoFinal = fechaFormateada;
       }
 
       if (camposPermitidos.includes('documento') && req.body.documento !== undefined) {
-        const nuevoValor = req.body.documento ? parseInt(req.body.documento) : null;
-        if (datosAnteriores.documento !== nuevoValor) {
+        const documentoTexto = normalizarTexto(req.body.documento);
+        const nuevoValor = /^\d{6,9}$/.test(documentoTexto) ? Number(documentoTexto) : null;
+        if (!nuevoValor) throw crearErrorNegocio("Documento inválido", 400);
+        if (Number(datosAnteriores.documento) !== nuevoValor) {
           updateFields.push('documento = ?');
           updateValues.push(nuevoValor);
           cambios.push({
@@ -14861,61 +15894,72 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
       }
 
       if (camposPermitidos.includes('email') && req.body.email !== undefined) {
-        if (datosAnteriores.email !== req.body.email) {
+        const nuevoValor = normalizarTexto(req.body.email).toLowerCase();
+        if (!nuevoValor || nuevoValor.length > 45 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(nuevoValor)) {
+          throw crearErrorNegocio("Email inválido", 400);
+        }
+        if (datosAnteriores.email !== nuevoValor) {
+          const [emailsExistentes] = await connection.query(
+            "SELECT id FROM usuario WHERE LOWER(TRIM(email)) = ? AND id <> ? LIMIT 1 FOR UPDATE",
+            [nuevoValor, userId]
+          );
+          if (emailsExistentes.length > 0) throw crearErrorNegocio("Ya existe un usuario con ese email", 409);
           updateFields.push('email = ?');
-          updateValues.push(req.body.email);
+          updateValues.push(nuevoValor);
           cambios.push({
             campo: 'email',
             valorAnterior: datosAnteriores.email,
-            valorNuevo: req.body.email
+            valorNuevo: nuevoValor
           });
         }
       }
 
       if (camposPermitidos.includes('telefono') && req.body.telefono !== undefined) {
-        if (datosAnteriores.telefono !== req.body.telefono) {
+        const nuevoValor = normalizarTexto(req.body.telefono) || null;
+        if (nuevoValor && nuevoValor.length > 15) throw crearErrorNegocio("Teléfono inválido", 400);
+        if (datosAnteriores.telefono !== nuevoValor) {
           updateFields.push('telefono = ?');
-          updateValues.push(req.body.telefono || null);
+          updateValues.push(nuevoValor);
           cambios.push({
             campo: 'telefono',
             valorAnterior: datosAnteriores.telefono,
-            valorNuevo: req.body.telefono || null
+            valorNuevo: nuevoValor
           });
         }
       }
 
       if (camposPermitidos.includes('legajo') && req.body.legajo !== undefined) {
-        if (datosAnteriores.legajo !== req.body.legajo) {
+        const nuevoValor = normalizarTexto(req.body.legajo) || null;
+        if (nuevoValor && nuevoValor.length > 45) throw crearErrorNegocio("Legajo inválido", 400);
+        if (datosAnteriores.legajo !== nuevoValor) {
           updateFields.push('legajo = ?');
-          updateValues.push(req.body.legajo || null);
+          updateValues.push(nuevoValor);
           cambios.push({
             campo: 'legajo',
             valorAnterior: datosAnteriores.legajo,
-            valorNuevo: req.body.legajo || null
+            valorNuevo: nuevoValor
           });
         }
       }
 
       if (camposPermitidos.includes('habilitado') && req.body.habilitado !== undefined) {
-        if (datosAnteriores.habilitado !== req.body.habilitado) {
+        const nuevoValor = normalizarSiNoEstricto(req.body.habilitado);
+        if (nuevoValor === null) throw crearErrorNegocio("Estado habilitado inválido", 400);
+        if (datosAnteriores.habilitado !== nuevoValor) {
           updateFields.push('habilitado = ?');
-          updateValues.push(req.body.habilitado);
+          updateValues.push(nuevoValor);
           cambios.push({
             campo: 'habilitado',
             valorAnterior: datosAnteriores.habilitado,
-            valorNuevo: req.body.habilitado
+            valorNuevo: nuevoValor
           });
         }
       }
 
       if (camposPermitidos.includes('cuil') && req.body.cuil !== undefined) {
-        const nuevoValor = String(req.body.cuil || '').replace(/\D/g, '').slice(0, 11) || null;
-        if (nuevoValor && nuevoValor.length !== 11) {
-          await connection.rollback();
-          return res.status(400).json({
-            success: false,
-            message: "El CUIL debe tener 11 dígitos (sin guiones)"
-          });
+        const nuevoValor = normalizarTexto(req.body.cuil) || null;
+        if (nuevoValor && !validarCuitCuil(nuevoValor)) {
+          throw crearErrorNegocio("El CUIL es inválido", 400);
         }
         if (datosAnteriores.cuil !== nuevoValor) {
           updateFields.push('cuil = ?');
@@ -14929,13 +15973,9 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
       }
 
       if (camposPermitidos.includes('cbu') && req.body.cbu !== undefined) {
-        const nuevoValor = String(req.body.cbu || '').replace(/\D/g, '').slice(0, 22) || null;
-        if (nuevoValor && nuevoValor.length !== 22) {
-          await connection.rollback();
-          return res.status(400).json({
-            success: false,
-            message: "El CBU debe tener 22 dígitos"
-          });
+        const nuevoValor = normalizarTexto(req.body.cbu) || null;
+        if (nuevoValor && !validarCbu(nuevoValor)) {
+          throw crearErrorNegocio("El CBU es inválido", 400);
         }
         if (datosAnteriores.cbu !== nuevoValor) {
           updateFields.push('cbu = ?');
@@ -14949,7 +15989,14 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
       }
 
       // Procesar password si viene
-      if (camposPermitidos.includes('password') && req.body.password && req.body.password.trim() !== '') {
+      if (
+        camposPermitidos.includes('password') &&
+        (cabecera.rol === "admin" || userId === normalizarIdPositivo(cabecera.id)) &&
+        typeof req.body.password === "string" && req.body.password.trim() !== ''
+      ) {
+        if (req.body.password.length < 8 || req.body.password.length > 128) {
+          throw crearErrorNegocio("La contraseña debe tener entre 8 y 128 caracteres", 400);
+        }
         const passwordHash = await bcryptjs.hash(req.body.password, 8);
         updateFields.push('password = ?');
         updateValues.push(passwordHash);
@@ -14958,6 +16005,20 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
           valorAnterior: '[OCULTO]',
           valorNuevo: '[MODIFICADO]'
         });
+      }
+
+      const [rolFinalRows] = rolFinalId
+        ? await connection.query("SELECT nombre FROM rol WHERE id = ?", [rolFinalId])
+        : [[]];
+      if (rolFinalRows.length === 0) throw crearErrorNegocio("El usuario debe tener un rol válido", 400);
+      if (rolFinalRows[0].nombre === "afiliado") {
+        if (!departamentalFinalId || !tipoPersonaFinalId || !fechaNacimientoFinal
+          || calcularEdadEnFecha(fechaNacimientoFinal, obtenerFechaCivilHoyArgentina()) === null) {
+          throw crearErrorNegocio(
+            "Los afiliados requieren departamental, tipo de persona y fecha de nacimiento válidos",
+            400
+          );
+        }
       }
 
       // Procesar foto si viene
@@ -14972,6 +16033,7 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
             buffer: req.file.buffer,
             contentType: req.file.mimetype || getMimeTypeFromFileName(nombreArchivo, "image/jpeg"),
           });
+          fotoNuevaSubida = nombreArchivo;
 
           // Actualizar campo en base de datos
           updateFields.push('foto_archivo = ?');
@@ -15037,6 +16099,7 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
       }
 
       await connection.commit();
+      fotoNuevaSubida = null;
 
       res.status(200).json({
         success: true,
@@ -15047,6 +16110,13 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
       if (connection) {
         await connection.rollback();
       }
+      if (fotoNuevaSubida) {
+        try {
+          await deleteFileFromS3(fotoNuevaSubida);
+        } catch (deleteError) {
+          console.error("No se pudo limpiar la foto nueva tras revertir el usuario", deleteError?.name || deleteError?.code);
+        }
+      }
       throw updateError;
     } finally {
       if (connection) {
@@ -15056,6 +16126,12 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
 
   } catch (error) {
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ success: false, message: error.message });
+    }
+    if (error?.code === "ER_DUP_ENTRY") {
+      return res.status(409).json({ success: false, message: "Ya existe un usuario con esos datos" });
+    }
     res.status(500).json({
       success: false,
       message: "Error al actualizar el usuario"
@@ -15064,7 +16140,7 @@ router.put("/configuracion/usuario/:id", verifyToken, uploadFotoPerfil.single('f
 });
 
 // POST /configuracion/usuario - Crear nuevo usuario
-router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto'), async (req, res) => {
+router.post("/configuracion/usuario", verifyToken, manejarUploadFotoPerfil, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
 
@@ -15076,15 +16152,28 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
       });
     }
 
-    // Validar campos requeridos
-    if (!req.body.nombre || !req.body.apellido || !req.body.email || !req.body.documento) {
+    const nombreNormalizado = normalizarTexto(req.body?.nombre);
+    const apellidoNormalizado = normalizarTexto(req.body?.apellido);
+    const emailNormalizado = normalizarTexto(req.body?.email).toLowerCase();
+    const documentoTexto = normalizarTexto(req.body?.documento);
+    const passwordTexto = typeof req.body?.password === "string" ? req.body.password : "";
+
+    // Estos límites reflejan el esquema actual y evitan truncados/coerciones de MySQL.
+    if (!nombreNormalizado || nombreNormalizado.length > 45
+      || !apellidoNormalizado || apellidoNormalizado.length > 45
+      || !emailNormalizado || emailNormalizado.length > 45
+      || !/^\d{6,9}$/.test(documentoTexto)
+      || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNormalizado)
+      || passwordTexto.length < 8 || passwordTexto.length > 128) {
       return res.status(400).json({
         success: false,
-        message: "Faltan campos requeridos: nombre, apellido, email y documento son obligatorios"
+        message: "Nombre, apellido, email, documento y contraseña son inválidos"
       });
     }
+    const documentoValor = Number(documentoTexto);
 
     let connection;
+    let nombreArchivo = null;
     try {
       connection = await mysqlConnection.promise().getConnection();
       await connection.beginTransaction();
@@ -15093,6 +16182,10 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
       let camposPermitidos = [];
       let valorDefectoRol = null;
       let valorDefectoDepartamental = null;
+      let rolEfectivo = null;
+      let departamentalEfectiva = null;
+      let tipoPersonaEfectivo = null;
+      let fechaNacimientoEfectiva = null;
 
       if (cabecera.rol === "admin") {
         camposPermitidos = [
@@ -15113,8 +16206,16 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
         );
         if (rolAfiliado.length > 0) {
           valorDefectoRol = rolAfiliado[0].id;
+          rolEfectivo = "afiliado";
         }
-        valorDefectoDepartamental = cabecera.id;
+        const [usuarioDepartamental] = await connection.query(
+          "SELECT departamental_id FROM usuario WHERE id = ? LIMIT 1",
+          [cabecera.id]
+        );
+        valorDefectoDepartamental = normalizarIdPositivo(usuarioDepartamental[0]?.departamental_id);
+        if (!valorDefectoDepartamental) {
+          throw crearErrorNegocio("El usuario departamental no tiene una departamental válida asignada", 409);
+        }
       }
 
       // Preparar campos para insertar
@@ -15123,21 +16224,15 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
       const insertValues = [];
       const cambios = [];
 
-      // Función auxiliar para formatear fechas
-      const formatearFecha = (fecha) => {
-        if (!fecha) return null;
-        try {
-          const fechaObj = new Date(fecha);
-          if (isNaN(fechaObj.getTime())) return null;
-          return fechaObj.toISOString().split('T')[0];
-        } catch (error) {
-          return null;
-        }
-      };
+      const formatearFecha = (fecha) => formatearFechaSQL(fecha);
 
       // Procesar rol_id
       if (camposPermitidos.includes('rol_id') && req.body.rol_id !== undefined) {
-        const nuevoValor = req.body.rol_id ? parseInt(req.body.rol_id) : null;
+        const nuevoValor = normalizarIdPositivo(req.body.rol_id);
+        if (nuevoValor === null) throw crearErrorNegocio("Rol inválido", 400);
+        const [rolesValidos] = await connection.query("SELECT nombre FROM rol WHERE id = ?", [nuevoValor]);
+        if (rolesValidos.length === 0) throw crearErrorNegocio("Rol inexistente", 400);
+        rolEfectivo = rolesValidos[0].nombre;
         insertFields.push('rol_id');
         insertPlaceholders.push('?');
         insertValues.push(nuevoValor);
@@ -15155,11 +16250,24 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
           valorAnterior: null,
           valorNuevo: valorDefectoRol
         });
+      } else {
+        throw crearErrorNegocio("El rol es obligatorio", 400);
       }
 
       // Procesar departamental_id
       if (camposPermitidos.includes('departamental_id') && req.body.departamental_id !== undefined) {
-        const nuevoValor = req.body.departamental_id ? parseInt(req.body.departamental_id) : null;
+        const nuevoValor = req.body.departamental_id === "" ? null : normalizarIdPositivo(req.body.departamental_id);
+        if (req.body.departamental_id !== "" && nuevoValor === null) {
+          throw crearErrorNegocio("Departamental inválida", 400);
+        }
+        if (nuevoValor !== null) {
+          const [departamentalesValidas] = await connection.query(
+            "SELECT id FROM departamental WHERE id = ? AND habilitado = 'Y'",
+            [nuevoValor]
+          );
+          if (departamentalesValidas.length === 0) throw crearErrorNegocio("Departamental inexistente o deshabilitada", 400);
+        }
+        departamentalEfectiva = nuevoValor;
         insertFields.push('departamental_id');
         insertPlaceholders.push('?');
         insertValues.push(nuevoValor);
@@ -15169,6 +16277,7 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
           valorNuevo: nuevoValor
         });
       } else if (valorDefectoDepartamental !== null) {
+        departamentalEfectiva = valorDefectoDepartamental;
         insertFields.push('departamental_id');
         insertPlaceholders.push('?');
         insertValues.push(valorDefectoDepartamental);
@@ -15181,7 +16290,15 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
 
       // Procesar tipo_persona_id
       if (camposPermitidos.includes('tipo_persona_id') && req.body.tipo_persona_id !== undefined) {
-        const nuevoValor = req.body.tipo_persona_id ? parseInt(req.body.tipo_persona_id) : null;
+        const nuevoValor = req.body.tipo_persona_id === "" ? null : normalizarIdPositivo(req.body.tipo_persona_id);
+        if (req.body.tipo_persona_id !== "" && nuevoValor === null) {
+          throw crearErrorNegocio("Tipo de persona inválido", 400);
+        }
+        if (nuevoValor !== null) {
+          const [tiposValidos] = await connection.query("SELECT id FROM tipo_persona WHERE id = ?", [nuevoValor]);
+          if (tiposValidos.length === 0) throw crearErrorNegocio("Tipo de persona inexistente", 400);
+        }
+        tipoPersonaEfectivo = nuevoValor;
         insertFields.push('tipo_persona_id');
         insertPlaceholders.push('?');
         insertValues.push(nuevoValor);
@@ -15192,10 +16309,15 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
         });
       }
 
+      if (rolEfectivo === "afiliado" && (!departamentalEfectiva || !tipoPersonaEfectivo)) {
+        throw crearErrorNegocio("Los afiliados requieren departamental y tipo de persona válidos", 400);
+      }
+
       // Procesar áreas habilitadas (solo staff departamental / admin-central)
       for (const campoArea of ['area_turismo', 'area_coseguro']) {
         if (camposPermitidos.includes(campoArea) && req.body[campoArea] !== undefined) {
-          const nuevoValor = ["1", "true", 1, true].includes(req.body[campoArea]) ? 1 : 0;
+          const nuevoValor = normalizarBooleanoBinarioEstricto(req.body[campoArea]);
+          if (nuevoValor === null) throw crearErrorNegocio(`El valor de ${campoArea} es inválido`, 400);
           insertFields.push(campoArea);
           insertPlaceholders.push('?');
           insertValues.push(nuevoValor);
@@ -15210,38 +16332,44 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
       // Procesar nombre (requerido)
       insertFields.push('nombre');
       insertPlaceholders.push('?');
-      insertValues.push(req.body.nombre);
+      insertValues.push(nombreNormalizado);
       cambios.push({
         campo: 'nombre',
         valorAnterior: null,
-        valorNuevo: req.body.nombre
+        valorNuevo: nombreNormalizado
       });
 
       // Procesar apellido (requerido)
       insertFields.push('apellido');
       insertPlaceholders.push('?');
-      insertValues.push(req.body.apellido);
+      insertValues.push(apellidoNormalizado);
       cambios.push({
         campo: 'apellido',
         valorAnterior: null,
-        valorNuevo: req.body.apellido
+        valorNuevo: apellidoNormalizado
       });
 
       // Procesar fecha_nacimiento
       if (camposPermitidos.includes('fecha_nacimiento') && req.body.fecha_nacimiento !== undefined) {
         const fechaFormateada = formatearFecha(req.body.fecha_nacimiento);
+        if (!fechaFormateada || calcularEdadEnFecha(fechaFormateada, obtenerFechaCivilHoyArgentina()) === null) {
+          throw crearErrorNegocio("Fecha de nacimiento inválida", 400);
+        }
         insertFields.push('fecha_nacimiento');
         insertPlaceholders.push('?');
         insertValues.push(fechaFormateada);
+        fechaNacimientoEfectiva = fechaFormateada;
         cambios.push({
           campo: 'fecha_nacimiento',
           valorAnterior: null,
           valorNuevo: fechaFormateada
         });
       }
+      if (rolEfectivo === "afiliado" && !fechaNacimientoEfectiva) {
+        throw crearErrorNegocio("La fecha de nacimiento es obligatoria para afiliados", 400);
+      }
 
       // Procesar documento (requerido)
-      const documentoValor = req.body.documento ? parseInt(req.body.documento) : null;
       insertFields.push('documento');
       insertPlaceholders.push('?');
       insertValues.push(documentoValor);
@@ -15254,17 +16382,17 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
       // Procesar email (requerido)
       insertFields.push('email');
       insertPlaceholders.push('?');
-      insertValues.push(req.body.email);
+      insertValues.push(emailNormalizado);
       cambios.push({
         campo: 'email',
         valorAnterior: null,
-        valorNuevo: req.body.email
+        valorNuevo: emailNormalizado
       });
 
       // Verificar si el email ya existe
       const [emailExistente] = await connection.query(
         "SELECT id FROM usuario WHERE email = ?",
-        [req.body.email]
+        [emailNormalizado]
       );
 
       if (emailExistente.length > 0) {
@@ -15277,31 +16405,52 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
 
       // Procesar telefono
       if (camposPermitidos.includes('telefono') && req.body.telefono !== undefined) {
+        const telefono = normalizarTexto(req.body.telefono) || null;
+        if (telefono && telefono.length > 15) throw crearErrorNegocio("Teléfono inválido", 400);
         insertFields.push('telefono');
         insertPlaceholders.push('?');
-        insertValues.push(req.body.telefono || null);
+        insertValues.push(telefono);
         cambios.push({
           campo: 'telefono',
           valorAnterior: null,
-          valorNuevo: req.body.telefono || null
+          valorNuevo: telefono
         });
       }
 
       // Procesar legajo
       if (camposPermitidos.includes('legajo') && req.body.legajo !== undefined) {
+        const legajo = normalizarTexto(req.body.legajo) || null;
+        if (legajo && legajo.length > 45) throw crearErrorNegocio("Legajo inválido", 400);
         insertFields.push('legajo');
         insertPlaceholders.push('?');
-        insertValues.push(req.body.legajo || null);
+        insertValues.push(legajo);
         cambios.push({
           campo: 'legajo',
           valorAnterior: null,
-          valorNuevo: req.body.legajo || null
+          valorNuevo: legajo
         });
+      }
+
+      for (const [campo, longitud] of [["cuil", 11], ["cbu", 22]]) {
+        if (camposPermitidos.includes(campo) && req.body[campo] !== undefined) {
+          const valor = normalizarTexto(req.body[campo]) || null;
+          const valido = valor === null || (campo === "cuil" ? validarCuitCuil(valor) : validarCbu(valor));
+          if (!valido || (valor !== null && valor.length !== longitud)) {
+            throw crearErrorNegocio(`${campo.toUpperCase()} inválido`, 400);
+          }
+          insertFields.push(campo);
+          insertPlaceholders.push('?');
+          insertValues.push(valor);
+          cambios.push({ campo, valorAnterior: null, valorNuevo: valor });
+        }
       }
 
       // Procesar habilitado (por defecto true)
       if (camposPermitidos.includes('habilitado')) {
-        const habilitadoValor = req.body.habilitado !== undefined ? req.body.habilitado : true;
+        const habilitadoValor = req.body.habilitado === undefined
+          ? "Y"
+          : normalizarSiNoEstricto(req.body.habilitado);
+        if (habilitadoValor === null) throw crearErrorNegocio("El estado habilitado es inválido", 400);
         insertFields.push('habilitado');
         insertPlaceholders.push('?');
         insertValues.push(habilitadoValor);
@@ -15314,10 +16463,6 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
 
       // Procesar password (si viene, sino generar una por defecto o dejarla opcional)
       if (camposPermitidos.includes('password')) {
-        const passwordTexto = req.body.password && req.body.password.trim() !== ''
-          ? req.body.password
-          : req.body.documento ? req.body.documento.toString() : '123456';
-
         const passwordHash = await bcryptjs.hash(passwordTexto, 8);
         insertFields.push('password');
         insertPlaceholders.push('?');
@@ -15330,7 +16475,6 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
       }
 
       // Procesar foto si viene
-      let nombreArchivo = null;
       if (camposPermitidos.includes('foto_archivo') && req.file) {
         try {
           // Generar nombre único para la foto
@@ -15382,6 +16526,7 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
       }
 
       await connection.commit();
+      nombreArchivo = null;
 
       res.status(201).json({
         success: true,
@@ -15395,6 +16540,13 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
       if (connection) {
         await connection.rollback();
       }
+      if (nombreArchivo) {
+        try {
+          await deleteFileFromS3(nombreArchivo);
+        } catch (deleteError) {
+          console.error("No se pudo limpiar la foto del usuario no creado", deleteError?.name || deleteError?.code);
+        }
+      }
       throw createError;
     } finally {
       if (connection) {
@@ -15404,6 +16556,12 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
 
   } catch (error) {
     console.log(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ success: false, message: error.message });
+    }
+    if (error?.code === "ER_DUP_ENTRY") {
+      return res.status(409).json({ success: false, message: "Ya existe un usuario con esos datos" });
+    }
     res.status(500).json({
       success: false,
       message: "Error al crear el usuario"
@@ -15412,21 +16570,17 @@ router.post("/configuracion/usuario", verifyToken, uploadFotoPerfil.single('foto
 });
 
 function verifyToken(req, res, next) {
-  if (!req.headers.authorization) return res.status(401).json("No autorizado");
+  const coincidencia = /^Bearer ([^\s]+)$/.exec(String(req.headers.authorization || ""));
+  if (!coincidencia) return res.status(401).json("No autorizado");
 
-  const token = req.headers.authorization.substr(7);
-  if (token !== "") {
-    jwt.verify(token, process.env.JWT_SECRET, (error, authData) => {
-      if (error) {
-        res.status(403).json("Error en el token");
-      } else {
-        req.data = authData;
-        next();
-      }
-    });
-  } else {
-    res.status(401).json("Token vacio");
-  }
+  jwt.verify(coincidencia[1], process.env.JWT_SECRET, (error, authData) => {
+    if (error) {
+      res.status(403).json("Error en el token");
+    } else {
+      req.data = authData;
+      next();
+    }
+  });
 }
 
 module.exports = router;

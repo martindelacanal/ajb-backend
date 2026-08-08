@@ -14,7 +14,7 @@
  * comparar contra las 8 orientaciones hace la detección inmune a rotaciones y espejos
  * sin depender de una canonización inestable.
  */
-const Jimp = require("jimp");
+const { Jimp, ResizeStrategy, intToRGBA } = require("jimp");
 
 const TAMANIO_NORMALIZADO = 128; // miniatura cuadrada de trabajo
 const GRILLA = 16; // 16x16 comparaciones -> 256 bits -> 64 caracteres hex
@@ -31,12 +31,16 @@ const MINIMO_BITS_INFORMACION = 30;
 
 /** dHash de 256 bits de una imagen Jimp cuadrada; devuelve hex de 64 caracteres */
 function dhash256(imagen) {
-  const chica = imagen.clone().resize(GRILLA + 1, GRILLA, Jimp.RESIZE_BILINEAR);
+  const chica = imagen.clone().resize({
+    w: GRILLA + 1,
+    h: GRILLA,
+    mode: ResizeStrategy.BILINEAR,
+  });
   let hash = 0n;
   for (let y = 0; y < GRILLA; y++) {
     for (let x = 0; x < GRILLA; x++) {
-      const izquierda = Jimp.intToRGBA(chica.getPixelColor(x, y)).r;
-      const derecha = Jimp.intToRGBA(chica.getPixelColor(x + 1, y)).r;
+      const izquierda = intToRGBA(chica.getPixelColor(x, y)).r;
+      const derecha = intToRGBA(chica.getPixelColor(x + 1, y)).r;
       hash = (hash << 1n) | (izquierda > derecha ? 1n : 0n);
     }
   }
@@ -51,20 +55,27 @@ function dhash256(imagen) {
 async function calcularPhashes(buffer, mime) {
   if (!mime || !mime.startsWith("image/")) return null;
   try {
-    const imagen = await Jimp.read(buffer);
+    const imagen = await Jimp.fromBuffer(buffer);
     imagen
-      .grayscale()
+      .greyscale()
       // Bicúbica + blur: con esta combinación una rotación/espejo exacto da distancia 0
       // y documentos distintos quedan lejos (medido: 35+ bits)
-      .resize(TAMANIO_NORMALIZADO, TAMANIO_NORMALIZADO, Jimp.RESIZE_BICUBIC)
+      .resize({
+        w: TAMANIO_NORMALIZADO,
+        h: TAMANIO_NORMALIZADO,
+        mode: ResizeStrategy.BICUBIC,
+      })
       .blur(3);
 
     const hashes = [];
     for (const espejar of [false, true]) {
       let base = imagen.clone();
-      if (espejar) base.flip(true, false);
+      if (espejar) base.flip({ horizontal: true, vertical: false });
       for (let giro = 0; giro < 4; giro++) {
-        const orientada = giro === 0 ? base : base.clone().rotate(giro * 90, false);
+        const orientada =
+          giro === 0
+            ? base
+            : base.clone().rotate({ deg: giro * 90, mode: false });
         hashes.push(dhash256(orientada));
       }
     }

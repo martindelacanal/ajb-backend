@@ -1,20 +1,28 @@
 const users = [];
  
 const addUser = ({id, usuario, rol}) => {
-    rol = rol.trim().toLowerCase();
-    if (rol === "cliente"){
-        room = "cliente";
-    } else {
-        room = "admin";
+    const rolNormalizado = String(rol || "").trim().toLowerCase();
+    if (rolNormalizado !== "cliente" && rolNormalizado !== "admin") {
+        return { error: "Rol invalido" };
     }
-    const existingUser = users.find((user) => {
-        user.usuario === usuario
-    });
- 
-    if(existingUser) {
-        return{error: "Username is taken"};
+
+    const idNormalizado = String(id || "").trim();
+    const usuarioNormalizado = String(usuario || "").trim();
+    if (!idNormalizado || !usuarioNormalizado) {
+        return { error: "Usuario invalido" };
     }
-    const user = {id,usuario,rol,room};
+
+    const existingSocket = users.find((user) => user.id === idNormalizado);
+    if (existingSocket) {
+        return { user: existingSocket };
+    }
+
+    const user = {
+        id: idNormalizado,
+        usuario: usuarioNormalizado,
+        rol: rolNormalizado,
+        room: rolNormalizado,
+    };
  
     users.push(user);
     return {user};
@@ -36,10 +44,13 @@ const getUser = (id) => users
         .find((user) => user.id === id);
         
 const getUserByUsuario = (usuario) => users
-        .find((user) => user.usuario === usuario);
+        .find((user) => user.usuario === String(usuario));
+
+const getUsersByUsuario = (usuario) => users
+        .filter((user) => user.usuario === String(usuario));
  
 const getUsersInRoom = (room) => users
         .filter((user) => user.room === room);
  
 module.exports = {addUser, removeUser,
-        getUser, getUsers, getUsersInRoom, getUserByUsuario};
+        getUser, getUsers, getUsersInRoom, getUserByUsuario, getUsersByUsuario};

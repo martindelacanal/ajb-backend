@@ -18,6 +18,11 @@ const fs = require("fs");
 const path = require("path");
 const forge = require("node-forge");
 const moment = require("moment");
+const {
+  centavosADecimal,
+  decimalACentavos,
+  normalizarFechaCivil,
+} = require("./valores-dominio");
 
 const RAIZ_BACKEND = path.join(__dirname, "..", "..");
 
@@ -154,7 +159,8 @@ async function obtenerTicketAcceso(forzar = false) {
 
   const ta = { token, sign, expirationTime, obtenido: moment().format() };
   try {
-    fs.writeFileSync(rutaCache, JSON.stringify(ta, null, 2));
+    fs.writeFileSync(rutaCache, JSON.stringify(ta, null, 2), { mode: 0o600 });
+    fs.chmodSync(rutaCache, 0o600);
   } catch (e) {
     console.error("No se pudo cachear el TA de ARCA:", e.message);
   }
@@ -169,6 +175,13 @@ function escaparXml(valor) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+function enteroPositivoEstricto(valor, maximo) {
+  if (typeof valor === "string" && !/^\d+$/.test(valor.trim())) return null;
+  if (typeof valor !== "string" && typeof valor !== "number") return null;
+  const numero = Number(valor);
+  return Number.isSafeInteger(numero) && numero > 0 && numero <= maximo ? numero : null;
 }
 
 async function llamarWscdc(metodo, cuerpoXml) {
@@ -222,29 +235,55 @@ async function comprobanteDummy() {
  *          cbte_tipo (código ARCA, ej: 11 = Factura C), doc_tipo_receptor?, doc_nro_receptor? }
  */
 async function constatarComprobante(datos) {
+  const cuitEmisor = String(datos?.cuit_emisor ?? "").replace(/\D/g, "");
+  const puntoVenta = enteroPositivoEstricto(datos?.pto_venta, 99999);
+  const tipoComprobante = enteroPositivoEstricto(datos?.cbte_tipo, 999);
+  const numeroComprobante = enteroPositivoEstricto(datos?.numero, 99999999);
+  const fecha = normalizarFechaCivil(datos?.fecha);
+  const importeCentavos = decimalACentavos(datos?.importe, { permiteCero: false });
+  const codigoAutorizacion = String(datos?.cod_autorizacion ?? "").replace(/\D/g, "");
+  const modo = String(datos?.cbte_modo || "CAE").trim().toUpperCase();
+  const documentoReceptor = datos?.doc_nro_receptor === undefined || datos?.doc_nro_receptor === null
+    ? ""
+    : String(datos.doc_nro_receptor).replace(/\D/g, "");
+  const tipoDocumentoReceptor = enteroPositivoEstricto(datos?.doc_tipo_receptor || 80, 999);
+
+  if (
+    !/^\d{11}$/.test(cuitEmisor) ||
+    puntoVenta === null ||
+    tipoComprobante === null || !TIPOS_COMPROBANTE_ARCA.some((tipo) => tipo.codigo === tipoComprobante) ||
+    numeroComprobante === null ||
+    !fecha || importeCentavos === null || importeCentavos <= 0 ||
+    !/^\d{6,20}$/.test(codigoAutorizacion) ||
+    !["CAE", "CAI", "CAEA"].includes(modo) ||
+    (documentoReceptor && (!/^\d{5,20}$/.test(documentoReceptor) || tipoDocumentoReceptor === null))
+  ) {
+    throw new TypeError("Los datos del comprobante para ARCA no son validos");
+  }
+
   const config = configuracion();
   const ta = await obtenerTicketAcceso();
 
-  const receptor = datos.doc_nro_receptor
-    ? `<ws:DocTipoReceptor>${escaparXml(datos.doc_tipo_receptor || "80")}</ws:DocTipoReceptor>
-       <ws:DocNroReceptor>${escaparXml(datos.doc_nro_receptor)}</ws:DocNroReceptor>`
+  const receptor = documentoReceptor
+    ? `<ws:DocTipoReceptor>${tipoDocumentoReceptor}</ws:DocTipoReceptor>
+       <ws:DocNroReceptor>${escaparXml(documentoReceptor)}</ws:DocNroReceptor>`
     : "";
 
   const cuerpo = `
       <ws:Auth>
-        <ws:Token>${ta.token}</ws:Token>
-        <ws:Sign>${ta.sign}</ws:Sign>
-        <ws:Cuit>${config.cuit}</ws:Cuit>
+        <ws:Token>${escaparXml(ta.token)}</ws:Token>
+        <ws:Sign>${escaparXml(ta.sign)}</ws:Sign>
+        <ws:Cuit>${escaparXml(config.cuit)}</ws:Cuit>
       </ws:Auth>
       <ws:CmpReq>
-        <ws:CbteModo>${escaparXml(datos.cbte_modo || "CAE")}</ws:CbteModo>
-        <ws:CuitEmisor>${escaparXml(datos.cuit_emisor)}</ws:CuitEmisor>
-        <ws:PtoVta>${Number(datos.pto_venta)}</ws:PtoVta>
-        <ws:CbteTipo>${Number(datos.cbte_tipo)}</ws:CbteTipo>
-        <ws:CbteNro>${Number(datos.numero)}</ws:CbteNro>
-        <ws:CbteFch>${moment(datos.fecha).format("YYYYMMDD")}</ws:CbteFch>
-        <ws:ImpTotal>${Number(datos.importe).toFixed(2)}</ws:ImpTotal>
-        <ws:CodAutorizacion>${escaparXml(String(datos.cod_autorizacion || "").replace(/\D/g, ""))}</ws:CodAutorizacion>
+        <ws:CbteModo>${modo}</ws:CbteModo>
+        <ws:CuitEmisor>${cuitEmisor}</ws:CuitEmisor>
+        <ws:PtoVta>${puntoVenta}</ws:PtoVta>
+        <ws:CbteTipo>${tipoComprobante}</ws:CbteTipo>
+        <ws:CbteNro>${numeroComprobante}</ws:CbteNro>
+        <ws:CbteFch>${fecha.replace(/-/g, "")}</ws:CbteFch>
+        <ws:ImpTotal>${centavosADecimal(importeCentavos)}</ws:ImpTotal>
+        <ws:CodAutorizacion>${codigoAutorizacion}</ws:CodAutorizacion>
         ${receptor}
       </ws:CmpReq>`;
 

@@ -25,6 +25,17 @@ const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/clien
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const arca = require("../services/arca");
 const { calcularPhashes, sonMismaImagen, parsearPhash } = require("../services/imagen-hash");
+const {
+  centavosANumero,
+  decimalACentavos,
+  decimalAPuntosBase,
+  normalizarFechaCivil,
+} = require("../services/valores-dominio");
+const {
+  archivarVersionReservaAntesDeReemplazo,
+  cerrarGuardiaArchivoReserva,
+  limpiarTokenGuardiaArchivoReserva,
+} = require("../services/reserva-version-archivo");
 
 // ---------------------------------------------------------------------------
 // S3
@@ -38,6 +49,49 @@ const s3 = new S3Client({
   region: process.env.BUCKET_REGION,
 });
 const S3_SIGNED_URL_EXPIRES_SECONDS = Number.parseInt(process.env.S3_SIGNED_URL_EXPIRES_SECONDS || "3600", 10);
+const MAX_ARCHIVO_COSEGURO_BYTES = 10 * 1024 * 1024;
+const MAX_TOTAL_COSEGURO_BYTES = 50 * 1024 * 1024;
+const MAX_FIRMA_BYTES = 2 * 1024 * 1024;
+
+const MIME_IMAGEN_PERMITIDO = new Set(["image/jpeg", "image/png", "image/webp", "image/heic"]);
+
+function detectarMimeArchivo(buffer, { permitePdf = false } = {}) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4) return null;
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg";
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (buffer.length >= 12 && buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP") return "image/webp";
+  if (buffer.length >= 12 && buffer.toString("ascii", 4, 8) === "ftyp") {
+    const marcas = buffer.toString("ascii", 8, Math.min(buffer.length, 40));
+    if (/(heic|heix|hevc|hevx|mif1|msf1)/.test(marcas)) return "image/heic";
+  }
+  if (permitePdf && buffer.length >= 5 && buffer.toString("ascii", 0, 5) === "%PDF-") return "application/pdf";
+  return null;
+}
+
+function validarContenidoArchivo(file, { permitePdf = false } = {}) {
+  if (!file || !Buffer.isBuffer(file.buffer) || file.buffer.length === 0 || file.buffer.length > MAX_ARCHIVO_COSEGURO_BYTES) {
+    return { error: "El archivo está vacío o supera el máximo de 10 MB" };
+  }
+  const mimeDetectado = detectarMimeArchivo(file.buffer, { permitePdf });
+  const mimeDeclarado = file.mimetype === "image/jpg" ? "image/jpeg" : file.mimetype;
+  if (!mimeDetectado || (!MIME_IMAGEN_PERMITIDO.has(mimeDetectado) && mimeDetectado !== "application/pdf")) {
+    return { error: "Formato no permitido: usá JPEG, PNG, WebP, HEIC o PDF" };
+  }
+  if (mimeDetectado !== mimeDeclarado) return { error: "El contenido del archivo no coincide con el tipo declarado" };
+  file.mimetype = mimeDetectado;
+  return { mime: mimeDetectado };
+}
+
+function decodificarFirmaBase64(firmaBase64) {
+  const match = /^data:(image\/(?:jpeg|jpg|png|webp|heic));base64,([A-Za-z0-9+/]+={0,2})$/.exec(String(firmaBase64 || ""));
+  if (!match || match[2].length % 4 !== 0 || match[2].length > Math.ceil(MAX_FIRMA_BYTES / 3) * 4) return null;
+  const buffer = Buffer.from(match[2], "base64");
+  if (buffer.length === 0 || buffer.length > MAX_FIRMA_BYTES || buffer.toString("base64") !== match[2]) return null;
+  const mimeDeclarado = match[1] === "image/jpg" ? "image/jpeg" : match[1];
+  const mimeDetectado = detectarMimeArchivo(buffer);
+  if (!mimeDetectado || mimeDetectado !== mimeDeclarado || !MIME_IMAGEN_PERMITIDO.has(mimeDetectado)) return null;
+  return { buffer, mime: mimeDetectado };
+}
 
 async function uploadBufferToS3({ key, buffer, contentType }) {
   await s3.send(new PutObjectCommand({ Bucket: bucketName, Key: key, Body: buffer, ContentType: contentType }));
@@ -63,6 +117,8 @@ async function getSignedFileUrlFromS3(key) {
 }
 
 async function subirArchivoCoseguro(file, prefijo) {
+  const validacion = validarContenidoArchivo(file, { permitePdf: true });
+  if (validacion.error) throw crearErrorHttp(validacion.error, 400);
   const extension = extensionSegura(file.originalname, file.mimetype);
   const key = `coseguro/${prefijo}_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.${extension}`;
   await uploadBufferToS3({ key, buffer: file.buffer, contentType: file.mimetype });
@@ -70,11 +126,11 @@ async function subirArchivoCoseguro(file, prefijo) {
 }
 
 async function subirFirmaBase64(firmaBase64) {
-  const match = /^data:(image\/[a-z+.-]+);base64,(.+)$/i.exec(firmaBase64 || "");
-  if (!match) return null;
-  const buffer = Buffer.from(match[2], "base64");
-  const key = `coseguro/firma_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.png`;
-  await uploadBufferToS3({ key, buffer, contentType: match[1] });
+  const firma = decodificarFirmaBase64(firmaBase64);
+  if (!firma) throw crearErrorHttp("La firma debe ser una imagen JPEG, PNG, WebP o HEIC válida de hasta 2 MB", 400);
+  const extension = extensionSegura(null, firma.mime);
+  const key = `coseguro/firma_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.${extension}`;
+  await uploadBufferToS3({ key, buffer: firma.buffer, contentType: firma.mime });
   return key;
 }
 
@@ -88,10 +144,9 @@ const EXTENSION_POR_MIME = {
 };
 
 function extensionSegura(nombre, mime) {
-  if (EXTENSION_POR_MIME[mime]) return EXTENSION_POR_MIME[mime];
-  const partes = String(nombre || "").split(".");
-  const ext = partes.length > 1 ? partes.pop().toLowerCase().replace(/[^a-z0-9]/g, "") : "";
-  return ext || "bin";
+  const extension = EXTENSION_POR_MIME[mime === "image/jpg" ? "image/jpeg" : mime];
+  if (!extension) throw crearErrorHttp("Formato de archivo no permitido", 400);
+  return extension;
 }
 
 // ---------------------------------------------------------------------------
@@ -106,11 +161,12 @@ const SLOTS_VALIDOS = [
 
 const uploadCoseguro = multer({
   storage: multer.memoryStorage(),
-  limits: { files: 20, fileSize: 10 * 1024 * 1024 },
+  limits: { files: 20, fileSize: MAX_ARCHIVO_COSEGURO_BYTES, fieldSize: Math.ceil(MAX_FIRMA_BYTES / 3) * 4 + 256 },
   fileFilter: (req, file, cb) => {
-    const esImagen = file.mimetype?.startsWith("image/");
+    const mime = file.mimetype === "image/jpg" ? "image/jpeg" : file.mimetype;
+    const esImagen = MIME_IMAGEN_PERMITIDO.has(mime);
     const esPdf = file.mimetype === "application/pdf";
-    if (!esImagen && !esPdf) return cb(new Error("Solo se permiten imágenes o PDF"));
+    if (!esImagen && !esPdf) return cb(new Error("Solo se permiten JPEG, PNG, WebP, HEIC o PDF"));
     return cb(null, true);
   },
 });
@@ -118,6 +174,12 @@ const uploadCoseguro = multer({
 function manejarUploadCoseguro(req, res, next) {
   uploadCoseguro.any()(req, res, (error) => {
     if (error) return res.status(400).json(error.message || "No se pudieron procesar los archivos");
+    const totalBytes = (req.files || []).reduce((total, file) => total + (file.buffer?.length || 0), 0);
+    if (totalBytes > MAX_TOTAL_COSEGURO_BYTES) return res.status(400).json("Los archivos superan el máximo total de 50 MB");
+    for (const file of req.files || []) {
+      const validacion = validarContenidoArchivo(file, { permitePdf: true });
+      if (validacion.error) return res.status(400).json(validacion.error);
+    }
     return next();
   });
 }
@@ -145,20 +207,13 @@ function manejarUploadCsv(req, res, next) {
 // Auth
 // ---------------------------------------------------------------------------
 function verifyToken(req, res, next) {
-  if (!req.headers.authorization) return res.status(401).json("No autorizado");
-  const token = req.headers.authorization.substr(7);
-  if (token !== "") {
-    jwt.verify(token, process.env.JWT_SECRET, (error, authData) => {
-      if (error) {
-        res.status(403).json("Error en el token");
-      } else {
-        req.data = authData;
-        next();
-      }
-    });
-  } else {
-    res.status(401).json("Token vacio");
-  }
+  const coincidencia = /^Bearer ([^\s]+)$/.exec(String(req.headers.authorization || ""));
+  if (!coincidencia) return res.status(401).json("Se requiere Authorization: Bearer <token>");
+  jwt.verify(coincidencia[1], process.env.JWT_SECRET, (error, authData) => {
+    if (error) return res.status(403).json("Error en el token");
+    req.data = authData;
+    return next();
+  });
 }
 
 function getCabecera(req) {
@@ -258,9 +313,9 @@ function puedeVerSolicitud(cabecera, solicitud) {
     case "auditor":
       return [ESTADO.APROBADA_CENTRAL, ESTADO.EXPORTADO, ESTADO.PENDIENTE_ACREDITACION, ESTADO.LIQUIDADO].includes(solicitud.estado_id);
     case "departamental":
-      return Number(solicitud.departamental_id) === Number(cabecera.departamental_id);
+      return idsPositivosIguales(solicitud.departamental_id, cabecera.departamental_id);
     case "afiliado":
-      return Number(solicitud.usuario_id) === Number(cabecera.id);
+      return idsPositivosIguales(solicitud.usuario_id, cabecera.id);
     default:
       return false;
   }
@@ -270,8 +325,8 @@ function puedeEditarSolicitud(cabecera, solicitud) {
   if (!tieneAreaCoseguro(cabecera)) return false;
   const estados = ESTADOS_EDICION_POR_ROL[cabecera.rol] || [];
   if (!estados.includes(solicitud.estado_id)) return false;
-  if (cabecera.rol === "afiliado") return Number(solicitud.usuario_id) === Number(cabecera.id);
-  if (cabecera.rol === "departamental") return Number(solicitud.departamental_id) === Number(cabecera.departamental_id);
+  if (cabecera.rol === "afiliado") return idsPositivosIguales(solicitud.usuario_id, cabecera.id);
+  if (cabecera.rol === "departamental") return idsPositivosIguales(solicitud.departamental_id, cabecera.departamental_id);
   return true;
 }
 
@@ -279,7 +334,7 @@ function puedeEliminarSolicitud(cabecera, solicitud) {
   if (!tieneAreaCoseguro(cabecera)) return false;
   const estados = ESTADOS_ELIMINACION_POR_ROL[cabecera.rol] || [];
   if (!estados.includes(solicitud.estado_id)) return false;
-  if (cabecera.rol === "departamental") return Number(solicitud.departamental_id) === Number(cabecera.departamental_id);
+  if (cabecera.rol === "departamental") return idsPositivosIguales(solicitud.departamental_id, cabecera.departamental_id);
   return cabecera.rol === "admin";
 }
 
@@ -325,10 +380,124 @@ function normalizarDigitos(valor, maxLargo) {
   return maxLargo ? texto.slice(0, maxLargo) : texto;
 }
 
-function normalizarImporte(valor) {
-  if (valor === undefined || valor === null || valor === "") return null;
-  const numero = Number(String(valor).replace(",", "."));
-  return Number.isFinite(numero) ? Math.round(numero * 100) / 100 : null;
+const MAX_DECIMAL_12_2_CENTAVOS = 999_999_999_999;
+const BLOQUEO_DUPLICADOS_COSEGURO = "ajb:coseguro:duplicados:v1";
+const SEGUNDOS_ESPERA_BLOQUEO_DUPLICADOS = 10;
+
+function normalizarIdPositivo(valor) {
+  if (typeof valor === "number") {
+    return Number.isSafeInteger(valor) && valor > 0 ? valor : null;
+  }
+  if (typeof valor !== "string") return null;
+  const texto = valor.trim();
+  if (!/^\d+$/.test(texto)) return null;
+  const numero = Number(texto);
+  return Number.isSafeInteger(numero) && numero > 0 ? numero : null;
+}
+
+function normalizarEnteroSeguro(valor, { minimo = 0, maximo = Number.MAX_SAFE_INTEGER } = {}) {
+  if (!Number.isSafeInteger(minimo) || !Number.isSafeInteger(maximo) || minimo > maximo) return null;
+  if (typeof valor === "number") {
+    return Number.isSafeInteger(valor) && valor >= minimo && valor <= maximo ? valor : null;
+  }
+  if (typeof valor !== "string") return null;
+  const texto = valor.trim();
+  if (!/^\d+$/.test(texto)) return null;
+  const numero = Number(texto);
+  return Number.isSafeInteger(numero) && numero >= minimo && numero <= maximo ? numero : null;
+}
+
+function valorOpcionalInformado(valor) {
+  return valor !== undefined && valor !== null && !(typeof valor === "string" && valor.trim() === "");
+}
+
+function normalizarIdOpcional(valor, nombre) {
+  if (!valorOpcionalInformado(valor)) return null;
+  const id = normalizarIdPositivo(valor);
+  if (id === null) throw crearErrorHttp(`${nombre} inválido`, 400);
+  return id;
+}
+
+function normalizarListaIdsPositivos(valor, { maximoItems = 500 } = {}) {
+  const items = Array.isArray(valor)
+    ? valor
+    : typeof valor === "string"
+      ? valor.split(",")
+      : null;
+  if (!items || items.length === 0 || items.length > maximoItems) return null;
+  const ids = items.map((item) => normalizarIdPositivo(item));
+  if (ids.some((id) => id === null)) return null;
+  return [...new Set(ids)];
+}
+
+function idsPositivosIguales(izquierda, derecha) {
+  const idIzquierda = normalizarIdPositivo(izquierda);
+  const idDerecha = normalizarIdPositivo(derecha);
+  return idIzquierda !== null && idDerecha !== null && idIzquierda === idDerecha;
+}
+
+function normalizarBooleanoOpcional(valor, nombre) {
+  if (!valorOpcionalInformado(valor)) return false;
+  if (valor === true || valor === 1 || valor === "1" || valor === "true") return true;
+  if (valor === false || valor === 0 || valor === "0" || valor === "false") return false;
+  throw crearErrorHttp(`${nombre} inválido`, 400);
+}
+
+function normalizarFechaFiltro(valor, nombre) {
+  if (!valorOpcionalInformado(valor)) return null;
+  const fecha = normalizarFecha(valor);
+  if (!fecha) throw crearErrorHttp(`${nombre} inválida`, 400);
+  return fecha;
+}
+
+function normalizarImporteFiltro(valor, nombre) {
+  if (!valorOpcionalInformado(valor)) return null;
+  const importe = normalizarImporte(valor);
+  if (importe === null) throw crearErrorHttp(`${nombre} inválido`, 400);
+  return importe;
+}
+
+function validarRangoFiltros(desde, hasta, nombre) {
+  if (desde !== null && hasta !== null && desde > hasta) {
+    throw crearErrorHttp(`El rango de ${nombre} es inválido`, 400);
+  }
+}
+
+function importeACentavos(valor, { permiteCero = true } = {}) {
+  const centavos = decimalACentavos(valor, { permiteCero, permiteNegativo: false });
+  if (centavos === null || centavos > MAX_DECIMAL_12_2_CENTAVOS) return null;
+  return centavos;
+}
+
+function normalizarImporte(valor, opciones = {}) {
+  const centavos = importeACentavos(valor, opciones);
+  return centavos === null ? null : centavosANumero(centavos);
+}
+
+function crearErrorHttp(mensaje, statusCode = 400) {
+  const error = new Error(mensaje);
+  error.statusCode = statusCode;
+  return error;
+}
+
+async function adquirirBloqueoDuplicados(connection) {
+  const [rows] = await connection.query(
+    "SELECT GET_LOCK(?, ?) AS adquirido",
+    [BLOQUEO_DUPLICADOS_COSEGURO, SEGUNDOS_ESPERA_BLOQUEO_DUPLICADOS]
+  );
+  if (Number(rows?.[0]?.adquirido) !== 1) {
+    throw crearErrorHttp("No se pudo validar el comprobante por concurrencia. Intentá nuevamente.", 409);
+  }
+  return true;
+}
+
+async function liberarBloqueoDuplicados(connection) {
+  if (!connection) return;
+  try {
+    await connection.query("SELECT RELEASE_LOCK(?) AS liberado", [BLOQUEO_DUPLICADOS_COSEGURO]);
+  } catch (error) {
+    console.error("No se pudo liberar el bloqueo de duplicados de coseguro:", error.message);
+  }
 }
 
 // Cobertura automática: cada tipo de reintegro puede definir un porcentaje de cobertura
@@ -338,17 +507,27 @@ function normalizarImporte(valor) {
 function calcularReintegroEstimado(tipo, importe) {
   const sinEstimacion = { porcentaje: null, estimado: null };
   if (!tipo || tipo.modo_cobertura !== "PORCENTAJE" || importe === null || importe === undefined) return sinEstimacion;
-  const porcentaje = Number(tipo.porcentaje_cobertura);
-  if (!Number.isFinite(porcentaje) || porcentaje <= 0) return sinEstimacion;
-  let estimado = Math.round(((importe * porcentaje) / 100) * 100) / 100;
-  const tope = tipo.tope_reintegro === null || tipo.tope_reintegro === undefined ? null : Number(tipo.tope_reintegro);
-  if (tope !== null && Number.isFinite(tope) && tope > 0 && estimado > tope) estimado = tope;
-  return { porcentaje: Math.round(porcentaje * 100) / 100, estimado };
+  const importeCentavos = importeACentavos(importe, { permiteCero: false });
+  const porcentajePuntosBase = decimalAPuntosBase(tipo.porcentaje_cobertura);
+  if (importeCentavos === null || porcentajePuntosBase === null || porcentajePuntosBase <= 0) return sinEstimacion;
+
+  let estimadoCentavos = Number(
+    (BigInt(importeCentavos) * BigInt(porcentajePuntosBase) + 5000n) / 10000n
+  );
+  const tieneTope = tipo.tope_reintegro !== null && tipo.tope_reintegro !== undefined && tipo.tope_reintegro !== "";
+  const topeCentavos = tieneTope ? importeACentavos(tipo.tope_reintegro, { permiteCero: false }) : null;
+  if (tieneTope && topeCentavos === null) return sinEstimacion;
+  if (topeCentavos !== null) estimadoCentavos = Math.min(estimadoCentavos, topeCentavos);
+  if (estimadoCentavos > MAX_DECIMAL_12_2_CENTAVOS) return sinEstimacion;
+
+  return {
+    porcentaje: porcentajePuntosBase / 100,
+    estimado: centavosANumero(estimadoCentavos),
+  };
 }
 
 function normalizarFecha(valor) {
-  const fecha = moment(String(valor || "").slice(0, 10), ["YYYY-MM-DD", "DD/MM/YYYY", "DD-MM-YYYY"], true);
-  return fecha.isValid() ? fecha.format("YYYY-MM-DD") : null;
+  return normalizarFechaCivil(valor);
 }
 
 // Formatos de fecha/hora aceptados en el CSV de liquidación del banco
@@ -566,13 +745,23 @@ async function extraerDatosComprobanteIA(files) {
 async function buscarDuplicadosComprobante(db, { emisor_cuit, comprobante_pto_venta, comprobante_numero, usuario_id, excluirId }) {
   if (!comprobante_numero) return [];
   if (!emisor_cuit && !usuario_id) return [];
-  const condiciones = ["s.eliminado = 0", "s.estado_id NOT IN (?, ?)", "s.comprobante_numero = ?"];
-  const params = [ESTADO.RECHAZADA_DEPTO, ESTADO.CANCELADA, comprobante_numero];
+  // Debe usar exactamente la misma identidad canónica que
+  // coseguro_comprobante_claim: de lo contrario una variante con ceros a la
+  // izquierda puede superar el chequeo de la API y fallar recién en el trigger.
+  const numeroCanonico = String(comprobante_numero).replace(/^0+/, "") || "0";
+  const condiciones = [
+    "s.eliminado = 0",
+    "s.estado_id NOT IN (?, ?)",
+    "COALESCE(NULLIF(TRIM(LEADING '0' FROM s.comprobante_numero), ''), '0') = ?",
+  ];
+  const params = [ESTADO.RECHAZADA_DEPTO, ESTADO.CANCELADA, numeroCanonico];
 
   const alcance = [];
   if (emisor_cuit) {
-    alcance.push("s.emisor_cuit = ? OR s.emisor_cuit IS NULL");
-    params.push(emisor_cuit);
+    alcance.push(
+      "NULLIF(REGEXP_REPLACE(COALESCE(s.emisor_cuit, ''), '[^0-9]', ''), '') = ? OR s.emisor_cuit IS NULL"
+    );
+    params.push(normalizarDigitos(emisor_cuit, 11));
   }
   if (usuario_id) {
     alcance.push("s.usuario_id = ?");
@@ -582,8 +771,12 @@ async function buscarDuplicadosComprobante(db, { emisor_cuit, comprobante_pto_ve
 
   // Si ambos tienen punto de venta y difieren, son comprobantes distintos
   if (comprobante_pto_venta) {
-    condiciones.push("(s.comprobante_pto_venta = ? OR s.comprobante_pto_venta IS NULL)");
-    params.push(comprobante_pto_venta);
+    const puntoCanonico = (String(comprobante_pto_venta).replace(/^0+/, "") || "0")
+      .padStart(5, "0");
+    condiciones.push(
+      "(LPAD(COALESCE(NULLIF(TRIM(LEADING '0' FROM s.comprobante_pto_venta), ''), '0'), 5, '0') = ? OR s.comprobante_pto_venta IS NULL)"
+    );
+    params.push(puntoCanonico);
   }
   if (excluirId) {
     condiciones.push("s.id <> ?");
@@ -840,7 +1033,7 @@ router.put("/coseguro/cobertura", verifyToken, async (req, res) => {
     const errores = [];
     const normalizados = [];
     for (const item of items) {
-      const id = Number(item.id);
+      const id = normalizarIdPositivo(item.id);
       if (!id) continue;
       const modo = String(item.modo_cobertura || "").toUpperCase() === "PORCENTAJE" ? "PORCENTAJE" : "MANUAL";
       let porcentaje = null;
@@ -850,8 +1043,9 @@ router.put("/coseguro/cobertura", verifyToken, async (req, res) => {
         if (porcentaje === null || porcentaje <= 0 || porcentaje > 100) {
           errores.push(`El porcentaje de "${normalizarTexto(item.nombre) || `tipo #${id}`}" debe estar entre 0,01 y 100`);
         }
-        tope = normalizarImporte(item.tope_reintegro);
-        if (tope !== null && tope <= 0) errores.push(`El tope de "${normalizarTexto(item.nombre) || `tipo #${id}`}" debe ser mayor a 0 (o quedar vacío)`);
+        const topeVacio = item.tope_reintegro === undefined || item.tope_reintegro === null || String(item.tope_reintegro).trim() === "";
+        tope = topeVacio ? null : normalizarImporte(item.tope_reintegro, { permiteCero: false });
+        if (!topeVacio && tope === null) errores.push(`El tope de "${normalizarTexto(item.nombre) || `tipo #${id}`}" debe ser un monto mayor a 0, con hasta dos decimales`);
       }
       normalizados.push({ id, modo, porcentaje, tope });
     }
@@ -889,8 +1083,10 @@ router.put("/coseguro/cobertura", verifyToken, async (req, res) => {
 router.get("/coseguro/perfil", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    let usuarioId = Number(cabecera.id);
-    if (ROLES_STAFF.includes(cabecera.rol) && tieneAreaCoseguro(cabecera) && req.query.usuario_id) usuarioId = Number(req.query.usuario_id);
+    let usuarioId = normalizarIdPositivo(cabecera.id);
+    if (!usuarioId) return res.status(401).json("Identidad inválida");
+    const usuarioFiltroId = normalizarIdOpcional(req.query.usuario_id, "Usuario");
+    if (usuarioFiltroId && ROLES_STAFF.includes(cabecera.rol) && tieneAreaCoseguro(cabecera)) usuarioId = usuarioFiltroId;
 
     const db = mysqlConnection.promise();
     const [usuarios] = await db.query(
@@ -899,8 +1095,8 @@ router.get("/coseguro/perfil", verifyToken, async (req, res) => {
       [usuarioId]
     );
     if (usuarios.length === 0) return res.status(404).json("Usuario no encontrado");
-    if (cabecera.rol === "departamental" && usuarios[0].departamental_id !== null &&
-        Number(usuarios[0].departamental_id) !== Number(cabecera.departamental_id)) {
+    if (cabecera.rol === "departamental" &&
+        !idsPositivosIguales(usuarios[0].departamental_id, cabecera.departamental_id)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -919,7 +1115,7 @@ router.get("/coseguro/perfil", verifyToken, async (req, res) => {
     });
   } catch (error) {
     console.log(error);
-    res.status(500).json("Error al obtener el perfil del afiliado");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al obtener el perfil del afiliado");
   }
 });
 
@@ -929,7 +1125,7 @@ router.get("/coseguro/perfil", verifyToken, async (req, res) => {
 router.put("/coseguro/familiares/:id/documento", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    const familiarId = Number(req.params.id);
+    const familiarId = normalizarIdPositivo(req.params.id);
     const documento = normalizarDigitos(req.body.documento, 9);
     if (!familiarId) return res.status(400).json("ID inválido");
     if (!documento || documento.length < 6) return res.status(400).json("El DNI debe tener al menos 6 dígitos");
@@ -938,7 +1134,7 @@ router.put("/coseguro/familiares/:id/documento", verifyToken, async (req, res) =
     const [familiares] = await db.query("SELECT id, usuario_familiar_id FROM usuario WHERE id = ?", [familiarId]);
     if (familiares.length === 0) return res.status(404).json("Familiar no encontrado");
 
-    const esPropio = Number(familiares[0].usuario_familiar_id) === Number(cabecera.id);
+    const esPropio = idsPositivosIguales(familiares[0].usuario_familiar_id, cabecera.id);
     if (cabecera.rol === "afiliado" && !esPropio) return res.status(401).json("No autorizado");
     if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
 
@@ -1032,15 +1228,21 @@ router.post("/coseguro/verificar-duplicados", verifyToken, async (req, res) => {
     if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const db = mysqlConnection.promise();
 
+    const usuarioId = cabecera.rol === "afiliado"
+      ? normalizarIdPositivo(cabecera.id)
+      : normalizarIdOpcional(req.body.usuario_id, "Usuario");
+    const excluirId = normalizarIdOpcional(req.body.solicitud_id, "Solicitud");
+    if (cabecera.rol === "afiliado" && !usuarioId) return res.status(401).json("Identidad inválida");
+
     const comprobantes = await buscarDuplicadosComprobante(db, {
       emisor_cuit: normalizarDigitos(req.body.emisor_cuit, 11),
       comprobante_pto_venta: normalizarDigitos(req.body.comprobante_pto_venta, 5),
       comprobante_numero: normalizarDigitos(req.body.comprobante_numero, 20),
-      usuario_id: cabecera.rol === "afiliado" ? Number(cabecera.id) : Number(req.body.usuario_id) || null,
-      excluirId: req.body.solicitud_id ? Number(req.body.solicitud_id) : null,
+      usuario_id: usuarioId,
+      excluirId,
     });
     const hashes = Array.isArray(req.body.hashes) ? req.body.hashes.filter((h) => /^[a-f0-9]{64}$/i.test(String(h))) : [];
-    const archivos = await buscarDuplicadosArchivo(db, hashes, req.body.solicitud_id ? Number(req.body.solicitud_id) : null);
+    const archivos = await buscarDuplicadosArchivo(db, hashes, excluirId);
 
     res.status(200).json({
       duplicado_comprobante: comprobantes.length > 0,
@@ -1050,7 +1252,7 @@ router.post("/coseguro/verificar-duplicados", verifyToken, async (req, res) => {
     });
   } catch (error) {
     console.log(error);
-    res.status(500).json("Error al verificar duplicados");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al verificar duplicados");
   }
 });
 
@@ -1069,7 +1271,7 @@ router.post("/coseguro/verificar-archivo", verifyToken, manejarUploadCoseguro, a
     const db = mysqlConnection.promise();
     const sha = sha256(file.buffer);
     const phashes = await calcularPhashes(file.buffer, file.mimetype);
-    const excluirId = req.body.solicitud_id ? Number(req.body.solicitud_id) : null;
+    const excluirId = normalizarIdOpcional(req.body.solicitud_id, "Solicitud");
     const duplicados = await buscarDuplicadosArchivo(db, [sha], excluirId, phashes ? [phashes] : []);
 
     if (duplicados.length === 0) return res.status(200).json({ duplicado: false });
@@ -1079,11 +1281,11 @@ router.post("/coseguro/verificar-archivo", verifyToken, manejarUploadCoseguro, a
       coincidencia: dup.coincidencia, // 'archivo' (idéntico) | 'imagen' (rotada/espejada/recomprimida)
       solicitud_id: dup.solicitud_id,
       estado: dup.estado,
-      mismo_afiliado: Number(dup.usuario_id) === Number(cabecera.rol === "afiliado" ? cabecera.id : dup.usuario_id),
+      mismo_afiliado: cabecera.rol !== "afiliado" || idsPositivosIguales(dup.usuario_id, cabecera.id),
     });
   } catch (error) {
     console.log(error);
-    res.status(500).json("Error al verificar el archivo");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al verificar el archivo");
   }
 });
 
@@ -1095,7 +1297,7 @@ async function validarDatosSolicitud(db, cabecera, body, opciones) {
   const advertencias = [];
   const esStaff = ROLES_GESTION.includes(cabecera.rol);
 
-  const tipoReintegroId = Number(body.tipo_reintegro_id) || null;
+  const tipoReintegroId = normalizarIdPositivo(body.tipo_reintegro_id);
   if (!tipoReintegroId) errores.push("Seleccioná el tipo de reintegro");
 
   let tipo = null;
@@ -1108,7 +1310,7 @@ async function validarDatosSolicitud(db, cabecera, body, opciones) {
     else tipo = { ...tipos[0], adjuntos_config: parseJsonSeguro(tipos[0].adjuntos_config) || [] };
   }
 
-  const conceptoId = Number(body.concepto_id) || null;
+  const conceptoId = normalizarIdPositivo(body.concepto_id);
   if (!conceptoId) errores.push("Seleccioná el concepto");
   else {
     const [conceptos] = await db.query("SELECT id FROM coseguro_concepto WHERE id = ? AND activo = 1", [conceptoId]);
@@ -1166,10 +1368,12 @@ async function validarDatosSolicitud(db, cabecera, body, opciones) {
   else if (!validarCbu(cbu)) errores.push("El CBU ingresado no es válido (verificá los 22 dígitos)");
 
   // Familiar a cargo (solicitante). NULL = titular
-  let familiarId = body.familiar_usuario_id !== undefined && body.familiar_usuario_id !== null && String(body.familiar_usuario_id) !== "" && String(body.familiar_usuario_id) !== "0"
-    ? Number(body.familiar_usuario_id)
-    : null;
-  if (familiarId) {
+  const familiarInformado = valorOpcionalInformado(body.familiar_usuario_id) &&
+    body.familiar_usuario_id !== 0 && body.familiar_usuario_id !== "0";
+  let familiarId = familiarInformado ? normalizarIdPositivo(body.familiar_usuario_id) : null;
+  if (familiarInformado && !familiarId) {
+    errores.push("El familiar seleccionado no es válido");
+  } else if (familiarId) {
     const [familiares] = await db.query(
       "SELECT id, documento, nombre, apellido FROM usuario WHERE id = ? AND usuario_familiar_id = ? AND es_familiar = 'S'",
       [familiarId, opciones.usuarioId]
@@ -1182,9 +1386,11 @@ async function validarDatosSolicitud(db, cabecera, body, opciones) {
     }
   }
 
-  const cantidadSesiones = body.cantidad_sesiones !== undefined && body.cantidad_sesiones !== null && String(body.cantidad_sesiones) !== ""
-    ? Math.max(1, Math.trunc(Number(body.cantidad_sesiones)) || 1)
-    : null;
+  let cantidadSesiones = null;
+  if (valorOpcionalInformado(body.cantidad_sesiones)) {
+    cantidadSesiones = normalizarIdPositivo(body.cantidad_sesiones);
+    if (!cantidadSesiones) errores.push("La cantidad de sesiones debe ser un entero mayor a 0");
+  }
 
   return {
     errores,
@@ -1225,30 +1431,37 @@ function archivosPorSlot(files) {
 // ---------------------------------------------------------------------------
 router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (req, res) => {
   let connection;
+  let transaccionIniciada = false;
+  let bloqueoDuplicadosAdquirido = false;
   try {
     const cabecera = getCabecera(req);
     if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const db = mysqlConnection.promise();
 
     // ¿Para qué afiliado es la solicitud?
-    let usuarioId = Number(cabecera.id);
+    let usuarioId = normalizarIdPositivo(cabecera.id);
     if (ROLES_GESTION.includes(cabecera.rol)) {
       if (!req.body.usuario_id) return res.status(400).json("Indicá el afiliado titular de la solicitud");
-      usuarioId = Number(req.body.usuario_id);
+      usuarioId = normalizarIdPositivo(req.body.usuario_id);
     }
+    if (!usuarioId) return res.status(400).json("Afiliado inválido");
     const [titulares] = await db.query(
-      `SELECT u.id, u.departamental_id, u.nombre, u.apellido, r.nombre AS rol
+      `SELECT u.id, u.departamental_id, u.nombre, u.apellido, u.habilitado,
+              u.usuario_familiar_id, r.nombre AS rol
        FROM usuario u INNER JOIN rol r ON r.id = u.rol_id WHERE u.id = ?`,
       [usuarioId]
     );
     if (titulares.length === 0) return res.status(404).json("Afiliado no encontrado");
     const titular = titulares[0];
-    if (cabecera.rol === "departamental" && titular.departamental_id !== null &&
-        Number(titular.departamental_id) !== Number(cabecera.departamental_id)) {
-      return res.status(401).json("El afiliado pertenece a otra departamental");
+    if (titular.rol !== "afiliado" || titular.habilitado !== "Y" || titular.usuario_familiar_id !== null) {
+      return res.status(422).json("El titular debe ser un afiliado principal habilitado");
+    }
+    if (cabecera.rol === "departamental" &&
+        !idsPositivosIguales(titular.departamental_id, cabecera.departamental_id)) {
+      return res.status(403).json("El afiliado pertenece a otra departamental");
     }
 
-    const validacion = await validarDatosSolicitud(db, cabecera, req.body, { usuarioId });
+    let validacion = await validarDatosSolicitud(db, cabecera, req.body, { usuarioId });
 
     // Archivos requeridos según el tipo de reintegro
     const slots = archivosPorSlot(req.files);
@@ -1267,7 +1480,7 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
 
     if (validacion.errores.length > 0) return res.status(400).json(validacion.errores.join(" | "));
 
-    const datos = validacion.datos;
+    let datos = validacion.datos;
     const forzarDuplicado = ROLES_GESTION.includes(cabecera.rol) && (String(req.body.forzar_duplicado) === "1" || req.body.forzar_duplicado === true);
 
     // Duplicados por número de comprobante
@@ -1313,7 +1526,66 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
     const extraccionIA = parseJsonSeguro(req.body.extraccion_ia);
 
     connection = await db.getConnection();
+    bloqueoDuplicadosAdquirido = await adquirirBloqueoDuplicados(connection);
     await connection.beginTransaction();
+    transaccionIniciada = true;
+
+    // La decisión final se toma bajo un bloqueo asesor y la fila del titular se
+    // vuelve a validar: así dos altas simultáneas no pueden pasar ambos chequeos.
+    const [titularesBloqueados] = await connection.query(
+      `SELECT u.id, u.departamental_id, u.habilitado, u.usuario_familiar_id, r.nombre AS rol
+       FROM usuario u INNER JOIN rol r ON r.id = u.rol_id
+       WHERE u.id = ? FOR UPDATE`,
+      [usuarioId]
+    );
+    if (titularesBloqueados.length === 0) throw crearErrorHttp("Afiliado no encontrado", 404);
+    const titularBloqueado = titularesBloqueados[0];
+    if (titularBloqueado.rol !== "afiliado" || titularBloqueado.habilitado !== "Y" || titularBloqueado.usuario_familiar_id !== null) {
+      throw crearErrorHttp("El titular debe ser un afiliado principal habilitado", 422);
+    }
+    if (cabecera.rol === "departamental" &&
+        !idsPositivosIguales(titularBloqueado.departamental_id, cabecera.departamental_id)) {
+      throw crearErrorHttp("El afiliado pertenece a otra departamental", 403);
+    }
+
+    validacion = await validarDatosSolicitud(connection, cabecera, req.body, { usuarioId });
+    if (validacion.tipo) {
+      for (const adjunto of validacion.tipo.adjuntos_config) {
+        if (Number(adjunto.requerido) === 1 && !slots.has(adjunto.key)) {
+          validacion.errores.push(`Falta adjuntar: ${adjunto.label}`);
+        }
+      }
+    }
+    if ((req.files || []).length === 0) validacion.errores.push("Adjuntá al menos un comprobante");
+    if (validacion.errores.length > 0) throw crearErrorHttp(validacion.errores.join(" | "), 400);
+    datos = validacion.datos;
+    verificacion.advertencias = validacion.advertencias;
+
+    const duplicadosComprobanteFinales = await buscarDuplicadosComprobante(connection, {
+      emisor_cuit: datos.emisor_cuit,
+      comprobante_pto_venta: datos.comprobante_pto_venta,
+      comprobante_numero: datos.comprobante_numero,
+      usuario_id: usuarioId,
+    });
+    if (duplicadosComprobanteFinales.length > 0 && !forzarDuplicado) {
+      const duplicado = duplicadosComprobanteFinales[0];
+      throw crearErrorHttp(
+        `Ya existe una solicitud con ese número de comprobante (solicitud #${duplicado.id}, estado: ${duplicado.estado}).`,
+        409
+      );
+    }
+    const duplicadosArchivoFinales = await buscarDuplicadosArchivo(connection, hashes, null, phashSets);
+    if (duplicadosArchivoFinales.length > 0 && !forzarDuplicado) {
+      throw crearErrorHttp(
+        `Uno de los archivos adjuntos ya fue presentado en la solicitud #${duplicadosArchivoFinales[0].solicitud_id}.`,
+        409
+      );
+    }
+    verificacion.duplicados_forzados = forzarDuplicado && (
+      duplicadosComprobanteFinales.length > 0 || duplicadosArchivoFinales.length > 0
+    );
+    const duplicadoComprobanteForzado =
+      forzarDuplicado && duplicadosComprobanteFinales.length > 0 ? 1 : 0;
 
     // Subir firma y archivos a S3
     let firmaArchivo = null;
@@ -1328,15 +1600,16 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
          tipo_reintegro_id, concepto_id, fecha_comprobante, comprobante_pto_venta, comprobante_numero,
          emisor_nombre, emisor_cuit, importe, porcentaje_cobertura_aplicado, importe_estimado,
          cuil_afiliado, cbu, observaciones, cantidad_sesiones,
-         periodo_prestacion, firma_archivo, extraccion_ia, verificacion)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         periodo_prestacion, firma_archivo, extraccion_ia, verificacion, duplicado_forzado)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         usuarioId, datos.familiar_usuario_id, departamentalId, cabecera.id, ESTADO.INICIADA,
         datos.tipo_reintegro_id, datos.concepto_id, datos.fecha_comprobante, datos.comprobante_pto_venta,
         datos.comprobante_numero, datos.emisor_nombre, datos.emisor_cuit, datos.importe,
         cobertura.porcentaje, cobertura.estimado, datos.cuil_afiliado,
         datos.cbu, datos.observaciones, datos.cantidad_sesiones, datos.periodo_prestacion, firmaArchivo,
-        extraccionIA ? JSON.stringify(extraccionIA) : null, JSON.stringify(verificacion),
+         extraccionIA ? JSON.stringify(extraccionIA) : null, JSON.stringify(verificacion),
+         duplicadoComprobanteForzado,
       ]
     );
     const solicitudId = resultado.insertId;
@@ -1371,16 +1644,18 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
       { solicitud_id: solicitudId, estado_id: ESTADO.INICIADA });
 
     await connection.commit();
+    transaccionIniciada = false;
 
     // Constatación en ARCA en segundo plano (si la IA leyó el CAE del comprobante)
     void constatarArcaAutomatico(solicitudId);
 
     res.status(201).json({ success: true, id: solicitudId, message: "Solicitud de reintegro enviada correctamente" });
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection && transaccionIniciada) await connection.rollback();
     console.log(error);
-    res.status(500).json("Error al crear la solicitud de reintegro");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al crear la solicitud de reintegro");
   } finally {
+    if (connection && bloqueoDuplicadosAdquirido) await liberarBloqueoDuplicados(connection);
     if (connection) connection.release();
   }
 });
@@ -1407,10 +1682,47 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
     if (!["afiliado", ...ROLES_STAFF].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const db = mysqlConnection.promise();
 
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 10));
-    const orderBy = COLUMNAS_ORDEN[req.query.orderBy] || "s.fecha_creacion";
-    const orderType = String(req.query.orderType).toLowerCase() === "asc" ? "ASC" : "DESC";
+    const page = req.query.page === undefined
+      ? 1
+      : normalizarEnteroSeguro(req.query.page, { minimo: 1 });
+    const pageSize = req.query.pageSize === undefined
+      ? 10
+      : normalizarEnteroSeguro(req.query.pageSize, { minimo: 1, maximo: 100 });
+    if (page === null || pageSize === null || !Number.isSafeInteger((page - 1) * pageSize)) {
+      return res.status(400).json("Paginación inválida");
+    }
+
+    const orderBySolicitado = normalizarTexto(req.query.orderBy);
+    if (orderBySolicitado && !Object.prototype.hasOwnProperty.call(COLUMNAS_ORDEN, orderBySolicitado)) {
+      return res.status(400).json("Columna de orden inválida");
+    }
+    const orderTypeSolicitado = normalizarTexto(req.query.orderType)?.toLowerCase() || "desc";
+    if (!["asc", "desc"].includes(orderTypeSolicitado)) return res.status(400).json("Dirección de orden inválida");
+    const orderBy = orderBySolicitado ? COLUMNAS_ORDEN[orderBySolicitado] : "s.fecha_creacion";
+    const orderType = orderTypeSolicitado.toUpperCase();
+
+    let estadosFiltro = null;
+    if (valorOpcionalInformado(req.query.estado_id)) {
+      estadosFiltro = normalizarListaIdsPositivos(req.query.estado_id, { maximoItems: Object.keys(ESTADO).length });
+      const estadosValidos = new Set(Object.values(ESTADO));
+      if (!estadosFiltro || estadosFiltro.some((estado) => !estadosValidos.has(estado))) {
+        return res.status(400).json("Filtro de estados inválido");
+      }
+    }
+    const departamentalFiltroId = normalizarIdOpcional(req.query.departamental_id, "Departamental");
+    const tipoReintegroFiltroId = normalizarIdOpcional(req.query.tipo_reintegro_id, "Tipo de reintegro");
+    const conceptoFiltroId = normalizarIdOpcional(req.query.concepto_id, "Concepto");
+    const usuarioFiltroId = normalizarIdOpcional(req.query.usuario_id, "Usuario");
+    const fechaDesde = normalizarFechaFiltro(req.query.fecha_desde, "Fecha desde");
+    const fechaHasta = normalizarFechaFiltro(req.query.fecha_hasta, "Fecha hasta");
+    const solicitudDesde = normalizarFechaFiltro(req.query.fecha_solicitud_desde, "Fecha de solicitud desde");
+    const solicitudHasta = normalizarFechaFiltro(req.query.fecha_solicitud_hasta, "Fecha de solicitud hasta");
+    const importeMin = normalizarImporteFiltro(req.query.importe_min, "Importe mínimo");
+    const importeMax = normalizarImporteFiltro(req.query.importe_max, "Importe máximo");
+    const conDuplicados = normalizarBooleanoOpcional(req.query.con_duplicados, "Filtro de duplicados");
+    validarRangoFiltros(fechaDesde, fechaHasta, "fechas de comprobante");
+    validarRangoFiltros(solicitudDesde, solicitudHasta, "fechas de solicitud");
+    validarRangoFiltros(importeMin, importeMax, "importes");
 
     const condiciones = ["s.eliminado = 0"];
     const params = [];
@@ -1427,56 +1739,47 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
       params.push(ESTADO.APROBADA_CENTRAL, ESTADO.EXPORTADO, ESTADO.PENDIENTE_ACREDITACION, ESTADO.LIQUIDADO);
     }
 
-    if (req.query.estado_id) {
-      const estados = String(req.query.estado_id).split(",").map((v) => Number(v)).filter((v) => v > 0);
-      if (estados.length > 0) {
-        condiciones.push(`s.estado_id IN (${estados.map(() => "?").join(",")})`);
-        params.push(...estados);
-      }
+    if (estadosFiltro) {
+      condiciones.push(`s.estado_id IN (${estadosFiltro.map(() => "?").join(",")})`);
+      params.push(...estadosFiltro);
     }
-    if (req.query.departamental_id && cabecera.rol !== "departamental" && cabecera.rol !== "afiliado") {
+    if (departamentalFiltroId && cabecera.rol !== "departamental" && cabecera.rol !== "afiliado") {
       condiciones.push("s.departamental_id = ?");
-      params.push(Number(req.query.departamental_id));
+      params.push(departamentalFiltroId);
     }
-    if (req.query.tipo_reintegro_id) {
+    if (tipoReintegroFiltroId) {
       condiciones.push("s.tipo_reintegro_id = ?");
-      params.push(Number(req.query.tipo_reintegro_id));
+      params.push(tipoReintegroFiltroId);
     }
-    if (req.query.concepto_id) {
+    if (conceptoFiltroId) {
       condiciones.push("s.concepto_id = ?");
-      params.push(Number(req.query.concepto_id));
+      params.push(conceptoFiltroId);
     }
-    if (req.query.usuario_id && ROLES_STAFF.includes(cabecera.rol)) {
+    if (usuarioFiltroId && ROLES_STAFF.includes(cabecera.rol)) {
       condiciones.push("s.usuario_id = ?");
-      params.push(Number(req.query.usuario_id));
+      params.push(usuarioFiltroId);
     }
-    const fechaDesde = normalizarFecha(req.query.fecha_desde);
     if (fechaDesde) {
       condiciones.push("s.fecha_comprobante >= ?");
       params.push(fechaDesde);
     }
-    const fechaHasta = normalizarFecha(req.query.fecha_hasta);
     if (fechaHasta) {
       condiciones.push("s.fecha_comprobante <= ?");
       params.push(fechaHasta);
     }
-    const solicitudDesde = normalizarFecha(req.query.fecha_solicitud_desde);
     if (solicitudDesde) {
       condiciones.push("DATE(s.fecha_creacion) >= ?");
       params.push(solicitudDesde);
     }
-    const solicitudHasta = normalizarFecha(req.query.fecha_solicitud_hasta);
     if (solicitudHasta) {
       condiciones.push("DATE(s.fecha_creacion) <= ?");
       params.push(solicitudHasta);
     }
     // Misma semántica que la exportación: filtra por el importe efectivo (autorizado si existe)
-    const importeMin = normalizarImporte(req.query.importe_min);
     if (importeMin !== null) {
       condiciones.push("COALESCE(s.importe_autorizado, s.importe) >= ?");
       params.push(importeMin);
     }
-    const importeMax = normalizarImporte(req.query.importe_max);
     if (importeMax !== null) {
       condiciones.push("COALESCE(s.importe_autorizado, s.importe) <= ?");
       params.push(importeMax);
@@ -1511,7 +1814,7 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
       WHERE a1.solicitud_id = s.id
     )`;
 
-    if (String(req.query.con_duplicados) === "1") condiciones.push(`${subqueryDuplicados} > 0`);
+    if (conDuplicados) condiciones.push(`${subqueryDuplicados} > 0`);
 
     const where = condiciones.join(" AND ");
     const [countRows] = await db.query(
@@ -1561,13 +1864,13 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
       estado_visible: cabecera.rol === "afiliado" && row.estado_nombre_afiliado ? row.estado_nombre_afiliado : row.estado,
       puede_editar: puedeEditarSolicitud(cabecera, row),
       puede_eliminar: puedeEliminarSolicitud(cabecera, row),
-      transiciones: transicionesDisponibles(cabecera, row.estado_id, Number(row.usuario_id) === Number(cabecera.id)),
+      transiciones: transicionesDisponibles(cabecera, row.estado_id, idsPositivosIguales(row.usuario_id, cabecera.id)),
     }));
 
     res.status(200).json({ results, totalItems, page, pageSize });
   } catch (error) {
     console.log(error);
-    res.status(500).json("Error al obtener las solicitudes de reintegro");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al obtener las solicitudes de reintegro");
   }
 });
 
@@ -1577,7 +1880,7 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
 router.get("/coseguro/solicitudes/:id", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    const solicitudId = Number(req.params.id);
+    const solicitudId = normalizarIdPositivo(req.params.id);
     if (!solicitudId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
 
@@ -1690,7 +1993,7 @@ router.get("/coseguro/solicitudes/:id", verifyToken, async (req, res) => {
       duplicados,
       puede_editar: puedeEditarSolicitud(cabecera, solicitud),
       puede_eliminar: puedeEliminarSolicitud(cabecera, solicitud),
-      transiciones: transicionesDisponibles(cabecera, solicitud.estado_id, Number(solicitud.usuario_id) === Number(cabecera.id)),
+      transiciones: transicionesDisponibles(cabecera, solicitud.estado_id, idsPositivosIguales(solicitud.usuario_id, cabecera.id)),
     });
   } catch (error) {
     console.log(error);
@@ -1726,28 +2029,33 @@ const ETIQUETAS_CAMPOS = {
 
 router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, async (req, res) => {
   let connection;
+  let transaccionIniciada = false;
+  let bloqueoDuplicadosAdquirido = false;
   try {
     const cabecera = getCabecera(req);
-    const solicitudId = Number(req.params.id);
+    const solicitudId = normalizarIdPositivo(req.params.id);
     if (!solicitudId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
 
     const [rows] = await db.query("SELECT * FROM coseguro_solicitud WHERE id = ? AND eliminado = 0", [solicitudId]);
     if (rows.length === 0) return res.status(404).json("Solicitud no encontrada");
-    const solicitud = rows[0];
+    let solicitud = rows[0];
     if (!puedeEditarSolicitud(cabecera, solicitud)) {
       return res.status(401).json("No tenés permisos para modificar esta solicitud en su estado actual");
     }
 
-    const validacion = await validarDatosSolicitud(db, cabecera, req.body, {
+    let validacion = await validarDatosSolicitud(db, cabecera, req.body, {
       usuarioId: solicitud.usuario_id,
       fechaOriginal: solicitud.fecha_comprobante,
     });
 
     // Archivos: los requeridos deben quedar cubiertos entre los existentes (no eliminados) y los nuevos
-    const eliminarIds = (parseJsonSeguro(req.body.archivos_eliminados) || []).map(Number).filter((n) => n > 0);
-    const [archivosActuales] = await db.query("SELECT id, tipo_adjunto, sha256, archivo FROM coseguro_archivo WHERE solicitud_id = ?", [solicitudId]);
-    const restantes = archivosActuales.filter((a) => !eliminarIds.includes(a.id));
+    const archivosEliminadosRaw = parseJsonSeguro(req.body.archivos_eliminados) || [];
+    if (!Array.isArray(archivosEliminadosRaw)) return res.status(400).json("La lista de archivos eliminados es inválida");
+    const eliminarIds = archivosEliminadosRaw.map(normalizarIdPositivo);
+    if (eliminarIds.some((id) => !id)) return res.status(400).json("La lista de archivos eliminados contiene IDs inválidos");
+    let [archivosActuales] = await db.query("SELECT id, tipo_adjunto, sha256, archivo FROM coseguro_archivo WHERE solicitud_id = ?", [solicitudId]);
+    let restantes = archivosActuales.filter((a) => !eliminarIds.includes(a.id));
     const slots = archivosPorSlot(req.files);
     if (validacion.tipo) {
       for (const adjunto of validacion.tipo.adjuntos_config) {
@@ -1762,7 +2070,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
 
     if (validacion.errores.length > 0) return res.status(400).json(validacion.errores.join(" | "));
 
-    const datos = validacion.datos;
+    let datos = validacion.datos;
     const forzarDuplicado = ROLES_GESTION.includes(cabecera.rol) && (String(req.body.forzar_duplicado) === "1" || req.body.forzar_duplicado === true);
 
     const duplicadosComprobante = await buscarDuplicadosComprobante(db, {
@@ -1797,12 +2105,30 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     // Campos exclusivos de servicios sociales / admin
     const camposCentral = {};
     if (["admin-central", "admin"].includes(cabecera.rol)) {
-      if (req.body.importe_autorizado !== undefined) camposCentral.importe_autorizado = normalizarImporte(req.body.importe_autorizado);
-      if (req.body.imputacion_id !== undefined) camposCentral.imputacion_id = Number(req.body.imputacion_id) || null;
-      if (req.body.imputacion_detalle_id !== undefined) camposCentral.imputacion_detalle_id = Number(req.body.imputacion_detalle_id) || null;
+      if (req.body.importe_autorizado !== undefined) {
+        const vacio = req.body.importe_autorizado === null || String(req.body.importe_autorizado).trim() === "";
+        const importeAutorizado = vacio ? null : normalizarImporte(req.body.importe_autorizado);
+        if (!vacio && importeAutorizado === null) {
+          return res.status(400).json("El importe autorizado debe ser un monto no negativo, con hasta dos decimales");
+        }
+        camposCentral.importe_autorizado = importeAutorizado;
+      }
+      if (req.body.imputacion_id !== undefined) {
+        const vacio = !valorOpcionalInformado(req.body.imputacion_id);
+        camposCentral.imputacion_id = vacio ? null : normalizarIdPositivo(req.body.imputacion_id);
+        if (!vacio && !camposCentral.imputacion_id) return res.status(400).json("Imputación inválida");
+      }
+      if (req.body.imputacion_detalle_id !== undefined) {
+        const vacio = !valorOpcionalInformado(req.body.imputacion_detalle_id);
+        camposCentral.imputacion_detalle_id = vacio ? null : normalizarIdPositivo(req.body.imputacion_detalle_id);
+        if (!vacio && !camposCentral.imputacion_detalle_id) return res.status(400).json("Detalle de imputación inválido");
+      }
       if (req.body.periodo_prestacion !== undefined) {
-        const periodo = String(req.body.periodo_prestacion || "").slice(0, 7);
-        camposCentral.periodo_prestacion = /^\d{4}-\d{2}$/.test(periodo) ? periodo : null;
+        const periodo = String(req.body.periodo_prestacion || "").trim();
+        if (periodo !== "" && !/^\d{4}-(0[1-9]|1[0-2])$/.test(periodo)) {
+          return res.status(400).json("El período de prestación debe tener formato YYYY-MM");
+        }
+        camposCentral.periodo_prestacion = periodo || null;
       }
       if (camposCentral.imputacion_id) {
         const [imps] = await db.query("SELECT codigo FROM coseguro_imputacion WHERE id = ? AND tipo = 'CUENTA'", [camposCentral.imputacion_id]);
@@ -1814,7 +2140,70 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     }
 
     connection = await db.getConnection();
+    bloqueoDuplicadosAdquirido = await adquirirBloqueoDuplicados(connection);
     await connection.beginTransaction();
+    transaccionIniciada = true;
+
+    const [solicitudesBloqueadas] = await connection.query(
+      "SELECT * FROM coseguro_solicitud WHERE id = ? AND eliminado = 0 FOR UPDATE",
+      [solicitudId]
+    );
+    if (solicitudesBloqueadas.length === 0) throw crearErrorHttp("Solicitud no encontrada", 404);
+    solicitud = solicitudesBloqueadas[0];
+    if (!puedeEditarSolicitud(cabecera, solicitud)) {
+      throw crearErrorHttp("No tenés permisos para modificar esta solicitud en su estado actual", 409);
+    }
+
+    validacion = await validarDatosSolicitud(connection, cabecera, req.body, {
+      usuarioId: solicitud.usuario_id,
+      fechaOriginal: solicitud.fecha_comprobante,
+    });
+    if (validacion.errores.length > 0) throw crearErrorHttp(validacion.errores.join(" | "), 400);
+    datos = validacion.datos;
+
+    [archivosActuales] = await connection.query(
+      "SELECT id, tipo_adjunto, sha256, archivo FROM coseguro_archivo WHERE solicitud_id = ? FOR UPDATE",
+      [solicitudId]
+    );
+    restantes = archivosActuales.filter((archivo) => !eliminarIds.includes(archivo.id));
+    if (validacion.tipo) {
+      for (const adjunto of validacion.tipo.adjuntos_config) {
+        const tieneExistente = restantes.some((archivo) => archivo.tipo_adjunto === adjunto.key);
+        const tieneNuevo = slots.has(adjunto.key);
+        if (Number(adjunto.requerido) === 1 && !tieneExistente && !tieneNuevo) {
+          throw crearErrorHttp(`Falta adjuntar: ${adjunto.label}`, 400);
+        }
+      }
+    }
+    if (restantes.length === 0 && (req.files || []).length === 0) {
+      throw crearErrorHttp("La solicitud debe conservar al menos un comprobante adjunto", 400);
+    }
+
+    const duplicadosComprobanteFinales = await buscarDuplicadosComprobante(connection, {
+      emisor_cuit: datos.emisor_cuit,
+      comprobante_pto_venta: datos.comprobante_pto_venta,
+      comprobante_numero: datos.comprobante_numero,
+      usuario_id: solicitud.usuario_id,
+      excluirId: solicitudId,
+    });
+    if (duplicadosComprobanteFinales.length > 0 && !forzarDuplicado) {
+      throw crearErrorHttp(
+        `Ya existe otra solicitud con ese número de comprobante (solicitud #${duplicadosComprobanteFinales[0].id}).`,
+        409
+      );
+    }
+    const duplicadosArchivoFinales = await buscarDuplicadosArchivo(
+      connection,
+      hashesNuevos,
+      solicitudId,
+      phashSetsNuevos
+    );
+    if (duplicadosArchivoFinales.length > 0 && !forzarDuplicado) {
+      throw crearErrorHttp(
+        `Uno de los archivos adjuntos ya fue presentado en la solicitud #${duplicadosArchivoFinales[0].solicitud_id}.`,
+        409
+      );
+    }
 
     // Diff de campos para el historial
     const camposEditables = { ...datos };
@@ -1828,7 +2217,31 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     } else {
       delete camposEditables.periodo_prestacion;
     }
+    const duplicadoComprobanteForzado =
+      forzarDuplicado && duplicadosComprobanteFinales.length > 0 ? 1 : 0;
+    camposEditables.duplicado_forzado = duplicadoComprobanteForzado;
     const todosLosCampos = { ...camposEditables, ...camposCentral };
+
+    const verificacionActual = parseJsonSeguro(solicitud.verificacion) || {};
+    verificacionActual.duplicados_forzados = forzarDuplicado && (
+      duplicadosComprobanteFinales.length > 0 || duplicadosArchivoFinales.length > 0
+    );
+    const camposArca = [
+      "emisor_cuit",
+      "comprobante_pto_venta",
+      "comprobante_numero",
+      "fecha_comprobante",
+      "importe",
+    ];
+    const constatacionDesactualizada = camposArca.some((campo) => {
+      const anterior = solicitud[campo] instanceof Date
+        ? moment(solicitud[campo]).format("YYYY-MM-DD")
+        : solicitud[campo];
+      return String(anterior ?? "") !== String(todosLosCampos[campo] ?? "");
+    });
+    if (constatacionDesactualizada) delete verificacionActual.arca;
+    todosLosCampos.verificacion = JSON.stringify(verificacionActual);
+
     const camposCambiados = new Set();
     for (const [campo, valorNuevo] of Object.entries(todosLosCampos)) {
       const valorAnterior = solicitud[campo];
@@ -1849,19 +2262,6 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     }
 
     // Si cambian los datos del comprobante, la constatación de ARCA guardada queda desactualizada
-    const camposArca = ["emisor_cuit", "comprobante_pto_venta", "comprobante_numero", "fecha_comprobante", "importe"];
-    const constatacionDesactualizada = camposArca.some((campo) => camposCambiados.has(campo));
-    if (constatacionDesactualizada) {
-      const verificacionActual = parseJsonSeguro(solicitud.verificacion) || {};
-      if (verificacionActual.arca) {
-        delete verificacionActual.arca;
-        await connection.query("UPDATE coseguro_solicitud SET verificacion = ? WHERE id = ?", [
-          JSON.stringify(verificacionActual),
-          solicitudId,
-        ]);
-      }
-    }
-
     const sets = [];
     const setParams = [];
     for (const [campo, valor] of Object.entries(todosLosCampos)) {
@@ -1877,8 +2277,15 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
       setParams.push(estadoNuevo);
     }
 
-    setParams.push(solicitudId);
-    await connection.query(`UPDATE coseguro_solicitud SET ${sets.join(", ")} WHERE id = ?`, setParams);
+    setParams.push(solicitudId, solicitud.estado_id);
+    const [actualizacionSolicitud] = await connection.query(
+      `UPDATE coseguro_solicitud SET ${sets.join(", ")}
+       WHERE id = ? AND estado_id = ? AND eliminado = 0`,
+      setParams
+    );
+    if (actualizacionSolicitud.affectedRows !== 1) {
+      throw crearErrorHttp("La solicitud cambió mientras se editaba. Recargá e intentá nuevamente.", 409);
+    }
 
     // Archivos eliminados
     for (const archivoId of eliminarIds) {
@@ -1952,16 +2359,18 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     }
 
     await connection.commit();
+    transaccionIniciada = false;
 
     // Re-constatar en ARCA en segundo plano si cambiaron los datos del comprobante
     if (constatacionDesactualizada) void constatarArcaAutomatico(solicitudId);
 
     res.status(200).json({ success: true, message: "Solicitud actualizada correctamente", estado_id: estadoNuevo || solicitud.estado_id });
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection && transaccionIniciada) await connection.rollback();
     console.log(error);
-    res.status(500).json("Error al actualizar la solicitud");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al actualizar la solicitud");
   } finally {
+    if (connection && bloqueoDuplicadosAdquirido) await liberarBloqueoDuplicados(connection);
     if (connection) connection.release();
   }
 });
@@ -1970,34 +2379,50 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
 // DELETE /coseguro/solicitudes/:id — eliminar (soft delete, antes de aprobación central)
 // ---------------------------------------------------------------------------
 router.delete("/coseguro/solicitudes/:id", verifyToken, async (req, res) => {
+  let connection;
+  let transaccionIniciada = false;
   try {
     const cabecera = getCabecera(req);
-    const solicitudId = Number(req.params.id);
+    const solicitudId = normalizarIdPositivo(req.params.id);
     if (!solicitudId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
 
-    const [rows] = await db.query("SELECT * FROM coseguro_solicitud WHERE id = ? AND eliminado = 0", [solicitudId]);
-    if (rows.length === 0) return res.status(404).json("Solicitud no encontrada");
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    transaccionIniciada = true;
+    const [rows] = await connection.query(
+      "SELECT * FROM coseguro_solicitud WHERE id = ? AND eliminado = 0 FOR UPDATE",
+      [solicitudId]
+    );
+    if (rows.length === 0) throw crearErrorHttp("Solicitud no encontrada", 404);
     const solicitud = rows[0];
     if (!puedeEliminarSolicitud(cabecera, solicitud)) {
-      return res.status(401).json("No se puede eliminar esta solicitud (ya pasó a la instancia de aprobación central o no tenés permisos)");
+      throw crearErrorHttp("No se puede eliminar esta solicitud en su estado actual o no tenés permisos", 409);
     }
 
-    await db.query(
-      "UPDATE coseguro_solicitud SET eliminado = 1, eliminado_usuario_id = ?, fecha_eliminacion = NOW() WHERE id = ?",
-      [cabecera.id, solicitudId]
+    const [eliminacion] = await connection.query(
+      `UPDATE coseguro_solicitud
+       SET eliminado = 1, eliminado_usuario_id = ?, fecha_eliminacion = NOW()
+       WHERE id = ? AND estado_id = ? AND eliminado = 0`,
+      [cabecera.id, solicitudId, solicitud.estado_id]
     );
-    await registrarHistorial(db, {
+    if (eliminacion.affectedRows !== 1) throw crearErrorHttp("La solicitud cambió mientras se eliminaba", 409);
+    await registrarHistorial(connection, {
       solicitud_id: solicitudId,
       usuario_id: cabecera.id,
       usuario_rol: cabecera.rol,
       tipo_operacion: "DELETE",
       observacion: normalizarTexto(req.body?.motivo) || "Solicitud eliminada",
     });
+    await connection.commit();
+    transaccionIniciada = false;
     res.status(200).json({ success: true, message: "Solicitud eliminada" });
   } catch (error) {
+    if (connection && transaccionIniciada) await connection.rollback();
     console.log(error);
-    res.status(500).json("Error al eliminar la solicitud");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al eliminar la solicitud");
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -2006,31 +2431,35 @@ router.delete("/coseguro/solicitudes/:id", verifyToken, async (req, res) => {
 // ---------------------------------------------------------------------------
 router.put("/coseguro/solicitudes/:id/estado", verifyToken, async (req, res) => {
   let connection;
+  let transaccionIniciada = false;
   try {
     const cabecera = getCabecera(req);
-    const solicitudId = Number(req.params.id);
-    const estadoNuevo = Number(req.body.estado_id);
+    const solicitudId = normalizarIdPositivo(req.params.id);
+    const estadoNuevo = normalizarIdPositivo(req.body.estado_id);
     const observacion = normalizarTexto(req.body.observacion);
     if (!solicitudId || !estadoNuevo) return res.status(400).json("Datos inválidos");
 
     const db = mysqlConnection.promise();
-    const [rows] = await db.query("SELECT * FROM coseguro_solicitud WHERE id = ? AND eliminado = 0", [solicitudId]);
-    if (rows.length === 0) return res.status(404).json("Solicitud no encontrada");
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    transaccionIniciada = true;
+    const [rows] = await connection.query(
+      "SELECT * FROM coseguro_solicitud WHERE id = ? AND eliminado = 0 FOR UPDATE",
+      [solicitudId]
+    );
+    if (rows.length === 0) throw crearErrorHttp("Solicitud no encontrada", 404);
     const solicitud = rows[0];
-    if (!puedeVerSolicitud(cabecera, solicitud)) return res.status(401).json("No autorizado");
+    if (!puedeVerSolicitud(cabecera, solicitud)) throw crearErrorHttp("No autorizado", 403);
 
-    const esPropia = Number(solicitud.usuario_id) === Number(cabecera.id);
+    const esPropia = idsPositivosIguales(solicitud.usuario_id, cabecera.id);
     const permitidas = transicionesDisponibles(cabecera, solicitud.estado_id, esPropia);
     if (!permitidas.includes(estadoNuevo)) {
-      return res.status(400).json("Transición de estado no permitida para tu rol en el estado actual");
+      throw crearErrorHttp("Transición de estado no permitida para tu rol en el estado actual", 409);
     }
     // Al pedir revisión o rechazar, la observación es obligatoria para que el afiliado sepa qué pasó
     if ([ESTADO.REVISAR, ESTADO.RECHAZADA_DEPTO].includes(estadoNuevo) && !observacion) {
-      return res.status(400).json("Ingresá una observación para el afiliado explicando el motivo");
+      throw crearErrorHttp("Ingresá una observación para el afiliado explicando el motivo", 400);
     }
-
-    connection = await db.getConnection();
-    await connection.beginTransaction();
 
     const sets = ["estado_id = ?"];
     const params = [estadoNuevo];
@@ -2046,6 +2475,12 @@ router.put("/coseguro/solicitudes/:id/estado", verifyToken, async (req, res) => 
       // editable después desde el formulario de edición.
       const importeAutorizadoActual = normalizarImporte(solicitud.importe_autorizado);
       const importeEstimado = normalizarImporte(solicitud.importe_estimado);
+      if (solicitud.importe_autorizado !== null && solicitud.importe_autorizado !== undefined && importeAutorizadoActual === null) {
+        throw crearErrorHttp("El importe autorizado guardado no es válido", 409);
+      }
+      if (solicitud.importe_estimado !== null && solicitud.importe_estimado !== undefined && importeEstimado === null) {
+        throw crearErrorHttp("El importe estimado guardado no es válido", 409);
+      }
       if (importeAutorizadoActual === null && importeEstimado !== null) {
         sets.push("importe_autorizado = ?");
         params.push(importeEstimado);
@@ -2062,12 +2497,21 @@ router.put("/coseguro/solicitudes/:id/estado", verifyToken, async (req, res) => 
       }
     }
     if (estadoNuevo === ESTADO.LIQUIDADO) {
-      const fechaPago = parsearFechaFlexible(req.body.fecha_pago) || moment().format("YYYY-MM-DD HH:mm:ss");
+      const fechaPagoInformada = req.body.fecha_pago !== undefined && req.body.fecha_pago !== null && String(req.body.fecha_pago).trim() !== "";
+      const fechaPago = fechaPagoInformada ? parsearFechaFlexible(req.body.fecha_pago) : moment().format("YYYY-MM-DD HH:mm:ss");
+      if (!fechaPago) throw crearErrorHttp("La fecha de pago no tiene un formato válido", 400);
       sets.push("fecha_pago = ?");
       params.push(fechaPago);
     }
-    params.push(solicitudId);
-    await connection.query(`UPDATE coseguro_solicitud SET ${sets.join(", ")} WHERE id = ?`, params);
+    params.push(solicitudId, solicitud.estado_id);
+    const [actualizacionEstado] = await connection.query(
+      `UPDATE coseguro_solicitud SET ${sets.join(", ")}
+       WHERE id = ? AND estado_id = ? AND eliminado = 0`,
+      params
+    );
+    if (actualizacionEstado.affectedRows !== 1) {
+      throw crearErrorHttp("La solicitud cambió mientras se procesaba. Recargá e intentá nuevamente.", 409);
+    }
 
     await registrarHistorial(connection, {
       solicitud_id: solicitudId,
@@ -2102,11 +2546,12 @@ router.put("/coseguro/solicitudes/:id/estado", verifyToken, async (req, res) => 
     }
 
     await connection.commit();
+    transaccionIniciada = false;
     res.status(200).json({ success: true, message: "Estado actualizado correctamente", estado_id: estadoNuevo });
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection && transaccionIniciada) await connection.rollback();
     console.log(error);
-    res.status(500).json("Error al cambiar el estado de la solicitud");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al cambiar el estado de la solicitud");
   } finally {
     if (connection) connection.release();
   }
@@ -2119,7 +2564,7 @@ router.post("/coseguro/solicitudes/:id/observaciones", verifyToken, async (req, 
   let connection;
   try {
     const cabecera = getCabecera(req);
-    const solicitudId = Number(req.params.id);
+    const solicitudId = normalizarIdPositivo(req.params.id);
     const mensaje = normalizarTexto(req.body.mensaje);
     if (!solicitudId || !mensaje) return res.status(400).json("El mensaje es obligatorio");
 
@@ -2191,7 +2636,7 @@ router.post("/coseguro/solicitudes/:id/observaciones", verifyToken, async (req, 
 router.get("/coseguro/archivos/:id/descargar", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    const archivoId = Number(req.params.id);
+    const archivoId = normalizarIdPositivo(req.params.id);
     if (!archivoId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
 
@@ -2223,7 +2668,7 @@ router.get("/coseguro/archivos/:id/descargar", verifyToken, async (req, res) => 
 router.get("/coseguro/solicitudes/:id/zip", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    const solicitudId = Number(req.params.id);
+    const solicitudId = normalizarIdPositivo(req.params.id);
     if (!solicitudId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
 
@@ -2273,14 +2718,14 @@ router.get("/coseguro/afiliado/:usuarioId/historial", verifyToken, async (req, r
     const cabecera = getCabecera(req);
     // El auditor no participa de la revisión de duplicados: no accede al historial completo del afiliado
     if (!ROLES_GESTION.includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
-    const usuarioId = Number(req.params.usuarioId);
+    const usuarioId = normalizarIdPositivo(req.params.usuarioId);
     if (!usuarioId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
 
     if (cabecera.rol === "departamental") {
       const [usuarios] = await db.query("SELECT departamental_id FROM usuario WHERE id = ?", [usuarioId]);
       if (usuarios.length === 0) return res.status(404).json("Afiliado no encontrado");
-      if (usuarios[0].departamental_id !== null && Number(usuarios[0].departamental_id) !== Number(cabecera.departamental_id)) {
+      if (!idsPositivosIguales(usuarios[0].departamental_id, cabecera.departamental_id)) {
         return res.status(401).json("No autorizado");
       }
     }
@@ -2357,27 +2802,45 @@ const ESTADOS_VISIBLES_AUDITOR = [ESTADO.APROBADA_CENTRAL, ESTADO.EXPORTADO, EST
 async function consultarSolicitudesParaExportar(db, cabecera, filtros) {
   const condiciones = ["s.eliminado = 0"];
   const params = [];
-  let estados = Array.isArray(filtros.estado_id) && filtros.estado_id.length > 0
-    ? filtros.estado_id.map(Number).filter((n) => n > 0)
-    : [ESTADO.APROBADA_CENTRAL];
+  const estadosValidos = new Set(Object.values(ESTADO));
+  let estados = [ESTADO.APROBADA_CENTRAL];
+  if (valorOpcionalInformado(filtros.estado_id)) {
+    estados = normalizarListaIdsPositivos(filtros.estado_id, { maximoItems: estadosValidos.size });
+    if (!estados || estados.some((estado) => !estadosValidos.has(estado))) {
+      throw crearErrorHttp("Filtro de estados inválido", 400);
+    }
+  }
   // El auditor solo puede ver/exportar a partir de "Aprobado por servicios sociales"
   if (cabecera.rol === "auditor") {
-    estados = estados.filter((estado) => ESTADOS_VISIBLES_AUDITOR.includes(estado));
-    if (estados.length === 0) estados = [ESTADO.APROBADA_CENTRAL];
+    if (estados.some((estado) => !ESTADOS_VISIBLES_AUDITOR.includes(estado))) {
+      throw crearErrorHttp("El filtro incluye estados fuera del alcance del auditor", 400);
+    }
   }
   condiciones.push(`s.estado_id IN (${estados.map(() => "?").join(",")})`);
   params.push(...estados);
 
+  const departamentalFiltroId = normalizarIdOpcional(filtros.departamental_id, "Departamental");
+  const usuarioFiltroId = normalizarIdOpcional(filtros.usuario_id, "Usuario");
+  const tipoReintegroFiltroId = normalizarIdOpcional(filtros.tipo_reintegro_id, "Tipo de reintegro");
+  const conceptoFiltroId = normalizarIdOpcional(filtros.concepto_id, "Concepto");
+  const fechaDesde = normalizarFechaFiltro(filtros.fecha_desde, "Fecha desde");
+  const fechaHasta = normalizarFechaFiltro(filtros.fecha_hasta, "Fecha hasta");
+  const importeMin = normalizarImporteFiltro(filtros.importe_min, "Importe mínimo");
+  const importeMax = normalizarImporteFiltro(filtros.importe_max, "Importe máximo");
+  const conDuplicados = normalizarBooleanoOpcional(filtros.con_duplicados, "Filtro de duplicados");
+  validarRangoFiltros(fechaDesde, fechaHasta, "fechas de comprobante");
+  validarRangoFiltros(importeMin, importeMax, "importes");
+
   if (cabecera.rol === "departamental") {
     condiciones.push("s.departamental_id = ?");
     params.push(cabecera.departamental_id);
-  } else if (filtros.departamental_id) {
+  } else if (departamentalFiltroId) {
     condiciones.push("s.departamental_id = ?");
-    params.push(Number(filtros.departamental_id));
+    params.push(departamentalFiltroId);
   }
-  if (filtros.usuario_id) {
+  if (usuarioFiltroId) {
     condiciones.push("s.usuario_id = ?");
-    params.push(Number(filtros.usuario_id));
+    params.push(usuarioFiltroId);
   }
   const search = normalizarTexto(filtros.search);
   if (search) {
@@ -2386,40 +2849,37 @@ async function consultarSolicitudesParaExportar(db, cabecera, filtros) {
     const like = `%${search}%`;
     params.push(like, like, like, like, like, like, like);
   }
-  if (filtros.tipo_reintegro_id) {
+  if (tipoReintegroFiltroId) {
     condiciones.push("s.tipo_reintegro_id = ?");
-    params.push(Number(filtros.tipo_reintegro_id));
+    params.push(tipoReintegroFiltroId);
   }
-  if (filtros.concepto_id) {
+  if (conceptoFiltroId) {
     condiciones.push("s.concepto_id = ?");
-    params.push(Number(filtros.concepto_id));
+    params.push(conceptoFiltroId);
   }
-  const fechaDesde = normalizarFecha(filtros.fecha_desde);
   if (fechaDesde) {
     condiciones.push("s.fecha_comprobante >= ?");
     params.push(fechaDesde);
   }
-  const fechaHasta = normalizarFecha(filtros.fecha_hasta);
   if (fechaHasta) {
     condiciones.push("s.fecha_comprobante <= ?");
     params.push(fechaHasta);
   }
-  const importeMin = normalizarImporte(filtros.importe_min);
   if (importeMin !== null) {
     condiciones.push("COALESCE(s.importe_autorizado, s.importe) >= ?");
     params.push(importeMin);
   }
-  const importeMax = normalizarImporte(filtros.importe_max);
   if (importeMax !== null) {
     condiciones.push("COALESCE(s.importe_autorizado, s.importe) <= ?");
     params.push(importeMax);
   }
-  if (Array.isArray(filtros.ids) && filtros.ids.length > 0) {
-    const ids = filtros.ids.map(Number).filter((n) => n > 0);
+  if (valorOpcionalInformado(filtros.ids) && (!Array.isArray(filtros.ids) || filtros.ids.length > 0)) {
+    const ids = normalizarListaIdsPositivos(filtros.ids);
+    if (!ids) throw crearErrorHttp("Lista de solicitudes inválida", 400);
     condiciones.push(`s.id IN (${ids.map(() => "?").join(",")})`);
     params.push(...ids);
   }
-  if (String(filtros.con_duplicados) === "1" || filtros.con_duplicados === true) {
+  if (conDuplicados) {
     condiciones.push(`((
       SELECT COUNT(DISTINCT s2.id) FROM coseguro_solicitud s2
       WHERE s2.id <> s.id AND s2.eliminado = 0 AND s2.estado_id NOT IN (${ESTADO.RECHAZADA_DEPTO}, ${ESTADO.CANCELADA})
@@ -2527,7 +2987,7 @@ router.post("/coseguro/exportar", verifyToken, async (req, res) => {
     });
   } catch (error) {
     console.log(error);
-    res.status(500).json("Error al generar la exportación");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al generar la exportación");
   }
 });
 
@@ -2537,8 +2997,9 @@ router.post("/coseguro/exportar/confirmar", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     if (!["auditor", "admin"].includes(cabecera.rol)) return res.status(401).json("No autorizado");
-    const ids = (Array.isArray(req.body.ids) ? req.body.ids : []).map(Number).filter((n) => n > 0);
-    if (ids.length === 0) return res.status(400).json("No se indicaron solicitudes");
+    if (!Array.isArray(req.body.ids) || req.body.ids.length === 0) return res.status(400).json("No se indicaron solicitudes");
+    const ids = normalizarListaIdsPositivos(req.body.ids);
+    if (!ids) return res.status(400).json("La lista de solicitudes contiene IDs inválidos");
 
     const db = mysqlConnection.promise();
     connection = await db.getConnection();
@@ -2592,9 +3053,10 @@ router.post("/coseguro/estado-masivo", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     if (!["admin", "admin-central", "auditor"].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
-    const ids = (Array.isArray(req.body.ids) ? req.body.ids : []).map(Number).filter((n) => n > 0);
-    const estadoNuevo = Number(req.body.estado_id);
-    if (ids.length === 0) return res.status(400).json("No se indicaron solicitudes");
+    if (!Array.isArray(req.body.ids) || req.body.ids.length === 0) return res.status(400).json("No se indicaron solicitudes");
+    const ids = normalizarListaIdsPositivos(req.body.ids);
+    const estadoNuevo = normalizarIdPositivo(req.body.estado_id);
+    if (!ids) return res.status(400).json("La lista de solicitudes contiene IDs inválidos");
     if (estadoNuevo !== ESTADO.PENDIENTE_ACREDITACION) return res.status(400).json("Este endpoint solo permite pasar a 'Pendiente de acreditación'");
 
     const db = mysqlConnection.promise();
@@ -2649,8 +3111,8 @@ function parsearCsvLiquidacion(buffer) {
     const linea = lineas[i];
     const separador = linea.includes(";") ? ";" : linea.includes("\t") ? "\t" : ",";
     const celdas = linea.split(separador).map((c) => c.trim().replace(/^"(.*)"$/, "$1"));
-    const id = Number(celdas[0]);
-    if (!Number.isInteger(id) || id <= 0) {
+    const id = normalizarIdPositivo(celdas[0]);
+    if (id === null) {
       // probablemente la fila de encabezados
       if (i === 0) continue;
       erroresParseo.push({ linea: i + 1, contenido: linea, motivo: "El ID no es un número válido" });
@@ -2718,7 +3180,7 @@ router.post("/coseguro/liquidacion/analizar", verifyToken, manejarUploadCsv, asy
         detalle,
         afiliado: solicitud?.afiliado || null,
         estado_actual: solicitud?.estado || null,
-        importe: solicitud ? solicitud.importe_autorizado || solicitud.importe : null,
+        importe: solicitud ? solicitud.importe_autorizado ?? solicitud.importe : null,
       };
     });
 
@@ -2740,10 +3202,19 @@ router.post("/coseguro/liquidacion/confirmar", verifyToken, async (req, res) => 
   try {
     const cabecera = getCabecera(req);
     if (!["auditor", "admin"].includes(cabecera.rol)) return res.status(401).json("No autorizado");
-    const items = (Array.isArray(req.body.items) ? req.body.items : [])
-      .map((i) => ({ id: Number(i.id), fecha_pago: parsearFechaFlexible(i.fecha_pago) }))
-      .filter((i) => i.id > 0 && i.fecha_pago);
-    if (items.length === 0) return res.status(400).json("No hay solicitudes válidas para liquidar");
+    if (!Array.isArray(req.body.items) || req.body.items.length === 0) {
+      return res.status(400).json("No hay solicitudes válidas para liquidar");
+    }
+    const items = req.body.items.map((item) => ({
+      id: normalizarIdPositivo(item?.id),
+      fecha_pago: parsearFechaFlexible(item?.fecha_pago),
+    }));
+    if (items.some((item) => item.id === null || !item.fecha_pago)) {
+      return res.status(400).json("La liquidación contiene IDs o fechas inválidos");
+    }
+    if (new Set(items.map((item) => item.id)).size !== items.length) {
+      return res.status(400).json("La liquidación contiene solicitudes repetidas");
+    }
 
     const db = mysqlConnection.promise();
     connection = await db.getConnection();
@@ -2801,6 +3272,17 @@ router.post("/coseguro/liquidacion/confirmar", verifyToken, async (req, res) => 
 function filtrosEstadisticas(cabecera, query) {
   const condiciones = ["s.eliminado = 0"];
   const params = [];
+  const departamentalFiltroId = normalizarIdOpcional(query.departamental_id, "Departamental");
+  const tipoReintegroFiltroId = normalizarIdOpcional(query.tipo_reintegro_id, "Tipo de reintegro");
+  const conceptoFiltroId = normalizarIdOpcional(query.concepto_id, "Concepto");
+  const usuarioFiltroId = normalizarIdOpcional(query.usuario_id, "Usuario");
+  const fechaDesde = normalizarFechaFiltro(query.fecha_desde, "Fecha desde");
+  const fechaHasta = normalizarFechaFiltro(query.fecha_hasta, "Fecha hasta");
+  const importeMin = normalizarImporteFiltro(query.importe_min, "Importe mínimo");
+  const importeMax = normalizarImporteFiltro(query.importe_max, "Importe máximo");
+  validarRangoFiltros(fechaDesde, fechaHasta, "fechas de comprobante");
+  validarRangoFiltros(importeMin, importeMax, "importes");
+
   if (cabecera.rol === "auditor") {
     // El auditor solo ve trámites desde "Aprobado por servicios sociales"
     condiciones.push(`s.estado_id IN (${ESTADOS_VISIBLES_AUDITOR.map(() => "?").join(",")})`);
@@ -2809,43 +3291,39 @@ function filtrosEstadisticas(cabecera, query) {
   if (cabecera.rol === "departamental") {
     condiciones.push("s.departamental_id = ?");
     params.push(cabecera.departamental_id);
-  } else if (query.departamental_id) {
+  } else if (departamentalFiltroId) {
     condiciones.push("s.departamental_id = ?");
-    params.push(Number(query.departamental_id));
+    params.push(departamentalFiltroId);
   }
-  const fechaDesde = normalizarFecha(query.fecha_desde);
   if (fechaDesde) {
     condiciones.push("s.fecha_comprobante >= ?");
     params.push(fechaDesde);
   }
-  const fechaHasta = normalizarFecha(query.fecha_hasta);
   if (fechaHasta) {
     condiciones.push("s.fecha_comprobante <= ?");
     params.push(fechaHasta);
   }
-  if (query.tipo_reintegro_id) {
+  if (tipoReintegroFiltroId) {
     condiciones.push("s.tipo_reintegro_id = ?");
-    params.push(Number(query.tipo_reintegro_id));
+    params.push(tipoReintegroFiltroId);
   }
-  if (query.concepto_id) {
+  if (conceptoFiltroId) {
     condiciones.push("s.concepto_id = ?");
-    params.push(Number(query.concepto_id));
+    params.push(conceptoFiltroId);
   }
-  if (query.usuario_id) {
+  if (usuarioFiltroId) {
     condiciones.push("s.usuario_id = ?");
-    params.push(Number(query.usuario_id));
+    params.push(usuarioFiltroId);
   }
-  const importeMin = normalizarImporte(query.importe_min);
   if (importeMin !== null) {
     condiciones.push("COALESCE(s.importe_autorizado, s.importe) >= ?");
     params.push(importeMin);
   }
-  const importeMax = normalizarImporte(query.importe_max);
   if (importeMax !== null) {
     condiciones.push("COALESCE(s.importe_autorizado, s.importe) <= ?");
     params.push(importeMax);
   }
-  return { where: condiciones.join(" AND "), params };
+  return { where: condiciones.join(" AND "), params, usuarioFiltroId };
 }
 
 router.get("/coseguro/estadisticas", verifyToken, async (req, res) => {
@@ -2853,7 +3331,7 @@ router.get("/coseguro/estadisticas", verifyToken, async (req, res) => {
     const cabecera = getCabecera(req);
     if ((!ROLES_GESTION.includes(cabecera.rol) && cabecera.rol !== "auditor") || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
     const db = mysqlConnection.promise();
-    const { where, params } = filtrosEstadisticas(cabecera, req.query);
+    const { where, params, usuarioFiltroId } = filtrosEstadisticas(cabecera, req.query);
 
     const [totales] = await db.query(
       `SELECT COUNT(*) AS cantidad, COALESCE(SUM(s.importe), 0) AS importe_solicitado,
@@ -2926,7 +3404,7 @@ router.get("/coseguro/estadisticas", verifyToken, async (req, res) => {
 
     // Consumo mensual por concepto de un afiliado puntual (ej: sesiones de psicología)
     let consumosAfiliado = null;
-    if (req.query.usuario_id) {
+    if (usuarioFiltroId) {
       const [consumos] = await db.query(
         `SELECT DATE_FORMAT(s.fecha_comprobante, '%Y-%m') AS mes, c.nombre AS concepto,
                 COUNT(*) AS solicitudes, COALESCE(SUM(COALESCE(s.cantidad_sesiones, 1)), 0) AS prestaciones,
@@ -2952,7 +3430,7 @@ router.get("/coseguro/estadisticas", verifyToken, async (req, res) => {
     });
   } catch (error) {
     console.log(error);
-    res.status(500).json("Error al obtener las estadísticas");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al obtener las estadísticas");
   }
 });
 
@@ -2982,7 +3460,7 @@ router.post("/coseguro/solicitudes/:id/constatar-arca", verifyToken, async (req,
   try {
     const cabecera = getCabecera(req);
     if (!ROLES_GESTION.includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
-    const solicitudId = Number(req.params.id);
+    const solicitudId = normalizarIdPositivo(req.params.id);
     if (!solicitudId) return res.status(400).json("ID inválido");
 
     const db = mysqlConnection.promise();
@@ -2991,9 +3469,11 @@ router.post("/coseguro/solicitudes/:id/constatar-arca", verifyToken, async (req,
     const solicitud = rows[0];
     if (!puedeVerSolicitud(cabecera, solicitud)) return res.status(401).json("No autorizado");
 
-    const cbteTipo = Number(req.body.cbte_tipo);
+    const cbteTipo = normalizarEnteroSeguro(req.body.cbte_tipo, { minimo: 1, maximo: 999 });
     const codAutorizacion = String(req.body.cod_autorizacion || "").replace(/\D/g, "");
-    if (!cbteTipo) return res.status(400).json("Indicá el tipo de comprobante (código ARCA)");
+    if (cbteTipo === null || !arca.TIPOS_COMPROBANTE_ARCA.some((tipo) => tipo.codigo === cbteTipo)) {
+      return res.status(400).json("Indicá un tipo de comprobante ARCA válido");
+    }
     if (codAutorizacion.length !== 14) return res.status(400).json("El CAE/CAI debe tener 14 dígitos");
     if (!solicitud.emisor_cuit) return res.status(400).json("La solicitud no tiene CUIT del emisor: no se puede constatar");
     if (!solicitud.comprobante_pto_venta) return res.status(400).json("La solicitud no tiene punto de venta: no se puede constatar");
@@ -3062,16 +3542,16 @@ router.get("/coseguro/estadisticas/export", verifyToken, async (req, res) => {
 
     const filtros = {
       ...req.query,
-      estado_id: req.query.estado_id
-        ? String(req.query.estado_id).split(",").map(Number).filter((n) => n > 0)
-        : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+      estado_id: valorOpcionalInformado(req.query.estado_id)
+        ? req.query.estado_id
+        : cabecera.rol === "auditor" ? ESTADOS_VISIBLES_AUDITOR : Object.values(ESTADO),
     };
     const rows = await consultarSolicitudesParaExportar(db, cabecera, filtros);
     const csv = generarCsvSolicitudes(rows);
     res.status(200).json({ csv, total: rows.length, nombre_archivo: `reintegros_${moment().format("YYYYMMDD_HHmm")}.csv` });
   } catch (error) {
     console.log(error);
-    res.status(500).json("Error al exportar las estadísticas");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al exportar las estadísticas");
   }
 });
 
@@ -3118,9 +3598,9 @@ function transicionesSubsidioSalud(cabecera, estado) {
 }
 
 function puedeVerSubsidio(cabecera, subsidio) {
-  if (cabecera.rol === "afiliado") return Number(subsidio.usuario_id) === Number(cabecera.id);
+  if (cabecera.rol === "afiliado") return idsPositivosIguales(subsidio.usuario_id, cabecera.id);
   if (!ROLES_STAFF.includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return false;
-  if (cabecera.rol === "departamental") return Number(subsidio.afiliado_departamental_id) === Number(cabecera.departamental_id);
+  if (cabecera.rol === "departamental") return idsPositivosIguales(subsidio.afiliado_departamental_id, cabecera.departamental_id);
   return true;
 }
 
@@ -3178,12 +3658,15 @@ router.get("/coseguro/subsidios-salud", verifyToken, async (req, res) => {
       condiciones.push("u.departamental_id = ?");
       params.push(cabecera.departamental_id);
     }
-    if (req.query.estado) {
-      const estados = String(req.query.estado).split(",").filter((e) => SUBSIDIO_ESTADO[e]);
-      if (estados.length > 0) {
-        condiciones.push(`rs.estado IN (${estados.map(() => "?").join(",")})`);
-        params.push(...estados);
+    if (valorOpcionalInformado(req.query.estado)) {
+      const estados = typeof req.query.estado === "string"
+        ? [...new Set(req.query.estado.split(",").map((estado) => estado.trim()))]
+        : null;
+      if (!estados || estados.length === 0 || estados.some((estado) => !SUBSIDIO_ESTADO[estado])) {
+        return res.status(400).json("Filtro de estados inválido");
       }
+      condiciones.push(`rs.estado IN (${estados.map(() => "?").join(",")})`);
+      params.push(...estados);
     }
     const search = normalizarTexto(req.query.search);
     if (search) {
@@ -3227,7 +3710,7 @@ router.get("/coseguro/subsidios-salud", verifyToken, async (req, res) => {
 router.get("/coseguro/subsidios-salud/:id", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    const subsidioId = Number(req.params.id);
+    const subsidioId = normalizarIdPositivo(req.params.id);
     if (!subsidioId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
 
@@ -3258,7 +3741,7 @@ router.get("/coseguro/subsidios-salud/:id", verifyToken, async (req, res) => {
 router.post("/coseguro/subsidios-salud/:id/archivos", verifyToken, manejarUploadCoseguro, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    const subsidioId = Number(req.params.id);
+    const subsidioId = normalizarIdPositivo(req.params.id);
     if (!subsidioId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
 
@@ -3266,7 +3749,7 @@ router.post("/coseguro/subsidios-salud/:id/archivos", verifyToken, manejarUpload
     if (rows.length === 0) return res.status(404).json("Subsidio no encontrado");
     const subsidio = rows[0];
 
-    const esDuenio = cabecera.rol === "afiliado" && Number(subsidio.usuario_id) === Number(cabecera.id);
+    const esDuenio = cabecera.rol === "afiliado" && idsPositivosIguales(subsidio.usuario_id, cabecera.id);
     const esGestion = ROLES_GESTION.includes(cabecera.rol) && tieneAreaCoseguro(cabecera) && puedeVerSubsidio(cabecera, subsidio);
     if (!esDuenio && !esGestion) return res.status(401).json("No autorizado");
     if ([SUBSIDIO_ESTADO.APROBADA, SUBSIDIO_ESTADO.RECHAZADA].includes(subsidio.estado) && !esGestion) {
@@ -3300,28 +3783,39 @@ router.post("/coseguro/subsidios-salud/:id/archivos", verifyToken, manejarUpload
 // ---------------------------------------------------------------------------
 router.put("/coseguro/subsidios-salud/:id/estado", verifyToken, async (req, res) => {
   let connection;
+  let transaccionIniciada = false;
+  let archivoReservaActivo = false;
   try {
     const cabecera = getCabecera(req);
-    const subsidioId = Number(req.params.id);
+    const subsidioId = normalizarIdPositivo(req.params.id);
     const estadoNuevo = String(req.body.estado || "").toUpperCase();
     const observacion = normalizarTexto(req.body.observacion);
     if (!subsidioId || !SUBSIDIO_ESTADO[estadoNuevo]) return res.status(400).json("Datos inválidos");
 
     const db = mysqlConnection.promise();
-    const [rows] = await db.query(`${SQL_SUBSIDIO_BASE} WHERE rs.id = ?`, [subsidioId]);
-    if (rows.length === 0) return res.status(404).json("Subsidio no encontrado");
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    transaccionIniciada = true;
+    const [subsidiosBloqueados] = await connection.query(
+      "SELECT id, reserva_id FROM reserva_salud WHERE id = ? FOR UPDATE",
+      [subsidioId]
+    );
+    if (subsidiosBloqueados.length === 0) throw crearErrorHttp("Subsidio no encontrado", 404);
+    await connection.query("SELECT id FROM reserva WHERE id = ? FOR UPDATE", [subsidiosBloqueados[0].reserva_id]);
+    const [rows] = await connection.query(`${SQL_SUBSIDIO_BASE} WHERE rs.id = ?`, [subsidioId]);
+    if (rows.length === 0) throw crearErrorHttp("Subsidio no encontrado", 404);
     const subsidio = rows[0];
-    if (!puedeVerSubsidio(cabecera, subsidio)) return res.status(401).json("No autorizado");
+    if (!puedeVerSubsidio(cabecera, subsidio)) throw crearErrorHttp("No autorizado", 403);
 
     const permitidas = transicionesSubsidioSalud(cabecera, subsidio.estado);
     if (!permitidas.includes(estadoNuevo)) {
-      return res.status(400).json("Transición no permitida para tu rol en el estado actual del subsidio");
+      throw crearErrorHttp("Transición no permitida para tu rol en el estado actual del subsidio", 409);
     }
     if (estadoNuevo === SUBSIDIO_ESTADO.RECHAZADA && !observacion) {
-      return res.status(400).json("Ingresá una observación para el afiliado explicando el motivo del rechazo");
+      throw crearErrorHttp("Ingresá una observación para el afiliado explicando el motivo del rechazo", 400);
     }
     if ([SUBSIDIO_ESTADO.APROBADA_DEPARTAMENTAL, SUBSIDIO_ESTADO.APROBADA].includes(estadoNuevo) && Number(subsidio.certificados) === 0) {
-      return res.status(400).json("No se puede aprobar un subsidio sin certificados médicos cargados");
+      throw crearErrorHttp("No se puede aprobar un subsidio sin certificados médicos cargados", 400);
     }
 
     // Imputación contable opcional al aprobar (igual que en los reintegros)
@@ -3329,17 +3823,18 @@ router.put("/coseguro/subsidios-salud/:id/estado", verifyToken, async (req, res)
     let imputacionDetalleId = null;
     let cicCodigo = null;
     if (estadoNuevo === SUBSIDIO_ESTADO.APROBADA) {
-      imputacionId = Number(req.body.imputacion_id) || null;
-      imputacionDetalleId = Number(req.body.imputacion_detalle_id) || null;
+      const imputacionInformada = valorOpcionalInformado(req.body.imputacion_id);
+      const detalleInformado = valorOpcionalInformado(req.body.imputacion_detalle_id);
+      imputacionId = imputacionInformada ? normalizarIdPositivo(req.body.imputacion_id) : null;
+      imputacionDetalleId = detalleInformado ? normalizarIdPositivo(req.body.imputacion_detalle_id) : null;
+      if (imputacionInformada && !imputacionId) throw crearErrorHttp("Imputación inválida", 400);
+      if (detalleInformado && !imputacionDetalleId) throw crearErrorHttp("Detalle de imputación inválido", 400);
       if (imputacionId) {
-        const [imps] = await db.query("SELECT codigo FROM coseguro_imputacion WHERE id = ? AND tipo = 'CUENTA'", [imputacionId]);
-        if (imps.length === 0) return res.status(400).json("Imputación inválida");
+        const [imps] = await connection.query("SELECT codigo FROM coseguro_imputacion WHERE id = ? AND tipo = 'CUENTA'", [imputacionId]);
+        if (imps.length === 0) throw crearErrorHttp("Imputación inválida", 400);
         cicCodigo = imps[0].codigo;
       }
     }
-
-    connection = await db.getConnection();
-    await connection.beginTransaction();
 
     const sets = ["estado = ?", "observacion_resolucion = ?"];
     const params = [estadoNuevo, observacion];
@@ -3353,11 +3848,28 @@ router.put("/coseguro/subsidios-salud/:id/estado", verifyToken, async (req, res)
     }
     if (estadoNuevo === SUBSIDIO_ESTADO.APROBADA) {
       // Foto del costo operativo que asume Servicios Sociales para pagarle al hotel
+      const precioCubierto = normalizarImporte(subsidio.precio_total);
+      if (precioCubierto === null) throw crearErrorHttp("La reserva tiene un precio total inválido", 409);
       sets.push("precio_cubierto = ?", "imputacion_id = ?", "imputacion_detalle_id = ?", "cic_codigo = ?");
-      params.push(normalizarImporte(subsidio.precio_total) || 0, imputacionId, imputacionDetalleId, cicCodigo);
+      params.push(precioCubierto, imputacionId, imputacionDetalleId, cicCodigo);
     }
-    params.push(subsidioId);
-    await connection.query(`UPDATE reserva_salud SET ${sets.join(", ")} WHERE id = ?`, params);
+    params.push(subsidioId, subsidio.estado);
+    if (estadoNuevo === SUBSIDIO_ESTADO.APROBADA) {
+      await archivarVersionReservaAntesDeReemplazo(
+        connection,
+        subsidio.reserva_id,
+        { id: cabecera.id, rol: cabecera.rol },
+        "CORRECCION"
+      );
+      archivoReservaActivo = true;
+    }
+    const [actualizacionSubsidio] = await connection.query(
+      `UPDATE reserva_salud SET ${sets.join(", ")} WHERE id = ? AND estado = ?`,
+      params
+    );
+    if (actualizacionSubsidio.affectedRows !== 1) {
+      throw crearErrorHttp("El subsidio cambió mientras se procesaba. Recargá e intentá nuevamente.", 409);
+    }
 
     if (estadoNuevo === SUBSIDIO_ESTADO.APROBADA) {
       // 100% de descuento para el afiliado: la reserva queda en $0
@@ -3398,15 +3910,50 @@ router.put("/coseguro/subsidios-salud/:id/estado", verifyToken, async (req, res)
         { reserva_id: subsidio.reserva_id, reserva_salud_id: subsidioId, estado: estadoNuevo });
     }
 
+    if (archivoReservaActivo) {
+      await cerrarGuardiaArchivoReserva(connection, subsidio.reserva_id);
+      archivoReservaActivo = false;
+    }
     await connection.commit();
+    transaccionIniciada = false;
     res.status(200).json({ success: true, message: "Subsidio actualizado correctamente", estado: estadoNuevo });
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection && transaccionIniciada) {
+      await connection.rollback();
+      if (archivoReservaActivo) {
+        try {
+          await limpiarTokenGuardiaArchivoReserva(connection);
+        } catch (_) {
+          // El rollback ya revirtió el archivo y la guardia de tabla.
+        }
+      }
+    }
     console.log(error);
-    res.status(500).json("Error al cambiar el estado del subsidio por salud");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al cambiar el estado del subsidio por salud");
   } finally {
     if (connection) connection.release();
   }
+});
+
+router.__test = Object.freeze({
+  adquirirBloqueoDuplicados,
+  buscarDuplicadosComprobante,
+  calcularReintegroEstimado,
+  decodificarFirmaBase64,
+  detectarMimeArchivo,
+  importeACentavos,
+  idsPositivosIguales,
+  liberarBloqueoDuplicados,
+  filtrosEstadisticas,
+  normalizarBooleanoOpcional,
+  normalizarEnteroSeguro,
+  normalizarFecha,
+  normalizarIdPositivo,
+  normalizarImporte,
+  normalizarListaIdsPositivos,
+  parsearCsvLiquidacion,
+  validarContenidoArchivo,
+  verifyToken,
 });
 
 module.exports = router;

@@ -5,42 +5,27 @@ const ESTADO_RESERVA_CANCELADA_ID = 4;
 const UMBRAL_ULTIMOS_LUGARES = 10;
 const HORIZONTE_ALTERNATIVAS_DIAS = 120;
 const MAX_RANGOS_ALTERNATIVOS = 30;
-
-function formatearFecha(fecha) {
-  return fecha.toISOString().split("T")[0];
-}
-
-function sumarDias(fechaString, dias) {
-  const fecha = new Date(fechaString);
-  fecha.setDate(fecha.getDate() + dias);
-  return formatearFecha(fecha);
-}
-
-function obtenerNochesReserva(fechaInicio, fechaFin) {
-  const inicio = new Date(fechaInicio);
-  const fin = new Date(fechaFin);
-
-  if (Number.isNaN(inicio.getTime()) || Number.isNaN(fin.getTime()) || inicio >= fin) {
-    return [];
-  }
-
-  const noches = [];
-  const cursor = new Date(inicio);
-
-  while (cursor < fin) {
-    noches.push(formatearFecha(cursor));
-    cursor.setDate(cursor.getDate() + 1);
-  }
-
-  return noches;
-}
+const MAX_PERSONAS_BUSQUEDA = 100;
+const MAX_DIAS_BUSQUEDA = 366;
+const {
+  diferenciaDiasCivil,
+  normalizarFechaCivil,
+  obtenerFechaCivilArgentina,
+  obtenerNochesReserva,
+  sumarDiasFechaCivil,
+  validarRangoReservaTemporal,
+} = require("./valores-dominio");
 
 function normalizarEnteroNoNegativo(valor, porDefecto = 0) {
   if (valor === undefined || valor === null || valor === "") {
     return porDefecto;
   }
 
-  const numero = Number.parseInt(valor, 10);
+  const texto = String(valor).trim();
+  if (!/^\d+$/.test(texto)) {
+    return null;
+  }
+  const numero = Number(texto);
   if (!Number.isInteger(numero) || numero < 0) {
     return null;
   }
@@ -53,21 +38,20 @@ function parsearServicioIdsCsv(servicioIdsRaw) {
     return [];
   }
 
-  if (Array.isArray(servicioIdsRaw)) {
-    return servicioIdsRaw
-      .map((id) => Number.parseInt(id, 10))
-      .filter((id) => Number.isInteger(id) && id > 0);
-  }
+  const entradas = Array.isArray(servicioIdsRaw)
+    ? servicioIdsRaw
+    : String(servicioIdsRaw).split(",");
 
-  return String(servicioIdsRaw)
-    .split(",")
-    .map((id) => Number.parseInt(id.trim(), 10))
-    .filter((id) => Number.isInteger(id) && id > 0);
+  return entradas
+    .map((id) => String(id).trim())
+    .filter((id) => /^\d+$/.test(id))
+    .map(Number)
+    .filter((id) => Number.isSafeInteger(id) && id > 0);
 }
 
 function parsearParametrosBusquedaDisponibilidad(
   query,
-  { requireFechas = true, requirePersonas = true } = {}
+  { requireFechas = true, requirePersonas = true, hoy = obtenerFechaCivilArgentina() } = {}
 ) {
   const fechaInicioRaw = query.fecha_inicio;
   const fechaFinRaw = query.fecha_fin;
@@ -88,6 +72,9 @@ function parsearParametrosBusquedaDisponibilidad(
   if (requirePersonas && totalPersonas <= 0) {
     return { error: "Debe indicar al menos 1 persona" };
   }
+  if (!Number.isSafeInteger(totalPersonas) || totalPersonas > MAX_PERSONAS_BUSQUEDA) {
+    return { error: `No se permiten mas de ${MAX_PERSONAS_BUSQUEDA} personas por busqueda` };
+  }
 
   if (!fechaInicioRaw && !fechaFinRaw && !requireFechas) {
     return {
@@ -102,27 +89,33 @@ function parsearParametrosBusquedaDisponibilidad(
     };
   }
 
-  const fechaInicio = new Date(fechaInicioRaw);
-  const fechaFin = new Date(fechaFinRaw);
+  const fechaInicio = normalizarFechaCivil(fechaInicioRaw);
+  const fechaFin = normalizarFechaCivil(fechaFinRaw);
 
-  if (Number.isNaN(fechaInicio.getTime()) || Number.isNaN(fechaFin.getTime())) {
-    return { error: "Las fechas deben tener formato YYYY-MM-DD" };
-  }
-
-  const fechaInicioNormalizada = formatearFecha(fechaInicio);
-  const fechaFinNormalizada = formatearFecha(fechaFin);
-  if (fechaInicioNormalizada !== fechaInicioRaw || fechaFinNormalizada !== fechaFinRaw) {
+  if (!fechaInicio || !fechaFin) {
     return { error: "Las fechas deben tener formato YYYY-MM-DD" };
   }
 
   if (fechaInicio >= fechaFin) {
     return { error: "fecha_inicio debe ser menor que fecha_fin" };
   }
+  const validacionTemporal = validarRangoReservaTemporal(fechaInicio, fechaFin, { hoy });
+  if (!validacionTemporal.valido) {
+    return {
+      error: validacionTemporal.codigo === "FECHA_INICIO_PASADA"
+        ? "fecha_inicio no puede ser anterior a hoy"
+        : "No se pudo validar el rango respecto de la fecha actual",
+    };
+  }
+  const dias = diferenciaDiasCivil(fechaInicio, fechaFin);
+  if (!Number.isInteger(dias) || dias > MAX_DIAS_BUSQUEDA) {
+    return { error: `El rango no puede superar ${MAX_DIAS_BUSQUEDA} dias` };
+  }
 
   return {
     value: {
-      fecha_inicio: fechaInicioRaw,
-      fecha_fin: fechaFinRaw,
+      fecha_inicio: fechaInicio,
+      fecha_fin: fechaFin,
       adultos,
       ninos,
       bebes,
@@ -152,9 +145,9 @@ function tarifaAplicaParaEdad(tarifa, edad) {
 }
 
 function cubreNoche(tarifa, noche) {
-  const inicio = formatearFecha(new Date(tarifa.fecha_inicio));
-  const fin = formatearFecha(new Date(tarifa.fecha_fin));
-  return inicio <= noche && fin >= noche;
+  const inicio = normalizarFechaCivil(tarifa.fecha_inicio);
+  const fin = normalizarFechaCivil(tarifa.fecha_fin);
+  return Boolean(inicio && fin && inicio <= noche && fin >= noche);
 }
 
 function tarifasCubrenTodasLasNoches(tarifas, noches) {
@@ -527,8 +520,8 @@ async function obtenerCalendarioAlternativoServicio(connection, params) {
       break;
     }
 
-    const nuevaFechaInicio = sumarDias(fechaInicio, i);
-    const nuevaFechaFin = sumarDias(nuevaFechaInicio, nochesCantidad);
+    const nuevaFechaInicio = sumarDiasFechaCivil(fechaInicio, i);
+    const nuevaFechaFin = sumarDiasFechaCivil(nuevaFechaInicio, nochesCantidad);
 
     const disponibilidad = await calcularDisponibilidadServicio(connection, {
       servicioId,

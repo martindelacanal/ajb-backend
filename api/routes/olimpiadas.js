@@ -19,6 +19,7 @@ const multer = require("multer");
 const crypto = require("crypto");
 const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+const { normalizarFechaCivil } = require("../services/valores-dominio");
 
 // ---------------------------------------------------------------------------
 // S3
@@ -32,6 +33,53 @@ const s3 = new S3Client({
   region: process.env.BUCKET_REGION,
 });
 const S3_SIGNED_URL_EXPIRES_SECONDS = Number.parseInt(process.env.S3_SIGNED_URL_EXPIRES_SECONDS || "3600", 10);
+const MAX_ARCHIVO_OLIMPIADAS_BYTES = 10 * 1024 * 1024;
+const MAX_TOTAL_OLIMPIADAS_BYTES = 30 * 1024 * 1024;
+const MAX_FIRMA_BYTES = 2 * 1024 * 1024;
+const MIME_IMAGEN_PERMITIDO = new Set(["image/jpeg", "image/png", "image/webp", "image/heic"]);
+
+function detectarMimeArchivo(buffer, { permitePdf = false } = {}) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4) return null;
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg";
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (buffer.length >= 12 && buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP") return "image/webp";
+  if (buffer.length >= 12 && buffer.toString("ascii", 4, 8) === "ftyp") {
+    const marcas = buffer.toString("ascii", 8, Math.min(buffer.length, 40));
+    if (/(heic|heix|hevc|hevx|mif1|msf1)/.test(marcas)) return "image/heic";
+  }
+  if (permitePdf && buffer.length >= 5 && buffer.toString("ascii", 0, 5) === "%PDF-") return "application/pdf";
+  return null;
+}
+
+function permitePdfEnSlot(fieldname) {
+  return String(fieldname || "").toUpperCase() === "CERTIFICADO";
+}
+
+function validarContenidoArchivo(file) {
+  if (!file || !Buffer.isBuffer(file.buffer) || file.buffer.length === 0 || file.buffer.length > MAX_ARCHIVO_OLIMPIADAS_BYTES) {
+    return { error: "El archivo está vacío o supera el máximo de 10 MB" };
+  }
+  const permitePdf = permitePdfEnSlot(file.fieldname);
+  const mimeDetectado = detectarMimeArchivo(file.buffer, { permitePdf });
+  const mimeDeclarado = file.mimetype === "image/jpg" ? "image/jpeg" : file.mimetype;
+  if (!mimeDetectado || (!MIME_IMAGEN_PERMITIDO.has(mimeDetectado) && !(permitePdf && mimeDetectado === "application/pdf"))) {
+    return { error: permitePdf ? "El certificado debe ser JPEG, PNG, WebP, HEIC o PDF" : "El archivo debe ser JPEG, PNG, WebP o HEIC" };
+  }
+  if (mimeDetectado !== mimeDeclarado) return { error: "El contenido del archivo no coincide con el tipo declarado" };
+  file.mimetype = mimeDetectado;
+  return { mime: mimeDetectado };
+}
+
+function decodificarFirmaBase64(firmaBase64) {
+  const match = /^data:(image\/(?:jpeg|jpg|png|webp|heic));base64,([A-Za-z0-9+/]+={0,2})$/.exec(String(firmaBase64 || ""));
+  if (!match || match[2].length % 4 !== 0 || match[2].length > Math.ceil(MAX_FIRMA_BYTES / 3) * 4) return null;
+  const buffer = Buffer.from(match[2], "base64");
+  if (buffer.length === 0 || buffer.length > MAX_FIRMA_BYTES || buffer.toString("base64") !== match[2]) return null;
+  const mimeDeclarado = match[1] === "image/jpg" ? "image/jpeg" : match[1];
+  const mimeDetectado = detectarMimeArchivo(buffer);
+  if (!mimeDetectado || mimeDetectado !== mimeDeclarado || !MIME_IMAGEN_PERMITIDO.has(mimeDetectado)) return null;
+  return { buffer, mime: mimeDetectado };
+}
 
 async function uploadBufferToS3({ key, buffer, contentType }) {
   await s3.send(new PutObjectCommand({ Bucket: bucketName, Key: key, Body: buffer, ContentType: contentType }));
@@ -62,18 +110,18 @@ const EXTENSION_POR_MIME = {
   "image/png": "png",
   "image/webp": "webp",
   "image/heic": "heic",
-  "image/svg+xml": "svg",
   "application/pdf": "pdf",
 };
 
 function extensionSegura(nombre, mime) {
-  if (EXTENSION_POR_MIME[mime]) return EXTENSION_POR_MIME[mime];
-  const partes = String(nombre || "").split(".");
-  const ext = partes.length > 1 ? partes.pop().toLowerCase().replace(/[^a-z0-9]/g, "") : "";
-  return ext || "bin";
+  const extension = EXTENSION_POR_MIME[mime === "image/jpg" ? "image/jpeg" : mime];
+  if (!extension) throw crearErrorHttp("Formato de archivo no permitido", 400);
+  return extension;
 }
 
 async function subirArchivoOlimpiadas(file, prefijo) {
+  const validacion = validarContenidoArchivo(file);
+  if (validacion.error) throw crearErrorHttp(validacion.error, 400);
   const extension = extensionSegura(file.originalname, file.mimetype);
   const key = `olimpiadas/${prefijo}_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.${extension}`;
   await uploadBufferToS3({ key, buffer: file.buffer, contentType: file.mimetype });
@@ -81,11 +129,11 @@ async function subirArchivoOlimpiadas(file, prefijo) {
 }
 
 async function subirFirmaBase64(firmaBase64, prefijo) {
-  const match = /^data:(image\/[a-z+.-]+);base64,(.+)$/i.exec(firmaBase64 || "");
-  if (!match) return null;
-  const buffer = Buffer.from(match[2], "base64");
-  const key = `olimpiadas/${prefijo}_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.png`;
-  await uploadBufferToS3({ key, buffer, contentType: match[1] });
+  const firma = decodificarFirmaBase64(firmaBase64);
+  if (!firma) throw crearErrorHttp("La firma debe ser una imagen JPEG, PNG, WebP o HEIC válida de hasta 2 MB", 400);
+  const extension = extensionSegura(null, firma.mime);
+  const key = `olimpiadas/${prefijo}_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.${extension}`;
+  await uploadBufferToS3({ key, buffer: firma.buffer, contentType: firma.mime });
   return key;
 }
 
@@ -94,11 +142,12 @@ async function subirFirmaBase64(firmaBase64, prefijo) {
 // ---------------------------------------------------------------------------
 const uploadOlimpiadas = multer({
   storage: multer.memoryStorage(),
-  limits: { files: 4, fileSize: 10 * 1024 * 1024 },
+  limits: { files: 4, fileSize: MAX_ARCHIVO_OLIMPIADAS_BYTES, fieldSize: Math.ceil(MAX_FIRMA_BYTES / 3) * 4 + 256 },
   fileFilter: (req, file, cb) => {
-    const esImagen = file.mimetype?.startsWith("image/");
-    const esPdf = file.mimetype === "application/pdf";
-    if (!esImagen && !esPdf) return cb(new Error("Solo se permiten imágenes o PDF"));
+    const mime = file.mimetype === "image/jpg" ? "image/jpeg" : file.mimetype;
+    const esImagen = MIME_IMAGEN_PERMITIDO.has(mime);
+    const esPdf = permitePdfEnSlot(file.fieldname) && file.mimetype === "application/pdf";
+    if (!esImagen && !esPdf) return cb(new Error("Solo se permiten JPEG, PNG, WebP, HEIC y PDF únicamente para certificados"));
     return cb(null, true);
   },
 });
@@ -106,6 +155,12 @@ const uploadOlimpiadas = multer({
 function manejarUploadOlimpiadas(req, res, next) {
   uploadOlimpiadas.any()(req, res, (error) => {
     if (error) return res.status(400).json(error.message || "No se pudieron procesar los archivos");
+    const totalBytes = (req.files || []).reduce((total, file) => total + (file.buffer?.length || 0), 0);
+    if (totalBytes > MAX_TOTAL_OLIMPIADAS_BYTES) return res.status(400).json("Los archivos superan el máximo total de 30 MB");
+    for (const file of req.files || []) {
+      const validacion = validarContenidoArchivo(file);
+      if (validacion.error) return res.status(400).json(validacion.error);
+    }
     return next();
   });
 }
@@ -114,20 +169,13 @@ function manejarUploadOlimpiadas(req, res, next) {
 // Auth
 // ---------------------------------------------------------------------------
 function verifyToken(req, res, next) {
-  if (!req.headers.authorization) return res.status(401).json("No autorizado");
-  const token = req.headers.authorization.substr(7);
-  if (token !== "") {
-    jwt.verify(token, process.env.JWT_SECRET, (error, authData) => {
-      if (error) {
-        res.status(403).json("Error en el token");
-      } else {
-        req.data = authData;
-        next();
-      }
-    });
-  } else {
-    res.status(401).json("Token vacio");
-  }
+  const coincidencia = /^Bearer ([^\s]+)$/.exec(String(req.headers.authorization || ""));
+  if (!coincidencia) return res.status(401).json("Se requiere Authorization: Bearer <token>");
+  jwt.verify(coincidencia[1], process.env.JWT_SECRET, (error, authData) => {
+    if (error) return res.status(403).json("Error en el token");
+    req.data = authData;
+    return next();
+  });
 }
 
 function getCabecera(req) {
@@ -148,8 +196,8 @@ function esAdmin(cabecera) {
 // El staff departamental solo ve inscripciones de su departamental
 function puedeVerInscripcion(cabecera, inscripcion) {
   if (cabecera.rol === "admin") return true;
-  if (cabecera.rol === "departamental") return Number(inscripcion.departamental_id) === Number(cabecera.departamental_id);
-  if (cabecera.rol === "afiliado") return Number(inscripcion.usuario_id) === Number(cabecera.id);
+  if (cabecera.rol === "departamental") return idsPositivosIguales(inscripcion.departamental_id, cabecera.departamental_id);
+  if (cabecera.rol === "afiliado") return idsPositivosIguales(inscripcion.usuario_id, cabecera.id);
   return false;
 }
 
@@ -157,8 +205,62 @@ function puedeVerInscripcion(cabecera, inscripcion) {
 // Helpers de negocio
 // ---------------------------------------------------------------------------
 function normalizarTexto(valor) {
-  const texto = String(valor ?? "").trim();
+  if (typeof valor !== "string") return null;
+  const texto = valor.trim();
   return texto.length > 0 ? texto : null;
+}
+
+function normalizarIdPositivo(valor) {
+  if (typeof valor === "number") {
+    return Number.isSafeInteger(valor) && valor > 0 ? valor : null;
+  }
+  if (typeof valor !== "string") return null;
+  const texto = valor.trim();
+  if (!/^\d+$/.test(texto)) return null;
+  const numero = Number(texto);
+  return Number.isSafeInteger(numero) && numero > 0 ? numero : null;
+}
+
+function idsPositivosIguales(a, b) {
+  const idA = normalizarIdPositivo(a);
+  const idB = normalizarIdPositivo(b);
+  return idA !== null && idB !== null && idA === idB;
+}
+
+function normalizarCupo(valor) {
+  if (valor === undefined || valor === null || valor === "") return { value: null };
+  if (typeof valor !== "string" && typeof valor !== "number") {
+    return { error: "El cupo debe ser un entero mayor a 0" };
+  }
+  const texto = String(valor).trim();
+  if (!/^\d+$/.test(texto)) return { error: "El cupo debe ser un entero mayor a 0" };
+  const numero = Number(texto);
+  if (!Number.isSafeInteger(numero) || numero <= 0) return { error: "El cupo debe ser un entero mayor a 0" };
+  return { value: numero };
+}
+
+function crearErrorHttp(mensaje, statusCode = 400) {
+  const error = new Error(mensaje);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function fechaHoyBuenosAires(fecha = new Date()) {
+  const partes = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Argentina/Buenos_Aires",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(fecha);
+  const porTipo = Object.fromEntries(partes.map((parte) => [parte.type, parte.value]));
+  return `${porTipo.year}-${porTipo.month}-${porTipo.day}`;
+}
+
+function estaVentanaInscripcionAbierta(olimpiada, hoy = fechaHoyBuenosAires()) {
+  const inicio = normalizarFechaCivil(olimpiada?.fecha_inicio_inscripcion);
+  const fin = normalizarFechaCivil(olimpiada?.fecha_fin_inscripcion);
+  const fechaActual = normalizarFechaCivil(hoy);
+  return Boolean(inicio && fin && fechaActual && inicio <= fechaActual && fechaActual <= fin);
 }
 
 function parseJsonSeguro(valor, porDefecto) {
@@ -329,7 +431,7 @@ router.put("/olimpiadas/tipos-disciplina/:id", verifyToken, async (req, res) => 
   try {
     const cabecera = getCabecera(req);
     if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
-    const tipoId = Number(req.params.id);
+    const tipoId = normalizarIdPositivo(req.params.id);
     const nombre = normalizarTexto(req.body.nombre);
     if (!tipoId || !nombre) return res.status(400).json("El nombre es obligatorio");
     const db = mysqlConnection.promise();
@@ -353,7 +455,7 @@ router.delete("/olimpiadas/tipos-disciplina/:id", verifyToken, async (req, res) 
   try {
     const cabecera = getCabecera(req);
     if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
-    const tipoId = Number(req.params.id);
+    const tipoId = normalizarIdPositivo(req.params.id);
     if (!tipoId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
     const [rows] = await db.query("SELECT * FROM olimpiada_disciplina_tipo WHERE id = ? AND habilitado = 'Y'", [tipoId]);
@@ -396,12 +498,12 @@ router.get("/olimpiadas/disciplinas", verifyToken, async (req, res) => {
   }
 });
 
-// Ícono de disciplina: imagen svg/png adjunta en el slot ICONO (opcional)
+// Ícono de disciplina: JPEG/PNG/WebP/HEIC adjunto en el slot ICONO (opcional)
 function obtenerArchivoIcono(req, res) {
   const archivo = (req.files || []).find((f) => f.fieldname === "ICONO");
   if (!archivo) return { archivo: null };
   if (!archivo.mimetype?.startsWith("image/")) {
-    res.status(400).json("El ícono debe ser una imagen (SVG o PNG)");
+    res.status(400).json("El ícono debe ser una imagen JPEG, PNG, WebP o HEIC");
     return { error: true };
   }
   return { archivo };
@@ -412,12 +514,11 @@ router.post("/olimpiadas/disciplinas", verifyToken, manejarUploadOlimpiadas, asy
     const cabecera = getCabecera(req);
     if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
     const nombre = normalizarTexto(req.body.nombre);
-    const tipoId = Number(req.body.tipo_id);
-    const max = req.body.max_por_departamental === null || req.body.max_por_departamental === undefined || req.body.max_por_departamental === ""
-      ? null
-      : Number(req.body.max_por_departamental);
+    const tipoId = normalizarIdPositivo(req.body.tipo_id);
+    const cupo = normalizarCupo(req.body.max_por_departamental);
     if (!nombre || !tipoId) return res.status(400).json("Nombre y tipo son obligatorios");
-    if (max !== null && (!Number.isFinite(max) || max < 0)) return res.status(400).json("El máximo por departamental es inválido");
+    if (cupo.error) return res.status(400).json(cupo.error);
+    const max = cupo.value;
 
     const icono = obtenerArchivoIcono(req, res);
     if (icono.error) return;
@@ -446,14 +547,13 @@ router.put("/olimpiadas/disciplinas/:id", verifyToken, manejarUploadOlimpiadas, 
   try {
     const cabecera = getCabecera(req);
     if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
-    const disciplinaId = Number(req.params.id);
+    const disciplinaId = normalizarIdPositivo(req.params.id);
     const nombre = normalizarTexto(req.body.nombre);
-    const tipoId = Number(req.body.tipo_id);
-    const max = req.body.max_por_departamental === null || req.body.max_por_departamental === undefined || req.body.max_por_departamental === ""
-      ? null
-      : Number(req.body.max_por_departamental);
+    const tipoId = normalizarIdPositivo(req.body.tipo_id);
+    const cupo = normalizarCupo(req.body.max_por_departamental);
     if (!disciplinaId || !nombre || !tipoId) return res.status(400).json("Nombre y tipo son obligatorios");
-    if (max !== null && (!Number.isFinite(max) || max < 0)) return res.status(400).json("El máximo por departamental es inválido");
+    if (cupo.error) return res.status(400).json(cupo.error);
+    const max = cupo.value;
     const db = mysqlConnection.promise();
     const [rows] = await db.query("SELECT * FROM olimpiada_disciplina WHERE id = ? AND habilitado = 'Y'", [disciplinaId]);
     if (rows.length === 0) return res.status(404).json("Disciplina no encontrada");
@@ -504,7 +604,7 @@ router.delete("/olimpiadas/disciplinas/:id", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
-    const disciplinaId = Number(req.params.id);
+    const disciplinaId = normalizarIdPositivo(req.params.id);
     if (!disciplinaId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
     const [rows] = await db.query("SELECT * FROM olimpiada_disciplina WHERE id = ? AND habilitado = 'Y'", [disciplinaId]);
@@ -553,11 +653,19 @@ router.get("/olimpiadas/config", verifyToken, async (req, res) => {
 });
 
 router.put("/olimpiadas/config", verifyToken, manejarUploadOlimpiadas, async (req, res) => {
+  let connection;
   try {
     const cabecera = getCabecera(req);
     if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
     const db = mysqlConnection.promise();
-    const [rows] = await db.query("SELECT * FROM olimpiada_config WHERE id = 1");
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    // La migración crea esta fila única. El upsert defensivo también materializa
+    // la clave antes del FOR UPDATE si una instalación antigua no ejecutó el seed.
+    await connection.query(
+      "INSERT INTO olimpiada_config (id) VALUES (1) ON DUPLICATE KEY UPDATE id = id"
+    );
+    const [rows] = await connection.query("SELECT * FROM olimpiada_config WHERE id = 1 FOR UPDATE");
     const anterior = rows[0] || {};
 
     const nombre = normalizarTexto(req.body.firma_secretario_nombre) || anterior.firma_secretario_nombre;
@@ -570,25 +678,27 @@ router.put("/olimpiadas/config", verifyToken, manejarUploadOlimpiadas, async (re
       firmaArchivo = await subirArchivoOlimpiadas(archivoFirma, "config/firma_secretario");
     }
 
-    await db.query(
-      `INSERT INTO olimpiada_config (id, firma_secretario_archivo, firma_secretario_nombre, firma_secretario_cargo)
-       VALUES (1, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE firma_secretario_archivo = VALUES(firma_secretario_archivo),
-                               firma_secretario_nombre = VALUES(firma_secretario_nombre),
-                               firma_secretario_cargo = VALUES(firma_secretario_cargo)`,
+    await connection.query(
+      `UPDATE olimpiada_config
+       SET firma_secretario_archivo = ?, firma_secretario_nombre = ?, firma_secretario_cargo = ?
+       WHERE id = 1`,
       [firmaArchivo, nombre, cargo]
     );
-    await registrarHistorial(db, {
+    await registrarHistorial(connection, {
       entidad: "CONFIG", entidad_id: 1,
       usuario_id: cabecera.id, usuario_rol: cabecera.rol,
       tipo_operacion: "UPDATE",
       campo_modificado: archivoFirma ? "firma_secretario" : "datos_secretario",
       valor_nuevo: `${nombre} - ${cargo}${archivoFirma ? " (nueva imagen de firma)" : ""}`,
     });
+    await connection.commit();
     res.status(200).json({ success: true, message: "Configuración guardada" });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.log(error);
-    res.status(500).json("Error al guardar la configuración de olimpiadas");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al guardar la configuración de olimpiadas");
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -675,7 +785,8 @@ router.get("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     if (!esStaff(cabecera)) return res.status(401).json("No autorizado");
-    const olimpiadaId = Number(req.params.id);
+    const olimpiadaId = normalizarIdPositivo(req.params.id);
+    if (!olimpiadaId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
     const [rows] = await db.query("SELECT * FROM olimpiada WHERE id = ? AND eliminado = 0", [olimpiadaId]);
     if (rows.length === 0) return res.status(404).json("Olimpiada no encontrada");
@@ -691,28 +802,30 @@ router.get("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
 
 function validarDatosOlimpiada(body) {
   const nombre = normalizarTexto(body.nombre);
-  const fechaInicio = normalizarTexto(body.fecha_inicio);
-  const fechaFin = normalizarTexto(body.fecha_fin);
-  const inscInicio = normalizarTexto(body.fecha_inicio_inscripcion);
-  const inscFin = normalizarTexto(body.fecha_fin_inscripcion);
+  const fechaInicio = normalizarFechaCivil(body.fecha_inicio);
+  const fechaFin = normalizarFechaCivil(body.fecha_fin);
+  const inscInicio = normalizarFechaCivil(body.fecha_inicio_inscripcion);
+  const inscFin = normalizarFechaCivil(body.fecha_fin_inscripcion);
   if (!nombre || !fechaInicio || !fechaFin || !inscInicio || !inscFin) {
-    return { error: "Nombre y las cuatro fechas son obligatorios" };
+    return { error: "Nombre y las cuatro fechas civiles válidas (YYYY-MM-DD) son obligatorios" };
   }
   if (fechaFin < fechaInicio) return { error: "La fecha de fin no puede ser anterior a la de inicio" };
   if (inscFin < inscInicio) return { error: "El cierre de inscripción no puede ser anterior a su apertura" };
+  if (inscFin > fechaInicio) return { error: "La inscripción debe cerrar antes o el mismo día de inicio de la olimpiada" };
   const disciplinas = Array.isArray(body.disciplinas) ? body.disciplinas : parseJsonSeguro(body.disciplinas, []);
   if (!Array.isArray(disciplinas) || disciplinas.length === 0) {
     return { error: "Elegí al menos una disciplina para la olimpiada" };
   }
   const disciplinasNormalizadas = [];
+  const disciplinasVistas = new Set();
   for (const d of disciplinas) {
-    const disciplinaId = Number(d.disciplina_id ?? d.id);
+    const disciplinaId = normalizarIdPositivo(d.disciplina_id ?? d.id);
     if (!disciplinaId) return { error: "Hay una disciplina inválida en la lista" };
-    const max = d.max_por_departamental === null || d.max_por_departamental === undefined || d.max_por_departamental === ""
-      ? null
-      : Number(d.max_por_departamental);
-    if (max !== null && (!Number.isFinite(max) || max < 0)) return { error: "Hay un cupo por departamental inválido" };
-    disciplinasNormalizadas.push({ disciplina_id: disciplinaId, max_por_departamental: max });
+    if (disciplinasVistas.has(disciplinaId)) return { error: "No se puede repetir una disciplina" };
+    disciplinasVistas.add(disciplinaId);
+    const cupo = normalizarCupo(d.max_por_departamental);
+    if (cupo.error) return { error: `Cupo inválido para la disciplina #${disciplinaId}: ${cupo.error}` };
+    disciplinasNormalizadas.push({ disciplina_id: disciplinaId, max_por_departamental: cupo.value });
   }
   return {
     value: {
@@ -730,6 +843,114 @@ function validarDatosOlimpiada(body) {
   };
 }
 
+async function bloquearOlimpiada(connection, olimpiadaId, { requiereHabilitada = false } = {}) {
+  const [rows] = await connection.query(
+    `SELECT * FROM olimpiada
+     WHERE id = ? AND eliminado = 0${requiereHabilitada ? " AND habilitado = 'Y'" : ""}
+     FOR UPDATE`,
+    [olimpiadaId]
+  );
+  return rows[0] || null;
+}
+
+async function validarDisciplinasCatalogo(connection, disciplinas) {
+  const ids = disciplinas.map((disciplina) => disciplina.disciplina_id);
+  const [rows] = await connection.query(
+    "SELECT id FROM olimpiada_disciplina WHERE id IN (?) AND habilitado = 'Y' FOR UPDATE",
+    [ids]
+  );
+  const existentes = new Set(rows.map((row) => Number(row.id)));
+  if (ids.some((id) => !existentes.has(id))) {
+    throw crearErrorHttp("Una de las disciplinas no existe o está deshabilitada", 400);
+  }
+}
+
+async function validarConfiguracionContraInscripciones(connection, olimpiadaId, disciplinas) {
+  const configuracion = new Map(disciplinas.map((disciplina) => [disciplina.disciplina_id, disciplina]));
+  const [usos] = await connection.query(
+    `SELECT idp.disciplina_id, i.departamental_id,
+            COUNT(*) AS inscripciones,
+            SUM(CASE WHEN i.estado = 'VALIDADO' THEN 1 ELSE 0 END) AS validadas
+     FROM olimpiada_inscripcion_disciplina idp
+     INNER JOIN olimpiada_inscripcion i ON i.id = idp.inscripcion_id
+     WHERE i.olimpiada_id = ? AND i.eliminado = 0
+     GROUP BY idp.disciplina_id, i.departamental_id`,
+    [olimpiadaId]
+  );
+
+  for (const uso of usos) {
+    const disciplinaId = Number(uso.disciplina_id);
+    const nuevaConfiguracion = configuracion.get(disciplinaId);
+    if (!nuevaConfiguracion) {
+      throw crearErrorHttp(`No se puede quitar la disciplina #${disciplinaId}: tiene inscripciones asociadas`, 409);
+    }
+    const cupo = nuevaConfiguracion.max_por_departamental;
+    if (cupo !== null && Number(uso.validadas) > cupo) {
+      const sede = uso.departamental_id === null ? "sin departamental" : `departamental #${uso.departamental_id}`;
+      throw crearErrorHttp(
+        `El cupo de la disciplina #${disciplinaId} no puede bajar de ${uso.validadas} para ${sede}`,
+        409
+      );
+    }
+  }
+}
+
+async function validarCapacidadDisciplinas(connection, {
+  olimpiadaId,
+  departamentalId,
+  disciplinaIds,
+  excluirInscripcionId = null,
+  controlarCapacidad = true,
+}) {
+  const [configs] = await connection.query(
+    `SELECT c.disciplina_id, c.max_por_departamental, d.nombre
+     FROM olimpiada_disciplina_config c
+     INNER JOIN olimpiada_disciplina d ON d.id = c.disciplina_id
+     WHERE c.olimpiada_id = ? AND d.habilitado = 'Y'
+     FOR UPDATE`,
+    [olimpiadaId]
+  );
+  const porDisciplina = new Map(configs.map((config) => [Number(config.disciplina_id), config]));
+
+  for (const disciplinaId of disciplinaIds) {
+    const config = porDisciplina.get(disciplinaId);
+    if (!config) throw crearErrorHttp("Una de las disciplinas elegidas no pertenece a esta olimpiada", 400);
+    if (!controlarCapacidad || config.max_por_departamental === null) continue;
+
+    const params = [disciplinaId, olimpiadaId, departamentalId];
+    const excluir = excluirInscripcionId ? " AND i.id <> ?" : "";
+    if (excluirInscripcionId) params.push(excluirInscripcionId);
+    const [[ocupacion]] = await connection.query(
+      `SELECT COUNT(*) AS total
+       FROM olimpiada_inscripcion_disciplina idp
+       INNER JOIN olimpiada_inscripcion i ON i.id = idp.inscripcion_id
+       WHERE idp.disciplina_id = ? AND i.olimpiada_id = ? AND i.eliminado = 0
+         AND i.estado = 'VALIDADO' AND i.departamental_id <=> ?${excluir}`,
+      params
+    );
+    if (Number(ocupacion.total) >= Number(config.max_por_departamental)) {
+      throw crearErrorHttp(`No quedan cupos de "${config.nombre}" para la departamental`, 409);
+    }
+  }
+}
+
+async function validarReferenciasSanitarias(connection, grupoSanguineoId, datosSanitarioIds) {
+  const [grupos] = await connection.query(
+    "SELECT id FROM olimpiada_grupo_sanguineo WHERE id = ? FOR UPDATE",
+    [grupoSanguineoId]
+  );
+  if (grupos.length === 0) throw crearErrorHttp("El grupo sanguíneo seleccionado no existe", 400);
+  if (datosSanitarioIds.length === 0) return;
+  const [datos] = await connection.query(
+    "SELECT id FROM olimpiada_dato_sanitario WHERE id IN (?) FOR UPDATE",
+    [datosSanitarioIds]
+  );
+  const existentes = new Set(datos.map((dato) => Number(dato.id)));
+  if (datosSanitarioIds.some((id) => !existentes.has(id))) {
+    throw crearErrorHttp("Uno de los datos sanitarios seleccionados no existe", 400);
+  }
+}
+
 router.post("/olimpiadas", verifyToken, async (req, res) => {
   let connection;
   try {
@@ -742,6 +963,7 @@ router.post("/olimpiadas", verifyToken, async (req, res) => {
     const db = mysqlConnection.promise();
     connection = await db.getConnection();
     await connection.beginTransaction();
+    await validarDisciplinasCatalogo(connection, datos.disciplinas);
 
     const [resultado] = await connection.query(
       `INSERT INTO olimpiada
@@ -775,7 +997,7 @@ router.post("/olimpiadas", verifyToken, async (req, res) => {
   } catch (error) {
     if (connection) await connection.rollback();
     console.log(error);
-    res.status(500).json("Error al crear la olimpiada");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al crear la olimpiada");
   } finally {
     if (connection) connection.release();
   }
@@ -786,18 +1008,23 @@ router.put("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
-    const olimpiadaId = Number(req.params.id);
+    const olimpiadaId = normalizarIdPositivo(req.params.id);
+    if (!olimpiadaId) return res.status(400).json("ID inválido");
     const parseo = validarDatosOlimpiada(req.body);
     if (parseo.error) return res.status(400).json(parseo.error);
     const datos = parseo.value;
 
     const db = mysqlConnection.promise();
-    const [rows] = await db.query("SELECT * FROM olimpiada WHERE id = ? AND eliminado = 0", [olimpiadaId]);
-    if (rows.length === 0) return res.status(404).json("Olimpiada no encontrada");
-    const anterior = rows[0];
-
     connection = await db.getConnection();
     await connection.beginTransaction();
+    const anterior = await bloquearOlimpiada(connection, olimpiadaId);
+    if (!anterior) throw crearErrorHttp("Olimpiada no encontrada", 404);
+    await connection.query(
+      "SELECT disciplina_id FROM olimpiada_disciplina_config WHERE olimpiada_id = ? FOR UPDATE",
+      [olimpiadaId]
+    );
+    await validarDisciplinasCatalogo(connection, datos.disciplinas);
+    await validarConfiguracionContraInscripciones(connection, olimpiadaId, datos.disciplinas);
 
     await connection.query(
       `UPDATE olimpiada
@@ -821,7 +1048,7 @@ router.put("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
       );
     }
 
-    const formatearFecha = (f) => (f instanceof Date ? f.toISOString().slice(0, 10) : String(f || ""));
+    const formatearFecha = (fecha) => normalizarFechaCivil(fecha) || "";
     const camposComparables = [
       ["nombre", anterior.nombre, datos.nombre],
       ["edicion", anterior.edicion, datos.edicion],
@@ -857,30 +1084,38 @@ router.put("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
   } catch (error) {
     if (connection) await connection.rollback();
     console.log(error);
-    res.status(500).json("Error al actualizar la olimpiada");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al actualizar la olimpiada");
   } finally {
     if (connection) connection.release();
   }
 });
 
 router.delete("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
+  let connection;
   try {
     const cabecera = getCabecera(req);
     if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
-    const olimpiadaId = Number(req.params.id);
+    const olimpiadaId = normalizarIdPositivo(req.params.id);
+    if (!olimpiadaId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
-    const [rows] = await db.query("SELECT * FROM olimpiada WHERE id = ? AND eliminado = 0", [olimpiadaId]);
-    if (rows.length === 0) return res.status(404).json("Olimpiada no encontrada");
-    await db.query("UPDATE olimpiada SET eliminado = 1 WHERE id = ?", [olimpiadaId]);
-    await registrarHistorial(db, {
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    const olimpiada = await bloquearOlimpiada(connection, olimpiadaId);
+    if (!olimpiada) throw crearErrorHttp("Olimpiada no encontrada", 404);
+    await connection.query("UPDATE olimpiada SET eliminado = 1 WHERE id = ? AND eliminado = 0", [olimpiadaId]);
+    await registrarHistorial(connection, {
       entidad: "OLIMPIADA", entidad_id: olimpiadaId, olimpiada_id: olimpiadaId,
       usuario_id: cabecera.id, usuario_rol: cabecera.rol,
-      tipo_operacion: "DELETE", valor_anterior: rows[0].nombre,
+      tipo_operacion: "DELETE", valor_anterior: olimpiada.nombre,
     });
+    await connection.commit();
     res.status(200).json({ success: true, message: "Olimpiada eliminada" });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.log(error);
-    res.status(500).json("Error al eliminar la olimpiada");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al eliminar la olimpiada");
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -891,7 +1126,7 @@ router.get("/olimpiadas/:id(\\d+)/mensajes", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     if (!esStaff(cabecera)) return res.status(401).json("No autorizado");
-    const olimpiadaId = Number(req.params.id);
+    const olimpiadaId = normalizarIdPositivo(req.params.id);
     const db = mysqlConnection.promise();
     const [mensajes] = await db.query(
       `SELECT m.*, u.nombre AS usuario_nombre, u.apellido AS usuario_apellido
@@ -913,7 +1148,7 @@ router.post("/olimpiadas/:id(\\d+)/mensajes", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     if (!esStaff(cabecera)) return res.status(401).json("No autorizado");
-    const olimpiadaId = Number(req.params.id);
+    const olimpiadaId = normalizarIdPositivo(req.params.id);
     const titulo = normalizarTexto(req.body.titulo);
     const mensaje = normalizarTexto(req.body.mensaje);
     if (!olimpiadaId || !titulo || !mensaje) return res.status(400).json("Título y mensaje son obligatorios");
@@ -973,9 +1208,19 @@ router.post("/olimpiadas/:id(\\d+)/mensajes", verifyToken, async (req, res) => {
 // ===========================================================================
 
 function normalizarIds(valor) {
-  const lista = Array.isArray(valor) ? valor : parseJsonSeguro(valor, []);
-  if (!Array.isArray(lista)) return [];
-  return [...new Set(lista.map((v) => Number(v)).filter((v) => Number.isFinite(v) && v > 0))];
+  if (valor === undefined || valor === null || valor === "") return [];
+  let lista = valor;
+  if (!Array.isArray(lista) && typeof valor === "string") {
+    try {
+      lista = JSON.parse(valor);
+    } catch (error) {
+      return null;
+    }
+  }
+  if (!Array.isArray(lista)) return null;
+  const normalizados = lista.map(normalizarIdPositivo);
+  if (normalizados.some((id) => !id)) return null;
+  return [...new Set(normalizados)];
 }
 
 // Alta (afiliado; el staff también puede cargar en nombre de un afiliado propio)
@@ -983,33 +1228,29 @@ router.post("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, manejarUploadOli
   let connection;
   try {
     const cabecera = getCabecera(req);
-    const olimpiadaId = Number(req.params.id);
+    const olimpiadaId = normalizarIdPositivo(req.params.id);
+    if (!olimpiadaId) return res.status(400).json("ID de olimpiada inválido");
     if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol)) return res.status(401).json("No autorizado");
 
     const db = mysqlConnection.promise();
     const [olimpiadas] = await db.query("SELECT * FROM olimpiada WHERE id = ? AND eliminado = 0 AND habilitado = 'Y'", [olimpiadaId]);
     if (olimpiadas.length === 0) return res.status(404).json("Olimpiada no encontrada");
-    const olimpiada = olimpiadas[0];
-
-    // Ventana de inscripción (el admin puede cargar fuera de término)
-    if (cabecera.rol !== "admin") {
-      const [[ventana]] = await db.query(
-        "SELECT CURDATE() BETWEEN ? AND ? AS abierta",
-        [olimpiada.fecha_inicio_inscripcion, olimpiada.fecha_fin_inscripcion]
-      );
-      if (!ventana.abierta) return res.status(409).json("La inscripción a esta olimpiada no está abierta");
-    }
+    let olimpiada = olimpiadas[0];
 
     // Afiliado destinatario de la inscripción
-    let usuarioId = cabecera.id;
-    if (cabecera.rol !== "afiliado" && req.body.usuario_id) usuarioId = Number(req.body.usuario_id);
+    let usuarioId = normalizarIdPositivo(cabecera.id);
+    if (cabecera.rol !== "afiliado") usuarioId = normalizarIdPositivo(req.body.usuario_id);
+    if (!usuarioId) return res.status(400).json("Afiliado inválido");
     const [usuarios] = await db.query(
       `SELECT u.*, r.nombre AS rol_nombre FROM usuario u INNER JOIN rol r ON r.id = u.rol_id WHERE u.id = ?`,
       [usuarioId]
     );
     if (usuarios.length === 0) return res.status(404).json("Afiliado no encontrado");
-    const afiliado = usuarios[0];
-    if (cabecera.rol === "departamental" && Number(afiliado.departamental_id) !== Number(cabecera.departamental_id)) {
+    let afiliado = usuarios[0];
+    if (afiliado.rol_nombre !== "afiliado" || afiliado.habilitado !== "Y" || afiliado.usuario_familiar_id !== null) {
+      return res.status(422).json("El destinatario debe ser un afiliado principal habilitado");
+    }
+    if (cabecera.rol === "departamental" && !idsPositivosIguales(afiliado.departamental_id, cabecera.departamental_id)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -1020,11 +1261,12 @@ router.post("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, manejarUploadOli
     if (existentes.length > 0) return res.status(409).json("El afiliado ya tiene una inscripción en esta olimpiada");
 
     const disciplinaIds = normalizarIds(req.body.disciplinas);
-    if (disciplinaIds.length === 0) return res.status(400).json("Elegí al menos una disciplina");
+    if (!disciplinaIds || disciplinaIds.length === 0) return res.status(400).json("Elegí al menos una disciplina con IDs válidos");
 
     const datosSanitarioIds = normalizarIds(req.body.datos_sanitarios);
+    if (!datosSanitarioIds) return res.status(400).json("La lista de datos sanitarios contiene IDs inválidos");
     const tensionArterial = normalizarTexto(req.body.tension_arterial);
-    const grupoSanguineoId = Number(req.body.grupo_sanguineo_id) || null;
+    const grupoSanguineoId = normalizarIdPositivo(req.body.grupo_sanguineo_id);
     if (!tensionArterial) return res.status(400).json("Indicá tu presión arterial habitual");
     if (!grupoSanguineoId) return res.status(400).json("Elegí tu grupo sanguíneo");
 
@@ -1041,34 +1283,47 @@ router.post("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, manejarUploadOli
     connection = await db.getConnection();
     await connection.beginTransaction();
 
-    const [configs] = await connection.query(
-      `SELECT c.disciplina_id, c.max_por_departamental, d.nombre
-       FROM olimpiada_disciplina_config c INNER JOIN olimpiada_disciplina d ON d.id = c.disciplina_id
-       WHERE c.olimpiada_id = ? FOR UPDATE`,
-      [olimpiadaId]
-    );
-    const configPorDisciplina = new Map(configs.map((c) => [Number(c.disciplina_id), c]));
-    for (const disciplinaId of disciplinaIds) {
-      const config = configPorDisciplina.get(disciplinaId);
-      if (!config) {
-        await connection.rollback();
-        return res.status(400).json("Una de las disciplinas elegidas no pertenece a esta olimpiada");
-      }
-      if (config.max_por_departamental !== null) {
-        const [[ocupacion]] = await connection.query(
-          `SELECT COUNT(*) AS total
-           FROM olimpiada_inscripcion_disciplina idp
-           INNER JOIN olimpiada_inscripcion i ON i.id = idp.inscripcion_id
-           WHERE idp.disciplina_id = ? AND i.olimpiada_id = ? AND i.eliminado = 0
-             AND i.estado = 'VALIDADO' AND i.departamental_id <=> ?`,
-          [disciplinaId, olimpiadaId, afiliado.departamental_id]
-        );
-        if (ocupacion.total >= config.max_por_departamental) {
-          await connection.rollback();
-          return res.status(409).json(`No quedan cupos de "${config.nombre}" para tu departamental`);
-        }
-      }
+    const olimpiadaBloqueada = await bloquearOlimpiada(connection, olimpiadaId, { requiereHabilitada: true });
+    if (!olimpiadaBloqueada) throw crearErrorHttp("Olimpiada no encontrada", 404);
+    olimpiada = olimpiadaBloqueada;
+    if (cabecera.rol !== "admin" && !estaVentanaInscripcionAbierta(olimpiada)) {
+      throw crearErrorHttp("La inscripción a esta olimpiada no está abierta", 409);
     }
+
+    const [usuariosBloqueados] = await connection.query(
+      `SELECT u.*, r.nombre AS rol_nombre
+       FROM usuario u INNER JOIN rol r ON r.id = u.rol_id
+       WHERE u.id = ? FOR UPDATE`,
+      [usuarioId]
+    );
+    if (usuariosBloqueados.length === 0) throw crearErrorHttp("Afiliado no encontrado", 404);
+    afiliado = usuariosBloqueados[0];
+    if (afiliado.rol_nombre !== "afiliado" || afiliado.habilitado !== "Y" || afiliado.usuario_familiar_id !== null) {
+      throw crearErrorHttp("El destinatario debe ser un afiliado principal habilitado", 422);
+    }
+    if (cabecera.rol === "departamental" && (
+      !normalizarIdPositivo(afiliado.departamental_id) ||
+      normalizarIdPositivo(afiliado.departamental_id) !== normalizarIdPositivo(cabecera.departamental_id)
+    )) {
+      throw crearErrorHttp("No autorizado", 403);
+    }
+
+    const [existentesBloqueadas] = await connection.query(
+      `SELECT id FROM olimpiada_inscripcion
+       WHERE olimpiada_id = ? AND usuario_id = ? AND eliminado = 0
+       FOR UPDATE`,
+      [olimpiadaId, usuarioId]
+    );
+    if (existentesBloqueadas.length > 0) {
+      throw crearErrorHttp("El afiliado ya tiene una inscripción en esta olimpiada", 409);
+    }
+
+    await validarReferenciasSanitarias(connection, grupoSanguineoId, datosSanitarioIds);
+    await validarCapacidadDisciplinas(connection, {
+      olimpiadaId,
+      departamentalId: afiliado.departamental_id,
+      disciplinaIds,
+    });
 
     // Archivos a S3
     const firmaArchivo = await subirFirmaBase64(firmaBase64, "inscripciones/firma");
@@ -1127,7 +1382,7 @@ router.post("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, manejarUploadOli
   } catch (error) {
     if (connection) await connection.rollback();
     console.log(error);
-    res.status(500).json("Error al enviar la inscripción");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al enviar la inscripción");
   } finally {
     if (connection) connection.release();
   }
@@ -1138,7 +1393,7 @@ router.get("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, async (req, res) 
   try {
     const cabecera = getCabecera(req);
     if (!esStaff(cabecera)) return res.status(401).json("No autorizado");
-    const olimpiadaId = Number(req.params.id);
+    const olimpiadaId = normalizarIdPositivo(req.params.id);
     const filtroDepartamental = cabecera.rol === "departamental" ? Number(cabecera.departamental_id) || 0 : null;
     const db = mysqlConnection.promise();
     const [inscripciones] = await db.query(
@@ -1196,7 +1451,8 @@ router.get("/olimpiadas/mis-inscripciones", verifyToken, async (req, res) => {
 router.get("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    const inscripcionId = Number(req.params.id);
+    const inscripcionId = normalizarIdPositivo(req.params.id);
+    if (!inscripcionId) return res.status(400).json("ID de inscripción inválido");
     const db = mysqlConnection.promise();
     const [rows] = await db.query(
       `SELECT i.*, o.nombre AS olimpiada_nombre, o.edicion AS olimpiada_edicion, o.localidad AS olimpiada_localidad,
@@ -1293,7 +1549,8 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
   let connection;
   try {
     const cabecera = getCabecera(req);
-    const inscripcionId = Number(req.params.id);
+    const inscripcionId = normalizarIdPositivo(req.params.id);
+    if (!inscripcionId) return res.status(400).json("ID de inscripción inválido");
     const db = mysqlConnection.promise();
     const [rows] = await db.query(
       `SELECT i.*, o.fecha_inicio_inscripcion, o.fecha_fin_inscripcion
@@ -1302,29 +1559,49 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
       [inscripcionId]
     );
     if (rows.length === 0) return res.status(404).json("Inscripción no encontrada");
-    const inscripcion = rows[0];
+    let inscripcion = rows[0];
     if (!puedeVerInscripcion(cabecera, inscripcion)) return res.status(401).json("No autorizado");
     if (cabecera.rol === "afiliado") {
-      const [[ventana]] = await db.query(
-        "SELECT CURDATE() BETWEEN ? AND ? AS abierta",
-        [inscripcion.fecha_inicio_inscripcion, inscripcion.fecha_fin_inscripcion]
-      );
-      if (!ventana.abierta) return res.status(409).json("La inscripción ya cerró: pedí los cambios por el chat de tu inscripción");
+      if (!estaVentanaInscripcionAbierta(inscripcion)) return res.status(409).json("La inscripción ya cerró: pedí los cambios por el chat de tu inscripción");
       if (inscripcion.estado === "CANCELADO") return res.status(409).json("La inscripción está cancelada");
     }
 
     connection = await db.getConnection();
     await connection.beginTransaction();
 
+    const olimpiadaBloqueada = await bloquearOlimpiada(connection, inscripcion.olimpiada_id);
+    if (!olimpiadaBloqueada) throw crearErrorHttp("Olimpiada no encontrada", 404);
+    const [inscripcionesBloqueadas] = await connection.query(
+      `SELECT i.*, o.fecha_inicio_inscripcion, o.fecha_fin_inscripcion
+       FROM olimpiada_inscripcion i INNER JOIN olimpiada o ON o.id = i.olimpiada_id
+       WHERE i.id = ? AND i.eliminado = 0 FOR UPDATE`,
+      [inscripcionId]
+    );
+    if (inscripcionesBloqueadas.length === 0) throw crearErrorHttp("Inscripción no encontrada", 404);
+    inscripcion = inscripcionesBloqueadas[0];
+    if (!puedeVerInscripcion(cabecera, inscripcion)) throw crearErrorHttp("No autorizado", 403);
+    if (cabecera.rol === "afiliado") {
+      if (!estaVentanaInscripcionAbierta(inscripcion)) {
+        throw crearErrorHttp("La inscripción ya cerró: pedí los cambios por el chat", 409);
+      }
+      if (inscripcion.estado === "CANCELADO") throw crearErrorHttp("La inscripción está cancelada", 409);
+    }
+
     const cambios = [];
+    let grupoSanguineoId = inscripcion.grupo_sanguineo_id;
+    if (req.body.grupo_sanguineo_id !== undefined) {
+      grupoSanguineoId = normalizarIdPositivo(req.body.grupo_sanguineo_id);
+      if (!grupoSanguineoId) throw crearErrorHttp("Grupo sanguíneo inválido", 400);
+    }
     const campos = {
       tension_arterial: normalizarTexto(req.body.tension_arterial) ?? inscripcion.tension_arterial,
-      grupo_sanguineo_id: req.body.grupo_sanguineo_id !== undefined ? (Number(req.body.grupo_sanguineo_id) || null) : inscripcion.grupo_sanguineo_id,
+      grupo_sanguineo_id: grupoSanguineoId,
       detalle_medico: req.body.detalle_medico !== undefined ? normalizarTexto(req.body.detalle_medico) : inscripcion.detalle_medico,
       detalle_alimentario: req.body.detalle_alimentario !== undefined ? normalizarTexto(req.body.detalle_alimentario) : inscripcion.detalle_alimentario,
       observaciones: req.body.observaciones !== undefined ? normalizarTexto(req.body.observaciones) : inscripcion.observaciones,
       lugar_trabajo: req.body.lugar_trabajo !== undefined ? normalizarTexto(req.body.lugar_trabajo) : inscripcion.lugar_trabajo,
     };
+    await validarReferenciasSanitarias(connection, campos.grupo_sanguineo_id, []);
     for (const [campo, valorNuevo] of Object.entries(campos)) {
       const valorAnterior = inscripcion[campo];
       if ((valorAnterior ?? "") !== (valorNuevo ?? "")) {
@@ -1363,36 +1640,34 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
       }
     }
 
-    await connection.query(
+    const [actualizacionInscripcion] = await connection.query(
       `UPDATE olimpiada_inscripcion
        SET tension_arterial = ?, grupo_sanguineo_id = ?, detalle_medico = ?, detalle_alimentario = ?,
            observaciones = ?, lugar_trabajo = ?, firma_archivo = ?,
            certificado_archivo = ?, certificado_nombre_original = ?, certificado_mime = ?, foto_archivo = ?
-       WHERE id = ?`,
+       WHERE id = ? AND estado = ? AND eliminado = 0`,
       [
         campos.tension_arterial, campos.grupo_sanguineo_id, campos.detalle_medico, campos.detalle_alimentario,
         campos.observaciones, campos.lugar_trabajo, firmaArchivo,
         certificadoArchivo, certificadoNombre, certificadoMime, fotoArchivo,
-        inscripcionId,
+        inscripcionId, inscripcion.estado,
       ]
     );
+    if (actualizacionInscripcion.affectedRows !== 1) {
+      throw crearErrorHttp("La inscripción cambió mientras se editaba. Recargá e intentá nuevamente.", 409);
+    }
 
     // Disciplinas y datos sanitarios (si vienen, se reemplazan)
     if (req.body.disciplinas !== undefined) {
       const disciplinaIds = normalizarIds(req.body.disciplinas);
-      if (disciplinaIds.length === 0) {
-        await connection.rollback();
-        return res.status(400).json("Elegí al menos una disciplina");
-      }
-      const [configs] = await connection.query(
-        "SELECT disciplina_id FROM olimpiada_disciplina_config WHERE olimpiada_id = ?",
-        [inscripcion.olimpiada_id]
-      );
-      const validas = new Set(configs.map((c) => Number(c.disciplina_id)));
-      if (disciplinaIds.some((id) => !validas.has(id))) {
-        await connection.rollback();
-        return res.status(400).json("Una de las disciplinas elegidas no pertenece a esta olimpiada");
-      }
+      if (!disciplinaIds || disciplinaIds.length === 0) throw crearErrorHttp("Elegí al menos una disciplina con IDs válidos", 400);
+      await validarCapacidadDisciplinas(connection, {
+        olimpiadaId: inscripcion.olimpiada_id,
+        departamentalId: inscripcion.departamental_id,
+        disciplinaIds,
+        excluirInscripcionId: inscripcionId,
+        controlarCapacidad: inscripcion.estado === "VALIDADO",
+      });
       const [anteriores] = await connection.query(
         `SELECT GROUP_CONCAT(d.nombre ORDER BY d.nombre SEPARATOR ', ') AS lista
          FROM olimpiada_inscripcion_disciplina idp
@@ -1420,6 +1695,8 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
     }
     if (req.body.datos_sanitarios !== undefined) {
       const datoIds = normalizarIds(req.body.datos_sanitarios);
+      if (!datoIds) throw crearErrorHttp("La lista de datos sanitarios contiene IDs inválidos", 400);
+      await validarReferenciasSanitarias(connection, campos.grupo_sanguineo_id, datoIds);
       await connection.query("DELETE FROM olimpiada_inscripcion_dato_sanitario WHERE inscripcion_id = ?", [inscripcionId]);
       for (const datoId of datoIds) {
         await connection.query(
@@ -1459,7 +1736,7 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
   } catch (error) {
     if (connection) await connection.rollback();
     console.log(error);
-    res.status(500).json("Error al actualizar la inscripción");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al actualizar la inscripción");
   } finally {
     if (connection) connection.release();
   }
@@ -1470,7 +1747,8 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)/estado", verifyToken, async (req
   let connection;
   try {
     const cabecera = getCabecera(req);
-    const inscripcionId = Number(req.params.id);
+    const inscripcionId = normalizarIdPositivo(req.params.id);
+    if (!inscripcionId) return res.status(400).json("ID de inscripción inválido");
     const estadoNuevo = String(req.body.estado || "").toUpperCase();
     if (!["VALIDADO", "CANCELADO"].includes(estadoNuevo)) return res.status(400).json("Estado inválido");
 
@@ -1482,7 +1760,7 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)/estado", verifyToken, async (req
       [inscripcionId]
     );
     if (rows.length === 0) return res.status(404).json("Inscripción no encontrada");
-    const inscripcion = rows[0];
+    let inscripcion = rows[0];
     if (!puedeVerInscripcion(cabecera, inscripcion)) return res.status(401).json("No autorizado");
     if (cabecera.rol === "afiliado" && estadoNuevo !== "CANCELADO") return res.status(401).json("No autorizado");
     if (inscripcion.estado === estadoNuevo) return res.status(409).json("La inscripción ya está en ese estado");
@@ -1490,7 +1768,44 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)/estado", verifyToken, async (req
     connection = await db.getConnection();
     await connection.beginTransaction();
 
-    await connection.query("UPDATE olimpiada_inscripcion SET estado = ? WHERE id = ?", [estadoNuevo, inscripcionId]);
+    const olimpiadaBloqueada = await bloquearOlimpiada(connection, inscripcion.olimpiada_id);
+    if (!olimpiadaBloqueada) throw crearErrorHttp("Olimpiada no encontrada", 404);
+    const [inscripcionesBloqueadas] = await connection.query(
+      `SELECT i.*, o.nombre AS olimpiada_nombre
+       FROM olimpiada_inscripcion i INNER JOIN olimpiada o ON o.id = i.olimpiada_id
+       WHERE i.id = ? AND i.eliminado = 0 FOR UPDATE`,
+      [inscripcionId]
+    );
+    if (inscripcionesBloqueadas.length === 0) throw crearErrorHttp("Inscripción no encontrada", 404);
+    inscripcion = inscripcionesBloqueadas[0];
+    if (!puedeVerInscripcion(cabecera, inscripcion)) throw crearErrorHttp("No autorizado", 403);
+    if (cabecera.rol === "afiliado" && estadoNuevo !== "CANCELADO") throw crearErrorHttp("No autorizado", 403);
+    if (inscripcion.estado === estadoNuevo) throw crearErrorHttp("La inscripción ya está en ese estado", 409);
+
+    if (estadoNuevo === "VALIDADO") {
+      const [disciplinas] = await connection.query(
+        "SELECT disciplina_id FROM olimpiada_inscripcion_disciplina WHERE inscripcion_id = ? FOR UPDATE",
+        [inscripcionId]
+      );
+      const disciplinaIds = disciplinas.map((disciplina) => normalizarIdPositivo(disciplina.disciplina_id));
+      if (disciplinaIds.length === 0 || disciplinaIds.some((id) => !id)) {
+        throw crearErrorHttp("La inscripción no tiene disciplinas válidas para reactivarse", 409);
+      }
+      await validarCapacidadDisciplinas(connection, {
+        olimpiadaId: inscripcion.olimpiada_id,
+        departamentalId: inscripcion.departamental_id,
+        disciplinaIds,
+        excluirInscripcionId: inscripcionId,
+      });
+    }
+
+    const [actualizacionEstado] = await connection.query(
+      "UPDATE olimpiada_inscripcion SET estado = ? WHERE id = ? AND estado = ? AND eliminado = 0",
+      [estadoNuevo, inscripcionId, inscripcion.estado]
+    );
+    if (actualizacionEstado.affectedRows !== 1) {
+      throw crearErrorHttp("La inscripción cambió mientras se procesaba. Recargá e intentá nuevamente.", 409);
+    }
     await registrarHistorial(connection, {
       entidad: "INSCRIPCION", entidad_id: inscripcionId,
       olimpiada_id: inscripcion.olimpiada_id, inscripcion_id: inscripcionId,
@@ -1519,7 +1834,7 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)/estado", verifyToken, async (req
   } catch (error) {
     if (connection) await connection.rollback();
     console.log(error);
-    res.status(500).json("Error al actualizar el estado");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al actualizar el estado");
   } finally {
     if (connection) connection.release();
   }
@@ -1527,10 +1842,12 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)/estado", verifyToken, async (req
 
 // Baja lógica (solo admin)
 router.delete("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, async (req, res) => {
+  let connection;
   try {
     const cabecera = getCabecera(req);
     if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
-    const inscripcionId = Number(req.params.id);
+    const inscripcionId = normalizarIdPositivo(req.params.id);
+    if (!inscripcionId) return res.status(400).json("ID de inscripción inválido");
     const db = mysqlConnection.promise();
     const [rows] = await db.query(
       `SELECT i.*, u.nombre AS afiliado_nombre, u.apellido AS afiliado_apellido
@@ -1539,22 +1856,42 @@ router.delete("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, async (req, re
       [inscripcionId]
     );
     if (rows.length === 0) return res.status(404).json("Inscripción no encontrada");
-    await db.query(
-      "UPDATE olimpiada_inscripcion SET eliminado = 1, eliminado_usuario_id = ?, fecha_eliminacion = NOW() WHERE id = ?",
-      [cabecera.id, inscripcionId]
+
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    const olimpiada = await bloquearOlimpiada(connection, rows[0].olimpiada_id);
+    if (!olimpiada) throw crearErrorHttp("Olimpiada no encontrada", 404);
+    const [inscripcionesBloqueadas] = await connection.query(
+      `SELECT i.*, u.nombre AS afiliado_nombre, u.apellido AS afiliado_apellido
+       FROM olimpiada_inscripcion i INNER JOIN usuario u ON u.id = i.usuario_id
+       WHERE i.id = ? AND i.eliminado = 0 FOR UPDATE`,
+      [inscripcionId]
     );
-    await registrarHistorial(db, {
+    if (inscripcionesBloqueadas.length === 0) throw crearErrorHttp("Inscripción no encontrada", 404);
+    const inscripcion = inscripcionesBloqueadas[0];
+    const [eliminacion] = await connection.query(
+      `UPDATE olimpiada_inscripcion
+       SET eliminado = 1, eliminado_usuario_id = ?, fecha_eliminacion = NOW()
+       WHERE id = ? AND estado = ? AND eliminado = 0`,
+      [cabecera.id, inscripcionId, inscripcion.estado]
+    );
+    if (eliminacion.affectedRows !== 1) throw crearErrorHttp("La inscripción cambió mientras se eliminaba", 409);
+    await registrarHistorial(connection, {
       entidad: "INSCRIPCION", entidad_id: inscripcionId,
-      olimpiada_id: rows[0].olimpiada_id, inscripcion_id: inscripcionId,
+      olimpiada_id: inscripcion.olimpiada_id, inscripcion_id: inscripcionId,
       usuario_id: cabecera.id, usuario_rol: cabecera.rol,
       tipo_operacion: "DELETE",
-      valor_anterior: `Inscripción de ${rows[0].afiliado_apellido}, ${rows[0].afiliado_nombre}`,
+      valor_anterior: `Inscripción de ${inscripcion.afiliado_apellido}, ${inscripcion.afiliado_nombre}`,
       observacion: normalizarTexto(req.body?.motivo),
     });
+    await connection.commit();
     res.status(200).json({ success: true, message: "Inscripción eliminada" });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.log(error);
-    res.status(500).json("Error al eliminar la inscripción");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al eliminar la inscripción");
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -1563,7 +1900,7 @@ router.post("/olimpiadas/inscripciones/:id(\\d+)/observaciones", verifyToken, as
   let connection;
   try {
     const cabecera = getCabecera(req);
-    const inscripcionId = Number(req.params.id);
+    const inscripcionId = normalizarIdPositivo(req.params.id);
     const mensaje = normalizarTexto(req.body.mensaje);
     if (!inscripcionId || !mensaje) return res.status(400).json("El mensaje es obligatorio");
 
@@ -1618,7 +1955,7 @@ router.post("/olimpiadas/inscripciones/:id(\\d+)/observaciones", verifyToken, as
 router.get("/olimpiadas/inscripciones/:id(\\d+)/certificado", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    const inscripcionId = Number(req.params.id);
+    const inscripcionId = normalizarIdPositivo(req.params.id);
     const db = mysqlConnection.promise();
     const [rows] = await db.query("SELECT * FROM olimpiada_inscripcion WHERE id = ? AND eliminado = 0", [inscripcionId]);
     if (rows.length === 0) return res.status(404).json("Inscripción no encontrada");
@@ -1644,7 +1981,8 @@ router.get("/olimpiadas/historial", verifyToken, async (req, res) => {
     const cabecera = getCabecera(req);
     if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
     const db = mysqlConnection.promise();
-    const limite = Math.min(Number(req.query.limite) || 500, 2000);
+    const limite = req.query.limite === undefined ? 500 : normalizarIdPositivo(req.query.limite);
+    if (!limite || limite > 2000) return res.status(400).json("El límite es inválido");
     const [historial] = await db.query(
       `SELECT h.*, u.nombre AS usuario_nombre, u.apellido AS usuario_apellido, o.nombre AS olimpiada_nombre
        FROM olimpiada_historial h
@@ -1659,6 +1997,22 @@ router.get("/olimpiadas/historial", verifyToken, async (req, res) => {
     console.log(error);
     res.status(500).json("Error al obtener el historial");
   }
+});
+
+router.__test = Object.freeze({
+  decodificarFirmaBase64,
+  detectarMimeArchivo,
+  estaVentanaInscripcionAbierta,
+  fechaHoyBuenosAires,
+  idsPositivosIguales,
+  normalizarCupo,
+  normalizarIdPositivo,
+  normalizarIds,
+  validarCapacidadDisciplinas,
+  validarConfiguracionContraInscripciones,
+  validarContenidoArchivo,
+  validarDatosOlimpiada,
+  verifyToken,
 });
 
 module.exports = router;

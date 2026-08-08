@@ -16,8 +16,9 @@ const mysqlConnection = require("../connection/connection");
 const jwt = require("jsonwebtoken");
 const multer = require("multer");
 const crypto = require("crypto");
-const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+const { normalizarFechaCivil } = require("../services/valores-dominio");
 
 // ---------------------------------------------------------------------------
 // S3
@@ -30,10 +31,28 @@ const s3 = new S3Client({
   },
   region: process.env.BUCKET_REGION,
 });
-const S3_SIGNED_URL_EXPIRES_SECONDS = Number.parseInt(process.env.S3_SIGNED_URL_EXPIRES_SECONDS || "3600", 10);
+const s3SignedUrlExpiresConfigurado = Number(process.env.S3_SIGNED_URL_EXPIRES_SECONDS || "3600");
+const S3_SIGNED_URL_EXPIRES_SECONDS = Number.isSafeInteger(s3SignedUrlExpiresConfigurado)
+  && s3SignedUrlExpiresConfigurado >= 60
+  && s3SignedUrlExpiresConfigurado <= 86400
+  ? s3SignedUrlExpiresConfigurado
+  : 3600;
 
 async function uploadBufferToS3({ key, buffer, contentType }) {
   await s3.send(new PutObjectCommand({ Bucket: bucketName, Key: key, Body: buffer, ContentType: contentType }));
+}
+
+async function eliminarObjetosS3Seguro(keys) {
+  for (const key of [...new Set((keys || []).filter(Boolean))]) {
+    try {
+      await s3.send(new DeleteObjectCommand({ Bucket: bucketName, Key: key }));
+    } catch (error) {
+      console.error("No se pudo eliminar un adjunto de traslado en S3", {
+        key,
+        code: error?.name || error?.code || "UNKNOWN",
+      });
+    }
+  }
 }
 
 async function getObjectBufferFromS3(key) {
@@ -67,6 +86,38 @@ const EXTENSION_POR_MIME = {
   "application/vnd.oasis.opendocument.text": "odt",
 };
 
+const MIMES_IMAGEN_RASTER = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/heic",
+]);
+
+function contenidoArchivoValido(file) {
+  const buffer = file?.buffer;
+  if (!Buffer.isBuffer(buffer) || buffer.length < 8) return false;
+  switch (file.mimetype) {
+    case "image/jpeg":
+    case "image/jpg":
+      return buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+    case "image/png":
+      return buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    case "image/webp":
+      return buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP";
+    case "image/heic":
+      return buffer.subarray(4, 8).toString("ascii") === "ftyp" && /^(heic|heix|hevc|hevx|mif1|msf1)$/.test(buffer.subarray(8, 12).toString("ascii"));
+    case "application/pdf":
+      return buffer.subarray(0, 5).toString("ascii") === "%PDF-";
+    case "application/msword":
+      return buffer.subarray(0, 8).equals(Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]));
+    case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+    case "application/vnd.oasis.opendocument.text":
+      return buffer.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+    default:
+      return false;
+  }
+}
+
 function extensionSegura(nombre, mime) {
   if (EXTENSION_POR_MIME[mime]) return EXTENSION_POR_MIME[mime];
   const partes = String(nombre || "").split(".");
@@ -91,7 +142,7 @@ const uploadTraslados = multer({
   storage: multer.memoryStorage(),
   limits: { files: 12, fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const esImagen = file.mimetype?.startsWith("image/");
+    const esImagen = MIMES_IMAGEN_RASTER.has(file.mimetype);
     const esDocumento = [
       "application/pdf",
       "application/msword",
@@ -106,6 +157,9 @@ const uploadTraslados = multer({
 function manejarUploadTraslados(req, res, next) {
   uploadTraslados.any()(req, res, (error) => {
     if (error) return res.status(400).json(error.message || "No se pudieron procesar los archivos");
+    if (!(req.files || []).every(contenidoArchivoValido)) {
+      return res.status(400).json("El contenido de un archivo no coincide con el formato declarado");
+    }
     return next();
   });
 }
@@ -125,20 +179,16 @@ function archivosPorSlot(files) {
 // Auth
 // ---------------------------------------------------------------------------
 function verifyToken(req, res, next) {
-  if (!req.headers.authorization) return res.status(401).json("No autorizado");
-  const token = req.headers.authorization.substr(7);
-  if (token !== "") {
-    jwt.verify(token, process.env.JWT_SECRET, (error, authData) => {
-      if (error) {
-        res.status(403).json("Error en el token");
-      } else {
-        req.data = authData;
-        next();
-      }
-    });
-  } else {
-    res.status(401).json("Token vacio");
-  }
+  const coincidencia = /^Bearer ([^\s]+)$/.exec(String(req.headers.authorization || ""));
+  if (!coincidencia) return res.status(401).json("No autorizado");
+  jwt.verify(coincidencia[1], process.env.JWT_SECRET, (error, authData) => {
+    if (error) {
+      res.status(403).json("Error en el token");
+    } else {
+      req.data = authData;
+      next();
+    }
+  });
 }
 
 function getCabecera(req) {
@@ -216,10 +266,11 @@ const ESTADO = {
 };
 
 function esDepartamentalInvolucrada(cabecera, solicitud) {
-  const propia = Number(cabecera.departamental_id);
+  const propia = normalizarIdPositivo(cabecera.departamental_id);
+  if (propia === null) return false;
   return (
-    Number(solicitud.departamental_origen_id) === propia ||
-    Number(solicitud.departamental_destino_id) === propia
+    normalizarIdPositivo(solicitud.departamental_origen_id) === propia ||
+    normalizarIdPositivo(solicitud.departamental_destino_id) === propia
   );
 }
 
@@ -231,7 +282,8 @@ function puedeVerSolicitud(cabecera, solicitud) {
     case "departamental":
       return esDepartamentalInvolucrada(cabecera, solicitud);
     case "afiliado":
-      return Number(solicitud.usuario_id) === Number(cabecera.id);
+      return normalizarIdPositivo(solicitud.usuario_id) !== null
+        && normalizarIdPositivo(solicitud.usuario_id) === normalizarIdPositivo(cabecera.id);
     default:
       return false;
   }
@@ -246,7 +298,8 @@ function puedeEditarSolicitud(cabecera, solicitud) {
     case "departamental":
       return esDepartamentalInvolucrada(cabecera, solicitud);
     case "afiliado":
-      return Number(solicitud.usuario_id) === Number(cabecera.id);
+      return normalizarIdPositivo(solicitud.usuario_id) !== null
+        && normalizarIdPositivo(solicitud.usuario_id) === normalizarIdPositivo(cabecera.id);
     default:
       return false;
   }
@@ -285,20 +338,43 @@ function transicionesDisponibles(cabecera, estadoId, esPropia) {
 // Helpers
 // ---------------------------------------------------------------------------
 function normalizarTexto(valor) {
-  if (valor === null || valor === undefined) return null;
-  const texto = String(valor).trim();
+  if (typeof valor !== "string") return null;
+  const texto = valor.trim();
   return texto.length > 0 ? texto : null;
+}
+
+function normalizarIdPositivo(valor) {
+  if (typeof valor === "string") {
+    const texto = valor.trim();
+    if (!/^\d+$/.test(texto)) return null;
+    valor = texto;
+  } else if (typeof valor !== "number") {
+    return null;
+  }
+
+  const numero = Number(valor);
+  return Number.isSafeInteger(numero) && numero > 0 ? numero : null;
+}
+
+function normalizarEnteroPositivo(valor, { porDefecto, maximo } = {}) {
+  if (valor === undefined || valor === null || valor === "") return porDefecto ?? null;
+  const numero = normalizarIdPositivo(valor);
+  if (numero === null || (Number.isSafeInteger(maximo) && numero > maximo)) return null;
+  return numero;
 }
 
 function normalizarBooleano(valor) {
   return valor === true || valor === 1 || String(valor) === "1" || String(valor).toLowerCase() === "true" ? 1 : 0;
 }
 
+function normalizarBooleanoEntrada(valor) {
+  if (valor === true || valor === 1 || valor === "1" || valor === "true") return 1;
+  if (valor === false || valor === 0 || valor === "0" || valor === "false") return 0;
+  return null;
+}
+
 function normalizarFecha(texto) {
-  const valor = normalizarTexto(texto);
-  if (!valor) return null;
-  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(valor);
-  return match ? `${match[1]}-${match[2]}-${match[3]}` : null;
+  return normalizarFechaCivil(texto);
 }
 
 function parseJsonSeguro(valor) {
@@ -365,7 +441,8 @@ async function notificarUsuariosDepartamental(connection, departamentalId, tipo,
     [departamentalId]
   );
   for (const u of usuarios) {
-    if (excluirUsuarioId && Number(u.id) === Number(excluirUsuarioId)) continue;
+    if (normalizarIdPositivo(excluirUsuarioId) !== null
+      && normalizarIdPositivo(u.id) === normalizarIdPositivo(excluirUsuarioId)) continue;
     await insertarNotificacion(connection, u.id, tipo, titulo, mensaje, payload);
   }
 }
@@ -374,12 +451,14 @@ async function notificarUsuariosDepartamental(connection, departamentalId, tipo,
 // origen + departamental destino), salvo al autor de la acción.
 async function notificarInvolucrados(connection, solicitud, autor, tipo, tituloStaff, tituloAfiliado, mensaje) {
   const payload = { solicitud_id: solicitud.id, estado_id: solicitud.estado_id };
-  if (Number(solicitud.usuario_id) !== Number(autor.id)) {
+  if (normalizarIdPositivo(solicitud.usuario_id) !== normalizarIdPositivo(autor.id)) {
     await insertarNotificacion(connection, solicitud.usuario_id, tipo, tituloAfiliado, mensaje, payload);
   }
   const departamentales = [...new Set([solicitud.departamental_origen_id, solicitud.departamental_destino_id].filter(Boolean))];
   for (const depId of departamentales) {
-    if (autor.rol === "departamental" && Number(autor.departamental_id) === Number(depId)) continue;
+    if (autor.rol === "departamental"
+      && normalizarIdPositivo(autor.departamental_id) !== null
+      && normalizarIdPositivo(autor.departamental_id) === normalizarIdPositivo(depId)) continue;
     await notificarUsuariosDepartamental(connection, depId, tipo, tituloStaff, mensaje, payload, autor.id);
   }
 }
@@ -390,9 +469,14 @@ async function notificarInvolucrados(connection, solicitud, autor, tipo, tituloS
 // intersección entre los fueros de destino de una y los de origen de la otra.
 // ---------------------------------------------------------------------------
 function sonCoincidentes(a, b) {
-  if (Number(a.departamental_origen_id) !== Number(b.departamental_destino_id)) return false;
-  if (Number(a.departamental_destino_id) !== Number(b.departamental_origen_id)) return false;
-  if (Number(a.usuario_id) === Number(b.usuario_id)) return false;
+  const origenA = normalizarIdPositivo(a.departamental_origen_id);
+  const destinoA = normalizarIdPositivo(a.departamental_destino_id);
+  const usuarioA = normalizarIdPositivo(a.usuario_id);
+  const origenB = normalizarIdPositivo(b.departamental_origen_id);
+  const destinoB = normalizarIdPositivo(b.departamental_destino_id);
+  const usuarioB = normalizarIdPositivo(b.usuario_id);
+  if ([origenA, destinoA, usuarioA, origenB, destinoB, usuarioB].some((id) => id === null)) return false;
+  if (origenA !== destinoB || destinoA !== origenB || usuarioA === usuarioB) return false;
   const fuerosA = { origen: parseJsonSeguro(a.fueros_origen) || [], destino: parseJsonSeguro(a.fueros_destino) || [] };
   const fuerosB = { origen: parseJsonSeguro(b.fueros_origen) || [], destino: parseJsonSeguro(b.fueros_destino) || [] };
   if (normalizarBooleano(a.fueros_excluyentes) && !hayInterseccion(fuerosB.destino, fuerosA.origen)) return false;
@@ -448,7 +532,9 @@ router.get("/traslados/catalogos", verifyToken, async (req, res) => {
 // ---------------------------------------------------------------------------
 function puedeGestionarLocalidades(cabecera, departamentalId) {
   if (["admin", "admin-central"].includes(cabecera.rol)) return true;
-  if (cabecera.rol === "departamental") return Number(cabecera.departamental_id) === Number(departamentalId);
+  const propia = normalizarIdPositivo(cabecera.departamental_id);
+  const objetivo = normalizarIdPositivo(departamentalId);
+  if (cabecera.rol === "departamental") return propia !== null && propia === objetivo;
   return false;
 }
 
@@ -458,8 +544,9 @@ router.get("/traslados/departamentales/:id/localidades", verifyToken, async (req
   try {
     const cabecera = getCabecera(req);
     if (!ROLES_STAFF.includes(cabecera.rol)) return res.status(401).json("No autorizado");
-    const departamentalId = Number(req.params.id);
+    const departamentalId = normalizarIdPositivo(req.params.id);
     if (!departamentalId) return res.status(400).json("ID inválido");
+    if (!puedeGestionarLocalidades(cabecera, departamentalId)) return res.status(401).json("No autorizado");
     const db = mysqlConnection.promise();
     const [rows] = await db.query(
       `SELECT l.id, l.departamental_id, l.nombre, l.habilitado, l.fecha_creacion,
@@ -481,13 +568,18 @@ router.get("/traslados/departamentales/:id/localidades", verifyToken, async (req
 router.post("/traslados/departamentales/:id/localidades", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    const departamentalId = Number(req.params.id);
+    const departamentalId = normalizarIdPositivo(req.params.id);
     const nombre = normalizarTexto(req.body.nombre);
     if (!departamentalId || !nombre) return res.status(400).json("El nombre de la localidad es obligatorio");
     if (nombre.length > 120) return res.status(400).json("El nombre es demasiado largo (máximo 120 caracteres)");
     if (!puedeGestionarLocalidades(cabecera, departamentalId)) return res.status(401).json("No autorizado");
 
     const db = mysqlConnection.promise();
+    const [departamentales] = await db.query(
+      "SELECT id FROM departamental WHERE id = ? AND habilitado = 'Y'",
+      [departamentalId]
+    );
+    if (departamentales.length === 0) return res.status(404).json("Departamental no encontrada");
     const [existentes] = await db.query(
       "SELECT id, habilitado FROM departamental_localidad WHERE departamental_id = ? AND nombre = ?",
       [departamentalId, nombre]
@@ -511,7 +603,7 @@ router.post("/traslados/departamentales/:id/localidades", verifyToken, async (re
 router.put("/traslados/localidades/:id", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    const localidadId = Number(req.params.id);
+    const localidadId = normalizarIdPositivo(req.params.id);
     const nombre = normalizarTexto(req.body.nombre);
     if (!localidadId || !nombre) return res.status(400).json("El nombre de la localidad es obligatorio");
     if (nombre.length > 120) return res.status(400).json("El nombre es demasiado largo (máximo 120 caracteres)");
@@ -539,7 +631,7 @@ router.put("/traslados/localidades/:id", verifyToken, async (req, res) => {
 router.delete("/traslados/localidades/:id", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    const localidadId = Number(req.params.id);
+    const localidadId = normalizarIdPositivo(req.params.id);
     if (!localidadId) return res.status(400).json("ID inválido");
 
     const db = mysqlConnection.promise();
@@ -577,6 +669,7 @@ router.get("/traslados/afiliados-buscar", verifyToken, async (req, res) => {
 
     const q = normalizarTexto(req.query.q);
     if (!q || q.length < 2) return res.status(200).json([]);
+    if (q.length > 120) return res.status(400).json("La búsqueda es demasiado larga");
 
     const condiciones = [
       "r.nombre = 'afiliado'",
@@ -586,8 +679,10 @@ router.get("/traslados/afiliados-buscar", verifyToken, async (req, res) => {
     ];
     const params = [];
     if (cabecera.rol === "departamental") {
+      const departamentalId = normalizarIdPositivo(cabecera.departamental_id);
+      if (departamentalId === null) return res.status(401).json("No autorizado");
       condiciones.push("u.departamental_id = ?");
-      params.push(cabecera.departamental_id);
+      params.push(departamentalId);
     }
     condiciones.push("(u.nombre LIKE ? OR u.apellido LIKE ? OR CAST(u.documento AS CHAR) LIKE ? OR CONCAT(u.apellido, ' ', u.nombre) LIKE ?)");
     params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
@@ -615,6 +710,7 @@ router.get("/traslados/afiliados-buscar", verifyToken, async (req, res) => {
 async function validarDatosSolicitud(db, body, usuarioId) {
   const errores = [];
   const datos = {};
+  body = body && typeof body === "object" ? body : {};
 
   datos.lugar_trabajo = normalizarTexto(body.lugar_trabajo);
   if (!datos.lugar_trabajo || !LUGARES_TRABAJO.includes(datos.lugar_trabajo)) {
@@ -637,11 +733,16 @@ async function validarDatosSolicitud(db, body, usuarioId) {
   datos.fueros_destino = normalizarFueros(body.fueros_destino);
   if (!datos.fueros_destino) errores.push("Elegí al menos un fuero de destino");
 
-  datos.disponibilidad_cargo = normalizarBooleano(body.disponibilidad_cargo);
-  datos.fueros_excluyentes = normalizarBooleano(body.fueros_excluyentes);
+  datos.disponibilidad_cargo = normalizarBooleanoEntrada(body.disponibilidad_cargo);
+  if (datos.disponibilidad_cargo === null) errores.push("Indicá si hay disponibilidad de cargo");
+  datos.fueros_excluyentes = normalizarBooleanoEntrada(body.fueros_excluyentes);
+  if (datos.fueros_excluyentes === null) errores.push("Indicá si los fueros son excluyentes");
   datos.observaciones = normalizarTexto(body.observaciones);
+  if (datos.observaciones && datos.observaciones.length > 5000) {
+    errores.push("Las observaciones son demasiado largas (máximo 5000 caracteres)");
+  }
 
-  datos.departamental_destino_id = Number(body.departamental_destino_id) || null;
+  datos.departamental_destino_id = normalizarIdPositivo(body.departamental_destino_id);
   if (!datos.departamental_destino_id) {
     errores.push("Elegí la departamental de destino");
   } else {
@@ -651,10 +752,17 @@ async function validarDatosSolicitud(db, body, usuarioId) {
 
   // Localidades: opcionales, pero si vienen deben pertenecer a la departamental
   // destino y estar habilitadas (el DELETE las deshabilita para nuevas solicitudes)
-  const localidadesIds = (parseJsonSeguro(body.localidades) || [])
-    .map((v) => Number(v))
-    .filter((v) => Number.isInteger(v) && v > 0);
-  datos.localidades = [...new Set(localidadesIds)];
+  const localidadesEntrada = body.localidades === undefined || body.localidades === null || body.localidades === ""
+    ? []
+    : parseJsonSeguro(body.localidades);
+  const localidadesIds = Array.isArray(localidadesEntrada)
+    ? localidadesEntrada.map(normalizarIdPositivo)
+    : [];
+  if (!Array.isArray(localidadesEntrada) || localidadesIds.some((id) => id === null)) {
+    errores.push("La lista de localidades es inválida");
+  }
+  if (localidadesIds.length > 100) errores.push("No se pueden elegir más de 100 localidades");
+  datos.localidades = [...new Set(localidadesIds.filter((id) => id !== null))];
   if (datos.localidades.length > 0 && datos.departamental_destino_id) {
     const [localidades] = await db.query(
       `SELECT id FROM departamental_localidad
@@ -675,45 +783,67 @@ async function validarDatosSolicitud(db, body, usuarioId) {
 // ---------------------------------------------------------------------------
 router.post("/traslados/solicitudes", verifyToken, manejarUploadTraslados, async (req, res) => {
   let connection;
+  let transaccionConfirmada = false;
+  const objetosSubidos = [];
   try {
     const cabecera = getCabecera(req);
     if (!["afiliado", ...ROLES_STAFF].includes(cabecera.rol)) return res.status(401).json("No autorizado");
-    const db = mysqlConnection.promise();
 
-    const usuarioId = cabecera.rol === "afiliado" ? Number(cabecera.id) : Number(req.body.usuario_id);
+    const usuarioId = cabecera.rol === "afiliado"
+      ? normalizarIdPositivo(cabecera.id)
+      : normalizarIdPositivo(req.body.usuario_id);
     if (!usuarioId) return res.status(400).json("Indicá el afiliado para el que se carga la solicitud");
 
-    const [titulares] = await db.query(
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    // El bloqueo del afiliado serializa altas concurrentes aun si el índice único
+    // todavía no estuviera instalado en una base heredada.
+    const [titulares] = await connection.query(
       `SELECT u.id, u.departamental_id, u.nombre, u.apellido, r.nombre AS rol
        FROM usuario u INNER JOIN rol r ON r.id = u.rol_id
-       WHERE u.id = ? AND u.habilitado = 'Y' AND (u.es_familiar IS NULL OR u.es_familiar <> 'S')`,
+       WHERE u.id = ? AND u.habilitado = 'Y' AND (u.es_familiar IS NULL OR u.es_familiar <> 'S')
+       FOR UPDATE`,
       [usuarioId]
     );
-    if (titulares.length === 0) return res.status(404).json("Afiliado no encontrado");
+    if (titulares.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Afiliado no encontrado");
+    }
     const titular = titulares[0];
-    if (titular.rol !== "afiliado") return res.status(400).json("La solicitud de traslado solo puede cargarse para usuarios con rol afiliado");
-    if (!titular.departamental_id) return res.status(400).json("El afiliado no tiene departamental asignada");
-    if (cabecera.rol === "departamental" && Number(titular.departamental_id) !== Number(cabecera.departamental_id)) {
+    if (titular.rol !== "afiliado") {
+      await connection.rollback();
+      return res.status(400).json("La solicitud de traslado solo puede cargarse para usuarios con rol afiliado");
+    }
+    if (normalizarIdPositivo(titular.departamental_id) === null) {
+      await connection.rollback();
+      return res.status(400).json("El afiliado no tiene departamental asignada");
+    }
+    if (cabecera.rol === "departamental"
+      && normalizarIdPositivo(titular.departamental_id) !== normalizarIdPositivo(cabecera.departamental_id)) {
+      await connection.rollback();
       return res.status(401).json("El afiliado pertenece a otra departamental");
     }
 
     // Un afiliado no puede tener dos pedidos activos a la vez
-    const [activas] = await db.query(
-      "SELECT id FROM traslado_solicitud WHERE usuario_id = ? AND eliminado = 0 AND estado_id = ?",
+    const [activas] = await connection.query(
+      "SELECT id FROM traslado_solicitud WHERE usuario_id = ? AND eliminado = 0 AND estado_id = ? FOR UPDATE",
       [usuarioId, ESTADO.INICIADA]
     );
     if (activas.length > 0) {
+      await connection.rollback();
       return res.status(409).json(`El afiliado ya tiene una solicitud de traslado en curso (#${activas[0].id}). Cancelala o concretala antes de iniciar otra.`);
     }
 
-    const { errores, datos } = await validarDatosSolicitud(db, req.body, usuarioId);
-    if (datos.departamental_destino_id && Number(datos.departamental_destino_id) === Number(titular.departamental_id)) {
+    const { errores, datos } = await validarDatosSolicitud(connection, req.body, usuarioId);
+    if (datos.departamental_destino_id
+      && datos.departamental_destino_id === normalizarIdPositivo(titular.departamental_id)) {
       errores.push("La departamental de destino tiene que ser distinta a la de origen");
     }
-    if (errores.length > 0) return res.status(400).json(errores.join(" | "));
-
-    connection = await db.getConnection();
-    await connection.beginTransaction();
+    if (errores.length > 0) {
+      await connection.rollback();
+      return res.status(400).json(errores.join(" | "));
+    }
 
     const [resultado] = await connection.query(
       `INSERT INTO traslado_solicitud
@@ -741,6 +871,7 @@ router.post("/traslados/solicitudes", verifyToken, manejarUploadTraslados, async
     for (const [slot, files] of slots.entries()) {
       for (const file of files) {
         const key = await subirArchivoTraslado(file, `sol${solicitudId}_${slot.toLowerCase()}`);
+        objetosSubidos.push(key);
         await connection.query(
           `INSERT INTO traslado_archivo (solicitud_id, tipo_adjunto, archivo, nombre_original, mime, tamanio)
            VALUES (?, ?, ?, ?, ?, ?)`,
@@ -775,9 +906,11 @@ router.post("/traslados/solicitudes", verifyToken, manejarUploadTraslados, async
     );
 
     await connection.commit();
+    transaccionConfirmada = true;
     res.status(201).json({ success: true, id: solicitudId, message: "Solicitud de traslado enviada correctamente" });
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection && !transaccionConfirmada) await connection.rollback();
+    if (!transaccionConfirmada) await eliminarObjetosS3Seguro(objetosSubidos);
     // Índice único uq_tra_sol_activa: doble submit concurrente de la misma solicitud
     if (error && error.code === "ER_DUP_ENTRY") {
       return res.status(409).json("El afiliado ya tiene una solicitud de traslado en curso. Cancelala o concretala antes de iniciar otra.");
@@ -806,8 +939,11 @@ router.get("/traslados/solicitudes", verifyToken, async (req, res) => {
     const cabecera = getCabecera(req);
     const db = mysqlConnection.promise();
 
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 20));
+    const page = normalizarEnteroPositivo(req.query.page, { porDefecto: 1, maximo: 1_000_000 });
+    const pageSize = normalizarEnteroPositivo(req.query.pageSize, { porDefecto: 20, maximo: 100 });
+    if (page === null || pageSize === null) {
+      return res.status(400).json("La paginación es inválida");
+    }
     const orderBy = COLUMNAS_ORDEN[req.query.orderBy] || "s.id";
     const orderType = String(req.query.orderType).toUpperCase() === "ASC" ? "ASC" : "DESC";
 
@@ -816,12 +952,14 @@ router.get("/traslados/solicitudes", verifyToken, async (req, res) => {
 
     switch (cabecera.rol) {
       case "afiliado":
+        if (normalizarIdPositivo(cabecera.id) === null) return res.status(401).json("No autorizado");
         condiciones.push("s.usuario_id = ?");
-        params.push(Number(cabecera.id));
+        params.push(normalizarIdPositivo(cabecera.id));
         break;
       case "departamental":
+        if (normalizarIdPositivo(cabecera.departamental_id) === null) return res.status(401).json("No autorizado");
         condiciones.push("(s.departamental_origen_id = ? OR s.departamental_destino_id = ?)");
-        params.push(Number(cabecera.departamental_id), Number(cabecera.departamental_id));
+        params.push(normalizarIdPositivo(cabecera.departamental_id), normalizarIdPositivo(cabecera.departamental_id));
         break;
       case "admin":
       case "admin-central":
@@ -831,44 +969,67 @@ router.get("/traslados/solicitudes", verifyToken, async (req, res) => {
     }
 
     if (req.query.estado_id) {
-      const estados = String(req.query.estado_id).split(",").map((v) => Number(v)).filter((v) => v > 0);
-      if (estados.length > 0) {
-        condiciones.push(`s.estado_id IN (${estados.map(() => "?").join(",")})`);
-        params.push(...estados);
+      const estados = String(req.query.estado_id).split(",").map(normalizarIdPositivo);
+      if (estados.length === 0 || estados.some((estado) => !Object.values(ESTADO).includes(estado))) {
+        return res.status(400).json("El filtro de estado es inválido");
       }
+      const estadosUnicos = [...new Set(estados)];
+      condiciones.push(`s.estado_id IN (${estadosUnicos.map(() => "?").join(",")})`);
+      params.push(...estadosUnicos);
     }
     if (req.query.departamental_origen_id) {
+      const departamentalOrigenId = normalizarIdPositivo(req.query.departamental_origen_id);
+      if (departamentalOrigenId === null) return res.status(400).json("La departamental de origen es inválida");
       condiciones.push("s.departamental_origen_id = ?");
-      params.push(Number(req.query.departamental_origen_id));
+      params.push(departamentalOrigenId);
     }
     if (req.query.departamental_destino_id) {
+      const departamentalDestinoId = normalizarIdPositivo(req.query.departamental_destino_id);
+      if (departamentalDestinoId === null) return res.status(400).json("La departamental de destino es inválida");
       condiciones.push("s.departamental_destino_id = ?");
-      params.push(Number(req.query.departamental_destino_id));
+      params.push(departamentalDestinoId);
     }
     if (req.query.disponibilidad_cargo === "0" || req.query.disponibilidad_cargo === "1") {
       condiciones.push("s.disponibilidad_cargo = ?");
-      params.push(Number(req.query.disponibilidad_cargo));
+      params.push(req.query.disponibilidad_cargo === "1" ? 1 : 0);
     }
     if (req.query.fueros_excluyentes === "0" || req.query.fueros_excluyentes === "1") {
       condiciones.push("s.fueros_excluyentes = ?");
-      params.push(Number(req.query.fueros_excluyentes));
+      params.push(req.query.fueros_excluyentes === "1" ? 1 : 0);
+    }
+    if (req.query.disponibilidad_cargo !== undefined && !["0", "1"].includes(req.query.disponibilidad_cargo)) {
+      return res.status(400).json("El filtro de disponibilidad de cargo es inválido");
+    }
+    if (req.query.fueros_excluyentes !== undefined && !["0", "1"].includes(req.query.fueros_excluyentes)) {
+      return res.status(400).json("El filtro de fueros excluyentes es inválido");
     }
     const fuero = normalizarTexto(req.query.fuero);
+    if (fuero && !FUEROS.includes(fuero)) return res.status(400).json("El filtro de fuero es inválido");
     if (fuero && FUEROS.includes(fuero)) {
       condiciones.push("(JSON_CONTAINS(s.fueros_origen, JSON_QUOTE(?)) OR JSON_CONTAINS(s.fueros_destino, JSON_QUOTE(?)))");
       params.push(fuero, fuero);
     }
     const fechaDesde = normalizarFecha(req.query.fecha_desde);
+    if (req.query.fecha_desde !== undefined && fechaDesde === null) {
+      return res.status(400).json("La fecha desde es inválida");
+    }
     if (fechaDesde) {
       condiciones.push("DATE(s.fecha_creacion) >= ?");
       params.push(fechaDesde);
     }
     const fechaHasta = normalizarFecha(req.query.fecha_hasta);
+    if (req.query.fecha_hasta !== undefined && fechaHasta === null) {
+      return res.status(400).json("La fecha hasta es inválida");
+    }
+    if (fechaDesde && fechaHasta && fechaDesde > fechaHasta) {
+      return res.status(400).json("La fecha desde no puede ser posterior a la fecha hasta");
+    }
     if (fechaHasta) {
       condiciones.push("DATE(s.fecha_creacion) <= ?");
       params.push(fechaHasta);
     }
     const search = normalizarTexto(req.query.search);
+    if (search && search.length > 200) return res.status(400).json("La búsqueda es demasiado larga");
     if (search) {
       condiciones.push(`(CONCAT('TR-', s.id) LIKE ? OR dor.nombre LIKE ? OR des.nombre LIKE ?
         OR u.nombre LIKE ? OR u.apellido LIKE ? OR CONCAT(u.apellido, ', ', u.nombre) LIKE ?
@@ -925,7 +1086,7 @@ router.get("/traslados/solicitudes", verifyToken, async (req, res) => {
     // Coincidencias de la página contra todas las solicitudes activas
     const activas = await obtenerSolicitudesActivas(db);
     const results = rows.map((row) => {
-      const coincidencias = Number(row.estado_id) === ESTADO.INICIADA
+      const coincidencias = normalizarIdPositivo(row.estado_id) === ESTADO.INICIADA
         ? activas.filter((otra) => sonCoincidentes(row, otra)).length
         : 0;
       return {
@@ -935,7 +1096,12 @@ router.get("/traslados/solicitudes", verifyToken, async (req, res) => {
         coincidencias,
         puede_editar: puedeEditarSolicitud(cabecera, row),
         puede_eliminar: puedeEliminarSolicitud(cabecera, row),
-        transiciones: transicionesDisponibles(cabecera, row.estado_id, Number(row.usuario_id) === Number(cabecera.id)),
+        transiciones: transicionesDisponibles(
+          cabecera,
+          row.estado_id,
+          normalizarIdPositivo(row.usuario_id) !== null
+            && normalizarIdPositivo(row.usuario_id) === normalizarIdPositivo(cabecera.id)
+        ),
       };
     });
 
@@ -973,7 +1139,7 @@ router.get("/traslados/solicitudes", verifyToken, async (req, res) => {
 router.get("/traslados/solicitudes/:id", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    const solicitudId = Number(req.params.id);
+    const solicitudId = normalizarIdPositivo(req.params.id);
     if (!solicitudId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
 
@@ -1044,14 +1210,16 @@ router.get("/traslados/solicitudes/:id", verifyToken, async (req, res) => {
 
     // Coincidencias: cruces activos contra esta solicitud
     let coincidencias = [];
-    if (Number(solicitud.estado_id) === ESTADO.INICIADA) {
+    if (normalizarIdPositivo(solicitud.estado_id) === ESTADO.INICIADA) {
       const activas = await obtenerSolicitudesActivas(db);
       const propia = {
         ...solicitud,
         fueros_origen: solicitud.fueros_origen_str,
         fueros_destino: solicitud.fueros_destino_str,
       };
-      const idsCoincidentes = activas.filter((otra) => Number(otra.id) !== solicitudId && sonCoincidentes(propia, otra)).map((o) => o.id);
+      const idsCoincidentes = activas
+        .filter((otra) => normalizarIdPositivo(otra.id) !== solicitudId && sonCoincidentes(propia, otra))
+        .map((o) => o.id);
       if (idsCoincidentes.length > 0) {
         const [filas] = await db.query(
           `SELECT s.id, s.usuario_id, s.fecha_creacion, s.disponibilidad_cargo, s.fueros_excluyentes,
@@ -1094,7 +1262,12 @@ router.get("/traslados/solicitudes/:id", verifyToken, async (req, res) => {
       coincidencias,
       puede_editar: puedeEditarSolicitud(cabecera, solicitud),
       puede_eliminar: puedeEliminarSolicitud(cabecera, solicitud),
-      transiciones: transicionesDisponibles(cabecera, solicitud.estado_id, Number(solicitud.usuario_id) === Number(cabecera.id)),
+      transiciones: transicionesDisponibles(
+        cabecera,
+        solicitud.estado_id,
+        normalizarIdPositivo(solicitud.usuario_id) !== null
+          && normalizarIdPositivo(solicitud.usuario_id) === normalizarIdPositivo(cabecera.id)
+      ),
     });
   } catch (error) {
     console.log(error);
@@ -1121,27 +1294,39 @@ const ETIQUETAS_CAMPOS = {
 
 router.put("/traslados/solicitudes/:id", verifyToken, manejarUploadTraslados, async (req, res) => {
   let connection;
+  let transaccionConfirmada = false;
+  const objetosSubidos = [];
+  const objetosEliminarTrasCommit = [];
   try {
     const cabecera = getCabecera(req);
-    const solicitudId = Number(req.params.id);
+    const solicitudId = normalizarIdPositivo(req.params.id);
     if (!solicitudId) return res.status(400).json("ID inválido");
-    const db = mysqlConnection.promise();
 
-    const [rows] = await db.query("SELECT * FROM traslado_solicitud WHERE id = ? AND eliminado = 0", [solicitudId]);
-    if (rows.length === 0) return res.status(404).json("Solicitud no encontrada");
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const [rows] = await connection.query(
+      "SELECT * FROM traslado_solicitud WHERE id = ? AND eliminado = 0 FOR UPDATE",
+      [solicitudId]
+    );
+    if (rows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Solicitud no encontrada");
+    }
     const solicitud = rows[0];
     if (!puedeEditarSolicitud(cabecera, solicitud)) {
+      await connection.rollback();
       return res.status(401).json("La solicitud no se puede editar en su estado actual");
     }
 
-    const { errores, datos } = await validarDatosSolicitud(db, req.body, solicitud.usuario_id);
-    if (datos.departamental_destino_id && Number(datos.departamental_destino_id) === Number(solicitud.departamental_origen_id)) {
+    const { errores, datos } = await validarDatosSolicitud(connection, req.body, solicitud.usuario_id);
+    if (datos.departamental_destino_id
+      && datos.departamental_destino_id === normalizarIdPositivo(solicitud.departamental_origen_id)) {
       errores.push("La departamental de destino tiene que ser distinta a la de origen");
     }
-    if (errores.length > 0) return res.status(400).json(errores.join(" | "));
-
-    connection = await db.getConnection();
-    await connection.beginTransaction();
+    if (errores.length > 0) {
+      await connection.rollback();
+      return res.status(400).json(errores.join(" | "));
+    }
 
     // Historial por campo modificado
     const camposSimples = ["lugar_trabajo", "actividad_laboral", "nivel_escalafon", "observaciones", "departamental_destino_id"];
@@ -1209,15 +1394,33 @@ router.put("/traslados/solicitudes/:id", verifyToken, manejarUploadTraslados, as
     }
 
     // Archivos a eliminar
-    const archivosEliminar = (parseJsonSeguro(req.body.archivos_eliminar) || []).map((v) => Number(v)).filter(Boolean);
+    const archivosEliminarEntrada = req.body.archivos_eliminar === undefined || req.body.archivos_eliminar === null
+      || req.body.archivos_eliminar === ""
+      ? []
+      : parseJsonSeguro(req.body.archivos_eliminar);
+    if (!Array.isArray(archivosEliminarEntrada)) {
+      await connection.rollback();
+      return res.status(400).json("La lista de archivos a eliminar es inválida");
+    }
+    const archivosEliminarNormalizados = archivosEliminarEntrada.map(normalizarIdPositivo);
+    if (archivosEliminarNormalizados.some((id) => id === null) || archivosEliminarNormalizados.length > 100) {
+      await connection.rollback();
+      return res.status(400).json("La lista de archivos a eliminar es inválida");
+    }
+    const archivosEliminar = [...new Set(archivosEliminarNormalizados)];
     if (archivosEliminar.length > 0) {
       const [archivos] = await connection.query(
-        `SELECT id, nombre_original, tipo_adjunto FROM traslado_archivo
+        `SELECT id, archivo, nombre_original, tipo_adjunto FROM traslado_archivo
          WHERE solicitud_id = ? AND id IN (${archivosEliminar.map(() => "?").join(",")})`,
         [solicitudId, ...archivosEliminar]
       );
+      if (archivos.length !== archivosEliminar.length) {
+        await connection.rollback();
+        return res.status(400).json("Algún archivo a eliminar no pertenece a la solicitud");
+      }
       for (const archivo of archivos) {
         await connection.query("DELETE FROM traslado_archivo WHERE id = ?", [archivo.id]);
+        objetosEliminarTrasCommit.push(archivo.archivo);
         await registrarHistorial(connection, {
           solicitud_id: solicitudId,
           usuario_id: cabecera.id,
@@ -1233,6 +1436,7 @@ router.put("/traslados/solicitudes/:id", verifyToken, manejarUploadTraslados, as
     for (const [slot, files] of slots.entries()) {
       for (const file of files) {
         const key = await subirArchivoTraslado(file, `sol${solicitudId}_${slot.toLowerCase()}`);
+        objetosSubidos.push(key);
         await connection.query(
           `INSERT INTO traslado_archivo (solicitud_id, tipo_adjunto, archivo, nombre_original, mime, tamanio)
            VALUES (?, ?, ?, ?, ?, ?)`,
@@ -1274,9 +1478,12 @@ router.put("/traslados/solicitudes/:id", verifyToken, manejarUploadTraslados, as
     }
 
     await connection.commit();
+    transaccionConfirmada = true;
+    await eliminarObjetosS3Seguro(objetosEliminarTrasCommit);
     res.status(200).json({ success: true, message: "Solicitud actualizada correctamente" });
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection && !transaccionConfirmada) await connection.rollback();
+    if (!transaccionConfirmada) await eliminarObjetosS3Seguro(objetosSubidos);
     console.log(error);
     res.status(500).json("Error al actualizar la solicitud de traslado");
   } finally {
@@ -1291,35 +1498,46 @@ router.put("/traslados/solicitudes/:id/estado", verifyToken, async (req, res) =>
   let connection;
   try {
     const cabecera = getCabecera(req);
-    const solicitudId = Number(req.params.id);
-    const estadoNuevo = Number(req.body.estado_id);
+    const solicitudId = normalizarIdPositivo(req.params.id);
+    const estadoNuevo = normalizarIdPositivo(req.body.estado_id);
     const observacion = normalizarTexto(req.body.observacion);
     if (!solicitudId || !estadoNuevo) return res.status(400).json("Datos incompletos");
+    if (!Object.values(ESTADO).includes(estadoNuevo)) return res.status(400).json("Estado inválido");
+    if (observacion && observacion.length > 5000) {
+      return res.status(400).json("La observación es demasiado larga (máximo 5000 caracteres)");
+    }
 
-    const db = mysqlConnection.promise();
-    const [rows] = await db.query("SELECT * FROM traslado_solicitud WHERE id = ? AND eliminado = 0", [solicitudId]);
-    if (rows.length === 0) return res.status(404).json("Solicitud no encontrada");
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const [rows] = await connection.query(
+      "SELECT * FROM traslado_solicitud WHERE id = ? AND eliminado = 0 FOR UPDATE",
+      [solicitudId]
+    );
+    if (rows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Solicitud no encontrada");
+    }
     const solicitud = rows[0];
 
-    const esPropia = Number(solicitud.usuario_id) === Number(cabecera.id);
+    const esPropia = normalizarIdPositivo(solicitud.usuario_id) !== null
+      && normalizarIdPositivo(solicitud.usuario_id) === normalizarIdPositivo(cabecera.id);
     const transiciones = transicionesDisponibles(cabecera, solicitud.estado_id, esPropia);
     if (!puedeVerSolicitud(cabecera, solicitud) || !transiciones.includes(estadoNuevo)) {
+      await connection.rollback();
       return res.status(401).json("No podés aplicar ese cambio de estado");
     }
 
     // Reabrir respeta la regla de una sola solicitud activa por afiliado
     if (estadoNuevo === ESTADO.INICIADA) {
-      const [otrasActivas] = await db.query(
-        "SELECT id FROM traslado_solicitud WHERE usuario_id = ? AND eliminado = 0 AND estado_id = ? AND id <> ?",
+      const [otrasActivas] = await connection.query(
+        "SELECT id FROM traslado_solicitud WHERE usuario_id = ? AND eliminado = 0 AND estado_id = ? AND id <> ? FOR UPDATE",
         [solicitud.usuario_id, ESTADO.INICIADA, solicitudId]
       );
       if (otrasActivas.length > 0) {
+        await connection.rollback();
         return res.status(409).json(`No se puede reabrir: el afiliado ya tiene otra solicitud de traslado en curso (#${otrasActivas[0].id}).`);
       }
     }
-
-    connection = await db.getConnection();
-    await connection.beginTransaction();
 
     await connection.query(
       `UPDATE traslado_solicitud
@@ -1377,18 +1595,26 @@ router.post("/traslados/solicitudes/:id/observaciones", verifyToken, async (req,
   let connection;
   try {
     const cabecera = getCabecera(req);
-    const solicitudId = Number(req.params.id);
+    const solicitudId = normalizarIdPositivo(req.params.id);
     const mensaje = normalizarTexto(req.body.mensaje);
     if (!solicitudId || !mensaje) return res.status(400).json("El mensaje es obligatorio");
+    if (mensaje.length > 5000) return res.status(400).json("El mensaje es demasiado largo (máximo 5000 caracteres)");
 
-    const db = mysqlConnection.promise();
-    const [rows] = await db.query("SELECT * FROM traslado_solicitud WHERE id = ? AND eliminado = 0", [solicitudId]);
-    if (rows.length === 0) return res.status(404).json("Solicitud no encontrada");
-    const solicitud = rows[0];
-    if (!puedeVerSolicitud(cabecera, solicitud)) return res.status(401).json("No autorizado");
-
-    connection = await db.getConnection();
+    connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
+    const [rows] = await connection.query(
+      "SELECT * FROM traslado_solicitud WHERE id = ? AND eliminado = 0 FOR UPDATE",
+      [solicitudId]
+    );
+    if (rows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Solicitud no encontrada");
+    }
+    const solicitud = rows[0];
+    if (!puedeVerSolicitud(cabecera, solicitud)) {
+      await connection.rollback();
+      return res.status(401).json("No autorizado");
+    }
 
     await connection.query(
       "INSERT INTO traslado_observacion (solicitud_id, usuario_id, usuario_rol, mensaje, estado_id) VALUES (?, ?, ?, ?, ?)",
@@ -1427,23 +1653,32 @@ router.delete("/traslados/solicitudes/:id", verifyToken, async (req, res) => {
   let connection;
   try {
     const cabecera = getCabecera(req);
-    const solicitudId = Number(req.params.id);
+    const solicitudId = normalizarIdPositivo(req.params.id);
     if (!solicitudId) return res.status(400).json("ID inválido");
+    const motivo = normalizarTexto(req.body?.motivo) || "Solicitud eliminada";
+    if (motivo.length > 5000) return res.status(400).json("El motivo es demasiado largo (máximo 5000 caracteres)");
 
-    const db = mysqlConnection.promise();
-    const [rows] = await db.query("SELECT * FROM traslado_solicitud WHERE id = ? AND eliminado = 0", [solicitudId]);
-    if (rows.length === 0) return res.status(404).json("Solicitud no encontrada");
-    if (!puedeEliminarSolicitud(cabecera, rows[0])) return res.status(401).json("No autorizado");
-
-    connection = await db.getConnection();
+    connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
+    const [rows] = await connection.query(
+      "SELECT * FROM traslado_solicitud WHERE id = ? AND eliminado = 0 FOR UPDATE",
+      [solicitudId]
+    );
+    if (rows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Solicitud no encontrada");
+    }
+    if (!puedeEliminarSolicitud(cabecera, rows[0])) {
+      await connection.rollback();
+      return res.status(401).json("No autorizado");
+    }
     await connection.query("UPDATE traslado_solicitud SET eliminado = 1 WHERE id = ?", [solicitudId]);
     await registrarHistorial(connection, {
       solicitud_id: solicitudId,
       usuario_id: cabecera.id,
       usuario_rol: cabecera.rol,
       tipo_operacion: "DELETE",
-      observacion: normalizarTexto(req.body?.motivo) || "Solicitud eliminada",
+      observacion: motivo,
     });
     await connection.commit();
     res.status(200).json({ success: true, message: "Solicitud eliminada" });
@@ -1462,7 +1697,7 @@ router.delete("/traslados/solicitudes/:id", verifyToken, async (req, res) => {
 router.get("/traslados/archivos/:id/descargar", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    const archivoId = Number(req.params.id);
+    const archivoId = normalizarIdPositivo(req.params.id);
     if (!archivoId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
 
