@@ -7,6 +7,8 @@ const jwt = require("jsonwebtoken");
 
 const bcryptjs = require("bcryptjs");
 
+const { normalizarCredencialesSignin } = require("../security/signin-input");
+
 const multer = require("multer");
 
 const moment = require("moment"); // para formatear fechas
@@ -569,11 +571,9 @@ router.delete("/admin/login/imagenes/:id", verifyToken, async (req, res) => {
 });
 
 router.post("/signin", async (req, res) => {
-  const documento = String(req.body?.documento ?? "").trim();
-  const password = typeof req.body?.password === "string" ? req.body.password : "";
-  const recordar = req.body?.recordar === true || req.body?.recordar === 1 || req.body?.recordar === "true";
+  const { documento, password, recordar, validas } = normalizarCredencialesSignin(req.body);
 
-  if (!/^\d{5,12}$/.test(documento) || password.length < 1 || password.length > 128) {
+  if (!validas) {
     return res.status(400).json("Documento o contraseña invalidos");
   }
 
