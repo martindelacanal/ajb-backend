@@ -5,6 +5,8 @@ Los comandos están separados deliberadamente:
 - `verificar-integridad-financiera.js`: auditoría exclusivamente de lectura;
 - `migrar-integridad-financiera.js`: migración idempotente de esquema, dry-run por defecto;
 - `corregir-doble-adicional-reservas.js`: corrección monetaria por manifiesto aprobado, dry-run por defecto;
+- `limpiar-datos-prueba-inconsistentes.js`: retiro transaccional de datos de prueba históricos que no se pueden reconstruir con certeza;
+- `seed-demo-integral.js`: dataset demostrativo coherente e idempotente, dry-run por defecto;
 - `configurar-usuario-runtime.js`: provisión de una cuenta de aplicación con privilegios mínimos.
 
 Los scripts cargan `BACKEND/.env`, admiten TLS verificable mediante
@@ -86,6 +88,56 @@ node scripts/configurar-usuario-runtime.js `
 El verificador estricto inspecciona definiciones de triggers y por eso debe
 ejecutarse con la cuenta de migración, no con la cuenta runtime deliberadamente
 sin privilegio `TRIGGER`.
+
+## Limpieza de datos de prueba y seed integral
+
+Estos comandos son deliberadamente destructivos y requieren la cuenta de
+migración/administración. Detener la API, crear un dump completo con triggers,
+rutinas y eventos, y comprobar primero que el dump restaura en un esquema
+temporal. El manifiesto se genera de nuevo en cada base y se vuelve a calcular
+bajo locks antes de escribir.
+
+```powershell
+# Sólo lectura: inventario exacto y SHA-256 del ambiente actual.
+node scripts/limpiar-datos-prueba-inconsistentes.js
+
+# Aplicación. La segunda confirmación habilita además la purga de TODO el
+# contenido de las dos tablas históricas de prueba; conserva tablas, esquema,
+# migración y repone/verifica inmediatamente el trigger append-only.
+node scripts/limpiar-datos-prueba-inconsistentes.js --apply `
+  --confirm=LIMPIAR_DATOS_PRUEBA_INCONSISTENTES `
+  --manifest-sha256=<SHA256_DEL_DRY_RUN> `
+  --purge-test-history `
+  --confirm-purge-history=PURGAR_HISTORIAL_PRUEBA
+
+# Sólo después de una limpieza verificada: plan del dataset futuro.
+node scripts/seed-demo-integral.js
+
+# Aplicación exacta del seed.
+node scripts/seed-demo-integral.js --apply `
+  --confirm=APLICAR_DATOS_DEMO `
+  --manifest-sha256=<SHA256_DEL_DRY_RUN>
+```
+
+En producción ambos `--apply` exigen también `--allow-production` y
+`DB_SSL_MODE=verify-full`. La purga histórica no usa `TRUNCATE`, no reinicia
+`AUTO_INCREMENT` y sólo debe habilitarse cuando se confirmó que todo ese
+historial es de prueba. Si el proceso se interrumpe después de la limpieza
+operativa, puede reanudarse con un nuevo dry-run: la purga opcional siempre
+inventaría y vacía por completo las dos tablas históricas de prueba.
+
+El seed crea o valida, mediante el marcador estable `[AJB-DEMO:v1]`, una
+reserva futura `FECHA_LIBRE` con participantes, descuento y adicional por
+noche; una temporada alta con sorteo y bloque futuros; y una olimpiada abierta
+con tres disciplinas. No crea solicitudes de coseguro directamente porque el
+flujo válido exige comprobantes y archivos en S3: esos casos deben probarse por
+la API. El script legado `seed-temporada-prueba.js` sólo delega al seed integral
+seguro.
+
+Al finalizar ejecutar el verificador con `--require-migrated --json`. No basta
+con mirar el código de salida: para este saneamiento deben quedar vacíos
+`fatal` y `warnings`, además de cero explícito en referencias históricas,
+totales, snapshots diarios, relaciones tarifarias, flujos, claims y guardias.
 
 ## Contratos aplicados
 

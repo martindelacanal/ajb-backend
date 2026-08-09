@@ -561,16 +561,49 @@ async function runDataPreflight(connection) {
   report.metrics.reservation_totals = await queryOne(
     connection,
     `SELECT
-       COALESCE(SUM(ABS(precio_total - (familiares + adicionales)) > 0.011), 0) AS discrepantes,
-       COALESCE(SUM(adicionales > 0 AND ABS(precio_total - (familiares + 2 * adicionales)) <= 0.011), 0) AS doble_adicional_exacto,
-       COALESCE(ROUND(SUM(CASE WHEN adicionales > 0 AND ABS(precio_total - (familiares + 2 * adicionales)) <= 0.011 THEN adicionales ELSE 0 END), 2), 0) AS exceso_total
+       COALESCE(SUM(CASE
+         WHEN precio_total IS NULL AND total_nulo_valido = 0 THEN 1
+         WHEN precio_total IS NOT NULL
+          AND excepcion_subsidio = 0
+          AND ABS(precio_total - (familiares + adicionales)) > 0.011 THEN 1
+         ELSE 0
+       END), 0) AS discrepantes,
+       COALESCE(SUM(CASE
+         WHEN excepcion_subsidio = 0
+          AND adicionales > 0
+          AND ABS(precio_total - (familiares + 2 * adicionales)) <= 0.011 THEN 1
+         ELSE 0
+       END), 0) AS doble_adicional_exacto,
+       COALESCE(ROUND(SUM(CASE
+         WHEN excepcion_subsidio = 0
+          AND adicionales > 0
+          AND ABS(precio_total - (familiares + 2 * adicionales)) <= 0.011 THEN adicionales
+         ELSE 0
+       END), 2), 0) AS exceso_total
       FROM (
         SELECT r.precio_total,
                COALESCE(f.total, 0) AS familiares,
-               COALESCE(a.total, 0) AS adicionales
+               COALESCE(a.total, 0) AS adicionales,
+               CASE
+                 WHEN r.es_por_salud = 1
+                  AND rs.estado = 'APROBADA'
+                  AND r.precio_total = 0
+                  AND rs.precio_cubierto IS NOT NULL
+                  AND ABS(rs.precio_cubierto - (COALESCE(f.total, 0) + COALESCE(a.total, 0))) <= 0.011
+                 THEN 1 ELSE 0
+               END AS excepcion_subsidio,
+               CASE
+                 WHEN r.modalidad = 'CONVENIO'
+                  AND LOWER(TRIM(COALESCE(er.nombre, ''))) = 'solicitud convenio'
+                  AND COALESCE(f.total, 0) = 0
+                  AND COALESCE(a.total, 0) = 0
+                 THEN 1 ELSE 0
+               END AS total_nulo_valido
           FROM reserva r
+          LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
           LEFT JOIN (SELECT reserva_id, SUM(precio) AS total FROM reserva_familiar GROUP BY reserva_id) f ON f.reserva_id = r.id
           LEFT JOIN (SELECT reserva_id, SUM(subtotal) AS total FROM reserva_adicional GROUP BY reserva_id) a ON a.reserva_id = r.id
+          LEFT JOIN reserva_salud rs ON rs.reserva_id = r.id
       ) totales`
   );
   if (Number(report.metrics.reservation_totals.discrepantes) > 0) {
@@ -582,27 +615,215 @@ async function runDataPreflight(connection) {
     );
   }
 
+  const tieneColumnasSnapshotTarifa = (await Promise.all([
+    "precio_aplicado",
+    "usa_porcentaje_aplicado",
+    "porcentaje_descuento_aplicado",
+    "snapshot_estado",
+    "snapshot_creado_en",
+  ].map((columnName) => columnInfo(connection, "reserva_familiar_tarifa", columnName))))
+    .every(Boolean);
+  const filasSnapshotInvalidasSql = tieneColumnasSnapshotTarifa
+    ? `COALESCE(SUM(CASE
+         WHEN rft.id IS NULL THEN 0
+         WHEN rft.fecha < r.fecha_inicio OR rft.fecha >= r.fecha_fin THEN 1
+         WHEN rft.tarifa_id IS NULL
+           OR rft.precio_aplicado IS NULL
+           OR rft.usa_porcentaje_aplicado IS NULL
+           OR rft.usa_porcentaje_aplicado NOT IN (0, 1)
+           OR rft.snapshot_estado <> 'COMPLETO'
+           OR rft.snapshot_creado_en IS NULL THEN 1
+         WHEN rft.usa_porcentaje_aplicado = 1
+           AND (rft.porcentaje_descuento_aplicado IS NULL
+             OR rft.porcentaje_descuento_aplicado < 0
+             OR rft.porcentaje_descuento_aplicado > 100) THEN 1
+         WHEN rft.usa_porcentaje_aplicado = 0
+           AND COALESCE(rft.porcentaje_descuento_aplicado, 0) <> 0 THEN 1
+         ELSE 0
+       END), 0)`
+    : "0";
+
   report.metrics.family_tariff_history = await queryOne(
     connection,
     `SELECT
        COALESCE(SUM(esperado > cantidad_real), 0) AS reservas_con_faltantes,
-       COALESCE(SUM(GREATEST(esperado - cantidad_real, 0)), 0) AS filas_faltantes
-      FROM (
-        SELECT r.id,
-               DATEDIFF(r.fecha_fin, r.fecha_inicio) * COUNT(DISTINCT rf.id) AS esperado,
-               COUNT(rft.id) AS cantidad_real
-          FROM reserva r
-          LEFT JOIN reserva_familiar rf ON rf.reserva_id = r.id
-          LEFT JOIN reserva_familiar_tarifa rft ON rft.reserva_familiar_id = rf.id
+       COALESCE(SUM(GREATEST(esperado - cantidad_real, 0)), 0) AS filas_faltantes,
+       COALESCE(SUM(esperado < cantidad_real), 0) AS reservas_con_sobrantes,
+       COALESCE(SUM(GREATEST(cantidad_real - esperado, 0)), 0) AS filas_sobrantes,
+       COALESCE(SUM(familiares = 0 OR filas_invalidas > 0), 0) AS reservas_con_snapshot_invalido,
+       COALESCE(SUM(filas_invalidas), 0) AS filas_snapshot_invalidas
+       FROM (
+         SELECT r.id,
+                DATEDIFF(r.fecha_fin, r.fecha_inicio) * COUNT(DISTINCT rf.id) AS esperado,
+                COUNT(DISTINCT rf.id) AS familiares,
+                COUNT(rft.id) AS cantidad_real,
+                ${filasSnapshotInvalidasSql} AS filas_invalidas
+           FROM reserva r
+           LEFT JOIN reserva_familiar rf ON rf.reserva_id = r.id
+           LEFT JOIN reserva_familiar_tarifa rft ON rft.reserva_familiar_id = rf.id
+          WHERE r.modalidad <> 'CONVENIO'
          GROUP BY r.id, r.fecha_inicio, r.fecha_fin
       ) cobertura`
   );
-  if (Number(report.metrics.family_tariff_history.filas_faltantes) > 0) {
+  if (Object.values(report.metrics.family_tariff_history).some((value) => Number(value) > 0)) {
     addIssue(
       report.warnings,
       "SNAPSHOT_DIARIO_INCOMPLETO",
-      "Faltan filas históricas por persona/noche; no se crearán sin fuente confiable",
+      "La cobertura o los snapshots históricos por persona/noche son incompletos o inválidos",
       report.metrics.family_tariff_history
+    );
+  }
+
+  report.metrics.relational_consistency = await queryOne(
+    connection,
+    `SELECT
+       (SELECT COUNT(*)
+          FROM tarifa t
+          LEFT JOIN recurso r ON r.id = t.recurso_id
+          LEFT JOIN tipo_persona tp ON tp.id = t.tipo_persona_id
+          LEFT JOIN regimen reg ON reg.id = t.regimen_id
+          LEFT JOIN temporada_tarifa tt ON tt.id = t.temporada_tarifa_id
+          LEFT JOIN servicio_regimen sr
+            ON sr.servicio_id = r.servicio_id AND sr.regimen_id = t.regimen_id
+         WHERE r.id IS NULL OR tp.id IS NULL OR reg.id IS NULL OR tt.id IS NULL
+            OR sr.servicio_id IS NULL) AS tarifa_regimen_fuera_servicio,
+       (SELECT COUNT(*)
+          FROM tarifa_adicional ta
+          LEFT JOIN recurso r ON r.id = ta.recurso_id
+          LEFT JOIN adicional ad ON ad.id = ta.adicional_id
+          LEFT JOIN regimen reg ON reg.id = ta.regimen_id
+          LEFT JOIN temporada_tarifa tt ON tt.id = ta.temporada_tarifa_id
+          LEFT JOIN servicio_regimen sr
+            ON sr.servicio_id = r.servicio_id AND sr.regimen_id = ta.regimen_id
+         WHERE r.id IS NULL OR ad.id IS NULL OR reg.id IS NULL OR tt.id IS NULL
+            OR sr.servicio_id IS NULL) AS adicional_regimen_fuera_servicio,
+       (SELECT COUNT(*)
+          FROM tarifa a
+          INNER JOIN tarifa b
+            ON a.id < b.id
+           AND a.recurso_id <=> b.recurso_id
+           AND a.regimen_id <=> b.regimen_id
+           AND a.tipo_persona_id <=> b.tipo_persona_id
+           AND COALESCE(a.edad_minima, 0) <= COALESCE(b.edad_maxima, 130)
+           AND COALESCE(b.edad_minima, 0) <= COALESCE(a.edad_maxima, 130)
+           AND a.fecha_inicio <= b.fecha_fin
+           AND b.fecha_inicio <= a.fecha_fin
+          LEFT JOIN temporada_tarifa ta ON ta.id = a.temporada_tarifa_id
+          LEFT JOIN temporada_tarifa tb ON tb.id = b.temporada_tarifa_id
+         WHERE a.temporada_tarifa_id <=> b.temporada_tarifa_id
+            OR (COALESCE(ta.origen, 'GENERAL') = 'GENERAL'
+                AND COALESCE(tb.origen, 'GENERAL') = 'GENERAL')) AS tarifas_aplicables_solapadas,
+       (SELECT COUNT(*)
+          FROM tarifa_adicional a
+          INNER JOIN tarifa_adicional b
+            ON a.id < b.id
+           AND a.recurso_id = b.recurso_id
+           AND a.regimen_id = b.regimen_id
+           AND a.adicional_id = b.adicional_id
+           AND a.activo = 1 AND b.activo = 1
+           AND a.fecha_inicio <= b.fecha_fin
+           AND b.fecha_inicio <= a.fecha_fin
+          LEFT JOIN temporada_tarifa ta ON ta.id = a.temporada_tarifa_id
+          LEFT JOIN temporada_tarifa tb ON tb.id = b.temporada_tarifa_id
+         WHERE a.temporada_tarifa_id = b.temporada_tarifa_id
+            OR (COALESCE(ta.origen, 'GENERAL') = 'GENERAL'
+                AND COALESCE(tb.origen, 'GENERAL') = 'GENERAL')) AS adicionales_aplicables_solapados`
+  );
+  if (Object.values(report.metrics.relational_consistency).some((value) => Number(value) > 0)) {
+    addIssue(
+      report.fatal,
+      "RELACIONES_TARIFARIAS_INCONSISTENTES",
+      "Hay tarifas fuera del regimen de su servicio o rangos de cotizacion ambiguos",
+      report.metrics.relational_consistency
+    );
+  }
+
+  report.metrics.workflow_consistency = await queryOne(
+    connection,
+    `SELECT
+       (SELECT COUNT(*)
+          FROM reserva r
+          LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+         WHERE r.fecha_fin < CURDATE()
+           AND LOWER(TRIM(COALESCE(er.nombre, ''))) NOT IN
+             ('cancelada', 'finalizada', 'rechazada', 'utilizada', 'no adjudicada', 'convenio rechazado')) AS reservas_vencidas_no_terminales,
+       (SELECT COUNT(*)
+          FROM sorteo s
+         WHERE s.estado = 'ACTIVO'
+           AND s.fecha_fin_inscripcion < CURDATE()
+           AND NOT EXISTS (
+             SELECT 1 FROM bloque_fecha bf
+              WHERE bf.sorteo_id = s.id AND bf.estado = 'ACTIVO' AND bf.fecha_fin > CURDATE()
+           )) AS sorteos_activos_obsoletos,
+       (SELECT COUNT(*)
+          FROM bloque_fecha bf
+          INNER JOIN bloque_fecha_recurso bfr ON bfr.bloque_fecha_id = bf.id
+          LEFT JOIN reserva r ON r.id = bfr.reserva_id
+          LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+         WHERE (bf.estado IN ('LIBERADO', 'CANCELADO') AND bfr.estado NOT IN ('LIBERADO', 'DISPONIBLE', 'CANCELADO'))
+            OR ((bfr.estado IN ('RESERVADO', 'ASIGNADO')) <> (bfr.reserva_id IS NOT NULL))
+            OR (bfr.reserva_id IS NOT NULL AND (
+                 r.id IS NULL
+                 OR r.bloque_fecha_id <> bf.id
+                 OR r.recurso_id <> bfr.recurso_id
+                 OR LOWER(TRIM(COALESCE(er.nombre, ''))) IN
+                   ('cancelada', 'finalizada', 'rechazada', 'utilizada', 'no adjudicada', 'convenio rechazado')
+               ))) AS bloques_recursos_inconsistentes,
+       (SELECT COUNT(*)
+          FROM usuario relacionado
+          LEFT JOIN usuario titular ON titular.id = relacionado.usuario_familiar_id
+         WHERE relacionado.usuario_familiar_id IS NOT NULL
+           AND (titular.id IS NULL
+             OR relacionado.id = relacionado.usuario_familiar_id
+             OR relacionado.departamental_id IS NULL
+             OR titular.departamental_id IS NULL
+             OR relacionado.departamental_id <> titular.departamental_id)) AS familiares_vinculo_inconsistente,
+       (SELECT COUNT(*)
+          FROM coseguro_solicitud s
+          INNER JOIN coseguro_tipo_reintegro tr ON tr.id = s.tipo_reintegro_id
+         WHERE s.eliminado = 0
+           AND tr.modo_cobertura = 'PORCENTAJE'
+           AND (s.porcentaje_cobertura_aplicado IS NULL OR s.importe_estimado IS NULL)) AS coseguros_porcentaje_sin_snapshot,
+       (SELECT COUNT(*)
+          FROM reserva r
+         WHERE r.es_por_salud = 1
+           AND NOT EXISTS (SELECT 1 FROM reserva_salud rs WHERE rs.reserva_id = r.id)) AS reservas_salud_sin_detalle,
+       (SELECT COUNT(*)
+          FROM reserva_salud rs
+          INNER JOIN reserva r ON r.id = rs.reserva_id
+          LEFT JOIN (SELECT reserva_id, SUM(precio) total FROM reserva_familiar GROUP BY reserva_id) f ON f.reserva_id = r.id
+          LEFT JOIN (SELECT reserva_id, SUM(subtotal) total FROM reserva_adicional GROUP BY reserva_id) a ON a.reserva_id = r.id
+         WHERE rs.estado = 'APROBADA'
+           AND NOT (
+             r.es_por_salud = 1
+             AND r.precio_total = 0
+             AND rs.precio_cubierto IS NOT NULL
+             AND ABS(rs.precio_cubierto - (COALESCE(f.total, 0) + COALESCE(a.total, 0))) <= 0.011
+           )) AS subsidios_aprobados_inconsistentes`
+  );
+  report.metrics.workflow_consistency.ciclos_familiares = Number((await queryOne(
+    connection,
+    `WITH RECURSIVE cadena AS (
+       SELECT id AS raiz, id AS actual, usuario_familiar_id AS siguiente,
+              CAST(CONCAT(',', id, ',') AS CHAR(2048)) AS camino, 0 AS ciclo, 0 AS profundidad
+         FROM usuario WHERE usuario_familiar_id IS NOT NULL
+       UNION ALL
+       SELECT c.raiz, u.id, u.usuario_familiar_id,
+              CONCAT(c.camino, u.id, ','),
+              IF(LOCATE(CONCAT(',', u.id, ','), c.camino) > 0, 1, 0),
+              c.profundidad + 1
+         FROM cadena c
+         INNER JOIN usuario u ON u.id = c.siguiente
+        WHERE c.ciclo = 0 AND c.profundidad < 20
+     )
+     SELECT COUNT(DISTINCT raiz) AS total FROM cadena WHERE ciclo = 1`
+  )).total || 0);
+  if (Object.values(report.metrics.workflow_consistency).some((value) => Number(value) > 0)) {
+    addIssue(
+      report.warnings,
+      "FLUJOS_HISTORICOS_INCONSISTENTES",
+      "Hay estados vencidos o snapshots operativos incompletos que requieren limpieza explicita",
+      report.metrics.workflow_consistency
     );
   }
 
