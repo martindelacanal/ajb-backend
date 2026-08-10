@@ -127,10 +127,12 @@ const userRoute = require('./api/routes/user');
 const coseguroRoute = require('./api/routes/coseguro');
 const olimpiadasRoute = require('./api/routes/olimpiadas');
 const trasladosRoute = require('./api/routes/traslados');
+const noticiasRoute = require('./api/routes/noticias');
 app.use('/api',userRoute);
 app.use('/api',coseguroRoute);
 app.use('/api',olimpiadasRoute);
 app.use('/api',trasladosRoute);
+app.use('/api',noticiasRoute);
 app.use('/imagenes', express.static(path.join(__dirname, 'imagenes'), {
   dotfiles: 'deny',
   fallthrough: false,
