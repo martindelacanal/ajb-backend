@@ -11,9 +11,9 @@
 require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
 const mysql = require("mysql2/promise");
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const { crearServicioNoticiaMedia, descriptorPersistible } = require("../api/services/noticia-media");
 
 function assertEnvVar(value, name) {
   if (!value) throw new Error(`Falta la variable de entorno ${name}`);
@@ -32,6 +32,10 @@ CREATE TABLE IF NOT EXISTS noticia (
   categoria VARCHAR(60) NOT NULL DEFAULT 'Institucional' COMMENT 'Etiqueta libre: Gremial, Salario, Turismo, etc.',
   departamental_id INT DEFAULT NULL COMMENT 'NULL = noticia provincial',
   imagen_archivo VARCHAR(260) DEFAULT NULL COMMENT 'Key S3 de la imagen de portada',
+  imagen_ancho INT UNSIGNED DEFAULT NULL,
+  imagen_alto INT UNSIGNED DEFAULT NULL,
+  imagen_mime VARCHAR(40) DEFAULT NULL,
+  imagen_variantes JSON DEFAULT NULL,
   destacada TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'Integra el bloque principal de la portada',
   orden INT NOT NULL DEFAULT 0 COMMENT 'Prioridad manual dentro del feed (mayor primero)',
   estado ENUM('BORRADOR','PUBLICADA','ARCHIVADA') NOT NULL DEFAULT 'BORRADOR',
@@ -54,6 +58,10 @@ CREATE TABLE IF NOT EXISTS noticia_imagen (
   id INT NOT NULL AUTO_INCREMENT,
   noticia_id INT NOT NULL,
   archivo VARCHAR(260) NOT NULL COMMENT 'Key S3',
+  ancho INT UNSIGNED DEFAULT NULL,
+  alto INT UNSIGNED DEFAULT NULL,
+  mime VARCHAR(40) DEFAULT NULL,
+  variantes JSON DEFAULT NULL,
   epigrafe VARCHAR(200) DEFAULT NULL,
   orden INT NOT NULL DEFAULT 0,
   fecha_creacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -253,7 +261,42 @@ const NOTICIAS_SEED = [
   },
 ];
 
-async function subirImagenSeed(s3, clave) {
+const COLUMNAS_MEDIA = Object.freeze({
+  noticia: Object.freeze({
+    imagen_ancho: "INT UNSIGNED DEFAULT NULL",
+    imagen_alto: "INT UNSIGNED DEFAULT NULL",
+    imagen_mime: "VARCHAR(40) DEFAULT NULL",
+    imagen_variantes: "JSON DEFAULT NULL",
+  }),
+  noticia_imagen: Object.freeze({
+    ancho: "INT UNSIGNED DEFAULT NULL",
+    alto: "INT UNSIGNED DEFAULT NULL",
+    mime: "VARCHAR(40) DEFAULT NULL",
+    variantes: "JSON DEFAULT NULL",
+  }),
+});
+
+async function asegurarColumnasMedia(connection) {
+  for (const [tabla, columnas] of Object.entries(COLUMNAS_MEDIA)) {
+    const [existentes] = await connection.query(
+      `SELECT COLUMN_NAME
+       FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`,
+      [tabla]
+    );
+    const nombres = new Set(existentes.map((fila) => fila.COLUMN_NAME));
+    const faltantes = Object.entries(columnas).filter(([columna]) => !nombres.has(columna));
+    if (faltantes.length > 0) {
+      const clausulas = faltantes
+        .map(([columna, definicion]) => `ADD COLUMN \`${columna}\` ${definicion}`)
+        .join(", ");
+      await connection.query(`ALTER TABLE \`${tabla}\` ${clausulas}`);
+      faltantes.forEach(([columna]) => console.log(`  ✔ ${tabla}.${columna}`));
+    }
+  }
+}
+
+async function subirImagenSeed(servicioMedia, clave) {
   const definicion = IMAGENES_SEED[clave];
   if (!definicion) return null;
   if (!fs.existsSync(definicion.archivo)) {
@@ -261,16 +304,7 @@ async function subirImagenSeed(s3, clave) {
     return null;
   }
   const buffer = fs.readFileSync(definicion.archivo);
-  const key = `noticias/portadas/seed_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.${definicion.extension}`;
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: process.env.BUCKET_NAME,
-      Key: key,
-      Body: buffer,
-      ContentType: definicion.mime,
-    })
-  );
-  return key;
+  return servicioMedia.procesarYSubir({ buffer, mimetype: definicion.mime }, "portadas");
 }
 
 async function main() {
@@ -301,6 +335,8 @@ async function main() {
     await connection.query(DDL_NOTICIA);
     console.log("Creando tabla noticia_imagen (si no existe)...");
     await connection.query(DDL_NOTICIA_IMAGEN);
+    console.log("Verificando columnas de media responsiva...");
+    await asegurarColumnasMedia(connection);
     console.log("Esquema listo.");
 
     if (!conSeed) return;
@@ -331,6 +367,19 @@ async function main() {
       },
       region: process.env.BUCKET_REGION,
     });
+    const servicioMedia = crearServicioNoticiaMedia({
+      subirObjeto: ({ key, buffer, contentType, cacheControl }) => s3.send(new PutObjectCommand({
+        Bucket: process.env.BUCKET_NAME,
+        Key: key,
+        Body: buffer,
+        ContentType: contentType,
+        CacheControl: cacheControl,
+      })),
+      eliminarObjeto: (key) => s3.send(new DeleteObjectCommand({
+        Bucket: process.env.BUCKET_NAME,
+        Key: key,
+      })),
+    });
 
     // Cada key de imagen se sube una sola vez aunque la usen varias noticias.
     const cacheImagenes = {};
@@ -353,19 +402,24 @@ async function main() {
       let imagenArchivo = null;
       if (noticia.imagen) {
         if (!(noticia.imagen in cacheImagenes)) {
-          cacheImagenes[noticia.imagen] = await subirImagenSeed(s3, noticia.imagen);
+          cacheImagenes[noticia.imagen] = await subirImagenSeed(servicioMedia, noticia.imagen);
         }
         imagenArchivo = cacheImagenes[noticia.imagen];
       }
 
+      const media = descriptorPersistible(imagenArchivo);
+
       await connection.query(
         `INSERT INTO noticia
-           (titulo, bajada, cuerpo, categoria, departamental_id, imagen_archivo,
-            destacada, orden, estado, fecha_publicacion, creado_por_usuario_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PUBLICADA', DATE_SUB(NOW(), INTERVAL ? DAY), ?)`,
+           (titulo, bajada, cuerpo, categoria, departamental_id,
+            imagen_archivo, imagen_ancho, imagen_alto, imagen_mime, imagen_variantes,
+             destacada, orden, estado, fecha_publicacion, creado_por_usuario_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PUBLICADA', DATE_SUB(NOW(), INTERVAL ? DAY), ?)`,
         [
           noticia.titulo, noticia.bajada, noticia.cuerpo, noticia.categoria, departamentalId,
-          imagenArchivo, noticia.destacada, noticia.orden, noticia.diasAtras, adminId,
+          media.archivo, media.ancho, media.alto, media.mime,
+          media.variantes.length > 0 ? JSON.stringify(media.variantes) : null,
+          noticia.destacada, noticia.orden, noticia.diasAtras, adminId,
         ]
       );
       console.log(`  ✔ ${noticia.titulo}`);
