@@ -6,8 +6,16 @@ const SQL_RED = `
     COUNT(*) AS usuarios_total,
     COALESCE(SUM(u.habilitado = 'Y'), 0) AS usuarios_habilitados,
     COALESCE(SUM(u.fecha_creacion >= NOW() - INTERVAL 30 DAY), 0) AS usuarios_nuevos_30_dias,
+    COALESCE(SUM(u.es_familiar = 'S'), 0) AS usuarios_familiares,
+    COALESCE(SUM(u.rol_id IN (1, 3, 5, 6)), 0) AS usuarios_staff,
     (SELECT COUNT(*) FROM departamental) AS departamentales_total,
-    (SELECT COUNT(*) FROM departamental d WHERE d.habilitado = 'Y') AS departamentales_habilitadas
+    (SELECT COUNT(*) FROM departamental d WHERE d.habilitado = 'Y') AS departamentales_habilitadas,
+    (
+      SELECT COUNT(DISTINCT u2.departamental_id)
+      FROM usuario u2
+      INNER JOIN departamental d2 ON d2.id = u2.departamental_id AND d2.habilitado = 'Y'
+      WHERE u2.habilitado = 'Y'
+    ) AS departamentales_con_usuarios
   FROM usuario u`;
 
 const SQL_TURISMO = `
@@ -21,7 +29,12 @@ const SQL_TURISMO = `
       r.fecha_inicio >= CURDATE()
       AND r.fecha_inicio < DATE_ADD(CURDATE(), INTERVAL 31 DAY)
       AND er.nombre IN ('Aprobada', 'Adjudicada', 'Convenio aceptado')
-    ), 0) AS proximas_30_dias
+    ), 0) AS proximas_30_dias,
+    COALESCE(SUM(
+      r.fecha_inicio >= CURDATE()
+      AND r.fecha_inicio < DATE_ADD(CURDATE(), INTERVAL 8 DAY)
+      AND er.nombre IN ('Aprobada', 'Adjudicada', 'Convenio aceptado')
+    ), 0) AS proximas_7_dias
   FROM estado_reserva er
   LEFT JOIN reserva r ON r.estado_reserva_id = er.id
   GROUP BY er.id, er.nombre
@@ -34,7 +47,11 @@ const SQL_COSEGURO = `
     ce.nombre,
     COUNT(s.id) AS cantidad,
     COALESCE(SUM(s.fecha_creacion >= NOW() - INTERVAL 30 DAY), 0) AS actividad_30_dias,
-    COALESCE(SUM(COALESCE(s.importe_autorizado, s.importe, 0)), 0) AS importe_total
+    COALESCE(SUM(COALESCE(s.importe_autorizado, s.importe, 0)), 0) AS importe_total,
+    COALESCE(SUM(
+      (s.fecha_pago IS NOT NULL AND s.fecha_pago >= NOW() - INTERVAL 30 DAY)
+      * COALESCE(s.importe_autorizado, s.importe, 0)
+    ), 0) AS importe_acreditado_30_dias
   FROM coseguro_estado ce
   LEFT JOIN coseguro_solicitud s
     ON s.estado_id = ce.id AND s.eliminado = 0
@@ -142,6 +159,95 @@ const SQL_EVOLUCION = `
   GROUP BY DATE_FORMAT(actividad.fecha_creacion, '%Y-%m')
   ORDER BY mes`;
 
+const SQL_CONVERSACIONES = `
+  /* dashboard:conversaciones */
+  SELECT 'reservas' AS modulo, COUNT(*) AS sin_responder
+  FROM reserva_observacion ro
+  INNER JOIN (
+    SELECT reserva_id, MAX(id) AS ultimo_id
+    FROM reserva_observacion
+    GROUP BY reserva_id
+  ) ult ON ult.ultimo_id = ro.id
+  WHERE ro.usuario_rol = 'afiliado'
+  UNION ALL
+  SELECT 'coseguro', COUNT(*)
+  FROM coseguro_observacion co
+  INNER JOIN (
+    SELECT solicitud_id, MAX(id) AS ultimo_id
+    FROM coseguro_observacion
+    GROUP BY solicitud_id
+  ) ult ON ult.ultimo_id = co.id
+  INNER JOIN coseguro_solicitud cs ON cs.id = co.solicitud_id AND cs.eliminado = 0
+  INNER JOIN coseguro_estado ces ON ces.id = cs.estado_id AND ces.nombre <> 'Solicitud cancelada'
+  WHERE co.usuario_rol = 'afiliado'
+  UNION ALL
+  SELECT 'traslados', COUNT(*)
+  FROM traslado_observacion tro
+  INNER JOIN (
+    SELECT solicitud_id, MAX(id) AS ultimo_id
+    FROM traslado_observacion
+    GROUP BY solicitud_id
+  ) ult ON ult.ultimo_id = tro.id
+  INNER JOIN traslado_solicitud tsol ON tsol.id = tro.solicitud_id AND tsol.eliminado = 0
+  INNER JOIN traslado_estado tes ON tes.id = tsol.estado_id AND tes.nombre <> 'Cancelada'
+  WHERE tro.usuario_rol = 'afiliado'
+  UNION ALL
+  SELECT 'olimpiadas', COUNT(*)
+  FROM olimpiada_inscripcion_observacion oo
+  INNER JOIN (
+    SELECT inscripcion_id, MAX(id) AS ultimo_id
+    FROM olimpiada_inscripcion_observacion
+    GROUP BY inscripcion_id
+  ) ult ON ult.ultimo_id = oo.id
+  INNER JOIN olimpiada_inscripcion oi
+    ON oi.id = oo.inscripcion_id AND oi.eliminado = 0 AND oi.estado <> 'CANCELADO'
+  WHERE oo.usuario_rol = 'afiliado'`;
+
+const SQL_ACTIVIDAD_DIARIA = `
+  /* dashboard:actividad_diaria */
+  SELECT
+    DATE_FORMAT(actividad.fecha_creacion, '%Y-%m-%d') AS dia,
+    COUNT(*) AS total
+  FROM (
+    SELECT fecha_creacion FROM reserva WHERE fecha_creacion >= ?
+    UNION ALL
+    SELECT fecha_creacion FROM usuario WHERE fecha_creacion >= ?
+    UNION ALL
+    SELECT fecha_creacion FROM coseguro_solicitud WHERE eliminado = 0 AND fecha_creacion >= ?
+    UNION ALL
+    SELECT fecha_creacion FROM traslado_solicitud WHERE eliminado = 0 AND fecha_creacion >= ?
+    UNION ALL
+    SELECT fecha_creacion FROM noticia WHERE eliminado = 0 AND fecha_creacion >= ?
+  ) actividad
+  GROUP BY DATE_FORMAT(actividad.fecha_creacion, '%Y-%m-%d')
+  ORDER BY dia`;
+
+const SQL_DESTINOS = `
+  /* dashboard:destinos */
+  SELECT
+    COALESCE(s.lugar, ch.ciudad) AS destino,
+    COUNT(*) AS cantidad
+  FROM reserva r
+  LEFT JOIN servicio s ON s.id = r.servicio_id
+  LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
+  WHERE r.fecha_creacion >= NOW() - INTERVAL 90 DAY
+    AND COALESCE(s.lugar, ch.ciudad) IS NOT NULL
+  GROUP BY destino
+  ORDER BY cantidad DESC, destino ASC
+  LIMIT 3`;
+
+const SQL_PRESENCIA = `
+  /* dashboard:presencia */
+  SELECT
+    d.nombre,
+    COUNT(u.id) AS usuarios
+  FROM departamental d
+  LEFT JOIN usuario u ON u.departamental_id = d.id AND u.habilitado = 'Y'
+  WHERE d.habilitado = 'Y'
+  GROUP BY d.id, d.nombre
+  ORDER BY usuarios DESC, d.nombre ASC
+  LIMIT 5`;
+
 const PRIORIDAD_ATENCION = Object.freeze({
   ALTA: "alta",
   MEDIA: "media",
@@ -191,6 +297,45 @@ function mesActualArgentina(fecha) {
   return `${year}-${month}`;
 }
 
+function diaActualArgentina(fecha) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Argentina/Buenos_Aires",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(fecha);
+}
+
+function obtenerVentanaDias(fecha, cantidad) {
+  const [year, month, day] = diaActualArgentina(fecha).split("-").map(Number);
+  const dias = [];
+  for (let offset = cantidad - 1; offset >= 0; offset -= 1) {
+    const item = new Date(Date.UTC(year, month - 1, day - offset));
+    dias.push(item.toISOString().slice(0, 10));
+  }
+  return dias;
+}
+
+function completarActividadDiaria(rows, dias) {
+  const porDia = new Map(rows.map((row) => [String(row.dia), aEntero(row.total)]));
+  return dias.map((dia) => ({ dia, total: porDia.get(dia) || 0 }));
+}
+
+function resumirConversaciones(rows) {
+  const porModulo = new Map(
+    rows.map((row) => [String(row.modulo), aEntero(row.sin_responder)])
+  );
+  const conversaciones = {
+    reservas: porModulo.get("reservas") || 0,
+    coseguro: porModulo.get("coseguro") || 0,
+    traslados: porModulo.get("traslados") || 0,
+    olimpiadas: porModulo.get("olimpiadas") || 0,
+  };
+  conversaciones.total = conversaciones.reservas + conversaciones.coseguro
+    + conversaciones.traslados + conversaciones.olimpiadas;
+  return conversaciones;
+}
+
 function obtenerVentanaMeses(fecha) {
   const [year, month] = mesActualArgentina(fecha).split("-").map(Number);
   const meses = [];
@@ -219,6 +364,7 @@ function completarEvolucion(rows, meses) {
 function construirRespuesta({
   generadoEn,
   meses,
+  dias,
   redRows,
   turismoRows,
   coseguroRows,
@@ -226,16 +372,26 @@ function construirRespuesta({
   noticiasRows,
   olimpiadasRows,
   evolucionRows,
+  conversacionesRows,
+  actividadDiariaRows,
+  destinosRows,
+  presenciaRows,
 }) {
   const red = redRows[0] || {};
   const olimpiadas = olimpiadasRows[0] || {};
   const coseguroPendienteAcreditacion = filaEstado(coseguroRows, "Pendiente de acreditación");
+  const conversaciones = resumirConversaciones(conversacionesRows);
 
   const turismo = {
     total: aEntero(sumar(turismoRows, "cantidad")),
     por_aprobar: cantidadEstado(turismoRows, "Verificada"),
     proximas_30_dias: aEntero(sumar(turismoRows, "proximas_30_dias")),
+    proximas_7_dias: aEntero(sumar(turismoRows, "proximas_7_dias")),
     actividad_30_dias: aEntero(sumar(turismoRows, "actividad_30_dias")),
+    destinos_90_dias: destinosRows.map((row) => ({
+      destino: String(row.destino || ""),
+      cantidad: aEntero(row.cantidad),
+    })),
     por_estado: porEstado(turismoRows),
   };
 
@@ -245,6 +401,7 @@ function construirRespuesta({
     pendientes_central: cantidadEstado(coseguroRows, "Aprobado por departamental"),
     pendientes_acreditacion: cantidadEstado(coseguroRows, "Pendiente de acreditación"),
     importe_pendiente_acreditacion: aNumero(coseguroPendienteAcreditacion?.importe_total),
+    importe_acreditado_30_dias: aNumero(sumar(coseguroRows, "importe_acreditado_30_dias")),
     actividad_30_dias: aEntero(sumar(coseguroRows, "actividad_30_dias")),
     por_estado: porEstado(coseguroRows),
   };
@@ -291,6 +448,14 @@ function construirRespuesta({
       prioridad: PRIORIDAD_ATENCION.ALTA,
     },
     {
+      modulo: "coseguro",
+      clave: "coseguro_por_acreditar",
+      etiqueta: "Reintegros por acreditar",
+      cantidad: coseguro.pendientes_acreditacion,
+      ruta: "/coseguro-medico",
+      prioridad: PRIORIDAD_ATENCION.MEDIA,
+    },
+    {
       modulo: "traslados",
       clave: "traslados_activos",
       etiqueta: "Traslados activos",
@@ -306,6 +471,38 @@ function construirRespuesta({
       ruta: "/noticias-admin",
       prioridad: PRIORIDAD_ATENCION.MEDIA,
     },
+    {
+      modulo: "turismo",
+      clave: "chat_reservas",
+      etiqueta: "Mensajes sin responder",
+      cantidad: conversaciones.reservas,
+      ruta: "/reservas",
+      prioridad: PRIORIDAD_ATENCION.MEDIA,
+    },
+    {
+      modulo: "coseguro",
+      clave: "chat_coseguro",
+      etiqueta: "Mensajes sin responder",
+      cantidad: conversaciones.coseguro,
+      ruta: "/coseguro-medico",
+      prioridad: PRIORIDAD_ATENCION.MEDIA,
+    },
+    {
+      modulo: "traslados",
+      clave: "chat_traslados",
+      etiqueta: "Mensajes sin responder",
+      cantidad: conversaciones.traslados,
+      ruta: "/traslados-admin",
+      prioridad: PRIORIDAD_ATENCION.MEDIA,
+    },
+    {
+      modulo: "olimpiadas",
+      clave: "chat_olimpiadas",
+      etiqueta: "Mensajes sin responder",
+      cantidad: conversaciones.olimpiadas,
+      ruta: "/olimpiadas-admin",
+      prioridad: PRIORIDAD_ATENCION.MEDIA,
+    },
   ];
 
   return {
@@ -314,16 +511,24 @@ function construirRespuesta({
       total: itemsAtencion.reduce((total, item) => total + item.cantidad, 0),
       items: itemsAtencion,
     },
+    conversaciones,
     resumen_red: {
       usuarios: {
         total: aEntero(red.usuarios_total),
         habilitados: aEntero(red.usuarios_habilitados),
         nuevos_30_dias: aEntero(red.usuarios_nuevos_30_dias),
+        familiares: aEntero(red.usuarios_familiares),
+        staff: aEntero(red.usuarios_staff),
       },
       departamentales: {
         total: aEntero(red.departamentales_total),
         habilitadas: aEntero(red.departamentales_habilitadas),
+        con_usuarios: aEntero(red.departamentales_con_usuarios),
       },
+      presencia: presenciaRows.map((row) => ({
+        nombre: String(row.nombre || ""),
+        usuarios: aEntero(row.usuarios),
+      })),
     },
     modulos: {
       turismo,
@@ -337,6 +542,7 @@ function construirRespuesta({
       },
     },
     evolucion: completarEvolucion(evolucionRows, meses),
+    actividad_diaria: completarActividadDiaria(actividadDiariaRows, dias),
   };
 }
 
@@ -352,7 +558,9 @@ function crearServicioDashboard({ conexion, ahora = () => new Date(), cacheMs = 
   async function cargar() {
     const generadoEn = ahora();
     const meses = obtenerVentanaMeses(generadoEn);
+    const dias = obtenerVentanaDias(generadoEn, 14);
     const desde = `${meses[0]}-01`;
+    const desdeDia = dias[0];
     const db = conexion.promise();
     const resultados = await Promise.all([
       db.query(SQL_RED),
@@ -362,11 +570,16 @@ function crearServicioDashboard({ conexion, ahora = () => new Date(), cacheMs = 
       db.query(SQL_NOTICIAS),
       db.query(SQL_OLIMPIADAS),
       db.query(SQL_EVOLUCION, [desde, desde, desde, desde, desde]),
+      db.query(SQL_CONVERSACIONES),
+      db.query(SQL_ACTIVIDAD_DIARIA, [desdeDia, desdeDia, desdeDia, desdeDia, desdeDia]),
+      db.query(SQL_DESTINOS),
+      db.query(SQL_PRESENCIA),
     ]);
 
     return construirRespuesta({
       generadoEn,
       meses,
+      dias,
       redRows: resultados[0][0],
       turismoRows: resultados[1][0],
       coseguroRows: resultados[2][0],
@@ -374,6 +587,10 @@ function crearServicioDashboard({ conexion, ahora = () => new Date(), cacheMs = 
       noticiasRows: resultados[4][0],
       olimpiadasRows: resultados[5][0],
       evolucionRows: resultados[6][0],
+      conversacionesRows: resultados[7][0],
+      actividadDiariaRows: resultados[8][0],
+      destinosRows: resultados[9][0],
+      presenciaRows: resultados[10][0],
     });
   }
 
@@ -402,6 +619,10 @@ module.exports = {
     construirRespuesta,
     completarEvolucion,
     obtenerVentanaMeses,
+    obtenerVentanaDias,
+    completarActividadDiaria,
+    resumirConversaciones,
     SQL_EVOLUCION,
+    SQL_ACTIVIDAD_DIARIA,
   },
 };
