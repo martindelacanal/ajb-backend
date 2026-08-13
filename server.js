@@ -26,6 +26,8 @@ const SOCKET_DISPONIBILIDAD_INTERVALO_MS = Number.isInteger(intervaloConfigurado
 const MAX_SUSCRIPCIONES_DISPONIBILIDAD = 5;
 const MAX_SERVICIOS_POR_SUSCRIPCION = 50;
 const ROLES_STAFF_SOCKET = new Set(["admin", "admin-central", "departamental"]);
+// Mismo gate que el GET /servicios/disponibilidad del REST
+const ROLES_DISPONIBILIDAD = new Set(["admin", "afiliado", "departamental"]);
 
 function callbackSeguro(callback) {
     return typeof callback === "function" ? callback : () => { };
@@ -79,6 +81,7 @@ function crearClaveSuscripcionDisponibilidad(payload) {
         payload.ninos,
         payload.bebes,
         idsOrdenados.join(","),
+        payload.reserva_excluir_id || "",
     ].join("|");
 }
 
@@ -97,6 +100,11 @@ function normalizarPayloadSuscripcionDisponibilidad(payload = {}) {
         return { error: `No se permiten mas de ${MAX_SERVICIOS_POR_SUSCRIPCION} servicios por suscripcion` };
     }
 
+    // Al editar una reserva, el snapshot no debe contarla como ocupación
+    const reservaExcluirIdRaw = Number(payload.reserva_excluir_id);
+    const reserva_excluir_id =
+        Number.isInteger(reservaExcluirIdRaw) && reservaExcluirIdRaw > 0 ? reservaExcluirIdRaw : null;
+
     return {
         value: {
             lugar: payload.lugar || null,
@@ -107,6 +115,7 @@ function normalizarPayloadSuscripcionDisponibilidad(payload = {}) {
             bebes: parseo.value.bebes,
             total_personas: parseo.value.total_personas,
             servicio_ids,
+            reserva_excluir_id,
         },
     };
 }
@@ -122,6 +131,7 @@ async function obtenerActualizacionesDisponibilidad(payloadNormalizado) {
         ninos: payloadNormalizado.ninos,
         bebes: payloadNormalizado.bebes,
         totalPersonas: payloadNormalizado.total_personas,
+        reservaExcluirId: payloadNormalizado.reserva_excluir_id || null,
     });
 }
 
@@ -280,6 +290,10 @@ io.on("connection", (socket) => {
 
     socket.on("servicios:disponibilidad:subscribe", async (payload = {}, callback = () => { }) => {
         try {
+            if (!ROLES_DISPONIBILIDAD.has(socket.data.auth.rol)) {
+                callback({ error: "No autorizado" });
+                return;
+            }
             if (socket.data.disponibilidadSubs.size >= MAX_SUSCRIPCIONES_DISPONIBILIDAD) {
                 callback({ error: `No se permiten mas de ${MAX_SUSCRIPCIONES_DISPONIBILIDAD} suscripciones simultaneas` });
                 return;
@@ -288,6 +302,17 @@ io.on("connection", (socket) => {
             if (normalizado.error) {
                 callback({ error: normalizado.error });
                 return;
+            }
+
+            // El afiliado solo puede excluir del conteo una reserva propia
+            if (normalizado.value.reserva_excluir_id && socket.data.auth.rol === "afiliado") {
+                const [reservaExcluir] = await mysqlConnection.promise().query(
+                    "SELECT usuario_id FROM reserva WHERE id = ?",
+                    [normalizado.value.reserva_excluir_id]
+                );
+                if (Number(reservaExcluir?.[0]?.usuario_id) !== Number(socket.data.auth.id)) {
+                    normalizado.value.reserva_excluir_id = null;
+                }
             }
 
             const clave = crearClaveSuscripcionDisponibilidad({

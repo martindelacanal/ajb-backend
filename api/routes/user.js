@@ -1905,6 +1905,22 @@ router.get("/servicios/disponibilidad", verifyToken, async (req, res) => {
 
       const servicioIds = parsearServicioIdsCsv(req.query.servicio_ids);
       const db = mysqlConnection.promise();
+
+      // Al editar una reserva, el snapshot no debe contarla como ocupación.
+      // El afiliado solo puede excluir una reserva propia (el cupo real lo
+      // valida igual el PUT dentro de la transacción).
+      let reservaExcluirId = normalizarIdPositivo(req.query.reserva_excluir_id);
+      if (reservaExcluirId !== null && cabecera.rol === "afiliado") {
+        const [reservaExcluir] = await db.query(
+          "SELECT usuario_id FROM reserva WHERE id = ?",
+          [reservaExcluirId]
+        );
+        const duenioReserva = normalizarIdPositivo(reservaExcluir?.[0]?.usuario_id);
+        if (duenioReserva === null || duenioReserva !== normalizarIdPositivo(cabecera.id)) {
+          reservaExcluirId = null;
+        }
+      }
+
       const snapshot = await obtenerSnapshotDisponibilidad(db, {
         lugar: req.query.lugar || null,
         servicioIds,
@@ -1914,6 +1930,7 @@ router.get("/servicios/disponibilidad", verifyToken, async (req, res) => {
         ninos: parseo.value.ninos,
         bebes: parseo.value.bebes,
         totalPersonas: parseo.value.total_personas,
+        reservaExcluirId,
       });
 
       res.status(200).json(snapshot);

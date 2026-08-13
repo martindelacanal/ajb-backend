@@ -246,7 +246,7 @@ async function obtenerServicios(connection, { lugar = null, servicioIds = null, 
   return rows;
 }
 
-async function obtenerDisponibilidadCamping(connection, { servicioId, fechaInicio, fechaFin, totalPersonas }) {
+async function obtenerDisponibilidadCamping(connection, { servicioId, fechaInicio, fechaFin, totalPersonas, reservaExcluirId = null }) {
   const [recursosCamping] = await connection.query(
     "SELECT id FROM recurso WHERE servicio_id = ? ORDER BY id ASC",
     [servicioId]
@@ -312,6 +312,9 @@ async function obtenerDisponibilidadCamping(connection, { servicioId, fechaInici
     return construirPayloadDisponibilidad(0, parcelasTotales);
   }
 
+  // Al editar una reserva, no debe contarse a sí misma como ocupación
+  const filtroExclusion = reservaExcluirId ? " AND id <> ?" : "";
+  const paramsExclusion = reservaExcluirId ? [reservaExcluirId] : [];
   const [reservasSolapadas] = await connection.query(
     `
       SELECT COUNT(*) AS total
@@ -319,9 +322,9 @@ async function obtenerDisponibilidadCamping(connection, { servicioId, fechaInici
       WHERE recurso_id = ?
         AND fecha_inicio < ?
         AND fecha_fin > ?
-        AND COALESCE(estado_reserva_id, 1) <> ?
+        AND COALESCE(estado_reserva_id, 1) <> ?${filtroExclusion}
     `,
-    [recursoCampingId, fechaFin, fechaInicio, ESTADO_RESERVA_CANCELADA_ID]
+    [recursoCampingId, fechaFin, fechaInicio, ESTADO_RESERVA_CANCELADA_ID, ...paramsExclusion]
   );
 
   const ocupadas = Number(reservasSolapadas?.[0]?.total || 0);
@@ -330,7 +333,7 @@ async function obtenerDisponibilidadCamping(connection, { servicioId, fechaInici
   return construirPayloadDisponibilidad(disponibles, parcelasTotales);
 }
 
-async function obtenerDisponibilidadNoCamping(connection, { servicioId, fechaInicio, fechaFin, adultos, ninos, bebes }) {
+async function obtenerDisponibilidadNoCamping(connection, { servicioId, fechaInicio, fechaFin, adultos, ninos, bebes, reservaExcluirId = null }) {
   const [recursos] = await connection.query(
     "SELECT id FROM recurso WHERE servicio_id = ? ORDER BY id ASC",
     [servicioId]
@@ -354,6 +357,9 @@ async function obtenerDisponibilidadNoCamping(connection, { servicioId, fechaIni
     [...recursoIds, fechaFin, fechaInicio]
   );
 
+  // Al editar una reserva, no debe contarse a sí misma como ocupación
+  const filtroExclusion = reservaExcluirId ? " AND id <> ?" : "";
+  const paramsExclusion = reservaExcluirId ? [reservaExcluirId] : [];
   const [reservasSolapadas] = await connection.query(
     `
       SELECT DISTINCT recurso_id
@@ -361,9 +367,9 @@ async function obtenerDisponibilidadNoCamping(connection, { servicioId, fechaIni
       WHERE recurso_id IN (${placeholders})
         AND fecha_inicio < ?
         AND fecha_fin > ?
-        AND COALESCE(estado_reserva_id, 1) <> ?
+        AND COALESCE(estado_reserva_id, 1) <> ?${filtroExclusion}
     `,
-    [...recursoIds, fechaFin, fechaInicio, ESTADO_RESERVA_CANCELADA_ID]
+    [...recursoIds, fechaFin, fechaInicio, ESTADO_RESERVA_CANCELADA_ID, ...paramsExclusion]
   );
 
   const recursoOcupadoSet = new Set(reservasSolapadas.map((r) => Number(r.recurso_id)));
@@ -429,6 +435,7 @@ async function calcularDisponibilidadServicio(connection, params) {
     ninos,
     bebes,
     totalPersonas,
+    reservaExcluirId = null,
   } = params;
 
   const actualizadoEn = new Date().toISOString();
@@ -439,6 +446,7 @@ async function calcularDisponibilidadServicio(connection, params) {
           fechaInicio,
           fechaFin,
           totalPersonas,
+          reservaExcluirId,
         })
       : await obtenerDisponibilidadNoCamping(connection, {
           servicioId,
@@ -447,6 +455,7 @@ async function calcularDisponibilidadServicio(connection, params) {
           adultos,
           ninos,
           bebes,
+          reservaExcluirId,
         });
 
   return {
@@ -465,6 +474,7 @@ async function obtenerSnapshotDisponibilidad(connection, params) {
     ninos,
     bebes,
     totalPersonas,
+    reservaExcluirId = null,
   } = params;
 
   const servicios = await obtenerServicios(connection, { lugar, servicioIds });
@@ -479,6 +489,7 @@ async function obtenerSnapshotDisponibilidad(connection, params) {
       ninos,
       bebes,
       totalPersonas,
+      reservaExcluirId,
     });
 
     resultados.push({
