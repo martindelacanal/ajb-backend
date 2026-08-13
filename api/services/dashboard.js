@@ -248,6 +248,189 @@ const SQL_PRESENCIA = `
   ORDER BY usuarios DESC, d.nombre ASC
   LIMIT 5`;
 
+// Actividad agrupada a demanda (selector de período del gráfico del tablero).
+// El formato SQL sale de esta whitelist, nunca del request.
+const GRANULARIDADES = Object.freeze({
+  dia: { formatoSql: "%Y-%m-%d", maxPeriodos: 92 },
+  semana: { formatoSql: "%x-W%v", maxPeriodos: 60 },
+  mes: { formatoSql: "%Y-%m", maxPeriodos: 36 },
+  anio: { formatoSql: "%Y", maxPeriodos: 15 },
+});
+
+function construirSqlActividadAgrupada(formatoSql) {
+  return `
+  /* dashboard:actividad_agrupada */
+  SELECT
+    DATE_FORMAT(actividad.fecha_creacion, '${formatoSql}') AS periodo,
+    SUM(actividad.modulo = 'reservas') AS reservas,
+    SUM(actividad.modulo = 'usuarios') AS usuarios,
+    SUM(actividad.modulo = 'coseguro') AS coseguro,
+    SUM(actividad.modulo = 'traslados') AS traslados,
+    SUM(actividad.modulo = 'noticias') AS noticias
+  FROM (
+    SELECT fecha_creacion, 'reservas' AS modulo
+    FROM reserva
+    WHERE fecha_creacion >= ? AND fecha_creacion < ?
+    UNION ALL
+    SELECT fecha_creacion, 'usuarios' AS modulo
+    FROM usuario
+    WHERE fecha_creacion >= ? AND fecha_creacion < ?
+    UNION ALL
+    SELECT fecha_creacion, 'coseguro' AS modulo
+    FROM coseguro_solicitud
+    WHERE eliminado = 0 AND fecha_creacion >= ? AND fecha_creacion < ?
+    UNION ALL
+    SELECT fecha_creacion, 'traslados' AS modulo
+    FROM traslado_solicitud
+    WHERE eliminado = 0 AND fecha_creacion >= ? AND fecha_creacion < ?
+    UNION ALL
+    SELECT fecha_creacion, 'noticias' AS modulo
+    FROM noticia
+    WHERE eliminado = 0 AND fecha_creacion >= ? AND fecha_creacion < ?
+  ) actividad
+  GROUP BY periodo
+  ORDER BY periodo`;
+}
+
+function esFechaIso(texto) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(texto || ""))) return false;
+  const fecha = new Date(`${texto}T00:00:00.000Z`);
+  return !Number.isNaN(fecha.getTime()) && fecha.toISOString().slice(0, 10) === texto;
+}
+
+function aFechaUtc(texto) {
+  return new Date(`${texto}T00:00:00.000Z`);
+}
+
+function aTextoIso(fecha) {
+  return fecha.toISOString().slice(0, 10);
+}
+
+function inicioSemanaIso(fecha) {
+  const lunes = new Date(fecha);
+  const dia = lunes.getUTCDay() || 7;
+  lunes.setUTCDate(lunes.getUTCDate() - dia + 1);
+  return lunes;
+}
+
+// Clave "2026-W33" con la misma convención que DATE_FORMAT '%x-W%v' (ISO 8601).
+function claveSemanaIso(fecha) {
+  const jueves = new Date(fecha);
+  const dia = jueves.getUTCDay() || 7;
+  jueves.setUTCDate(jueves.getUTCDate() + 4 - dia);
+  const anio = jueves.getUTCFullYear();
+  const inicioAnio = new Date(Date.UTC(anio, 0, 1));
+  const semana = Math.ceil(((jueves.getTime() - inicioAnio.getTime()) / 86400000 + 1) / 7);
+  return `${anio}-W${String(semana).padStart(2, "0")}`;
+}
+
+// Enumera los períodos naturales completos que cubren [desde, hasta].
+// Cada período lleva su clave (la que produce DATE_FORMAT) y su fecha de
+// inicio, que el frontend usa para las etiquetas del eje.
+function enumerarPeriodos(granularidad, desde, hasta) {
+  const periodos = [];
+  if (granularidad === "dia") {
+    for (let f = new Date(desde); f <= hasta; f.setUTCDate(f.getUTCDate() + 1)) {
+      periodos.push({ periodo: aTextoIso(f), inicio: aTextoIso(f) });
+    }
+  } else if (granularidad === "semana") {
+    for (let f = inicioSemanaIso(desde); f <= hasta; f.setUTCDate(f.getUTCDate() + 7)) {
+      periodos.push({ periodo: claveSemanaIso(f), inicio: aTextoIso(f) });
+    }
+  } else if (granularidad === "mes") {
+    for (
+      let f = new Date(Date.UTC(desde.getUTCFullYear(), desde.getUTCMonth(), 1));
+      f <= hasta;
+      f.setUTCMonth(f.getUTCMonth() + 1)
+    ) {
+      periodos.push({ periodo: aTextoIso(f).slice(0, 7), inicio: aTextoIso(f) });
+    }
+  } else {
+    for (
+      let f = new Date(Date.UTC(desde.getUTCFullYear(), 0, 1));
+      f <= hasta;
+      f.setUTCFullYear(f.getUTCFullYear() + 1)
+    ) {
+      periodos.push({ periodo: String(f.getUTCFullYear()), inicio: aTextoIso(f) });
+    }
+  }
+  return periodos;
+}
+
+function finExclusivoPeriodos(granularidad, hasta) {
+  const fin = new Date(hasta);
+  if (granularidad === "dia") {
+    fin.setUTCDate(fin.getUTCDate() + 1);
+  } else if (granularidad === "semana") {
+    const lunes = inicioSemanaIso(fin);
+    lunes.setUTCDate(lunes.getUTCDate() + 7);
+    return lunes;
+  } else if (granularidad === "mes") {
+    return new Date(Date.UTC(fin.getUTCFullYear(), fin.getUTCMonth() + 1, 1));
+  } else {
+    return new Date(Date.UTC(fin.getUTCFullYear() + 1, 0, 1));
+  }
+  return fin;
+}
+
+function validarActividadAgrupada({ granularidad, desde, hasta }) {
+  const config = GRANULARIDADES[granularidad];
+  if (!config) {
+    return { error: "Granularidad inválida: usá dia, semana, mes o anio" };
+  }
+  if (!esFechaIso(desde) || !esFechaIso(hasta)) {
+    return { error: "Las fechas deben tener formato YYYY-MM-DD" };
+  }
+  const fechaDesde = aFechaUtc(desde);
+  const fechaHasta = aFechaUtc(hasta);
+  if (fechaDesde > fechaHasta) {
+    return { error: "La fecha desde no puede ser posterior a la fecha hasta" };
+  }
+  const periodos = enumerarPeriodos(granularidad, fechaDesde, fechaHasta);
+  if (periodos.length > config.maxPeriodos) {
+    return { error: `El rango es demasiado amplio para esa agrupación (máximo ${config.maxPeriodos} períodos)` };
+  }
+  return { config, fechaDesde, fechaHasta, periodos };
+}
+
+function completarPeriodos(rows, periodos) {
+  const porPeriodo = new Map(rows.map((row) => [String(row.periodo), row]));
+  return periodos.map(({ periodo, inicio }) => {
+    const row = porPeriodo.get(periodo) || {};
+    return {
+      periodo,
+      inicio,
+      reservas: aEntero(row.reservas),
+      usuarios: aEntero(row.usuarios),
+      coseguro: aEntero(row.coseguro),
+      traslados: aEntero(row.traslados),
+      noticias: aEntero(row.noticias),
+    };
+  });
+}
+
+function crearServicioActividad({ conexion }) {
+  async function obtener(params) {
+    const validacion = validarActividadAgrupada(params);
+    if (validacion.error) {
+      return { error: validacion.error };
+    }
+    const { config, periodos } = validacion;
+    const desdeSql = periodos[0].inicio;
+    const hastaSql = aTextoIso(finExclusivoPeriodos(params.granularidad, validacion.fechaHasta));
+    const parametros = [desdeSql, hastaSql, desdeSql, hastaSql, desdeSql, hastaSql, desdeSql, hastaSql, desdeSql, hastaSql];
+    const [rows] = await conexion.promise().query(construirSqlActividadAgrupada(config.formatoSql), parametros);
+    return {
+      granularidad: params.granularidad,
+      desde: periodos[0].inicio,
+      hasta: params.hasta,
+      buckets: completarPeriodos(rows, periodos),
+    };
+  }
+
+  return { obtener };
+}
+
 const PRIORIDAD_ATENCION = Object.freeze({
   ALTA: "alta",
   MEDIA: "media",
@@ -615,7 +798,13 @@ function crearServicioDashboard({ conexion, ahora = () => new Date(), cacheMs = 
 
 module.exports = {
   crearServicioDashboard,
+  crearServicioActividad,
   __test: {
+    enumerarPeriodos,
+    claveSemanaIso,
+    validarActividadAgrupada,
+    completarPeriodos,
+    finExclusivoPeriodos,
     construirRespuesta,
     completarEvolucion,
     obtenerVentanaMeses,

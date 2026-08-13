@@ -88,6 +88,11 @@ function resultadoPara(sql) {
       { nombre: "Quilmes", usuarios: 11 },
     ]];
   }
+  if (sql.includes("dashboard:actividad_agrupada")) {
+    return [[
+      { periodo: "2026-W32", reservas: 2, usuarios: 1, coseguro: 0, traslados: 0, noticias: 1 },
+    ]];
+  }
   throw new Error(`Consulta de prueba inesperada: ${sql}`);
 }
 
@@ -214,6 +219,80 @@ test("la actividad diaria completa catorce días en orden y rellena los vacíos"
   assert.equal(serie.length, 14);
   assert.deepEqual(serie[0], { dia: "2026-07-31", total: 0 });
   assert.deepEqual(serie[12], { dia: "2026-08-12", total: 4 });
+});
+
+test("la actividad agrupada valida entrada y rechaza sin token o rol", async () => {
+  databaseCalls.length = 0;
+  const sinToken = await request("/api/admin/dashboard/actividad?granularidad=dia&desde=2026-08-01&hasta=2026-08-13");
+  assert.equal(sinToken.status, 401);
+
+  const rolAjeno = await request(
+    "/api/admin/dashboard/actividad?granularidad=dia&desde=2026-08-01&hasta=2026-08-13",
+    tokenFor({ rol: "departamental" })
+  );
+  assert.equal(rolAjeno.status, 401);
+  assert.equal(databaseCalls.length, 0);
+
+  const granularidadMala = await request(
+    "/api/admin/dashboard/actividad?granularidad=hora&desde=2026-08-01&hasta=2026-08-13",
+    tokenFor()
+  );
+  assert.equal(granularidadMala.status, 400);
+
+  const rangoInvertido = await request(
+    "/api/admin/dashboard/actividad?granularidad=dia&desde=2026-08-13&hasta=2026-08-01",
+    tokenFor()
+  );
+  assert.equal(rangoInvertido.status, 400);
+
+  const rangoEnorme = await request(
+    "/api/admin/dashboard/actividad?granularidad=dia&desde=2020-01-01&hasta=2026-08-13",
+    tokenFor()
+  );
+  assert.equal(rangoEnorme.status, 400);
+  assert.equal(databaseCalls.length, 0);
+});
+
+test("la actividad agrupada por semana completa los períodos ISO y rellena vacíos", async () => {
+  databaseCalls.length = 0;
+  const response = await request(
+    "/api/admin/dashboard/actividad?granularidad=semana&desde=2026-08-01&hasta=2026-08-13",
+    tokenFor()
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.granularidad, "semana");
+  // 2026-08-01 es sábado: su semana ISO arranca el lunes 2026-07-27.
+  assert.equal(response.body.buckets.length, 3);
+  assert.deepEqual(response.body.buckets.map((bucket) => bucket.periodo), ["2026-W31", "2026-W32", "2026-W33"]);
+  assert.equal(response.body.buckets[0].inicio, "2026-07-27");
+  assert.equal(response.body.buckets[1].reservas, 2);
+  assert.equal(response.body.buckets[2].reservas, 0);
+
+  const llamada = databaseCalls.find((call) => call.sql.includes("dashboard:actividad_agrupada"));
+  assert.equal(llamada.params.length, 10);
+  assert.equal(llamada.params[0], "2026-07-27");
+  assert.equal(llamada.params[1], "2026-08-17");
+});
+
+test("los períodos se enumeran bien en los bordes de año", () => {
+  const { enumerarPeriodos, claveSemanaIso } = dashboardTest;
+  const meses = enumerarPeriodos(
+    "mes",
+    new Date("2025-11-15T00:00:00.000Z"),
+    new Date("2026-02-10T00:00:00.000Z")
+  );
+  assert.deepEqual(meses.map((p) => p.periodo), ["2025-11", "2025-12", "2026-01", "2026-02"]);
+
+  const anios = enumerarPeriodos(
+    "anio",
+    new Date("2024-06-01T00:00:00.000Z"),
+    new Date("2026-01-01T00:00:00.000Z")
+  );
+  assert.deepEqual(anios.map((p) => p.periodo), ["2024", "2025", "2026"]);
+
+  // El 1 de enero de 2027 cae viernes: pertenece a la semana ISO 53 de 2026.
+  assert.equal(claveSemanaIso(new Date("2027-01-01T00:00:00.000Z")), "2026-W53");
 });
 
 test("las conversaciones sin responder se agrupan por módulo con total", () => {
