@@ -5,6 +5,8 @@
 /api/public/uploads/*
 .env
 /scripts/seed-olimpiadas-disciplinas.js
+# Respaldos de la normalización de DNI: llevan nombre y documento de personas
+/scripts/dni-respaldo-*.json
 /logs/*
 /imagenes/*
 

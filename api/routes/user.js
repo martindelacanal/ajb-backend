@@ -8,6 +8,7 @@ const jwt = require("jsonwebtoken");
 const bcryptjs = require("bcryptjs");
 
 const { normalizarCredencialesSignin } = require("../security/signin-input");
+const { DNI_MENSAJE, esDniValido } = require("../security/dni");
 
 const multer = require("multer");
 
@@ -5950,7 +5951,7 @@ async function crearOBuscarUsuariosReserva(connection, personas, {
   for (let indice = 0; indice < personas.length; indice++) {
     const persona = personas[indice];
     const dni = String(persona.dni ?? persona.documento ?? "").trim();
-    if (!/^\d{6,9}$/.test(dni)) {
+    if (!esDniValido(dni)) {
       throw crearErrorNegocio(`El documento de personas[${indice}] no es valido`, 400);
     }
     if (documentosIncluidos.has(dni)) {
@@ -12075,8 +12076,8 @@ router.post("/familiares", verifyToken, async (req, res) => {
     const documentoNormalizado = documento !== undefined && documento !== null && String(documento).trim() !== ""
       ? normalizarTexto(documento)
       : null;
-    if (documentoNormalizado !== null && !/^\d{6,9}$/.test(documentoNormalizado)) {
-      return res.status(400).json({ success: false, message: "El DNI debe tener entre 6 y 9 dígitos" });
+    if (documentoNormalizado !== null && !esDniValido(documentoNormalizado)) {
+      return res.status(400).json({ success: false, message: DNI_MENSAJE });
     }
 
     // Menores de 2 años (5); resto: invitados familiares AJB (2)
@@ -15897,7 +15898,7 @@ router.put("/configuracion/usuario/:id", verifyToken, manejarUploadFotoPerfil, a
 
       if (camposPermitidos.includes('documento') && req.body.documento !== undefined) {
         const documentoTexto = normalizarTexto(req.body.documento);
-        const nuevoValor = /^\d{6,9}$/.test(documentoTexto) ? Number(documentoTexto) : null;
+        const nuevoValor = esDniValido(documentoTexto) ? Number(documentoTexto) : null;
         if (!nuevoValor) throw crearErrorNegocio("Documento inválido", 400);
         if (Number(datosAnteriores.documento) !== nuevoValor) {
           updateFields.push('documento = ?');
@@ -16179,7 +16180,7 @@ router.post("/configuracion/usuario", verifyToken, manejarUploadFotoPerfil, asyn
     if (!nombreNormalizado || nombreNormalizado.length > 45
       || !apellidoNormalizado || apellidoNormalizado.length > 45
       || !emailNormalizado || emailNormalizado.length > 45
-      || !/^\d{6,9}$/.test(documentoTexto)
+      || !esDniValido(documentoTexto)
       || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNormalizado)
       || passwordTexto.length < 8 || passwordTexto.length > 128) {
       return res.status(400).json({
