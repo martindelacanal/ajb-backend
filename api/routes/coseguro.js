@@ -17,6 +17,7 @@ const express = require("express");
 const router = express.Router();
 const mysqlConnection = require("../connection/connection");
 const jwt = require("jsonwebtoken");
+const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
 const multer = require("multer");
 const crypto = require("crypto");
 const moment = require("moment");
@@ -207,12 +208,14 @@ function manejarUploadCsv(req, res, next) {
 // Auth
 // ---------------------------------------------------------------------------
 function verifyToken(req, res, next) {
-  const coincidencia = /^Bearer ([^\s]+)$/.exec(String(req.headers.authorization || ""));
-  if (!coincidencia) return res.status(401).json("Se requiere Authorization: Bearer <token>");
-  jwt.verify(coincidencia[1], process.env.JWT_SECRET, (error, authData) => {
-    if (error) return res.status(403).json("Error en el token");
-    req.data = authData;
-    return next();
+  return verificarTokenConAutorizacionActual({
+    req,
+    res,
+    next,
+    jwt,
+    jwtSecret: process.env.JWT_SECRET,
+    db: mysqlConnection.promise(),
+    mensajeAuthorization: "Se requiere Authorization: Bearer <token>",
   });
 }
 
@@ -231,6 +234,10 @@ const ROLES_GESTION = ["admin", "departamental", "admin-central"];
 const ROLES_CON_AREA = ["departamental", "admin-central"];
 
 function tieneAreaCoseguro(cabecera) {
+  if (cabecera.rol === "afiliado") {
+    const valorModulo = cabecera.modulo_coseguro;
+    return valorModulo === undefined || valorModulo === null || Number(valorModulo) === 1;
+  }
   if (!ROLES_CON_AREA.includes(cabecera.rol)) return true;
   return cabecera.area_coseguro === undefined || cabecera.area_coseguro === null || Number(cabecera.area_coseguro) === 1;
 }
@@ -948,6 +955,9 @@ async function constatarArcaAutomatico(solicitudId) {
 router.get("/coseguro/catalogos", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
+    if (!["afiliado", ...ROLES_STAFF].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) {
+      return res.status(401).json("No autorizado");
+    }
     const db = mysqlConnection.promise();
 
     const [estados] = await db.query("SELECT * FROM coseguro_estado ORDER BY orden");
@@ -1083,6 +1093,9 @@ router.put("/coseguro/cobertura", verifyToken, async (req, res) => {
 router.get("/coseguro/perfil", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
+    if (!["afiliado", ...ROLES_STAFF].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) {
+      return res.status(401).json("No autorizado");
+    }
     let usuarioId = normalizarIdPositivo(cabecera.id);
     if (!usuarioId) return res.status(401).json("Identidad inválida");
     const usuarioFiltroId = normalizarIdOpcional(req.query.usuario_id, "Usuario");
@@ -3598,7 +3611,9 @@ function transicionesSubsidioSalud(cabecera, estado) {
 }
 
 function puedeVerSubsidio(cabecera, subsidio) {
-  if (cabecera.rol === "afiliado") return idsPositivosIguales(subsidio.usuario_id, cabecera.id);
+  if (cabecera.rol === "afiliado") {
+    return tieneAreaCoseguro(cabecera) && idsPositivosIguales(subsidio.usuario_id, cabecera.id);
+  }
   if (!ROLES_STAFF.includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return false;
   if (cabecera.rol === "departamental") return idsPositivosIguales(subsidio.afiliado_departamental_id, cabecera.departamental_id);
   return true;
@@ -3710,6 +3725,9 @@ router.get("/coseguro/subsidios-salud", verifyToken, async (req, res) => {
 router.get("/coseguro/subsidios-salud/:id", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
+    if (!["afiliado", ...ROLES_STAFF].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) {
+      return res.status(401).json("No autorizado");
+    }
     const subsidioId = normalizarIdPositivo(req.params.id);
     if (!subsidioId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
@@ -3741,6 +3759,9 @@ router.get("/coseguro/subsidios-salud/:id", verifyToken, async (req, res) => {
 router.post("/coseguro/subsidios-salud/:id/archivos", verifyToken, manejarUploadCoseguro, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
+    if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) {
+      return res.status(401).json("No autorizado");
+    }
     const subsidioId = normalizarIdPositivo(req.params.id);
     if (!subsidioId) return res.status(400).json("ID inválido");
     const db = mysqlConnection.promise();
@@ -3749,7 +3770,7 @@ router.post("/coseguro/subsidios-salud/:id/archivos", verifyToken, manejarUpload
     if (rows.length === 0) return res.status(404).json("Subsidio no encontrado");
     const subsidio = rows[0];
 
-    const esDuenio = cabecera.rol === "afiliado" && idsPositivosIguales(subsidio.usuario_id, cabecera.id);
+    const esDuenio = cabecera.rol === "afiliado" && puedeVerSubsidio(cabecera, subsidio);
     const esGestion = ROLES_GESTION.includes(cabecera.rol) && tieneAreaCoseguro(cabecera) && puedeVerSubsidio(cabecera, subsidio);
     if (!esDuenio && !esGestion) return res.status(401).json("No autorizado");
     if ([SUBSIDIO_ESTADO.APROBADA, SUBSIDIO_ESTADO.RECHAZADA].includes(subsidio.estado) && !esGestion) {
@@ -3952,6 +3973,8 @@ router.__test = Object.freeze({
   normalizarImporte,
   normalizarListaIdsPositivos,
   parsearCsvLiquidacion,
+  puedeVerSubsidio,
+  tieneAreaCoseguro,
   validarContenidoArchivo,
   verifyToken,
 });

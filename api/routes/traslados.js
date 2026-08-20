@@ -14,6 +14,7 @@ const express = require("express");
 const router = express.Router();
 const mysqlConnection = require("../connection/connection");
 const jwt = require("jsonwebtoken");
+const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
 const multer = require("multer");
 const crypto = require("crypto");
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
@@ -179,15 +180,24 @@ function archivosPorSlot(files) {
 // Auth
 // ---------------------------------------------------------------------------
 function verifyToken(req, res, next) {
-  const coincidencia = /^Bearer ([^\s]+)$/.exec(String(req.headers.authorization || ""));
-  if (!coincidencia) return res.status(401).json("No autorizado");
-  jwt.verify(coincidencia[1], process.env.JWT_SECRET, (error, authData) => {
-    if (error) {
-      res.status(403).json("Error en el token");
-    } else {
-      req.data = authData;
-      next();
-    }
+  return verificarTokenConAutorizacionActual({
+    req,
+    res,
+    next: () => {
+      try {
+        const cabecera = getCabecera(req);
+        if (cabecera?.rol !== "admin") {
+          return res.status(403).json("El módulo de Traslados está disponible únicamente para administradores");
+        }
+      } catch (_parseError) {
+        return res.status(403).json("Error en el token");
+      }
+      return next();
+    },
+    jwt,
+    jwtSecret: process.env.JWT_SECRET,
+    db: mysqlConnection.promise(),
+    mensajeAuthorization: "No autorizado",
   });
 }
 
@@ -1722,5 +1732,7 @@ router.get("/traslados/archivos/:id/descargar", verifyToken, async (req, res) =>
     res.status(500).json("Error al descargar el archivo");
   }
 });
+
+router.__test = Object.freeze({ verifyToken });
 
 module.exports = router;

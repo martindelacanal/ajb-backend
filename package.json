@@ -13,6 +13,9 @@
     "migrate:login-gallery-schema": "node scripts/migrate-login-gallery-schema.js",
     "migrate:turismo-propuestas": "node scripts/migrar-propuestas-turismo.js",
     "migrate:noticias": "node scripts/migrar-noticias.js",
+    "migrate:reservas-plazos": "node scripts/migrar-reservas-plazos-v1.js",
+    "migrate:reservas-plazos:check": "node scripts/migrar-reservas-plazos-v1.js --check",
+    "migrate:preferencias-modulos-contacto": "node scripts/migrar-preferencias-modulos-contacto.js",
     "seed:login-gallery": "node scripts/seed-login-gallery.js"
   },
   "keywords": [],

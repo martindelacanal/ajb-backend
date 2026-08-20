@@ -13,6 +13,8 @@ const server = http.createServer(app);
 
 const socketio = require('socket.io');
 const { addUser, removeUser, getUser, getUsersByUsuario } = require("./api/socket/socket-user");
+const { registrarEventosChatTiempoReal } = require("./api/socket/chat-tiempo-real");
+const { iniciarMantenimientoReservas } = require("./api/services/reservas-turismo");
 const {
     obtenerSnapshotDisponibilidad,
     parsearParametrosBusquedaDisponibilidad,
@@ -28,6 +30,16 @@ const MAX_SERVICIOS_POR_SUSCRIPCION = 50;
 const ROLES_STAFF_SOCKET = new Set(["admin", "admin-central", "departamental"]);
 // Mismo gate que el GET /servicios/disponibilidad del REST
 const ROLES_DISPONIBILIDAD = new Set(["admin", "afiliado", "departamental"]);
+
+function tieneAccesoTurismoSocket(auth) {
+    if (auth?.rol === "afiliado") {
+        return auth.modulo_turismo == null || Number(auth.modulo_turismo) === 1;
+    }
+    if (auth?.rol === "departamental" || auth?.rol === "admin-central") {
+        return auth.area_turismo == null || Number(auth.area_turismo) === 1;
+    }
+    return auth?.rol === "admin";
+}
 
 function callbackSeguro(callback) {
     return typeof callback === "function" ? callback : () => { };
@@ -206,7 +218,9 @@ io.use(async (socket, next) => {
         }
 
         const [usuarios] = await mysqlConnection.promise().query(
-            `SELECT u.id, u.documento, r.nombre AS rol
+            `SELECT u.id, u.documento, u.departamental_id, u.area_turismo, u.area_coseguro,
+                    u.modulo_turismo, u.modulo_coseguro, u.modulo_olimpiadas,
+                    r.nombre AS rol
              FROM usuario u
              INNER JOIN rol r ON r.id = u.rol_id
              WHERE u.id = ? AND u.habilitado = 'Y'
@@ -222,6 +236,14 @@ io.use(async (socket, next) => {
             id: Number(usuarios[0].id),
             documento: String(usuarios[0].documento),
             rol: String(usuarios[0].rol || "").trim().toLowerCase(),
+            departamentalId: usuarios[0].departamental_id == null
+                ? null
+                : Number(usuarios[0].departamental_id),
+            area_turismo: usuarios[0].area_turismo,
+            area_coseguro: usuarios[0].area_coseguro,
+            modulo_turismo: usuarios[0].modulo_turismo,
+            modulo_coseguro: usuarios[0].modulo_coseguro,
+            modulo_olimpiadas: usuarios[0].modulo_olimpiadas,
         };
         next();
     } catch (_error) {
@@ -244,6 +266,12 @@ io.on("connection", (socket) => {
         return;
     }
     socket.join(alta.user.room);
+
+    registrarEventosChatTiempoReal({
+        io,
+        socket,
+        db: mysqlConnection.promise(),
+    });
 
     // Compatibilidad con clientes antiguos: la identidad y el rol del payload se ignoran.
     socket.on('join', (_payload, callback) => {
@@ -290,7 +318,10 @@ io.on("connection", (socket) => {
 
     socket.on("servicios:disponibilidad:subscribe", async (payload = {}, callback = () => { }) => {
         try {
-            if (!ROLES_DISPONIBILIDAD.has(socket.data.auth.rol)) {
+            if (
+                !ROLES_DISPONIBILIDAD.has(socket.data.auth.rol)
+                || !tieneAccesoTurismoSocket(socket.data.auth)
+            ) {
                 callback({ error: "No autorizado" });
                 return;
             }
@@ -385,3 +416,4 @@ io.on("connection", (socket) => {
 });
 
 server.listen(port);
+iniciarMantenimientoReservas(mysqlConnection.promise());

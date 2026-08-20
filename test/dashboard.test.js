@@ -10,7 +10,23 @@ process.env.DASHBOARD_CACHE_MS = "30000";
 
 const databaseCalls = [];
 
-function resultadoPara(sql) {
+function resultadoPara(sql, params = []) {
+  if (sql.includes("FROM usuario u") && sql.includes("INNER JOIN rol r")) {
+    const usuarioId = Number(params[0]);
+    const rol = usuarioId === 11 ? "departamental" : "admin";
+    return [[{
+      id: usuarioId,
+      rol_id: rol === "admin" ? 1 : 2,
+      rol,
+      departamental_id: rol === "admin" ? null : 8,
+      habilitado: usuarioId === 12 ? "N" : "S",
+      area_turismo: 1,
+      area_coseguro: 1,
+      modulo_turismo: 1,
+      modulo_coseguro: 1,
+      modulo_olimpiadas: 1,
+    }]];
+  }
   if (sql.includes("dashboard:red")) {
     return [[{
       usuarios_total: 120,
@@ -101,7 +117,7 @@ const fakeConnection = {
     return {
       query: async (sql, params = []) => {
         databaseCalls.push({ sql, params });
-        return resultadoPara(sql);
+        return resultadoPara(sql, params);
       },
     };
   },
@@ -152,15 +168,25 @@ test("dashboard administrativo rechaza solicitudes sin token antes de consultar"
   assert.equal(databaseCalls.length, 0);
 });
 
-test("dashboard administrativo rechaza roles no admin antes de consultar", async () => {
+test("dashboard administrativo rechaza el rol no admin vigente en la base", async () => {
   databaseCalls.length = 0;
-  const response = await request("/api/admin/dashboard", tokenFor({ rol: "departamental" }));
+  const response = await request("/api/admin/dashboard", tokenFor({ id: 11, rol: "admin" }));
 
   assert.equal(response.status, 401);
-  assert.equal(databaseCalls.length, 0);
+  assert.equal(databaseCalls.length, 1);
+  assert.ok(databaseCalls[0].sql.includes("FROM usuario u"));
 });
 
-test("dashboard entrega agregados estables, sin datos personales y en once consultas", async () => {
+test("dashboard rechaza un administrador inhabilitado despues de validar su estado actual", async () => {
+  databaseCalls.length = 0;
+  const response = await request("/api/admin/dashboard", tokenFor({ id: 12, rol: "admin" }));
+
+  assert.equal(response.status, 403);
+  assert.equal(response.body, "Usuario inhabilitado");
+  assert.equal(databaseCalls.length, 1);
+});
+
+test("dashboard entrega agregados estables, sin datos personales y con autorizacion actual", async () => {
   databaseCalls.length = 0;
   const response = await request("/api/admin/dashboard", tokenFor());
 
@@ -190,7 +216,7 @@ test("dashboard entrega agregados estables, sin datos personales y en once consu
   assert.equal(response.body.evolucion.length, 6);
   assert.equal(response.body.actividad_diaria.length, 14);
   assert.ok(response.body.actividad_diaria.every((dia) => /^\d{4}-\d{2}-\d{2}$/.test(dia.dia)));
-  assert.equal(databaseCalls.length, 11);
+  assert.equal(databaseCalls.length, 12);
 
   const evolucion = databaseCalls.find((call) => call.sql.includes("dashboard:evolucion"));
   assert.equal(evolucion.params.length, 5);
@@ -228,10 +254,10 @@ test("la actividad agrupada valida entrada y rechaza sin token o rol", async () 
 
   const rolAjeno = await request(
     "/api/admin/dashboard/actividad?granularidad=dia&desde=2026-08-01&hasta=2026-08-13",
-    tokenFor({ rol: "departamental" })
+    tokenFor({ id: 11, rol: "admin" })
   );
   assert.equal(rolAjeno.status, 401);
-  assert.equal(databaseCalls.length, 0);
+  assert.equal(databaseCalls.length, 1);
 
   const granularidadMala = await request(
     "/api/admin/dashboard/actividad?granularidad=hora&desde=2026-08-01&hasta=2026-08-13",
@@ -250,7 +276,8 @@ test("la actividad agrupada valida entrada y rechaza sin token o rol", async () 
     tokenFor()
   );
   assert.equal(rangoEnorme.status, 400);
-  assert.equal(databaseCalls.length, 0);
+  assert.equal(databaseCalls.length, 4);
+  assert.ok(databaseCalls.every((call) => call.sql.includes("FROM usuario u")));
 });
 
 test("la actividad agrupada por semana completa los períodos ISO y rellena vacíos", async () => {

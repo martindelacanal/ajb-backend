@@ -9,6 +9,8 @@ const bcryptjs = require("bcryptjs");
 
 const { normalizarCredencialesSignin } = require("../security/signin-input");
 const { DNI_MENSAJE, esDniValido } = require("../security/dni");
+const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
+const { condicionModuloNotificacion } = require("../services/notificaciones-modulos");
 
 const multer = require("multer");
 
@@ -56,6 +58,18 @@ const {
   validarAdjudicacionSorteo,
   validarRespuestaAdjudicacion,
 } = require("../services/sorteos-vigencia");
+const {
+  ESTADO_APROBADA,
+  ESTADO_CONVENIO_RECHAZADO,
+  ESTADO_INICIADA,
+  ESTADO_RECHAZADA,
+  ESTADO_VERIFICADA,
+  PLAZO_RESPUESTA_HORAS,
+  asegurarSinReservaIniciadaAfiliado,
+  expirarPropuestaConvenioEnTransaccion,
+  obtenerEstadoAltaTurismo,
+  validarTransicionTurismo,
+} = require("../services/reservas-turismo");
 
 const HISTORIAL_USUARIO_LEGIBLE = crearEnriquecimientoHistorial(
   CATALOGOS_HISTORIAL_USUARIO
@@ -156,9 +170,37 @@ const s3 = new S3Client({
 // migración no traen los flags y se tratan como habilitados (default 1).
 const ROLES_CON_AREA = ["departamental", "admin-central"];
 
+function moduloHabilitado(cabecera, campo) {
+  if (cabecera.rol !== "afiliado") return true;
+  const valor = cabecera[campo];
+  // Los tokens emitidos antes de la migracion conservan acceso hasta el
+  // siguiente inicio de sesion. Las columnas nuevas nacen habilitadas.
+  return valor === undefined || valor === null || Number(valor) === 1;
+}
+
+function tieneModuloTurismo(cabecera) {
+  return moduloHabilitado(cabecera, "modulo_turismo");
+}
+
+function tieneModuloCoseguro(cabecera) {
+  return moduloHabilitado(cabecera, "modulo_coseguro");
+}
+
+function tieneModuloOlimpiadas(cabecera) {
+  return moduloHabilitado(cabecera, "modulo_olimpiadas");
+}
+
 function tieneAreaTurismo(cabecera) {
+  if (!tieneModuloTurismo(cabecera)) return false;
   if (!ROLES_CON_AREA.includes(cabecera.rol)) return true;
   return cabecera.area_turismo === undefined || cabecera.area_turismo === null || Number(cabecera.area_turismo) === 1;
+}
+
+function puedeVerDatosSaludReserva(cabecera) {
+  if (cabecera.rol === "admin") return true;
+  if (cabecera.rol === "afiliado") return tieneModuloCoseguro(cabecera);
+  return ["departamental", "admin-central", "auditor"].includes(cabecera.rol) &&
+    Number(cabecera.area_coseguro) === 1;
 }
 
 function getMimeTypeFromFileName(fileName, fallback = "application/octet-stream") {
@@ -580,7 +622,8 @@ router.post("/signin", async (req, res) => {
 
   const query = `
     SELECT u.id, u.nombre, u.apellido, u.documento, u.email, u.password, u.departamental_id, rol.nombre AS rol, u.habilitado,
-           u.area_turismo, u.area_coseguro
+           u.area_turismo, u.area_coseguro,
+           u.modulo_turismo, u.modulo_coseguro, u.modulo_olimpiadas
     FROM usuario as u
     INNER JOIN rol ON rol.id = u.rol_id
     WHERE u.documento = ? AND u.password IS NOT NULL AND u.rol_id <> 4
@@ -615,6 +658,28 @@ router.post("/signin", async (req, res) => {
       res.status(500).json("Error interno");
     }
   });
+});
+
+// Permisos actuales de la sesion. El middleware reemplaza los claims
+// autorizativos del JWT con los valores vigentes de la base en cada llamada.
+router.get("/sesion/permisos", verifyToken, (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    return res.status(200).json({
+      id: cabecera.id,
+      rol_id: cabecera.rol_id,
+      rol: cabecera.rol,
+      departamental_id: cabecera.departamental_id,
+      habilitado: cabecera.habilitado,
+      area_turismo: cabecera.area_turismo,
+      area_coseguro: cabecera.area_coseguro,
+      modulo_turismo: cabecera.modulo_turismo,
+      modulo_coseguro: cabecera.modulo_coseguro,
+      modulo_olimpiadas: cabecera.modulo_olimpiadas,
+    });
+  } catch (_error) {
+    return res.status(403).json("Error en la sesion");
+  }
 });
 
 router.get("/new/token", verifyToken, async (req, res) => {
@@ -753,7 +818,8 @@ router.get("/credencial-digital/verificacion/:hash", async (req, res) => {
         `SELECT 
           id,
           hash_credencial,
-          fecha_hash_credencial
+          DATE(fecha_hash_credencial) AS fecha_validez,
+          CURDATE() AS fecha_actual
         FROM usuario 
         WHERE hash_credencial = ?`,
         [hash]
@@ -768,24 +834,19 @@ router.get("/credencial-digital/verificacion/:hash", async (req, res) => {
     }
 
     const usuario = rows[0];
-    const fechaHash = new Date(usuario.fecha_hash_credencial);
-    const fechaActual = new Date();
 
-    // Calcular la diferencia en milisegundos y convertir a días
-    const diferenciaDias = (fechaActual - fechaHash) / (1000 * 60 * 60 * 24);
-
-    // Si la diferencia es mayor a 1 día, está expirada
-    if (diferenciaDias > 1) {
+    // La vigencia es la fecha civil actual de Argentina, no una ventana móvil
+    // de 24 horas que permitiría reutilizar una captura del día anterior.
+    if (!usuario.fecha_validez || String(usuario.fecha_validez) !== String(usuario.fecha_actual)) {
       return res.status(200).json({
         estado: "Expirada",
-        descripcion: "La credencial ha expirado"
+        descripcion: "La credencial no es válida en la fecha actual"
       });
     }
 
-    // Si está dentro del día, está vigente
     return res.status(200).json({
       estado: "Vigente",
-      descripcion: "Credencial válida y vigente"
+      descripcion: "Credencial válida en la fecha actual"
     });
 
   } catch (error) {
@@ -801,9 +862,11 @@ router.get("/lugares", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      cabecera.rol === "admin" ||
-      cabecera.rol === "afiliado" ||
-      cabecera.rol === "departamental"
+      (
+        cabecera.rol === "admin" ||
+        cabecera.rol === "afiliado" ||
+        cabecera.rol === "departamental"
+      ) && tieneAreaTurismo(cabecera)
     ) {
       let rows;
       try {
@@ -841,9 +904,11 @@ router.get("/servicios", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      cabecera.rol === "admin" ||
-      cabecera.rol === "afiliado" ||
-      cabecera.rol === "departamental"
+      (
+        cabecera.rol === "admin" ||
+        cabecera.rol === "afiliado" ||
+        cabecera.rol === "departamental"
+      ) && tieneAreaTurismo(cabecera)
     ) {
       const db = mysqlConnection.promise();
       const lugar = req.query.lugar;
@@ -1176,11 +1241,8 @@ router.get("/servicios", verifyToken, async (req, res) => {
 router.get("/turismo/propuestas", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
-    }
-    if (!tieneAreaTurismo(cabecera)) {
-      return res.status(403).json("No autorizado");
     }
 
     const propuestas = await obtenerPropuestasTurismo(mysqlConnection.promise());
@@ -1276,7 +1338,7 @@ router.put("/admin/turismo/propuestas/:id", verifyToken, manejarUploadTurismoPro
 router.get("/turismo/testimonios", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -1786,7 +1848,7 @@ router.patch("/admin/convenios-hoteleros/:id/activo", verifyToken, async (req, r
 router.get("/convenios-hoteleros", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -1840,7 +1902,7 @@ router.get("/convenios-hoteleros", verifyToken, async (req, res) => {
 router.get("/convenios-hoteleros/:id", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -1891,9 +1953,11 @@ router.get("/servicios/disponibilidad", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      cabecera.rol === "admin" ||
-      cabecera.rol === "afiliado" ||
-      cabecera.rol === "departamental"
+      (
+        cabecera.rol === "admin" ||
+        cabecera.rol === "afiliado" ||
+        cabecera.rol === "departamental"
+      ) && tieneAreaTurismo(cabecera)
     ) {
       const parseo = parsearParametrosBusquedaDisponibilidad(req.query, {
         requireFechas: true,
@@ -1948,9 +2012,11 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      cabecera.rol === "admin" ||
-      cabecera.rol === "afiliado" ||
-      cabecera.rol === "departamental"
+      (
+        cabecera.rol === "admin" ||
+        cabecera.rol === "afiliado" ||
+        cabecera.rol === "departamental"
+      ) && tieneAreaTurismo(cabecera)
     ) {
       const servicioId = normalizarIdPositivo(req.params.id);
       if (servicioId === null) {
@@ -2024,11 +2090,7 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
 router.get("/recursos", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (
-      cabecera.rol === "admin" ||
-      cabecera.rol === "afiliado" ||
-      cabecera.rol === "departamental"
-    ) {
+    if (["admin", "afiliado", "departamental"].includes(cabecera.rol) && tieneAreaTurismo(cabecera)) {
       const servicioId = req.query.servicio;
       let query = "SELECT id, servicio_id, nombre, grupo_recurso_id FROM recurso";
       let params = [];
@@ -2050,11 +2112,7 @@ router.get("/recursos", verifyToken, async (req, res) => {
 router.get("/adicionales", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (
-      cabecera.rol === "admin" ||
-      cabecera.rol === "afiliado" ||
-      cabecera.rol === "departamental"
-    ) {
+    if (["admin", "afiliado", "departamental"].includes(cabecera.rol) && tieneAreaTurismo(cabecera)) {
       const [rows] = await mysqlConnection
         .promise()
         .query("SELECT id, nombre FROM adicional ORDER BY nombre ASC");
@@ -2071,7 +2129,7 @@ router.get("/adicionales", verifyToken, async (req, res) => {
 router.get("/sorteos/activos", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -2161,7 +2219,7 @@ router.get("/sorteos/activos", verifyToken, async (req, res) => {
 router.get("/sorteos/inscripcion-activa", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -2181,53 +2239,63 @@ router.get("/sorteos/inscripcion-activa", verifyToken, async (req, res) => {
   }
 });
 
-// Agrupación de tipos de notificación por módulo de origen (filtro `modulo`).
-// Los prefijos siguen la misma convención que usa el frontend para iconos/navegación.
-const MODULOS_NOTIFICACION = {
-  coseguro: { prefijos: ["COSEGURO"] },
-  salud: { prefijos: ["RESERVA_SALUD"] },
-  turismo: { tipos: ["CONVENIO_PROPUESTA", "RESERVA_OBSERVACION", "SORTEO_ADJUDICADO"] },
-  traslados: { prefijos: ["TRASLADO"] },
-  olimpiadas: { prefijos: ["OLIMPIADA"] }
-};
+// Búsqueda de titulares para altas presenciales de Turismo. Mantiene el
+// contrato de /coseguro/afiliados-buscar, pero aplica el módulo y la
+// jurisdicción propios de Turismo.
+router.get("/turismo/afiliados-buscar", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!["admin", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const q = normalizarTexto(req.query.q);
+    if (!q || q.length < 2) return res.status(200).json([]);
+    if (q.length > 100) return res.status(400).json("La búsqueda es demasiado larga");
+
+    const condiciones = [
+      "r.nombre = 'afiliado'",
+      "u.habilitado = 'Y'",
+      "u.usuario_familiar_id IS NULL",
+      "u.modulo_turismo = 1",
+    ];
+    const params = [];
+    if (cabecera.rol === "departamental") {
+      const departamentalId = normalizarIdPositivo(cabecera.departamental_id);
+      if (!departamentalId) return res.status(403).json("No tienes una departamental asignada");
+      condiciones.push("u.departamental_id = ?");
+      params.push(departamentalId);
+    }
+    condiciones.push(
+      "(u.nombre LIKE ? OR u.apellido LIKE ? OR CAST(u.documento AS CHAR) LIKE ? OR CONCAT(u.apellido, ' ', u.nombre) LIKE ?)"
+    );
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+
+    const [rows] = await mysqlConnection.promise().query(
+      `SELECT u.id, u.nombre, u.apellido, u.documento, u.departamental_id,
+              u.modulo_coseguro, d.nombre AS departamental_nombre
+         FROM usuario u
+         INNER JOIN rol r ON r.id = u.rol_id
+         LEFT JOIN departamental d ON d.id = u.departamental_id
+        WHERE ${condiciones.join(" AND ")}
+        ORDER BY u.apellido, u.nombre
+        LIMIT 15`,
+      params
+    );
+    return res.status(200).json(rows.map((row) => ({
+      ...row,
+      modulo_coseguro: Number(row.modulo_coseguro) === 1 ? 1 : 0,
+    })));
+  } catch (error) {
+    console.log(error);
+    return res.status(500).json("Error al buscar afiliados de Turismo");
+  }
+});
 
 // El query parser de Express puede entregar arrays (?leida=0&leida=0):
 // siempre se toma el primer valor escalar.
 function primerValorQuery(valor) {
   return Array.isArray(valor) ? valor[0] : valor;
-}
-
-function condicionModuloNotificacion(modulo) {
-  const construir = def => {
-    const partes = [];
-    const params = [];
-    (def.prefijos || []).forEach(prefijo => {
-      partes.push("n.tipo LIKE ?");
-      params.push(`${prefijo}%`);
-    });
-    if (def.tipos && def.tipos.length) {
-      partes.push(`n.tipo IN (${def.tipos.map(() => "?").join(", ")})`);
-      params.push(...def.tipos);
-    }
-    return { sql: `(${partes.join(" OR ")})`, params };
-  };
-
-  // hasOwnProperty: un lookup directo aceptaría claves del prototipo
-  // (__proto__, constructor…) y generaría SQL inválido.
-  if (Object.prototype.hasOwnProperty.call(MODULOS_NOTIFICACION, modulo)) {
-    return construir(MODULOS_NOTIFICACION[modulo]);
-  }
-
-  if (modulo === "otras") {
-    // Todo lo que no pertenece a ningún módulo conocido.
-    const conocidos = Object.values(MODULOS_NOTIFICACION).map(construir);
-    return {
-      sql: `NOT (${conocidos.map(c => c.sql).join(" OR ")})`,
-      params: conocidos.flatMap(c => c.params)
-    };
-  }
-
-  return null;
 }
 
 router.get("/notificaciones", verifyToken, async (req, res) => {
@@ -2254,6 +2322,24 @@ router.get("/notificaciones", verifyToken, async (req, res) => {
 
     const condiciones = ["n.usuario_id = ?"];
     const params = [usuarioId];
+    const condicionesVisibilidad = [];
+    const paramsVisibilidad = [];
+
+    const modulosOcultos = cabecera.rol === "admin" ? [] : ["traslados"];
+    if (cabecera.rol === "afiliado") {
+      if (!tieneModuloTurismo(cabecera)) modulosOcultos.push("turismo");
+      if (!tieneModuloCoseguro(cabecera)) modulosOcultos.push("coseguro", "salud");
+      if (!tieneModuloOlimpiadas(cabecera)) modulosOcultos.push("olimpiadas");
+    }
+    for (const moduloOculto of modulosOcultos) {
+      const condicionOculta = condicionModuloNotificacion(moduloOculto);
+      condicionesVisibilidad.push(`NOT ${condicionOculta.sql}`);
+      paramsVisibilidad.push(...condicionOculta.params);
+    }
+    if (condicionesVisibilidad.length > 0) {
+      condiciones.push(...condicionesVisibilidad);
+      params.push(...paramsVisibilidad);
+    }
 
     const leidaParam = primerValorQuery(req.query.leida);
     if (leidaParam === "0" || leidaParam === "1") {
@@ -2344,9 +2430,10 @@ router.get("/notificaciones", verifyToken, async (req, res) => {
     );
     const total = Number(totalRows?.[0]?.total || 0);
 
+    const whereNoLeidas = ["n.usuario_id = ?", "n.leida = 0", ...condicionesVisibilidad].join(" AND ");
     const [countRows] = await db.query(
-      "SELECT COUNT(*) AS total FROM notificacion WHERE usuario_id = ? AND leida = 0",
-      [usuarioId]
+      `SELECT COUNT(*) AS total FROM notificacion n WHERE ${whereNoLeidas}`,
+      [usuarioId, ...paramsVisibilidad]
     );
 
     res.status(200).json({
@@ -2485,7 +2572,7 @@ router.put("/observaciones/:modulo/:entidadId/lectura", verifyToken, async (req,
 router.get("/sorteos/adjudicaciones/pendiente", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (cabecera.rol !== "afiliado") {
+    if (cabecera.rol !== "afiliado" || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -2507,7 +2594,7 @@ router.put("/sorteos/adjudicaciones/:id/aceptar", verifyToken, async (req, res) 
   let connection;
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (cabecera.rol !== "afiliado") {
+    if (cabecera.rol !== "afiliado" || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -2599,7 +2686,7 @@ router.put("/sorteos/adjudicaciones/:id/rechazar", verifyToken, async (req, res)
   let connection;
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (cabecera.rol !== "afiliado") {
+    if (cabecera.rol !== "afiliado" || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -3646,11 +3733,8 @@ router.get("/admin/sorteos/:id/adjudicaciones/historial", verifyToken, async (re
 router.post("/sorteos/:id/cotizacion", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
-    }
-    if (!tieneAreaTurismo(cabecera)) {
-      return res.status(403).json("No autorizado");
     }
 
     const sorteoId = normalizarIdPositivo(req.params.id);
@@ -3695,7 +3779,7 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
   let connection;
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol)) {
+    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -4158,13 +4242,12 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      cabecera.rol === "admin" ||
-      cabecera.rol === "afiliado" ||
-      cabecera.rol === "departamental"
+      (
+        cabecera.rol === "admin" ||
+        cabecera.rol === "afiliado" ||
+        cabecera.rol === "departamental"
+      ) && tieneAreaTurismo(cabecera)
     ) {
-      if (!tieneAreaTurismo(cabecera)) {
-        return res.status(403).json("No autorizado");
-      }
       const {
         fecha_inicio,
         fecha_fin,
@@ -5087,9 +5170,11 @@ router.post("/reserva/adicionales", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      cabecera.rol === "admin" ||
-      cabecera.rol === "afiliado" ||
-      cabecera.rol === "departamental"
+      (
+        cabecera.rol === "admin" ||
+        cabecera.rol === "afiliado" ||
+        cabecera.rol === "departamental"
+      ) && tieneAreaTurismo(cabecera)
     ) {
       const { recurso_id, regimen_id, fecha_inicio, fecha_fin, modalidad, bloque_fecha_id } = req.body;
 
@@ -5203,44 +5288,27 @@ async function registrarHistorial(connection, usuarioId, tipoOperacion, tablaAfe
   }
 }
 
-// Función auxiliar para registrar cambios en el historial de reservas
-async function registrarHistorialReserva(connection, reservaId, tipoOperacion, usuarioModificadorId, req, campos = null, observaciones = null) {
-  try {
-    const ipAddress = req.ip || req.connection.remoteAddress || req.socket.remoteAddress ||
-      (req.connection.socket ? req.connection.socket.remoteAddress : null);
-    const userAgent = req.get('User-Agent') || null;
+// Variante estricta para operaciones cuyo cambio de estado y auditoría deben
+// confirmar o revertir juntos dentro de la misma transacción.
+async function registrarHistorialReservaEstricto(connection, reservaId, tipoOperacion, usuarioModificadorId, req, campos = null, observaciones = null) {
+  const ipAddress = req.ip || req.connection.remoteAddress || req.socket.remoteAddress ||
+    (req.connection.socket ? req.connection.socket.remoteAddress : null);
+  const userAgent = req.get('User-Agent') || null;
 
-    if (campos && Array.isArray(campos)) {
-      // Registrar cambio por cada campo modificado
-      for (const campo of campos) {
-        await connection.query(
-          `INSERT INTO historial_reserva 
-           (reserva_id, tipo_operacion, campo_modificado, valor_anterior, valor_nuevo, 
-            usuario_modificador_id, ip_address, user_agent, observaciones)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            reservaId,
-            tipoOperacion,
-            campo.campo,
-            campo.valorAnterior,
-            campo.valorNuevo,
-            usuarioModificadorId,
-            ipAddress,
-            userAgent,
-            observaciones
-          ]
-        );
-      }
-    } else {
-      // Registrar operación general
+  if (campos && Array.isArray(campos)) {
+    // Registrar cambio por cada campo modificado
+    for (const campo of campos) {
       await connection.query(
-        `INSERT INTO historial_reserva 
-         (reserva_id, tipo_operacion, usuario_modificador_id, 
-          ip_address, user_agent, observaciones)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO historial_reserva
+         (reserva_id, tipo_operacion, campo_modificado, valor_anterior, valor_nuevo,
+          usuario_modificador_id, ip_address, user_agent, observaciones)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           reservaId,
           tipoOperacion,
+          campo.campo,
+          campo.valorAnterior,
+          campo.valorNuevo,
           usuarioModificadorId,
           ipAddress,
           userAgent,
@@ -5248,6 +5316,39 @@ async function registrarHistorialReserva(connection, reservaId, tipoOperacion, u
         ]
       );
     }
+  } else {
+    // Registrar operación general
+    await connection.query(
+      `INSERT INTO historial_reserva
+       (reserva_id, tipo_operacion, usuario_modificador_id,
+        ip_address, user_agent, observaciones)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        reservaId,
+        tipoOperacion,
+        usuarioModificadorId,
+        ipAddress,
+        userAgent,
+        observaciones
+      ]
+    );
+  }
+}
+
+// Los flujos legacy conservan historial best-effort para no cambiar su
+// contrato. Las operaciones atómicas llaman directamente a la variante
+// estricta de arriba.
+async function registrarHistorialReserva(connection, reservaId, tipoOperacion, usuarioModificadorId, req, campos = null, observaciones = null) {
+  try {
+    await registrarHistorialReservaEstricto(
+      connection,
+      reservaId,
+      tipoOperacion,
+      usuarioModificadorId,
+      req,
+      campos,
+      observaciones
+    );
   } catch (error) {
     console.error('Error al registrar historial de reserva:', error);
   }
@@ -5278,6 +5379,19 @@ async function notificarStaffTurismo(connection, departamentalId, tipo, titulo, 
   for (const u of usuarios) {
     if (excluirUsuarioId && Number(u.id) === Number(excluirUsuarioId)) continue;
     await insertarNotificacion(connection, u.id, tipo, titulo, mensaje, payload);
+  }
+}
+
+async function notificarAdministradoresTurismo(connection, tipo, titulo, mensaje, payload, excluirUsuarioId) {
+  const [usuarios] = await connection.query(
+    `SELECT u.id
+       FROM usuario u
+       INNER JOIN rol r ON r.id = u.rol_id
+      WHERE u.habilitado = 'Y' AND r.nombre = 'admin'`
+  );
+  for (const usuario of usuarios) {
+    if (excluirUsuarioId && Number(usuario.id) === Number(excluirUsuarioId)) continue;
+    await insertarNotificacion(connection, usuario.id, tipo, titulo, mensaje, payload);
   }
 }
 
@@ -5370,6 +5484,100 @@ function normalizarIdPositivo(valor) {
   if (typeof valor !== "string" && typeof valor !== "number") return null;
   const numero = Number(valor);
   return Number.isSafeInteger(numero) && numero > 0 ? numero : null;
+}
+
+async function resolverTitularReservaAlta(connection, cabecera, usuarioIdRaw, {
+  requiereCoseguro = false,
+} = {}) {
+  const esRolCargaAdministrativa = ["admin", "departamental"].includes(cabecera.rol);
+  if (
+    requiereCoseguro &&
+    esRolCargaAdministrativa &&
+    !puedeVerDatosSaludReserva(cabecera)
+  ) {
+    throw crearErrorNegocio(
+      "Para registrar un viaje por salud, debes tener acceso al área Coseguro",
+      403,
+      "AREA_COSEGURO_REQUERIDA"
+    );
+  }
+  const usuarioIdFueInformado = !(
+    usuarioIdRaw === undefined ||
+    usuarioIdRaw === null ||
+    (typeof usuarioIdRaw === "string" && usuarioIdRaw.trim() === "")
+  );
+  const usuarioIdSolicitado = normalizarIdPositivo(usuarioIdRaw);
+  if (esRolCargaAdministrativa && !usuarioIdFueInformado) {
+    throw crearErrorNegocio(
+      "Debes seleccionar al afiliado titular de la reserva",
+      400,
+      "TITULAR_REQUERIDO"
+    );
+  }
+  if (esRolCargaAdministrativa && !usuarioIdSolicitado) {
+    throw crearErrorNegocio("El usuario titular indicado no es válido", 400, "TITULAR_INVALIDO");
+  }
+
+  const usuarioReservaId = esRolCargaAdministrativa
+    ? usuarioIdSolicitado
+    : normalizarIdPositivo(cabecera.id);
+  if (!usuarioReservaId) {
+    throw crearErrorNegocio("El usuario titular indicado no es válido", 400, "TITULAR_INVALIDO");
+  }
+
+  const [usuariosTitulares] = await connection.query(
+    `SELECT u.id, u.nombre, u.apellido, u.usuario_familiar_id, u.departamental_id,
+            u.habilitado, u.modulo_turismo, u.modulo_coseguro, r.nombre AS rol
+       FROM usuario u
+       INNER JOIN rol r ON r.id = u.rol_id
+      WHERE u.id = ?
+      LIMIT 1
+      FOR UPDATE`,
+    [usuarioReservaId]
+  );
+  if (usuariosTitulares.length === 0) {
+    throw crearErrorNegocio("El usuario titular indicado no existe", 404, "TITULAR_NO_ENCONTRADO");
+  }
+
+  const usuarioTitular = usuariosTitulares[0];
+  if (cabecera.rol === "departamental") {
+    const [editores] = await connection.query(
+      "SELECT departamental_id FROM usuario WHERE id = ? LIMIT 1",
+      [cabecera.id]
+    );
+    const departamentalEditorId = normalizarIdPositivo(editores[0]?.departamental_id);
+    const departamentalTitularId = normalizarIdPositivo(usuarioTitular.departamental_id);
+    if (!departamentalEditorId || departamentalEditorId !== departamentalTitularId) {
+      throw crearErrorNegocio(
+        "No puedes crear reservas para afiliados de otra departamental",
+        403,
+        "TITULAR_OTRA_DEPARTAMENTAL"
+      );
+    }
+  }
+  if (usuarioTitular.habilitado !== "Y" || usuarioTitular.rol !== "afiliado") {
+    throw crearErrorNegocio(
+      "El titular debe ser un afiliado habilitado",
+      422,
+      "TITULAR_NO_AFILIADO"
+    );
+  }
+  if (Number(usuarioTitular.modulo_turismo) !== 1) {
+    throw crearErrorNegocio(
+      "El afiliado titular no tiene habilitado el módulo Turismo",
+      403,
+      "MODULO_TURISMO_DESHABILITADO"
+    );
+  }
+  if (requiereCoseguro && Number(usuarioTitular.modulo_coseguro) !== 1) {
+    throw crearErrorNegocio(
+      "Para registrar un viaje por salud, el afiliado titular debe tener habilitado el módulo Coseguro",
+      403,
+      "MODULO_COSEGURO_DESHABILITADO"
+    );
+  }
+
+  return { esRolCargaAdministrativa, usuarioReservaId, usuarioTitular };
 }
 
 function normalizarEnteroNoNegativoOpcional(valor, maximo = Number.MAX_SAFE_INTEGER) {
@@ -5847,6 +6055,23 @@ async function obtenerUsuarioPrincipalFamilia(connection, usuarioId) {
   return { usuarioFamiliarPrincipalId, departamentalId };
 }
 
+async function puedeAccederUsuarioPorJurisdiccion(connection, cabecera, usuarioObjetivoId) {
+  const objetivoId = normalizarIdPositivo(usuarioObjetivoId);
+  const actorId = normalizarIdPositivo(cabecera?.id);
+  if (!objetivoId || !actorId) return false;
+  if (cabecera.rol !== "departamental") return false;
+
+  const [usuarios] = await connection.query(
+    "SELECT id, departamental_id FROM usuario WHERE id IN (?, ?)",
+    [actorId, objetivoId]
+  );
+  if (usuarios.length !== (actorId === objetivoId ? 1 : 2)) return false;
+  const porId = new Map(usuarios.map((usuario) => [Number(usuario.id), usuario.departamental_id]));
+  const departamentalActor = normalizarIdPositivo(porId.get(actorId));
+  const departamentalObjetivo = normalizarIdPositivo(porId.get(objetivoId));
+  return Boolean(departamentalActor && departamentalObjetivo && departamentalActor === departamentalObjetivo);
+}
+
 async function puedeAccederUsuarioRelacionado(connection, cabecera, usuarioObjetivoId) {
   const objetivoId = normalizarIdPositivo(usuarioObjetivoId);
   const actorId = normalizarIdPositivo(cabecera?.id);
@@ -5860,15 +6085,7 @@ async function puedeAccederUsuarioRelacionado(connection, cabecera, usuarioObjet
   }
 
   if (cabecera.rol === "departamental" && tieneAreaTurismo(cabecera)) {
-    const [usuarios] = await connection.query(
-      "SELECT id, departamental_id FROM usuario WHERE id IN (?, ?)",
-      [actorId, objetivoId]
-    );
-    if (usuarios.length !== (actorId === objetivoId ? 1 : 2)) return false;
-    const porId = new Map(usuarios.map((usuario) => [Number(usuario.id), usuario.departamental_id]));
-    const departamentalActor = normalizarIdPositivo(porId.get(actorId));
-    const departamentalObjetivo = normalizarIdPositivo(porId.get(objetivoId));
-    return Boolean(departamentalActor && departamentalObjetivo && departamentalActor === departamentalObjetivo);
+    return puedeAccederUsuarioPorJurisdiccion(connection, cabecera, objetivoId);
   }
 
   return false;
@@ -6104,12 +6321,14 @@ async function obtenerReservaConvenioParaAcceso(connection, reservaId, { forUpda
     `
       SELECT
         r.*,
+        er.nombre AS estado_nombre,
         u.departamental_id AS usuario_departamental_id,
         ch.nombre AS convenio_nombre,
         ch.ciudad AS convenio_ciudad,
         ch.provincia AS convenio_provincia
       FROM reserva r
       INNER JOIN usuario u ON u.id = r.usuario_id
+      LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
       LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
       WHERE r.id = ?
         AND r.modalidad = ?
@@ -8109,6 +8328,37 @@ router.post("/reserva", verifyToken, async (req, res) => {
         connection = await mysqlConnection.promise().getConnection();
         await connection.beginTransaction();
 
+        // Admin y departamental pueden cargar una reserva para un afiliado. La
+        // departamental queda limitada a afiliados de su propia jurisdiccion.
+        const {
+          esRolCargaAdministrativa,
+          usuarioReservaId,
+          usuarioTitular,
+        } = await resolverTitularReservaAlta(connection, cabecera, req.body.usuario_id, {
+          requiereCoseguro: Boolean(porSalud),
+        });
+
+        // Se controla antes de consultar disponibilidad para que, si la unica
+        // reserva iniciada ya vencio, quede rechazada y libere el recurso en
+        // esta misma transaccion. Tambien cubre altas hechas por admin para un
+        // afiliado, que igualmente deben respetar la unicidad.
+        const altaQuedaIniciada = obtenerEstadoAltaTurismo(cabecera.rol) === ESTADO_INICIADA;
+        if (usuarioTitular.rol === "afiliado" && altaQuedaIniciada) {
+          const reservaIniciada = await asegurarSinReservaIniciadaAfiliado(
+            connection,
+            usuarioReservaId
+          );
+          if (reservaIniciada) {
+            const error = crearErrorNegocio(
+              "Ya tenes una reserva de turismo iniciada. Podes verla y continuarla antes de crear otra.",
+              409,
+              "RESERVA_INICIADA_EXISTENTE"
+            );
+            error.detalles = { reserva: reservaIniciada };
+            throw error;
+          }
+        }
+
         try {
           const bloquesPorRecurso = await obtenerBloquesActivosParaRecursos(connection, {
             recursoIds: [recursoIdReserva],
@@ -8176,41 +8426,6 @@ router.post("/reserva", verifyToken, async (req, res) => {
           fechaInicio: fechaInicioReserva,
           fechaFin: fechaFinReserva,
         });
-
-        // El rol admin puede crear la reserva en nombre de un afiliado. Para el
-        // resto de los roles el titular siempre es el usuario autenticado, aunque
-        // intenten enviar otro usuario_id en el payload.
-        const usuarioIdSolicitado = normalizarIdPositivo(req.body.usuario_id);
-        if (cabecera.rol === "admin" && req.body.usuario_id && !usuarioIdSolicitado) {
-          await connection.rollback();
-          return res.status(400).json("El usuario titular indicado no es valido");
-        }
-
-        const usuarioReservaId = cabecera.rol === "admin" && usuarioIdSolicitado
-          ? usuarioIdSolicitado
-          : Number(cabecera.id);
-        const [usuariosTitulares] = await connection.query(
-          `
-            SELECT u.id, u.nombre, u.apellido, u.usuario_familiar_id, u.departamental_id,
-                   u.habilitado, r.nombre AS rol
-            FROM usuario u
-            INNER JOIN rol r ON r.id = u.rol_id
-            WHERE u.id = ?
-            LIMIT 1
-          `,
-          [usuarioReservaId]
-        );
-        if (usuariosTitulares.length === 0) {
-          await connection.rollback();
-          return res.status(404).json("El usuario titular indicado no existe");
-        }
-
-        const usuarioTitular = usuariosTitulares[0];
-        const esAsignacionAdmin = cabecera.rol === "admin" && usuarioReservaId !== Number(cabecera.id);
-        if (esAsignacionAdmin && (usuarioTitular.habilitado !== "Y" || usuarioTitular.rol !== "afiliado")) {
-          await connection.rollback();
-          return res.status(422).json("El titular debe ser un afiliado habilitado");
-        }
 
         const { usuarioFamiliarPrincipalId, departamentalId } = await obtenerUsuarioPrincipalFamilia(
           connection,
@@ -8292,6 +8507,66 @@ router.post("/reserva", verifyToken, async (req, res) => {
         );
 
         const reservaId = reservaResult.insertId;
+        let estadoRespuesta = ESTADO_INICIADA;
+        const esAltaDepartamental = obtenerEstadoAltaTurismo(cabecera.rol) === ESTADO_VERIFICADA;
+        const registrarHitoAlta = esAltaDepartamental
+          ? registrarHistorialReservaEstricto
+          : registrarHistorialReserva;
+
+        await registrarHitoAlta(
+          connection,
+          reservaId,
+          "CREATE",
+          cabecera.id,
+          req,
+          [{ campo: "estado_reserva_id", valorAnterior: null, valorNuevo: ESTADO_RESERVA_INICIADA_ID }],
+          "Reserva creada en estado Iniciada"
+        );
+
+        // Una reserva cargada por la departamental ya fue revisada por ese
+        // equipo. Se conserva el paso Iniciada en el historial y se avanza en
+        // la misma transaccion a Verificada.
+        if (esAltaDepartamental) {
+          const estadoVerificadaId = await obtenerEstadoReservaId(connection, ESTADO_VERIFICADA, 2);
+          await connection.query(
+            "UPDATE reserva SET estado_reserva_id = ?, fecha_modificacion = NOW() WHERE id = ?",
+            [estadoVerificadaId, reservaId]
+          );
+          await registrarHistorialReservaEstricto(
+            connection,
+            reservaId,
+            "UPDATE",
+            cabecera.id,
+            req,
+            [{
+              campo: "estado_reserva_id",
+              valorAnterior: ESTADO_RESERVA_INICIADA_ID,
+              valorNuevo: estadoVerificadaId,
+            }],
+            "Verificacion automatica por alta departamental"
+          );
+          await notificarAdministradoresTurismo(
+            connection,
+            "RESERVA_PARA_APROBAR",
+            `Reserva #${reservaId} verificada`,
+            "La departamental creó y verificó la reserva. Ya está disponible para aprobación administrativa.",
+            { reserva_id: reservaId, estado: ESTADO_VERIFICADA },
+            cabecera.id
+          );
+          estadoRespuesta = ESTADO_VERIFICADA;
+        }
+        if (esRolCargaAdministrativa) {
+          await insertarNotificacion(
+            connection,
+            usuarioReservaId,
+            "RESERVA_CREADA_POR_TURISMO",
+            `Nueva reserva de turismo #${reservaId}`,
+            estadoRespuesta === ESTADO_VERIFICADA
+              ? "Tu departamental creó y verificó una reserva de turismo a tu nombre."
+              : "El equipo de Turismo creó una reserva a tu nombre. La departamental tiene 72 horas para verificarla.",
+            { reserva_id: reservaId, estado: estadoRespuesta }
+          );
+        }
         let numeroParcelaAsignada = null;
 
         if (modalidadReserva === MODALIDAD_BLOQUE && bloqueFechaIdReserva) {
@@ -8365,7 +8640,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
           id: reservaId,
           numero_reserva: numeroReserva,
           numero_parcela: numeroParcelaAsignada,
-          estado: "Iniciada",
+          estado: estadoRespuesta,
           mensaje: "Reserva creada exitosamente",
           fecha_creacion: new Date().toISOString(),
           precio_total: precioTotalReserva,
@@ -8391,6 +8666,13 @@ router.post("/reserva", verifyToken, async (req, res) => {
   } catch (error) {
     console.log(error);
     if (error?.statusCode) {
+      if (error.codigo) {
+        return res.status(error.statusCode).json({
+          message: error.message,
+          codigo: error.codigo,
+          ...(error.detalles || {}),
+        });
+      }
       return res.status(error.statusCode).json(error.message);
     }
     res.status(500).json("Error al procesar la reserva");
@@ -8401,7 +8683,7 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
   let connection;
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "departamental", "afiliado"].includes(cabecera.rol)) {
+    if (!["admin", "departamental", "afiliado"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -8428,6 +8710,14 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
 
+    const {
+      esRolCargaAdministrativa,
+      usuarioReservaId,
+      usuarioTitular,
+    } = await resolverTitularReservaAlta(connection, cabecera, req.body.usuario_id, {
+      requiereCoseguro: Boolean(porSalud),
+    });
+
     const [hoteles] = await connection.query(
       "SELECT id, nombre FROM convenio_hotel WHERE id = ? AND activo = 1 LIMIT 1",
       [hotelId]
@@ -8444,7 +8734,10 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
       defaultContentType: "image/png",
     });
 
-    const { usuarioFamiliarPrincipalId, departamentalId } = await obtenerUsuarioPrincipalFamilia(connection, cabecera.id);
+    const { usuarioFamiliarPrincipalId, departamentalId } = await obtenerUsuarioPrincipalFamilia(
+      connection,
+      usuarioReservaId
+    );
     const usuariosIds = await crearOBuscarUsuariosReserva(connection, personas, {
       usuarioFamiliarPrincipalId,
       departamentalId,
@@ -8483,7 +8776,7 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
         estadoSolicitudConvenioId,
         MODALIDAD_CONVENIO,
         hotelId,
-        cabecera.id,
+        usuarioReservaId,
         firmaFileName,
         fechaInicioReserva,
         fechaFinReserva,
@@ -8524,14 +8817,26 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
       `Solicitud de convenio hotelero creada para ${hoteles[0].nombre}`
     );
 
+    if (esRolCargaAdministrativa) {
+      await insertarNotificacion(
+        connection,
+        usuarioReservaId,
+        "CONVENIO_CREADO_POR_TURISMO",
+        `Nueva solicitud de convenio #${reservaId}`,
+        "El equipo de Turismo creó una solicitud de convenio hotelero a tu nombre.",
+        { reserva_id: reservaId, estado: "Solicitud convenio" }
+      );
+    }
+
     // Viaje por motivos de salud: crea el trámite de subsidio para Servicios Sociales
     let reservaSaludId = null;
     if (porSalud) {
       reservaSaludId = await crearReservaSalud(connection, {
         reservaId,
-        usuarioId: cabecera.id,
+        usuarioId: usuarioReservaId,
         salud: porSalud,
-        usuarioNombre: `${cabecera.apellido}, ${cabecera.nombre}`,
+        usuarioNombre: `${usuarioTitular.apellido}, ${usuarioTitular.nombre}`,
+        usuarioModificadorId: cabecera.id,
       });
     }
 
@@ -8551,7 +8856,10 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
     }
     console.log(error);
     if (error?.statusCode) {
-      return res.status(error.statusCode).json(error.message);
+      return res.status(error.statusCode).json({
+        message: error.message,
+        codigo: error.codigo || null,
+      });
     }
     res.status(500).json("Error al crear la solicitud de convenio hotelero");
   } finally {
@@ -8638,11 +8946,28 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         }
 
         const reservaActual = reservaExistente[0];
+        // Autorizar antes de exponer el estado o validar el contenido editable.
+        if (cabecera.rol === "afiliado" && Number(reservaActual.usuario_id) !== Number(cabecera.id)) {
+          throw crearErrorNegocio("No tienes permisos para editar esta reserva", 403);
+        }
+        if (cabecera.rol === "departamental") {
+          const [editores] = await connection.query("SELECT departamental_id FROM usuario WHERE id = ? LIMIT 1", [cabecera.id]);
+          if (
+            editores.length === 0 ||
+            Number(editores[0].departamental_id) !== Number(reservaActual.usuario_departamental_id)
+          ) {
+            throw crearErrorNegocio("No tienes permisos para editar reservas de otra departamental", 403);
+          }
+        }
+        if (reservaActual.estado_nombre !== ESTADO_INICIADA) {
+          throw crearErrorNegocio(
+            "Solo se pueden editar reservas en estado Iniciada",
+            409,
+            "RESERVA_NO_EDITABLE_POR_ESTADO"
+          );
+        }
         if ([MODALIDAD_SORTEO, MODALIDAD_CONVENIO].includes(reservaActual.modalidad)) {
           throw crearErrorNegocio("Esta modalidad no se puede editar desde la reserva general", 409);
-        }
-        if (esEstadoReservaTerminal(reservaActual.estado_nombre)) {
-          throw crearErrorNegocio("Una reserva en estado terminal no se puede editar", 409);
         }
         const validacionTemporalEdicion = validarRangoReservaTemporal(fechaInicioReserva, fechaFinReserva, {
           rangoExistente: {
@@ -8656,20 +8981,6 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
             422,
             "RANGO_HISTORICO_NO_EDITABLE"
           );
-        }
-
-        // Si el rol es afiliado, verificar que la reserva le pertenezca
-        if (cabecera.rol === "afiliado" && Number(reservaActual.usuario_id) !== Number(cabecera.id)) {
-          throw crearErrorNegocio("No tienes permisos para editar esta reserva", 403);
-        }
-        if (cabecera.rol === "departamental") {
-          const [editores] = await connection.query("SELECT departamental_id FROM usuario WHERE id = ? LIMIT 1", [cabecera.id]);
-          if (
-            editores.length === 0 ||
-            Number(editores[0].departamental_id) !== Number(reservaActual.usuario_departamental_id)
-          ) {
-            throw crearErrorNegocio("No tienes permisos para editar reservas de otra departamental", 403);
-          }
         }
 
         const numeroParcelaAnteriorRaw = reservaActual.numero_parcela;
@@ -8958,7 +9269,8 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
     if (error?.statusCode) {
       return res.status(error.statusCode).json({
         success: false,
-        message: error.message
+        message: error.message,
+        codigo: error.codigo || null
       });
     }
     res.status(500).json({
@@ -8991,6 +9303,7 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
         const [reservaInfo] = await connection.query(`
           SELECT 
             r.id,
+            r.usuario_id,
             r.numero_parcela,
             r.precio_total as total_tarifa,
             r.monto_adicionales,
@@ -8998,6 +9311,7 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
             r.fecha_fin,
             r.observaciones,
             r.fecha_creacion,
+            DATE_ADD(r.fecha_creacion, INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR) AS fecha_vencimiento_respuesta,
             COALESCE(r.modalidad, 'FECHA_LIBRE') as modalidad,
             r.sorteo_id,
             r.bloque_fecha_id,
@@ -9041,14 +9355,15 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
 
         // Si el rol es afiliado, verificar que la reserva le pertenezca
         if (cabecera.rol === "afiliado") {
-          const [usuarioReserva] = await connection.query(
-            "SELECT usuario_id FROM reserva WHERE id = ?",
-            [reservaId]
-          );
-
-          if (usuarioReserva.length === 0 || usuarioReserva[0].usuario_id !== cabecera.id) {
+          if (Number(reserva.usuario_id) !== Number(cabecera.id)) {
             return res.status(403).json("No tienes permisos para editar esta reserva");
           }
+        }
+        if (
+          cabecera.rol === "departamental" &&
+          !(await puedeAccederUsuarioRelacionado(connection, cabecera, reserva.usuario_id))
+        ) {
+          return res.status(403).json("No tienes permisos para editar esta reserva");
         }
 
         // Obtener las personas de la reserva con información completa para edición
@@ -9200,11 +9515,13 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      cabecera.rol === "admin" ||
-      cabecera.rol === "afiliado" ||
-      cabecera.rol === "departamental"
+      (
+        cabecera.rol === "admin" ||
+        cabecera.rol === "afiliado" ||
+        cabecera.rol === "departamental"
+      ) && tieneAreaTurismo(cabecera)
     ) {
-      const reservaId = req.params.id;
+      const reservaId = normalizarIdPositivo(req.params.id);
 
       if (!reservaId) {
         return res.status(400).json("ID de reserva requerido");
@@ -9225,6 +9542,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
             r.fecha_fin,
             r.observaciones,
             r.fecha_creacion,
+            DATE_ADD(r.fecha_creacion, INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR) AS fecha_vencimiento_respuesta,
             r.firma_archivo,
             r.usuario_id,
             r.es_por_salud,
@@ -9271,20 +9589,14 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
 
         // Si el rol es afiliado, verificar que la reserva le pertenezca
         if (cabecera.rol === "afiliado") {
-          const [usuarioReserva] = await connection.query(
-            "SELECT usuario_id FROM reserva WHERE id = ?",
-            [reservaId]
-          );
-
-          if (usuarioReserva.length === 0 || usuarioReserva[0].usuario_id !== cabecera.id) {
+          if (Number(reserva.usuario_id) !== Number(cabecera.id)) {
             return res.status(403).json("No tienes permisos para ver esta reserva");
           }
         }
 
         if (
           cabecera.rol === "departamental" &&
-          reserva.modalidad === MODALIDAD_CONVENIO &&
-          Number(reserva.usuario_departamental_id) !== Number(cabecera.departamental_id)
+          !(await puedeAccederUsuarioRelacionado(connection, cabecera, reserva.usuario_id))
         ) {
           return res.status(403).json("No tienes permisos para ver esta reserva");
         }
@@ -9392,9 +9704,12 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           }))
         }));
 
-        // Subsidio por salud (viaje por motivos de salud validado por Servicios Sociales)
+        // Los datos médicos pertenecen al módulo Coseguro. Poder consultar la
+        // reserva turística no habilita por sí solo a leerlos ni a firmar sus
+        // certificados.
+        const puedeVerSalud = puedeVerDatosSaludReserva(cabecera);
         let salud = null;
-        if (Number(reserva.es_por_salud) === 1) {
+        if (puedeVerSalud && Number(reserva.es_por_salud) === 1) {
           const [saludRows] = await connection.query(
             `SELECT rs.id, rs.motivo, rs.centro_medico, rs.estado, rs.precio_cubierto, rs.observacion_resolucion,
                     rs.fecha_aprobacion_departamental, rs.fecha_resolucion, rs.fecha_creacion
@@ -9479,6 +9794,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
                 ${selectUsuarioDepartamentalPropuesta},
                 rcp.respuesta,
                 rcp.fecha_propuesta,
+                DATE_ADD(rcp.fecha_propuesta, INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR) AS fecha_vencimiento,
                 rcp.fecha_respuesta,
                 d.nombre AS departamental_nombre
               FROM reserva_convenio_propuesta rcp
@@ -9501,7 +9817,9 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
               departamental_nombre: propuestas[0].departamental_nombre || null,
               respuesta: propuestas[0].respuesta || "PENDIENTE",
               fecha_propuesta: propuestas[0].fecha_propuesta,
+              fecha_vencimiento: propuestas[0].fecha_vencimiento,
               fecha_respuesta: propuestas[0].fecha_respuesta,
+              plazo_respuesta_horas: PLAZO_RESPUESTA_HORAS,
             };
           }
         }
@@ -9516,6 +9834,8 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           nombre: reserva.observaciones || `Reserva ${numeroReserva}`,
           estado: reserva.estado || "Confirmada",
           fecha_creacion: reserva.fecha_creacion,
+          fecha_vencimiento_respuesta: reserva.fecha_vencimiento_respuesta,
+          plazo_respuesta_horas: PLAZO_RESPUESTA_HORAS,
           observaciones: reserva.observaciones,
           fecha_inicio: reserva.fecha_inicio,
           fecha_fin: reserva.fecha_fin,
@@ -9546,7 +9866,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           bebes: bebes,
           monto_adicionales: reserva.monto_adicionales || 0,
           adicionales: adicionalesFormateados,
-          es_por_salud: Number(reserva.es_por_salud) === 1,
+          es_por_salud: puedeVerSalud && Number(reserva.es_por_salud) === 1,
           salud,
           observaciones_hilo: observacionesHilo
         };
@@ -9690,6 +10010,29 @@ router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
       await connection.rollback();
       return res.status(403).json("No tienes permisos para gestionar esta reserva");
     }
+    if (reserva.estado_nombre !== "Solicitud convenio") {
+      throw crearErrorNegocio(
+        "La solicitud ya no admite una nueva cotización",
+        409,
+        "CONVENIO_NO_COTIZABLE"
+      );
+    }
+
+    const [propuestasExistentes] = await connection.query(
+      `SELECT id, respuesta, fecha_propuesta, fecha_respuesta
+         FROM reserva_convenio_propuesta
+        WHERE reserva_id = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [reservaId]
+    );
+    if (propuestasExistentes.length > 0) {
+      throw crearErrorNegocio(
+        "La solicitud ya tiene una cotización registrada",
+        409,
+        "CONVENIO_PROPUESTA_EXISTENTE"
+      );
+    }
 
     const [familiares] = await connection.query(
       "SELECT id FROM reserva_familiar WHERE reserva_id = ?",
@@ -9751,39 +10094,49 @@ router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
       ? `, ${columnaUsuarioDepartamentalPropuesta}`
       : "";
     const valorUsuarioDepartamentalSql = columnaUsuarioDepartamentalPropuesta ? ", ?" : "";
-    const updateUsuarioDepartamentalSql = columnaUsuarioDepartamentalPropuesta
-      ? `, ${columnaUsuarioDepartamentalPropuesta} = VALUES(${columnaUsuarioDepartamentalPropuesta})`
-      : "";
-    await connection.query(
-      `
-        INSERT INTO reserva_convenio_propuesta (
-          reserva_id,
+    try {
+      await connection.query(
+        `
+          INSERT INTO reserva_convenio_propuesta (
+            reserva_id,
+            mensaje,
+            departamental_id
+            ${columnaUsuarioDepartamentalSql},
+            respuesta,
+            fecha_propuesta,
+            fecha_respuesta
+          ) VALUES (?, ?, ?${valorUsuarioDepartamentalSql}, 'PENDIENTE', NOW(), NULL)
+        `,
+        [
+          reservaId,
           mensaje,
-          departamental_id
-          ${columnaUsuarioDepartamentalSql},
-          respuesta,
-          fecha_propuesta,
-          fecha_respuesta
-        ) VALUES (?, ?, ?${valorUsuarioDepartamentalSql}, 'PENDIENTE', NOW(), NULL)
-        ON DUPLICATE KEY UPDATE
-          mensaje = VALUES(mensaje),
-          departamental_id = VALUES(departamental_id)
-          ${updateUsuarioDepartamentalSql},
-          respuesta = 'PENDIENTE',
-          fecha_propuesta = NOW(),
-          fecha_respuesta = NULL
-      `,
-      [
-        reservaId,
-        mensaje,
-        cabecera.departamental_id || null,
-        ...(columnaUsuarioDepartamentalPropuesta ? [cabecera.id] : [])
-      ]
-    );
+          cabecera.departamental_id || null,
+          ...(columnaUsuarioDepartamentalPropuesta ? [cabecera.id] : [])
+        ]
+      );
+    } catch (error) {
+      if (error?.code === "ER_DUP_ENTRY") {
+        throw crearErrorNegocio(
+          "La solicitud ya tiene una cotización registrada",
+          409,
+          "CONVENIO_PROPUESTA_EXISTENTE"
+        );
+      }
+      throw error;
+    }
 
     await connection.query(
-      "UPDATE reserva SET precio_total = ?, estado_reserva_id = ? WHERE id = ?",
+      "UPDATE reserva SET precio_total = ?, estado_reserva_id = ?, fecha_modificacion = NOW() WHERE id = ?",
       [precioTotal, estadoPropuestaId, reservaId]
+    );
+
+    const [plazosPropuesta] = await connection.query(
+      `SELECT fecha_propuesta,
+              DATE_ADD(fecha_propuesta, INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR) AS fecha_vencimiento
+         FROM reserva_convenio_propuesta
+        WHERE reserva_id = ?
+        LIMIT 1`,
+      [reservaId]
     );
 
     const payload = {
@@ -9791,6 +10144,8 @@ router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
       hotel_id: reserva.convenio_hotel_id,
       hotel_nombre: reserva.convenio_nombre,
       total: precioTotal,
+      fecha_vencimiento: plazosPropuesta[0]?.fecha_vencimiento || null,
+      plazo_respuesta_horas: PLAZO_RESPUESTA_HORAS,
     };
     await connection.query(
       `
@@ -9800,8 +10155,8 @@ router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
       [
         reserva.usuario_id,
         TIPO_NOTIFICACION_CONVENIO_PROPUESTA,
-        "Propuesta de convenio hotelero",
-        `Ya tenes una propuesta de costos para ${reserva.convenio_nombre || "tu convenio hotelero"}.`,
+        "Propuesta de cotización",
+        `Ya tenes una propuesta de cotización para ${reserva.convenio_nombre || "tu convenio hotelero"}. Recordá responderla dentro de las 72 horas.`,
         JSON.stringify(payload),
       ]
     );
@@ -9817,7 +10172,7 @@ router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
         { campo: "estado_reserva_id", valorAnterior: reserva.estado_reserva_id, valorNuevo: estadoPropuestaId },
         { campo: "reserva_convenio_propuesta.mensaje", valorAnterior: null, valorNuevo: mensaje },
       ],
-      "Propuesta de convenio hotelero cargada"
+      "Propuesta de cotización cargada"
     );
 
     await cerrarGuardiaArchivoReserva(connection, reservaId);
@@ -9829,6 +10184,9 @@ router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
       reserva_id: reservaId,
       precio_total: precioTotal,
       respuesta: "PENDIENTE",
+      fecha_propuesta: plazosPropuesta[0]?.fecha_propuesta || null,
+      fecha_vencimiento: plazosPropuesta[0]?.fecha_vencimiento || null,
+      plazo_respuesta_horas: PLAZO_RESPUESTA_HORAS,
     });
   } catch (error) {
     if (connection) {
@@ -9857,7 +10215,7 @@ router.put("/reserva/:id/convenio/respuesta", verifyToken, async (req, res) => {
   let connection;
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (cabecera.rol !== "afiliado") {
+    if (cabecera.rol !== "afiliado" || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -9881,7 +10239,13 @@ router.put("/reserva/:id/convenio/respuesta", verifyToken, async (req, res) => {
     }
 
     const [propuestas] = await connection.query(
-      "SELECT * FROM reserva_convenio_propuesta WHERE reserva_id = ? LIMIT 1 FOR UPDATE",
+      `SELECT *,
+              DATE_ADD(fecha_propuesta, INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR) AS fecha_vencimiento,
+              (fecha_propuesta <= DATE_SUB(NOW(), INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR)) AS vencida
+         FROM reserva_convenio_propuesta
+        WHERE reserva_id = ?
+        LIMIT 1
+        FOR UPDATE`,
       [reservaId]
     );
     if (propuestas.length === 0 || !propuestas[0].fecha_propuesta) {
@@ -9891,6 +10255,28 @@ router.put("/reserva/:id/convenio/respuesta", verifyToken, async (req, res) => {
     if (propuestas[0].respuesta !== "PENDIENTE") {
       await connection.rollback();
       return res.status(409).json("La propuesta ya fue respondida");
+    }
+
+    if (Number(propuestas[0].vencida) === 1) {
+      const estadoConvenioRechazadoId = await obtenerEstadoReservaId(
+        connection,
+        ESTADO_CONVENIO_RECHAZADO,
+        ESTADO_RESERVA_RECHAZADA_ID
+      );
+      await expirarPropuestaConvenioEnTransaccion(
+        connection,
+        reserva,
+        propuestas[0],
+        estadoConvenioRechazadoId
+      );
+      await connection.commit();
+      return res.status(409).json({
+        message: "La propuesta vencio porque transcurrieron las 72 horas para responderla.",
+        codigo: "PROPUESTA_CONVENIO_VENCIDA",
+        reserva_id: reservaId,
+        estado: ESTADO_CONVENIO_RECHAZADO,
+        fecha_vencimiento: propuestas[0].fecha_vencimiento,
+      });
     }
 
     const respuesta = accion === "ACEPTAR" ? "ACEPTADA" : "RECHAZADA";
@@ -9912,7 +10298,7 @@ router.put("/reserva/:id/convenio/respuesta", verifyToken, async (req, res) => {
     );
 
     await connection.query(
-      "UPDATE reserva SET estado_reserva_id = ? WHERE id = ?",
+      "UPDATE reserva SET estado_reserva_id = ?, fecha_modificacion = NOW() WHERE id = ?",
       [estadoId, reservaId]
     );
 
@@ -9963,197 +10349,202 @@ router.put("/reserva/:id/convenio/respuesta", verifyToken, async (req, res) => {
 });
 
 router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
+  let connection;
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (
-      (cabecera.rol === "admin" ||
-        cabecera.rol === "departamental" ||
-        cabecera.rol === "afiliado") &&
-      tieneAreaTurismo(cabecera)
-    ) {
-      const reservaId = normalizarIdPositivo(req.params.id);
-      const { estado, observaciones } = req.body;
+    if (!["admin", "departamental", "afiliado"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
+      return res.status(403).json({ success: false, message: "No autorizado" });
+    }
 
-      // Validar campos requeridos
-      if (!reservaId || !estado) {
-        return res.status(400).json({
-          success: false,
-          message: "ID de reserva y estado son requeridos"
-        });
-      }
-
-      // Validar que el estado sea válido
-      const estadosValidos = ["Verificada", "Cancelada"];
-      if (!estadosValidos.includes(estado)) {
-        return res.status(400).json({
-          success: false,
-          message: "Estado no válido. Debe ser 'Verificada' o 'Cancelada'"
-        });
-      }
-
-      if (observaciones !== undefined && observaciones !== null && typeof observaciones !== "string") {
-        return res.status(400).json({ success: false, message: "Las observaciones deben ser texto" });
-      }
-      const observacionesNormalizadas = typeof observaciones === "string" && observaciones.trim()
-        ? observaciones.trim()
-        : null;
-      if (observacionesNormalizadas && Buffer.byteLength(observacionesNormalizadas, "utf8") > 65535) {
-        return res.status(400).json({ success: false, message: "Las observaciones son demasiado extensas" });
-      }
-
-      let connection;
-      try {
-        // Iniciar transacción
-        connection = await mysqlConnection.promise().getConnection();
-        await connection.beginTransaction();
-
-        // Verificar que la reserva existe
-        const [reservaExistente] = await connection.query(
-          `SELECT r.*, er.nombre AS estado_nombre,
-                  u.departamental_id AS usuario_departamental_id
-           FROM reserva r
-           LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
-           INNER JOIN usuario u ON u.id = r.usuario_id
-           WHERE r.id = ?
-           FOR UPDATE`,
-          [reservaId]
-        );
-
-        if (reservaExistente.length === 0) {
-          throw crearErrorNegocio("Reserva no encontrada", 404);
-        }
-
-        const reservaActual = reservaExistente[0];
-        if (cabecera.rol === "afiliado") {
-          if (Number(reservaActual.usuario_id) !== Number(cabecera.id) || estado !== "Cancelada") {
-            throw crearErrorNegocio("Solo puedes cancelar una reserva propia", 403);
-          }
-        }
-        if (cabecera.rol === "departamental") {
-          const [editores] = await connection.query("SELECT departamental_id FROM usuario WHERE id = ? LIMIT 1", [cabecera.id]);
-          const departamentalEditorId = normalizarIdPositivo(editores[0]?.departamental_id);
-          const departamentalReservaId = normalizarIdPositivo(reservaActual.usuario_departamental_id);
-          if (!departamentalEditorId || !departamentalReservaId || departamentalEditorId !== departamentalReservaId) {
-            throw crearErrorNegocio("No puedes gestionar reservas de otra departamental", 403);
-          }
-        }
-        if (esEstadoReservaTerminal(reservaActual.estado_nombre)) {
-          throw crearErrorNegocio("La reserva ya se encuentra en un estado terminal", 409);
-        }
-
-        // Mapear estado a ID numérico
-        let estadoId;
-        let estadoNombre;
-        if (estado === "Verificada") {
-          estadoId = await obtenerEstadoReservaId(connection, "Verificada", 2);
-          estadoNombre = "Verificada";
-        } else if (estado === "Cancelada") {
-          const [estadoCancelacion] = await connection.query(
-            "SELECT id, nombre FROM estado_reserva WHERE nombre IN ('Cancelada', 'Rechazada') ORDER BY nombre = 'Cancelada' DESC LIMIT 1"
-          );
-          if (estadoCancelacion.length === 0) {
-            throw crearErrorNegocio("No existe un estado de cancelacion configurado", 409);
-          }
-          estadoId = Number(estadoCancelacion[0].id);
-          estadoNombre = estadoCancelacion[0].nombre;
-        }
-
-        // Detectar cambios
-        const datosAnteriores = reservaExistente[0];
-        const cambiosReserva = [];
-
-        if (datosAnteriores.estado_reserva_id !== estadoId) {
-            cambiosReserva.push({ campo: 'estado_reserva_id', valorAnterior: datosAnteriores.estado_reserva_id, valorNuevo: estadoId });
-        }
-        
-        const obsAnt = datosAnteriores.observaciones || '';
-        const obsNew = observacionesNormalizadas || '';
-        if (obsAnt !== obsNew) {
-            cambiosReserva.push({ campo: 'observaciones', valorAnterior: obsAnt, valorNuevo: obsNew });
-        }
-
-        if (cambiosReserva.length > 0) {
-            await registrarHistorialReserva(connection, reservaId, 'UPDATE', cabecera.id, req, cambiosReserva, 'Cambio de estado de reserva');
-        }
-
-        // Actualizar el estado de la reserva
-        const [updateResult] = await connection.query(
-          `UPDATE reserva SET 
-            estado_reserva_id = ?, 
-            observaciones = ?,
-            fecha_modificacion = NOW()
-          WHERE id = ?`,
-          [estadoId, observacionesNormalizadas, reservaId]
-        );
-
-        if (updateResult.affectedRows === 0) {
-          throw crearErrorNegocio("No se pudo actualizar la reserva", 409);
-        }
-
-        if (estado === "Cancelada") {
-          await liberarRecursoBloqueReserva(connection, reservaId);
-          await connection.query(
-            `UPDATE sorteo_adjudicacion_respuesta
-             SET estado = 'RECHAZADA', fecha_respuesta = COALESCE(fecha_respuesta, NOW())
-             WHERE reserva_id = ? AND estado = 'PENDIENTE'`,
-            [reservaId]
-          );
-        }
-
-        // Insertar registro de auditoría si se proporciona usuario_admin_id
-        // if (usuario_admin_id) {
-        //   await connection.query(
-        //     `INSERT INTO auditoria_reserva (reserva_id, usuario_id, estado_anterior, estado_nuevo, observaciones, fecha_cambio)
-        //      VALUES (?, ?, ?, ?, ?, NOW())`,
-        //     [reservaId, usuario_admin_id, reservaExistente[0].estado_reserva_id, estadoId, observaciones || null]
-        //   );
-        // }
-
-        // Confirmar transacción
-        await connection.commit();
-
-        // Generar número de reserva para la respuesta
-        const numeroReserva = `RES-${reservaId.toString().padStart(6, '0')}`;
-
-        // Respuesta exitosa
-        res.status(200).json({
-          success: true,
-          message: `Reserva ${estado.toLowerCase()} exitosamente`,
-          reserva: {
-            id: parseInt(reservaId),
-            numero_reserva: numeroReserva,
-            estado: estadoNombre,
-            fecha_actualizacion: new Date().toISOString()
-          }
-        });
-
-      } catch (transactionError) {
-        // Rollback en caso de error
-        if (connection) {
-          await connection.rollback();
-        }
-        throw transactionError;
-      } finally {
-        if (connection) {
-          connection.release();
-        }
-      }
-
-    } else {
-      res.status(401).json({
+    const reservaId = normalizarIdPositivo(req.params.id);
+    const estado = typeof req.body?.estado === "string" ? req.body.estado.trim() : "";
+    const estadosValidos = ["Verificada", "Aprobada", "Rechazada", "Cancelada"];
+    if (!reservaId || !estadosValidos.includes(estado)) {
+      return res.status(400).json({
         success: false,
-        message: "No autorizado. Solo administradores y departamentales pueden cambiar estados de reservas"
+        message: "Estado no válido. Debe ser Verificada, Aprobada, Rechazada o Cancelada",
       });
     }
+
+    const observaciones = req.body?.observaciones;
+    if (observaciones !== undefined && observaciones !== null && typeof observaciones !== "string") {
+      return res.status(400).json({ success: false, message: "Las observaciones deben ser texto" });
+    }
+    const observacionesNormalizadas = typeof observaciones === "string" && observaciones.trim()
+      ? observaciones.trim()
+      : null;
+    if (observacionesNormalizadas && Buffer.byteLength(observacionesNormalizadas, "utf8") > 65535) {
+      return res.status(400).json({ success: false, message: "Las observaciones son demasiado extensas" });
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const [reservas] = await connection.query(
+      `SELECT r.*, er.nombre AS estado_nombre,
+              u.departamental_id AS usuario_departamental_id
+         FROM reserva r
+         LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+         INNER JOIN usuario u ON u.id = r.usuario_id
+        WHERE r.id = ?
+        FOR UPDATE`,
+      [reservaId]
+    );
+    if (reservas.length === 0) {
+      throw crearErrorNegocio("Reserva no encontrada", 404, "RESERVA_NO_ENCONTRADA");
+    }
+
+    const reservaActual = reservas[0];
+    if (cabecera.rol === "departamental") {
+      const [editores] = await connection.query(
+        "SELECT departamental_id FROM usuario WHERE id = ? LIMIT 1",
+        [cabecera.id]
+      );
+      const departamentalEditorId = normalizarIdPositivo(editores[0]?.departamental_id);
+      const departamentalReservaId = normalizarIdPositivo(reservaActual.usuario_departamental_id);
+      if (!departamentalEditorId || departamentalEditorId !== departamentalReservaId) {
+        throw crearErrorNegocio(
+          "No puedes gestionar reservas de otra departamental",
+          403,
+          "RESERVA_OTRA_DEPARTAMENTAL"
+        );
+      }
+    }
+
+    const transicion = validarTransicionTurismo({
+      rol: cabecera.rol,
+      usuarioId: cabecera.id,
+      propietarioId: reservaActual.usuario_id,
+      estadoActual: reservaActual.estado_nombre,
+      estadoSolicitado: estado,
+      modalidad: reservaActual.modalidad,
+    });
+    if (!transicion.valido) {
+      throw crearErrorNegocio(transicion.mensaje, transicion.statusCode, transicion.codigo);
+    }
+
+    const fallbackEstadoId = transicion.estadoDestino === ESTADO_VERIFICADA
+      ? 2
+      : (transicion.estadoDestino === ESTADO_APROBADA ? 3 : ESTADO_RESERVA_RECHAZADA_ID);
+    const estadoId = await obtenerEstadoReservaId(
+      connection,
+      transicion.estadoDestino,
+      fallbackEstadoId
+    );
+
+    const cambios = [{
+      campo: "estado_reserva_id",
+      valorAnterior: reservaActual.estado_reserva_id,
+      valorNuevo: estadoId,
+    }];
+    if (
+      observacionesNormalizadas !== null &&
+      String(reservaActual.observaciones || "") !== observacionesNormalizadas
+    ) {
+      cambios.push({
+        campo: "observaciones",
+        valorAnterior: reservaActual.observaciones || "",
+        valorNuevo: observacionesNormalizadas,
+      });
+    }
+
+    const [actualizacion] = await connection.query(
+      `UPDATE reserva
+          SET estado_reserva_id = ?,
+              observaciones = COALESCE(?, observaciones),
+              fecha_modificacion = NOW()
+        WHERE id = ? AND estado_reserva_id = ?`,
+      [estadoId, observacionesNormalizadas, reservaId, reservaActual.estado_reserva_id]
+    );
+    if (actualizacion.affectedRows !== 1) {
+      throw crearErrorNegocio("La reserva cambió de estado. Volvé a cargarla.", 409, "RESERVA_MODIFICADA");
+    }
+
+    await registrarHistorialReserva(
+      connection,
+      reservaId,
+      "UPDATE",
+      cabecera.id,
+      req,
+      cambios,
+      `Cambio de estado: ${reservaActual.estado_nombre} → ${transicion.estadoDestino}`
+    );
+
+    if (transicion.estadoDestino === ESTADO_RECHAZADA) {
+      await liberarRecursoBloqueReserva(connection, reservaId);
+      await connection.query(
+        `UPDATE sorteo_adjudicacion_respuesta
+            SET estado = 'RECHAZADA', fecha_respuesta = COALESCE(fecha_respuesta, NOW())
+          WHERE reserva_id = ? AND estado = 'PENDIENTE'`,
+        [reservaId]
+      );
+    }
+
+    const mensajes = {
+      [ESTADO_VERIFICADA]: "Tu reserva fue verificada por Turismo y ahora espera la aprobación de un administrador.",
+      [ESTADO_APROBADA]: "Tu reserva fue aprobada.",
+      [ESTADO_RECHAZADA]: observacionesNormalizadas
+        ? `Tu reserva fue rechazada. Motivo: ${observacionesNormalizadas}`
+        : "Tu reserva fue rechazada.",
+    };
+    if (Number(reservaActual.usuario_id) !== Number(cabecera.id)) {
+      await insertarNotificacion(
+        connection,
+        reservaActual.usuario_id,
+        `RESERVA_${transicion.accion}`,
+        `Reserva #${reservaId}: ${transicion.estadoDestino}`,
+        mensajes[transicion.estadoDestino],
+        { reserva_id: reservaId, estado: transicion.estadoDestino }
+      );
+    } else if (cabecera.rol === "afiliado") {
+      await notificarStaffTurismo(
+        connection,
+        reservaActual.usuario_departamental_id,
+        "RESERVA_CANCELADA_AFILIADO",
+        `Reserva #${reservaId} cancelada por el afiliado`,
+        observacionesNormalizadas || "El afiliado canceló la reserva iniciada.",
+        { reserva_id: reservaId, estado: transicion.estadoDestino },
+        cabecera.id
+      );
+    }
+    if (transicion.estadoDestino === ESTADO_VERIFICADA) {
+      await notificarAdministradoresTurismo(
+        connection,
+        "RESERVA_PARA_APROBAR",
+        `Reserva #${reservaId} verificada`,
+        "Turismo verificó la reserva. Ya está disponible para aprobación administrativa.",
+        { reserva_id: reservaId, estado: ESTADO_VERIFICADA },
+        cabecera.id
+      );
+    }
+
+    await connection.commit();
+    return res.status(200).json({
+      success: true,
+      message: `Reserva ${transicion.estadoDestino.toLowerCase()} exitosamente`,
+      reserva: {
+        id: reservaId,
+        numero_reserva: `RES-${reservaId.toString().padStart(6, "0")}`,
+        estado: transicion.estadoDestino,
+        fecha_actualizacion: new Date().toISOString(),
+      },
+    });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.log(error);
     if (error?.statusCode) {
-      return res.status(error.statusCode).json({ success: false, message: error.message });
+      return res.status(error.statusCode).json({
+        success: false,
+        message: error.message,
+        codigo: error.codigo || null,
+      });
     }
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      message: "Error interno del servidor al actualizar el estado de la reserva"
+      message: "Error interno del servidor al actualizar el estado de la reserva",
     });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -10757,9 +11148,11 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
 router.get("/regimen", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   if (
-    cabecera.rol === "admin" ||
-    cabecera.rol === "afiliado" ||
-    cabecera.rol === "departamental"
+    (
+      cabecera.rol === "admin" ||
+      cabecera.rol === "afiliado" ||
+      cabecera.rol === "departamental"
+    ) && tieneAreaTurismo(cabecera)
   ) {
     try {
       const servicioId = req.query.servicio;
@@ -11611,22 +12004,23 @@ router.get("/mis-gestiones/catalogos", verifyToken, async (req, res) => {
   if (cabecera.rol !== "afiliado") return res.status(401).json("No autorizado");
   try {
     const db = mysqlConnection.promise();
-    const [estadosTurismo] = await db.query("SELECT id, nombre FROM estado_reserva ORDER BY id");
-    const [estadosCoseguro] = await db.query(
-      `SELECT id, COALESCE(nombre_afiliado, nombre) AS nombre, color, color_texto
-       FROM coseguro_estado WHERE id <> ? ORDER BY id`,
-      [COSEGURO_ESTADO_EXPORTADO]
-    );
-    const [estadosTraslados] = await db.query(
-      "SELECT id, nombre, color, color_texto FROM traslado_estado ORDER BY orden"
-    );
+    const [estadosTurismo] = tieneModuloTurismo(cabecera)
+      ? await db.query("SELECT id, nombre FROM estado_reserva ORDER BY id")
+      : [[]];
+    const [estadosCoseguro] = tieneModuloCoseguro(cabecera)
+      ? await db.query(
+        `SELECT id, COALESCE(nombre_afiliado, nombre) AS nombre, color, color_texto
+         FROM coseguro_estado WHERE id <> ? ORDER BY id`,
+        [COSEGURO_ESTADO_EXPORTADO]
+      )
+      : [[]];
     res.json({
       estados_turismo: estadosTurismo.map((estado) => ({
         ...estado,
         ...(COLORES_ESTADO_RESERVA[estado.nombre] || COLOR_ESTADO_GESTION_DEFECTO),
       })),
       estados_coseguro: estadosCoseguro,
-      estados_traslados: estadosTraslados,
+      estados_traslados: [],
     });
   } catch (error) {
     console.log(error);
@@ -11653,7 +12047,15 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
     };
     const orderBy = COLUMNAS_ORDEN_GESTIONES[req.query.orderBy] || "g.fecha_creacion";
 
-    // Vista unificada: ambos módulos proyectados a las mismas columnas
+    const puedeVerSalud = puedeVerDatosSaludReserva(cabecera);
+    const esPorSaludTurismoSql = puedeVerSalud ? "r.es_por_salud" : "0";
+    const estadoSaludTurismoSql = puedeVerSalud ? "rs.estado" : "NULL";
+    const joinSaludTurismoSql = puedeVerSalud
+      ? "LEFT JOIN reserva_salud rs ON rs.reserva_id = r.id"
+      : "";
+
+    // Vista unificada: ambos módulos proyectados a las mismas columnas. Si
+    // Coseguro está apagado, la rama Turismo ni siquiera une la tabla médica.
     const unionSql = `
       SELECT
         r.id,
@@ -11671,16 +12073,16 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         NULL AS importe,
         NULL AS comprobante,
         NULL AS beneficiario,
-        r.es_por_salud,
-        rs.estado AS salud_estado,
+        ${esPorSaludTurismoSql} AS es_por_salud,
+        ${estadoSaludTurismoSql} AS salud_estado,
         r.fecha_creacion
       FROM reserva r
         INNER JOIN estado_reserva er ON er.id = r.estado_reserva_id
         LEFT JOIN recurso rec ON rec.id = r.recurso_id
         LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
         LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
-        LEFT JOIN reserva_salud rs ON rs.reserva_id = r.id
-      WHERE r.usuario_id = ?
+        ${joinSaludTurismoSql}
+      WHERE r.usuario_id = ? AND ? = 1
       UNION ALL
       SELECT
         cs.id,
@@ -11706,7 +12108,7 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         LEFT JOIN usuario fam ON fam.id = cs.familiar_usuario_id
         LEFT JOIN coseguro_tipo_reintegro t ON t.id = cs.tipo_reintegro_id
         LEFT JOIN coseguro_concepto c ON c.id = cs.concepto_id
-      WHERE cs.usuario_id = ? AND cs.eliminado = 0
+      WHERE cs.usuario_id = ? AND cs.eliminado = 0 AND ? = 1
       UNION ALL
       SELECT
         ts.id,
@@ -11731,9 +12133,15 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         INNER JOIN traslado_estado te ON te.id = ts.estado_id
         INNER JOIN departamental dori ON dori.id = ts.departamental_origen_id
         INNER JOIN departamental ddes ON ddes.id = ts.departamental_destino_id
-      WHERE ts.usuario_id = ? AND ts.eliminado = 0
+      WHERE ts.usuario_id = ? AND ts.eliminado = 0 AND 1 = 0
     `;
-    const unionParams = [cabecera.id, cabecera.id, cabecera.id];
+    const unionParams = [
+      cabecera.id,
+      tieneModuloTurismo(cabecera) ? 1 : 0,
+      cabecera.id,
+      tieneModuloCoseguro(cabecera) ? 1 : 0,
+      cabecera.id,
+    ];
 
     // Filtros comunes (el tipo se aplica aparte para poder devolver los
     // contadores de ambos módulos calculados con estos mismos filtros)
@@ -15599,7 +16007,7 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
     if (cabecera.rol === "admin") {
       tienePermisos = true;
     } else if (cabecera.rol === "departamental") {
-      tienePermisos = await puedeAccederUsuarioRelacionado(db, cabecera, userId);
+      tienePermisos = await puedeAccederUsuarioPorJurisdiccion(db, cabecera, userId);
     } else if (cabecera.rol === "afiliado") {
       // Afiliado solo puede verse a sí mismo
       tienePermisos = userId === normalizarIdPositivo(cabecera.id);
@@ -15624,6 +16032,9 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
           u.rol_id,
           u.area_turismo,
           u.area_coseguro,
+          u.modulo_turismo,
+          u.modulo_coseguro,
+          u.modulo_olimpiadas,
           u.departamental_id,
           d.nombre as departamental_nombre,
           u.tipo_persona_id,
@@ -15634,6 +16045,8 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
           u.documento,
           u.email,
           u.telefono,
+          u.direccion,
+          u.dependencia_judicial,
           u.legajo,
           u.cuil,
           u.cbu,
@@ -15726,15 +16139,17 @@ router.put("/configuracion/usuario/:id", verifyToken, manejarUploadFotoPerfil, a
       if (cabecera.rol === "admin") {
         tienePermisos = true;
         camposPermitidos = [
-          'rol_id', 'area_turismo', 'area_coseguro', 'departamental_id', 'tipo_persona_id', 'nombre', 'apellido',
-          'fecha_nacimiento', 'documento', 'password', 'email', 'telefono',
+          'rol_id', 'area_turismo', 'area_coseguro', 'modulo_turismo', 'modulo_coseguro', 'modulo_olimpiadas',
+          'departamental_id', 'tipo_persona_id', 'nombre', 'apellido',
+          'fecha_nacimiento', 'documento', 'password', 'email', 'telefono', 'direccion', 'dependencia_judicial',
           'legajo', 'cuil', 'cbu', 'foto_archivo', 'habilitado'
         ];
       } else if (cabecera.rol === "departamental") {
-        tienePermisos = await puedeAccederUsuarioRelacionado(connection, cabecera, userId);
+        tienePermisos = await puedeAccederUsuarioPorJurisdiccion(connection, cabecera, userId);
         camposPermitidos = [
           'tipo_persona_id', 'nombre', 'apellido', 'fecha_nacimiento',
-          'documento', 'password', 'email', 'telefono', 'legajo',
+          'documento', 'password', 'email', 'telefono', 'direccion', 'dependencia_judicial', 'legajo',
+          'modulo_turismo', 'modulo_coseguro', 'modulo_olimpiadas',
           'cuil', 'cbu', 'foto_archivo', 'habilitado'
         ];
       } else if (cabecera.rol === "afiliado") {
@@ -15744,7 +16159,7 @@ router.put("/configuracion/usuario/:id", verifyToken, manejarUploadFotoPerfil, a
         }
         camposPermitidos = [
           'nombre', 'apellido',
-          'password', 'email', 'telefono',
+          'password', 'email', 'telefono', 'direccion', 'dependencia_judicial',
           'cuil', 'cbu', 'foto_archivo'
         ];
       } else if (["admin-central", "auditor"].includes(cabecera.rol)) {
@@ -15754,7 +16169,7 @@ router.put("/configuracion/usuario/:id", verifyToken, manejarUploadFotoPerfil, a
         }
         camposPermitidos = [
           'nombre', 'apellido',
-          'password', 'email', 'telefono', 'cuil', 'cbu', 'foto_archivo'
+          'password', 'email', 'telefono', 'direccion', 'dependencia_judicial', 'cuil', 'cbu', 'foto_archivo'
         ];
       }
 
@@ -15825,6 +16240,24 @@ router.put("/configuracion/usuario/:id", verifyToken, manejarUploadFotoPerfil, a
             cambios.push({
               campo: campoArea,
               valorAnterior: datosAnteriores[campoArea],
+              valorNuevo: nuevoValor
+            });
+          }
+        }
+      }
+
+      // Módulos visibles para cuentas afiliadas. Admin y departamental pueden
+      // gestionarlos desde el perfil; el afiliado no puede cambiarlos.
+      for (const campoModulo of ['modulo_turismo', 'modulo_coseguro', 'modulo_olimpiadas']) {
+        if (camposPermitidos.includes(campoModulo) && req.body[campoModulo] !== undefined) {
+          const nuevoValor = normalizarBooleanoBinarioEstricto(req.body[campoModulo]);
+          if (nuevoValor === null) throw crearErrorNegocio(`El valor de ${campoModulo} es inválido`, 400);
+          if (Number(datosAnteriores[campoModulo]) !== nuevoValor) {
+            updateFields.push(`${campoModulo} = ?`);
+            updateValues.push(nuevoValor);
+            cambios.push({
+              campo: campoModulo,
+              valorAnterior: datosAnteriores[campoModulo],
               valorNuevo: nuevoValor
             });
           }
@@ -15943,6 +16376,27 @@ router.put("/configuracion/usuario/:id", verifyToken, manejarUploadFotoPerfil, a
             valorAnterior: datosAnteriores.telefono,
             valorNuevo: nuevoValor
           });
+        }
+      }
+
+      for (const campoContacto of ['direccion', 'dependencia_judicial']) {
+        if (camposPermitidos.includes(campoContacto) && req.body[campoContacto] !== undefined) {
+          const nuevoValor = normalizarTexto(req.body[campoContacto]) || null;
+          if (nuevoValor && nuevoValor.length > 50) {
+            throw crearErrorNegocio(
+              campoContacto === 'direccion' ? "Dirección inválida" : "Dependencia judicial inválida",
+              400
+            );
+          }
+          if (datosAnteriores[campoContacto] !== nuevoValor) {
+            updateFields.push(`${campoContacto} = ?`);
+            updateValues.push(nuevoValor);
+            cambios.push({
+              campo: campoContacto,
+              valorAnterior: datosAnteriores[campoContacto],
+              valorNuevo: nuevoValor
+            });
+          }
         }
       }
 
@@ -16207,15 +16661,17 @@ router.post("/configuracion/usuario", verifyToken, manejarUploadFotoPerfil, asyn
 
       if (cabecera.rol === "admin") {
         camposPermitidos = [
-          'rol_id', 'area_turismo', 'area_coseguro', 'departamental_id', 'tipo_persona_id', 'nombre', 'apellido',
-          'fecha_nacimiento', 'documento', 'password', 'email', 'telefono',
+          'rol_id', 'area_turismo', 'area_coseguro', 'modulo_turismo', 'modulo_coseguro', 'modulo_olimpiadas',
+          'departamental_id', 'tipo_persona_id', 'nombre', 'apellido',
+          'fecha_nacimiento', 'documento', 'password', 'email', 'telefono', 'direccion', 'dependencia_judicial',
           'legajo', 'cuil', 'cbu', 'foto_archivo', 'habilitado'
         ];
       } else if (cabecera.rol === "departamental") {
         // Departamental puede crear usuarios pero con restricciones
         camposPermitidos = [
           'tipo_persona_id', 'nombre', 'apellido', 'fecha_nacimiento',
-          'documento', 'password', 'email', 'telefono', 'legajo',
+          'documento', 'password', 'email', 'telefono', 'direccion', 'dependencia_judicial', 'legajo',
+          'modulo_turismo', 'modulo_coseguro', 'modulo_olimpiadas',
           'cuil', 'cbu', 'foto_archivo', 'habilitado'
         ];
         // Asignar automáticamente rol afiliado y su departamento
@@ -16347,6 +16803,17 @@ router.post("/configuracion/usuario", verifyToken, manejarUploadFotoPerfil, asyn
         }
       }
 
+      for (const campoModulo of ['modulo_turismo', 'modulo_coseguro', 'modulo_olimpiadas']) {
+        if (camposPermitidos.includes(campoModulo) && req.body[campoModulo] !== undefined) {
+          const nuevoValor = normalizarBooleanoBinarioEstricto(req.body[campoModulo]);
+          if (nuevoValor === null) throw crearErrorNegocio(`El valor de ${campoModulo} es inválido`, 400);
+          insertFields.push(campoModulo);
+          insertPlaceholders.push('?');
+          insertValues.push(nuevoValor);
+          cambios.push({ campo: campoModulo, valorAnterior: null, valorNuevo: nuevoValor });
+        }
+      }
+
       // Procesar nombre (requerido)
       insertFields.push('nombre');
       insertPlaceholders.push('?');
@@ -16433,6 +16900,22 @@ router.post("/configuracion/usuario", verifyToken, manejarUploadFotoPerfil, asyn
           valorAnterior: null,
           valorNuevo: telefono
         });
+      }
+
+      for (const campoContacto of ['direccion', 'dependencia_judicial']) {
+        if (camposPermitidos.includes(campoContacto) && req.body[campoContacto] !== undefined) {
+          const valor = normalizarTexto(req.body[campoContacto]) || null;
+          if (valor && valor.length > 50) {
+            throw crearErrorNegocio(
+              campoContacto === 'direccion' ? "Dirección inválida" : "Dependencia judicial inválida",
+              400
+            );
+          }
+          insertFields.push(campoContacto);
+          insertPlaceholders.push('?');
+          insertValues.push(valor);
+          cambios.push({ campo: campoContacto, valorAnterior: null, valorNuevo: valor });
+        }
       }
 
       // Procesar legajo
@@ -16588,16 +17071,14 @@ router.post("/configuracion/usuario", verifyToken, manejarUploadFotoPerfil, asyn
 });
 
 function verifyToken(req, res, next) {
-  const coincidencia = /^Bearer ([^\s]+)$/.exec(String(req.headers.authorization || ""));
-  if (!coincidencia) return res.status(401).json("No autorizado");
-
-  jwt.verify(coincidencia[1], process.env.JWT_SECRET, (error, authData) => {
-    if (error) {
-      res.status(403).json("Error en el token");
-    } else {
-      req.data = authData;
-      next();
-    }
+  return verificarTokenConAutorizacionActual({
+    req,
+    res,
+    next,
+    jwt,
+    jwtSecret: process.env.JWT_SECRET,
+    db: mysqlConnection.promise(),
+    mensajeAuthorization: "No autorizado",
   });
 }
 

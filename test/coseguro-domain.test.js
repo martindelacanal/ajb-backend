@@ -1,6 +1,5 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const jwt = require("jsonwebtoken");
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || "test-only-secret";
 
@@ -12,6 +11,8 @@ const {
   decodificarFirmaBase64,
   normalizarFecha,
   normalizarImporte,
+  puedeVerSubsidio,
+  tieneAreaCoseguro,
   validarContenidoArchivo,
   verifyToken,
 } = router.__test;
@@ -111,7 +112,30 @@ test("coseguro busca duplicados con la misma identidad canónica que los claims"
   assert.deepEqual(consulta.params, [5, 6, "123", "20123456786", 42, "00001", 9]);
 });
 
-test("coseguro requiere esquema Bearer estricto", async () => {
+test("coseguro aplica el modulo al afiliado y conserva el area del staff", () => {
+  assert.equal(tieneAreaCoseguro({ rol: "afiliado", modulo_coseguro: 0 }), false);
+  assert.equal(tieneAreaCoseguro({ rol: "afiliado", modulo_coseguro: 1 }), true);
+  assert.equal(tieneAreaCoseguro({ rol: "departamental", area_coseguro: 0 }), false);
+  assert.equal(tieneAreaCoseguro({ rol: "departamental", area_coseguro: 1 }), true);
+  assert.equal(tieneAreaCoseguro({ rol: "admin" }), true);
+});
+
+test("un afiliado sin Coseguro no puede leer ni siquiera su subsidio propio", () => {
+  const subsidio = { usuario_id: 17, afiliado_departamental_id: 8 };
+
+  assert.equal(puedeVerSubsidio({ rol: "afiliado", id: 17, modulo_coseguro: 0 }, subsidio), false);
+  assert.equal(puedeVerSubsidio({ rol: "afiliado", id: 17, modulo_coseguro: 1 }, subsidio), true);
+  assert.equal(
+    puedeVerSubsidio({ rol: "departamental", departamental_id: 8, area_coseguro: 1 }, subsidio),
+    true
+  );
+  assert.equal(
+    puedeVerSubsidio({ rol: "departamental", departamental_id: 8, area_coseguro: 0 }, subsidio),
+    false
+  );
+});
+
+test("coseguro requiere esquema Bearer estricto", () => {
   const respuesta = () => ({
     codigo: null,
     cuerpo: null,
@@ -124,11 +148,4 @@ test("coseguro requiere esquema Bearer estricto", async () => {
     verifyToken({ headers: { authorization } }, res, () => assert.fail("no debe continuar"));
     assert.equal(res.codigo, 401, authorization);
   }
-
-  const token = jwt.sign({ data: JSON.stringify({ id: 1, rol: "admin" }) }, process.env.JWT_SECRET);
-  const req = { headers: { authorization: `Bearer ${token}` } };
-  let continuo = false;
-  verifyToken(req, respuesta(), () => { continuo = true; });
-  assert.equal(continuo, true);
-  assert.equal(JSON.parse(req.data.data).id, 1);
 });

@@ -1,6 +1,5 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const jwt = require("jsonwebtoken");
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || "test-only-secret";
 
@@ -138,9 +137,4 @@ test("olimpiadas requiere esquema Bearer estricto", () => {
     verifyToken({ headers: { authorization } }, res, () => assert.fail("no debe continuar"));
     assert.equal(res.codigo, 401, authorization);
   }
-  const token = jwt.sign({ data: JSON.stringify({ id: 1, rol: "admin" }) }, process.env.JWT_SECRET);
-  const req = { headers: { authorization: `Bearer ${token}` } };
-  let continuo = false;
-  verifyToken(req, respuesta(), () => { continuo = true; });
-  assert.equal(continuo, true);
 });

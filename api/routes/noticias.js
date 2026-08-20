@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const mysqlConnection = require("../connection/connection");
 const jwt = require("jsonwebtoken");
+const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
 const multer = require("multer");
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
@@ -159,12 +160,14 @@ function manejarUploadNoticia(req, res, next) {
 }
 
 function verifyToken(req, res, next) {
-  const coincidencia = /^Bearer ([^\s]+)$/.exec(String(req.headers.authorization || ""));
-  if (!coincidencia) return res.status(401).json("Se requiere Authorization: Bearer <token>");
-  jwt.verify(coincidencia[1], process.env.JWT_SECRET, (error, authData) => {
-    if (error) return res.status(403).json("Error en el token");
-    req.data = authData;
-    return next();
+  return verificarTokenConAutorizacionActual({
+    req,
+    res,
+    next,
+    jwt,
+    jwtSecret: process.env.JWT_SECRET,
+    db: mysqlConnection.promise(),
+    mensajeAuthorization: "Se requiere Authorization: Bearer <token>",
   });
 }
 

@@ -15,6 +15,7 @@ const express = require("express");
 const router = express.Router();
 const mysqlConnection = require("../connection/connection");
 const jwt = require("jsonwebtoken");
+const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
 const multer = require("multer");
 const crypto = require("crypto");
 const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
@@ -169,12 +170,23 @@ function manejarUploadOlimpiadas(req, res, next) {
 // Auth
 // ---------------------------------------------------------------------------
 function verifyToken(req, res, next) {
-  const coincidencia = /^Bearer ([^\s]+)$/.exec(String(req.headers.authorization || ""));
-  if (!coincidencia) return res.status(401).json("Se requiere Authorization: Bearer <token>");
-  jwt.verify(coincidencia[1], process.env.JWT_SECRET, (error, authData) => {
-    if (error) return res.status(403).json("Error en el token");
-    req.data = authData;
-    return next();
+  return verificarTokenConAutorizacionActual({
+    req,
+    res,
+    next: () => {
+      const cabecera = JSON.parse(req.data.data);
+      if (
+        cabecera.rol === "afiliado"
+        && Number(cabecera.modulo_olimpiadas) !== 1
+      ) {
+        return res.status(403).json("El módulo de Olimpiadas no está habilitado para este usuario");
+      }
+      return next();
+    },
+    jwt,
+    jwtSecret: process.env.JWT_SECRET,
+    db: mysqlConnection.promise(),
+    mensajeAuthorization: "Se requiere Authorization: Bearer <token>",
   });
 }
 

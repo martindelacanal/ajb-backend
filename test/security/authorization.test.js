@@ -6,6 +6,7 @@ const jwt = require("jsonwebtoken");
 process.env.JWT_SECRET = "security-regression-test-secret";
 
 const databaseCalls = [];
+let usuarioSesionActual = null;
 let databaseHandler = async (sql) => {
   if (/COUNT\(\*\)/i.test(sql)) {
     return [[{ count: 0, total: 0 }]];
@@ -22,6 +23,9 @@ const fakeConnection = {
       },
       query: async (sql, params = []) => {
         databaseCalls.push({ method: "query", sql, params });
+        if (esConsultaAutorizacion(sql)) {
+          return usuarioSesionActual ? [[usuarioSesionActual]] : [[]];
+        }
         return databaseHandler(sql, params);
       },
     };
@@ -46,6 +50,37 @@ function setDatabaseHandler(handler) {
   databaseHandler = handler;
 }
 
+function esConsultaAutorizacion(sql) {
+  return /u\.modulo_olimpiadas[\s\S]+FROM usuario u[\s\S]+INNER JOIN rol r[\s\S]+WHERE u\.id = \?/i.test(sql);
+}
+
+function filaAutorizacion(claims) {
+  const rolIds = {
+    admin: 1,
+    departamental: 2,
+    afiliado: 3,
+    "admin-central": 4,
+    auditor: 5,
+    invitado: 6,
+  };
+  return {
+    id: Number(claims.id),
+    rol_id: rolIds[claims.rol] || 99,
+    rol: claims.rol,
+    departamental_id: claims.departamental_id ?? null,
+    habilitado: claims.habilitado ?? "Y",
+    area_turismo: claims.area_turismo ?? 1,
+    area_coseguro: claims.area_coseguro ?? 1,
+    modulo_turismo: claims.modulo_turismo ?? 1,
+    modulo_coseguro: claims.modulo_coseguro ?? 1,
+    modulo_olimpiadas: claims.modulo_olimpiadas ?? 1,
+  };
+}
+
+function consultasDeNegocio() {
+  return databaseCalls.filter(({ sql }) => !esConsultaAutorizacion(sql));
+}
+
 function tokenFor(overrides = {}) {
   const claims = {
     id: 100,
@@ -54,6 +89,7 @@ function tokenFor(overrides = {}) {
     area_turismo: 1,
     ...overrides,
   };
+  usuarioSesionActual = filaAutorizacion(claims);
   return jwt.sign({ data: JSON.stringify(claims) }, process.env.JWT_SECRET);
 }
 
@@ -138,7 +174,8 @@ test("tabla de reservas rechaza roles no autorizados antes de consultar la base"
       });
 
       assert.equal(response.status, 403);
-      assert.equal(databaseCalls.length, 0);
+      assert.equal(consultasDeNegocio().length, 0);
+      assert.equal(databaseCalls.filter(({ sql }) => esConsultaAutorizacion(sql)).length, 1);
     });
   }
 });
@@ -196,7 +233,7 @@ test("tabla de reservas falla cerrada ante un departamental sin alcance valido",
       });
 
       assert.equal(response.status, 403);
-      assert.equal(databaseCalls.length, 0);
+      assert.equal(consultasDeNegocio().length, 0);
     });
   }
 });
@@ -223,7 +260,7 @@ test("historial de usuarios exige ID al departamental", async () => {
   });
 
   assert.equal(response.status, 400);
-  assert.equal(databaseCalls.length, 0);
+  assert.equal(consultasDeNegocio().length, 0);
 });
 
 test("historial de usuarios rechaza IDs, claims y roles no validos sin leer historiales", async (t) => {
@@ -257,7 +294,7 @@ test("historial de usuarios rechaza IDs, claims y roles no validos sin leer hist
       });
 
       assert.equal(response.status, caso.status);
-      assert.equal(databaseCalls.length, 0);
+      assert.equal(consultasDeNegocio().length, 0);
     });
   }
 });
@@ -347,7 +384,7 @@ test("historial de reservas exige ID al departamental", async () => {
   });
 
   assert.equal(response.status, 400);
-  assert.equal(databaseCalls.length, 0);
+  assert.equal(consultasDeNegocio().length, 0);
 });
 
 test("historial de reservas rechaza IDs y claims no validos sin leer historiales", async (t) => {
@@ -381,7 +418,7 @@ test("historial de reservas rechaza IDs y claims no validos sin leer historiales
       });
 
       assert.equal(response.status, caso.status);
-      assert.equal(databaseCalls.length, 0);
+      assert.equal(consultasDeNegocio().length, 0);
     });
   }
 });

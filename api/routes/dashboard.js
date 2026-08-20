@@ -3,6 +3,7 @@
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const mysqlConnection = require("../connection/connection");
+const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
 const { crearServicioDashboard, crearServicioActividad } = require("../services/dashboard");
 
 const router = express.Router();
@@ -10,13 +11,14 @@ const dashboard = crearServicioDashboard({ conexion: mysqlConnection });
 const actividad = crearServicioActividad({ conexion: mysqlConnection });
 
 function verifyToken(req, res, next) {
-  const coincidencia = /^Bearer ([^\s]+)$/.exec(String(req.headers.authorization || ""));
-  if (!coincidencia) return res.status(401).json("No autorizado");
-
-  jwt.verify(coincidencia[1], process.env.JWT_SECRET, (error, authData) => {
-    if (error) return res.status(403).json("Error en el token");
-    req.data = authData;
-    return next();
+  return verificarTokenConAutorizacionActual({
+    req,
+    res,
+    next,
+    jwt,
+    jwtSecret: process.env.JWT_SECRET,
+    db: mysqlConnection.promise(),
+    mensajeAuthorization: "No autorizado",
   });
 }
 
