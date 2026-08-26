@@ -15,6 +15,7 @@ const socketio = require('socket.io');
 const { addUser, removeUser, getUser, getUsersByUsuario } = require("./api/socket/socket-user");
 const { registrarEventosChatTiempoReal } = require("./api/socket/chat-tiempo-real");
 const { iniciarMantenimientoReservas } = require("./api/services/reservas-turismo");
+const { verificarCorreo } = require("./api/services/correo");
 const {
     obtenerSnapshotDisponibilidad,
     parsearParametrosBusquedaDisponibilidad,
@@ -417,3 +418,17 @@ io.on("connection", (socket) => {
 
 server.listen(port);
 iniciarMantenimientoReservas(mysqlConnection.promise());
+
+// Chequeo informativo del correo saliente: no bloquea el arranque, solo deja
+// registro si la casilla de notificaciones quedo mal configurada.
+verificarCorreo().then((resultado) => {
+    if (resultado.conectado) {
+        console.log(`[correo] SMTP listo (${resultado.detalle.usuario} via ${resultado.detalle.host}:${resultado.detalle.puerto})`);
+    } else if (resultado.motivo === "sin_configurar") {
+        console.warn("[correo] Sin configuracion SMTP: las notificaciones por mail estan desactivadas.");
+    } else {
+        console.error("[correo] No se pudo conectar al servidor SMTP:", resultado.error);
+    }
+}).catch((error) => {
+    console.error("[correo] Verificacion de SMTP fallida:", error?.message || error);
+});

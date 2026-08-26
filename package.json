@@ -16,7 +16,9 @@
     "migrate:reservas-plazos": "node scripts/migrar-reservas-plazos-v1.js",
     "migrate:reservas-plazos:check": "node scripts/migrar-reservas-plazos-v1.js --check",
     "migrate:preferencias-modulos-contacto": "node scripts/migrar-preferencias-modulos-contacto.js",
-    "seed:login-gallery": "node scripts/seed-login-gallery.js"
+    "seed:login-gallery": "node scripts/seed-login-gallery.js",
+    "mail:verificar": "node scripts/probar-correo.js --solo-verificar",
+    "mail:probar": "node scripts/probar-correo.js"
   },
   "keywords": [],
   "author": "",
@@ -39,6 +41,7 @@
     "mysql": "^2.18.1",
     "mysql2": "^3.3.3",
     "node-forge": "^1.4.0",
+    "nodemailer": "^9.0.5",
     "sharp": "^0.35.3",
     "socket.io": "^4.5.1"
   },
