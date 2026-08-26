@@ -48,6 +48,9 @@ const mysqlConnection = mysql.createPool({
   multipleStatements: false,
   enableKeepAlive: true,
   keepAliveInitialDelay: 0,
+  // Ojo: no usar maxIdle/idleTimeout. Con maxIdle < connectionLimit mysql2 arma
+  // un temporizador que nunca se libera (unref) y mantiene vivo cualquier
+  // proceso que cargue este módulo (los tests y scripts no terminan).
   decimalNumbers: true,
   // Toda fecha/hora de negocio se interpreta en Argentina. Esto también alinea
   // CURDATE()/NOW() de MySQL con las validaciones civiles de la API.
@@ -78,12 +81,18 @@ mysqlConnection.on("connection", connection => {
   });
 
   connection.on("error", err => {
-        console.error(new Date(), "MySQL error", err.code);
-    });
+    // 4031 / PROTOCOL_CONNECTION_LOST: el servidor cerró una conexión ociosa.
+    // El pool la descarta solo; no es un fallo del sistema.
+    if (err?.code === "ER_CLIENT_INTERACTION_TIMEOUT" || err?.code === "PROTOCOL_CONNECTION_LOST") {
+      console.info(new Date(), "MySQL: conexión ociosa cerrada por el servidor, se descarta del pool", err.code);
+      return;
+    }
+    console.error(new Date(), "MySQL error", err?.code, err?.message);
+  });
 
-    connection.on("close", err => {
-        console.error(new Date(), "MySQL close", err);
-    });
+  connection.on("close", err => {
+    if (err) console.error(new Date(), "MySQL close", err);
+  });
 });
 
 module.exports = mysqlConnection;

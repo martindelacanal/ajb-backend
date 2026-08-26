@@ -13,6 +13,7 @@
 const express = require("express");
 const router = express.Router();
 const mysqlConnection = require("../connection/connection");
+const { registrarErrorRuta } = require("../services/errores");
 const jwt = require("jsonwebtoken");
 const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
 const multer = require("multer");
@@ -531,7 +532,7 @@ router.get("/traslados/catalogos", verifyToken, async (req, res) => {
       })),
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los catálogos de traslados");
   }
 });
@@ -570,7 +571,7 @@ router.get("/traslados/departamentales/:id/localidades", verifyToken, async (req
     );
     res.status(200).json(rows);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener las localidades");
   }
 });
@@ -605,7 +606,7 @@ router.post("/traslados/departamentales/:id/localidades", verifyToken, async (re
     );
     res.status(201).json({ success: true, id: resultado.insertId, message: "Localidad agregada" });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al agregar la localidad");
   }
 });
@@ -632,7 +633,7 @@ router.put("/traslados/localidades/:id", verifyToken, async (req, res) => {
     await db.query("UPDATE departamental_localidad SET nombre = ? WHERE id = ?", [nombre, localidadId]);
     res.status(200).json({ success: true, message: "Localidad actualizada" });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al actualizar la localidad");
   }
 });
@@ -664,7 +665,7 @@ router.delete("/traslados/localidades/:id", verifyToken, async (req, res) => {
     await db.query("DELETE FROM departamental_localidad WHERE id = ?", [localidadId]);
     res.status(200).json({ success: true, deshabilitada: false, message: "Localidad eliminada" });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al eliminar la localidad");
   }
 });
@@ -709,7 +710,7 @@ router.get("/traslados/afiliados-buscar", verifyToken, async (req, res) => {
     );
     res.status(200).json(rows);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al buscar afiliados");
   }
 });
@@ -925,7 +926,7 @@ router.post("/traslados/solicitudes", verifyToken, manejarUploadTraslados, async
     if (error && error.code === "ER_DUP_ENTRY") {
       return res.status(409).json("El afiliado ya tiene una solicitud de traslado en curso. Cancelala o concretala antes de iniciar otra.");
     }
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al crear la solicitud de traslado");
   } finally {
     if (connection) connection.release();
@@ -1138,7 +1139,7 @@ router.get("/traslados/solicitudes", verifyToken, async (req, res) => {
 
     res.status(200).json({ results, totalItems, page, pageSize, resumen });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener las solicitudes de traslado");
   }
 });
@@ -1280,7 +1281,7 @@ router.get("/traslados/solicitudes/:id", verifyToken, async (req, res) => {
       ),
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener el detalle de la solicitud de traslado");
   }
 });
@@ -1494,7 +1495,7 @@ router.put("/traslados/solicitudes/:id", verifyToken, manejarUploadTraslados, as
   } catch (error) {
     if (connection && !transaccionConfirmada) await connection.rollback();
     if (!transaccionConfirmada) await eliminarObjetosS3Seguro(objetosSubidos);
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al actualizar la solicitud de traslado");
   } finally {
     if (connection) connection.release();
@@ -1591,7 +1592,7 @@ router.put("/traslados/solicitudes/:id/estado", verifyToken, async (req, res) =>
     if (error && error.code === "ER_DUP_ENTRY") {
       return res.status(409).json("No se puede reabrir: el afiliado ya tiene otra solicitud de traslado en curso.");
     }
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al cambiar el estado de la solicitud");
   } finally {
     if (connection) connection.release();
@@ -1649,7 +1650,7 @@ router.post("/traslados/solicitudes/:id/observaciones", verifyToken, async (req,
     res.status(201).json({ success: true, message: "Mensaje enviado" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al enviar el mensaje");
   } finally {
     if (connection) connection.release();
@@ -1694,7 +1695,7 @@ router.delete("/traslados/solicitudes/:id", verifyToken, async (req, res) => {
     res.status(200).json({ success: true, message: "Solicitud eliminada" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al eliminar la solicitud");
   } finally {
     if (connection) connection.release();
@@ -1728,7 +1729,7 @@ router.get("/traslados/archivos/:id/descargar", verifyToken, async (req, res) =>
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(nombre)}"`);
     res.status(200).send(objeto.buffer);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al descargar el archivo");
   }
 });

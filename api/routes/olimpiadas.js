@@ -14,6 +14,7 @@
 const express = require("express");
 const router = express.Router();
 const mysqlConnection = require("../connection/connection");
+const { registrarErrorRuta } = require("../services/errores");
 const jwt = require("jsonwebtoken");
 const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
 const multer = require("multer");
@@ -392,7 +393,7 @@ router.get("/olimpiadas/catalogos", verifyToken, async (req, res) => {
       disciplinas: await firmarIconosDisciplinas(disciplinas),
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los catálogos de olimpiadas");
   }
 });
@@ -414,7 +415,7 @@ router.get("/olimpiadas/tipos-disciplina", verifyToken, async (req, res) => {
     );
     res.status(200).json(tipos);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los tipos de disciplina");
   }
 });
@@ -434,7 +435,7 @@ router.post("/olimpiadas/tipos-disciplina", verifyToken, async (req, res) => {
     });
     res.status(201).json({ success: true, id: resultado.insertId, message: "Tipo de disciplina creado" });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al crear el tipo de disciplina");
   }
 });
@@ -458,7 +459,7 @@ router.put("/olimpiadas/tipos-disciplina/:id", verifyToken, async (req, res) => 
     });
     res.status(200).json({ success: true, message: "Tipo de disciplina actualizado" });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al actualizar el tipo de disciplina");
   }
 });
@@ -484,7 +485,7 @@ router.delete("/olimpiadas/tipos-disciplina/:id", verifyToken, async (req, res) 
     });
     res.status(200).json({ success: true, message: "Tipo de disciplina eliminado" });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al eliminar el tipo de disciplina");
   }
 });
@@ -505,7 +506,7 @@ router.get("/olimpiadas/disciplinas", verifyToken, async (req, res) => {
     );
     res.status(200).json(await firmarIconosDisciplinas(disciplinas));
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener las disciplinas");
   }
 });
@@ -550,7 +551,7 @@ router.post("/olimpiadas/disciplinas", verifyToken, manejarUploadOlimpiadas, asy
     });
     res.status(201).json({ success: true, id: resultado.insertId, message: "Disciplina creada" });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al crear la disciplina");
   }
 });
@@ -607,7 +608,7 @@ router.put("/olimpiadas/disciplinas/:id", verifyToken, manejarUploadOlimpiadas, 
     }
     res.status(200).json({ success: true, message: "Disciplina actualizada" });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al actualizar la disciplina");
   }
 });
@@ -637,7 +638,7 @@ router.delete("/olimpiadas/disciplinas/:id", verifyToken, async (req, res) => {
     });
     res.status(200).json({ success: true, message: "Disciplina eliminada" });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al eliminar la disciplina");
   }
 });
@@ -659,7 +660,7 @@ router.get("/olimpiadas/config", verifyToken, async (req, res) => {
       tiene_firma: !!config.firma_secretario_archivo,
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener la configuración de olimpiadas");
   }
 });
@@ -707,7 +708,7 @@ router.put("/olimpiadas/config", verifyToken, manejarUploadOlimpiadas, async (re
     res.status(200).json({ success: true, message: "Configuración guardada" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al guardar la configuración de olimpiadas");
   } finally {
     if (connection) connection.release();
@@ -761,7 +762,7 @@ router.get("/olimpiadas/actual", verifyToken, async (req, res) => {
       inscripcion_abierta: !!olimpiada,
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener la olimpiada vigente");
   }
 });
@@ -788,7 +789,7 @@ router.get("/olimpiadas", verifyToken, async (req, res) => {
     );
     res.status(200).json(olimpiadas);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener las olimpiadas");
   }
 });
@@ -807,7 +808,7 @@ router.get("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
     );
     res.status(200).json({ ...rows[0], disciplinas });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener la olimpiada");
   }
 });
@@ -1008,7 +1009,7 @@ router.post("/olimpiadas", verifyToken, async (req, res) => {
     res.status(201).json({ success: true, id: olimpiadaId, message: "Olimpiada creada" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al crear la olimpiada");
   } finally {
     if (connection) connection.release();
@@ -1095,7 +1096,7 @@ router.put("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
     res.status(200).json({ success: true, message: "Olimpiada actualizada" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al actualizar la olimpiada");
   } finally {
     if (connection) connection.release();
@@ -1124,7 +1125,7 @@ router.delete("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
     res.status(200).json({ success: true, message: "Olimpiada eliminada" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al eliminar la olimpiada");
   } finally {
     if (connection) connection.release();
@@ -1150,7 +1151,7 @@ router.get("/olimpiadas/:id(\\d+)/mensajes", verifyToken, async (req, res) => {
     );
     res.status(200).json(mensajes);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los mensajes");
   }
 });
@@ -1208,7 +1209,7 @@ router.post("/olimpiadas/:id(\\d+)/mensajes", verifyToken, async (req, res) => {
     res.status(201).json({ success: true, message: `Mensaje enviado a ${inscriptos.length} inscriptos` });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al enviar el mensaje");
   } finally {
     if (connection) connection.release();
@@ -1393,7 +1394,7 @@ router.post("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, manejarUploadOli
     res.status(201).json({ success: true, id: inscripcionId, message: "¡Inscripción enviada! Nos vemos en las olimpiadas" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al enviar la inscripción");
   } finally {
     if (connection) connection.release();
@@ -1429,7 +1430,7 @@ router.get("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, async (req, res) 
     );
     res.status(200).json(inscripciones);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener las inscripciones");
   }
 });
@@ -1454,7 +1455,7 @@ router.get("/olimpiadas/mis-inscripciones", verifyToken, async (req, res) => {
     );
     res.status(200).json(inscripciones);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener tus inscripciones");
   }
 });
@@ -1551,7 +1552,7 @@ router.get("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, async (req, res) 
       foto_url: await getSignedFileUrlFromS3(inscripcion.foto_archivo).catch(() => null),
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener la inscripción");
   }
 });
@@ -1747,7 +1748,7 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
     res.status(200).json({ success: true, message: "Inscripción actualizada" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al actualizar la inscripción");
   } finally {
     if (connection) connection.release();
@@ -1845,7 +1846,7 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)/estado", verifyToken, async (req
     res.status(200).json({ success: true, message: "Estado actualizado", estado: estadoNuevo });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al actualizar el estado");
   } finally {
     if (connection) connection.release();
@@ -1900,7 +1901,7 @@ router.delete("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, async (req, re
     res.status(200).json({ success: true, message: "Inscripción eliminada" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al eliminar la inscripción");
   } finally {
     if (connection) connection.release();
@@ -1956,7 +1957,7 @@ router.post("/olimpiadas/inscripciones/:id(\\d+)/observaciones", verifyToken, as
     res.status(201).json({ success: true, message: "Mensaje enviado" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al enviar el mensaje");
   } finally {
     if (connection) connection.release();
@@ -1980,7 +1981,7 @@ router.get("/olimpiadas/inscripciones/:id(\\d+)/certificado", verifyToken, async
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(nombre)}"`);
     res.status(200).send(objeto.buffer);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al descargar el certificado");
   }
 });
@@ -2006,7 +2007,7 @@ router.get("/olimpiadas/historial", verifyToken, async (req, res) => {
     );
     res.status(200).json(historial);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener el historial");
   }
 });

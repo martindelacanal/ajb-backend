@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 
 const mysqlConnection = require("../connection/connection");
+const { registrarErrorRuta } = require("../services/errores");
 
 const jwt = require("jsonwebtoken");
 
@@ -793,7 +794,7 @@ router.get("/credencial-digital", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener la credencial digital");
   }
 });
@@ -850,7 +851,7 @@ router.get("/credencial-digital/verificacion/:hash", async (req, res) => {
     });
 
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json({
       estado: "Inexistente",
       descripcion: "Error interno del servidor"
@@ -895,7 +896,7 @@ router.get("/lugares", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los lugares");
   }
 });
@@ -1233,7 +1234,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los servicios");
   }
 });
@@ -1248,7 +1249,7 @@ router.get("/turismo/propuestas", verifyToken, async (req, res) => {
     const propuestas = await obtenerPropuestasTurismo(mysqlConnection.promise());
     res.status(200).json(propuestas);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener las propuestas de turismo");
   }
 });
@@ -1263,7 +1264,7 @@ router.get("/admin/turismo/propuestas", verifyToken, async (req, res) => {
     const propuestas = await obtenerPropuestasTurismo(mysqlConnection.promise());
     res.status(200).json(propuestas);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener las propuestas de turismo");
   }
 });
@@ -1326,7 +1327,7 @@ router.put("/admin/turismo/propuestas/:id", verifyToken, manejarUploadTurismoPro
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al actualizar la propuesta de turismo");
   } finally {
     if (connection) {
@@ -1345,7 +1346,7 @@ router.get("/turismo/testimonios", verifyToken, async (req, res) => {
     const testimonios = await obtenerTestimoniosTurismo(mysqlConnection.promise(), { soloActivos: true });
     res.status(200).json(testimonios);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los testimonios de turismo");
   }
 });
@@ -1360,7 +1361,7 @@ router.get("/admin/turismo/testimonios", verifyToken, async (req, res) => {
     const testimonios = await obtenerTestimoniosTurismo(mysqlConnection.promise());
     res.status(200).json(testimonios);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los testimonios de turismo");
   }
 });
@@ -1394,7 +1395,7 @@ router.post("/admin/turismo/testimonios", verifyToken, manejarUploadTurismoTesti
     const testimonios = await obtenerTestimoniosTurismo(db, { testimonioId: resultado.insertId });
     res.status(201).json(testimonios[0]);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al crear el testimonio de turismo");
   }
 });
@@ -1459,7 +1460,7 @@ router.put("/admin/turismo/testimonios/:id", verifyToken, manejarUploadTurismoTe
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al actualizar el testimonio de turismo");
   } finally {
     if (connection) {
@@ -1492,7 +1493,7 @@ router.delete("/admin/turismo/testimonios/:id", verifyToken, async (req, res) =>
 
     res.status(200).json({ id: testimonioId });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al eliminar el testimonio de turismo");
   }
 });
@@ -1530,7 +1531,7 @@ router.get("/admin/convenios-hoteleros", verifyToken, async (req, res) => {
 
     res.status(200).json(respuesta);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los convenios hoteleros");
   }
 });
@@ -1579,7 +1580,7 @@ router.get("/admin/convenios-hoteleros/:id", verifyToken, async (req, res) => {
 
     res.status(200).json(respuesta);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener el convenio hotelero");
   }
 });
@@ -1665,7 +1666,7 @@ router.post("/admin/convenios-hoteleros", verifyToken, manejarUploadConvenioHote
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al crear el convenio hotelero");
   } finally {
     if (connection) {
@@ -1807,7 +1808,7 @@ router.put("/admin/convenios-hoteleros/:id", verifyToken, manejarUploadConvenioH
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al actualizar el convenio hotelero");
   } finally {
     if (connection) {
@@ -1840,7 +1841,7 @@ router.patch("/admin/convenios-hoteleros/:id/activo", verifyToken, async (req, r
 
     res.status(200).json({ message: "Convenio hotelero actualizado", activo: activo === 1 });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al actualizar el estado del convenio hotelero");
   }
 });
@@ -1891,7 +1892,7 @@ router.get("/convenios-hoteleros", verifyToken, async (req, res) => {
 
     res.status(200).json(respuesta);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (esErrorTemporadaAltaNoMigrada(error)) {
       return res.status(200).json([]);
     }
@@ -1944,7 +1945,7 @@ router.get("/convenios-hoteleros/:id", verifyToken, async (req, res) => {
 
     res.status(200).json(respuesta);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener el convenio hotelero");
   }
 });
@@ -2003,7 +2004,7 @@ router.get("/servicios/disponibilidad", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener disponibilidad de servicios");
   }
 });
@@ -2082,7 +2083,7 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener fechas alternativas");
   }
 });
@@ -2104,7 +2105,7 @@ router.get("/recursos", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los recursos");
   }
 });
@@ -2121,7 +2122,7 @@ router.get("/adicionales", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los adicionales");
   }
 });
@@ -2208,7 +2209,7 @@ router.get("/sorteos/activos", verifyToken, async (req, res) => {
 
     res.status(200).json(Array.from(sorteosMap.values()));
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (esErrorTemporadaAltaNoMigrada(error)) {
       return res.status(200).json([]);
     }
@@ -2231,7 +2232,7 @@ router.get("/sorteos/inscripcion-activa", verifyToken, async (req, res) => {
       inscripcion
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (esErrorTemporadaAltaNoMigrada(error)) {
       return res.status(200).json({ activa: false, inscripcion: null });
     }
@@ -2287,7 +2288,7 @@ router.get("/turismo/afiliados-buscar", verifyToken, async (req, res) => {
       modulo_coseguro: Number(row.modulo_coseguro) === 1 ? 1 : 0,
     })));
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     return res.status(500).json("Error al buscar afiliados de Turismo");
   }
 });
@@ -2445,7 +2446,7 @@ router.get("/notificaciones", verifyToken, async (req, res) => {
       hay_mas: offset + rows.length < total
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (esErrorTemporadaAltaNoMigrada(error)) {
       return res.status(200).json({ notificaciones: [], no_leidas: 0, total: 0, pagina: 1, paginas: 1, hay_mas: false });
     }
@@ -2475,7 +2476,7 @@ router.put("/notificaciones/leidas", verifyToken, async (req, res) => {
       actualizadas: Number(result.affectedRows || 0)
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al marcar notificaciones");
   }
 });
@@ -2508,7 +2509,7 @@ router.put("/notificaciones/:id/leida", verifyToken, async (req, res) => {
 
     res.status(200).json({ message: "Notificacion marcada como leida" });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al marcar notificacion");
   }
 });
@@ -2537,7 +2538,7 @@ router.get("/observaciones/:modulo/:entidadId/lectura", verifyToken, async (req,
     );
     res.status(200).json({ ultima_observacion_id: rows.length ? Number(rows[0].ultima_observacion_id) : 0 });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener la lectura del chat");
   }
 });
@@ -2564,7 +2565,7 @@ router.put("/observaciones/:modulo/:entidadId/lectura", verifyToken, async (req,
     );
     res.status(200).json({ success: true });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al marcar el chat como leído");
   }
 });
@@ -2582,7 +2583,7 @@ router.get("/sorteos/adjudicaciones/pendiente", verifyToken, async (req, res) =>
       adjudicacion
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (esErrorTemporadaAltaNoMigrada(error)) {
       return res.status(200).json({ pendiente: false, adjudicacion: null });
     }
@@ -2670,7 +2671,7 @@ router.put("/sorteos/adjudicaciones/:id/aceptar", verifyToken, async (req, res) 
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
     }
@@ -2812,7 +2813,7 @@ router.put("/sorteos/adjudicaciones/:id/rechazar", verifyToken, async (req, res)
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
     }
@@ -2925,7 +2926,7 @@ router.get("/admin/sorteos", verifyToken, async (req, res) => {
       bloques: bloquesPorSorteo.get(sorteo.id) || []
     })));
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener sorteos");
   }
 });
@@ -3024,7 +3025,7 @@ router.post("/admin/sorteos", verifyToken, async (req, res) => {
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
     }
@@ -3083,7 +3084,7 @@ router.put("/admin/sorteos/:id", verifyToken, async (req, res) => {
     res.status(200).json({ message: "Sorteo actualizado correctamente" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) return res.status(error.statusCode).json({ message: error.message });
     res.status(500).json("Error al actualizar sorteo");
   } finally {
@@ -3154,7 +3155,7 @@ router.delete("/admin/sorteos/:id", verifyToken, async (req, res) => {
     res.status(200).json({ message: "Sorteo cancelado correctamente" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) return res.status(error.statusCode).json({ message: error.message });
     res.status(500).json("Error al cancelar sorteo");
   } finally {
@@ -3291,7 +3292,7 @@ router.post("/admin/bloques", verifyToken, async (req, res) => {
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
     }
@@ -3462,7 +3463,7 @@ router.put("/admin/bloques/:id", verifyToken, async (req, res) => {
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
     }
@@ -3545,7 +3546,7 @@ router.get("/admin/bloques", verifyToken, async (req, res) => {
       recursos_detalle: recursosPorBloque.get(Number(row.id)) || []
     })));
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener bloques");
   }
 });
@@ -3666,7 +3667,7 @@ router.get("/admin/sorteos/:id/inscripciones", verifyToken, async (req, res) => 
 
     res.status(200).json(inscripciones);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener inscripciones");
   }
 });
@@ -3722,7 +3723,7 @@ router.get("/admin/sorteos/:id/adjudicaciones/historial", verifyToken, async (re
       notificacion_leida: row.notificacion_leida === 1 || row.notificacion_leida === true
     })));
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (esErrorTemporadaAltaNoMigrada(error)) {
       return res.status(200).json([]);
     }
@@ -3767,7 +3768,7 @@ router.post("/sorteos/:id/cotizacion", verifyToken, async (req, res) => {
 
     res.status(200).json(cotizacion);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
     }
@@ -3939,7 +3940,7 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
     }
@@ -4103,7 +4104,7 @@ router.put("/admin/sorteos/inscripciones/:id/adjudicar", verifyToken, async (req
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) return res.status(error.statusCode).json({ message: error.message });
     res.status(500).json("Error al adjudicar inscripcion");
   } finally {
@@ -4158,7 +4159,7 @@ router.put("/admin/sorteos/inscripciones/:id/no-adjudicada", verifyToken, async 
     res.status(200).json({ message: "Inscripcion marcada como no adjudicada" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) return res.status(error.statusCode).json({ message: error.message });
     res.status(500).json("Error al marcar inscripcion");
   } finally {
@@ -4228,7 +4229,7 @@ router.put("/admin/sorteos/:id/cerrar", verifyToken, async (req, res) => {
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) return res.status(error.statusCode).json({ message: error.message });
     res.status(500).json("Error al cerrar sorteo");
   } finally {
@@ -4711,7 +4712,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
     }
@@ -4972,7 +4973,7 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
     }
@@ -5158,7 +5159,7 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json(error.message);
     }
@@ -5230,7 +5231,7 @@ router.post("/reserva/adicionales", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los adicionales para la reserva");
   }
 });
@@ -8664,7 +8665,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       if (error.codigo) {
         return res.status(error.statusCode).json({
@@ -8854,7 +8855,7 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({
         message: error.message,
@@ -9265,7 +9266,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
       });
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({
         success: false,
@@ -9506,7 +9507,7 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener la información de la reserva para edición");
   }
 });
@@ -9892,7 +9893,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener el resumen de la reserva");
   }
 });
@@ -9974,7 +9975,7 @@ router.post("/reserva/:id/observaciones", verifyToken, async (req, res) => {
     res.status(201).json({ success: true, message: "Mensaje enviado" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al enviar el mensaje");
   } finally {
     if (connection) connection.release();
@@ -10199,7 +10200,7 @@ router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
         }
       }
     }
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
     }
@@ -10339,7 +10340,7 @@ router.put("/reserva/:id/convenio/respuesta", verifyToken, async (req, res) => {
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al responder la propuesta de convenio");
   } finally {
     if (connection) {
@@ -10531,7 +10532,7 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
     });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({
         success: false,
@@ -10730,7 +10731,7 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los acompañantes");
   }
 });
@@ -11134,7 +11135,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
       });
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ success: false, message: error.message });
     }
@@ -11171,7 +11172,7 @@ router.get("/regimen", verifyToken, async (req, res) => {
         );
       res.status(200).json(rows);
     } catch (error) {
-      console.log(error);
+      registrarErrorRuta(error);
       res.status(500).json("Error al obtener los regimenes");
     }
   } else {
@@ -11195,7 +11196,7 @@ router.get("/tipo_persona", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los tipos de persona");
   }
 });
@@ -11216,7 +11217,7 @@ router.get("/parentesco", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los parentescos");
   }
 });
@@ -11247,7 +11248,7 @@ router.get("/departamental", verifyToken, async (req, res) => {
 
     res.status(200).json(rows);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error interno");
   }
 });
@@ -11367,7 +11368,7 @@ router.post("/tabla/departamentales", verifyToken, async (req, res) => {
       orderType,
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error interno");
   }
 });
@@ -11406,7 +11407,7 @@ router.get("/departamental/:id", verifyToken, async (req, res) => {
 
     res.status(200).json(rows[0]);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error interno");
   }
 });
@@ -11518,7 +11519,7 @@ router.post("/departamental", verifyToken, async (req, res) => {
     if (connection) {
       connection.release();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error interno");
   }
 });
@@ -11703,7 +11704,7 @@ router.put("/departamental/:id", verifyToken, async (req, res) => {
     if (connection) {
       connection.release();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error interno");
   }
 });
@@ -11803,7 +11804,7 @@ router.post("/tabla/temporadas", verifyToken, async (req, res) => {
         orderType,
       });
     } catch (error) {
-      console.log(error);
+      registrarErrorRuta(error);
       res.status(500).json("Error interno");
     }
   } else {
@@ -11965,7 +11966,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       orderType,
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error interno");
   }
 });
@@ -12023,7 +12024,7 @@ router.get("/mis-gestiones/catalogos", verifyToken, async (req, res) => {
       estados_traslados: [],
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los catálogos de gestiones");
   }
 });
@@ -12231,7 +12232,7 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
 
     res.json({ results, totalItems, page, pageSize, conteos });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener las gestiones");
   }
 });
@@ -12440,7 +12441,7 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
       },
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error interno");
   }
 });
@@ -12611,7 +12612,7 @@ router.post("/familiares", verifyToken, async (req, res) => {
     if (error && error.code === "ER_DUP_ENTRY") {
       return res.status(409).json({ success: false, message: "Ya existe otra persona registrada con ese DNI" });
     }
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json({ success: false, message: "Error al agregar el familiar" });
   } finally {
     if (connection) {
@@ -12757,7 +12758,7 @@ router.put("/familiares/:id/vinculo", verifyToken, async (req, res) => {
     });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json({ success: false, message: "Error al actualizar el vínculo" });
   } finally {
     if (connection) connection.release();
@@ -12929,7 +12930,7 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
       res.status(403).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener el historial de usuarios");
   }
 });
@@ -13057,7 +13058,7 @@ router.get("/tabla/historial-departamental/:id?", verifyToken, async (req, res) 
     });
 
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener el historial de departamentales");
   }
 });
@@ -13228,7 +13229,7 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
       res.status(403).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener el historial de reservas");
   }
 });
@@ -13413,7 +13414,7 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error interno");
   }
 });
@@ -13459,7 +13460,7 @@ router.get("/rol", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los roles");
   }
 });
@@ -13499,7 +13500,7 @@ router.get("/usuario", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener el usuario");
   }
 });
@@ -14490,7 +14491,7 @@ router.post("/temporada", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
     }
@@ -14537,7 +14538,7 @@ router.get("/temporada/rangos", verifyToken, async (req, res) => {
     const [rows] = await mysqlConnection.promise().query(query, queryParams);
     res.status(200).json(rows);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los rangos de temporada");
   }
 });
@@ -14783,7 +14784,7 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener la temporada");
   }
 });
@@ -15169,7 +15170,7 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
     }
@@ -15702,7 +15703,7 @@ router.get("/flujo-descuento-escalonado", verifyToken, async (req, res) => {
       connection.release();
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener el flujo de descuento escalonado");
   }
 });
@@ -15727,7 +15728,7 @@ router.get("/valores-predeterminados-temporada/:tipo", verifyToken, async (req, 
       connection.release();
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener valores predeterminados de temporada");
   }
 });
@@ -15803,7 +15804,7 @@ router.put("/valores-predeterminados-temporada/:tipo", verifyToken, async (req, 
     if (connection) {
       await connection.rollback();
     }
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al guardar valores predeterminados de temporada");
   } finally {
     if (connection) {
@@ -15871,7 +15872,7 @@ router.post("/flujo-descuento-escalonado", verifyToken, async (req, res) => {
       }
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al crear el flujo de descuento escalonado");
   }
 });
@@ -15959,7 +15960,7 @@ router.put("/flujo-descuento-escalonado/:id", verifyToken, async (req, res) => {
       }
     }
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al actualizar el flujo de descuento escalonado");
   }
 });
@@ -16092,7 +16093,7 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
     });
 
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json({
       success: false,
       message: "Error al obtener datos del usuario"
@@ -16597,7 +16598,7 @@ router.put("/configuracion/usuario/:id", verifyToken, manejarUploadFotoPerfil, a
     }
 
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ success: false, message: error.message });
     }
@@ -17056,7 +17057,7 @@ router.post("/configuracion/usuario", verifyToken, manejarUploadFotoPerfil, asyn
     }
 
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ success: false, message: error.message });
     }

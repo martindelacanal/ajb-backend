@@ -16,6 +16,7 @@
 const express = require("express");
 const router = express.Router();
 const mysqlConnection = require("../connection/connection");
+const { registrarErrorRuta } = require("../services/errores");
 const jwt = require("jsonwebtoken");
 const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
 const multer = require("multer");
@@ -658,6 +659,10 @@ async function notificarCambioEstadoAfiliado(connection, solicitud, estadoAnteri
 // Extracción automática del comprobante con Google Gemini (opcional)
 // ---------------------------------------------------------------------------
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+// Reintento ante 429/5xx o fallo de red de Gemini (espera = base x nro de intento)
+const GEMINI_INTENTOS = 2;
+const GEMINI_ESPERA_REINTENTO_MS = 1500;
+const GEMINI_TIMEOUT_MS = 60000;
 
 const ESQUEMA_EXTRACCION = {
   type: "OBJECT",
@@ -706,25 +711,48 @@ async function extraerDatosComprobanteIA(files) {
     partes.push({ inline_data: { mime_type: file.mimetype, data: file.buffer.toString("base64") } });
   }
 
-  const respuesta = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-      body: JSON.stringify({
-        contents: [{ parts: partes }],
-        generationConfig: {
-          temperature: 0,
-          response_mime_type: "application/json",
-          response_schema: ESQUEMA_EXTRACCION,
-        },
-      }),
+  const cuerpo = JSON.stringify({
+    contents: [{ parts: partes }],
+    generationConfig: {
+      temperature: 0,
+      response_mime_type: "application/json",
+      response_schema: ESQUEMA_EXTRACCION,
+    },
+  });
+
+  // Gemini devuelve 503 ("overloaded") o 429 de forma transitoria: se reintenta
+  // una vez antes de darlo por no disponible. Un fallo de red tampoco debe
+  // tumbar la carga del comprobante: el afiliado completa los datos a mano.
+  let respuesta = null;
+  for (let intento = 1; intento <= GEMINI_INTENTOS; intento++) {
+    try {
+      respuesta = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+          body: cuerpo,
+          signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
+        }
+      );
+    } catch (error) {
+      console.warn(`Gemini sin respuesta (intento ${intento}/${GEMINI_INTENTOS}):`, error?.name, error?.message);
+      respuesta = null;
     }
-  );
+
+    const reintentable = !respuesta || respuesta.status === 429 || respuesta.status >= 500;
+    if (!reintentable || intento === GEMINI_INTENTOS) break;
+    await new Promise((resolver) => setTimeout(resolver, GEMINI_ESPERA_REINTENTO_MS * intento));
+  }
+
+  if (!respuesta) {
+    return { disponible: false, motivo: "El servicio de extracción no respondió" };
+  }
 
   if (!respuesta.ok) {
     const detalle = await respuesta.text().catch(() => "");
-    console.error("Error Gemini:", respuesta.status, detalle.slice(0, 500));
+    const nivel = respuesta.status === 429 || respuesta.status >= 500 ? "warn" : "error";
+    console[nivel]("Error Gemini:", respuesta.status, detalle.slice(0, 300).replace(/\s+/g, " "));
     return { disponible: false, motivo: `Error del servicio de extracción (${respuesta.status})` };
   }
 
@@ -1000,7 +1028,7 @@ router.get("/coseguro/catalogos", verifyToken, async (req, res) => {
       extraccion_ia_disponible: Boolean(process.env.GEMINI_API_KEY),
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los catálogos de coseguro");
   }
 });
@@ -1026,7 +1054,7 @@ router.get("/coseguro/cobertura", verifyToken, async (req, res) => {
     );
     res.status(200).json({ tipos });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener la configuración de cobertura");
   }
 });
@@ -1080,7 +1108,7 @@ router.put("/coseguro/cobertura", verifyToken, async (req, res) => {
     res.status(200).json({ success: true, message: "Cobertura actualizada correctamente", tipos });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al actualizar la configuración de cobertura");
   } finally {
     if (connection) connection.release();
@@ -1127,7 +1155,7 @@ router.get("/coseguro/perfil", verifyToken, async (req, res) => {
       familiares: familiares.map((f) => ({ ...f, dni_cargado: f.documento !== null && Number(f.documento) > 0 })),
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al obtener el perfil del afiliado");
   }
 });
@@ -1161,7 +1189,7 @@ router.put("/coseguro/familiares/:id/documento", verifyToken, async (req, res) =
     }
     res.status(200).json({ success: true, message: "DNI actualizado" });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al actualizar el DNI del familiar");
   }
 });
@@ -1198,7 +1226,7 @@ router.get("/coseguro/afiliados-buscar", verifyToken, async (req, res) => {
     );
     res.status(200).json(rows);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al buscar afiliados");
   }
 });
@@ -1227,7 +1255,7 @@ router.post("/coseguro/extraer-comprobante", verifyToken, manejarUploadCoseguro,
     };
     res.status(200).json({ disponible: true, datos, validaciones });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al extraer los datos del comprobante");
   }
 });
@@ -1264,7 +1292,7 @@ router.post("/coseguro/verificar-duplicados", verifyToken, async (req, res) => {
       archivos,
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al verificar duplicados");
   }
 });
@@ -1297,7 +1325,7 @@ router.post("/coseguro/verificar-archivo", verifyToken, manejarUploadCoseguro, a
       mismo_afiliado: cabecera.rol !== "afiliado" || idsPositivosIguales(dup.usuario_id, cabecera.id),
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al verificar el archivo");
   }
 });
@@ -1665,7 +1693,7 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
     res.status(201).json({ success: true, id: solicitudId, message: "Solicitud de reintegro enviada correctamente" });
   } catch (error) {
     if (connection && transaccionIniciada) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al crear la solicitud de reintegro");
   } finally {
     if (connection && bloqueoDuplicadosAdquirido) await liberarBloqueoDuplicados(connection);
@@ -1882,7 +1910,7 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
 
     res.status(200).json({ results, totalItems, page, pageSize });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al obtener las solicitudes de reintegro");
   }
 });
@@ -2009,7 +2037,7 @@ router.get("/coseguro/solicitudes/:id", verifyToken, async (req, res) => {
       transiciones: transicionesDisponibles(cabecera, solicitud.estado_id, idsPositivosIguales(solicitud.usuario_id, cabecera.id)),
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener el detalle de la solicitud");
   }
 });
@@ -2380,7 +2408,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     res.status(200).json({ success: true, message: "Solicitud actualizada correctamente", estado_id: estadoNuevo || solicitud.estado_id });
   } catch (error) {
     if (connection && transaccionIniciada) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al actualizar la solicitud");
   } finally {
     if (connection && bloqueoDuplicadosAdquirido) await liberarBloqueoDuplicados(connection);
@@ -2432,7 +2460,7 @@ router.delete("/coseguro/solicitudes/:id", verifyToken, async (req, res) => {
     res.status(200).json({ success: true, message: "Solicitud eliminada" });
   } catch (error) {
     if (connection && transaccionIniciada) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al eliminar la solicitud");
   } finally {
     if (connection) connection.release();
@@ -2563,7 +2591,7 @@ router.put("/coseguro/solicitudes/:id/estado", verifyToken, async (req, res) => 
     res.status(200).json({ success: true, message: "Estado actualizado correctamente", estado_id: estadoNuevo });
   } catch (error) {
     if (connection && transaccionIniciada) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al cambiar el estado de la solicitud");
   } finally {
     if (connection) connection.release();
@@ -2636,7 +2664,7 @@ router.post("/coseguro/solicitudes/:id/observaciones", verifyToken, async (req, 
     res.status(201).json({ success: true, message: "Observación registrada", estado_id: estadoNuevo || solicitud.estado_id });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al registrar la observación");
   } finally {
     if (connection) connection.release();
@@ -2670,7 +2698,7 @@ router.get("/coseguro/archivos/:id/descargar", verifyToken, async (req, res) => 
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(nombre)}"`);
     res.status(200).send(objeto.buffer);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al descargar el archivo");
   }
 });
@@ -2717,7 +2745,7 @@ router.get("/coseguro/solicitudes/:id/zip", verifyToken, async (req, res) => {
     }
     await zip.finalize();
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     if (!res.headersSent) res.status(500).json("Error al generar el ZIP");
   }
 });
@@ -2790,7 +2818,7 @@ router.get("/coseguro/afiliado/:usuarioId/historial", verifyToken, async (req, r
       con_repetidos: repetidos.size > 0,
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener el historial del afiliado");
   }
 });
@@ -2999,7 +3027,7 @@ router.post("/coseguro/exportar", verifyToken, async (req, res) => {
       nombre_archivo: `reintegros_para_liquidar_${moment().format("YYYYMMDD_HHmm")}.csv`,
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al generar la exportación");
   }
 });
@@ -3051,7 +3079,7 @@ router.post("/coseguro/exportar/confirmar", verifyToken, async (req, res) => {
     res.status(200).json({ success: true, message: `${idsValidos.length} solicitudes marcadas como "Exportado para liquidar"`, ids: idsValidos });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al confirmar la exportación");
   } finally {
     if (connection) connection.release();
@@ -3105,7 +3133,7 @@ router.post("/coseguro/estado-masivo", verifyToken, async (req, res) => {
     res.status(200).json({ success: true, message: `${idsValidos.length} solicitudes pasaron a "Pendiente de acreditación"`, ids: idsValidos });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al actualizar los estados");
   } finally {
     if (connection) connection.release();
@@ -3204,7 +3232,7 @@ router.post("/coseguro/liquidacion/analizar", verifyToken, manejarUploadCsv, asy
       aplicables: preview.filter((p) => p.situacion === "OK").length,
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al analizar el archivo de liquidación");
   }
 });
@@ -3272,7 +3300,7 @@ router.post("/coseguro/liquidacion/confirmar", verifyToken, async (req, res) => 
     res.status(200).json({ success: true, message: `${aplicadas} solicitudes liquidadas correctamente`, aplicadas });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al confirmar la liquidación");
   } finally {
     if (connection) connection.release();
@@ -3442,7 +3470,7 @@ router.get("/coseguro/estadisticas", verifyToken, async (req, res) => {
       consumos_afiliado: consumosAfiliado,
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al obtener las estadísticas");
   }
 });
@@ -3462,7 +3490,7 @@ router.get("/coseguro/arca/estado", verifyToken, async (req, res) => {
       tipos_comprobante: arca.TIPOS_COMPROBANTE_ARCA,
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al consultar el estado de ARCA");
   }
 });
@@ -3541,7 +3569,7 @@ router.post("/coseguro/solicitudes/:id/constatar-arca", verifyToken, async (req,
 
     res.status(200).json(verificacion.arca);
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al constatar el comprobante");
   }
 });
@@ -3563,7 +3591,7 @@ router.get("/coseguro/estadisticas/export", verifyToken, async (req, res) => {
     const csv = generarCsvSolicitudes(rows);
     res.status(200).json({ csv, total: rows.length, nombre_archivo: `reintegros_${moment().format("YYYYMMDD_HHmm")}.csv` });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al exportar las estadísticas");
   }
 });
@@ -3714,7 +3742,7 @@ router.get("/coseguro/subsidios-salud", verifyToken, async (req, res) => {
       conteos: Object.fromEntries(conteos.map((c) => [c.estado, Number(c.cantidad)])),
     });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener los subsidios por salud");
   }
 });
@@ -3747,7 +3775,7 @@ router.get("/coseguro/subsidios-salud/:id", verifyToken, async (req, res) => {
 
     res.status(200).json({ ...mapearSubsidio(cabecera, subsidio), archivos: archivosFirmados });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al obtener el subsidio por salud");
   }
 });
@@ -3790,7 +3818,7 @@ router.post("/coseguro/subsidios-salud/:id/archivos", verifyToken, manejarUpload
     }
     res.status(201).json({ success: true, message: "Certificados cargados correctamente", cantidad: files.length });
   } catch (error) {
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(500).json("Error al cargar los certificados médicos");
   }
 });
@@ -3949,7 +3977,7 @@ router.put("/coseguro/subsidios-salud/:id/estado", verifyToken, async (req, res)
         }
       }
     }
-    console.log(error);
+    registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al cambiar el estado del subsidio por salud");
   } finally {
     if (connection) connection.release();
