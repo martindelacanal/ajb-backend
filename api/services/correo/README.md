@@ -1,7 +1,14 @@
 # Módulo de correo automático
 
-Envío de correo saliente de Mi AJB sobre la casilla institucional
-`miajbnotificaciones@ajb.org.ar` (servidor cPanel/Exim del hosting de `ajb.org.ar`).
+Envío de correo saliente de Mi AJB mediante SMTP configurable, preparado para
+Amazon SES en `sa-east-1`. El dominio de pruebas es `miajbpruebas.com.ar` y el
+remitente definitivo será `Mi AJB <no-responder@miajb.org.ar>`.
+La integración sigue usando Nodemailer: SES reemplaza al proveedor SMTP, no la
+API pública del módulo.
+
+La estrategia vigente y las plantillas de configuración por entorno están en
+[`SES-PRUEBAS.md`](./SES-PRUEBAS.md). Cambiar los ejemplos del repositorio no
+activa el correo: hay que verificar SES, aplicar el `.env` y validar la entrega.
 
 ## Archivos
 
@@ -16,27 +23,43 @@ Envío de correo saliente de Mi AJB sobre la casilla institucional
 ## Configuración (`.env`)
 
 ```
-MAIL_HOST = mail.ajb.org.ar
+MAIL_HOST = email-smtp.sa-east-1.amazonaws.com
 MAIL_PORT = 465               # 465 = SSL/TLS implícito; 587 = STARTTLS (MAIL_SECURE = false)
 MAIL_SECURE = true
-MAIL_USER = miajbnotificaciones@ajb.org.ar
-MAIL_PASSWORD = ...           # la contraseña termina en punto: el punto es parte de la clave
-MAIL_FROM = miajbnotificaciones@ajb.org.ar
+MAIL_USER = ...               # usuario SMTP generado por SES; no es una casilla
+MAIL_PASSWORD = ...           # contraseña SMTP de SES; no es la secret access key
+MAIL_FROM = no-responder@miajb.org.ar
 MAIL_FROM_NAME = Mi AJB
-MAIL_REPLY_TO =               # casilla de respuesta (opcional)
-MAIL_HELO_NAME = ajb.org.ar   # nombre con el que el backend se presenta en EHLO (ver "Estado de la entrega")
+MAIL_REPLY_TO =               # ausente o vacío: esta dirección no recibe respuestas
+MAIL_HELO_NAME = miajb.org.ar  # nombre con el que el backend se presenta en EHLO
 MAIL_ENABLED = true           # false apaga el envío sin tocar código
-MAIL_REDIRECT_TO =            # solo desarrollo: desvía TODO a esa casilla
+MAIL_TEST_MODE = false        # true exige MAIL_REDIRECT_TO válida y evita envíos a afiliados
+MAIL_REDIRECT_TO =            # pruebas: desvía To/CC/BCC a esa casilla
 MAIL_APP_URL = https://d2bnjhvusxwgza.cloudfront.net
-MAIL_MAX_POR_MINUTO = 20      # techo del hosting compartido
-MAIL_MAX_CONEXIONES = 2
+MAIL_MAX_POR_MINUTO = 300     # solo tras confirmar una cuota SES de al menos 5 por segundo
+MAIL_MAX_CONEXIONES = 5
 MAIL_TLS_ESTRICTO = true
 MAIL_DEBUG = false            # true vuelca el diálogo SMTP en consola
 ```
 
-En desarrollo conviene poner `MAIL_REDIRECT_TO` con la casilla propia: los correos
-se generan igual, pero ninguno llega a un afiliado real (el asunto queda prefijado
-con `[DESARROLLO -> destinatario_original]`).
+`MAIL_USER` y `MAIL_PASSWORD` deben ser las credenciales SMTP de SES de
+`sa-east-1`. Como el usuario de SES no es una dirección de correo,
+`MAIL_FROM` debe definirse expresamente con una identidad verificada. Nunca se
+versionan las credenciales ni se copian a logs.
+
+El limitador reparte `MAIL_MAX_POR_MINUTO` según la concurrencia efectiva. Con
+los valores anteriores salen como máximo 5 mensajes por segundo. Esos valores
+se aplican únicamente después de salir del sandbox y confirmar en el panel que
+la cuota concedida admite al menos ese ritmo; en sandbox la cuota observada es
+1 mensaje por segundo y 200 por día. SES contabiliza destinatarios, por lo que
+los envíos masivos deben generar un mensaje por afiliado y respetar también la
+cuota vigente de la cuenta.
+
+En pruebas usar `MAIL_TEST_MODE=true` y `MAIL_REDIRECT_TO` con la casilla propia:
+los correos se generan igual, pero To/CC/BCC se desvían a esa única casilla (el
+asunto queda prefijado con `[DESARROLLO -> destinatario_original]`). Si el modo
+de pruebas está activo y falta una redirección válida, se bloquean los envíos y
+la verificación SMTP. Es independiente de `NODE_ENV`.
 
 ## Uso
 
@@ -58,8 +81,8 @@ const resultado = await enviarCorreoPlantilla({
 });
 
 if (!resultado.enviado) {
-  // resultado.motivo: sin_configurar | deshabilitado | destinatario_invalido |
-  //                   asunto_invalido | cuerpo_vacio | error_smtp
+  // resultado.motivo: sin_configurar | deshabilitado | destino_pruebas_invalido |
+  //                   destinatario_invalido | asunto_invalido | cuerpo_vacio | error_smtp
 }
 ```
 
@@ -90,14 +113,22 @@ npm test -- test/correo.test.js                         # pruebas offline del m�
 
 El servidor además deja una línea en el log al arrancar (`[correo] SMTP listo ...`).
 
-## Estado de la entrega (verificado el 21/08/2026)
+## Configuración de Amazon SES
 
-- SPF, DKIM (`default._domainkey`) y DMARC (`p=none`) están publicados en `ajb.org.ar`.
-- El SPF autoriza al servidor de envío por el mecanismo `+mx` (`mail.ajb.org.ar` → `192.185.166.137`).
-- Casilla con cuota de 400 MB: el cliente la limpia periódicamente. Como el módulo
-  solo envía, lo único que se acumula ahí son los rebotes.
+La identidad de dominio, Easy DKIM, custom MAIL FROM, DMARC, credenciales SMTP,
+salida del sandbox y eventos de rebote/queja se configuran siguiendo
+[`SES-PRUEBAS.md`](./SES-PRUEBAS.md). El brief original
+[`MIGRACION-SES.md`](./MIGRACION-SES.md) se conserva como antecedente, pero su
+plan de usar el dominio final desde el inicio fue reemplazado por el dominio
+independiente de pruebas. Los recursos SES viven en `sa-east-1` y sus secretos
+no forman parte del repositorio.
 
-## Por qué existe `MAIL_HELO_NAME` (diagnóstico del 26/08/2026)
+Antes de habilitar envíos reales se deben completar las pruebas de aceptación
+del documento: conexión SMTP, entrega a Gmail con SPF/DKIM/DMARC en PASS y evento
+de rebote en SNS. La casilla SMTP anterior se conserva solo como respaldo durante
+la migración.
+
+## Por qué existe `MAIL_HELO_NAME` (antecedente del 26/08/2026)
 
 Síntoma: el servidor aceptaba todo con `250 OK id=...`, pero **nada llegaba** a Gmail
 ni a verificadores externos, y tampoco volvía ningún rebote a la casilla.
@@ -116,5 +147,6 @@ enviados a `check-auth@verifier.port25.com`, que contesta por mail a la casilla 
 | E | `ajb.org.ar` | Respuesta en 4 segundos: SPF **pass**, DKIM **pass**, iprev **pass** |
 
 Desde entonces el transporte pasa `name: MAIL_HELO_NAME` (por defecto, el dominio del
-remitente). Si algún día vuelve a "enviar pero no llegar", lo primero es mirar qué
-`helo=` aparece en el `Received` del mensaje (`npm run mail:probar` imprime el nombre en uso).
+remitente). La configuración SES mantiene este comportamiento con `miajb.org.ar`. Si
+algún día vuelve a "enviar pero no llegar", lo primero es mirar qué `helo=` aparece
+en el `Received` del mensaje (`npm run mail:probar` imprime el nombre en uso).

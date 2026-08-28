@@ -3,10 +3,10 @@
 /**
  * Transporte SMTP compartido por todo el backend.
  *
- * Se crea una sola vez (pool de conexiones) porque la casilla vive en un
- * hosting compartido: abrir una conexión por mensaje hace que el servidor
- * empiece a rechazar por "too many connections". El pool además serializa los
- * envíos y respeta el techo de mensajes por minuto configurado.
+ * Se crea una sola vez (pool de conexiones) para reutilizar sesiones SMTP y
+ * limitar tanto la concurrencia como el ritmo de salida. El cupo por minuto se
+ * distribuye en ventanas cortas: Nodemailer permitiría consumirlo entero al
+ * comienzo de cada minuto si se configurara como una única ventana de 60 s.
  */
 
 const nodemailer = require("nodemailer");
@@ -31,6 +31,13 @@ function firmaDeConfiguracion(config) {
 }
 
 function opcionesDeTransporte(config) {
+  // Nodemailer limita por ventanas, no espacia cada mensaje. Se permite como
+  // máximo una tanda por conexión y se calcula la duración de la ventana para
+  // repartir MAIL_MAX_POR_MINUTO de manera uniforme. Ejemplo SES: 300/min con
+  // 5 conexiones => tandas de hasta 5 mensajes cada 1 segundo.
+  const concurrencia = Math.min(config.maxConexiones, config.maxPorMinuto);
+  const intervaloRitmo = Math.ceil((60000 * concurrencia) / config.maxPorMinuto);
+
   return {
     host: config.host,
     port: config.puerto,
@@ -41,14 +48,14 @@ function opcionesDeTransporte(config) {
     // del hosting descarta el mensaje en silencio: 250 OK, pero nunca llega.
     ...(config.nombreHelo ? { name: config.nombreHelo } : {}),
     pool: true,
-    maxConnections: config.maxConexiones,
+    maxConnections: concurrencia,
     maxMessages: config.maxMensajesPorConexion,
-    rateDelta: 60000,
-    rateLimit: config.maxPorMinuto,
+    rateDelta: intervaloRitmo,
+    rateLimit: concurrencia,
     connectionTimeout: config.tiemposEspera.conexion,
     greetingTimeout: config.tiemposEspera.saludo,
     socketTimeout: config.tiemposEspera.socket,
-    // El certificado del hosting es válido; se exige verificación salvo que
+    // El certificado del proveedor es válido; se exige verificación salvo que
     // se desactive expresamente con MAIL_TLS_ESTRICTO=false.
     tls: {
       rejectUnauthorized: config.tlsEstricto,

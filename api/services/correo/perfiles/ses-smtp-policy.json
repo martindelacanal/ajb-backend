@@ -1,0 +1,33 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowMiajbNoResponderOnly",
+      "Effect": "Allow",
+      "Action": "ses:SendRawEmail",
+      "Resource": [
+        "arn:aws:ses:sa-east-1:337909740711:identity/miajb.org.ar",
+        "arn:aws:ses:sa-east-1:337909740711:configuration-set/miajb-envios"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ses:FromAddress": "no-responder@miajb.org.ar"
+        }
+      }
+    },
+    {
+      "Sid": "AllowMiajbPruebasNoResponderOnly",
+      "Effect": "Allow",
+      "Action": "ses:SendRawEmail",
+      "Resource": [
+        "arn:aws:ses:sa-east-1:337909740711:identity/miajbpruebas.com.ar",
+        "arn:aws:ses:sa-east-1:337909740711:configuration-set/miajb-envios"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ses:FromAddress": "no-responder@miajbpruebas.com.ar"
+        }
+      }
+    }
+  ]
+}

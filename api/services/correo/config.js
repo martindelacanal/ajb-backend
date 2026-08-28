@@ -6,24 +6,25 @@
  * Todo sale de variables de entorno para que la casilla y la contraseña nunca
  * queden versionadas (.env está en .gitignore):
  *
- *   MAIL_HOST         = servidor SMTP (ej: mail.ajb.org.ar)
+ *   MAIL_HOST         = servidor SMTP (ej: email-smtp.sa-east-1.amazonaws.com)
  *   MAIL_PORT         = 465 (SSL/TLS implícito) o 587 (STARTTLS)
  *   MAIL_SECURE       = true para 465, false para 587. Si se omite se deduce del puerto.
- *   MAIL_USER         = casilla completa que autentica
- *   MAIL_PASSWORD     = contraseña de esa casilla
+ *   MAIL_USER         = usuario de la credencial SMTP (en SES no es una casilla)
+ *   MAIL_PASSWORD     = contraseña de la credencial SMTP
  *   MAIL_FROM         = dirección del remitente (por defecto, MAIL_USER)
  *   MAIL_FROM_NAME    = nombre visible del remitente
  *   MAIL_REPLY_TO     = casilla a la que contesta el afiliado (opcional)
  *   MAIL_ENABLED      = false para apagar el envío sin tocar código
- *   MAIL_REDIRECT_TO  = en desarrollo, desvía TODO a esa casilla (nunca en producción)
+ *   MAIL_REDIRECT_TO  = para pruebas, desvía To/CC/BCC a esa casilla; no depende de NODE_ENV
+ *   MAIL_TEST_MODE    = true exige MAIL_REDIRECT_TO válido y bloquea SMTP si falta
  *   MAIL_APP_URL      = URL pública del sistema, usada en los botones de las plantillas
  *   MAIL_HELO_NAME    = nombre con el que el backend se presenta al servidor (EHLO). Debe ser un
  *                       nombre de dominio real (por defecto, el dominio del remitente). Si se omite,
  *                       nodemailer se presenta como "[127.0.0.1]" cuando el hostname de la máquina
  *                       no tiene punto, y el filtro de salida del hosting descarta esos mensajes
  *                       sin generar rebote (verificado el 26/08/2026 contra verifier.port25.com).
- *   MAIL_MAX_POR_MINUTO / MAIL_MAX_CONEXIONES = techos del hosting compartido
- *   MAIL_TLS_ESTRICTO = false solo si el hosting presenta un certificado que no valida
+ *   MAIL_MAX_POR_MINUTO / MAIL_MAX_CONEXIONES = ritmo y concurrencia máximos del proveedor
+ *   MAIL_TLS_ESTRICTO = false solo si el proveedor presenta un certificado que no valida
  *   MAIL_DEBUG        = true para volcar el diálogo SMTP en consola
  */
 
@@ -98,13 +99,15 @@ function configuracionCorreo(env = process.env) {
   const remitenteNombre = leerTexto(env.MAIL_FROM_NAME, "Mi AJB");
   const responderA = leerTexto(env.MAIL_REPLY_TO);
   const redirigirA = leerTexto(env.MAIL_REDIRECT_TO);
+  const modoPruebas = leerBooleano(env.MAIL_TEST_MODE, false);
+  const bloqueadoPorPruebas = modoPruebas && !esCorreoValido(redirigirA);
 
   // EHLO: si no se define, se usa el dominio del remitente (siempre es un nombre real).
   const heloConfigurado = leerTexto(env.MAIL_HELO_NAME);
   const nombreHelo = esNombreHostValido(heloConfigurado) ? heloConfigurado : dominioDeCorreo(remitenteEmail);
 
   const configurado = Boolean(host && usuario && password && esCorreoValido(remitenteEmail));
-  const habilitado = configurado && leerBooleano(env.MAIL_ENABLED, true);
+  const habilitado = configurado && leerBooleano(env.MAIL_ENABLED, true) && !bloqueadoPorPruebas;
 
   return Object.freeze({
     host,
@@ -118,6 +121,8 @@ function configuracionCorreo(env = process.env) {
     remitente: remitenteNombre ? { name: remitenteNombre, address: remitenteEmail } : remitenteEmail,
     responderA: esCorreoValido(responderA) ? responderA : "",
     redirigirA: esCorreoValido(redirigirA) ? redirigirA : "",
+    modoPruebas,
+    bloqueadoPorPruebas,
     urlAplicacion: leerTexto(env.MAIL_APP_URL, "https://d2bnjhvusxwgza.cloudfront.net").replace(/\/+$/, ""),
     maxPorMinuto: leerEntero(env.MAIL_MAX_POR_MINUTO, MAX_POR_MINUTO_PREDETERMINADO, { minimo: 1, maximo: 600 }),
     maxConexiones: leerEntero(env.MAIL_MAX_CONEXIONES, MAX_CONEXIONES_PREDETERMINADO, { minimo: 1, maximo: 10 }),
@@ -140,6 +145,8 @@ function describirConfiguracion(config = configuracionCorreo()) {
     remitente: config.remitenteEmail || "(sin definir)",
     helo: config.nombreHelo || "(por defecto de nodemailer)",
     redirigirA: config.redirigirA || null,
+    modoPruebas: config.modoPruebas,
+    bloqueadoPorPruebas: config.bloqueadoPorPruebas,
     configurado: config.configurado,
     habilitado: config.habilitado,
   };

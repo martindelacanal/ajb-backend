@@ -32,6 +32,10 @@ const { construirCorreoHtml, textoPlanoDesdeHtml } = require("./plantilla");
 
 const MAX_DESTINATARIOS = 50;
 const MAX_LARGO_ASUNTO = 200;
+const BLOQUEO_PRUEBAS = Object.freeze({
+  motivo: "destino_pruebas_invalido",
+  error: "MAIL_TEST_MODE requiere una dirección válida en MAIL_REDIRECT_TO; SMTP está bloqueado.",
+});
 
 /**
  * Acepta "a@b.com", ["a@b.com", "c@d.com"] o "a@b.com, c@d.com" y devuelve
@@ -106,6 +110,9 @@ async function enviarCorreo({
 } = {}) {
   const config = configuracionCorreo();
 
+  if (config.bloqueadoPorPruebas) {
+    return { enviado: false, ...BLOQUEO_PRUEBAS };
+  }
   if (!config.configurado) {
     console.warn("[correo] Falta configuración SMTP (MAIL_HOST / MAIL_USER / MAIL_PASSWORD): no se envía nada.");
     return { enviado: false, motivo: "sin_configurar" };
@@ -224,7 +231,11 @@ function estadoCorreo() {
 
 /** Prueba conexión y credenciales contra el servidor SMTP, sin enviar nada. */
 async function verificarCorreo() {
-  return verificarConexion(configuracionCorreo());
+  const config = configuracionCorreo();
+  if (config.bloqueadoPorPruebas) {
+    return { conectado: false, ...BLOQUEO_PRUEBAS, detalle: describirConfiguracion(config) };
+  }
+  return verificarConexion(config);
 }
 
 module.exports = {
