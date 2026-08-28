@@ -7,26 +7,28 @@ Maxi para probar el nuevo sistema. `miajb.org.ar` sigue siendo el dominio final.
 Este documento actualiza la estrategia de pruebas del brief `MIGRACION-SES.md`;
 no autoriza cambios sobre los dominios ni el correo del sistema anterior.
 
-## Estado de ejecucion al 28/08/2026
+## Estado de ejecucion al 28/08/2026, despues de la prueba de las 17:35 (UTC-03)
 
 - Registro NIC pagado y habilitado: `miajbpruebas.com.ar`, a nombre de Martin,
   alta 28/08/2026 y vencimiento 28/08/2027. Se cargaron los cuatro NS de esta
   zona Route 53 y se ejecutaron los cambios; NIC muestra `Delegado: SI`.
-  La propagacion publica todavia esta pendiente en el ultimo control DNS.
+  La delegacion y los seis registros de correo ya se resuelven desde DNS publico.
 - Zona publica Route 53 creada: `Z0437381NTV12Q65HVMT`,
   `miajbpruebas.com.ar`, con los seis registros de autenticacion de correo.
   Los cuatro NS responden y los seis registros se comprobaron directamente
-  contra dos NS de AWS: 12/12 verificaciones correctas. Esto no sustituye
-  la delegacion en NIC ni la verificacion publica de SES.
+  contra dos NS de AWS: 12/12 verificaciones correctas. Tambien se confirmaron
+  los seis registros en Cloudflare y Google: 12/12 coincidencias publicas.
 - Identidad SES `miajbpruebas.com.ar` creada en `sa-east-1`: Easy DKIM RSA 2048,
   MAIL FROM `envios.miajbpruebas.com.ar` y configuration set `miajb-envios`.
-  Identidad, DKIM y MAIL FROM pendientes de verificacion publica.
+  Identidad Verified, DKIM Successful y MAIL FROM Successful, comprobados en AWS.
 - AWS SES en `sa-east-1` sigue en sandbox: 200 destinatarios por 24 horas y 1/s.
   El Gmail de pruebas esta Verified y la identidad final sigue pendiente.
 - Politica SMTP `AmazonSesSendingAccess` actualizada y releida en el grupo
   `AWSSESSendingGroupDoNotRename`: permite solo los remitentes exactos de
   pruebas y final, sus identidades SES y el configuration set `miajb-envios`.
-  Se conservaron el usuario y las credenciales existentes.
+  La regla de pruebas agrega la identidad Gmail del destinatario y exige
+  `ses:Recipients` exclusivamente igual a `martin.delacanalerbetta@gmail.com`.
+  Se conservaron el usuario, sus credenciales y el statement del remitente final.
 - Destino `miajb-rebotes-quejas` habilitado para rebotes permanentes y quejas;
   SNS `miajb-correo-eventos` conserva la suscripcion Gmail Confirmed y permite
   publicar a SES solo desde la cuenta y configuration set previstos.
@@ -36,22 +38,36 @@ no autoriza cambios sobre los dominios ni el correo del sistema anterior.
   desactivados. Los `.env` anteriores se respaldaron fuera de Git, en carpetas
   privadas. No se modificaron los dominios ni el servidor del sistema anterior.
 - Las credenciales SMTP del CSV existente autentican correctamente por TLS
-  desde local y EC2. No se envio ningun mensaje: EHLO/AUTH no confirma aun
-  permiso de envio para el remitente nuevo ni entrega de correo.
+  desde local y EC2. A las 17:35 se realizo una unica entrega aceptada desde EC2
+  al Gmail de Martin con `enviarCorreoPlantilla`: HTML, texto plano, logo inline,
+  ficha de datos, boton y PNG adjunto. Gmail la recibio en INBOX, no en SPAM,
+  con SPF, DKIM y DMARC PASS. El Return-Path usa `envios.miajbpruebas.com.ar`.
 - EC2: proceso `miajb-backend` online, `/api/healthz` responde 200 con
   `status: ok`, `.env` con permisos 600. Se comprobaron todas las variables
   `MAIL_*` efectivas de PM2 contra el archivo y se guardo la configuracion PM2.
-- Pendientes propagacion DNS, verificacion SES, prueba de entrega y activacion
-  exclusivamente redirigida. La zona Route 53 creada cuesta USD 0,50/mes
+- La prueba manual esta completada. Por indicacion expresa de Martin, no se
+  activan envios automaticos ni se agregan integraciones a reservas u otros
+  modulos. `MAIL_ENABLED=false` se releyo en local, EC2 y el proceso efectivo
+  de PM2 despues de la prueba; `MAIL_TEST_MODE=true` y la redireccion siguen activos.
+  La zona Route 53 creada cuesta USD 0,50/mes
   mas consultas e impuestos; el registro NIC autorizado es ARS 8.500 el primer ano.
 
 El control del dominio anterior confirmo sus cuatro NS de `afraid.org`,
 su A/MX anteriores y respuesta HTTP 200 del login. El backend nuevo EC2 ya
-no usa el SMTP institucional, pero mantiene el envio apagado hasta validar SES.
+no usa el SMTP institucional, pero mantiene el envio automatico apagado por
+indicacion de Martin, aun con SES y la entrega manual ya validados.
 El 28/08 a las 15:15 (UTC-03), despues de ejecutar la delegacion en NIC, el
 padre y los resolutores publicos seguian respondiendo NXDOMAIN para el dominio
 nuevo. A las 15:23, `c.dns.ar` y `d.dns.ar` aun no publicaban la delegacion.
-Esto no indica que el pago haya fallado; NIC ya muestra `Delegado: SI`.
+A las 16:18 ya se publico la delegacion y a las 17:12 SES mostraba las tres
+validaciones correctas. No quedan cambios DNS pendientes para esta prueba.
+
+La entrega aceptada de las 17:35 tiene identificador SES
+`010301a04a15a0f4-3d0c8ac9-c786-4737-a3b7-498464b2a753-000000`.
+Dos intentos anteriores fueron rechazados y no generaron entregas. El diagnostico
+mostro `554 Access denied` sobre la identidad Gmail del destinatario. Se corrigio ese permiso
+con autorizacion expresa antes de repetir la prueba. No se uso Gmail como
+remitente ni se habilito el envio persistente del servidor.
 
 Servidores DNS reales asignados a esta zona (solo para `miajbpruebas.com.ar`):
 
@@ -150,19 +166,28 @@ politicas adicionales de envio ni acceso a la consola habilitado.
 La politica tiene dos statements acotados a `ses:SendRawEmail`: conserva
 `no-responder@miajb.org.ar` y agrega `no-responder@miajbpruebas.com.ar`.
 Cada uno autoriza el ARN de su identidad y el del configuration set utilizado,
-con condicion exacta `ses:FromAddress`. No contiene `ses:*`, recursos comodin
-ni un permiso para cualquier remitente. La politica anterior se respaldo
-fuera del repositorio antes de actualizarla.
+con condicion exacta `ses:FromAddress`. El statement de pruebas tambien incluye
+el ARN de la identidad Gmail verificada, requerido por el rechazo observado en
+sandbox. `ForAllValues:StringEquals` sobre `ses:Recipients` limita todos los
+destinatarios (To/CC/BCC) a esa unica casilla; `Null: false` exige que exista el
+contexto de destinatarios. Esto no autoriza enviar desde Gmail. El statement
+del dominio final no se modifico. No contiene `ses:*`, recursos comodin ni un
+permiso para cualquier remitente. La politica anterior se respaldo fuera del
+repositorio antes de actualizarla.
 
 La consola confirmo la actualizacion y se releyo el JSON guardado. La prueba
-de envio real sigue pendiente: AUTH correcto o politica guardada no acreditan
-por si solos la verificacion del dominio ni la entrega del mensaje.
+real fue aceptada por SES y recibida en Gmail con SPF/DKIM/DMARC PASS. Un AUTH
+correcto o una politica guardada por si solos no habrian acreditado la entrega.
 
 Mantener el destino SNS existente de rebotes/quejas y la supresion de cuenta
 para BOUNCE y COMPLAINT. El configuration set predeterminado evita depender
 de cabeceras particulares en cada llamada del backend.
 
 ## Verificacion antes de activar
+
+La entrega manual del 28/08 ya fue validada. Los pasos siguientes son una guia
+para una futura activacion autorizada; no ejecutar ahora cambios persistentes
+en `MAIL_ENABLED` ni integrar envios en los modulos de negocio.
 
 - NIC muestra registro completado y la delegacion publica contiene solo los
   cuatro NS correctos del dominio nuevo.
@@ -177,6 +202,9 @@ de cabeceras particulares en cada llamada del backend.
 - Probar un rebote contra el simulador de SES en un proceso de diagnostico
   separado: la redireccion normal impediria que llegara al simulador. Nunca
   quitar la proteccion de la aplicacion para esta prueba. Verificar el evento SNS.
+  Esta prueba sigue pendiente y requiere autorizacion especifica: la politica
+  IAM actual permite solo Gmail y tambien bloquea al simulador. No ampliar los
+  permisos ni ejecutar esa prueba como parte del despliegue actual.
 - Aplicar la configuracion validada al backend nuevo, con copia de seguridad
   privada del `.env` anterior y sin versionar secretos. Reiniciar y comprobar.
 

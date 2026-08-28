@@ -21,11 +21,20 @@
       "Action": "ses:SendRawEmail",
       "Resource": [
         "arn:aws:ses:sa-east-1:337909740711:identity/miajbpruebas.com.ar",
+        "arn:aws:ses:sa-east-1:337909740711:identity/martin.delacanalerbetta@gmail.com",
         "arn:aws:ses:sa-east-1:337909740711:configuration-set/miajb-envios"
       ],
       "Condition": {
         "StringEquals": {
           "ses:FromAddress": "no-responder@miajbpruebas.com.ar"
+        },
+        "ForAllValues:StringEquals": {
+          "ses:Recipients": [
+            "martin.delacanalerbetta@gmail.com"
+          ]
+        },
+        "Null": {
+          "ses:Recipients": "false"
         }
       }
     }
