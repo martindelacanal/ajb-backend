@@ -30,25 +30,28 @@ no autoriza cambios sobre los dominios ni el correo del sistema anterior.
 - Destino `miajb-rebotes-quejas` habilitado para rebotes permanentes y quejas;
   SNS `miajb-correo-eventos` conserva la suscripcion Gmail Confirmed y permite
   publicar a SES solo desde la cuenta y configuration set previstos.
-- Modo seguro y perfiles implementados; 228/228 pruebas del backend aprobadas
-  nuevamente sin conexiones externas ni carga del `.env` real. El `.env` local
-  ya tiene SES, modo de pruebas, una sola casilla de redireccion y envios
-  desactivados. Se guardo un respaldo privado fuera del repositorio.
-  El servidor EC2 y los dominios actuales aun no se modificaron.
-- La credencial SMTP del CSV existente autentico correctamente por TLS en SES.
-  Se uso solo en memoria para EHLO/AUTH; no se envio ningun mensaje. Esto no
-  confirma aun permiso para el remitente nuevo ni entrega de correo.
-- Pendientes propagacion DNS, verificacion SES, despliegue/configuracion EC2,
-  activacion y prueba de entrega. La zona Route 53 creada cuesta USD 0,50/mes
+- Modo seguro y perfiles desplegados en el backend nuevo; 228/228 pruebas
+  aprobadas sin conexiones externas ni carga del `.env` real. Local y EC2
+  tienen SES, modo de pruebas, una sola casilla de redireccion y envios
+  desactivados. Los `.env` anteriores se respaldaron fuera de Git, en carpetas
+  privadas. No se modificaron los dominios ni el servidor del sistema anterior.
+- Las credenciales SMTP del CSV existente autentican correctamente por TLS
+  desde local y EC2. No se envio ningun mensaje: EHLO/AUTH no confirma aun
+  permiso de envio para el remitente nuevo ni entrega de correo.
+- EC2: proceso `miajb-backend` online, `/api/healthz` responde 200 con
+  `status: ok`, `.env` con permisos 600. Se comprobaron todas las variables
+  `MAIL_*` efectivas de PM2 contra el archivo y se guardo la configuracion PM2.
+- Pendientes propagacion DNS, verificacion SES, prueba de entrega y activacion
+  exclusivamente redirigida. La zona Route 53 creada cuesta USD 0,50/mes
   mas consultas e impuestos; el registro NIC autorizado es ARS 8.500 el primer ano.
 
 El control del dominio anterior confirmo sus cuatro NS de `afraid.org`,
-su A/MX anteriores y respuesta HTTP 200 del login. El backend EC2 sigue con
-el SMTP anterior: aun no se desplegaron el codigo ni el perfil SES de pruebas.
-El 28/08 a las 15:15 (UTC-03), despues de ejecutar la delegacion en NIC,
-`c.dns.ar`, `d.dns.ar`, Cloudflare y Google
-seguian respondiendo NXDOMAIN para el dominio nuevo: aun no habia delegacion
-publicada. Esto no indica que el pago haya fallado.
+su A/MX anteriores y respuesta HTTP 200 del login. El backend nuevo EC2 ya
+no usa el SMTP institucional, pero mantiene el envio apagado hasta validar SES.
+El 28/08 a las 15:15 (UTC-03), despues de ejecutar la delegacion en NIC, el
+padre y los resolutores publicos seguian respondiendo NXDOMAIN para el dominio
+nuevo. A las 15:23, `c.dns.ar` y `d.dns.ar` aun no publicaban la delegacion.
+Esto no indica que el pago haya fallado; NIC ya muestra `Delegado: SI`.
 
 Servidores DNS reales asignados a esta zona (solo para `miajbpruebas.com.ar`):
 
@@ -188,8 +191,9 @@ del reinicio, incluidos los valores vacios, conservando el resto de variables.
 El primer reinicio debe mantener `MAIL_ENABLED=false`, `MAIL_TEST_MODE=true`
 y una redireccion valida. Comprobar la configuracion efectiva antes de habilitar
 los envios redirigidos y de guardar PM2. No imprimir `pm2 env`, el `.env` completo
-ni credenciales. Los scripts de diagnostico imprimen el usuario SMTP en su tabla
-de estado: usar salida filtrada o un envoltorio con campos expresamente permitidos.
+ni credenciales. El arranque y el script de diagnostico omiten el usuario SMTP
+en sus mensajes. El arranque distingue SMTP autenticado de envios habilitados:
+un AUTH correcto con `MAIL_ENABLED=false` no implica que se este enviando correo.
 
 ## Cambio final a miajb.org.ar
 

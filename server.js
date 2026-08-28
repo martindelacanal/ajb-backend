@@ -423,7 +423,9 @@ iniciarMantenimientoReservas(mysqlConnection.promise());
 // registro si la casilla de notificaciones quedo mal configurada.
 verificarCorreo().then((resultado) => {
     if (resultado.conectado) {
-        console.log(`[correo] SMTP listo (${resultado.detalle.usuario} via ${resultado.detalle.host}:${resultado.detalle.puerto})`);
+        const detalle = resultado.detalle;
+        const estadoEnvios = detalle.habilitado ? "habilitados" : "desactivados";
+        console.log(`[correo] SMTP autenticado (${detalle.remitente} via ${detalle.host}:${detalle.puerto}; envios ${estadoEnvios}${detalle.modoPruebas ? ", modo pruebas" : ""})`);
     } else if (resultado.motivo === "sin_configurar") {
         console.warn("[correo] Sin configuracion SMTP: las notificaciones por mail estan desactivadas.");
     } else {

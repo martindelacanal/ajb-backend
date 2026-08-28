@@ -32,7 +32,10 @@ function marcaDeTiempo() {
 
 async function main() {
   console.log("Configuración SMTP en uso:");
-  console.table(estadoCorreo());
+  const estado = estadoCorreo();
+  // En SES el usuario SMTP es un identificador de acceso; no hace falta publicarlo.
+  delete estado.usuario;
+  console.table(estado);
 
   console.log("\n1) Verificando credenciales y conectividad (EHLO + AUTH)...");
   const verificacion = await verificarCorreo();
