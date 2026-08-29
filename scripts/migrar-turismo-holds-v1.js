@@ -245,6 +245,7 @@ async function obtenerEsquemaTabla(connection) {
 function compactarSql(sql) {
   return String(sql || "")
     .replace(/`/g, "")
+    .replace(/\\'/g, "'")
     .replace(/_[a-z0-9]+(?=')/gi, "")
     .replace(/[()]/g, " ")
     .replace(/\s+/g, " ")

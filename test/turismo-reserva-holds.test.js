@@ -217,6 +217,10 @@ test("la verificación acepta los introductores de charset que devuelve MySQL 8.
     compactarSql("(`estado` <> _utf8mb4'CONSUMIDO')"),
     compactarSql("estado <> 'CONSUMIDO'")
   );
+  assert.equal(
+    compactarSql("(case when (`estado` = _utf8mb4\\'ACTIVO\\') then `actor_usuario_id` else NULL end)"),
+    compactarSql("case when estado = 'ACTIVO' then actor_usuario_id else NULL end")
+  );
 });
 
 test("el evento de invalidación no contiene actor, titular ni token", () => {
