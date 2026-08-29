@@ -7,6 +7,26 @@ Maxi para probar el nuevo sistema. `miajb.org.ar` sigue siendo el dominio final.
 Este documento actualiza la estrategia de pruebas del brief `MIGRACION-SES.md`;
 no autoriza cambios sobre los dominios ni el correo del sistema anterior.
 
+## Correccion de avisos AWS Health del 29/08/2026
+
+- AWS notifico `DKIM FAILURE` para `miajb.org.ar` y `Custom MAIL FROM FAILURE`
+  para `envios.miajb.org.ar` despues de 72 horas sin encontrar sus registros DNS.
+- Un control de solo lectura contra resolutores publicos y los cuatro NS
+  autoritativos de `afraid.org` confirmo que esos registros SES nunca fueron
+  publicados. El dominio anterior conserva su delegacion, A y MX originales.
+- Como el dominio final no se utilizara hasta la migracion coordinada, se elimino
+  solamente la identidad SES no verificada `miajb.org.ar` de `sa-east-1`. No se
+  modificaron su dominio, DNS, web, correo institucional ni el configuration set.
+- SES quedo con dos identidades, ambas verificadas: `miajbpruebas.com.ar` y el
+  Gmail de Martin. La identidad de pruebas sigue con DKIM y custom MAIL FROM
+  `Successful`; sus registros Route 53 tambien se comprobaron intactos.
+- No fue necesario cambiar codigo, `.env`, credenciales ni PM2. El transporte
+  autentica con el perfil de pruebas, pero `MAIL_ENABLED=false` sigue impidiendo
+  envios automaticos.
+- Antes del cambio final hay que recrear `miajb.org.ar` en SES y usar los nuevos
+  registros que AWS genere entonces. No reutilizar los tres DKIM del intento
+  eliminado ni iniciar la verificacion hasta poder coordinar su publicacion.
+
 ## Estado de ejecucion al 28/08/2026, despues de la prueba de las 17:35 (UTC-03)
 
 - Registro NIC pagado y habilitado: `miajbpruebas.com.ar`, a nombre de Martin,
@@ -22,13 +42,15 @@ no autoriza cambios sobre los dominios ni el correo del sistema anterior.
   MAIL FROM `envios.miajbpruebas.com.ar` y configuration set `miajb-envios`.
   Identidad Verified, DKIM Successful y MAIL FROM Successful, comprobados en AWS.
 - AWS SES en `sa-east-1` sigue en sandbox: 200 destinatarios por 24 horas y 1/s.
-  El Gmail de pruebas esta Verified y la identidad final sigue pendiente.
+  El Gmail de pruebas esta Verified. La identidad final fue retirada el 29/08
+  y debe recrearse recien para la migracion coordinada.
 - Politica SMTP `AmazonSesSendingAccess` actualizada y releida en el grupo
   `AWSSESSendingGroupDoNotRename`: permite solo los remitentes exactos de
   pruebas y final, sus identidades SES y el configuration set `miajb-envios`.
   La regla de pruebas agrega la identidad Gmail del destinatario y exige
   `ses:Recipients` exclusivamente igual a `martin.delacanalerbetta@gmail.com`.
-  Se conservaron el usuario, sus credenciales y el statement del remitente final.
+  Se conservaron el usuario, sus credenciales y el statement futuro del remitente
+  final. Mientras esa identidad no exista, ese statement no habilita envios.
 - Destino `miajb-rebotes-quejas` habilitado para rebotes permanentes y quejas;
   SNS `miajb-correo-eventos` conserva la suscripcion Gmail Confirmed y permite
   publicar a SES solo desde la cuenta y configuration set previstos.
@@ -96,7 +118,7 @@ servidores DNS para pegar en la delegacion de NIC.
 
 | Dato | Pruebas | Produccion final |
 | --- | --- | --- |
-| Identidad SES | `miajbpruebas.com.ar` | `miajb.org.ar` |
+| Identidad SES | `miajbpruebas.com.ar` | `miajb.org.ar` (por recrear y verificar) |
 | From | `no-responder@miajbpruebas.com.ar` | `no-responder@miajb.org.ar` |
 | MAIL FROM de SES | `envios.miajbpruebas.com.ar` | `envios.miajb.org.ar` |
 | Region / SMTP | `sa-east-1` / `email-smtp.sa-east-1.amazonaws.com:465` | Los mismos |
@@ -163,15 +185,17 @@ que contiene al usuario `ses-smtp-user.miajb`. La vista Permissions de ese
 usuario muestra una sola politica, heredada de ese grupo; no se observaron
 politicas adicionales de envio ni acceso a la consola habilitado.
 
-La politica tiene dos statements acotados a `ses:SendRawEmail`: conserva
-`no-responder@miajb.org.ar` y agrega `no-responder@miajbpruebas.com.ar`.
+La politica tiene dos statements acotados a `ses:SendRawEmail`: conserva como
+preparacion futura `no-responder@miajb.org.ar` y agrega
+`no-responder@miajbpruebas.com.ar`.
 Cada uno autoriza el ARN de su identidad y el del configuration set utilizado,
 con condicion exacta `ses:FromAddress`. El statement de pruebas tambien incluye
 el ARN de la identidad Gmail verificada, requerido por el rechazo observado en
 sandbox. `ForAllValues:StringEquals` sobre `ses:Recipients` limita todos los
 destinatarios (To/CC/BCC) a esa unica casilla; `Null: false` exige que exista el
 contexto de destinatarios. Esto no autoriza enviar desde Gmail. El statement
-del dominio final no se modifico. No contiene `ses:*`, recursos comodin ni un
+del dominio final queda inerte mientras la identidad SES no exista y debera
+revisarse al recrearla. No contiene `ses:*`, recursos comodin ni un
 permiso para cualquier remitente. La politica anterior se respaldo fuera del
 repositorio antes de actualizarla.
 
@@ -228,9 +252,11 @@ un AUTH correcto con `MAIL_ENABLED=false` no implica que se este enviando correo
 1. Coordinar con quien controla el DNS final los registros exclusivos de SES:
    tres CNAME DKIM, MX/TXT del MAIL FROM y DMARC compatible con el sistema viejo.
    Conservar los A, MX y demas registros existentes durante esa preparacion.
-2. Esperar y verificar la identidad final en SES. Prepararlo con anticipacion:
-   DNS/DKIM y MAIL FROM pueden tardar hasta 72 horas; no prometer un cambio
-   instantaneo ni depender de hacerlo todo el dia de la salida.
+2. Recrear la identidad final en SES solo cuando se pueda publicar el DNS.
+   Volver a asociar `miajb-envios`, configurar `envios.miajb.org.ar` y entregar
+   los nuevos registros DKIM/MX/TXT al responsable. Esperar `Verified` para la
+   identidad y `Successful` para DKIM y MAIL FROM. Puede tardar hasta 72 horas;
+   no prometer un cambio instantaneo ni depender de hacerlo el dia de la salida.
 3. Obtener y comprobar acceso a produccion SES en `sa-east-1` antes de enviar
    a afiliados no verificados. Es por cuenta/region, no por dominio. Verificar
    un dominio no elimina el sandbox y AWS no garantiza una fecha de aprobacion.
