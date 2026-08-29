@@ -129,6 +129,8 @@ const olimpiadasRoute = require('./api/routes/olimpiadas');
 const trasladosRoute = require('./api/routes/traslados');
 const noticiasRoute = require('./api/routes/noticias');
 const dashboardRoute = require('./api/routes/dashboard');
+const webauthnRoute = require('./api/routes/webauthn');
+app.use('/api', webauthnRoute);
 app.use('/api',userRoute);
 app.use('/api',coseguroRoute);
 app.use('/api',olimpiadasRoute);

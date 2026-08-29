@@ -17,6 +17,10 @@
     "migrate:reservas-plazos:check": "node scripts/migrar-reservas-plazos-v1.js --check",
     "migrate:turismo-holds": "node scripts/migrar-turismo-holds-v1.js --apply --confirm=APLICAR_TURISMO_HOLDS",
     "migrate:turismo-holds:check": "node scripts/migrar-turismo-holds-v1.js --check",
+    "migrate:webauthn": "node scripts/migrar-webauthn-v1.js --check --target=develop",
+    "migrate:webauthn:apply": "node scripts/migrar-webauthn-v1.js --apply --target=develop --confirm=APLICAR_WEBAUTHN",
+    "migrate:webauthn:check": "node scripts/migrar-webauthn-v1.js --check --target=develop",
+    "migrate:webauthn:check:all": "node scripts/migrar-webauthn-v1.js --check --target=all --allow-production",
     "migrate:preferencias-modulos-contacto": "node scripts/migrar-preferencias-modulos-contacto.js",
     "seed:login-gallery": "node scripts/seed-login-gallery.js",
     "mail:verificar": "node scripts/probar-correo.js --solo-verificar",
@@ -25,9 +29,13 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.193.0",
     "@aws-sdk/s3-request-presigner": "^3.193.0",
+    "@simplewebauthn/server": "^13.3.3",
     "archiver": "^7.0.1",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",

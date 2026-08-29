@@ -11,6 +11,7 @@ const bcryptjs = require("bcryptjs");
 const { normalizarCredencialesSignin } = require("../security/signin-input");
 const { DNI_MENSAJE, esDniValido } = require("../security/dni");
 const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
+const { emitirTokenSesion } = require("../security/token-sesion");
 const { condicionModuloNotificacion } = require("../services/notificaciones-modulos");
 
 const multer = require("multer");
@@ -653,16 +654,13 @@ router.post("/signin", async (req, res) => {
           delete rows[0].password;
           let data = rows[0];
 
-          let tokenData = JSON.stringify(data);
-          const expiresIn = recordar ? "7d" : "8h";
-          jwt.sign({ data: tokenData }, process.env.JWT_SECRET, { expiresIn }, (err, token) => {
-            if (err || !token) {
-              console.error("Error al emitir token de acceso:", err);
-              res.status(500).json("Error interno");
-              return;
-            }
+          try {
+            const token = await emitirTokenSesion({ data, recordar });
             res.status(200).json({ token, data });
-          });
+          } catch (tokenError) {
+            console.error("Error al emitir token de acceso:", tokenError);
+            res.status(500).json("Error interno");
+          }
         }
       } else {
         res.status(401).send();

@@ -56,8 +56,31 @@ test("autoriza cada room por entidad, rol, departamental y área", () => {
     { departamental_origen_id: 2, departamental_destino_id: 5 }
   ), false);
   assert.equal(puedeAccederSegunEntidad(
+    { rol: "departamental", departamentalId: 7 },
+    traslados,
+    { usuario_id: 8, departamental_origen_id: 2, departamental_destino_id: 5 }
+  ), false);
+  assert.equal(puedeAccederSegunEntidad(
     { rol: "admin" }, traslados, { departamental_origen_id: 2, departamental_destino_id: 5 }
   ), true);
+  assert.equal(puedeAccederSegunEntidad(
+    { rol: "admin-central" }, traslados, { departamental_origen_id: 2, departamental_destino_id: 5 }
+  ), false);
+  assert.equal(puedeAccederSegunEntidad(
+    { id: 8, rol: "afiliado" },
+    traslados,
+    { usuario_id: 8, departamental_origen_id: 2, departamental_destino_id: 5 }
+  ), false);
+  assert.equal(puedeAccederSegunEntidad(
+    { id: 9, rol: "afiliado" },
+    traslados,
+    { usuario_id: 8, departamental_origen_id: 2, departamental_destino_id: 5 }
+  ), false);
+  assert.equal(puedeAccederSegunEntidad(
+    { id: 8, rol: "auditor" },
+    traslados,
+    { usuario_id: 8, departamental_origen_id: 2, departamental_destino_id: 5 }
+  ), false);
   assert.equal(puedeAccederSegunEntidad(
     { id: 11, rol: "afiliado" }, olimpiadas, { usuario_id: 12, departamental_id: 5 }
   ), false);
