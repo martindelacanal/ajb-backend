@@ -16,7 +16,7 @@ const {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // NOTICIAS · Portada institucional pública + administración de la redacción.
-// Público: /noticias/publicas* (sin token). Gestión: /admin/noticias* (rol admin).
+// Público: /noticias/publicas* (sin token). Gestión: /admin/noticias* (roles admin y prensa).
 // ═══════════════════════════════════════════════════════════════════════════
 
 // S3 INICIO
@@ -175,7 +175,9 @@ function getCabecera(req) {
   return JSON.parse(req.data.data);
 }
 
-const esAdmin = (cabecera) => cabecera.rol === "admin";
+const puedeGestionarNoticias = (cabecera) => (
+  cabecera?.rol === "admin" || cabecera?.rol === "prensa"
+);
 
 const ESTADOS_NOTICIA = ["BORRADOR", "PUBLICADA", "ARCHIVADA"];
 const MAX_IMAGENES_GALERIA = 12;
@@ -613,7 +615,7 @@ router.get("/noticias/publicas/:id(\\d+)", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ADMIN · Redacción de noticias (rol admin)
+// ADMIN · Redacción de noticias (roles admin y prensa)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const COLUMNAS_ORDEN_ADMIN = {
@@ -627,7 +629,7 @@ const COLUMNAS_ORDEN_ADMIN = {
 router.get("/admin/noticias", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
+    if (!puedeGestionarNoticias(cabecera)) return res.status(401).json("No autorizado");
 
     const db = mysqlConnection.promise();
     const paginacion = normalizarPaginacion(req.query, 10);
@@ -703,7 +705,7 @@ router.get("/admin/noticias", verifyToken, async (req, res) => {
 router.get("/admin/noticias/apoyos", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
+    if (!puedeGestionarNoticias(cabecera)) return res.status(401).json("No autorizado");
 
     const db = mysqlConnection.promise();
     const [categorias] = await db.query(
@@ -725,7 +727,7 @@ router.get("/admin/noticias/apoyos", verifyToken, async (req, res) => {
 router.get("/admin/noticias/:id(\\d+)", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
+    if (!puedeGestionarNoticias(cabecera)) return res.status(401).json("No autorizado");
 
     const noticiaId = normalizarIdPositivo(req.params.id);
     if (!noticiaId) return res.status(400).json("ID inválido");
@@ -762,7 +764,7 @@ router.post("/admin/noticias", verifyToken, manejarUploadNoticia, async (req, re
   const mediasSubidasS3 = [];
   try {
     const cabecera = getCabecera(req);
-    if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
+    if (!puedeGestionarNoticias(cabecera)) return res.status(401).json("No autorizado");
 
     const parseo = validarDatosNoticia(req.body);
     if (parseo.error) return res.status(400).json(parseo.error);
@@ -852,7 +854,7 @@ router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async
   const mediasABorrarS3 = [];
   try {
     const cabecera = getCabecera(req);
-    if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
+    if (!puedeGestionarNoticias(cabecera)) return res.status(401).json("No autorizado");
 
     const noticiaId = normalizarIdPositivo(req.params.id);
     if (!noticiaId) return res.status(400).json("ID inválido");
@@ -1005,7 +1007,7 @@ router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async
 router.put("/admin/noticias/:id(\\d+)/flags", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
+    if (!puedeGestionarNoticias(cabecera)) return res.status(401).json("No autorizado");
 
     const noticiaId = normalizarIdPositivo(req.params.id);
     if (!noticiaId) return res.status(400).json("ID inválido");
@@ -1047,7 +1049,7 @@ router.put("/admin/noticias/:id(\\d+)/flags", verifyToken, async (req, res) => {
 router.delete("/admin/noticias/:id(\\d+)", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
-    if (!esAdmin(cabecera)) return res.status(401).json("No autorizado");
+    if (!puedeGestionarNoticias(cabecera)) return res.status(401).json("No autorizado");
 
     const noticiaId = normalizarIdPositivo(req.params.id);
     if (!noticiaId) return res.status(400).json("ID inválido");
@@ -1077,6 +1079,7 @@ router.__test = Object.freeze({
   normalizarIdsExcluidos,
   normalizarPaginacion,
   normalizarBooleanoBinario,
+  puedeGestionarNoticias,
 });
 
 module.exports = router;

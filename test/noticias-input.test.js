@@ -4,7 +4,20 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const router = require("../api/routes/noticias");
 
-const { normalizarIdsExcluidos } = router.__test;
+const { normalizarIdsExcluidos, puedeGestionarNoticias } = router.__test;
+
+test("la gestión de noticias admite los roles admin y prensa", () => {
+  assert.equal(puedeGestionarNoticias({ rol: "admin" }), true);
+  assert.equal(puedeGestionarNoticias({ rol: "prensa" }), true);
+});
+
+test("la gestión de noticias rechaza los demás roles", () => {
+  ["afiliado", "departamental", "admin-central", "coseguro"].forEach((rol) => {
+    assert.equal(puedeGestionarNoticias({ rol }), false, `el rol ${rol} no debe gestionar noticias`);
+  });
+  assert.equal(puedeGestionarNoticias({}), false);
+  assert.equal(puedeGestionarNoticias(null), false);
+});
 
 test("exclude_ids admite hasta seis enteros positivos y elimina repetidos", () => {
   assert.deepEqual(normalizarIdsExcluidos(undefined), []);
