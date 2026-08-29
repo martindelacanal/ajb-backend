@@ -15,6 +15,11 @@ const socketio = require('socket.io');
 const { addUser, removeUser, getUser, getUsersByUsuario } = require("./api/socket/socket-user");
 const { registrarEventosChatTiempoReal } = require("./api/socket/chat-tiempo-real");
 const { iniciarMantenimientoReservas } = require("./api/services/reservas-turismo");
+const {
+    crearEventoInvalidacionHold,
+    iniciarMantenimientoHolds,
+    obtenerHoldIdActivoPorToken,
+} = require("./api/services/turismo-reserva-holds");
 const { verificarCorreo } = require("./api/services/correo");
 const {
     obtenerSnapshotDisponibilidad,
@@ -129,6 +134,8 @@ function normalizarPayloadSuscripcionDisponibilidad(payload = {}) {
             total_personas: parseo.value.total_personas,
             servicio_ids,
             reserva_excluir_id,
+            hold_token: typeof payload.hold_token === "string" ? payload.hold_token : null,
+            hold_id_excluir: null,
         },
     };
 }
@@ -145,6 +152,7 @@ async function obtenerActualizacionesDisponibilidad(payloadNormalizado) {
         bebes: payloadNormalizado.bebes,
         totalPersonas: payloadNormalizado.total_personas,
         reservaExcluirId: payloadNormalizado.reserva_excluir_id || null,
+        holdIdExcluir: payloadNormalizado.hold_id_excluir || null,
     });
 }
 
@@ -202,6 +210,7 @@ const io = socketio(server, {
     },
     maxHttpBufferSize: 100000,
 });
+app.set("io", io);
 
 io.use(async (socket, next) => {
     try {
@@ -346,6 +355,11 @@ io.on("connection", (socket) => {
                     normalizado.value.reserva_excluir_id = null;
                 }
             }
+            normalizado.value.hold_id_excluir = await obtenerHoldIdActivoPorToken(mysqlConnection.promise(), {
+                actorUsuarioId: socket.data.auth.id,
+                holdToken: normalizado.value.hold_token,
+            });
+            delete normalizado.value.hold_token;
 
             const clave = crearClaveSuscripcionDisponibilidad({
                 ...normalizado.value,
@@ -370,7 +384,7 @@ io.on("connection", (socket) => {
         }
     });
 
-    socket.on("servicios:disponibilidad:unsubscribe", (payload = {}, callback = () => { }) => {
+    socket.on("servicios:disponibilidad:unsubscribe", async (payload = {}, callback = () => { }) => {
         try {
             if (!payload || Object.keys(payload).length === 0) {
                 socket.data.disponibilidadSubs.clear();
@@ -384,6 +398,11 @@ io.on("connection", (socket) => {
                 callback({ error: normalizado.error });
                 return;
             }
+            normalizado.value.hold_id_excluir = await obtenerHoldIdActivoPorToken(mysqlConnection.promise(), {
+                actorUsuarioId: socket.data.auth.id,
+                holdToken: normalizado.value.hold_token,
+            });
+            delete normalizado.value.hold_token;
 
             const clave = crearClaveSuscripcionDisponibilidad({
                 ...normalizado.value,
@@ -418,6 +437,14 @@ io.on("connection", (socket) => {
 
 server.listen(port);
 iniciarMantenimientoReservas(mysqlConnection.promise());
+iniciarMantenimientoHolds(mysqlConnection.promise(), {
+    onExpirados: async (holds) => {
+        for (const hold of holds) {
+            const evento = crearEventoInvalidacionHold(hold, "HOLD_VENCIDO");
+            if (evento) io.emit("servicios:disponibilidad:invalidada", evento);
+        }
+    },
+});
 
 // Chequeo informativo del correo saliente: no bloquea el arranque, solo deja
 // registro si la casilla de notificaciones quedo mal configurada.

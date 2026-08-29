@@ -15,6 +15,8 @@
     "migrate:noticias": "node scripts/migrar-noticias.js",
     "migrate:reservas-plazos": "node scripts/migrar-reservas-plazos-v1.js",
     "migrate:reservas-plazos:check": "node scripts/migrar-reservas-plazos-v1.js --check",
+    "migrate:turismo-holds": "node scripts/migrar-turismo-holds-v1.js --apply --confirm=APLICAR_TURISMO_HOLDS",
+    "migrate:turismo-holds:check": "node scripts/migrar-turismo-holds-v1.js --check",
     "migrate:preferencias-modulos-contacto": "node scripts/migrar-preferencias-modulos-contacto.js",
     "seed:login-gallery": "node scripts/seed-login-gallery.js",
     "mail:verificar": "node scripts/probar-correo.js --solo-verificar",

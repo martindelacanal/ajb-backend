@@ -15,6 +15,10 @@ const {
   sumarDiasFechaCivil,
   validarRangoReservaTemporal,
 } = require("./valores-dominio");
+const {
+  contarHoldsActivosRecurso,
+  obtenerRecursosRetenidos,
+} = require("./turismo-reserva-holds");
 
 function normalizarEnteroNoNegativo(valor, porDefecto = 0) {
   if (valor === undefined || valor === null || valor === "") {
@@ -246,7 +250,14 @@ async function obtenerServicios(connection, { lugar = null, servicioIds = null, 
   return rows;
 }
 
-async function obtenerDisponibilidadCamping(connection, { servicioId, fechaInicio, fechaFin, totalPersonas, reservaExcluirId = null }) {
+async function obtenerDisponibilidadCamping(connection, {
+  servicioId,
+  fechaInicio,
+  fechaFin,
+  totalPersonas,
+  reservaExcluirId = null,
+  holdIdExcluir = null,
+}) {
   const [recursosCamping] = await connection.query(
     "SELECT id FROM recurso WHERE servicio_id = ? ORDER BY id ASC",
     [servicioId]
@@ -328,12 +339,27 @@ async function obtenerDisponibilidadCamping(connection, { servicioId, fechaInici
   );
 
   const ocupadas = Number(reservasSolapadas?.[0]?.total || 0);
-  const disponibles = Math.max(parcelasTotales - ocupadas, 0);
+  const retenidas = await contarHoldsActivosRecurso(connection, {
+    recursoId: recursoCampingId,
+    fechaInicio,
+    fechaFin,
+    holdIdExcluir,
+  });
+  const disponibles = Math.max(parcelasTotales - ocupadas - retenidas, 0);
 
   return construirPayloadDisponibilidad(disponibles, parcelasTotales);
 }
 
-async function obtenerDisponibilidadNoCamping(connection, { servicioId, fechaInicio, fechaFin, adultos, ninos, bebes, reservaExcluirId = null }) {
+async function obtenerDisponibilidadNoCamping(connection, {
+  servicioId,
+  fechaInicio,
+  fechaFin,
+  adultos,
+  ninos,
+  bebes,
+  reservaExcluirId = null,
+  holdIdExcluir = null,
+}) {
   const [recursos] = await connection.query(
     "SELECT id FROM recurso WHERE servicio_id = ? ORDER BY id ASC",
     [servicioId]
@@ -373,6 +399,12 @@ async function obtenerDisponibilidadNoCamping(connection, { servicioId, fechaIni
   );
 
   const recursoOcupadoSet = new Set(reservasSolapadas.map((r) => Number(r.recurso_id)));
+  const recursoRetenidoSet = await obtenerRecursosRetenidos(connection, {
+    recursoIds,
+    fechaInicio,
+    fechaFin,
+    holdIdExcluir,
+  });
   const recursoBloqueadoPorBloqueSet = await obtenerRecursosBloqueadosPorBloques(connection, {
     recursoIds,
     fechaInicio,
@@ -419,7 +451,9 @@ async function obtenerDisponibilidadNoCamping(connection, { servicioId, fechaIni
   }
 
   const disponibles = recursosCompatibles.reduce((acumulado, recursoId) => {
-    const noDisponible = recursoOcupadoSet.has(recursoId) || recursoBloqueadoPorBloqueSet.has(recursoId);
+    const noDisponible = recursoOcupadoSet.has(recursoId)
+      || recursoRetenidoSet.has(recursoId)
+      || recursoBloqueadoPorBloqueSet.has(recursoId);
     return acumulado + (noDisponible ? 0 : 1);
   }, 0);
 
@@ -436,6 +470,7 @@ async function calcularDisponibilidadServicio(connection, params) {
     bebes,
     totalPersonas,
     reservaExcluirId = null,
+    holdIdExcluir = null,
   } = params;
 
   const actualizadoEn = new Date().toISOString();
@@ -447,6 +482,7 @@ async function calcularDisponibilidadServicio(connection, params) {
           fechaFin,
           totalPersonas,
           reservaExcluirId,
+          holdIdExcluir,
         })
       : await obtenerDisponibilidadNoCamping(connection, {
           servicioId,
@@ -456,6 +492,7 @@ async function calcularDisponibilidadServicio(connection, params) {
           ninos,
           bebes,
           reservaExcluirId,
+          holdIdExcluir,
         });
 
   return {
@@ -475,6 +512,7 @@ async function obtenerSnapshotDisponibilidad(connection, params) {
     bebes,
     totalPersonas,
     reservaExcluirId = null,
+    holdIdExcluir = null,
   } = params;
 
   const servicios = await obtenerServicios(connection, { lugar, servicioIds });
@@ -490,6 +528,7 @@ async function obtenerSnapshotDisponibilidad(connection, params) {
       bebes,
       totalPersonas,
       reservaExcluirId,
+      holdIdExcluir,
     });
 
     resultados.push({
@@ -512,6 +551,7 @@ async function obtenerCalendarioAlternativoServicio(connection, params) {
     totalPersonas,
     horizonteDias = HORIZONTE_ALTERNATIVAS_DIAS,
     maxResultados = MAX_RANGOS_ALTERNATIVOS,
+    holdIdExcluir = null,
   } = params;
 
   const noches = obtenerNochesReserva(fechaInicio, fechaFin);
@@ -542,6 +582,7 @@ async function obtenerCalendarioAlternativoServicio(connection, params) {
       ninos,
       bebes,
       totalPersonas,
+      holdIdExcluir,
     });
 
     if (disponibilidad.disponibles > 0) {

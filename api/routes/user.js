@@ -71,6 +71,19 @@ const {
   obtenerEstadoAltaTurismo,
   validarTransicionTurismo,
 } = require("../services/reservas-turismo");
+const {
+  adquirirHoldTurismo,
+  asegurarSinHoldAjenoEnTransaccion,
+  consumirHoldEnTransaccion,
+  contarHoldsActivosPorBloque,
+  crearEventoInvalidacionHold,
+  liberarHoldTurismo,
+  obtenerEstadoHold,
+  obtenerHoldIdActivoPorToken,
+  obtenerNumerosParcelasRetenidas,
+  obtenerRecursosRetenidos,
+  validarHoldParaReservaEnTransaccion,
+} = require("../services/turismo-reserva-holds");
 
 const HISTORIAL_USUARIO_LEGIBLE = crearEnriquecimientoHistorial(
   CATALOGOS_HISTORIAL_USUARIO
@@ -912,6 +925,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
       ) && tieneAreaTurismo(cabecera)
     ) {
       const db = mysqlConnection.promise();
+      const holdIdExcluir = await resolverHoldIdExcluir(db, cabecera, req.query.hold_token);
       const lugar = req.query.lugar;
       const hayParametrosDisponibilidad =
         req.query.fecha_inicio !== undefined ||
@@ -962,6 +976,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
           ninos: criteriosDisponibilidad.ninos,
           bebes: criteriosDisponibilidad.bebes,
           totalPersonas: criteriosDisponibilidad.total_personas,
+          holdIdExcluir,
         });
 
         disponibilidadSnapshot.forEach((item) => {
@@ -971,7 +986,8 @@ router.get("/servicios", verifyToken, async (req, res) => {
         bloquesDisponiblesPorServicio = await obtenerBloquesDisponiblesPorServicio(db, {
           servicioIds: servicios.map((servicio) => Number(servicio.id)),
           fechaInicio: criteriosDisponibilidad.fecha_inicio,
-          fechaFin: criteriosDisponibilidad.fecha_fin
+          fechaFin: criteriosDisponibilidad.fecha_fin,
+          holdIdExcluir,
         });
 
         try {
@@ -1172,6 +1188,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
               totalPersonas: criteriosDisponibilidad.total_personas,
               horizonteDias: 45,
               maxResultados: 12,
+              holdIdExcluir,
             });
           }
         }
@@ -1234,8 +1251,117 @@ router.get("/servicios", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
+    if (responderErrorHold(res, error)) return;
     registrarErrorRuta(error);
     res.status(500).json("Error al obtener los servicios");
+  }
+});
+
+function responderErrorHold(res, error) {
+  const status = Number(error?.statusCode);
+  if (!Number.isInteger(status) || status < 400 || status > 599) return false;
+  const payload = {
+    message: error.message,
+    codigo: error.codigo || "HOLD_ERROR",
+  };
+  if (error.detalles && typeof error.detalles === "object") {
+    Object.assign(payload, error.detalles);
+  }
+  res.status(status).json(payload);
+  return true;
+}
+
+async function resolverHoldIdExcluir(connection, cabecera, holdToken) {
+  if (holdToken === undefined || holdToken === null || holdToken === "") return null;
+  return obtenerHoldIdActivoPorToken(connection, {
+    actorUsuarioId: cabecera.id,
+    holdToken,
+  });
+}
+
+function emitirInvalidacionDisponibilidad(req, hold, motivo) {
+  const evento = crearEventoInvalidacionHold(hold, motivo);
+  if (evento) req.app.get("io")?.emit("servicios:disponibilidad:invalidada", evento);
+}
+
+function puedeUsarHoldsTurismo(cabecera) {
+  return ["admin", "departamental", "afiliado"].includes(cabecera?.rol)
+    && tieneAreaTurismo(cabecera);
+}
+
+router.post("/turismo/reserva-holds", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!puedeUsarHoldsTurismo(cabecera)) {
+      return res.status(401).json({ message: "No autorizado", codigo: "HOLD_NO_AUTORIZADO" });
+    }
+    const actorId = normalizarIdPositivo(cabecera.id);
+    const titularId = cabecera.rol === "afiliado"
+      ? actorId
+      : normalizarIdPositivo(req.body.titular_usuario_id ?? req.body.usuario_id);
+    const resultado = await adquirirHoldTurismo(mysqlConnection.promise(), {
+      actorUsuarioId: actorId,
+      actorRol: cabecera.rol,
+      actorDepartamentalId: cabecera.departamental_id,
+      titularUsuarioId: titularId,
+      servicioId: req.body.servicio_id,
+      recursoId: req.body.recurso_id,
+      bloqueFechaId: req.body.bloque_fecha_id,
+      modalidad: req.body.modalidad,
+      fechaInicio: req.body.fecha_inicio,
+      fechaFin: req.body.fecha_fin,
+      holdToken: req.body.hold_token,
+    });
+    const { creado, hold_anterior: holdAnterior, ...respuesta } = resultado;
+    if (holdAnterior) emitirInvalidacionDisponibilidad(req, holdAnterior, "HOLD_REEMPLAZADO");
+    emitirInvalidacionDisponibilidad(req, respuesta, respuesta.reemplazado ? "HOLD_REEMPLAZADO" : "HOLD_CREADO");
+    return res.status(creado ? 201 : 200).json(respuesta);
+  } catch (error) {
+    if (responderErrorHold(res, error)) return;
+    registrarErrorRuta(error);
+    return res.status(500).json({ message: "No pudimos guardar temporalmente el alojamiento.", codigo: "HOLD_ERROR_INTERNO" });
+  }
+});
+
+router.get("/turismo/reserva-holds/:id?", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!puedeUsarHoldsTurismo(cabecera)) {
+      return res.status(401).json({ message: "No autorizado", codigo: "HOLD_NO_AUTORIZADO" });
+    }
+    const resultado = await obtenerEstadoHold(mysqlConnection.promise(), {
+      actorUsuarioId: cabecera.id,
+      holdId: req.params.id || null,
+    });
+    if (req.params.id && !resultado.hold) {
+      return res.status(404).json({ message: "Reserva temporal no encontrada.", codigo: "HOLD_NO_ENCONTRADO" });
+    }
+    return res.status(200).json(resultado);
+  } catch (error) {
+    if (responderErrorHold(res, error)) return;
+    registrarErrorRuta(error);
+    return res.status(500).json({ message: "No pudimos consultar la reserva temporal.", codigo: "HOLD_ERROR_INTERNO" });
+  }
+});
+
+router.delete("/turismo/reserva-holds/:id", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!puedeUsarHoldsTurismo(cabecera)) {
+      return res.status(401).json({ message: "No autorizado", codigo: "HOLD_NO_AUTORIZADO" });
+    }
+    const resultado = await liberarHoldTurismo(mysqlConnection.promise(), {
+      actorUsuarioId: cabecera.id,
+      holdId: req.params.id,
+      holdToken: req.body?.hold_token,
+    });
+    emitirInvalidacionDisponibilidad(req, resultado.hold, resultado.estado === "VENCIDO" ? "HOLD_VENCIDO" : "HOLD_LIBERADO");
+    const { hold: _hold, ...respuesta } = resultado;
+    return res.status(200).json(respuesta);
+  } catch (error) {
+    if (responderErrorHold(res, error)) return;
+    registrarErrorRuta(error);
+    return res.status(500).json({ message: "No pudimos liberar la reserva temporal.", codigo: "HOLD_ERROR_INTERNO" });
   }
 });
 
@@ -1971,6 +2097,7 @@ router.get("/servicios/disponibilidad", verifyToken, async (req, res) => {
 
       const servicioIds = parsearServicioIdsCsv(req.query.servicio_ids);
       const db = mysqlConnection.promise();
+      const holdIdExcluir = await resolverHoldIdExcluir(db, cabecera, req.query.hold_token);
 
       // Al editar una reserva, el snapshot no debe contarla como ocupación.
       // El afiliado solo puede excluir una reserva propia (el cupo real lo
@@ -1997,6 +2124,7 @@ router.get("/servicios/disponibilidad", verifyToken, async (req, res) => {
         bebes: parseo.value.bebes,
         totalPersonas: parseo.value.total_personas,
         reservaExcluirId,
+        holdIdExcluir,
       });
 
       res.status(200).json(snapshot);
@@ -2004,6 +2132,7 @@ router.get("/servicios/disponibilidad", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
+    if (responderErrorHold(res, error)) return;
     registrarErrorRuta(error);
     res.status(500).json("Error al obtener disponibilidad de servicios");
   }
@@ -2034,6 +2163,7 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
       }
 
       const db = mysqlConnection.promise();
+      const holdIdExcluir = await resolverHoldIdExcluir(db, cabecera, req.query.hold_token);
       const servicios = await obtenerServicios(db, { servicioId });
       if (servicios.length === 0) {
         return res.status(404).json("Servicio inexistente");
@@ -2047,6 +2177,7 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
         ninos: parseo.value.ninos,
         bebes: parseo.value.bebes,
         totalPersonas: parseo.value.total_personas,
+        holdIdExcluir,
       });
 
       const horizonteBloquesDiasRaw = normalizarEnteroNoNegativoOpcional(
@@ -2067,7 +2198,8 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
       const bloquesDisponiblesMap = await obtenerBloquesDisponiblesPorServicio(db, {
         servicioId,
         fechaInicio: fechaInicioBloques,
-        fechaFin: fechaFinBloques
+        fechaFin: fechaFinBloques,
+        holdIdExcluir,
       });
       calendario.bloques_disponibles = bloquesDisponiblesMap.get(servicioId) || [];
 
@@ -2083,6 +2215,7 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
       res.status(401).json("No autorizado");
     }
   } catch (error) {
+    if (responderErrorHold(res, error)) return;
     registrarErrorRuta(error);
     res.status(500).json("Error al obtener fechas alternativas");
   }
@@ -4263,6 +4396,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         orden_id,
         modalidad,
         bloque_fecha_id,
+        hold_token,
         solo_fecha_libre,
         soloFechaLibre
       } = req.body;
@@ -4289,6 +4423,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       }
 
       const db = mysqlConnection.promise();
+      const holdIdExcluir = await resolverHoldIdExcluir(db, cabecera, hold_token);
       const personasAutorizadas = await resolverPersonasCotizacionAutorizadas(db, cabecera, {
         personas,
         usuarioObjetivoId: usuario_id,
@@ -4501,6 +4636,26 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         [...recursosIds, fecha_fin, fecha_inicio, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
       );
       const recursosOcupadosSet = new Set(reservasSolapadasRecursos.map((reserva) => Number(reserva.recurso_id)));
+      const recursosRetenidosSet = await obtenerRecursosRetenidos(db, {
+        recursoIds: recursos.map((recurso) => Number(recurso.id)),
+        fechaInicio: fechaInicioSolicitud,
+        fechaFin: fechaFinSolicitud,
+        holdIdExcluir,
+      });
+      let campingSinDisponibilidad = false;
+      if (esServicioCamping(servicioIdSolicitud)) {
+        const snapshotCamping = await obtenerSnapshotDisponibilidad(db, {
+          servicioIds: [servicioIdSolicitud],
+          fechaInicio: fechaInicioSolicitud,
+          fechaFin: fechaFinSolicitud,
+          adultos: 0,
+          ninos: 0,
+          bebes: 0,
+          totalPersonas: personasAutorizadas.length,
+          holdIdExcluir,
+        });
+        campingSinDisponibilidad = Number(snapshotCamping[0]?.disponibles || 0) <= 0;
+      }
 
       // Obtener imágenes solo para los recursos válidos
       const [imagenes] = await mysqlConnection
@@ -4567,7 +4722,12 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
 
       // Calcular tarifas para cada recurso y aplicar filtro de precio
       for (const recurso of recursos) {
-        if (recursosOcupadosSet.has(Number(recurso.id))) {
+        if (
+          (esServicioCamping(servicioIdSolicitud) && campingSinDisponibilidad) ||
+          (!esServicioCamping(servicioIdSolicitud) && (
+            recursosOcupadosSet.has(Number(recurso.id)) || recursosRetenidosSet.has(Number(recurso.id))
+          ))
+        ) {
           continue;
         }
 
@@ -7494,7 +7654,13 @@ async function obtenerBloquesActivosParaRecursos(connection, { recursoIds, fecha
   }
 }
 
-async function obtenerBloquesDisponiblesPorServicio(connection, { servicioIds = [], servicioId = null, fechaInicio, fechaFin }) {
+async function obtenerBloquesDisponiblesPorServicio(connection, {
+  servicioIds = [],
+  servicioId = null,
+  fechaInicio,
+  fechaFin,
+  holdIdExcluir = null,
+}) {
   const ids = Number.isInteger(servicioId) && servicioId > 0
     ? [servicioId]
     : (Array.isArray(servicioIds) ? servicioIds.map(Number).filter((id) => Number.isInteger(id) && id > 0) : []);
@@ -7551,8 +7717,17 @@ async function obtenerBloquesDisponiblesPorServicio(connection, { servicioIds = 
       [...ids, fechaFin, fechaInicio]
     );
 
+    const holdsPorBloque = await contarHoldsActivosPorBloque(connection, {
+      bloqueFechaIds: rows.map((row) => Number(row.id)),
+      holdIdExcluir,
+    });
     const mapa = new Map();
     rows.forEach((row) => {
+      const recursosDisponibles = Math.max(
+        Number(row.recursos_disponibles || 0) - Number(holdsPorBloque.get(Number(row.id)) || 0),
+        0
+      );
+      if (recursosDisponibles <= 0) return;
       const servicioIdRow = Number(row.servicio_id);
       if (!mapa.has(servicioIdRow)) {
         mapa.set(servicioIdRow, []);
@@ -7570,7 +7745,7 @@ async function obtenerBloquesDisponiblesPorServicio(connection, { servicioIds = 
         lugar: row.lugar || null,
         fecha_inicio: formatearFechaSQL(row.fecha_inicio),
         fecha_fin: formatearFechaSQL(row.fecha_fin),
-        recursos_disponibles: Number(row.recursos_disponibles || 0)
+        recursos_disponibles: recursosDisponibles
       });
     });
     return mapa;
@@ -7614,6 +7789,8 @@ async function bloquearYValidarDisponibilidadReserva(connection, {
   fechaInicio,
   fechaFin,
   reservaIdExcluir = null,
+  holdIdExcluir = null,
+  omitirValidacionHolds = false,
 }) {
   const servicioIdNormalizado = normalizarIdPositivo(servicioId);
   const recursoIdNormalizado = normalizarIdPositivo(recursoId);
@@ -7635,6 +7812,15 @@ async function bloquearYValidarDisponibilidadReserva(connection, {
 
   if (esServicioCamping(servicioIdNormalizado)) {
     return;
+  }
+
+  if (!omitirValidacionHolds) {
+    await asegurarSinHoldAjenoEnTransaccion(connection, {
+      recursoId: recursoIdNormalizado,
+      fechaInicio: inicio,
+      fechaFin: fin,
+      holdIdExcluir,
+    });
   }
 
   const params = [recursoIdNormalizado, fin, inicio];
@@ -7763,7 +7949,13 @@ async function obtenerMinimoParcelasDisponiblesCamping(connection, recursoId, no
   return minParcelasDisponibles;
 }
 
-async function asignarNumeroParcelaCamping(connection, { recursoId, fechaInicio, fechaFin, reservaIdExcluir = null }) {
+async function asignarNumeroParcelaCamping(connection, {
+  recursoId,
+  fechaInicio,
+  fechaFin,
+  reservaIdExcluir = null,
+  holdIdExcluir = null,
+}) {
   const noches = obtenerNochesReserva(fechaInicio, fechaFin);
   if (noches.length === 0) {
     throw crearErrorReservaCamping("El rango de fechas seleccionado no es valido", 422);
@@ -7813,6 +8005,16 @@ async function asignarNumeroParcelaCamping(connection, { recursoId, fechaInicio,
       parcelasOcupadas.add(numeroParcela);
     }
   }
+  const parcelasRetenidas = await obtenerNumerosParcelasRetenidas(connection, {
+    recursoId,
+    fechaInicio,
+    fechaFin,
+    holdIdExcluir,
+    forUpdate: true,
+  });
+  parcelasRetenidas.forEach((numeroParcela) => {
+    if (numeroParcela <= parcelasDisponibles) parcelasOcupadas.add(numeroParcela);
+  });
 
   for (let numeroParcela = 1; numeroParcela <= parcelasDisponibles; numeroParcela++) {
     if (!parcelasOcupadas.has(numeroParcela)) {
@@ -8284,7 +8486,9 @@ router.post("/reserva", verifyToken, async (req, res) => {
         firma,
         adicionales,
         modalidad,
-        bloque_fecha_id
+        bloque_fecha_id,
+        hold_id,
+        hold_token
       } = req.body;
 
       // Validar campos requeridos
@@ -8322,6 +8526,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
       let modalidadReserva = MODALIDAD_FECHA_LIBRE;
       let bloqueFechaIdReserva = null;
       let temporadaTarifaIdReserva = null;
+      let holdReservaValidado = null;
 
       let connection;
       try {
@@ -8421,12 +8626,45 @@ router.post("/reserva", verifyToken, async (req, res) => {
           }
         }
 
+        const requiereHold = cabecera.rol === "afiliado" || Boolean(hold_token);
+        const holdIdExcluirPrevalidado = requiereHold
+          ? await obtenerHoldIdActivoPorToken(connection, {
+              actorUsuarioId: cabecera.id,
+              holdToken: hold_token,
+            })
+          : null;
+
         await bloquearYValidarDisponibilidadReserva(connection, {
           servicioId: servicioIdReserva,
           recursoId: recursoIdReserva,
           fechaInicio: fechaInicioReserva,
           fechaFin: fechaFinReserva,
+          holdIdExcluir: holdIdExcluirPrevalidado,
+          omitirValidacionHolds: requiereHold,
         });
+
+        if (requiereHold) {
+          holdReservaValidado = await validarHoldParaReservaEnTransaccion(connection, {
+            actorUsuarioId: cabecera.id,
+            titularUsuarioId: usuarioReservaId,
+            servicioId: servicioIdReserva,
+            recursoId: recursoIdReserva,
+            bloqueFechaId: bloqueFechaIdReserva,
+            modalidad: modalidadReserva,
+            fechaInicio: fechaInicioReserva,
+            fechaFin: fechaFinReserva,
+            holdId: hold_id,
+            holdToken: hold_token,
+          });
+          if (!esReservaCamping) {
+            await asegurarSinHoldAjenoEnTransaccion(connection, {
+              recursoId: recursoIdReserva,
+              fechaInicio: fechaInicioReserva,
+              fechaFin: fechaFinReserva,
+              holdIdExcluir: holdReservaValidado.id,
+            });
+          }
+        }
 
         const { usuarioFamiliarPrincipalId, departamentalId } = await obtenerUsuarioPrincipalFamilia(
           connection,
@@ -8621,11 +8859,23 @@ router.post("/reserva", verifyToken, async (req, res) => {
 
         // Confirmar transacción
         if (esReservaCamping) {
-          numeroParcelaAsignada = await asignarNumeroParcelaCamping(connection, {
-            recursoId: recursoIdReserva,
-            fechaInicio: fechaInicioReserva,
-            fechaFin: fechaFinReserva
-          });
+          if (holdReservaValidado?.numeroParcela) {
+            numeroParcelaAsignada = holdReservaValidado.numeroParcela;
+            await validarNumeroParcelaCampingExistente(connection, {
+              reservaId,
+              recursoId: recursoIdReserva,
+              fechaInicio: fechaInicioReserva,
+              fechaFin: fechaFinReserva,
+              numeroParcela: numeroParcelaAsignada,
+            });
+          } else {
+            numeroParcelaAsignada = await asignarNumeroParcelaCamping(connection, {
+              recursoId: recursoIdReserva,
+              fechaInicio: fechaInicioReserva,
+              fechaFin: fechaFinReserva,
+              holdIdExcluir: holdReservaValidado?.id || null,
+            });
+          }
 
           await connection.query(
             "UPDATE reserva SET numero_parcela = ? WHERE id = ?",
@@ -8633,7 +8883,25 @@ router.post("/reserva", verifyToken, async (req, res) => {
           );
         }
 
+        if (holdReservaValidado) {
+          await consumirHoldEnTransaccion(connection, {
+            holdId: holdReservaValidado.id,
+            reservaId,
+          });
+        }
+
         await connection.commit();
+        emitirInvalidacionDisponibilidad(
+          req,
+          holdReservaValidado?.hold || {
+            servicio_id: servicioIdReserva,
+            recurso_id: recursoIdReserva,
+            bloque_fecha_id: bloqueFechaIdReserva,
+            fecha_inicio: fechaInicioReserva,
+            fecha_fin: fechaFinReserva,
+          },
+          holdReservaValidado ? "HOLD_CONSUMIDO" : "RESERVA_CREADA"
+        );
 
         const numeroReserva = `${reservaId}`;
 

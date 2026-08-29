@@ -569,6 +569,7 @@ test("el alta departamental revierte Iniciada y Verificada si falla el segundo h
     if (/SELECT id FROM recurso WHERE id = \? AND servicio_id = \? FOR UPDATE/i.test(sql)) {
       return [[{ id: 2 }]];
     }
+    if (/FROM turismo_reserva_hold/i.test(sql)) return [[]];
     if (/SELECT r\.id[\s\S]+FROM reserva r[\s\S]+FOR UPDATE/i.test(sql)) return [[]];
     if (/SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = \?/i.test(sql)) {
       return [[{ id: 200, usuario_familiar_id: null, departamental_id: 7 }]];
