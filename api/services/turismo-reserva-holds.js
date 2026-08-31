@@ -15,9 +15,6 @@ const HOLD_ESTADO_LIBERADO = "LIBERADO";
 const HOLD_ESTADO_VENCIDO = "VENCIDO";
 const MODALIDAD_FECHA_LIBRE = "FECHA_LIBRE";
 const MODALIDAD_BLOQUE = "BLOQUE";
-const SERVICIO_CAMPING_ID = 4;
-const RECURSO_CAMPING_ID = 1;
-const MAX_PERSONAS_CAMPING = 6;
 const LOCK_EXPIRACION_HOLDS = "ajb:turismo:reserva-holds:expiracion:v1";
 const TOKEN_MIN_LENGTH = 32;
 const TOKEN_MAX_LENGTH = 200;
@@ -177,9 +174,9 @@ function normalizarDatosAdquisicion(params) {
     !actorUsuarioId || !servicioId || !recursoId || !modalidad || !fechaInicio || !fechaFin ||
     fechaInicio >= fechaFin || !validacionTemporal.valido ||
     (params.titularUsuarioId != null && !titularUsuarioId) ||
+    (params.totalPersonas != null && (!Number.isSafeInteger(Number(params.totalPersonas)) || Number(params.totalPersonas) <= 0)) ||
     (modalidad === MODALIDAD_BLOQUE && !bloqueFechaId) ||
-    (modalidad === MODALIDAD_FECHA_LIBRE && bloqueFechaId !== null) ||
-    (servicioId === SERVICIO_CAMPING_ID && recursoId !== RECURSO_CAMPING_ID)
+    (modalidad === MODALIDAD_FECHA_LIBRE && bloqueFechaId !== null)
   ) {
     throw crearErrorHold(
       "Los datos para reservar temporalmente el alojamiento no son válidos.",
@@ -198,6 +195,7 @@ function normalizarDatosAdquisicion(params) {
     bloqueFechaId,
     fechaInicio,
     fechaFin,
+    totalPersonas: params.totalPersonas == null ? null : Number(params.totalPersonas),
   };
 }
 
@@ -219,6 +217,8 @@ async function bloquearYValidarUsuarios(connection, datos) {
     throw crearErrorHold("La sesión ya no está habilitada.", 403, "HOLD_NO_AUTORIZADO");
   }
   const rolActual = String(actor.rol || "").trim().toLowerCase();
+  datos.actorRol = rolActual;
+  datos.actorDepartamentalId = normalizarIdPositivo(actor.departamental_id);
   if (!['admin', 'departamental', 'afiliado'].includes(rolActual)) {
     throw crearErrorHold("No tienes permisos para reservar este alojamiento.", 403, "HOLD_NO_AUTORIZADO");
   }
@@ -233,10 +233,14 @@ async function bloquearYValidarUsuarios(connection, datos) {
     if (actor.modulo_turismo != null && Number(actor.modulo_turismo) !== 1) {
       throw crearErrorHold("No tienes habilitado el módulo Turismo.", 403, "HOLD_NO_AUTORIZADO");
     }
+    datos.departamentalVisibilidadId = normalizarIdPositivo(actor.departamental_id);
     return;
   }
 
-  if (datos.titularUsuarioId == null) return;
+  if (datos.titularUsuarioId == null) {
+    datos.departamentalVisibilidadId = normalizarIdPositivo(actor.departamental_id);
+    return;
+  }
   const titular = usuarios.get(datos.titularUsuarioId);
   if (
     !titular || titular.habilitado !== "Y" ||
@@ -259,6 +263,7 @@ async function bloquearYValidarUsuarios(connection, datos) {
       "HOLD_NO_AUTORIZADO"
     );
   }
+  datos.departamentalVisibilidadId = normalizarIdPositivo(titular.departamental_id);
 }
 
 async function obtenerHoldPorId(connection, holdId, { forUpdate = false } = {}) {
@@ -286,16 +291,39 @@ async function obtenerHoldActivoActor(connection, actorUsuarioId, { forUpdate = 
   return rows[0] || null;
 }
 
-async function bloquearRecursos(connection, recursoIds, servicioIdEsperado) {
+async function bloquearRecursos(connection, recursoIds, servicioIdEsperado, datos) {
   const ids = [...new Set(recursoIds.filter(Boolean).map(Number))].sort((a, b) => a - b);
   const placeholders = ids.map(() => "?").join(",");
+  const params = [...ids];
+  let visibilidad = "";
+  if (datos.actorRol !== "admin") {
+    const dep = normalizarIdPositivo(datos.departamentalVisibilidadId);
+    if (dep) {
+      visibilidad = `AND (
+        s.alcance_departamental = 'TODAS'
+        OR (s.alcance_departamental = 'PROPIA' AND s.propietario_departamental_id = ?)
+        OR (s.alcance_departamental = 'SELECCIONADAS' AND EXISTS (
+          SELECT 1 FROM servicio_departamental_visible sdv
+           WHERE sdv.servicio_id = s.id AND sdv.departamental_id = ?
+        ))
+      )`;
+      params.push(dep, dep);
+    } else {
+      visibilidad = "AND s.alcance_departamental = 'TODAS'";
+    }
+  }
   const [rows] = await connection.query(
-    `SELECT id, servicio_id
-       FROM recurso
-      WHERE id IN (${placeholders})
-      ORDER BY id
+    `SELECT r.id, r.servicio_id, r.cupo_maximo, r.es_recurso_principal,
+            s.max_personas_reserva, s.modelo_tarifa, ts.codigo AS tipo_codigo
+       FROM recurso r
+       INNER JOIN servicio s ON s.id = r.servicio_id
+       INNER JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id
+      WHERE r.id IN (${placeholders}) AND r.activo = 1
+        AND s.activo = 1 AND s.estado_aprobacion = 'APROBADO' AND ts.activo = 1
+        ${visibilidad}
+      ORDER BY r.id
       FOR UPDATE`,
-    ids
+    params
   );
   const nuevo = rows.find((row) => Number(row.id) === Number(recursoIds.at(-1)));
   if (!nuevo || Number(nuevo.servicio_id) !== Number(servicioIdEsperado)) {
@@ -305,6 +333,21 @@ async function bloquearRecursos(connection, recursoIds, servicioIdEsperado) {
       "HOLD_RECURSO_INVALIDO"
     );
   }
+  const maxPersonas = Number(nuevo.max_personas_reserva);
+  if (nuevo.modelo_tarifa === "PRECIO_UNICO" && Number.isInteger(datos.totalPersonas) && datos.totalPersonas !== 1) {
+    throw crearErrorHold(
+      "Este servicio sólo admite la reserva del titular.",
+      422,
+      "PRECIO_UNICO_SOLO_TITULAR"
+    );
+  }
+  if (
+    Number.isInteger(datos.totalPersonas) && Number.isInteger(maxPersonas) && maxPersonas > 0 &&
+    datos.totalPersonas > maxPersonas
+  ) {
+    throw crearErrorHold("La cantidad de personas supera el máximo del servicio.", 422, "HOLD_CAPACIDAD_EXCEDIDA");
+  }
+  return nuevo;
 }
 
 async function validarBloque(connection, datos) {
@@ -409,13 +452,21 @@ async function obtenerHoldsSolapados(connection, datos, holdIdExcluir = null, { 
   return rows;
 }
 
-async function obtenerParcelasCamping(connection, datos, holdIdExcluir = null) {
+async function obtenerParcelasCamping(connection, datos, configuracion, holdIdExcluir = null) {
   const noches = obtenerNochesReserva(datos.fechaInicio, datos.fechaFin, 366);
   if (noches.length === 0) {
     throw crearErrorHold("El rango de fechas no es válido.", 400, "HOLD_DATOS_INVALIDOS");
   }
   let minimo = null;
   for (const fecha of noches) {
+    const [cupos] = await connection.query(
+      `SELECT MIN(cupo_total) AS cupo
+         FROM recurso_cupo_periodo
+        WHERE recurso_id = ? AND activo = 1
+          AND fecha_inicio <= ? AND fecha_fin >= ?`,
+      [datos.recursoId, fecha, fecha]
+    );
+    let parcelas = Number(cupos[0]?.cupo);
     const [rows] = await connection.query(
       `SELECT MIN(parcelas_disponibles) AS parcelas
          FROM tarifa
@@ -425,7 +476,8 @@ async function obtenerParcelasCamping(connection, datos, holdIdExcluir = null) {
           AND parcelas_disponibles IS NOT NULL`,
       [datos.recursoId, fecha, fecha]
     );
-    const parcelas = Number(rows[0]?.parcelas);
+    if (!Number.isInteger(parcelas) || parcelas <= 0) parcelas = Number(rows[0]?.parcelas);
+    if (!Number.isInteger(parcelas) || parcelas <= 0) parcelas = Number(configuracion.cupo_maximo);
     if (!Number.isInteger(parcelas) || parcelas <= 0) {
       throw crearErrorHold(HOLD_CONFLICTO_MENSAJE, 409, "HOLD_RECURSO_NO_DISPONIBLE");
     }
@@ -456,15 +508,15 @@ async function obtenerParcelasCamping(connection, datos, holdIdExcluir = null) {
   throw crearErrorHold(HOLD_CONFLICTO_MENSAJE, 409, "HOLD_RECURSO_NO_DISPONIBLE");
 }
 
-async function validarDisponibilidad(connection, datos, holdActual = null) {
+async function validarDisponibilidad(connection, datos, configuracion, holdActual = null) {
   if (datos.modalidad === MODALIDAD_BLOQUE) {
     await validarBloque(connection, datos);
   } else {
     await validarFechaLibreFueraDeBloque(connection, datos);
   }
 
-  if (datos.servicioId === SERVICIO_CAMPING_ID) {
-    return obtenerParcelasCamping(connection, datos, holdActual?.id || null);
+  if (configuracion.tipo_codigo === "CUPO_NUMERADO") {
+    return obtenerParcelasCamping(connection, datos, configuracion, holdActual?.id || null);
   }
   await validarReservaDefinitivaNoCamping(connection, datos);
   const holds = await obtenerHoldsSolapados(connection, datos, holdActual?.id || null, { forUpdate: true });
@@ -497,7 +549,7 @@ async function adquirirHoldTurismo(db, params) {
     const recursosABloquear = holdObservado
       ? [Number(holdObservado.recurso_id), datos.recursoId]
       : [datos.recursoId];
-    await bloquearRecursos(connection, recursosABloquear, datos.servicioId);
+    const configuracion = await bloquearRecursos(connection, recursosABloquear, datos.servicioId, datos);
 
     let holdActual = await obtenerHoldActivoActor(connection, datos.actorUsuarioId, { forUpdate: true });
     if (holdActual && Number(holdActual.expira_en_ms) <= Number(holdActual.servidor_ahora_ms)) {
@@ -553,7 +605,7 @@ async function adquirirHoldTurismo(db, params) {
       }
     }
 
-    const numeroParcela = await validarDisponibilidad(connection, datos, holdActual);
+    const numeroParcela = await validarDisponibilidad(connection, datos, configuracion, holdActual);
     let holdId;
     let reemplazado = false;
     if (holdActual) {
@@ -1129,11 +1181,8 @@ module.exports = {
   HOLD_ESTADO_VENCIDO,
   HOLD_TTL_MINUTOS,
   HOLD_VENCIDO_MENSAJE,
-  MAX_PERSONAS_CAMPING,
   MODALIDAD_BLOQUE,
   MODALIDAD_FECHA_LIBRE,
-  RECURSO_CAMPING_ID,
-  SERVICIO_CAMPING_ID,
   TABLA_HOLDS,
   adquirirHoldTurismo,
   asegurarSinHoldAjenoEnTransaccion,

@@ -35,7 +35,7 @@ test("GET /servicios publica sorteos solo dentro de la ventana de inscripcion", 
 test("obtenerBloquesDisponiblesPorServicio exige inicio y fin de inscripcion", () => {
   const contract = extraerContrato(
     "async function obtenerBloquesDisponiblesPorServicio",
-    "function esServicioCamping"
+    "function crearErrorReservaCamping"
   );
 
   assertVentanaInscripcionCompleta(contract);

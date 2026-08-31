@@ -13,6 +13,11 @@ const { DNI_MENSAJE, esDniValido } = require("../security/dni");
 const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
 const { emitirTokenSesion } = require("../security/token-sesion");
 const { condicionModuloNotificacion } = require("../services/notificaciones-modulos");
+const {
+  construirVisibilidadServicioSql,
+  cumpleFiltroTipado,
+  servicioVisibleParaActor,
+} = require("../services/turismo-catalogo");
 
 const multer = require("multer");
 
@@ -877,29 +882,36 @@ router.get("/lugares", verifyToken, async (req, res) => {
       (
         cabecera.rol === "admin" ||
         cabecera.rol === "afiliado" ||
-        cabecera.rol === "departamental"
+        cabecera.rol === "departamental" ||
+        cabecera.rol === "admin-central"
       ) && tieneAreaTurismo(cabecera)
     ) {
       let rows;
       try {
+        const visibilidad = construirVisibilidadServicioSql(cabecera, "s");
         [rows] = await mysqlConnection
           .promise()
           .query(`
             SELECT lugar
             FROM (
-              SELECT lugar FROM servicio WHERE lugar IS NOT NULL AND lugar <> ''
+              SELECT s.lugar FROM servicio s INNER JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id
+               WHERE ${visibilidad.sql} AND ts.codigo <> 'CONVENIO_HOTELERO'
+                 AND s.lugar IS NOT NULL AND s.lugar <> ''
               UNION
-              SELECT ciudad AS lugar FROM convenio_hotel WHERE activo = 1 AND ciudad IS NOT NULL AND ciudad <> ''
+              SELECT ch.ciudad AS lugar FROM convenio_hotel ch
+               INNER JOIN servicio s ON s.id = ch.servicio_id
+               WHERE ch.activo = 1 AND ${visibilidad.sql}
+                 AND ch.ciudad IS NOT NULL AND ch.ciudad <> ''
             ) lugares
             ORDER BY lugar ASC
-          `);
+          `, [...visibilidad.params, ...visibilidad.params]);
       } catch (queryError) {
         if (!esErrorTemporadaAltaNoMigrada(queryError)) {
           throw queryError;
         }
         [rows] = await mysqlConnection
           .promise()
-          .query("SELECT lugar FROM servicio GROUP BY lugar ORDER BY lugar ASC");
+          .query("SELECT lugar FROM servicio WHERE activo = 1 AND estado_aprobacion = 'APROBADO' GROUP BY lugar ORDER BY lugar ASC");
       }
       const lugares = rows.map(row => row.lugar);
       res.status(200).json(lugares);
@@ -919,7 +931,8 @@ router.get("/servicios", verifyToken, async (req, res) => {
       (
         cabecera.rol === "admin" ||
         cabecera.rol === "afiliado" ||
-        cabecera.rol === "departamental"
+        cabecera.rol === "departamental" ||
+        cabecera.rol === "admin-central"
       ) && tieneAreaTurismo(cabecera)
     ) {
       const db = mysqlConnection.promise();
@@ -946,19 +959,36 @@ router.get("/servicios", verifyToken, async (req, res) => {
         criteriosDisponibilidad = parseo.value;
       }
 
-      let query = "SELECT id, nombre, lugar, rating FROM servicio";
-      let params = [];
+      const visibilidad = construirVisibilidadServicioSql(cabecera, "s");
+      let query = `SELECT s.id, s.nombre, s.lugar, s.rating, s.codigo, s.descripcion,
+                          s.modelo_tarifa, s.unidad_cobro, s.permite_acompanantes,
+                          s.max_personas_reserva, s.etiqueta_identificador,
+                          s.propietario_departamental_id,
+                          ts.codigo AS tipo_codigo,
+                          (SELECT rp.id FROM recurso rp
+                            WHERE rp.servicio_id = s.id AND rp.activo = 1
+                            ORDER BY rp.es_recurso_principal DESC, rp.orden ASC, rp.id ASC
+                            LIMIT 1) AS recurso_principal_id
+                     FROM servicio s INNER JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id
+                    WHERE ${visibilidad.sql} AND ts.activo = 1 AND ts.codigo <> 'CONVENIO_HOTELERO'`;
+      let params = [...visibilidad.params];
       if (lugar) {
-        query += " WHERE lugar = ?";
+        query += " AND s.lugar = ?";
         params.push(lugar);
       }
-      query += " ORDER BY nombre ASC";
+      query += " ORDER BY s.orden ASC, s.nombre ASC";
 
       // Obtener los servicios (filtrados o no)
       const [servicios] = await db.query(query, params);
 
       // Obtener todas las imagenes de servicios
-      const [imagenes] = await db.query("SELECT id, servicio_id, archivo FROM imagen_servicio");
+      const [imagenes] = servicios.length
+        ? await db.query(
+          `SELECT id, servicio_id, archivo FROM imagen_servicio
+            WHERE servicio_id IN (${servicios.map(() => "?").join(",")})`,
+          servicios.map((servicio) => servicio.id)
+        )
+        : [[]];
 
       const disponibilidadPorServicio = new Map();
       const sorteosActivosPorServicio = new Map();
@@ -974,6 +1004,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
           ninos: criteriosDisponibilidad.ninos,
           bebes: criteriosDisponibilidad.bebes,
           totalPersonas: criteriosDisponibilidad.total_personas,
+          departamentalId: cabecera.departamental_id,
           holdIdExcluir,
         });
 
@@ -1081,6 +1112,36 @@ router.get("/servicios", verifyToken, async (req, res) => {
           const { fecha_inicio, fecha_fin, adultos, ninos, bebes } = criteriosDisponibilidad;
           const nochesSolicitud = obtenerNochesReserva(fecha_inicio, fecha_fin, 366);
 
+          if (servicio.modelo_tarifa === "PRECIO_UNICO") {
+            const [recursosPrecioUnico] = await db.query(
+              "SELECT id FROM recurso WHERE servicio_id = ? AND activo = 1 ORDER BY orden, id",
+              [servicio.id]
+            );
+            const totales = [];
+            for (const recursoPrecioUnico of recursosPrecioUnico) {
+              try {
+                const cotizacion = await calcularTarifaBaseReserva(db, {
+                  recursoId: recursoPrecioUnico.id,
+                  regimenId: null,
+                  personas: [{ id: cabecera.id, usuario_id: cabecera.id }],
+                  fechaInicio: fecha_inicio,
+                  fechaFin: fecha_fin,
+                  departamentalId: cabecera.departamental_id,
+                });
+                const total = decimalACentavos(cotizacion.total);
+                if (total !== null) totales.push(total);
+              } catch (error) {
+                if (!["TARIFA_INCOMPLETA", "TARIFA_AMBIGUA", "TARIFA_REGLA_INCOMPLETA"].includes(error?.codigo)) {
+                  throw error;
+                }
+              }
+            }
+            if (totales.length) {
+              precio_minimo = centavosANumero(Math.min(...totales));
+              precio_maximo = centavosANumero(Math.max(...totales));
+            }
+          } else {
+
           const preciosMinimosCentavos = [];
           const preciosMaximosCentavos = [];
           let estimacionCompleta = nochesSolicitud.length > 0;
@@ -1164,6 +1225,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
             precio_minimo = centavosANumero(totalMinimoCentavos);
             precio_maximo = centavosANumero(totalMaximoCentavos);
           }
+          }
         }
 
         const disponibilidadBase = disponibilidadPorServicio.get(Number(servicio.id)) || null;
@@ -1184,6 +1246,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
               ninos: criteriosDisponibilidad.ninos,
               bebes: criteriosDisponibilidad.bebes,
               totalPersonas: criteriosDisponibilidad.total_personas,
+              departamentalId: cabecera.departamental_id,
               horizonteDias: 45,
               maxResultados: 12,
               holdIdExcluir,
@@ -1193,6 +1256,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
 
         const respuestaServicio = {
           ...servicio,
+          tipo: servicio.tipo_codigo,
           imagenes: imagenesPorServicio[servicio.id] || [],
           precio_minimo,
           precio_maximo,
@@ -1308,6 +1372,9 @@ router.post("/turismo/reserva-holds", verifyToken, async (req, res) => {
       modalidad: req.body.modalidad,
       fechaInicio: req.body.fecha_inicio,
       fechaFin: req.body.fecha_fin,
+      totalPersonas: req.body.total_personas ?? (
+        Number(req.body.adultos || 0) + Number(req.body.ninos || 0) + Number(req.body.bebes || 0) || null
+      ),
       holdToken: req.body.hold_token,
     });
     const { creado, hold_anterior: holdAnterior, ...respuesta } = resultado;
@@ -1366,7 +1433,7 @@ router.delete("/turismo/reserva-holds/:id", verifyToken, async (req, res) => {
 router.get("/turismo/propuestas", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
+    if (!["admin", "admin-central", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -1463,7 +1530,7 @@ router.put("/admin/turismo/propuestas/:id", verifyToken, manejarUploadTurismoPro
 router.get("/turismo/testimonios", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
+    if (!["admin", "admin-central", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -1633,6 +1700,7 @@ router.get("/admin/convenios-hoteleros", verifyToken, async (req, res) => {
     const [hoteles] = await db.query(`
       SELECT
         id,
+        servicio_id,
         nombre,
         ciudad,
         provincia,
@@ -1648,7 +1716,11 @@ router.get("/admin/convenios-hoteleros", verifyToken, async (req, res) => {
       ORDER BY nombre ASC
     `);
 
-    const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(db, hoteles.map((hotel) => hotel.id));
+    const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(
+      db,
+      hoteles.map((hotel) => hotel.id),
+      { incluirImagenesServicio: true }
+    );
     const respuesta = await Promise.all(hoteles.map((hotel) => (
       firmarConvenioHotel(hotel, imagenesPorHotel.get(Number(hotel.id)) || [])
     )));
@@ -1677,6 +1749,7 @@ router.get("/admin/convenios-hoteleros/:id", verifyToken, async (req, res) => {
       `
         SELECT
           id,
+          servicio_id,
           nombre,
           ciudad,
           provincia,
@@ -1699,7 +1772,11 @@ router.get("/admin/convenios-hoteleros/:id", verifyToken, async (req, res) => {
       return res.status(404).json("Convenio hotelero no encontrado");
     }
 
-    const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(db, [hotelId]);
+    const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(
+      db,
+      [hotelId],
+      { incluirImagenesServicio: true }
+    );
     const respuesta = await firmarConvenioHotel(hoteles[0], imagenesPorHotel.get(hotelId) || []);
 
     res.status(200).json(respuesta);
@@ -1716,6 +1793,11 @@ router.post("/admin/convenios-hoteleros", verifyToken, manejarUploadConvenioHote
     if (cabecera.rol !== "admin") {
       return res.status(401).json("No autorizado");
     }
+
+    return res.status(409).json({
+      message: "Crea los convenios desde Gestion de Turismo para mantener servicio, alcance e historial sincronizados",
+      codigo: "CONVENIO_GESTION_CATALOGO_REQUERIDA",
+    });
 
     const nombre = normalizarTexto(req.body.nombre);
     const ciudad = normalizarTexto(req.body.ciudad);
@@ -1845,6 +1927,14 @@ router.put("/admin/convenios-hoteleros/:id", verifyToken, manejarUploadConvenioH
       await connection.rollback();
       return res.status(404).json("Convenio hotelero no encontrado");
     }
+    if (existentes[0].servicio_id) {
+      await connection.rollback();
+      return res.status(409).json({
+        message: "Este convenio esta vinculado al catalogo. Editalo desde Gestion de Turismo",
+        codigo: "CONVENIO_GESTION_CATALOGO_REQUERIDA",
+        servicio_id: Number(existentes[0].servicio_id),
+      });
+    }
 
     const [imagenesActuales] = await connection.query(
       "SELECT id FROM convenio_hotel_imagen WHERE convenio_hotel_id = ? ORDER BY orden ASC, id ASC",
@@ -1953,6 +2043,19 @@ router.patch("/admin/convenios-hoteleros/:id/activo", verifyToken, async (req, r
       return res.status(400).json("ID invalido");
     }
 
+    const [[hotel]] = await mysqlConnection.promise().query(
+      "SELECT servicio_id FROM convenio_hotel WHERE id = ? LIMIT 1",
+      [hotelId]
+    );
+    if (!hotel) return res.status(404).json("Convenio hotelero no encontrado");
+    if (hotel.servicio_id) {
+      return res.status(409).json({
+        message: "Este convenio esta vinculado al catalogo. Editalo desde Gestion de Turismo",
+        codigo: "CONVENIO_GESTION_CATALOGO_REQUERIDA",
+        servicio_id: Number(hotel.servicio_id),
+      });
+    }
+
     const activo = normalizarBooleanActivo(req.body.activo, true);
     const [result] = await mysqlConnection.promise().query(
       "UPDATE convenio_hotel SET activo = ? WHERE id = ?",
@@ -1973,12 +2076,13 @@ router.patch("/admin/convenios-hoteleros/:id/activo", verifyToken, async (req, r
 router.get("/convenios-hoteleros", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
+    if (!["admin", "admin-central", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
     const ciudad = normalizarTexto(req.query.ciudad || req.query.lugar);
-    const params = [];
+    const visibilidad = construirVisibilidadServicioSql(cabecera, "s");
+    const params = [...visibilidad.params];
     let filtroCiudad = "";
     if (ciudad) {
       filtroCiudad = "AND ciudad = ?";
@@ -1989,27 +2093,37 @@ router.get("/convenios-hoteleros", verifyToken, async (req, res) => {
     const [hoteles] = await db.query(
       `
         SELECT
-          id,
-          nombre,
-          ciudad,
-          provincia,
-          coordenadas_maps,
-          latitud,
-          longitud,
-          descripcion,
-          tarifario_pdf_archivo,
-          activo,
-          fecha_creacion,
-          fecha_modificacion
-        FROM convenio_hotel
-        WHERE activo = 1
+          ch.id,
+          ch.servicio_id,
+          ch.nombre,
+          ch.ciudad,
+          ch.provincia,
+          ch.coordenadas_maps,
+          ch.latitud,
+          ch.longitud,
+          ch.descripcion,
+          ch.tarifario_pdf_archivo,
+          s.direccion,
+          s.tarifario_pdf_url AS servicio_tarifario_pdf_url,
+          s.formulario_adhesion_url,
+          ch.activo,
+          ch.fecha_creacion,
+          ch.fecha_modificacion
+        FROM convenio_hotel ch
+        INNER JOIN servicio s ON s.id = ch.servicio_id
+        INNER JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id AND ts.codigo = 'CONVENIO_HOTELERO'
+        WHERE ch.activo = 1 AND ${visibilidad.sql}
           ${filtroCiudad}
-        ORDER BY nombre ASC
+        ORDER BY ch.nombre ASC
       `,
       params
     );
 
-    const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(db, hoteles.map((hotel) => hotel.id));
+    const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(
+      db,
+      hoteles.map((hotel) => hotel.id),
+      { incluirImagenesServicio: true }
+    );
     const respuesta = await Promise.all(hoteles.map((hotel) => (
       firmarConvenioHotel(hotel, imagenesPorHotel.get(Number(hotel.id)) || [])
     )));
@@ -2027,7 +2141,7 @@ router.get("/convenios-hoteleros", verifyToken, async (req, res) => {
 router.get("/convenios-hoteleros/:id", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
+    if (!["admin", "admin-central", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -2037,34 +2151,44 @@ router.get("/convenios-hoteleros/:id", verifyToken, async (req, res) => {
     }
 
     const db = mysqlConnection.promise();
+    const visibilidad = construirVisibilidadServicioSql(cabecera, "s");
     const [hoteles] = await db.query(
       `
         SELECT
-          id,
-          nombre,
-          ciudad,
-          provincia,
-          coordenadas_maps,
-          latitud,
-          longitud,
-          descripcion,
-          tarifario_pdf_archivo,
-          activo,
-          fecha_creacion,
-          fecha_modificacion
-        FROM convenio_hotel
-        WHERE id = ?
-          AND (activo = 1 OR ? = 'admin')
+          ch.id,
+          ch.servicio_id,
+          ch.nombre,
+          ch.ciudad,
+          ch.provincia,
+          ch.coordenadas_maps,
+          ch.latitud,
+          ch.longitud,
+          ch.descripcion,
+          ch.tarifario_pdf_archivo,
+          s.direccion,
+          s.tarifario_pdf_url AS servicio_tarifario_pdf_url,
+          s.formulario_adhesion_url,
+          ch.activo,
+          ch.fecha_creacion,
+          ch.fecha_modificacion
+        FROM convenio_hotel ch
+        INNER JOIN servicio s ON s.id = ch.servicio_id
+        INNER JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id AND ts.codigo = 'CONVENIO_HOTELERO'
+        WHERE ch.id = ? AND ch.activo = 1 AND ${visibilidad.sql}
         LIMIT 1
       `,
-      [hotelId, cabecera.rol]
+      [hotelId, ...visibilidad.params]
     );
 
     if (hoteles.length === 0) {
       return res.status(404).json("Convenio hotelero no encontrado");
     }
 
-    const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(db, [hotelId]);
+    const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(
+      db,
+      [hotelId],
+      { incluirImagenesServicio: true }
+    );
     const respuesta = await firmarConvenioHotel(hoteles[0], imagenesPorHotel.get(hotelId) || []);
 
     res.status(200).json(respuesta);
@@ -2081,7 +2205,8 @@ router.get("/servicios/disponibilidad", verifyToken, async (req, res) => {
       (
         cabecera.rol === "admin" ||
         cabecera.rol === "afiliado" ||
-        cabecera.rol === "departamental"
+        cabecera.rol === "departamental" ||
+        cabecera.rol === "admin-central"
       ) && tieneAreaTurismo(cabecera)
     ) {
       const parseo = parsearParametrosBusquedaDisponibilidad(req.query, {
@@ -2096,6 +2221,21 @@ router.get("/servicios/disponibilidad", verifyToken, async (req, res) => {
       const servicioIds = parsearServicioIdsCsv(req.query.servicio_ids);
       const db = mysqlConnection.promise();
       const holdIdExcluir = await resolverHoldIdExcluir(db, cabecera, req.query.hold_token);
+      const visibilidad = construirVisibilidadServicioSql(cabecera, "s");
+      const condicionesVisibles = [visibilidad.sql];
+      const parametrosVisibles = [...visibilidad.params];
+      if (req.query.lugar) { condicionesVisibles.push("s.lugar = ?"); parametrosVisibles.push(req.query.lugar); }
+      if (servicioIds.length) {
+        condicionesVisibles.push(`s.id IN (${servicioIds.map(() => "?").join(",")})`);
+        parametrosVisibles.push(...servicioIds);
+      }
+      const [serviciosVisibles] = await db.query(
+        `SELECT s.id FROM servicio s INNER JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id
+          WHERE ${condicionesVisibles.join(" AND ")} AND ts.activo = 1 AND ts.codigo <> 'CONVENIO_HOTELERO'`,
+        parametrosVisibles
+      );
+      const servicioIdsVisibles = serviciosVisibles.map((servicio) => Number(servicio.id));
+      if (!servicioIdsVisibles.length) return res.status(200).json([]);
 
       // Al editar una reserva, el snapshot no debe contarla como ocupación.
       // El afiliado solo puede excluir una reserva propia (el cupo real lo
@@ -2113,14 +2253,15 @@ router.get("/servicios/disponibilidad", verifyToken, async (req, res) => {
       }
 
       const snapshot = await obtenerSnapshotDisponibilidad(db, {
-        lugar: req.query.lugar || null,
-        servicioIds,
+        lugar: null,
+        servicioIds: servicioIdsVisibles,
         fechaInicio: parseo.value.fecha_inicio,
         fechaFin: parseo.value.fecha_fin,
         adultos: parseo.value.adultos,
         ninos: parseo.value.ninos,
         bebes: parseo.value.bebes,
         totalPersonas: parseo.value.total_personas,
+        departamentalId: cabecera.departamental_id,
         reservaExcluirId,
         holdIdExcluir,
       });
@@ -2143,7 +2284,8 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
       (
         cabecera.rol === "admin" ||
         cabecera.rol === "afiliado" ||
-        cabecera.rol === "departamental"
+        cabecera.rol === "departamental" ||
+        cabecera.rol === "admin-central"
       ) && tieneAreaTurismo(cabecera)
     ) {
       const servicioId = normalizarIdPositivo(req.params.id);
@@ -2162,6 +2304,8 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
 
       const db = mysqlConnection.promise();
       const holdIdExcluir = await resolverHoldIdExcluir(db, cabecera, req.query.hold_token);
+      const servicioVisible = await servicioVisibleParaActor(db, cabecera, servicioId);
+      if (!servicioVisible) return res.status(404).json("Servicio inexistente");
       const servicios = await obtenerServicios(db, { servicioId });
       if (servicios.length === 0) {
         return res.status(404).json("Servicio inexistente");
@@ -2175,6 +2319,7 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
         ninos: parseo.value.ninos,
         bebes: parseo.value.bebes,
         totalPersonas: parseo.value.total_personas,
+        departamentalId: cabecera.departamental_id,
         holdIdExcluir,
       });
 
@@ -2222,14 +2367,19 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
 router.get("/recursos", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (["admin", "afiliado", "departamental"].includes(cabecera.rol) && tieneAreaTurismo(cabecera)) {
+    if (["admin", "admin-central", "afiliado", "departamental"].includes(cabecera.rol) && tieneAreaTurismo(cabecera)) {
       const servicioId = req.query.servicio;
-      let query = "SELECT id, servicio_id, nombre, grupo_recurso_id FROM recurso";
-      let params = [];
+      const visibilidad = construirVisibilidadServicioSql(cabecera, "s");
+      let query = `SELECT r.id, r.servicio_id, r.nombre, r.grupo_recurso_id,
+                          r.codigo, r.categoria, r.descripcion, r.cupo_maximo
+                     FROM recurso r INNER JOIN servicio s ON s.id = r.servicio_id
+                    WHERE r.activo = 1 AND ${visibilidad.sql}`;
+      let params = [...visibilidad.params];
       if (servicioId) {
-        query += " WHERE servicio_id = ?";
+        query += " AND r.servicio_id = ?";
         params.push(servicioId);
       }
+      query += " ORDER BY r.categoria, r.orden, r.nombre";
       const [rows] = await mysqlConnection.promise().query(query, params);
       res.status(200).json(rows);
     } else {
@@ -4406,21 +4556,31 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       const recursoIdFiltro = recurso_id === undefined || recurso_id === null
         ? null
         : normalizarIdPositivo(recurso_id);
+      const db = mysqlConnection.promise();
+      const servicioConfigurado = servicioIdSolicitud
+        ? await servicioVisibleParaActor(db, cabecera, servicioIdSolicitud)
+        : null;
       if (
         !fechaInicioSolicitud || !fechaFinSolicitud ||
         obtenerNochesReserva(fechaInicioSolicitud, fechaFinSolicitud, 366).length === 0 ||
-        !servicioIdSolicitud || !regimenIdSolicitud ||
+        !servicioIdSolicitud || !servicioConfigurado || servicioConfigurado.tipo_codigo === "CONVENIO_HOTELERO" ||
+        (servicioConfigurado.modelo_tarifa !== "PRECIO_UNICO" && !regimenIdSolicitud) ||
         !Array.isArray(personas) || personas.length === 0 ||
         ((recurso_id !== undefined && recurso_id !== null) && !recursoIdFiltro)
       ) {
         return res.status(400).json("Faltan campos requeridos");
+      }
+      if (
+        (servicioConfigurado.modelo_tarifa === "PRECIO_UNICO" || Number(servicioConfigurado.permite_acompanantes) !== 1) &&
+        personas.length !== 1
+      ) {
+        return res.status(422).json("Este servicio solo admite la reserva del titular");
       }
 
       if (!validarRangoReservaTemporal(fechaInicioSolicitud, fechaFinSolicitud).valido) {
         return res.status(422).json("La fecha de inicio no puede ser anterior a hoy");
       }
 
-      const db = mysqlConnection.promise();
       const holdIdExcluir = await resolverHoldIdExcluir(db, cabecera, hold_token);
       const personasAutorizadas = await resolverPersonasCotizacionAutorizadas(db, cabecera, {
         personas,
@@ -4487,7 +4647,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
             SELECT DISTINCT recurso_id
             FROM tarifa 
             INNER JOIN recurso r ON tarifa.recurso_id = r.id
-            WHERE r.servicio_id = ?
+            WHERE r.servicio_id = ? AND r.activo = 1
               AND tarifa.tipo_persona_id = ? 
               AND tarifa.regimen_id = ?
               AND (tarifa.edad_minima IS NULL OR tarifa.edad_minima <= ?)
@@ -4510,6 +4670,15 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           recursosValidos.add(tarifa.recurso_id);
         });
       }
+
+      await agregarRecursosConReglasGestionadas(db, {
+        recursosValidos,
+        servicio: servicioConfigurado,
+        usuarioTitularId: cabecera.rol === "afiliado" ? cabecera.id : usuario_id,
+        fechaInicio: fechaInicioSolicitud,
+        fechaFin: fechaFinSolicitud,
+        temporadaTarifaId: temporadaTarifaIdFiltro,
+      });
 
       if (recursosValidos.size === 0) {
         return res.status(404).json("No se encontraron recursos con tarifas válidas para las personas especificadas");
@@ -4552,10 +4721,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
             }
 
             const filtroIdNormalizado = normalizarIdPositivo(filtroId);
-            const valorNumericoValido = typeof valorFiltro === 'number'
-              && Number.isSafeInteger(valorFiltro)
-              && valorFiltro >= 0;
-            if (!filtroIdNormalizado || (typeof valorFiltro !== 'boolean' && !valorNumericoValido)) {
+            if (!filtroIdNormalizado || !['boolean', 'number', 'string', 'object'].includes(typeof valorFiltro)) {
               return res.status(400).json("Los filtros de recursos contienen valores invalidos");
             }
 
@@ -4563,10 +4729,14 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
             const [filtroRecurso] = await mysqlConnection
               .promise()
               .query(`
-                      SELECT cantidad, habilitado
-                      FROM filtro_recurso
-                      WHERE recurso_id = ? AND filtro_id = ?
-                    `, [recursoId, filtroIdNormalizado]);
+                      SELECT fr.cantidad, fr.habilitado, fr.valor_numero, fr.valor_booleano,
+                             fr.valor_texto, f.codigo AS filtro_codigo, f.tipo_valor
+                      FROM filtro_recurso fr
+                      INNER JOIN filtro f ON f.id = fr.filtro_id
+                      INNER JOIN servicio_filtro sf
+                        ON sf.filtro_id = f.id AND sf.servicio_id = ? AND sf.mostrar_en_busqueda = 1
+                      WHERE fr.recurso_id = ? AND fr.filtro_id = ? AND f.activo = 1
+                    `, [servicioIdSolicitud, recursoId, filtroIdNormalizado]);
 
             if (filtroRecurso.length === 0) {
               // Si el recurso no tiene este filtro, no cumple con los criterios
@@ -4576,20 +4746,9 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
 
             const filtroData = filtroRecurso[0];
 
-            // Verificar según el tipo de valor del filtro
-            if (typeof valorFiltro === 'boolean') {
-              // Filtro booleano: verificar campo habilitado
-              const habilitadoBoolean = filtroData.habilitado === 'Y';
-              if (habilitadoBoolean !== valorFiltro) {
-                cumpleTodosFiltros = false;
-                break;
-              }
-            } else if (typeof valorFiltro === 'number') {
-              // Filtro numérico: verificar campo cantidad
-              if (filtroData.cantidad !== valorFiltro) {
-                cumpleTodosFiltros = false;
-                break;
-              }
+            if (!cumpleFiltroTipado(filtroData, valorFiltro)) {
+              cumpleTodosFiltros = false;
+              break;
             }
           }
 
@@ -4614,7 +4773,8 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
 
       const [recursos] = await mysqlConnection
         .promise()
-        .query(`SELECT id, servicio_id, grupo_recurso_id, nombre FROM recurso WHERE id IN (${placeholders})`, recursosIds);
+        .query(`SELECT id, servicio_id, grupo_recurso_id, nombre, codigo, categoria, descripcion, cupo_maximo
+                  FROM recurso WHERE activo = 1 AND id IN (${placeholders})`, recursosIds);
 
       const bloquesPorRecurso = await obtenerBloquesActivosParaRecursos(mysqlConnection.promise(), {
         recursoIds: recursos.map((recurso) => Number(recurso.id)),
@@ -4640,8 +4800,9 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         fechaFin: fechaFinSolicitud,
         holdIdExcluir,
       });
+      const esCupoNumerado = servicioConfigurado.tipo_codigo === "CUPO_NUMERADO";
       let campingSinDisponibilidad = false;
-      if (esServicioCamping(servicioIdSolicitud)) {
+      if (esCupoNumerado) {
         const snapshotCamping = await obtenerSnapshotDisponibilidad(db, {
           servicioIds: [servicioIdSolicitud],
           fechaInicio: fechaInicioSolicitud,
@@ -4650,6 +4811,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           ninos: 0,
           bebes: 0,
           totalPersonas: personasAutorizadas.length,
+          departamentalId: cabecera.departamental_id,
           holdIdExcluir,
         });
         campingSinDisponibilidad = Number(snapshotCamping[0]?.disponibles || 0) <= 0;
@@ -4668,11 +4830,15 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       const [filtrosData] = await mysqlConnection
         .promise()
         .query(`
-          SELECT fr.recurso_id, f.id as filtro_id, f.nombre, f.icono, fr.cantidad, fr.habilitado
+          SELECT fr.recurso_id, f.id as filtro_id, f.codigo AS filtro_codigo,
+                 f.nombre, f.icono, f.tipo_valor, f.categoria, f.unidad,
+                 fr.cantidad, fr.habilitado, fr.valor_numero, fr.valor_booleano, fr.valor_texto
           FROM filtro_recurso fr
           INNER JOIN filtro f ON fr.filtro_id = f.id
-          WHERE fr.recurso_id IN (${placeholders})
-        `, recursosIds);
+          INNER JOIN servicio_filtro sf
+            ON sf.filtro_id = f.id AND sf.servicio_id = ? AND sf.mostrar_en_busqueda = 1
+          WHERE fr.recurso_id IN (${placeholders}) AND f.activo = 1
+        `, [servicioIdSolicitud, ...recursosIds]);
 
       // Mapear imagenes por recurso_id
       const imagenesConUrlPorRecurso = await Promise.all(
@@ -4711,18 +4877,25 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         }
         filtrosPorRecurso[filtro.recurso_id].push({
           id: filtro.filtro_id,
+          codigo: filtro.filtro_codigo,
           nombre: filtro.nombre,
           icono: filtro.icono,
-          cantidad: filtro.cantidad,
-          habilitado: filtro.habilitado
+          tipo_valor: filtro.tipo_valor,
+          categoria: filtro.categoria,
+          unidad: filtro.unidad,
+          cantidad: filtro.valor_numero ?? filtro.cantidad,
+          habilitado: filtro.valor_booleano ?? filtro.habilitado,
+          valor_numero: filtro.valor_numero,
+          valor_booleano: filtro.valor_booleano,
+          valor_texto: filtro.valor_texto,
         });
       });
 
       // Calcular tarifas para cada recurso y aplicar filtro de precio
       for (const recurso of recursos) {
         if (
-          (esServicioCamping(servicioIdSolicitud) && campingSinDisponibilidad) ||
-          (!esServicioCamping(servicioIdSolicitud) && (
+          (esCupoNumerado && campingSinDisponibilidad) ||
+          (!esCupoNumerado && (
             recursosOcupadosSet.has(Number(recurso.id)) || recursosRetenidosSet.has(Number(recurso.id))
           ))
         ) {
@@ -4803,13 +4976,14 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           let totalCamas = 0;
           let ambientes = 0;
 
-          // Buscar camas (filtro_id 3 y 4) y ambientes (filtro_id 2)
           const filtrosRecurso = filtrosPorRecurso[recurso.id] || [];
           filtrosRecurso.forEach(filtro => {
-            if (filtro.id === 3 || filtro.id === 4) { // Cama individual (3) y matrimonial (4)
-              totalCamas += filtro.cantidad || 0;
-            } else if (filtro.id === 2) { // Ambientes
-              ambientes = filtro.cantidad || 0;
+            const codigo = String(filtro.codigo || "").toUpperCase();
+            const cantidad = Number(filtro.valor_numero ?? filtro.cantidad ?? 0);
+            if (["CAMAS_INDIVIDUALES", "CAMAS_MATRIMONIALES"].includes(codigo)) {
+              totalCamas += Number.isFinite(cantidad) ? cantidad : 0;
+            } else if (codigo === "AMBIENTES") {
+              ambientes = Number.isFinite(cantidad) ? cantidad : 0;
             }
           });
 
@@ -4910,14 +5084,25 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
       const recursoIdFiltro = recurso_id === undefined || recurso_id === null
         ? null
         : normalizarIdPositivo(recurso_id);
+      const db = mysqlConnection.promise();
+      const servicioConfigurado = servicioIdSolicitud
+        ? await servicioVisibleParaActor(db, cabecera, servicioIdSolicitud)
+        : null;
       if (
         !fechaInicioSolicitud || !fechaFinSolicitud ||
         obtenerNochesReserva(fechaInicioSolicitud, fechaFinSolicitud, 366).length === 0 ||
-        !servicioIdSolicitud || !regimenIdSolicitud ||
+        !servicioIdSolicitud || !servicioConfigurado || servicioConfigurado.tipo_codigo === "CONVENIO_HOTELERO" ||
+        (servicioConfigurado.modelo_tarifa !== "PRECIO_UNICO" && !regimenIdSolicitud) ||
         !Array.isArray(personas) || personas.length === 0 ||
         ((recurso_id !== undefined && recurso_id !== null) && !recursoIdFiltro)
       ) {
         return res.status(400).json("Faltan campos requeridos");
+      }
+      if (
+        (servicioConfigurado.modelo_tarifa === "PRECIO_UNICO" || Number(servicioConfigurado.permite_acompanantes) !== 1) &&
+        personas.length !== 1
+      ) {
+        return res.status(422).json("Este servicio solo admite la reserva del titular");
       }
 
       if (!validarRangoReservaTemporal(fechaInicioSolicitud, fechaFinSolicitud).valido) {
@@ -4925,7 +5110,6 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
       }
 
       // Primero obtenemos solo los recursos que tienen tarifas válidas para el servicio y las personas
-      const db = mysqlConnection.promise();
       const personasAutorizadas = await resolverPersonasCotizacionAutorizadas(db, cabecera, {
         personas,
         usuarioObjetivoId: usuario_id,
@@ -4972,7 +5156,7 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
             SELECT DISTINCT recurso_id
             FROM tarifa 
             INNER JOIN recurso r ON tarifa.recurso_id = r.id
-            WHERE r.servicio_id = ?
+            WHERE r.servicio_id = ? AND r.activo = 1
               AND tarifa.tipo_persona_id = ? 
               AND tarifa.regimen_id = ?
               AND (tarifa.edad_minima IS NULL OR tarifa.edad_minima <= ?)
@@ -4995,6 +5179,15 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
           recursosValidos.add(tarifa.recurso_id);
         });
       }
+
+      await agregarRecursosConReglasGestionadas(db, {
+        recursosValidos,
+        servicio: servicioConfigurado,
+        usuarioTitularId: cabecera.rol === "afiliado" ? cabecera.id : usuario_id,
+        fechaInicio: fechaInicioSolicitud,
+        fechaFin: fechaFinSolicitud,
+        temporadaTarifaId: temporadaTarifaIdFiltro,
+      });
 
       if (recursosPermitidosBloqueSet) {
         for (const recursoValido of Array.from(recursosValidos)) {
@@ -5026,20 +5219,33 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
         .query(`
           SELECT 
             f.id,
+            f.codigo,
             f.nombre,
             f.icono,
+            f.tipo_valor,
+            f.categoria,
+            f.unidad,
+            f.ayuda,
+            f.opciones,
+            sf.orden,
             fr.cantidad,
-            fr.habilitado
-          FROM filtro_recurso fr
-          INNER JOIN filtro f ON fr.filtro_id = f.id
-          WHERE fr.recurso_id IN (${placeholders})
-            AND fr.habilitado = 'Y'
-        `, recursosAConsiderar);
+            fr.habilitado,
+            fr.valor_numero,
+            fr.valor_booleano,
+            fr.valor_texto
+          FROM servicio_filtro sf
+          INNER JOIN filtro f ON f.id = sf.filtro_id
+          LEFT JOIN filtro_recurso fr
+            ON fr.filtro_id = f.id AND fr.recurso_id IN (${placeholders})
+          WHERE sf.servicio_id = ? AND sf.mostrar_en_busqueda = 1 AND f.activo = 1
+          ORDER BY sf.orden, f.orden, f.nombre
+        `, [...recursosAConsiderar, servicioIdSolicitud]);
 
       // Calcular el rango de precios de todos los recursos válidos
       const [recursos] = await mysqlConnection
         .promise()
-        .query(`SELECT id, servicio_id, grupo_recurso_id, nombre FROM recurso WHERE id IN (${placeholders})`, recursosAConsiderar);
+        .query(`SELECT id, servicio_id, grupo_recurso_id, nombre FROM recurso
+                 WHERE activo = 1 AND id IN (${placeholders})`, recursosAConsiderar);
 
       let precioMinimo = null;
       let precioMaximo = null;
@@ -5073,34 +5279,51 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
         precioMaximo = Math.max(...precios);
       }
 
-      // Agrupar por filtro y calcular min/max
+      // Agrupar por filtro y calcular valores tipados.
       const filtrosAgrupados = {};
 
       filtrosRecursos.forEach(filtroRecurso => {
         const filtroId = filtroRecurso.id;
 
         if (!filtrosAgrupados[filtroId]) {
+          let opciones = filtroRecurso.opciones;
+          if (typeof opciones === "string") {
+            try { opciones = JSON.parse(opciones); } catch (_) { opciones = []; }
+          }
           filtrosAgrupados[filtroId] = {
             id: filtroId,
+            codigo: filtroRecurso.codigo,
             nombre: filtroRecurso.nombre,
             icono: filtroRecurso.icono,
-            cantidades: []
+            tipo_valor: filtroRecurso.tipo_valor,
+            categoria: filtroRecurso.categoria,
+            unidad: filtroRecurso.unidad,
+            ayuda: filtroRecurso.ayuda,
+            opciones: Array.isArray(opciones) ? opciones : [],
+            orden: Number(filtroRecurso.orden || 0),
+            valores: [],
           };
         }
-
-        filtrosAgrupados[filtroId].cantidades.push(filtroRecurso.cantidad);
+        const tipo = String(filtroRecurso.tipo_valor || "").toUpperCase();
+        const valor = tipo === "NUMERO"
+          ? Number(filtroRecurso.valor_numero ?? filtroRecurso.cantidad)
+          : tipo === "BOOLEANO"
+            ? (filtroRecurso.valor_booleano ?? (filtroRecurso.habilitado === "Y" ? 1 : 0))
+            : filtroRecurso.valor_texto;
+        if (valor !== null && valor !== undefined && valor !== "" && !(tipo === "NUMERO" && !Number.isFinite(valor))) {
+          filtrosAgrupados[filtroId].valores.push(valor);
+        }
       });
 
-      // Calcular valorMinimo y valorMaximo para cada filtro
+      // Mantener aliases legacy para no romper el step actual mientras expone el contrato tipado.
       const filtrosConValores = Object.values(filtrosAgrupados).map(filtro => {
-        const cantidades = filtro.cantidades;
-        const valorMinimo = Math.min(...cantidades);
-        const valorMaximo = Math.max(...cantidades);
+        const numericos = filtro.tipo_valor === "NUMERO" ? filtro.valores.map(Number).filter(Number.isFinite) : [];
+        const valorMinimo = numericos.length ? Math.min(...numericos) : null;
+        const valorMaximo = numericos.length ? Math.max(...numericos) : null;
 
         return {
-          id: filtro.id,
-          nombre: filtro.nombre,
-          icono: filtro.icono,
+          ...filtro,
+          valores: [...new Set(filtro.valores)],
           valorMinimo: valorMinimo,
           valorMaximo: valorMaximo,
           habilitado: true
@@ -5124,7 +5347,7 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
       }
 
       // Agregar el resto de filtros ordenados por nombre
-      filtrosConValores.sort((a, b) => a.nombre.localeCompare(b.nombre));
+      filtrosConValores.sort((a, b) => a.orden - b.orden || a.nombre.localeCompare(b.nombre));
       filtrosFinales.push(...filtrosConValores);
       res.status(200).json(filtrosFinales);
     } else {
@@ -5245,9 +5468,45 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
       }
 
       const pool = mysqlConnection.promise();
+      const servicioIdSolicitud = normalizarIdPositivo(servicio_id);
+      const recursoIdSolicitud = normalizarIdPositivo(recurso_id);
+      if (!servicioIdSolicitud || !recursoIdSolicitud) {
+        return res.status(400).json("El servicio o el recurso no es válido");
+      }
+      const personasAutorizadas = await resolverPersonasCotizacionAutorizadas(pool, cabecera, {
+        personas,
+        usuarioObjetivoId: usuario_id,
+        fechaIngreso: fechaInicioSolicitud,
+      });
+      const titularId = cabecera.rol === "afiliado"
+        ? normalizarIdPositivo(cabecera.id)
+        : normalizarIdPositivo(usuario_id);
+      const [titularesCotizacion] = await pool.query(
+        "SELECT id, documento, departamental_id FROM usuario WHERE id = ? LIMIT 1",
+        [titularId]
+      );
+      if (!titularesCotizacion.length) return res.status(404).json("Titular no encontrado");
+      const titularCotizacion = titularesCotizacion[0];
+      const servicioConfigurado = await servicioVisibleParaActor(
+        pool,
+        { rol: "afiliado", departamental_id: titularCotizacion.departamental_id },
+        servicioIdSolicitud,
+        { recursoId: recursoIdSolicitud }
+      );
+      if (!servicioConfigurado || servicioConfigurado.tipo_codigo === "CONVENIO_HOTELERO") {
+        return res.status(404).json("El recurso no está disponible");
+      }
       const regimenIdSolicitud = normalizarIdPositivo(regimen_id);
-      if (!regimenIdSolicitud) {
+      if (servicioConfigurado.modelo_tarifa !== "PRECIO_UNICO" && !regimenIdSolicitud) {
         return res.status(400).json("El regimen es requerido");
+      }
+      const errorReglasServicio = validarReglasCampingReserva(
+        servicioConfigurado,
+        personasAutorizadas,
+        titularCotizacion
+      );
+      if (errorReglasServicio) {
+        throw crearErrorNegocio(errorReglasServicio, 422, "CAPACIDAD_SERVICIO_EXCEDIDA");
       }
       const modalidadSolicitada = normalizarModalidad(modalidad);
       const bloqueFechaIdSolicitado = normalizarIdPositivo(bloque_fecha_id);
@@ -5255,10 +5514,10 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
 
       if (modalidadSolicitada === MODALIDAD_BLOQUE && bloqueFechaIdSolicitado) {
         const bloqueSeleccionado = await obtenerBloqueConRecursos(pool, bloqueFechaIdSolicitado);
-        const recursoBloque = (bloqueSeleccionado.recursos || []).find((recurso) => Number(recurso.recurso_id) === Number(recurso_id));
+        const recursoBloque = (bloqueSeleccionado.recursos || []).find((recurso) => Number(recurso.recurso_id) === recursoIdSolicitud);
         if (
           bloqueSeleccionado.estado !== "ACTIVO" ||
-          Number(bloqueSeleccionado.servicio_id) !== Number(servicio_id) ||
+          Number(bloqueSeleccionado.servicio_id) !== servicioIdSolicitud ||
           !recursoBloque ||
           !ESTADOS_RECURSO_BLOQUE_RESERVABLES.has(recursoBloque.estado) ||
           !rangoCoincideConBloque(fecha_inicio, fecha_fin, bloqueSeleccionado)
@@ -5280,31 +5539,26 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
           SELECT id FROM recurso 
           WHERE id = ? AND servicio_id = ?
         `,
-        [recurso_id, servicio_id]
+        [recursoIdSolicitud, servicioIdSolicitud]
       );
 
       if (recursoValido.length === 0) {
         return res.status(404).json("El recurso no pertenece al servicio especificado");
       }
 
-      const personasAutorizadas = await resolverPersonasCotizacionAutorizadas(pool, cabecera, {
-        personas,
-        usuarioObjetivoId: usuario_id,
-        fechaIngreso: fechaInicioSolicitud,
-      });
-
       const tarifaBase = await calcularTarifaBaseReserva(pool, {
-        recursoId: recurso_id,
+        recursoId: recursoIdSolicitud,
         regimenId: regimenIdSolicitud,
         personas: personasAutorizadas,
         fechaInicio: fechaInicioSolicitud,
         fechaFin: fechaFinSolicitud,
         temporadaTarifaId: temporadaTarifaIdFiltro,
+        departamentalId: titularCotizacion.departamental_id,
       });
       const adicionalesProcesados = await calcularAdicionalesReserva(
         pool,
         adicionalesSeleccionados,
-        recurso_id,
+        recursoIdSolicitud,
         regimenIdSolicitud,
         fechaInicioSolicitud,
         fechaFinSolicitud,
@@ -5554,9 +5808,6 @@ async function notificarAdministradoresTurismo(connection, tipo, titulo, mensaje
   }
 }
 
-const SERVICIO_CAMPING_ID = 4;
-const RECURSO_CAMPING_ID = 1;
-const MAX_PERSONAS_CAMPING = 6;
 const ESTADO_RESERVA_CANCELADA_ID = 4;
 const ESTADO_RESERVA_INICIADA_ID = 1;
 const ESTADO_RESERVA_RECHAZADA_ID = 4;
@@ -5685,7 +5936,7 @@ async function resolverTitularReservaAlta(connection, cabecera, usuarioIdRaw, {
   }
 
   const [usuariosTitulares] = await connection.query(
-    `SELECT u.id, u.nombre, u.apellido, u.usuario_familiar_id, u.departamental_id,
+    `SELECT u.id, u.nombre, u.apellido, u.documento, u.usuario_familiar_id, u.departamental_id,
             u.habilitado, u.modulo_turismo, u.modulo_coseguro, r.nombre AS rol
        FROM usuario u
        INNER JOIN rol r ON r.id = u.rol_id
@@ -6108,12 +6359,13 @@ async function firmarImagenesConvenio(imagenes = []) {
       archivo: archivoUrl,
       archivo_url: archivoUrl,
       orden: Number(imagen.orden || 0),
+      origen: imagen.origen || "CONVENIO",
     };
   }));
 }
 
 async function firmarConvenioHotel(row, imagenes = []) {
-  let tarifarioPdfUrl = null;
+  let tarifarioPdfUrl = row?.servicio_tarifario_pdf_url || row?.tarifario_pdf_url || null;
   if (row?.tarifario_pdf_archivo) {
     try {
       tarifarioPdfUrl = await getSignedFileUrlFromS3(row.tarifario_pdf_archivo);
@@ -6124,6 +6376,7 @@ async function firmarConvenioHotel(row, imagenes = []) {
 
   return {
     id: Number(row.id),
+    servicio_id: row.servicio_id ? Number(row.servicio_id) : null,
     nombre: row.nombre,
     ciudad: row.ciudad,
     provincia: row.provincia,
@@ -6131,6 +6384,8 @@ async function firmarConvenioHotel(row, imagenes = []) {
     latitud: row.latitud !== null && row.latitud !== undefined ? Number(row.latitud) : null,
     longitud: row.longitud !== null && row.longitud !== undefined ? Number(row.longitud) : null,
     descripcion: row.descripcion || "",
+    direccion: row.direccion || null,
+    formulario_adhesion_url: row.formulario_adhesion_url || null,
     activo: row.activo === 1 || row.activo === true,
     tarifario_pdf_url: tarifarioPdfUrl,
     fecha_creacion: row.fecha_creacion,
@@ -6139,7 +6394,7 @@ async function firmarConvenioHotel(row, imagenes = []) {
   };
 }
 
-async function obtenerImagenesConvenioPorHotel(connection, hotelIds) {
+async function obtenerImagenesConvenioPorHotel(connection, hotelIds, { incluirImagenesServicio = false } = {}) {
   const ids = (hotelIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0);
   if (ids.length === 0) {
     return new Map();
@@ -6147,15 +6402,29 @@ async function obtenerImagenesConvenioPorHotel(connection, hotelIds) {
 
   const placeholders = ids.map(() => "?").join(",");
   const [rows] = await connection.query(
-    `SELECT id, convenio_hotel_id AS hotel_id, archivo, orden
-     FROM convenio_hotel_imagen
-     WHERE convenio_hotel_id IN (${placeholders})
-     ORDER BY convenio_hotel_id ASC, orden ASC, id ASC`,
+    `SELECT chi.id, chi.convenio_hotel_id AS hotel_id, chi.archivo, chi.orden
+       FROM convenio_hotel_imagen chi
+       INNER JOIN convenio_hotel ch ON ch.id = chi.convenio_hotel_id
+      WHERE chi.convenio_hotel_id IN (${placeholders}) AND ch.servicio_id IS NULL
+      ORDER BY chi.convenio_hotel_id ASC, chi.orden ASC, chi.id ASC`,
     ids
   );
 
+  let todas = rows;
+  if (incluirImagenesServicio) {
+    const [imagenesServicio] = await connection.query(
+      `SELECT i.id, ch.id AS hotel_id, i.archivo, i.id AS orden, 'SERVICIO' AS origen
+         FROM convenio_hotel ch
+         INNER JOIN imagen_servicio i ON i.servicio_id = ch.servicio_id
+        WHERE ch.id IN (${placeholders})
+        ORDER BY ch.id, i.id`,
+      ids
+    );
+    todas = [...rows, ...imagenesServicio];
+  }
+
   const mapa = new Map();
-  rows.forEach((row) => {
+  todas.forEach((row) => {
     const hotelId = Number(row.hotel_id);
     if (!mapa.has(hotelId)) {
       mapa.set(hotelId, []);
@@ -7096,7 +7365,313 @@ function normalizarPersonasParaCotizacion(personas, regimenId, fechaInicio) {
   });
 }
 
-async function calcularTarifaBaseReserva(connection, { recursoId, regimenId, personas, fechaInicio, fechaFin, temporadaTarifaId = null }) {
+async function agregarRecursosConReglasGestionadas(connection, {
+  recursosValidos,
+  servicio,
+  usuarioTitularId,
+  fechaInicio,
+  fechaFin,
+  temporadaTarifaId = null,
+}) {
+  if (temporadaTarifaId) return;
+  const titularId = normalizarIdPositivo(usuarioTitularId);
+  const [titulares] = titularId
+    ? await connection.query("SELECT departamental_id FROM usuario WHERE id = ? LIMIT 1", [titularId])
+    : [[]];
+  const depTitular = normalizarIdPositivo(titulares[0]?.departamental_id);
+  const audiencia = depTitular && depTitular === normalizarIdPositivo(servicio.propietario_departamental_id)
+    ? "PROPIA" : "OTRAS";
+  const [reglasGestionadas] = await connection.query(
+    `SELECT r.id AS recurso_id, tr.recurso_id AS regla_recurso_id,
+            tr.fecha_inicio, tr.fecha_fin, tr.audiencia_departamental
+       FROM recurso r INNER JOIN turismo_tarifa_regla tr
+         ON tr.servicio_id = r.servicio_id
+        AND (tr.recurso_id IS NULL OR tr.recurso_id = r.id)
+      WHERE r.servicio_id = ? AND r.activo = 1 AND tr.activo = 1
+        AND tr.audiencia_departamental IN ('TODAS', ?)
+        AND tr.fecha_inicio < ? AND tr.fecha_fin >= ?`,
+    [servicio.id, audiencia, fechaFin, fechaInicio]
+  );
+  if (servicio.modelo_tarifa === "PRECIO_UNICO") recursosValidos.clear();
+  const noches = obtenerNochesReserva(fechaInicio, fechaFin);
+  const porRecurso = new Map();
+  for (const regla of reglasGestionadas) {
+    const recursoId = Number(regla.recurso_id);
+    if (!porRecurso.has(recursoId)) porRecurso.set(recursoId, []);
+    porRecurso.get(recursoId).push(regla);
+  }
+  for (const [recursoId, reglas] of porRecurso) {
+    const coberturaCompleta = noches.every((noche) => {
+      let aplicables = reglas.filter((regla) => {
+        const inicio = formatearFechaSQL(regla.fecha_inicio);
+        const fin = formatearFechaSQL(regla.fecha_fin);
+        return inicio && fin && inicio <= noche && fin >= noche;
+      });
+      const especificas = aplicables.filter((regla) => regla.audiencia_departamental === audiencia);
+      if (especificas.length) aplicables = especificas;
+      const especificasRecurso = aplicables.filter(
+        (regla) => Number(regla.regla_recurso_id) === recursoId
+      );
+      if (especificasRecurso.length) aplicables = especificasRecurso;
+      return aplicables.length === 1;
+    });
+    if (coberturaCompleta) recursosValidos.add(recursoId);
+  }
+}
+
+async function calcularTarifaPrecioUnico(connection, {
+  recurso,
+  personas,
+  noches,
+  fechaInicio,
+  fechaFin,
+  departamentalId = null,
+}) {
+  if (!Array.isArray(personas) || personas.length !== 1) {
+    throw crearErrorNegocio("El precio único requiere reservar solo para el titular", 422, "PRECIO_UNICO_SOLO_TITULAR");
+  }
+  let dep = normalizarIdPositivo(departamentalId);
+  if (!dep) {
+    const personaId = normalizarIdPositivo(personas[0]?.usuario_id ?? personas[0]?.id);
+    if (personaId) {
+      const [usuarios] = await connection.query(
+        "SELECT departamental_id FROM usuario WHERE id = ? LIMIT 1",
+        [personaId]
+      );
+      dep = normalizarIdPositivo(usuarios[0]?.departamental_id);
+    }
+  }
+  const audiencia = dep && dep === normalizarIdPositivo(recurso.propietario_departamental_id)
+    ? "PROPIA" : "OTRAS";
+  const [reglas] = await connection.query(
+    `SELECT tr.*, t.id AS tarifa_id
+       FROM turismo_tarifa_regla tr
+       LEFT JOIN tarifa t
+         ON t.turismo_tarifa_regla_id = tr.id AND t.recurso_id = ?
+      WHERE tr.servicio_id = ? AND tr.activo = 1
+        AND (tr.recurso_id IS NULL OR tr.recurso_id = ?)
+        AND tr.audiencia_departamental IN ('TODAS', ?)
+        AND tr.fecha_inicio <= ? AND tr.fecha_fin >= ?
+      ORDER BY CASE WHEN tr.audiencia_departamental = ? THEN 0 ELSE 1 END, tr.id`,
+    [recurso.id, recurso.servicio_id, recurso.id, audiencia, fechaFin, fechaInicio, audiencia]
+  );
+  const detalles = [];
+  for (const noche of noches) {
+    let aplicables = reglas.filter((regla) => {
+      const inicio = formatearFechaSQL(regla.fecha_inicio);
+      const fin = formatearFechaSQL(regla.fecha_fin);
+      return inicio && fin && inicio <= noche && fin >= noche;
+    });
+    const especificas = aplicables.filter((regla) => regla.audiencia_departamental === audiencia);
+    if (especificas.length) aplicables = especificas;
+    const especificasRecurso = aplicables.filter(
+      (regla) => Number(regla.recurso_id) === Number(recurso.id)
+    );
+    if (especificasRecurso.length) aplicables = especificasRecurso;
+    if (aplicables.length === 0) {
+      // El tarifario administrable toma control solo cuando cubre el rango
+      // completo. Mientras se carga una temporada por etapas, las tarifas
+      // legacy siguen siendo la fuente canonica y no se corta la venta.
+      return null;
+    }
+    if (aplicables.length > 1) {
+      throw crearErrorNegocio(`Hay más de una tarifa aplicable para ${noche}`, 409, "TARIFA_AMBIGUA");
+    }
+    const regla = aplicables[0];
+    const tarifaId = normalizarIdPositivo(regla.tarifa_id);
+    if (!tarifaId) {
+      throw crearErrorNegocio("La tarifa todavía no fue materializada", 409, "TARIFA_REGLA_INCOMPLETA");
+    }
+    const precioOriginalCentavos = decimalACentavos(regla.precio, { permiteCero: false });
+    const descuento = decimalAPuntosBase(regla.porcentaje_descuento || 0);
+    const precioCentavos = aplicarDescuentoEnPuntosBase(precioOriginalCentavos, descuento);
+    if (precioOriginalCentavos === null || descuento === null || precioCentavos === null) {
+      throw crearErrorNegocio("La tarifa tiene un importe o descuento inválido", 409, "TARIFA_INVALIDA");
+    }
+    detalles.push({
+      fecha: noche,
+      precio_centavos: precioCentavos,
+      precio_original_centavos: precioOriginalCentavos,
+      tarifa_id: tarifaId,
+      tarifa_regla_id: Number(regla.id),
+      usa_porcentaje: descuento > 0,
+      porcentaje_descuento: descuento / 100,
+    });
+  }
+
+  let cobrables = detalles;
+  if (recurso.unidad_cobro === "POR_ESTADIA") {
+    const reglasUsadas = new Set(detalles.map((detalle) => detalle.tarifa_regla_id));
+    if (reglasUsadas.size !== 1) {
+      throw crearErrorNegocio("Una tarifa por estadía no puede cambiar dentro del rango", 409, "TARIFA_AMBIGUA");
+    }
+    cobrables = detalles.slice(0, 1);
+  }
+  const totalCentavos = sumarCentavos(...cobrables.map((detalle) => detalle.precio_centavos));
+  const totalOriginalCentavos = sumarCentavos(...cobrables.map((detalle) => detalle.precio_original_centavos));
+  if (totalCentavos === null || totalOriginalCentavos === null) {
+    throw crearErrorNegocio("El total de la tarifa excede el máximo permitido", 409, "TARIFA_INVALIDA");
+  }
+  const tarifasPorFecha = cobrables.map((detalle) => ({
+    fecha: detalle.fecha,
+    precio: centavosANumero(detalle.precio_centavos),
+    precio_original: centavosANumero(detalle.precio_original_centavos),
+    tarifa_id: detalle.tarifa_id,
+    tarifa_regla_id: detalle.tarifa_regla_id,
+    usa_porcentaje: detalle.usa_porcentaje,
+    porcentaje_descuento: detalle.porcentaje_descuento,
+  }));
+  return {
+    total: centavosANumero(totalCentavos),
+    total_original: centavosANumero(totalOriginalCentavos),
+    personas: [{
+      ...personas[0],
+      regimen_id: normalizarIdPositivo(personas[0]?.regimen_id),
+      tarifa_individual: centavosANumero(totalCentavos),
+      tarifa_original_individual: centavosANumero(totalOriginalCentavos),
+      tarifas_por_fecha: tarifasPorFecha,
+    }],
+  };
+}
+
+async function calcularTarifaTemporadasGestionadas(connection, {
+  recurso,
+  personas,
+  noches,
+  fechaInicio,
+  fechaFin,
+  departamentalId = null,
+}) {
+  let dep = normalizarIdPositivo(departamentalId);
+  if (!dep) {
+    const personaId = normalizarIdPositivo(personas[0]?.usuario_id ?? personas[0]?.id);
+    if (personaId) {
+      const [usuarios] = await connection.query(
+        "SELECT departamental_id FROM usuario WHERE id = ? LIMIT 1",
+        [personaId]
+      );
+      dep = normalizarIdPositivo(usuarios[0]?.departamental_id);
+    }
+  }
+  const audiencia = dep && dep === normalizarIdPositivo(recurso.propietario_departamental_id)
+    ? "PROPIA" : "OTRAS";
+  const [reglas] = await connection.query(
+    `SELECT tr.*, t.id AS tarifa_id
+       FROM turismo_tarifa_regla tr
+       LEFT JOIN tarifa t
+         ON t.turismo_tarifa_regla_id = tr.id AND t.recurso_id = ?
+      WHERE tr.servicio_id = ? AND tr.activo = 1
+        AND (tr.recurso_id IS NULL OR tr.recurso_id = ?)
+        AND tr.audiencia_departamental IN ('TODAS', ?)
+        AND tr.fecha_inicio <= ? AND tr.fecha_fin >= ?
+      ORDER BY CASE WHEN tr.audiencia_departamental = ? THEN 0 ELSE 1 END, tr.id`,
+    [recurso.id, recurso.servicio_id, recurso.id, audiencia, fechaFin, fechaInicio, audiencia]
+  );
+  if (reglas.length === 0) return null;
+
+  const detalles = [];
+  for (const noche of noches) {
+    let aplicables = reglas.filter((regla) => {
+      const inicio = formatearFechaSQL(regla.fecha_inicio);
+      const fin = formatearFechaSQL(regla.fecha_fin);
+      return inicio && fin && inicio <= noche && fin >= noche;
+    });
+    const especificas = aplicables.filter((regla) => regla.audiencia_departamental === audiencia);
+    if (especificas.length) aplicables = especificas;
+    const especificasRecurso = aplicables.filter(
+      (regla) => Number(regla.recurso_id) === Number(recurso.id)
+    );
+    if (especificasRecurso.length) aplicables = especificasRecurso;
+    if (aplicables.length === 0) {
+      throw crearErrorNegocio("No hay una tarifa configurada para todas las fechas", 409, "TARIFA_INCOMPLETA");
+    }
+    if (aplicables.length > 1) {
+      throw crearErrorNegocio(`Hay más de una tarifa aplicable para ${noche}`, 409, "TARIFA_AMBIGUA");
+    }
+    const regla = aplicables[0];
+    const tarifaId = normalizarIdPositivo(regla.tarifa_id);
+    if (!tarifaId) {
+      throw crearErrorNegocio("La tarifa todavía no fue materializada", 409, "TARIFA_REGLA_INCOMPLETA");
+    }
+    const precioOriginalCentavos = decimalACentavos(regla.precio, { permiteCero: false });
+    const descuento = decimalAPuntosBase(regla.porcentaje_descuento || 0);
+    const precioCentavos = aplicarDescuentoEnPuntosBase(precioOriginalCentavos, descuento);
+    if (precioOriginalCentavos === null || descuento === null || precioCentavos === null) {
+      throw crearErrorNegocio("La tarifa tiene un importe o descuento inválido", 409, "TARIFA_INVALIDA");
+    }
+    detalles.push({
+      fecha: noche,
+      precio_centavos: precioCentavos,
+      precio_original_centavos: precioOriginalCentavos,
+      tarifa_id: tarifaId,
+      tarifa_regla_id: Number(regla.id),
+      precio_por_persona: Number(regla.precio_por_persona) === 1,
+      usa_porcentaje: descuento > 0,
+      porcentaje_descuento: descuento / 100,
+    });
+  }
+
+  let cobrables = detalles;
+  if (recurso.unidad_cobro === "POR_ESTADIA") {
+    const reglasUsadas = new Set(detalles.map((detalle) => detalle.tarifa_regla_id));
+    if (reglasUsadas.size !== 1) {
+      throw crearErrorNegocio("Una tarifa por estadía no puede cambiar dentro del rango", 409, "TARIFA_AMBIGUA");
+    }
+    cobrables = detalles.slice(0, 1);
+  }
+
+  let totalCentavos = 0;
+  let totalOriginalCentavos = 0;
+  const personasResultado = personas.map((persona, indice) => {
+    let totalPersonaCentavos = 0;
+    let totalOriginalPersonaCentavos = 0;
+    const tarifasPorFecha = cobrables.map((detalle) => {
+      const cobra = detalle.precio_por_persona || indice === 0;
+      const precioCentavos = cobra ? detalle.precio_centavos : 0;
+      const precioOriginalCentavos = cobra ? detalle.precio_original_centavos : 0;
+      totalPersonaCentavos = sumarCentavos(totalPersonaCentavos, precioCentavos);
+      totalOriginalPersonaCentavos = sumarCentavos(totalOriginalPersonaCentavos, precioOriginalCentavos);
+      if (totalPersonaCentavos === null || totalOriginalPersonaCentavos === null) {
+        throw crearErrorNegocio("El total de la tarifa excede el máximo permitido", 409, "TARIFA_INVALIDA");
+      }
+      return {
+        fecha: detalle.fecha,
+        precio: centavosANumero(precioCentavos),
+        precio_original: centavosANumero(precioOriginalCentavos),
+        tarifa_id: detalle.tarifa_id,
+        tarifa_regla_id: detalle.tarifa_regla_id,
+        usa_porcentaje: cobra && detalle.usa_porcentaje,
+        porcentaje_descuento: cobra ? detalle.porcentaje_descuento : 0,
+      };
+    });
+    totalCentavos = sumarCentavos(totalCentavos, totalPersonaCentavos);
+    totalOriginalCentavos = sumarCentavos(totalOriginalCentavos, totalOriginalPersonaCentavos);
+    if (totalCentavos === null || totalOriginalCentavos === null) {
+      throw crearErrorNegocio("El total de la reserva excede el máximo permitido", 409, "TARIFA_INVALIDA");
+    }
+    return {
+      ...persona,
+      tarifa_individual: centavosANumero(totalPersonaCentavos),
+      tarifa_original_individual: centavosANumero(totalOriginalPersonaCentavos),
+      tarifas_por_fecha: tarifasPorFecha,
+    };
+  });
+  return {
+    total: centavosANumero(totalCentavos),
+    total_original: centavosANumero(totalOriginalCentavos),
+    personas: personasResultado,
+  };
+}
+
+async function calcularTarifaBaseReserva(connection, {
+  recursoId,
+  regimenId,
+  personas,
+  fechaInicio,
+  fechaFin,
+  temporadaTarifaId = null,
+  departamentalId = null,
+}) {
   const fechaInicioNormalizada = formatearFechaSQL(fechaInicio);
   const fechaFinNormalizada = formatearFechaSQL(fechaFin);
   const noches = obtenerNochesReserva(fechaInicioNormalizada, fechaFinNormalizada);
@@ -7106,7 +7681,42 @@ async function calcularTarifaBaseReserva(connection, { recursoId, regimenId, per
 
   const recursoIdNormalizado = normalizarIdPositivo(recursoId);
   const regimenIdNormalizado = normalizarIdPositivo(regimenId);
-  if (!recursoIdNormalizado || !regimenIdNormalizado) {
+  if (!recursoIdNormalizado) {
+    throw crearErrorNegocio("El recurso es requerido", 400);
+  }
+  const [recursosConfigurados] = await connection.query(
+    `SELECT r.id, r.servicio_id, s.modelo_tarifa, s.unidad_cobro,
+            s.propietario_departamental_id, s.permite_acompanantes
+            , s.anticipacion_minima_dias
+       FROM recurso r INNER JOIN servicio s ON s.id = r.servicio_id
+      WHERE r.id = ? AND r.activo = 1 AND s.activo = 1 AND s.estado_aprobacion = 'APROBADO'
+      LIMIT 1`,
+    [recursoIdNormalizado]
+  );
+  const recursoConfigurado = recursosConfigurados[0];
+  if (!recursoConfigurado) throw crearErrorNegocio("El recurso no está disponible", 404, "RECURSO_NO_DISPONIBLE");
+  const fechaMinima = sumarDiasFechaCivil(
+    obtenerFechaCivilArgentina(),
+    Number(recursoConfigurado.anticipacion_minima_dias || 0)
+  );
+  if (fechaMinima && fechaInicioNormalizada < fechaMinima) {
+    throw crearErrorNegocio(
+      `Este servicio requiere ${Number(recursoConfigurado.anticipacion_minima_dias || 0)} días de anticipación`,
+      422,
+      "ANTICIPACION_MINIMA"
+    );
+  }
+  if (recursoConfigurado.modelo_tarifa === "PRECIO_UNICO") {
+    return calcularTarifaPrecioUnico(connection, {
+      recurso: recursoConfigurado,
+      personas,
+      noches,
+      fechaInicio: fechaInicioNormalizada,
+      fechaFin: fechaFinNormalizada,
+      departamentalId,
+    });
+  }
+  if (!regimenIdNormalizado) {
     throw crearErrorNegocio("El recurso y el regimen son requeridos", 400);
   }
 
@@ -7115,6 +7725,17 @@ async function calcularTarifaBaseReserva(connection, { recursoId, regimenId, per
     regimenIdNormalizado,
     fechaInicioNormalizada
   );
+  if (!temporadaTarifaId) {
+    const tarifaGestionada = await calcularTarifaTemporadasGestionadas(connection, {
+      recurso: recursoConfigurado,
+      personas: personasNormalizadas,
+      noches,
+      fechaInicio: fechaInicioNormalizada,
+      fechaFin: fechaFinNormalizada,
+      departamentalId,
+    });
+    if (tarifaGestionada) return tarifaGestionada;
+  }
   let totalCentavos = 0;
   let totalOriginalCentavos = 0;
   const personasResultado = [];
@@ -7755,29 +8376,58 @@ async function obtenerBloquesDisponiblesPorServicio(connection, {
   }
 }
 
-function esServicioCamping(servicioId) {
-  return Number(servicioId) === SERVICIO_CAMPING_ID;
-}
-
 function crearErrorReservaCamping(mensaje, statusCode = 422) {
   const error = new Error(mensaje);
   error.statusCode = statusCode;
   return error;
 }
 
-function validarReglasCampingReserva(servicioId, recursoId, personas) {
-  if (!esServicioCamping(servicioId)) {
-    return null;
-  }
+async function obtenerConfiguracionServicioReserva(connection, servicioId, recursoId, { forUpdate = false } = {}) {
+  const lock = forUpdate ? " FOR UPDATE" : "";
+  const [rows] = await connection.query(
+    `SELECT s.id AS servicio_id, s.modelo_tarifa, s.permite_acompanantes,
+            s.max_personas_reserva, s.anticipacion_minima_dias,
+            ts.codigo AS tipo_codigo, r.id AS recurso_id, r.cupo_maximo,
+            r.es_recurso_principal
+       FROM servicio s INNER JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id
+       INNER JOIN recurso r ON r.servicio_id = s.id AND r.id = ? AND r.activo = 1
+      WHERE s.id = ? AND s.activo = 1 AND s.estado_aprobacion = 'APROBADO' AND ts.activo = 1
+      LIMIT 1${lock}`,
+    [recursoId, servicioId]
+  );
+  return rows[0] || null;
+}
 
-  if (Number(recursoId) !== RECURSO_CAMPING_ID) {
-    return "Recurso invalido para servicio Camping";
-  }
+function normalizarDocumentoReserva(valor) {
+  return String(valor ?? "").replace(/\D/g, "");
+}
 
-  if (Array.isArray(personas) && personas.length > MAX_PERSONAS_CAMPING) {
-    return "Camping permite un maximo de 6 personas";
-  }
+function personaCorrespondeAlTitular(persona, titular) {
+  const titularId = normalizarIdPositivo(titular?.id ?? titular?.usuario_id);
+  const personaId = normalizarIdPositivo(persona?.usuario_id ?? persona?.id);
+  if (personaId) return Boolean(titularId && personaId === titularId);
+  const documentoTitular = normalizarDocumentoReserva(titular?.documento ?? titular?.dni);
+  const documentoPersona = normalizarDocumentoReserva(persona?.documento ?? persona?.dni);
+  return Boolean(
+    documentoTitular && documentoPersona && documentoTitular === documentoPersona &&
+    Number(persona?.parentesco_id ?? persona?.parentesco) === 1
+  );
+}
 
+function validarReglasCampingReserva(configuracion, personas, titular = null) {
+  if (!Array.isArray(personas) || personas.length === 0) return "Debe indicar al menos una persona";
+  const soloTitular = configuracion?.modelo_tarifa === "PRECIO_UNICO" ||
+    Number(configuracion?.permite_acompanantes) !== 1;
+  if (soloTitular && (personas.length !== 1 || (titular && !personaCorrespondeAlTitular(personas[0], titular)))) {
+    return "Este servicio sólo permite reservar para el titular";
+  }
+  const capacidades = [configuracion?.max_personas_reserva, configuracion?.recurso_cupo_maximo]
+    .map(Number)
+    .filter((valor) => Number.isInteger(valor) && valor > 0);
+  const maxPersonas = capacidades.length ? Math.min(...capacidades) : null;
+  if (maxPersonas && personas.length > maxPersonas) {
+    return `Este servicio permite un máximo de ${maxPersonas} personas`;
+  }
   return null;
 }
 
@@ -7800,15 +8450,14 @@ async function bloquearYValidarDisponibilidadReserva(connection, {
 
   // La fila del recurso serializa altas y ediciones concurrentes, incluso cuando
   // todavia no existe ninguna reserva que pueda bloquearse con FOR UPDATE.
-  const [recursos] = await connection.query(
-    "SELECT id FROM recurso WHERE id = ? AND servicio_id = ? FOR UPDATE",
-    [recursoIdNormalizado, servicioIdNormalizado]
+  const configuracion = await obtenerConfiguracionServicioReserva(
+    connection, servicioIdNormalizado, recursoIdNormalizado, { forUpdate: true }
   );
-  if (recursos.length === 0) {
+  if (!configuracion) {
     throw crearErrorNegocio("El recurso no pertenece al servicio indicado", 422);
   }
 
-  if (esServicioCamping(servicioIdNormalizado)) {
+  if (configuracion.tipo_codigo === "CUPO_NUMERADO") {
     return;
   }
 
@@ -7901,11 +8550,14 @@ async function liberarRecursoBloqueReserva(connection, reservaId) {
 
 async function bloquearRecursoCamping(connection, recursoId) {
   const [recursoRows] = await connection.query(
-    `SELECT id
-     FROM recurso
-     WHERE id = ? AND servicio_id = ?
+    `SELECT r.id, r.cupo_maximo
+     FROM recurso r
+     INNER JOIN servicio s ON s.id = r.servicio_id
+     INNER JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id
+     WHERE r.id = ? AND r.activo = 1 AND s.activo = 1
+       AND s.estado_aprobacion = 'APROBADO' AND ts.codigo = 'CUPO_NUMERADO'
      FOR UPDATE`,
-    [recursoId, SERVICIO_CAMPING_ID]
+    [recursoId]
   );
 
   if (recursoRows.length === 0) {
@@ -7915,28 +8567,31 @@ async function bloquearRecursoCamping(connection, recursoId) {
 
 async function obtenerMinimoParcelasDisponiblesCamping(connection, recursoId, noches) {
   let minParcelasDisponibles = null;
+  const [recursos] = await connection.query("SELECT cupo_maximo FROM recurso WHERE id = ? LIMIT 1", [recursoId]);
+  const cupoFallback = Number(recursos[0]?.cupo_maximo);
 
   for (const fecha of noches) {
+    const [cuposRows] = await connection.query(
+      `SELECT MIN(cupo_total) AS cupo_total FROM recurso_cupo_periodo
+        WHERE recurso_id = ? AND activo = 1 AND fecha_inicio <= ? AND fecha_fin >= ?`,
+      [recursoId, fecha, fecha]
+    );
+    let parcelasDia = Number(cuposRows[0]?.cupo_total);
     const [parcelasDiaRows] = await connection.query(
       `SELECT MIN(t.parcelas_disponibles) AS parcelas_disponibles
        FROM tarifa t
-       INNER JOIN recurso r ON t.recurso_id = r.id
        WHERE t.recurso_id = ?
-         AND r.servicio_id = ?
          AND t.fecha_inicio <= ?
          AND t.fecha_fin >= ?
          AND t.parcelas_disponibles IS NOT NULL`,
-      [recursoId, SERVICIO_CAMPING_ID, fecha, fecha]
+      [recursoId, fecha, fecha]
     );
 
     const parcelasDiaRaw = parcelasDiaRows?.[0]?.parcelas_disponibles;
-    if (parcelasDiaRaw === null || parcelasDiaRaw === undefined) {
-      return null;
-    }
-
-    const parcelasDia = Number(parcelasDiaRaw);
+    if (!Number.isInteger(parcelasDia) || parcelasDia <= 0) parcelasDia = Number(parcelasDiaRaw);
+    if (!Number.isInteger(parcelasDia) || parcelasDia <= 0) parcelasDia = cupoFallback;
     if (!Number.isFinite(parcelasDia) || parcelasDia <= 0) {
-      return 0;
+      return null;
     }
 
     if (minParcelasDisponibles === null || parcelasDia < minParcelasDisponibles) {
@@ -8491,7 +9146,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
 
       // Validar campos requeridos
       if (!nombre || !fecha_inicio || !fecha_fin || !servicio_id || !recurso_id ||
-        !regimen_id || !Array.isArray(personas) || personas.length === 0) {
+        !Array.isArray(personas) || personas.length === 0) {
         return res.status(400).json("Faltan campos requeridos");
       }
 
@@ -8501,7 +9156,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
       const fechaInicioReserva = formatearFechaSQL(fecha_inicio);
       const fechaFinReserva = formatearFechaSQL(fecha_fin);
       if (
-        !servicioIdReserva || !recursoIdReserva || !regimenIdReserva ||
+        !servicioIdReserva || !recursoIdReserva ||
         !fechaInicioReserva || !fechaFinReserva ||
         diferenciaDiasCivil(fechaInicioReserva, fechaFinReserva) <= 0
       ) {
@@ -8512,12 +9167,6 @@ router.post("/reserva", verifyToken, async (req, res) => {
       }
 
       const porSalud = normalizarPorSalud(req.body);
-
-      const esReservaCamping = esServicioCamping(servicio_id);
-      const errorReglasCamping = validarReglasCampingReserva(servicio_id, recurso_id, personas);
-      if (errorReglasCamping) {
-        return res.status(422).json(errorReglasCamping);
-      }
 
       const modalidadSolicitada = normalizarModalidad(modalidad);
       const bloqueFechaIdSolicitado = normalizarIdPositivo(bloque_fecha_id);
@@ -8541,6 +9190,23 @@ router.post("/reserva", verifyToken, async (req, res) => {
         } = await resolverTitularReservaAlta(connection, cabecera, req.body.usuario_id, {
           requiereCoseguro: Boolean(porSalud),
         });
+        const servicioVisibleTitular = await servicioVisibleParaActor(
+          connection,
+          { rol: "afiliado", departamental_id: usuarioTitular.departamental_id },
+          servicioIdReserva,
+          { recursoId: recursoIdReserva }
+        );
+        if (!servicioVisibleTitular || servicioVisibleTitular.tipo_codigo === "CONVENIO_HOTELERO") {
+          throw crearErrorNegocio("El servicio no está disponible para la departamental del afiliado", 403, "SERVICIO_NO_VISIBLE");
+        }
+        if (servicioVisibleTitular.modelo_tarifa !== "PRECIO_UNICO" && !regimenIdReserva) {
+          throw crearErrorNegocio("El régimen es requerido para este servicio", 400, "REGIMEN_REQUERIDO");
+        }
+        const esReservaCamping = servicioVisibleTitular.tipo_codigo === "CUPO_NUMERADO";
+        const errorReglasCamping = validarReglasCampingReserva(servicioVisibleTitular, personas, usuarioTitular);
+        if (errorReglasCamping) {
+          throw crearErrorNegocio(errorReglasCamping, 422, "CAPACIDAD_SERVICIO_EXCEDIDA");
+        }
 
         // Se controla antes de consultar disponibilidad para que, si la unica
         // reserva iniciada ya vencio, quede rechazada y libere el recurso en
@@ -8986,12 +9652,26 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
     });
 
     const [hoteles] = await connection.query(
-      "SELECT id, nombre FROM convenio_hotel WHERE id = ? AND activo = 1 LIMIT 1",
+      "SELECT id, nombre, servicio_id FROM convenio_hotel WHERE id = ? AND activo = 1 LIMIT 1",
       [hotelId]
     );
     if (hoteles.length === 0) {
       await connection.rollback();
       return res.status(404).json("Convenio hotelero no disponible");
+    }
+    const servicioConvenio = await servicioVisibleParaActor(
+      connection,
+      { rol: "afiliado", departamental_id: usuarioTitular.departamental_id },
+      hoteles[0].servicio_id,
+      { forUpdate: true }
+    );
+    if (!servicioConvenio || servicioConvenio.tipo_codigo !== "CONVENIO_HOTELERO") {
+      await connection.rollback();
+      return res.status(404).json("Convenio hotelero no disponible");
+    }
+    const errorReglasConvenio = validarReglasCampingReserva(servicioConvenio, personas, usuarioTitular);
+    if (errorReglasConvenio) {
+      throw crearErrorNegocio(errorReglasConvenio, 422, "CAPACIDAD_SERVICIO_EXCEDIDA");
     }
 
     const firmaFileName = `firma_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.png`;
@@ -9160,7 +9840,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
 
       // Validar campos requeridos
       if (!reservaId || !nombre || !fecha_inicio || !fecha_fin || !servicio_id ||
-        !recurso_id || !regimen_id || !Array.isArray(personas) || personas.length === 0) {
+        !recurso_id || !Array.isArray(personas) || personas.length === 0) {
         return res.status(400).json({
           success: false,
           message: "Faltan campos requeridos"
@@ -9173,20 +9853,11 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
       const fechaInicioReserva = formatearFechaSQL(fecha_inicio);
       const fechaFinReserva = formatearFechaSQL(fecha_fin);
       if (
-        !servicioIdReserva || !recursoIdReserva || !regimenIdReserva ||
+        !servicioIdReserva || !recursoIdReserva ||
         !fechaInicioReserva || !fechaFinReserva ||
         diferenciaDiasCivil(fechaInicioReserva, fechaFinReserva) <= 0
       ) {
         return res.status(400).json({ success: false, message: "Los identificadores o el rango de fechas no son válidos" });
-      }
-
-      const esReservaCamping = esServicioCamping(servicioIdReserva);
-      const errorReglasCamping = validarReglasCampingReserva(servicioIdReserva, recursoIdReserva, personas);
-      if (errorReglasCamping) {
-        return res.status(422).json({
-          success: false,
-          message: errorReglasCamping
-        });
       }
 
       let connection;
@@ -9199,7 +9870,8 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         // Verificar que la reserva existe
         const [reservaExistente] = await connection.query(
           `SELECT r.*, er.nombre AS estado_nombre,
-                  u.departamental_id AS usuario_departamental_id
+                  u.departamental_id AS usuario_departamental_id,
+                  u.documento AS usuario_documento
            FROM reserva r
            LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
            INNER JOIN usuario u ON u.id = r.usuario_id
@@ -9235,6 +9907,27 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         }
         if ([MODALIDAD_SORTEO, MODALIDAD_CONVENIO].includes(reservaActual.modalidad)) {
           throw crearErrorNegocio("Esta modalidad no se puede editar desde la reserva general", 409);
+        }
+        const configuracionServicioReserva = await servicioVisibleParaActor(
+          connection,
+          { rol: "afiliado", departamental_id: reservaActual.usuario_departamental_id },
+          servicioIdReserva,
+          { recursoId: recursoIdReserva }
+        );
+        if (!configuracionServicioReserva || configuracionServicioReserva.tipo_codigo === "CONVENIO_HOTELERO") {
+          throw crearErrorNegocio("El recurso no está disponible", 422, "SERVICIO_NO_VISIBLE");
+        }
+        if (configuracionServicioReserva.modelo_tarifa !== "PRECIO_UNICO" && !regimenIdReserva) {
+          throw crearErrorNegocio("El régimen es requerido para este servicio", 400, "REGIMEN_REQUERIDO");
+        }
+        const esReservaCamping = configuracionServicioReserva.tipo_codigo === "CUPO_NUMERADO";
+        const errorReglasCamping = validarReglasCampingReserva(
+          configuracionServicioReserva,
+          personas,
+          { id: reservaActual.usuario_id, documento: reservaActual.usuario_documento }
+        );
+        if (errorReglasCamping) {
+          throw crearErrorNegocio(errorReglasCamping, 422, "CAPACIDAD_SERVICIO_EXCEDIDA");
         }
         const validacionTemporalEdicion = validarRangoReservaTemporal(fechaInicioReserva, fechaFinReserva, {
           rangoExistente: {
@@ -9586,6 +10279,18 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
             er.nombre as estado,
             s.id as servicio_id,
             s.nombre as servicio_nombre,
+            ts.codigo as servicio_tipo_codigo,
+            s.etiqueta_identificador,
+            s.max_personas_reserva,
+            s.modelo_tarifa,
+            s.unidad_cobro,
+            s.permite_acompanantes,
+            (SELECT rp.id FROM recurso rp
+              WHERE rp.servicio_id = s.id AND rp.activo = 1 AND rp.es_recurso_principal = 1
+              ORDER BY rp.orden, rp.id LIMIT 1) as recurso_principal_id,
+            s.direccion as servicio_direccion,
+            s.tarifario_pdf_url as servicio_tarifario_pdf_url,
+            s.formulario_adhesion_url,
             s.lugar,
             rec.id as recurso_id,
             rec.nombre as recurso_nombre,
@@ -9607,6 +10312,7 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
           LEFT JOIN estado_reserva er ON r.estado_reserva_id = er.id
           LEFT JOIN recurso rec ON r.recurso_id = rec.id
           LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
+          LEFT JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id
           LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
           LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
           LEFT JOIN sorteo ON sorteo.id = r.sorteo_id
@@ -9721,7 +10427,18 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
           observaciones: reserva.observaciones,
           servicio: {
             id: reserva.servicio_id,
-            nombre: reserva.servicio_nombre
+            nombre: reserva.servicio_nombre,
+            tipo_codigo: reserva.servicio_tipo_codigo || null,
+            etiqueta_identificador: reserva.etiqueta_identificador || null,
+            recurso_principal_id: reserva.recurso_principal_id ? Number(reserva.recurso_principal_id) : null,
+            max_personas_reserva: reserva.max_personas_reserva == null ? null : Number(reserva.max_personas_reserva),
+            modelo_tarifa: reserva.modelo_tarifa || "TEMPORADAS",
+            unidad_cobro: reserva.unidad_cobro || "POR_PERSONA_NOCHE",
+            permite_acompanantes: Number(reserva.permite_acompanantes) === 1,
+            captura_personas: Number(reserva.permite_acompanantes) === 1 ? "GRUPO" : "SOLO_TITULAR",
+            direccion: reserva.servicio_direccion || null,
+            tarifario_pdf_url: reserva.servicio_tarifario_pdf_url || null,
+            formulario_adhesion_url: reserva.formulario_adhesion_url || null,
           },
           recurso: {
             id: reserva.recurso_id,
@@ -9820,6 +10537,18 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
             er.nombre as estado,
             s.id as servicio_id,
             s.nombre as servicio_nombre,
+            ts.codigo as servicio_tipo_codigo,
+            s.etiqueta_identificador,
+            s.max_personas_reserva,
+            s.modelo_tarifa,
+            s.unidad_cobro,
+            s.permite_acompanantes,
+            (SELECT rp.id FROM recurso rp
+              WHERE rp.servicio_id = s.id AND rp.activo = 1 AND rp.es_recurso_principal = 1
+              ORDER BY rp.orden, rp.id LIMIT 1) as recurso_principal_id,
+            s.direccion as servicio_direccion,
+            s.tarifario_pdf_url as servicio_tarifario_pdf_url,
+            s.formulario_adhesion_url,
             s.lugar,
             rec.id as recurso_id,
             rec.nombre as recurso_nombre,
@@ -9841,6 +10570,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           LEFT JOIN estado_reserva er ON r.estado_reserva_id = er.id
           LEFT JOIN recurso rec ON r.recurso_id = rec.id
           LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
+          LEFT JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id
           LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
           LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
           LEFT JOIN sorteo ON sorteo.id = r.sorteo_id
@@ -10031,10 +10761,15 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
         let convenioHotel = null;
         let convenioPropuesta = null;
         if (reserva.modalidad === MODALIDAD_CONVENIO && reserva.convenio_hotel_id) {
-          const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(connection, [reserva.convenio_hotel_id]);
+          const imagenesPorHotel = await obtenerImagenesConvenioPorHotel(
+            connection,
+            [reserva.convenio_hotel_id],
+            { incluirImagenesServicio: true }
+          );
           convenioHotel = await firmarConvenioHotel(
             {
               id: reserva.convenio_hotel_id,
+              servicio_id: reserva.servicio_id,
               nombre: reserva.convenio_nombre,
               ciudad: reserva.convenio_ciudad,
               provincia: reserva.convenio_provincia,
@@ -10042,6 +10777,9 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
               latitud: reserva.convenio_latitud,
               longitud: reserva.convenio_longitud,
               descripcion: reserva.convenio_descripcion,
+              direccion: reserva.servicio_direccion,
+              servicio_tarifario_pdf_url: reserva.servicio_tarifario_pdf_url,
+              formulario_adhesion_url: reserva.formulario_adhesion_url,
               tarifario_pdf_archivo: reserva.convenio_tarifario_pdf_archivo,
               activo: 1,
             },
@@ -10113,7 +10851,18 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           bloque_nombre: reserva.bloque_nombre,
           servicio: {
             id: reserva.servicio_id,
-            nombre: reserva.servicio_nombre || (convenioHotel ? "Convenio hotelero" : null)
+            nombre: reserva.servicio_nombre || (convenioHotel ? "Convenio hotelero" : null),
+            tipo_codigo: reserva.servicio_tipo_codigo || null,
+            etiqueta_identificador: reserva.etiqueta_identificador || null,
+            recurso_principal_id: reserva.recurso_principal_id ? Number(reserva.recurso_principal_id) : null,
+            max_personas_reserva: reserva.max_personas_reserva == null ? null : Number(reserva.max_personas_reserva),
+            modelo_tarifa: reserva.modelo_tarifa || "TEMPORADAS",
+            unidad_cobro: reserva.unidad_cobro || "POR_PERSONA_NOCHE",
+            permite_acompanantes: Number(reserva.permite_acompanantes) === 1,
+            captura_personas: Number(reserva.permite_acompanantes) === 1 ? "GRUPO" : "SOLO_TITULAR",
+            direccion: reserva.servicio_direccion || null,
+            tarifario_pdf_url: reserva.servicio_tarifario_pdf_url || null,
+            formulario_adhesion_url: reserva.formulario_adhesion_url || null,
           },
           lugar: reserva.lugar,
           recurso: {
@@ -14177,6 +14926,31 @@ async function validarReferenciasConfiguracionTemporada(connection, configuracio
   }
 }
 
+async function enriquecerTiposConfiguracionTemporada(connection, configuracionServicios) {
+  if (!Array.isArray(configuracionServicios) || configuracionServicios.length === 0) return;
+  const servicioIds = [...new Set(
+    configuracionServicios
+      .map((servicio) => normalizarIdPositivo(servicio?.id ?? servicio?.servicio_id))
+      .filter(Boolean)
+  )];
+  if (servicioIds.length === 0) return;
+  const placeholders = servicioIds.map(() => "?").join(",");
+  const [servicios] = await connection.query(
+    `SELECT s.id, ts.codigo AS tipo_codigo
+       FROM servicio s
+       INNER JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id
+      WHERE s.id IN (${placeholders})`,
+    servicioIds
+  );
+  const tipoPorServicio = new Map(
+    servicios.map((servicio) => [Number(servicio.id), String(servicio.tipo_codigo || "").toUpperCase()])
+  );
+  for (const servicio of configuracionServicios) {
+    const servicioId = normalizarIdPositivo(servicio?.id ?? servicio?.servicio_id);
+    servicio.tipo_codigo = tipoPorServicio.get(servicioId) || null;
+  }
+}
+
 function validarParcelasDisponiblesEnConfiguracion(configuracionServicios) {
   if (!Array.isArray(configuracionServicios)) {
     return null;
@@ -14184,7 +14958,7 @@ function validarParcelasDisponiblesEnConfiguracion(configuracionServicios) {
 
   for (let i = 0; i < configuracionServicios.length; i++) {
     const servicio = configuracionServicios[i];
-    if (Number(servicio?.id) !== 4 || !Array.isArray(servicio?.regimenes)) {
+    if (servicio?.tipo_codigo !== "CUPO_NUMERADO" || !Array.isArray(servicio?.regimenes)) {
       continue;
     }
 
@@ -14204,7 +14978,7 @@ function validarParcelasDisponiblesEnConfiguracion(configuracionServicios) {
           const fecha = recurso.fechas[l];
           const normalizado = normalizarParcelasDisponibles(fecha?.parcelas_disponibles);
           if (normalizado.error) {
-            return `Servicio 4: recurso ${recurso?.id || "sin_id"}, rango ${l + 1}: ${normalizado.error}`;
+            return `Servicio de cupo numerado: recurso ${recurso?.id || "sin_id"}, rango ${l + 1}: ${normalizado.error}`;
           }
           fecha.parcelas_disponibles = normalizado.value;
         }
@@ -14215,8 +14989,8 @@ function validarParcelasDisponiblesEnConfiguracion(configuracionServicios) {
   return null;
 }
 
-function obtenerParcelasDisponiblesPorFecha(servicioId, fecha) {
-  if (Number(servicioId) !== 4) {
+function obtenerParcelasDisponiblesPorFecha(servicio, fecha) {
+  if (servicio?.tipo_codigo !== "CUPO_NUMERADO") {
     return null;
   }
 
@@ -14252,6 +15026,7 @@ async function crearTemporadaTarifasDesdeConfiguracion(connection, {
     throw crearErrorNegocio(errorConfiguracion, 400);
   }
 
+  await enriquecerTiposConfiguracionTemporada(connection, configuracion_servicios);
   const errorParcelas = validarParcelasDisponiblesEnConfiguracion(configuracion_servicios);
   if (errorParcelas) {
     throw crearErrorNegocio(errorParcelas, 400);
@@ -14336,7 +15111,7 @@ async function crearTemporadaTarifasDesdeConfiguracion(connection, {
         }
 
         for (const fecha of recurso.fechas) {
-          const parcelasDisponibles = obtenerParcelasDisponiblesPorFecha(servicio.id, fecha);
+          const parcelasDisponibles = obtenerParcelasDisponiblesPorFecha(servicio, fecha);
 
           if (Array.isArray(fecha.adicionales) && fecha.adicionales.length > 0) {
             for (const adicional of fecha.adicionales) {
@@ -14503,6 +15278,7 @@ router.post("/temporada", verifyToken, async (req, res) => {
         return res.status(400).json(errorConfiguracion);
       }
 
+      await enriquecerTiposConfiguracionTemporada(mysqlConnection.promise(), configuracion_servicios);
       const errorParcelas = validarParcelasDisponiblesEnConfiguracion(configuracion_servicios);
       if (errorParcelas) {
         return res.status(400).json(errorParcelas);
@@ -14589,7 +15365,7 @@ router.post("/temporada", verifyToken, async (req, res) => {
             for (const recurso of regimen.recursos) {
               // Procesar cada fecha del recurso
               for (const fecha of recurso.fechas) {
-                const parcelasDisponibles = obtenerParcelasDisponiblesPorFecha(servicio.id, fecha);
+                const parcelasDisponibles = obtenerParcelasDisponiblesPorFecha(servicio, fecha);
 
                 if (Array.isArray(fecha.adicionales) && fecha.adicionales.length > 0) {
                   for (const adicional of fecha.adicionales) {
@@ -14852,10 +15628,12 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
             r.nombre as recurso_nombre,
             r.servicio_id,
             s.nombre as servicio_nombre,
+            ts.codigo as tipo_codigo,
             reg.nombre as regimen_nombre
           FROM tarifa t
           JOIN recurso r ON t.recurso_id = r.id
           JOIN servicio s ON r.servicio_id = s.id
+          JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id
           JOIN regimen reg ON t.regimen_id = reg.id
           WHERE t.temporada_tarifa_id = ?
           ORDER BY s.id, reg.id, r.id, t.fecha_inicio`,
@@ -14872,6 +15650,7 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
             serviciosMap.set(tarifa.servicio_id, {
               id: tarifa.servicio_id,
               nombre: tarifa.servicio_nombre,
+              tipo_codigo: tarifa.tipo_codigo,
               regimenes: []
             });
           }
@@ -14916,10 +15695,10 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
             return formatearFechaSQL(f.fecha_inicio) === tarifaFechaInicio &&
               formatearFechaSQL(f.fecha_fin) === tarifaFechaFin;
           });
-          const esServicioParcelas = Number(tarifa.servicio_id) === 4;
+          const esServicioParcelas = tarifa.tipo_codigo === "CUPO_NUMERADO";
           const parcelasDisponibles = tarifa.parcelas_disponibles !== null && tarifa.parcelas_disponibles !== undefined
             ? Number(tarifa.parcelas_disponibles)
-            : 100;
+            : null;
           if (!fecha) {
             fecha = {
               id: tarifa.tarifa_id,
@@ -15079,6 +15858,7 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
         return res.status(400).json(errorConfiguracion);
       }
 
+      await enriquecerTiposConfiguracionTemporada(mysqlConnection.promise(), configuracion_servicios);
       const errorParcelas = validarParcelasDisponiblesEnConfiguracion(configuracion_servicios);
       if (errorParcelas) {
         return res.status(400).json(errorParcelas);
@@ -15261,7 +16041,7 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
           for (const regimen of servicio.regimenes) {
               for (const recurso of regimen.recursos) {
                 for (const fecha of recurso.fechas) {
-                  const parcelasDisponibles = obtenerParcelasDisponiblesPorFecha(servicio.id, fecha);
+                  const parcelasDisponibles = obtenerParcelasDisponiblesPorFecha(servicio, fecha);
 
                   if (Array.isArray(fecha.adicionales) && fecha.adicionales.length > 0) {
                     for (const adicional of fecha.adicionales) {

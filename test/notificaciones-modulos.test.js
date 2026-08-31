@@ -13,6 +13,7 @@ test("Turismo incluye todos los tipos de reserva y convenio salvo Reserva Salud"
   assert.deepEqual(condicion.params, [
     "RESERVA_%",
     "CONVENIO_%",
+    "TURISMO_%",
     "SORTEO_ADJUDICADO",
     "RESERVA_SALUD%",
   ]);

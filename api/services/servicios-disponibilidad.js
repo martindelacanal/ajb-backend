@@ -1,6 +1,3 @@
-const SERVICIO_CAMPING_ID = 4;
-const RECURSO_CAMPING_ID = 1;
-const MAX_PERSONAS_CAMPING = 6;
 const ESTADO_RESERVA_CANCELADA_ID = 4;
 const UMBRAL_ULTIMOS_LUGARES = 10;
 const HORIZONTE_ALTERNATIVAS_DIAS = 120;
@@ -223,28 +220,36 @@ function construirPayloadDisponibilidad(disponibles, total, actualizadoEn = new 
 }
 
 async function obtenerServicios(connection, { lugar = null, servicioIds = null, servicioId = null } = {}) {
-  const condiciones = [];
+  const condiciones = [
+    "s.activo = 1",
+    "s.estado_aprobacion = 'APROBADO'",
+    "ts.activo = 1",
+    "ts.codigo <> 'CONVENIO_HOTELERO'",
+  ];
   const params = [];
 
   if (lugar) {
-    condiciones.push("lugar = ?");
+    condiciones.push("s.lugar = ?");
     params.push(lugar);
   }
 
   if (Number.isInteger(servicioId) && servicioId > 0) {
-    condiciones.push("id = ?");
+    condiciones.push("s.id = ?");
     params.push(servicioId);
   } else if (Array.isArray(servicioIds) && servicioIds.length > 0) {
     const placeholders = servicioIds.map(() => "?").join(",");
-    condiciones.push(`id IN (${placeholders})`);
+    condiciones.push(`s.id IN (${placeholders})`);
     params.push(...servicioIds);
   }
 
-  let query = "SELECT id, nombre, lugar FROM servicio";
+  let query = `SELECT s.id, s.nombre, s.lugar, s.modelo_tarifa, s.max_personas_reserva,
+                      s.anticipacion_minima_dias, s.propietario_departamental_id,
+                      ts.codigo AS tipo_codigo
+                 FROM servicio s INNER JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id`;
   if (condiciones.length > 0) {
     query += ` WHERE ${condiciones.join(" AND ")}`;
   }
-  query += " ORDER BY id ASC";
+  query += " ORDER BY s.orden ASC, s.id ASC";
 
   const [rows] = await connection.query(query, params);
   return rows;
@@ -255,11 +260,14 @@ async function obtenerDisponibilidadCamping(connection, {
   fechaInicio,
   fechaFin,
   totalPersonas,
+  maxPersonasReserva,
   reservaExcluirId = null,
   holdIdExcluir = null,
 }) {
   const [recursosCamping] = await connection.query(
-    "SELECT id FROM recurso WHERE servicio_id = ? ORDER BY id ASC",
+    `SELECT id, cupo_maximo, es_recurso_principal FROM recurso
+      WHERE servicio_id = ? AND activo = 1
+      ORDER BY es_recurso_principal DESC, orden ASC, id ASC`,
     [servicioId]
   );
 
@@ -267,7 +275,7 @@ async function obtenerDisponibilidadCamping(connection, {
     return construirPayloadDisponibilidad(0, 0);
   }
 
-  const recursoCamping = recursosCamping.find((r) => Number(r.id) === RECURSO_CAMPING_ID) || recursosCamping[0];
+  const recursoCamping = recursosCamping[0];
   const recursoCampingId = Number(recursoCamping.id);
   const noches = obtenerNochesReserva(fechaInicio, fechaFin);
 
@@ -286,16 +294,27 @@ async function obtenerDisponibilidadCamping(connection, {
     `,
     [recursoCampingId, fechaFin, fechaInicio]
   );
-
-  if (tarifasCamping.length === 0) {
-    return construirPayloadDisponibilidad(0, 0);
-  }
+  const [cuposConfigurados] = await connection.query(
+    `SELECT fecha_inicio, fecha_fin, cupo_total
+       FROM recurso_cupo_periodo
+      WHERE recurso_id = ? AND activo = 1
+        AND fecha_inicio <= ? AND fecha_fin >= ?`,
+    [recursoCampingId, fechaFin, fechaInicio]
+  );
 
   let parcelasMinimas = null;
   for (const noche of noches) {
     let parcelasNoche = null;
+    for (const cupo of cuposConfigurados) {
+      if (cubreNoche(cupo, noche)) {
+        const cantidad = Number(cupo.cupo_total);
+        if (Number.isInteger(cantidad) && cantidad >= 0) {
+          parcelasNoche = parcelasNoche === null ? cantidad : Math.min(parcelasNoche, cantidad);
+        }
+      }
+    }
     for (const tarifa of tarifasCamping) {
-      if (cubreNoche(tarifa, noche)) {
+      if (parcelasNoche === null && cubreNoche(tarifa, noche)) {
         const parcelas = Number(tarifa.parcelas_disponibles);
         if (Number.isFinite(parcelas)) {
           if (parcelasNoche === null || parcelas < parcelasNoche) {
@@ -305,9 +324,10 @@ async function obtenerDisponibilidadCamping(connection, {
       }
     }
 
-    if (parcelasNoche === null) {
-      return construirPayloadDisponibilidad(0, 0);
+    if (parcelasNoche === null && Number.isInteger(Number(recursoCamping.cupo_maximo))) {
+      parcelasNoche = Number(recursoCamping.cupo_maximo);
     }
+    if (parcelasNoche === null) return construirPayloadDisponibilidad(0, 0);
 
     if (parcelasMinimas === null || parcelasNoche < parcelasMinimas) {
       parcelasMinimas = parcelasNoche;
@@ -319,7 +339,8 @@ async function obtenerDisponibilidadCamping(connection, {
     return construirPayloadDisponibilidad(0, parcelasTotales);
   }
 
-  if (totalPersonas > MAX_PERSONAS_CAMPING) {
+  const maxPersonas = Number(maxPersonasReserva);
+  if (Number.isInteger(maxPersonas) && maxPersonas > 0 && totalPersonas > maxPersonas) {
     return construirPayloadDisponibilidad(0, parcelasTotales);
   }
 
@@ -357,11 +378,13 @@ async function obtenerDisponibilidadNoCamping(connection, {
   adultos,
   ninos,
   bebes,
+  modeloTarifa,
+  audienciaDepartamental = "TODAS",
   reservaExcluirId = null,
   holdIdExcluir = null,
 }) {
   const [recursos] = await connection.query(
-    "SELECT id FROM recurso WHERE servicio_id = ? ORDER BY id ASC",
+    "SELECT id FROM recurso WHERE servicio_id = ? AND activo = 1 ORDER BY orden ASC, id ASC",
     [servicioId]
   );
 
@@ -372,16 +395,34 @@ async function obtenerDisponibilidadNoCamping(connection, {
   const recursoIds = recursos.map((recurso) => Number(recurso.id));
   const placeholders = recursoIds.map(() => "?").join(",");
 
-  const [tarifas] = await connection.query(
-    `
-      SELECT recurso_id, edad_minima, edad_maxima, fecha_inicio, fecha_fin
-      FROM tarifa
-      WHERE recurso_id IN (${placeholders})
-        AND fecha_inicio <= ?
-        AND fecha_fin >= ?
-    `,
-    [...recursoIds, fechaFin, fechaInicio]
+  let tarifas = [];
+  if (modeloTarifa !== "PRECIO_UNICO") {
+    [tarifas] = await connection.query(
+      `
+        SELECT recurso_id, edad_minima, edad_maxima, fecha_inicio, fecha_fin
+        FROM tarifa
+        WHERE recurso_id IN (${placeholders})
+          AND turismo_tarifa_regla_id IS NULL
+          AND COALESCE(audiencia_departamental, 'TODAS') IN ('TODAS', ?)
+          AND fecha_inicio <= ?
+          AND fecha_fin >= ?
+      `,
+      [...recursoIds, audienciaDepartamental, fechaFin, fechaInicio]
+    );
+  }
+  const [reglas] = await connection.query(
+    `SELECT rr.id AS recurso_id, tr.fecha_inicio, tr.fecha_fin,
+            NULL AS edad_minima, NULL AS edad_maxima
+       FROM recurso rr
+       INNER JOIN turismo_tarifa_regla tr
+         ON tr.servicio_id = rr.servicio_id
+        AND (tr.recurso_id IS NULL OR tr.recurso_id = rr.id)
+      WHERE rr.id IN (${placeholders}) AND tr.activo = 1
+        AND tr.audiencia_departamental IN ('TODAS', ?)
+        AND tr.fecha_inicio <= ? AND tr.fecha_fin >= ?`,
+    [...recursoIds, audienciaDepartamental, fechaFin, fechaInicio]
   );
+  tarifas.push(...reglas);
 
   // Al editar una reserva, no debe contarse a sí misma como ocupación
   const filtroExclusion = reservaExcluirId ? " AND id <> ?" : "";
@@ -469,18 +510,53 @@ async function calcularDisponibilidadServicio(connection, params) {
     ninos,
     bebes,
     totalPersonas,
+    tipoCodigo = null,
+    modeloTarifa = null,
+    maxPersonasReserva = null,
+    anticipacionMinimaDias = null,
+    propietarioDepartamentalId = null,
+    departamentalId = null,
     reservaExcluirId = null,
     holdIdExcluir = null,
   } = params;
 
+  let configuracion = {
+    tipo_codigo: tipoCodigo,
+    modelo_tarifa: modeloTarifa,
+    max_personas_reserva: maxPersonasReserva,
+    anticipacion_minima_dias: anticipacionMinimaDias,
+    propietario_departamental_id: propietarioDepartamentalId,
+  };
+  if (!configuracion.tipo_codigo) {
+    const [filas] = await connection.query(
+      `SELECT ts.codigo AS tipo_codigo, s.modelo_tarifa, s.max_personas_reserva,
+              s.anticipacion_minima_dias, s.propietario_departamental_id
+         FROM servicio s INNER JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id
+        WHERE s.id = ? AND s.activo = 1 AND s.estado_aprobacion = 'APROBADO' AND ts.activo = 1
+        LIMIT 1`,
+      [servicioId]
+    );
+    if (!filas.length) return { ...construirPayloadDisponibilidad(0, 0), actualizado_en: new Date().toISOString() };
+    [configuracion] = filas;
+  }
+  const anticipacion = Number(configuracion.anticipacion_minima_dias || 0);
+  const fechaMinima = sumarDiasFechaCivil(obtenerFechaCivilArgentina(), anticipacion);
+  if (fechaMinima && fechaInicio < fechaMinima) {
+    return { ...construirPayloadDisponibilidad(0, 0), actualizado_en: new Date().toISOString() };
+  }
+
   const actualizadoEn = new Date().toISOString();
+  if (configuracion.modelo_tarifa === "PRECIO_UNICO" && Number(totalPersonas) !== 1) {
+    return { ...construirPayloadDisponibilidad(0, 0), actualizado_en: actualizadoEn };
+  }
   const disponibilidad =
-    Number(servicioId) === SERVICIO_CAMPING_ID
+    configuracion.tipo_codigo === "CUPO_NUMERADO"
       ? await obtenerDisponibilidadCamping(connection, {
           servicioId,
           fechaInicio,
           fechaFin,
           totalPersonas,
+          maxPersonasReserva: configuracion.max_personas_reserva,
           reservaExcluirId,
           holdIdExcluir,
         })
@@ -491,6 +567,10 @@ async function calcularDisponibilidadServicio(connection, params) {
           adultos,
           ninos,
           bebes,
+          modeloTarifa: configuracion.modelo_tarifa,
+          audienciaDepartamental: configuracion.propietario_departamental_id == null
+            ? "TODAS"
+            : (Number(departamentalId) === Number(configuracion.propietario_departamental_id) ? "PROPIA" : "OTRAS"),
           reservaExcluirId,
           holdIdExcluir,
         });
@@ -511,6 +591,7 @@ async function obtenerSnapshotDisponibilidad(connection, params) {
     ninos,
     bebes,
     totalPersonas,
+    departamentalId = null,
     reservaExcluirId = null,
     holdIdExcluir = null,
   } = params;
@@ -521,6 +602,12 @@ async function obtenerSnapshotDisponibilidad(connection, params) {
   for (const servicio of servicios) {
     const disponibilidad = await calcularDisponibilidadServicio(connection, {
       servicioId: Number(servicio.id),
+      tipoCodigo: servicio.tipo_codigo,
+      modeloTarifa: servicio.modelo_tarifa,
+      maxPersonasReserva: servicio.max_personas_reserva,
+      anticipacionMinimaDias: servicio.anticipacion_minima_dias,
+      propietarioDepartamentalId: servicio.propietario_departamental_id,
+      departamentalId,
       fechaInicio,
       fechaFin,
       adultos,
@@ -549,6 +636,7 @@ async function obtenerCalendarioAlternativoServicio(connection, params) {
     ninos,
     bebes,
     totalPersonas,
+    departamentalId = null,
     horizonteDias = HORIZONTE_ALTERNATIVAS_DIAS,
     maxResultados = MAX_RANGOS_ALTERNATIVOS,
     holdIdExcluir = null,
@@ -582,6 +670,7 @@ async function obtenerCalendarioAlternativoServicio(connection, params) {
       ninos,
       bebes,
       totalPersonas,
+      departamentalId,
       holdIdExcluir,
     });
 
@@ -603,8 +692,6 @@ async function obtenerCalendarioAlternativoServicio(connection, params) {
 
 module.exports = {
   HORIZONTE_ALTERNATIVAS_DIAS,
-  MAX_PERSONAS_CAMPING,
-  SERVICIO_CAMPING_ID,
   UMBRAL_ULTIMOS_LUGARES,
   parsearParametrosBusquedaDisponibilidad,
   parsearServicioIdsCsv,

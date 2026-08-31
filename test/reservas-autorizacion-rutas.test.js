@@ -432,6 +432,238 @@ test("staff no puede crear turismo regular ni convenio para un titular con Turis
   }
 });
 
+test("un convenio no admite reservas si su servicio no es visible para la departamental del titular", async () => {
+  setDatabaseHandler(async (sql) => {
+    if (/SELECT u\.id, u\.nombre[\s\S]+FOR UPDATE/i.test(sql)) {
+      return [[{
+        id: 100,
+        nombre: "Ana",
+        apellido: "Afiliada",
+        usuario_familiar_id: null,
+        departamental_id: 7,
+        habilitado: "Y",
+        modulo_turismo: 1,
+        modulo_coseguro: 1,
+        rol: "afiliado",
+      }]];
+    }
+    if (/SELECT id, nombre, servicio_id FROM convenio_hotel/i.test(sql)) {
+      return [[{ id: 3, nombre: "Hotel oculto", servicio_id: 44 }]];
+    }
+    if (/SELECT s\.id, s\.tipo_servicio_id[\s\S]+FROM servicio s/i.test(sql)) return [[]];
+    throw new Error(`Consulta inesperada: ${sql}`);
+  });
+
+  const response = await request("/api/convenios-hoteleros/3/reservas", {
+    method: "POST",
+    token: tokenFor({ id: 100, rol: "afiliado", departamental_id: 7 }),
+    body: bodyConvenio(),
+  });
+
+  assert.equal(response.status, 404);
+  assert.equal(response.body, "Convenio hotelero no disponible");
+  assert.equal(transactionCalls.includes("rollback"), true);
+  assert.equal(transactionCalls.includes("commit"), false);
+  assert.equal(databaseCalls.some(({ sql }) => /INSERT INTO reserva/i.test(sql)), false);
+});
+
+function configuracionServicioVisible(overrides = {}) {
+  return {
+    id: 1,
+    tipo_servicio_id: 1,
+    propietario_departamental_id: 7,
+    modelo_tarifa: "TEMPORADAS",
+    unidad_cobro: "POR_PERSONA_NOCHE",
+    permite_acompanantes: 1,
+    max_personas_reserva: 6,
+    recurso_cupo_maximo: null,
+    tipo_codigo: "ALOJAMIENTO_RECURSO",
+    ...overrides,
+  };
+}
+
+test("SOLO_TITULAR y la capacidad se validan antes de insertar reservas regulares o de convenio", async () => {
+  const escenarios = [
+    {
+      nombre: "precio unico con otra persona",
+      endpoint: "/api/reserva",
+      body: bodyEdicion({ usuario_id: 200, personas: [{ id: 201 }] }),
+      configuracion: configuracionServicioVisible({
+        modelo_tarifa: "PRECIO_UNICO",
+        unidad_cobro: "POR_ESTADIA",
+        permite_acompanantes: 0,
+        max_personas_reserva: 1,
+      }),
+    },
+    {
+      nombre: "capacidad general excedida",
+      endpoint: "/api/reserva",
+      body: bodyEdicion({
+        usuario_id: 200,
+        personas: [{ id: 200 }, { id: 201 }, { id: 202 }],
+      }),
+      configuracion: configuracionServicioVisible({ max_personas_reserva: 2 }),
+    },
+    {
+      nombre: "convenio precio unico con grupo",
+      endpoint: "/api/convenios-hoteleros/3/reservas",
+      body: bodyConvenio({
+        usuario_id: 200,
+        personas: [{ id: 200 }, { id: 201 }],
+      }),
+      configuracion: configuracionServicioVisible({
+        id: 44,
+        modelo_tarifa: "PRECIO_UNICO",
+        unidad_cobro: "POR_ESTADIA",
+        permite_acompanantes: 0,
+        max_personas_reserva: 1,
+        tipo_codigo: "CONVENIO_HOTELERO",
+      }),
+    },
+  ];
+
+  for (const escenario of escenarios) {
+    setDatabaseHandler(async (sql) => {
+      if (/SELECT u\.id, u\.nombre[\s\S]+FOR UPDATE/i.test(sql)) {
+        return [[{
+          id: 200,
+          nombre: "Ana",
+          apellido: "Afiliada",
+          documento: "12345678",
+          usuario_familiar_id: null,
+          departamental_id: 7,
+          habilitado: "Y",
+          modulo_turismo: 1,
+          modulo_coseguro: 1,
+          rol: "afiliado",
+        }]];
+      }
+      if (/SELECT id, nombre, servicio_id FROM convenio_hotel/i.test(sql)) {
+        return [[{ id: 3, nombre: "Hotel", servicio_id: 44 }]];
+      }
+      if (/SELECT s\.id, s\.tipo_servicio_id[\s\S]+FROM servicio s/i.test(sql)) {
+        return [[escenario.configuracion]];
+      }
+      throw new Error(`Consulta inesperada en ${escenario.nombre}: ${sql}`);
+    });
+
+    const response = await request(escenario.endpoint, {
+      method: "POST",
+      token: tokenFor({ rol: "admin" }),
+      body: escenario.body,
+    });
+
+    assert.equal(response.status, 422, escenario.nombre);
+    assert.equal(response.body.codigo, "CAPACIDAD_SERVICIO_EXCEDIDA", escenario.nombre);
+    assert.equal(databaseCalls.some(({ sql }) => /INSERT INTO reserva/i.test(sql)), false, escenario.nombre);
+    assert.equal(transactionCalls.includes("rollback"), true, escenario.nombre);
+  }
+});
+
+function responderCotizacionTarifa({ configuracion = null } = {}) {
+  return async (sql) => {
+    if (/SELECT u\.id, u\.habilitado, r\.nombre AS rol/i.test(sql)) {
+      return [[{ id: 100, habilitado: "Y", rol: "afiliado" }]];
+    }
+    if (/SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = \?/i.test(sql)) {
+      return [[{ id: 100, usuario_familiar_id: null, departamental_id: 7 }]];
+    }
+    if (/SELECT id, documento, nombre, apellido, fecha_nacimiento, tipo_persona_id,[\s\S]+FROM usuario WHERE id = \?/i.test(sql)) {
+      return [[{
+        id: 100,
+        documento: "12345678",
+        nombre: "Ana",
+        apellido: "Afiliada",
+        fecha_nacimiento: "1985-06-15",
+        tipo_persona_id: 1,
+        parentesco_id: 1,
+        telefono: null,
+        email: null,
+      }]];
+    }
+    if (/SELECT id, documento, departamental_id FROM usuario WHERE id = \?/i.test(sql)) {
+      return [[{ id: 100, documento: "12345678", departamental_id: 7 }]];
+    }
+    if (/SELECT s\.id, s\.tipo_servicio_id[\s\S]+FROM servicio s/i.test(sql)) {
+      return [configuracion ? [configuracion] : []];
+    }
+    if (/SELECT id FROM recurso\s+WHERE id = \? AND servicio_id = \?/i.test(sql)) {
+      return [[{ id: 2 }]];
+    }
+    if (/SELECT r\.id, r\.servicio_id, s\.modelo_tarifa[\s\S]+FROM recurso r/i.test(sql)) {
+      return [[{
+        id: 2,
+        servicio_id: 1,
+        modelo_tarifa: configuracion.modelo_tarifa,
+        unidad_cobro: configuracion.unidad_cobro,
+        propietario_departamental_id: 7,
+        permite_acompanantes: configuracion.permite_acompanantes,
+        anticipacion_minima_dias: 0,
+      }]];
+    }
+    if (/FROM turismo_tarifa_regla tr[\s\S]+LEFT JOIN tarifa t/i.test(sql)) {
+      return [[{
+        id: 90,
+        servicio_id: 1,
+        recurso_id: 2,
+        audiencia_departamental: "PROPIA",
+        fecha_inicio: "2099-01-01",
+        fecha_fin: "2099-12-31",
+        precio: 1000,
+        porcentaje_descuento: 0,
+        tarifa_id: 91,
+      }]];
+    }
+    throw new Error(`Consulta inesperada en cotizacion: ${sql}`);
+  };
+}
+
+test("tarifa/fechas aplica visibilidad del titular y exige regimen solo en TEMPORADAS", async () => {
+  const body = {
+    fecha_inicio: "2099-01-10",
+    fecha_fin: "2099-01-13",
+    servicio_id: 1,
+    recurso_id: 2,
+    personas: [{ id: 100, dni: "12345678" }],
+  };
+
+  setDatabaseHandler(responderCotizacionTarifa());
+  const oculta = await request("/api/reserva/tarifa/fechas", {
+    method: "POST",
+    token: tokenFor({ id: 100, rol: "afiliado", departamental_id: 7 }),
+    body,
+  });
+  assert.equal(oculta.status, 404);
+  assert.equal(databaseCalls.some(({ sql }) => /FROM turismo_tarifa_regla tr[\s\S]+LEFT JOIN tarifa t/i.test(sql)), false);
+
+  setDatabaseHandler(responderCotizacionTarifa({
+    configuracion: configuracionServicioVisible({
+      modelo_tarifa: "PRECIO_UNICO",
+      unidad_cobro: "POR_ESTADIA",
+      permite_acompanantes: 0,
+      max_personas_reserva: 1,
+    }),
+  }));
+  const precioUnico = await request("/api/reserva/tarifa/fechas", {
+    method: "POST",
+    token: tokenFor({ id: 100, rol: "afiliado", departamental_id: 7 }),
+    body,
+  });
+  assert.equal(precioUnico.status, 200);
+  assert.equal(databaseCalls.some(({ sql }) => /FROM turismo_tarifa_regla tr[\s\S]+LEFT JOIN tarifa t/i.test(sql)), true);
+
+  setDatabaseHandler(responderCotizacionTarifa({
+    configuracion: configuracionServicioVisible(),
+  }));
+  const temporadas = await request("/api/reserva/tarifa/fechas", {
+    method: "POST",
+    token: tokenFor({ id: 100, rol: "afiliado", departamental_id: 7 }),
+    body,
+  });
+  assert.equal(temporadas.status, 400);
+  assert.equal(databaseCalls.some(({ sql }) => /FROM turismo_tarifa_regla tr[\s\S]+LEFT JOIN tarifa t/i.test(sql)), false);
+});
+
 test("por_salud exige Coseguro activo en el titular para turismo regular y convenio", async () => {
   const salud = {
     por_salud: true,
@@ -564,6 +796,42 @@ test("el alta departamental revierte Iniciada y Verificada si falla el segundo h
     if (/SELECT departamental_id FROM usuario WHERE id = \?/i.test(sql)) {
       return [[{ departamental_id: 7 }]];
     }
+    if (/SELECT s\.id, s\.tipo_servicio_id[\s\S]+FROM servicio s/i.test(sql)) {
+      return [[{
+        id: 1,
+        tipo_servicio_id: 1,
+        propietario_departamental_id: null,
+        modelo_tarifa: "TEMPORADAS",
+        unidad_cobro: "POR_PERSONA_NOCHE",
+        permite_acompanantes: 1,
+        max_personas_reserva: 6,
+        tipo_codigo: "ALOJAMIENTO_RECURSO",
+      }]];
+    }
+    if (/SELECT s\.id AS servicio_id, s\.modelo_tarifa[\s\S]+FROM servicio s/i.test(sql)) {
+      return [[{
+        servicio_id: 1,
+        modelo_tarifa: "TEMPORADAS",
+        permite_acompanantes: 1,
+        max_personas_reserva: 6,
+        anticipacion_minima_dias: 0,
+        tipo_codigo: "ALOJAMIENTO_RECURSO",
+        recurso_id: 2,
+        cupo_maximo: null,
+        es_recurso_principal: 0,
+      }]];
+    }
+    if (/SELECT r\.id, r\.servicio_id, s\.modelo_tarifa[\s\S]+FROM recurso r/i.test(sql)) {
+      return [[{
+        id: 2,
+        servicio_id: 1,
+        modelo_tarifa: "TEMPORADAS",
+        unidad_cobro: "POR_PERSONA_NOCHE",
+        propietario_departamental_id: null,
+        permite_acompanantes: 1,
+        anticipacion_minima_dias: 0,
+      }]];
+    }
     if (/^\s*UPDATE bloque_fecha/i.test(sql)) return [{ affectedRows: 0 }];
     if (/FROM bloque_fecha_recurso bfr[\s\S]+bf\.estado = 'ACTIVO'/i.test(sql)) return [[]];
     if (/SELECT id FROM recurso WHERE id = \? AND servicio_id = \? FOR UPDATE/i.test(sql)) {
@@ -587,6 +855,7 @@ test("el alta departamental revierte Iniciada y Verificada si falla el segundo h
         email: null,
       }]];
     }
+    if (/FROM turismo_tarifa_regla tr[\s\S]+LEFT JOIN tarifa t/i.test(sql)) return [[]];
     if (/FROM tarifa[\s\S]+WHERE recurso_id = \?/i.test(sql)) {
       return [[{
         id: 31,

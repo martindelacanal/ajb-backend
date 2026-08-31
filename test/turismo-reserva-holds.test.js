@@ -274,10 +274,18 @@ test("dos adquisiciones concurrentes del mismo recurso dejan un solo ganador", a
         if (/h\.actor_usuario_id = \?[\s\S]*h\.estado = 'ACTIVO'/i.test(sql)) {
           return [[...filas.filter((fila) => fila.actor_usuario_id === Number(params[0]) && fila.estado === "ACTIVO")]];
         }
-        if (/SELECT id, servicio_id[\s\S]*FROM recurso/i.test(sql)) {
+        if (/SELECT r\.id, r\.servicio_id[\s\S]*FROM recurso r/i.test(sql)) {
           await tomarLockRecurso();
           connection.tieneLockRecurso = true;
-          return [[{ id: 7, servicio_id: 2 }]];
+          return [[{
+            id: 7,
+            servicio_id: 2,
+            cupo_maximo: null,
+            es_recurso_principal: 0,
+            max_personas_reserva: 6,
+            modelo_tarifa: "TEMPORADAS",
+            tipo_codigo: "ALOJAMIENTO_RECURSO",
+          }]];
         }
         if (/WHERE token_hash = \?/i.test(sql)) return [[]];
         if (/FROM bloque_fecha bf/i.test(sql)) return [[]];

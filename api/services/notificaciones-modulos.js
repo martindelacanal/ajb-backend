@@ -7,7 +7,7 @@ const MODULOS_NOTIFICACION = {
   coseguro: { prefijos: ["COSEGURO"] },
   salud: { prefijos: ["RESERVA_SALUD"] },
   turismo: {
-    prefijos: ["RESERVA_", "CONVENIO_"],
+    prefijos: ["RESERVA_", "CONVENIO_", "TURISMO_"],
     tipos: ["SORTEO_ADJUDICADO"],
     excluirPrefijos: ["RESERVA_SALUD"],
   },
