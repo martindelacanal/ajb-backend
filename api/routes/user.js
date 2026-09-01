@@ -2799,7 +2799,9 @@ router.put("/notificaciones/:id/leida", verifyToken, async (req, res) => {
 // Lectura de los hilos de chat (badge de "no leídos" del chat flotante).
 // Guarda, por usuario y entidad, el id del último mensaje visto.
 // ---------------------------------------------------------------------------
-const MODULOS_OBSERVACION = ["turismo", "coseguro", "traslados", "olimpiadas"];
+// La tabla de cada hilo la resuelve api/socket/chat-tiempo-real.js (CONFIGURACION_CHAT);
+// acá solo se valida el nombre del módulo: beneficios -> beneficio_observacion.beneficio_id.
+const MODULOS_OBSERVACION = ["turismo", "coseguro", "traslados", "olimpiadas", "beneficios"];
 
 router.get("/observaciones/:modulo/:entidadId/lectura", verifyToken, async (req, res) => {
   try {
@@ -13030,6 +13032,9 @@ router.get("/mis-gestiones/catalogos", verifyToken, async (req, res) => {
         [COSEGURO_ESTADO_EXPORTADO]
       )
       : [[]];
+    const [estadosBeneficios] = await db.query(
+      "SELECT id, nombre, color, color_texto FROM beneficio_inscripcion_estado ORDER BY orden"
+    );
     res.json({
       estados_turismo: estadosTurismo.map((estado) => ({
         ...estado,
@@ -13037,6 +13042,7 @@ router.get("/mis-gestiones/catalogos", verifyToken, async (req, res) => {
       })),
       estados_coseguro: estadosCoseguro,
       estados_traslados: [],
+      estados_beneficios: estadosBeneficios,
     });
   } catch (error) {
     registrarErrorRuta(error);
@@ -13150,6 +13156,36 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         INNER JOIN departamental dori ON dori.id = ts.departamental_origen_id
         INNER JOIN departamental ddes ON ddes.id = ts.departamental_destino_id
       WHERE ts.usuario_id = ? AND ts.eliminado = 0 AND 1 = 0
+      UNION ALL
+      SELECT
+        bi.id,
+        'beneficio' AS tipo,
+        CONCAT('B-', bi.id) AS codigo,
+        be.id AS estado_id,
+        be.nombre AS estado,
+        be.color AS estado_color,
+        be.color_texto AS estado_color_texto,
+        b.nombre AS titulo,
+        br.nombre AS subtitulo,
+        -- Beneficios: la gestión es la INSCRIPCIÓN (id y código B-<inscripción>), pero el
+        -- front navega al detalle del BENEFICIO. La columna libre "modalidad" lleva el
+        -- beneficio_id: el front lo lee en ['/beneficios/detalle', gestion.modalidad].
+        -- Charset + collation explícitos: un CAST a secas toma la collation de la conexión
+        -- (utf8mb4_unicode_ci) y rompe el UNION contra reserva.modalidad (utf8mb4_0900_ai_ci).
+        CAST(bi.beneficio_id AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_0900_ai_ci AS modalidad,
+        DATE_FORMAT(b.fecha_vigencia_desde, '%d/%m/%Y') AS fecha_inicio,
+        DATE_FORMAT(b.fecha_vigencia_hasta, '%d/%m/%Y') AS fecha_fin,
+        NULL AS importe,
+        NULL AS comprobante,
+        NULL AS beneficiario,
+        0 AS es_por_salud,
+        NULL AS salud_estado,
+        bi.fecha_creacion
+      FROM beneficio_inscripcion bi
+        INNER JOIN beneficio b ON b.id = bi.beneficio_id
+        INNER JOIN beneficio_inscripcion_estado be ON be.id = bi.estado_id
+        LEFT JOIN beneficio_rubro br ON br.id = b.rubro_id
+      WHERE bi.usuario_id = ? AND bi.eliminado = 0 AND ? = 1
     `;
     const unionParams = [
       cabecera.id,
@@ -13157,6 +13193,8 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
       cabecera.id,
       tieneModuloCoseguro(cabecera) ? 1 : 0,
       cabecera.id,
+      cabecera.id,
+      1, // Beneficios no tiene flag de módulo por usuario: siempre visible
     ];
 
     // Filtros comunes (el tipo se aplica aparte para poder devolver los
@@ -13183,10 +13221,11 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
     const estadosTurismo = tokens.filter((t) => /^T\d+$/.test(t)).map((t) => Number(t.slice(1)));
     const estadosCoseguro = tokens.filter((t) => /^C\d+$/.test(t)).map((t) => Number(t.slice(1)));
     const estadosTraslados = tokens.filter((t) => /^R\d+$/.test(t)).map((t) => Number(t.slice(1)));
+    const estadosBeneficios = tokens.filter((t) => /^B\d+$/.test(t)).map((t) => Number(t.slice(1)));
     if (estadosCoseguro.includes(COSEGURO_ESTADO_PENDIENTE_ACREDITACION) && !estadosCoseguro.includes(COSEGURO_ESTADO_EXPORTADO)) {
       estadosCoseguro.push(COSEGURO_ESTADO_EXPORTADO);
     }
-    if (estadosTurismo.length > 0 || estadosCoseguro.length > 0 || estadosTraslados.length > 0) {
+    if (estadosTurismo.length > 0 || estadosCoseguro.length > 0 || estadosTraslados.length > 0 || estadosBeneficios.length > 0) {
       const ramas = [];
       if (estadosTurismo.length > 0) {
         ramas.push(`(g.tipo = 'turismo' AND g.estado_id IN (${estadosTurismo.map(() => "?").join(",")}))`);
@@ -13199,6 +13238,10 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
       if (estadosTraslados.length > 0) {
         ramas.push(`(g.tipo = 'traslado' AND g.estado_id IN (${estadosTraslados.map(() => "?").join(",")}))`);
         params.push(...estadosTraslados);
+      }
+      if (estadosBeneficios.length > 0) {
+        ramas.push(`(g.tipo = 'beneficio' AND g.estado_id IN (${estadosBeneficios.map(() => "?").join(",")}))`);
+        params.push(...estadosBeneficios);
       }
       condiciones.push(`(${ramas.join(" OR ")})`);
     }
@@ -13220,11 +13263,11 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
       `SELECT g.tipo, COUNT(*) AS total FROM (${unionSql}) g ${whereComun} GROUP BY g.tipo`,
       [...unionParams, ...params]
     );
-    const conteos = { turismo: 0, coseguro: 0, traslado: 0 };
+    const conteos = { turismo: 0, coseguro: 0, traslado: 0, beneficio: 0 };
     conteoRows.forEach((row) => (conteos[row.tipo] = Number(row.total)));
 
-    const tipo = ["turismo", "coseguro", "traslado"].includes(req.query.tipo) ? req.query.tipo : null;
-    const totalItems = tipo ? conteos[tipo] : conteos.turismo + conteos.coseguro + conteos.traslado;
+    const tipo = ["turismo", "coseguro", "traslado", "beneficio"].includes(req.query.tipo) ? req.query.tipo : null;
+    const totalItems = tipo ? conteos[tipo] : conteos.turismo + conteos.coseguro + conteos.traslado + conteos.beneficio;
 
     const condicionesFinal = tipo ? [...condiciones, "g.tipo = ?"] : condiciones;
     const paramsFinal = tipo ? [...params, tipo] : params;

@@ -13,6 +13,7 @@ const MODULOS_NOTIFICACION = {
   },
   traslados: { prefijos: ["TRASLADO"] },
   olimpiadas: { prefijos: ["OLIMPIADA"] },
+  beneficios: { prefijos: ["BENEFICIO"] },
 };
 
 function construirCondicion(def) {

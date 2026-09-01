@@ -131,6 +131,7 @@ const noticiasRoute = require('./api/routes/noticias');
 const dashboardRoute = require('./api/routes/dashboard');
 const webauthnRoute = require('./api/routes/webauthn');
 const turismoGestionRoute = require('./api/routes/turismo-gestion');
+const beneficiosRoute = require('./api/routes/beneficios');
 app.use('/api', webauthnRoute);
 app.use('/api', turismoGestionRoute);
 app.use('/api',userRoute);
@@ -139,6 +140,7 @@ app.use('/api',olimpiadasRoute);
 app.use('/api',trasladosRoute);
 app.use('/api',noticiasRoute);
 app.use('/api',dashboardRoute);
+app.use('/api',beneficiosRoute);
 app.use('/imagenes', express.static(path.join(__dirname, 'imagenes'), {
   dotfiles: 'deny',
   fallthrough: false,

@@ -1,4 +1,4 @@
-const MODULOS_CHAT = new Set(["turismo", "coseguro", "traslados", "olimpiadas"]);
+const MODULOS_CHAT = new Set(["turismo", "coseguro", "traslados", "olimpiadas", "beneficios"]);
 const MAX_MENSAJES_SINCRONIZACION = 100;
 const ESTADOS_COSEGURO_AUDITOR = new Set([7, 8, 9, 10]);
 
@@ -64,6 +64,24 @@ const CONFIGURACION_CHAT = {
                       FROM olimpiada_inscripcion_observacion o
                       LEFT JOIN usuario u ON u.id = o.usuario_id
                       WHERE o.inscripcion_id = ? AND o.id > ?
+                      ORDER BY o.id ASC
+                      LIMIT ${MAX_MENSAJES_SINCRONIZACION}`,
+    },
+    // Beneficios: hilo de aprobación entre la departamental dueña y los superiores
+    // (el afiliado nunca participa de este chat).
+    beneficios: {
+        entidadSql: `SELECT departamental_id, alcance_todas, estado_id
+                     FROM beneficio
+                     WHERE id = ? AND eliminado = 0
+                     LIMIT 1`,
+        mensajesSql: `SELECT o.id, o.usuario_id, o.usuario_rol, o.mensaje,
+                             o.estado_id, o.fecha_creacion,
+                             u.nombre AS usuario_nombre, u.apellido AS usuario_apellido,
+                             e.nombre AS estado_nombre
+                      FROM beneficio_observacion o
+                      LEFT JOIN usuario u ON u.id = o.usuario_id
+                      LEFT JOIN beneficio_estado e ON e.id = o.estado_id
+                      WHERE o.beneficio_id = ? AND o.id > ?
                       ORDER BY o.id ASC
                       LIMIT ${MAX_MENSAJES_SINCRONIZACION}`,
     },
@@ -178,6 +196,10 @@ function puedeAccederSegunEntidad(auth, conversacion, entidad) {
             if (auth.rol === "admin") return true;
             if (auth.rol === "departamental") return idsIguales(entidad.departamental_id, auth.departamentalId);
             return auth.rol === "afiliado" && idsIguales(entidad.usuario_id, auth.id);
+        case "beneficios":
+            if (["admin", "admin-central"].includes(auth.rol)) return true;
+            return auth.rol === "departamental"
+                && idsIguales(entidad.departamental_id, auth.departamentalId);
         default:
             return false;
     }
