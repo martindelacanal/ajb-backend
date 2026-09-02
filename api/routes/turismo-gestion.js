@@ -626,6 +626,10 @@ async function evaluarConfiguracionServicio(connection, servicio) {
   return {
     configuracion_completa: faltantes.length === 0,
     faltantes_configuracion: faltantes,
+    // El editor muestra de donde sale el precio: reglas propias o temporadas.
+    reglas_vigentes: Number(metricas.reglas_vigentes || 0),
+    tarifas_legacy_vigentes: Number(metricas.tarifas_legacy_vigentes || 0),
+    cupos_vigentes: Number(metricas.cupos_vigentes || 0),
   };
 }
 
@@ -830,7 +834,7 @@ router.get("/gestion/turismo/servicios/:id", verifyToken, async (req, res) => {
     if (!servicioId) throw crearErrorCatalogo("ID inválido", 400);
     const db = mysqlConnection.promise();
     const servicio = await asegurarPuedeVerDetalle(db, cabecera, servicioId);
-    const [departamentales, imagenesServicio, recursos, imagenesRecurso, filtros, valores, cupos, reglas, convenios] = await Promise.all([
+    const [departamentales, imagenesServicio, recursos, imagenesRecurso, filtros, valores, cupos, reglas, convenios, temporadasLegacy] = await Promise.all([
       db.query(`SELECT d.id, d.nombre FROM servicio_departamental_visible sdv
         INNER JOIN departamental d ON d.id = sdv.departamental_id
         WHERE sdv.servicio_id = ? ORDER BY d.nombre`, [servicioId]).then(([rows]) => rows),
@@ -854,6 +858,30 @@ router.get("/gestion/turismo/servicios/:id", verifyToken, async (req, res) => {
       db.query(`SELECT * FROM turismo_tarifa_regla WHERE servicio_id = ?
         ORDER BY activo DESC, fecha_inicio, audiencia_departamental, id`, [servicioId]).then(([rows]) => rows),
       db.query("SELECT * FROM convenio_hotel WHERE servicio_id = ? LIMIT 1", [servicioId]).then(([rows]) => rows),
+      db.query(
+        `SELECT tt.id, tt.nombre,
+                DATE_FORMAT(tt.fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
+                DATE_FORMAT(tt.fecha_fin, '%Y-%m-%d') AS fecha_fin,
+                COALESCE(tt.origen, 'GENERAL') AS origen,
+                COUNT(DISTINCT t.recurso_id) AS recursos,
+                COUNT(DISTINCT t.regimen_id) AS regimenes,
+                MIN(t.precio) AS precio_minimo,
+                MAX(t.precio) AS precio_maximo,
+                (SELECT COUNT(*) FROM tarifa_adicional ta
+                  WHERE ta.temporada_tarifa_id = tt.id AND ta.activo = 1
+                    AND ta.recurso_id IN (SELECT rr.id FROM recurso rr WHERE rr.servicio_id = ?)) AS adicionales,
+                (SELECT bf.id FROM bloque_fecha bf WHERE bf.temporada_tarifa_id = tt.id LIMIT 1) AS bloque_fecha_id
+           FROM temporada_tarifa tt
+           INNER JOIN tarifa t ON t.temporada_tarifa_id = tt.id
+           INNER JOIN recurso r ON r.id = t.recurso_id
+          WHERE r.servicio_id = ? AND tt.fecha_fin >= CURDATE()
+          GROUP BY tt.id
+          ORDER BY tt.fecha_inicio, tt.id`,
+        [servicioId, servicioId]
+      ).then(([rows]) => rows).catch((error) => {
+        registrarErrorRuta(error);
+        return [];
+      }),
     ]);
 
     const imagenesServicioFirmadas = await Promise.all(imagenesServicio.map(firmarImagen));
@@ -885,6 +913,16 @@ router.get("/gestion/turismo/servicios/:id", verifyToken, async (req, res) => {
       filtros,
       reglas_tarifa: reglas,
       tarifas: reglas,
+      temporadas_legacy: temporadasLegacy.map((temporada) => ({
+        ...temporada,
+        id: Number(temporada.id),
+        recursos: Number(temporada.recursos || 0),
+        regimenes: Number(temporada.regimenes || 0),
+        adicionales: Number(temporada.adicionales || 0),
+        precio_minimo: temporada.precio_minimo === null ? null : Number(temporada.precio_minimo),
+        precio_maximo: temporada.precio_maximo === null ? null : Number(temporada.precio_maximo),
+        bloque_fecha_id: temporada.bloque_fecha_id === null ? null : Number(temporada.bloque_fecha_id),
+      })),
       cupos,
       convenio_hotel: convenios[0] || null,
       recursos: recursos.map((recurso) => ({
@@ -1565,6 +1603,11 @@ function validarFiltroPayload(body, { parcial = false } = {}) {
   const categoria = body.categoria === undefined && parcial ? undefined : normalizarTexto(body.categoria, { nullable: true, maximo: 80 });
   const unidad = body.unidad === undefined && parcial ? undefined : normalizarTexto(body.unidad, { nullable: true, maximo: 40 });
   const ayuda = body.ayuda === undefined && parcial ? undefined : normalizarTexto(body.ayuda, { nullable: true, maximo: 500 });
+  // Nombre de icono de Material Symbols (p. ej. "king_bed"); vacio = el front infiere uno.
+  const iconoRaw = body.icono === undefined && parcial ? undefined : normalizarTexto(body.icono, { nullable: true, maximo: 60 });
+  const icono = iconoRaw === undefined
+    ? undefined
+    : (iconoRaw === null ? null : (/^[a-z0-9_]{1,60}$/.test(iconoRaw.toLowerCase()) ? iconoRaw.toLowerCase() : undefined));
   const activo = body.activo === undefined && parcial ? undefined : normalizarBooleano(body.activo, 1);
   const orden = body.orden === undefined && parcial ? undefined : normalizarEnteroNoNegativo(body.orden, { maximo: 1_000_000 });
   let opciones = body.opciones;
@@ -1575,7 +1618,7 @@ function validarFiltroPayload(body, { parcial = false } = {}) {
   }
   if (
     nombre === undefined || codigo === null || tipoValor === undefined || categoria === undefined ||
-    unidad === undefined || ayuda === undefined || activo === undefined || orden === undefined ||
+    unidad === undefined || ayuda === undefined || icono === undefined || activo === undefined || orden === undefined ||
     (opciones !== undefined && (!Array.isArray(opciones) || opciones.length > 100))
   ) {
     throw crearErrorCatalogo("Los datos del filtro no son válidos", 400, "FILTRO_DATOS_INVALIDOS");
@@ -1596,7 +1639,7 @@ function validarFiltroPayload(body, { parcial = false } = {}) {
   if (tipoValor === "OPCION" && opciones !== undefined && opciones.length === 0) {
     throw crearErrorCatalogo("Agregá al menos una opción", 400, "FILTRO_OPCIONES_REQUERIDAS");
   }
-  return { nombre, codigo, tipo_valor: tipoValor, categoria, unidad, ayuda, opciones, activo, orden };
+  return { nombre, codigo, tipo_valor: tipoValor, categoria, unidad, ayuda, icono, opciones, activo, orden };
 }
 
 router.get("/gestion/turismo/servicios/:id/recursos", verifyToken, async (req, res) => {
@@ -1933,11 +1976,11 @@ router.post("/gestion/turismo/servicios/:id/filtros", verifyToken, async (req, r
       if (!existentes.length) throw crearErrorCatalogo("Filtro no encontrado", 404, "FILTRO_NO_ENCONTRADO");
     } else {
       const [resultado] = await connection.query(
-        `INSERT INTO filtro (codigo, nombre, tipo_valor, categoria, unidad, ayuda, opciones, activo, orden)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO filtro (codigo, nombre, tipo_valor, categoria, unidad, ayuda, icono, opciones, activo, orden)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           datos.codigo, datos.nombre, datos.tipo_valor, datos.categoria, datos.unidad,
-          datos.ayuda, JSON.stringify(datos.opciones || []), datos.activo, datos.orden,
+          datos.ayuda, datos.icono, JSON.stringify(datos.opciones || []), datos.activo, datos.orden,
         ]
       );
       filtroId = Number(resultado.insertId);
@@ -2019,6 +2062,7 @@ router.put("/gestion/turismo/servicios/:id/filtros/:filtroId", verifyToken, asyn
         categoria: anterior.categoria || null,
         unidad: anterior.unidad || null,
         ayuda: anterior.ayuda || null,
+        icono: anterior.icono || null,
         opciones: Array.isArray(opcionesAnteriores) ? opcionesAnteriores : [],
         activo: Number(anterior.activo),
         orden: Number(anterior.orden || 0),
@@ -2030,6 +2074,7 @@ router.put("/gestion/turismo/servicios/:id/filtros/:filtroId", verifyToken, asyn
         categoria: datos.categoria || null,
         unidad: datos.unidad || null,
         ayuda: datos.ayuda || null,
+        icono: datos.icono || null,
         opciones: datos.opciones || [],
         activo: Number(datos.activo),
         orden: Number(datos.orden || 0),
@@ -2044,11 +2089,11 @@ router.put("/gestion/turismo/servicios/:id/filtros/:filtroId", verifyToken, asyn
         connection, datos.codigo, servicioId
       );
       const [resultadoClon] = await connection.query(
-        `INSERT INTO filtro (codigo, nombre, tipo_valor, categoria, unidad, ayuda, opciones, activo, orden)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO filtro (codigo, nombre, tipo_valor, categoria, unidad, ayuda, icono, opciones, activo, orden)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           codigoClonado, datos.nombre, datos.tipo_valor, datos.categoria, datos.unidad,
-          datos.ayuda, JSON.stringify(datos.opciones || []), datos.activo, datos.orden,
+          datos.ayuda, datos.icono, JSON.stringify(datos.opciones || []), datos.activo, datos.orden,
         ]
       );
       filtroId = Number(resultadoClon.insertId);
@@ -2067,10 +2112,10 @@ router.put("/gestion/turismo/servicios/:id/filtros/:filtroId", verifyToken, asyn
     } else {
       await connection.query(
         `UPDATE filtro SET codigo = ?, nombre = ?, tipo_valor = ?, categoria = ?, unidad = ?,
-                ayuda = ?, opciones = ?, activo = ?, orden = ? WHERE id = ?`,
+                ayuda = ?, icono = ?, opciones = ?, activo = ?, orden = ? WHERE id = ?`,
         [
           datos.codigo, datos.nombre, datos.tipo_valor, datos.categoria, datos.unidad,
-          datos.ayuda, JSON.stringify(datos.opciones || []), datos.activo, datos.orden, filtroId,
+          datos.ayuda, datos.icono, JSON.stringify(datos.opciones || []), datos.activo, datos.orden, filtroId,
         ]
       );
       await connection.query(

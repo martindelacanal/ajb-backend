@@ -24,10 +24,13 @@ const multer = require("multer");
 const moment = require("moment"); // para formatear fechas
 const {
   obtenerCalendarioAlternativoServicio,
+  obtenerCapacidadRecursos,
+  obtenerOcupacionNochesRecurso,
   obtenerSnapshotDisponibilidad,
   obtenerServicios,
   parsearParametrosBusquedaDisponibilidad,
   parsearServicioIdsCsv,
+  recursoAdmitePersonas,
 } = require("../services/servicios-disponibilidad");
 const {
   CATALOGOS_HISTORIAL_RESERVA,
@@ -1258,6 +1261,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
               horizonteDias: 45,
               maxResultados: 12,
               holdIdExcluir,
+              incluirNoches: false,
             });
           }
         }
@@ -2319,8 +2323,26 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
         return res.status(404).json("Servicio inexistente");
       }
 
+      // Al editar, la propia reserva no cuenta como ocupación (solo si es del afiliado).
+      let reservaExcluirId = normalizarIdPositivo(req.query.reserva_excluir_id);
+      if (reservaExcluirId !== null && cabecera.rol === "afiliado") {
+        const [reservaExcluir] = await db.query(
+          "SELECT usuario_id FROM reserva WHERE id = ?",
+          [reservaExcluirId]
+        );
+        const duenioReserva = normalizarIdPositivo(reservaExcluir?.[0]?.usuario_id);
+        if (duenioReserva === null || duenioReserva !== normalizarIdPositivo(cabecera.id)) {
+          reservaExcluirId = null;
+        }
+      }
+      const horizonteDiasRaw = normalizarEnteroNoNegativoOpcional(req.query.horizonte_dias, 365);
+      if (horizonteDiasRaw === undefined) {
+        return res.status(400).json("El horizonte de fechas es inválido");
+      }
+
       const calendario = await obtenerCalendarioAlternativoServicio(db, {
         servicioId,
+        servicio: servicios[0],
         fechaInicio: parseo.value.fecha_inicio,
         fechaFin: parseo.value.fecha_fin,
         adultos: parseo.value.adultos,
@@ -2329,6 +2351,8 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
         totalPersonas: parseo.value.total_personas,
         departamentalId: cabecera.departamental_id,
         holdIdExcluir,
+        reservaExcluirId,
+        ...(horizonteDiasRaw ? { horizonteDias: horizonteDiasRaw } : {}),
       });
 
       const horizonteBloquesDiasRaw = normalizarEnteroNoNegativoOpcional(
@@ -2353,14 +2377,8 @@ router.get("/servicios/:id/disponibilidad", verifyToken, async (req, res) => {
         holdIdExcluir,
       });
       calendario.bloques_disponibles = bloquesDisponiblesMap.get(servicioId) || [];
-
-      if (
-        (!calendario.fechas_habilitadas || calendario.fechas_habilitadas.length === 0) &&
-        calendario.bloques_disponibles.length === 0
-      ) {
-        return res.status(409).json("No hay fechas alternativas para la cantidad de personas indicada");
-      }
-
+      // Sin alternativas también es una respuesta válida: el front muestra el
+      // aviso amable en lugar de tratarlo como error.
       res.status(200).json(calendario);
     } else {
       res.status(401).json("No autorizado");
@@ -4668,7 +4686,8 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           `, [
             servicioIdSolicitud,
             persona.tipo_persona_id,
-            persona.regimen_id,
+            // Si la persona no trae régimen propio se usa el elegido para la reserva.
+            persona.regimen_id || regimenIdSolicitud,
             persona.edad,
             persona.edad,
             fechaFinSolicitud,
@@ -4691,7 +4710,28 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
       });
 
       if (recursosValidos.size === 0) {
-        return res.status(404).json("No se encontraron recursos con tarifas válidas para las personas especificadas");
+        return res.status(404).json({
+          message: "No se encontraron recursos con tarifas válidas para las personas especificadas",
+          codigo: "SIN_RECURSOS",
+          motivo: "SIN_TARIFAS",
+        });
+      }
+
+      // Capacidad real de cada unidad (cupo del catálogo o característica
+      // "Personas"): una cabaña para 2 no se ofrece a un grupo de 6.
+      const cantidadPersonasSolicitud = personasAutorizadas.length;
+      const capacidadesRecursos = await obtenerCapacidadRecursos(db, Array.from(recursosValidos));
+      for (const recursoValido of Array.from(recursosValidos)) {
+        if (!recursoAdmitePersonas(capacidadesRecursos, recursoValido, cantidadPersonasSolicitud)) {
+          recursosValidos.delete(recursoValido);
+        }
+      }
+      if (recursosValidos.size === 0) {
+        return res.status(404).json({
+          message: `Ninguna unidad de este servicio admite ${cantidadPersonasSolicitud} ${cantidadPersonasSolicitud === 1 ? "persona" : "personas"} para esas fechas`,
+          codigo: "SIN_RECURSOS",
+          motivo: "CAPACIDAD",
+        });
       }
 
       // Si se especifica recurso_id, filtramos solo ese recurso (si está en los válidos)
@@ -4703,7 +4743,11 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         }
 
         if (recursosValidos.size === 0) {
-          return res.status(404).json("No se encontraron recursos disponibles dentro del bloque seleccionado");
+          return res.status(404).json({
+            message: "No se encontraron recursos disponibles dentro del bloque seleccionado",
+            codigo: "SIN_RECURSOS",
+            motivo: "BLOQUE",
+          });
         }
       }
 
@@ -4713,7 +4757,11 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           recursosValidos.clear();
           recursosValidos.add(recursoIdFiltro);
         } else {
-          return res.status(404).json("El recurso especificado no tiene tarifas válidas para las personas especificadas");
+          return res.status(404).json({
+            message: "El recurso especificado no tiene tarifas válidas para las personas especificadas",
+            codigo: "SIN_RECURSOS",
+            motivo: "RECURSO",
+          });
         }
       }
 
@@ -4773,7 +4821,11 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           recursosQueCumplenFiltros.forEach(id => recursosValidos.add(id));
         } else {
           // Si no hay recursos que cumplan filtros, retornar error específico
-          return res.status(404).json("No se encontraron recursos que cumplan con los filtros especificados");
+          return res.status(404).json({
+            message: "No se encontraron recursos que cumplan con los filtros especificados",
+            codigo: "SIN_RECURSOS",
+            motivo: "FILTROS",
+          });
         }
       }
 
@@ -5048,7 +5100,17 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         const { totalCamas, ambientes, ...recursoLimpio } = recurso;
         return recursoLimpio;
       });
-      
+
+      if (recursosLimpios.length === 0) {
+        // Hay unidades con tarifa pero todas están reservadas, retenidas o
+        // dentro de un bloque: el front ofrece fechas alternativas.
+        return res.status(404).json({
+          message: "No quedan unidades libres para las fechas elegidas",
+          codigo: "SIN_RECURSOS",
+          motivo: "SIN_DISPONIBILIDAD",
+        });
+      }
+
       res.status(200).json(recursosLimpios);
     } else {
       res.status(401).json("No autorizado");
@@ -5456,15 +5518,35 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
          usuario_id,
          adicionales,
         modalidad,
-        bloque_fecha_id
+        bloque_fecha_id,
+        modo,
+        reserva_excluir_id,
+        hold_token
       } = req.body;
 
       if (!fecha_inicio || !fecha_fin || !servicio_id || !recurso_id || !personas || personas.length === 0) {
         return res.status(400).json("Faltan campos requeridos");
       }
+      // modo "CALENDARIO": una entrada por noche de la ventana con su estado
+      // (precio, sin tarifa, ocupada, anticipación) en lugar de exigir que la
+      // tarifa cubra el rango completo.
+      const modoCalendario = String(modo || "").trim().toUpperCase() === "CALENDARIO";
 
-      const fechaInicioSolicitud = formatearFechaSQL(fecha_inicio);
+      let fechaInicioSolicitud = formatearFechaSQL(fecha_inicio);
       const fechaFinSolicitud = formatearFechaSQL(fecha_fin);
+
+      // En modo calendario el front pide meses completos: si la ventana empieza
+      // antes de hoy se recorta a hoy (las noches pasadas no se cotizan) y una
+      // ventana enteramente pasada devuelve vacío en vez de rechazarse.
+      if (modoCalendario) {
+        const hoyCalendario = obtenerFechaCivilArgentina();
+        if (fechaInicioSolicitud && hoyCalendario && fechaInicioSolicitud < hoyCalendario) {
+          fechaInicioSolicitud = hoyCalendario;
+        }
+        if (fechaFinSolicitud && hoyCalendario && fechaFinSolicitud <= hoyCalendario) {
+          return res.status(200).json([]);
+        }
+      }
 
       // Calcular días correctamente: INCLUIR el día de salida (fecha_fin)
       const diasTotales = diferenciaDiasCivil(fechaInicioSolicitud, fechaFinSolicitud);
@@ -5564,6 +5646,7 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
         fechaFin: fechaFinSolicitud,
         temporadaTarifaId: temporadaTarifaIdFiltro,
         departamentalId: titularCotizacion.departamental_id,
+        tolerarHuecos: modoCalendario,
       });
       const adicionalesProcesados = await calcularAdicionalesReserva(
         pool,
@@ -5573,10 +5656,67 @@ router.post("/reserva/tarifa/fechas", verifyToken, async (req, res) => {
         fechaInicioSolicitud,
         fechaFinSolicitud,
         tarifaBase.personas,
-        temporadaTarifaIdFiltro
+        temporadaTarifaIdFiltro,
+        { tolerarHuecos: modoCalendario }
       );
+      const fechasCotizadas = construirFechasCotizacion(tarifaBase, adicionalesProcesados);
+      if (!modoCalendario) {
+        return res.status(200).json(fechasCotizadas);
+      }
 
-      return res.status(200).json(construirFechasCotizacion(tarifaBase, adicionalesProcesados));
+      const holdIdExcluirCalendario = await resolverHoldIdExcluir(pool, cabecera, hold_token);
+      let reservaExcluirCalendario = normalizarIdPositivo(reserva_excluir_id);
+      if (reservaExcluirCalendario !== null && cabecera.rol === "afiliado") {
+        const [reservaExcluir] = await pool.query(
+          "SELECT usuario_id FROM reserva WHERE id = ?",
+          [reservaExcluirCalendario]
+        );
+        const duenioReserva = normalizarIdPositivo(reservaExcluir?.[0]?.usuario_id);
+        if (duenioReserva === null || duenioReserva !== normalizarIdPositivo(cabecera.id)) {
+          reservaExcluirCalendario = null;
+        }
+      }
+      const ocupacionNoches = await obtenerOcupacionNochesRecurso(pool, {
+        servicio: { id: servicioIdSolicitud, tipo_codigo: servicioConfigurado.tipo_codigo },
+        recursoId: recursoIdSolicitud,
+        fechaDesde: fechaInicioSolicitud,
+        fechaHasta: fechaFinSolicitud,
+        reservaExcluirId: reservaExcluirCalendario,
+        holdIdExcluir: holdIdExcluirCalendario,
+      });
+      const anticipacionServicio = Number(servicioConfigurado.anticipacion_minima_dias || 0);
+      const fechaMinimaCalendario = anticipacionServicio > 0
+        ? sumarDiasFechaSQL(obtenerFechaCivilHoyArgentina(), anticipacionServicio)
+        : null;
+      const cotizadasPorFecha = new Map(fechasCotizadas.map((item) => [item.fecha, item]));
+      const nochesCalendario = obtenerNochesReserva(fechaInicioSolicitud, fechaFinSolicitud, 366);
+      const calendario = nochesCalendario.map((fecha) => {
+        const cotizada = cotizadasPorFecha.get(fecha) || null;
+        const ocupacion = ocupacionNoches.get(fecha) || { ocupado: false, motivo: null };
+        const sinTarifa = !cotizada;
+        const requiereAnticipacion = Boolean(fechaMinimaCalendario && fecha < fechaMinimaCalendario);
+        // La ocupación manda: una noche dentro de un bloque o ya reservada se
+        // muestra como tal aunque además no tenga tarifa de fecha libre.
+        let motivo = null;
+        if (ocupacion.ocupado) motivo = ocupacion.motivo || "OCUPADO";
+        else if (sinTarifa) motivo = "SIN_TARIFA";
+        else if (requiereAnticipacion) motivo = "ANTICIPACION";
+        return {
+          fecha,
+          precio: cotizada ? cotizada.precio : null,
+          precio_base: cotizada ? cotizada.precio_base : null,
+          usa_porcentaje: cotizada ? cotizada.usa_porcentaje : false,
+          porcentaje_descuento: cotizada ? cotizada.porcentaje_descuento : 0,
+          adicionales: cotizada ? cotizada.adicionales : [],
+          sin_tarifa: sinTarifa,
+          ocupado: Boolean(ocupacion.ocupado),
+          motivo,
+          disponible: !sinTarifa && !ocupacion.ocupado && !requiereAnticipacion,
+          lugares: ocupacion.lugares ?? null,
+          bloque: ocupacion.bloque || null,
+        };
+      });
+      return res.status(200).json(calendario);
     } else {
       res.status(401).json("No autorizado");
     }
@@ -5599,7 +5739,7 @@ router.post("/reserva/adicionales", verifyToken, async (req, res) => {
         cabecera.rol === "departamental"
       ) && tieneAreaTurismo(cabecera)
     ) {
-      const { recurso_id, regimen_id, fecha_inicio, fecha_fin, modalidad, bloque_fecha_id } = req.body;
+      const { recurso_id, regimen_id, fecha_inicio, fecha_fin, modalidad, bloque_fecha_id, servicio_id } = req.body;
 
       if (!recurso_id || !regimen_id || !fecha_inicio || !fecha_fin) {
         return res.status(400).json("Faltan campos requeridos");
@@ -5609,6 +5749,29 @@ router.post("/reserva/adicionales", verifyToken, async (req, res) => {
       const fechaFinSolicitud = formatearFechaSQL(fecha_fin);
       if (!validarRangoReservaTemporal(fechaInicioSolicitud, fechaFinSolicitud).valido) {
         return res.status(422).json("El rango debe ser válido y no puede comenzar antes de hoy");
+      }
+
+      // El recurso debe pertenecer al servicio indicado y ser visible para el actor.
+      const recursoIdAdicionales = normalizarIdPositivo(recurso_id);
+      const servicioIdAdicionales = normalizarIdPositivo(servicio_id);
+      const dbAdicionales = mysqlConnection.promise();
+      const [recursosAdicionales] = recursoIdAdicionales
+        ? await dbAdicionales.query("SELECT servicio_id FROM recurso WHERE id = ? AND activo = 1 LIMIT 1", [recursoIdAdicionales])
+        : [[]];
+      if (
+        !recursoIdAdicionales || recursosAdicionales.length === 0 ||
+        (servicioIdAdicionales && Number(recursosAdicionales[0].servicio_id) !== servicioIdAdicionales)
+      ) {
+        return res.status(404).json("El recurso no pertenece al servicio indicado");
+      }
+      const servicioVisibleAdicionales = await servicioVisibleParaActor(
+        dbAdicionales,
+        cabecera,
+        Number(recursosAdicionales[0].servicio_id),
+        { recursoId: recursoIdAdicionales }
+      );
+      if (!servicioVisibleAdicionales) {
+        return res.status(404).json("El recurso no está disponible");
       }
 
       const modalidadSolicitada = normalizarModalidad(modalidad);
@@ -7436,6 +7599,7 @@ async function calcularTarifaPrecioUnico(connection, {
   fechaInicio,
   fechaFin,
   departamentalId = null,
+  tolerarHuecos = false,
 }) {
   if (!Array.isArray(personas) || personas.length !== 1) {
     throw crearErrorNegocio("El precio único requiere reservar solo para el titular", 422, "PRECIO_UNICO_SOLO_TITULAR");
@@ -7482,14 +7646,17 @@ async function calcularTarifaPrecioUnico(connection, {
       // El tarifario administrable toma control solo cuando cubre el rango
       // completo. Mientras se carga una temporada por etapas, las tarifas
       // legacy siguen siendo la fuente canonica y no se corta la venta.
+      if (tolerarHuecos) continue;
       return null;
     }
     if (aplicables.length > 1) {
+      if (tolerarHuecos) continue;
       throw crearErrorNegocio(`Hay más de una tarifa aplicable para ${noche}`, 409, "TARIFA_AMBIGUA");
     }
     const regla = aplicables[0];
     const tarifaId = normalizarIdPositivo(regla.tarifa_id);
     if (!tarifaId) {
+      if (tolerarHuecos) continue;
       throw crearErrorNegocio("La tarifa todavía no fue materializada", 409, "TARIFA_REGLA_INCOMPLETA");
     }
     const precioOriginalCentavos = decimalACentavos(regla.precio, { permiteCero: false });
@@ -7510,9 +7677,9 @@ async function calcularTarifaPrecioUnico(connection, {
   }
 
   let cobrables = detalles;
-  if (recurso.unidad_cobro === "POR_ESTADIA") {
+  if (recurso.unidad_cobro === "POR_ESTADIA" && detalles.length > 0) {
     const reglasUsadas = new Set(detalles.map((detalle) => detalle.tarifa_regla_id));
-    if (reglasUsadas.size !== 1) {
+    if (reglasUsadas.size !== 1 && !tolerarHuecos) {
       throw crearErrorNegocio("Una tarifa por estadía no puede cambiar dentro del rango", 409, "TARIFA_AMBIGUA");
     }
     cobrables = detalles.slice(0, 1);
@@ -7551,6 +7718,7 @@ async function calcularTarifaTemporadasGestionadas(connection, {
   fechaInicio,
   fechaFin,
   departamentalId = null,
+  tolerarHuecos = false,
 }) {
   let dep = normalizarIdPositivo(departamentalId);
   if (!dep) {
@@ -7593,14 +7761,17 @@ async function calcularTarifaTemporadasGestionadas(connection, {
     );
     if (especificasRecurso.length) aplicables = especificasRecurso;
     if (aplicables.length === 0) {
+      if (tolerarHuecos) continue;
       throw crearErrorNegocio("No hay una tarifa configurada para todas las fechas", 409, "TARIFA_INCOMPLETA");
     }
     if (aplicables.length > 1) {
+      if (tolerarHuecos) continue;
       throw crearErrorNegocio(`Hay más de una tarifa aplicable para ${noche}`, 409, "TARIFA_AMBIGUA");
     }
     const regla = aplicables[0];
     const tarifaId = normalizarIdPositivo(regla.tarifa_id);
     if (!tarifaId) {
+      if (tolerarHuecos) continue;
       throw crearErrorNegocio("La tarifa todavía no fue materializada", 409, "TARIFA_REGLA_INCOMPLETA");
     }
     const precioOriginalCentavos = decimalACentavos(regla.precio, { permiteCero: false });
@@ -7622,9 +7793,9 @@ async function calcularTarifaTemporadasGestionadas(connection, {
   }
 
   let cobrables = detalles;
-  if (recurso.unidad_cobro === "POR_ESTADIA") {
+  if (recurso.unidad_cobro === "POR_ESTADIA" && detalles.length > 0) {
     const reglasUsadas = new Set(detalles.map((detalle) => detalle.tarifa_regla_id));
-    if (reglasUsadas.size !== 1) {
+    if (reglasUsadas.size !== 1 && !tolerarHuecos) {
       throw crearErrorNegocio("Una tarifa por estadía no puede cambiar dentro del rango", 409, "TARIFA_AMBIGUA");
     }
     cobrables = detalles.slice(0, 1);
@@ -7673,6 +7844,49 @@ async function calcularTarifaTemporadasGestionadas(connection, {
   };
 }
 
+/**
+ * En modo tolerante (calendario) cada persona pudo quedar con noches
+ * distintas cubiertas; la cotizacion solo vale para las noches que TODAS las
+ * personas tienen tarifa. Se recortan las demas y se recalculan los totales.
+ */
+function recortarCotizacionANochesComunes(personasResultado) {
+  let nochesComunes = null;
+  for (const persona of personasResultado) {
+    const fechas = new Set((persona.tarifas_por_fecha || []).map((tarifa) => tarifa.fecha));
+    nochesComunes = nochesComunes === null
+      ? fechas
+      : new Set([...nochesComunes].filter((fecha) => fechas.has(fecha)));
+  }
+  const comunes = nochesComunes || new Set();
+  let totalCentavos = 0;
+  let totalOriginalCentavos = 0;
+  const personas = personasResultado.map((persona) => {
+    const tarifasPorFecha = (persona.tarifas_por_fecha || []).filter((tarifa) => comunes.has(tarifa.fecha));
+    let totalPersonaCentavos = 0;
+    let totalOriginalPersonaCentavos = 0;
+    for (const tarifa of tarifasPorFecha) {
+      totalPersonaCentavos = sumarCentavos(totalPersonaCentavos, decimalACentavos(tarifa.precio) ?? 0) ?? totalPersonaCentavos;
+      totalOriginalPersonaCentavos = sumarCentavos(
+        totalOriginalPersonaCentavos,
+        decimalACentavos(tarifa.precio_original ?? tarifa.precio) ?? 0
+      ) ?? totalOriginalPersonaCentavos;
+    }
+    totalCentavos = sumarCentavos(totalCentavos, totalPersonaCentavos) ?? totalCentavos;
+    totalOriginalCentavos = sumarCentavos(totalOriginalCentavos, totalOriginalPersonaCentavos) ?? totalOriginalCentavos;
+    return {
+      ...persona,
+      tarifa_individual: centavosANumero(totalPersonaCentavos),
+      tarifa_original_individual: centavosANumero(totalOriginalPersonaCentavos),
+      tarifas_por_fecha: tarifasPorFecha,
+    };
+  });
+  return {
+    total: centavosANumero(totalCentavos),
+    total_original: centavosANumero(totalOriginalCentavos),
+    personas,
+  };
+}
+
 async function calcularTarifaBaseReserva(connection, {
   recursoId,
   regimenId,
@@ -7681,6 +7895,8 @@ async function calcularTarifaBaseReserva(connection, {
   fechaFin,
   temporadaTarifaId = null,
   departamentalId = null,
+  // Calendario: no exige cobertura completa; las noches sin tarifa se omiten.
+  tolerarHuecos = false,
 }) {
   const fechaInicioNormalizada = formatearFechaSQL(fechaInicio);
   const fechaFinNormalizada = formatearFechaSQL(fechaFin);
@@ -7709,7 +7925,7 @@ async function calcularTarifaBaseReserva(connection, {
     obtenerFechaCivilArgentina(),
     Number(recursoConfigurado.anticipacion_minima_dias || 0)
   );
-  if (fechaMinima && fechaInicioNormalizada < fechaMinima) {
+  if (!tolerarHuecos && fechaMinima && fechaInicioNormalizada < fechaMinima) {
     throw crearErrorNegocio(
       `Este servicio requiere ${Number(recursoConfigurado.anticipacion_minima_dias || 0)} días de anticipación`,
       422,
@@ -7717,14 +7933,32 @@ async function calcularTarifaBaseReserva(connection, {
     );
   }
   if (recursoConfigurado.modelo_tarifa === "PRECIO_UNICO") {
-    return calcularTarifaPrecioUnico(connection, {
+    const tarifaUnica = await calcularTarifaPrecioUnico(connection, {
       recurso: recursoConfigurado,
       personas,
       noches,
       fechaInicio: fechaInicioNormalizada,
       fechaFin: fechaFinNormalizada,
       departamentalId,
+      tolerarHuecos,
     });
+    if (tarifaUnica) return tarifaUnica;
+    if (tolerarHuecos) {
+      return {
+        total: 0,
+        total_original: 0,
+        personas: [{
+          ...personas[0],
+          regimen_id: null,
+          tarifa_individual: 0,
+          tarifa_original_individual: 0,
+          tarifas_por_fecha: [],
+        }],
+      };
+    }
+    // Sin reglas que cubran el rango no hay precio unico posible: el resto del
+    // sistema (recursos, cotizacion, alta) ya trata TARIFA_INCOMPLETA.
+    throw crearErrorNegocio("No hay una tarifa configurada para todas las fechas", 409, "TARIFA_INCOMPLETA");
   }
   if (!regimenIdNormalizado) {
     throw crearErrorNegocio("El recurso y el regimen son requeridos", 400);
@@ -7743,8 +7977,14 @@ async function calcularTarifaBaseReserva(connection, {
       fechaInicio: fechaInicioNormalizada,
       fechaFin: fechaFinNormalizada,
       departamentalId,
+      tolerarHuecos,
     });
-    if (tarifaGestionada) return tarifaGestionada;
+    if (tarifaGestionada) {
+      // En modo calendario, si las reglas no cubren ninguna noche se sigue
+      // con las temporadas legacy para no dejar el calendario vacio.
+      const cubreAlgunaNoche = tarifaGestionada.personas.some((persona) => (persona.tarifas_por_fecha || []).length > 0);
+      if (!tolerarHuecos || cubreAlgunaNoche) return tarifaGestionada;
+    }
   }
   let totalCentavos = 0;
   let totalOriginalCentavos = 0;
@@ -7788,6 +8028,15 @@ async function calcularTarifaBaseReserva(connection, {
     );
 
     if (tarifasPersona.length === 0) {
+      if (tolerarHuecos) {
+        personasResultado.push({
+          ...persona,
+          tarifa_individual: 0,
+          tarifa_original_individual: 0,
+          tarifas_por_fecha: [],
+        });
+        continue;
+      }
       throw crearErrorNegocio("No hay tarifas para todas las personas del bloque", 409, "TARIFA_INCOMPLETA");
     }
 
@@ -7803,9 +8052,11 @@ async function calcularTarifaBaseReserva(connection, {
       });
 
       if (tarifasAplicables.length === 0) {
+        if (tolerarHuecos) continue;
         throw crearErrorNegocio("No hay tarifas para todas las noches del bloque", 409, "TARIFA_INCOMPLETA");
       }
       if (tarifasAplicables.length > 1) {
+        if (tolerarHuecos) continue;
         throw crearErrorNegocio(
           `Hay mas de una tarifa aplicable para la fecha ${noche}`,
           409,
@@ -7864,6 +8115,10 @@ async function calcularTarifaBaseReserva(connection, {
       tarifa_original_individual: centavosANumero(totalOriginalPersonaCentavos),
       tarifas_por_fecha: tarifasPorFecha.sort((a, b) => a.fecha.localeCompare(b.fecha))
     });
+  }
+
+  if (tolerarHuecos) {
+    return recortarCotizacionANochesComunes(personasResultado);
   }
 
   return {
@@ -8844,7 +9099,8 @@ async function obtenerMejorDescuentoDia(connection, recursoId, regimenId, person
   };
 }
 
-async function calcularAdicionalesReserva(connection, adicionales, recursoId, regimenId, fechaInicio, fechaFin, personas, temporadaTarifaId = null) {
+async function calcularAdicionalesReserva(connection, adicionales, recursoId, regimenId, fechaInicio, fechaFin, personas, temporadaTarifaId = null, opciones = {}) {
+  const tolerarHuecos = Boolean(opciones?.tolerarHuecos);
   if (!Array.isArray(adicionales) || adicionales.length === 0) {
     return { total: 0, items: [] };
   }
@@ -8864,17 +9120,24 @@ async function calcularAdicionalesReserva(connection, adicionales, recursoId, re
   let totalCentavos = 0;
 
   for (const noche of noches) {
-    descuentosPorDia.set(
-      noche,
-      await obtenerMejorDescuentoDia(
-        connection,
-        recursoId,
-        regimenId,
-        personasNormalizadas,
+    try {
+      descuentosPorDia.set(
         noche,
-        temporadaTarifaId
-      )
-    );
+        await obtenerMejorDescuentoDia(
+          connection,
+          recursoId,
+          regimenId,
+          personasNormalizadas,
+          noche,
+          temporadaTarifaId
+        )
+      );
+    } catch (error) {
+      if (!tolerarHuecos || !["TARIFA_AMBIGUA", "TARIFA_INVALIDA"].includes(error?.codigo)) {
+        throw error;
+      }
+      descuentosPorDia.set(noche, { porcentaje_descuento: 0, porcentaje_puntos_base: 0, tarifa_id: null });
+    }
   }
 
   for (let indice = 0; indice < adicionales.length; indice++) {
@@ -8890,16 +9153,23 @@ async function calcularAdicionalesReserva(connection, adicionales, recursoId, re
     let subtotalOriginalCentavos = 0;
 
     for (const noche of noches) {
-      const resultadoAdicional = await obtenerPrecioAdicional(
-        connection,
-        cachePrecios,
-        recursoId,
-        regimenId,
-        adicionalId,
-        noche,
-        temporadaTarifaId
-      );
+      let resultadoAdicional = null;
+      try {
+        resultadoAdicional = await obtenerPrecioAdicional(
+          connection,
+          cachePrecios,
+          recursoId,
+          regimenId,
+          adicionalId,
+          noche,
+          temporadaTarifaId
+        );
+      } catch (error) {
+        if (!tolerarHuecos || error?.codigo !== "TARIFA_AMBIGUA") throw error;
+        resultadoAdicional = null;
+      }
       if (resultadoAdicional === null) {
+        if (tolerarHuecos) continue;
         throw crearErrorNegocio(
           `No hay una tarifa de adicional vigente para la fecha ${noche}`,
           409,
@@ -8949,6 +9219,8 @@ async function calcularAdicionalesReserva(connection, adicionales, recursoId, re
         tarifa_id: descuentoInfo.tarifa_id,
       });
     }
+
+    if (tolerarHuecos && detalles.length === 0) continue;
 
     items.push({
       adicional_id: adicionalId,

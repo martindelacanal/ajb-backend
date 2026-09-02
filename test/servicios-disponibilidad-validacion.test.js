@@ -67,6 +67,7 @@ test("una tarifa historica desligada respeta la audiencia departamental", async 
         } : []].flat()];
       }
       if (/FROM recurso rr[\s\S]+turismo_tarifa_regla tr/i.test(sql)) return [[]];
+      if (/personas_filtro/i.test(sql)) return [[{ id: 11, cupo_maximo: null, personas_filtro: null }]];
       if (/FROM reserva\b/i.test(sql)) return [[]];
       if (/FROM turismo_reserva_hold\b/i.test(sql)) return [[]];
       if (/FROM bloque_fecha_recurso\b/i.test(sql)) return [[]];

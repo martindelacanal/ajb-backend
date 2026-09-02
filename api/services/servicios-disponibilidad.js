@@ -4,6 +4,9 @@ const HORIZONTE_ALTERNATIVAS_DIAS = 120;
 const MAX_RANGOS_ALTERNATIVOS = 30;
 const MAX_PERSONAS_BUSQUEDA = 100;
 const MAX_DIAS_BUSQUEDA = 366;
+// Estados terminales que liberan el recurso; el resto (Iniciada, Verificada,
+// Aprobada, Solicitud sorteo, Adjudicada, ...) sigue ocupando.
+const ESTADOS_RESERVA_LIBERAN = ["Cancelada", "Rechazada", "No adjudicada"];
 const {
   diferenciaDiasCivil,
   normalizarFechaCivil,
@@ -13,8 +16,7 @@ const {
   validarRangoReservaTemporal,
 } = require("./valores-dominio");
 const {
-  contarHoldsActivosRecurso,
-  obtenerRecursosRetenidos,
+  listarHoldsActivosRecursos,
 } = require("./turismo-reserva-holds");
 
 function normalizarEnteroNoNegativo(valor, porDefecto = 0) {
@@ -72,6 +74,10 @@ function parsearParametrosBusquedaDisponibilidad(
   const totalPersonas = adultos + ninos + bebes;
   if (requirePersonas && totalPersonas <= 0) {
     return { error: "Debe indicar al menos 1 persona" };
+  }
+  // Ningún sitio de reservas acepta una estadía sin un adulto responsable.
+  if (requirePersonas && adultos <= 0) {
+    return { error: "La búsqueda necesita al menos 1 adulto" };
   }
   if (!Number.isSafeInteger(totalPersonas) || totalPersonas > MAX_PERSONAS_BUSQUEDA) {
     return { error: `No se permiten mas de ${MAX_PERSONAS_BUSQUEDA} personas por busqueda` };
@@ -145,10 +151,18 @@ function tarifaAplicaParaEdad(tarifa, edad) {
   return (edadMinima === null || edadMinima <= edad) && (edadMaxima === null || edadMaxima >= edad);
 }
 
+// Las tarifas son inclusivas en ambos extremos (fecha_fin = ultima noche cubierta).
 function cubreNoche(tarifa, noche) {
   const inicio = normalizarFechaCivil(tarifa.fecha_inicio);
   const fin = normalizarFechaCivil(tarifa.fecha_fin);
   return Boolean(inicio && fin && inicio <= noche && fin >= noche);
+}
+
+// Reservas, holds y bloques usan checkout exclusivo: ocupan [inicio, fin).
+function ocupaNoche(rango, noche) {
+  const inicio = normalizarFechaCivil(rango.fecha_inicio);
+  const fin = normalizarFechaCivil(rango.fecha_fin);
+  return Boolean(inicio && fin && inicio <= noche && fin > noche);
 }
 
 function tarifasCubrenTodasLasNoches(tarifas, noches) {
@@ -166,41 +180,6 @@ function esErrorTemporadaAltaNoMigrada(error) {
     error?.errno === 1146 ||
     error?.errno === 1054
   );
-}
-
-async function obtenerRecursosBloqueadosPorBloques(connection, { recursoIds, fechaInicio, fechaFin }) {
-  if (!Array.isArray(recursoIds) || recursoIds.length === 0) {
-    return new Set();
-  }
-
-  try {
-    const placeholders = recursoIds.map(() => "?").join(",");
-    const [rows] = await connection.query(
-      `
-        SELECT DISTINCT bfr.recurso_id
-        FROM bloque_fecha_recurso bfr
-        INNER JOIN bloque_fecha bf ON bf.id = bfr.bloque_fecha_id
-        WHERE bfr.recurso_id IN (${placeholders})
-          AND bf.estado = 'ACTIVO'
-          AND bfr.estado IN ('DISPONIBLE', 'SORTEO', 'VENTA_DIRECTA')
-          AND bf.fecha_inicio < ?
-          AND bf.fecha_fin > ?
-          AND NOT (
-            (bf.modalidad = 'BLOQUE' OR bfr.estado = 'VENTA_DIRECTA')
-            AND bf.fecha_inicio = ?
-            AND bf.fecha_fin = ?
-          )
-      `,
-      [...recursoIds, fechaFin, fechaInicio, fechaInicio, fechaFin]
-    );
-
-    return new Set(rows.map((row) => Number(row.recurso_id)));
-  } catch (error) {
-    if (esErrorTemporadaAltaNoMigrada(error)) {
-      return new Set();
-    }
-    throw error;
-  }
 }
 
 function construirPayloadDisponibilidad(disponibles, total, actualizadoEn = new Date().toISOString()) {
@@ -255,129 +234,64 @@ async function obtenerServicios(connection, { lugar = null, servicioIds = null, 
   return rows;
 }
 
-async function obtenerDisponibilidadCamping(connection, {
-  servicioId,
-  fechaInicio,
-  fechaFin,
-  totalPersonas,
-  maxPersonasReserva,
-  reservaExcluirId = null,
-  holdIdExcluir = null,
-}) {
-  const [recursosCamping] = await connection.query(
-    `SELECT id, cupo_maximo, es_recurso_principal FROM recurso
-      WHERE servicio_id = ? AND activo = 1
-      ORDER BY es_recurso_principal DESC, orden ASC, id ASC`,
-    [servicioId]
+/**
+ * Capacidad efectiva de cada recurso: el cupo del catalogo o, si no esta
+ * cargado, la caracteristica "Personas" (filtro PERSONAS). null = sin dato.
+ */
+async function obtenerCapacidadRecursos(connection, recursoIds) {
+  const ids = [...new Set((recursoIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  const capacidades = new Map();
+  if (ids.length === 0) return capacidades;
+  const placeholders = ids.map(() => "?").join(",");
+  const [rows] = await connection.query(
+    `SELECT r.id, r.cupo_maximo,
+            (SELECT COALESCE(fr.valor_numero, fr.cantidad)
+               FROM filtro_recurso fr
+               INNER JOIN filtro f ON f.id = fr.filtro_id
+              WHERE fr.recurso_id = r.id AND f.codigo = 'PERSONAS'
+              LIMIT 1) AS personas_filtro
+       FROM recurso r
+      WHERE r.id IN (${placeholders})`,
+    ids
   );
-
-  if (recursosCamping.length === 0) {
-    return construirPayloadDisponibilidad(0, 0);
+  for (const row of rows) {
+    const cupo = Number(row.cupo_maximo);
+    const personas = Number(row.personas_filtro);
+    let capacidad = null;
+    if (Number.isFinite(cupo) && cupo > 0) capacidad = Math.trunc(cupo);
+    else if (Number.isFinite(personas) && personas > 0) capacidad = Math.trunc(personas);
+    capacidades.set(Number(row.id), capacidad);
   }
-
-  const recursoCamping = recursosCamping[0];
-  const recursoCampingId = Number(recursoCamping.id);
-  const noches = obtenerNochesReserva(fechaInicio, fechaFin);
-
-  if (noches.length === 0) {
-    return construirPayloadDisponibilidad(0, 0);
-  }
-
-  const [tarifasCamping] = await connection.query(
-    `
-      SELECT fecha_inicio, fecha_fin, parcelas_disponibles
-      FROM tarifa
-      WHERE recurso_id = ?
-        AND fecha_inicio <= ?
-        AND fecha_fin >= ?
-        AND parcelas_disponibles IS NOT NULL
-    `,
-    [recursoCampingId, fechaFin, fechaInicio]
-  );
-  const [cuposConfigurados] = await connection.query(
-    `SELECT fecha_inicio, fecha_fin, cupo_total
-       FROM recurso_cupo_periodo
-      WHERE recurso_id = ? AND activo = 1
-        AND fecha_inicio <= ? AND fecha_fin >= ?`,
-    [recursoCampingId, fechaFin, fechaInicio]
-  );
-
-  let parcelasMinimas = null;
-  for (const noche of noches) {
-    let parcelasNoche = null;
-    for (const cupo of cuposConfigurados) {
-      if (cubreNoche(cupo, noche)) {
-        const cantidad = Number(cupo.cupo_total);
-        if (Number.isInteger(cantidad) && cantidad >= 0) {
-          parcelasNoche = parcelasNoche === null ? cantidad : Math.min(parcelasNoche, cantidad);
-        }
-      }
-    }
-    for (const tarifa of tarifasCamping) {
-      if (parcelasNoche === null && cubreNoche(tarifa, noche)) {
-        const parcelas = Number(tarifa.parcelas_disponibles);
-        if (Number.isFinite(parcelas)) {
-          if (parcelasNoche === null || parcelas < parcelasNoche) {
-            parcelasNoche = parcelas;
-          }
-        }
-      }
-    }
-
-    if (parcelasNoche === null && Number.isInteger(Number(recursoCamping.cupo_maximo))) {
-      parcelasNoche = Number(recursoCamping.cupo_maximo);
-    }
-    if (parcelasNoche === null) return construirPayloadDisponibilidad(0, 0);
-
-    if (parcelasMinimas === null || parcelasNoche < parcelasMinimas) {
-      parcelasMinimas = parcelasNoche;
-    }
-  }
-
-  const parcelasTotales = Number.isFinite(parcelasMinimas) ? Math.max(Number(parcelasMinimas), 0) : 0;
-  if (parcelasTotales <= 0) {
-    return construirPayloadDisponibilidad(0, parcelasTotales);
-  }
-
-  const maxPersonas = Number(maxPersonasReserva);
-  if (Number.isInteger(maxPersonas) && maxPersonas > 0 && totalPersonas > maxPersonas) {
-    return construirPayloadDisponibilidad(0, parcelasTotales);
-  }
-
-  // Al editar una reserva, no debe contarse a sí misma como ocupación
-  const filtroExclusion = reservaExcluirId ? " AND id <> ?" : "";
-  const paramsExclusion = reservaExcluirId ? [reservaExcluirId] : [];
-  const [reservasSolapadas] = await connection.query(
-    `
-      SELECT COUNT(*) AS total
-      FROM reserva
-      WHERE recurso_id = ?
-        AND fecha_inicio < ?
-        AND fecha_fin > ?
-        AND COALESCE(estado_reserva_id, 1) <> ?${filtroExclusion}
-    `,
-    [recursoCampingId, fechaFin, fechaInicio, ESTADO_RESERVA_CANCELADA_ID, ...paramsExclusion]
-  );
-
-  const ocupadas = Number(reservasSolapadas?.[0]?.total || 0);
-  const retenidas = await contarHoldsActivosRecurso(connection, {
-    recursoId: recursoCampingId,
-    fechaInicio,
-    fechaFin,
-    holdIdExcluir,
-  });
-  const disponibles = Math.max(parcelasTotales - ocupadas - retenidas, 0);
-
-  return construirPayloadDisponibilidad(disponibles, parcelasTotales);
+  return capacidades;
 }
 
-async function obtenerDisponibilidadNoCamping(connection, {
+function recursoAdmitePersonas(capacidades, recursoId, totalPersonas) {
+  const capacidad = capacidades.get(Number(recursoId));
+  if (!Number.isInteger(capacidad) || capacidad <= 0) return true;
+  const personas = Number(totalPersonas);
+  if (!Number.isFinite(personas) || personas <= 0) return true;
+  return personas <= capacidad;
+}
+
+async function consultarTolerante(connection, sql, params, valorPorDefecto = []) {
+  try {
+    const [rows] = await connection.query(sql, params);
+    return rows;
+  } catch (error) {
+    if (esErrorTemporadaAltaNoMigrada(error)) return valorPorDefecto;
+    throw error;
+  }
+}
+
+/**
+ * Carga en una sola pasada todo lo necesario para evaluar noche por noche la
+ * disponibilidad de los recursos de un servicio "por recurso" dentro de la
+ * ventana [fechaDesde, fechaHasta).
+ */
+async function cargarContextoNoCamping(connection, {
   servicioId,
-  fechaInicio,
-  fechaFin,
-  adultos,
-  ninos,
-  bebes,
+  fechaDesde,
+  fechaHasta,
   modeloTarifa,
   audienciaDepartamental = "TODAS",
   reservaExcluirId = null,
@@ -387,16 +301,18 @@ async function obtenerDisponibilidadNoCamping(connection, {
     "SELECT id FROM recurso WHERE servicio_id = ? AND activo = 1 ORDER BY orden ASC, id ASC",
     [servicioId]
   );
-
-  if (recursos.length === 0) {
-    return construirPayloadDisponibilidad(0, 0);
-  }
-
   const recursoIds = recursos.map((recurso) => Number(recurso.id));
+  if (recursoIds.length === 0) {
+    return { recursoIds, tarifas: [], reservas: [], holds: [], bloques: [], capacidades: new Map() };
+  }
   const placeholders = recursoIds.map(() => "?").join(",");
+  const ultimaNoche = sumarDiasFechaCivil(fechaHasta, -1) || fechaHasta;
 
   let tarifas = [];
   if (modeloTarifa !== "PRECIO_UNICO") {
+    // Solo cuentan las tarifas que la cotizacion realmente usaria: temporadas
+    // generales o temporadas de un bloque todavia activo (mismo criterio que
+    // validarSolapamientoTarifasExistentes).
     [tarifas] = await connection.query(
       `
         SELECT recurso_id, edad_minima, edad_maxima, fecha_inicio, fecha_fin
@@ -406,8 +322,19 @@ async function obtenerDisponibilidadNoCamping(connection, {
           AND COALESCE(audiencia_departamental, 'TODAS') IN ('TODAS', ?)
           AND fecha_inicio <= ?
           AND fecha_fin >= ?
+          AND (
+            temporada_tarifa_id IS NULL
+            OR temporada_tarifa_id IN (
+              SELECT tt.id FROM temporada_tarifa tt
+               WHERE COALESCE(tt.origen, 'GENERAL') = 'GENERAL'
+                  OR EXISTS (
+                    SELECT 1 FROM bloque_fecha bfv
+                     WHERE bfv.temporada_tarifa_id = tt.id AND bfv.estado = 'ACTIVO'
+                  )
+            )
+          )
       `,
-      [...recursoIds, audienciaDepartamental, fechaFin, fechaInicio]
+      [...recursoIds, audienciaDepartamental, ultimaNoche, fechaDesde]
     );
   }
   const [reglas] = await connection.query(
@@ -420,85 +347,336 @@ async function obtenerDisponibilidadNoCamping(connection, {
       WHERE rr.id IN (${placeholders}) AND tr.activo = 1
         AND tr.audiencia_departamental IN ('TODAS', ?)
         AND tr.fecha_inicio <= ? AND tr.fecha_fin >= ?`,
-    [...recursoIds, audienciaDepartamental, fechaFin, fechaInicio]
+    [...recursoIds, audienciaDepartamental, ultimaNoche, fechaDesde]
   );
   tarifas.push(...reglas);
 
-  // Al editar una reserva, no debe contarse a sí misma como ocupación
-  const filtroExclusion = reservaExcluirId ? " AND id <> ?" : "";
+  const filtroExclusion = reservaExcluirId ? " AND r.id <> ?" : "";
   const paramsExclusion = reservaExcluirId ? [reservaExcluirId] : [];
-  const [reservasSolapadas] = await connection.query(
+  const [reservas] = await connection.query(
     `
-      SELECT DISTINCT recurso_id
-      FROM reserva
-      WHERE recurso_id IN (${placeholders})
-        AND fecha_inicio < ?
-        AND fecha_fin > ?
-        AND COALESCE(estado_reserva_id, 1) <> ?${filtroExclusion}
+      SELECT r.recurso_id,
+             DATE_FORMAT(r.fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
+             DATE_FORMAT(r.fecha_fin, '%Y-%m-%d') AS fecha_fin
+      FROM reserva r
+      LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+      WHERE r.recurso_id IN (${placeholders})
+        AND r.fecha_inicio < ?
+        AND r.fecha_fin > ?
+        AND COALESCE(r.estado_reserva_id, 1) <> ?
+        AND COALESCE(er.nombre, '') NOT IN (${ESTADOS_RESERVA_LIBERAN.map(() => "?").join(",")})${filtroExclusion}
     `,
-    [...recursoIds, fechaFin, fechaInicio, ESTADO_RESERVA_CANCELADA_ID, ...paramsExclusion]
+    [...recursoIds, fechaHasta, fechaDesde, ESTADO_RESERVA_CANCELADA_ID, ...ESTADOS_RESERVA_LIBERAN, ...paramsExclusion]
   );
 
-  const recursoOcupadoSet = new Set(reservasSolapadas.map((r) => Number(r.recurso_id)));
-  const recursoRetenidoSet = await obtenerRecursosRetenidos(connection, {
+  const holds = await listarHoldsActivosRecursos(connection, {
     recursoIds,
-    fechaInicio,
-    fechaFin,
+    fechaInicio: fechaDesde,
+    fechaFin: fechaHasta,
     holdIdExcluir,
   });
-  const recursoBloqueadoPorBloqueSet = await obtenerRecursosBloqueadosPorBloques(connection, {
-    recursoIds,
-    fechaInicio,
-    fechaFin,
-  });
+
+  const bloques = await consultarTolerante(
+    connection,
+    `
+      SELECT bfr.recurso_id, bf.modalidad, bfr.estado AS estado_recurso,
+             DATE_FORMAT(bf.fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
+             DATE_FORMAT(bf.fecha_fin, '%Y-%m-%d') AS fecha_fin
+      FROM bloque_fecha_recurso bfr
+      INNER JOIN bloque_fecha bf ON bf.id = bfr.bloque_fecha_id
+      WHERE bfr.recurso_id IN (${placeholders})
+        AND bf.estado = 'ACTIVO'
+        AND bfr.estado IN ('DISPONIBLE', 'SORTEO', 'VENTA_DIRECTA')
+        AND bf.fecha_inicio < ?
+        AND bf.fecha_fin > ?
+    `,
+    [...recursoIds, fechaHasta, fechaDesde]
+  );
+
+  const capacidades = await obtenerCapacidadRecursos(connection, recursoIds);
+
+  return { recursoIds, tarifas, reservas, holds, bloques, capacidades };
+}
+
+/**
+ * Para cada noche devuelve los recursos con tarifa completa para las
+ * categorias buscadas y, de ellos, cuales estan libres (sin reserva, hold ni
+ * bloque). `bloqueExacto` permite que una busqueda que coincide exactamente
+ * con un bloque de venta directa no vea bloqueados sus recursos.
+ */
+function calcularNochesNoCamping(contexto, { noches, categorias, totalPersonas, bloqueExacto = null }) {
   const tarifasPorRecurso = new Map();
-  for (const tarifa of tarifas) {
+  for (const tarifa of contexto.tarifas) {
     const recursoId = Number(tarifa.recurso_id);
-    if (!tarifasPorRecurso.has(recursoId)) {
-      tarifasPorRecurso.set(recursoId, []);
-    }
+    if (!tarifasPorRecurso.has(recursoId)) tarifasPorRecurso.set(recursoId, []);
     tarifasPorRecurso.get(recursoId).push(tarifa);
   }
+  const bloqueoExento = (bloque) => Boolean(
+    bloqueExacto
+    && (bloque.modalidad === "BLOQUE" || bloque.estado_recurso === "VENTA_DIRECTA")
+    && normalizarFechaCivil(bloque.fecha_inicio) === bloqueExacto.fechaInicio
+    && normalizarFechaCivil(bloque.fecha_fin) === bloqueExacto.fechaFin
+  );
+  const recursosAdmitidos = contexto.recursoIds.filter((recursoId) =>
+    recursoAdmitePersonas(contexto.capacidades, recursoId, totalPersonas)
+  );
 
+  const resultado = new Map();
+  for (const noche of noches) {
+    const conTarifa = new Set();
+    const libres = new Set();
+    for (const recursoId of recursosAdmitidos) {
+      const tarifasRecurso = tarifasPorRecurso.get(recursoId) || [];
+      if (tarifasRecurso.length === 0) continue;
+      const cubre = categorias.every((categoria) =>
+        tarifasRecurso.some((tarifa) => tarifaAplicaParaEdad(tarifa, categoria.edadRepresentativa) && cubreNoche(tarifa, noche))
+      );
+      if (!cubre) continue;
+      conTarifa.add(recursoId);
+      const ocupado = contexto.reservas.some((reserva) => Number(reserva.recurso_id) === recursoId && ocupaNoche(reserva, noche))
+        || contexto.holds.some((hold) => Number(hold.recurso_id) === recursoId && ocupaNoche(hold, noche))
+        || contexto.bloques.some((bloque) => Number(bloque.recurso_id) === recursoId && !bloqueoExento(bloque) && ocupaNoche(bloque, noche));
+      if (!ocupado) libres.add(recursoId);
+    }
+    resultado.set(noche, { conTarifa, libres });
+  }
+  return resultado;
+}
+
+function interseccionRecursos(mapaNoches, noches, clave) {
+  let acumulado = null;
+  for (const noche of noches) {
+    const datos = mapaNoches.get(noche);
+    const conjunto = datos ? datos[clave] : new Set();
+    if (acumulado === null) {
+      acumulado = new Set(conjunto);
+    } else {
+      for (const recursoId of [...acumulado]) {
+        if (!conjunto.has(recursoId)) acumulado.delete(recursoId);
+      }
+    }
+    if (acumulado.size === 0) break;
+  }
+  return acumulado || new Set();
+}
+
+async function cargarContextoCamping(connection, {
+  servicioId,
+  fechaDesde,
+  fechaHasta,
+  reservaExcluirId = null,
+  holdIdExcluir = null,
+}) {
+  const [recursosCamping] = await connection.query(
+    `SELECT id, cupo_maximo, es_recurso_principal FROM recurso
+      WHERE servicio_id = ? AND activo = 1
+      ORDER BY es_recurso_principal DESC, orden ASC, id ASC`,
+    [servicioId]
+  );
+  if (recursosCamping.length === 0) {
+    return null;
+  }
+  const recursoCamping = recursosCamping[0];
+  const recursoCampingId = Number(recursoCamping.id);
+  const ultimaNoche = sumarDiasFechaCivil(fechaHasta, -1) || fechaHasta;
+
+  const [tarifasCamping] = await connection.query(
+    `
+      SELECT fecha_inicio, fecha_fin, parcelas_disponibles
+      FROM tarifa
+      WHERE recurso_id = ?
+        AND fecha_inicio <= ?
+        AND fecha_fin >= ?
+        AND parcelas_disponibles IS NOT NULL
+    `,
+    [recursoCampingId, ultimaNoche, fechaDesde]
+  );
+  const [cuposConfigurados] = await connection.query(
+    `SELECT fecha_inicio, fecha_fin, cupo_total
+       FROM recurso_cupo_periodo
+      WHERE recurso_id = ? AND activo = 1
+        AND fecha_inicio <= ? AND fecha_fin >= ?`,
+    [recursoCampingId, ultimaNoche, fechaDesde]
+  );
+
+  const filtroExclusion = reservaExcluirId ? " AND r.id <> ?" : "";
+  const paramsExclusion = reservaExcluirId ? [reservaExcluirId] : [];
+  const [reservas] = await connection.query(
+    `
+      SELECT r.recurso_id,
+             DATE_FORMAT(r.fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
+             DATE_FORMAT(r.fecha_fin, '%Y-%m-%d') AS fecha_fin
+      FROM reserva r
+      LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+      WHERE r.recurso_id = ?
+        AND r.fecha_inicio < ?
+        AND r.fecha_fin > ?
+        AND COALESCE(r.estado_reserva_id, 1) <> ?
+        AND COALESCE(er.nombre, '') NOT IN (${ESTADOS_RESERVA_LIBERAN.map(() => "?").join(",")})${filtroExclusion}
+    `,
+    [recursoCampingId, fechaHasta, fechaDesde, ESTADO_RESERVA_CANCELADA_ID, ...ESTADOS_RESERVA_LIBERAN, ...paramsExclusion]
+  );
+  const holds = await listarHoldsActivosRecursos(connection, {
+    recursoIds: [recursoCampingId],
+    fechaInicio: fechaDesde,
+    fechaFin: fechaHasta,
+    holdIdExcluir,
+  });
+
+  return {
+    recursoCampingId,
+    cupoMaximo: Number.isInteger(Number(recursoCamping.cupo_maximo)) ? Number(recursoCamping.cupo_maximo) : null,
+    tarifas: tarifasCamping,
+    cupos: cuposConfigurados,
+    reservas,
+    holds,
+  };
+}
+
+function parcelasConfiguradasNoche(contexto, noche) {
+  let parcelasNoche = null;
+  for (const cupo of contexto.cupos) {
+    if (cubreNoche(cupo, noche)) {
+      const cantidad = Number(cupo.cupo_total);
+      if (Number.isInteger(cantidad) && cantidad >= 0) {
+        parcelasNoche = parcelasNoche === null ? cantidad : Math.min(parcelasNoche, cantidad);
+      }
+    }
+  }
+  if (parcelasNoche === null) {
+    for (const tarifa of contexto.tarifas) {
+      if (cubreNoche(tarifa, noche)) {
+        const parcelas = Number(tarifa.parcelas_disponibles);
+        if (Number.isFinite(parcelas) && (parcelasNoche === null || parcelas < parcelasNoche)) {
+          parcelasNoche = parcelas;
+        }
+      }
+    }
+  }
+  if (parcelasNoche === null && Number.isInteger(contexto.cupoMaximo)) {
+    parcelasNoche = contexto.cupoMaximo;
+  }
+  return parcelasNoche;
+}
+
+/**
+ * Para cada noche: parcelas configuradas (null si no hay cupo ni tarifa) y
+ * parcelas libres descontando reservas y holds que ocupan esa noche.
+ */
+function calcularNochesCamping(contexto, { noches }) {
+  const resultado = new Map();
+  for (const noche of noches) {
+    const parcelas = parcelasConfiguradasNoche(contexto, noche);
+    if (parcelas === null) {
+      resultado.set(noche, { parcelas: null, libres: 0 });
+      continue;
+    }
+    const ocupadas = contexto.reservas.filter((reserva) => ocupaNoche(reserva, noche)).length
+      + contexto.holds.filter((hold) => ocupaNoche(hold, noche)).length;
+    resultado.set(noche, { parcelas, libres: Math.max(parcelas - ocupadas, 0) });
+  }
+  return resultado;
+}
+
+async function obtenerDisponibilidadCamping(connection, {
+  servicioId,
+  fechaInicio,
+  fechaFin,
+  totalPersonas,
+  maxPersonasReserva,
+  reservaExcluirId = null,
+  holdIdExcluir = null,
+}) {
   const noches = obtenerNochesReserva(fechaInicio, fechaFin);
   if (noches.length === 0) {
     return construirPayloadDisponibilidad(0, 0);
   }
-
-  const categorias = categoriasBusquedaDesdePersonas({ adultos, ninos, bebes });
-  const recursosCompatibles = [];
-
-  for (const recursoId of recursoIds) {
-    const tarifasRecurso = tarifasPorRecurso.get(recursoId) || [];
-    if (tarifasRecurso.length === 0) {
-      continue;
-    }
-
-    const cumpleTodasCategorias = categorias.every((categoria) => {
-      const tarifasCategoria = tarifasRecurso.filter((tarifa) =>
-        tarifaAplicaParaEdad(tarifa, categoria.edadRepresentativa)
-      );
-      return tarifasCubrenTodasLasNoches(tarifasCategoria, noches);
-    });
-
-    if (cumpleTodasCategorias) {
-      recursosCompatibles.push(recursoId);
-    }
-  }
-
-  const total = recursosCompatibles.length;
-  if (total === 0) {
+  const contexto = await cargarContextoCamping(connection, {
+    servicioId,
+    fechaDesde: fechaInicio,
+    fechaHasta: fechaFin,
+    reservaExcluirId,
+    holdIdExcluir,
+  });
+  if (!contexto) {
     return construirPayloadDisponibilidad(0, 0);
   }
 
-  const disponibles = recursosCompatibles.reduce((acumulado, recursoId) => {
-    const noDisponible = recursoOcupadoSet.has(recursoId)
-      || recursoRetenidoSet.has(recursoId)
-      || recursoBloqueadoPorBloqueSet.has(recursoId);
-    return acumulado + (noDisponible ? 0 : 1);
-  }, 0);
+  const mapaNoches = calcularNochesCamping(contexto, { noches });
+  let parcelasMinimas = null;
+  let libresMinimas = null;
+  for (const noche of noches) {
+    const datos = mapaNoches.get(noche);
+    if (!datos || datos.parcelas === null) return construirPayloadDisponibilidad(0, 0);
+    parcelasMinimas = parcelasMinimas === null ? datos.parcelas : Math.min(parcelasMinimas, datos.parcelas);
+    libresMinimas = libresMinimas === null ? datos.libres : Math.min(libresMinimas, datos.libres);
+  }
 
+  const parcelasTotales = Math.max(Number(parcelasMinimas) || 0, 0);
+  if (parcelasTotales <= 0) {
+    return construirPayloadDisponibilidad(0, parcelasTotales);
+  }
+
+  const maxPersonas = Number(maxPersonasReserva);
+  if (Number.isInteger(maxPersonas) && maxPersonas > 0 && totalPersonas > maxPersonas) {
+    return construirPayloadDisponibilidad(0, parcelasTotales);
+  }
+
+  return construirPayloadDisponibilidad(Math.max(Number(libresMinimas) || 0, 0), parcelasTotales);
+}
+
+async function obtenerDisponibilidadNoCamping(connection, {
+  servicioId,
+  fechaInicio,
+  fechaFin,
+  adultos,
+  ninos,
+  bebes,
+  totalPersonas = null,
+  modeloTarifa,
+  audienciaDepartamental = "TODAS",
+  reservaExcluirId = null,
+  holdIdExcluir = null,
+}) {
+  const noches = obtenerNochesReserva(fechaInicio, fechaFin);
+  if (noches.length === 0) {
+    return construirPayloadDisponibilidad(0, 0);
+  }
+  const contexto = await cargarContextoNoCamping(connection, {
+    servicioId,
+    fechaDesde: fechaInicio,
+    fechaHasta: fechaFin,
+    modeloTarifa,
+    audienciaDepartamental,
+    reservaExcluirId,
+    holdIdExcluir,
+  });
+  if (contexto.recursoIds.length === 0) {
+    return construirPayloadDisponibilidad(0, 0);
+  }
+
+  const categorias = categoriasBusquedaDesdePersonas({ adultos, ninos, bebes });
+  const personas = Number.isFinite(Number(totalPersonas)) && Number(totalPersonas) > 0
+    ? Number(totalPersonas)
+    : Number(adultos || 0) + Number(ninos || 0) + Number(bebes || 0);
+  const mapaNoches = calcularNochesNoCamping(contexto, {
+    noches,
+    categorias,
+    totalPersonas: personas,
+    bloqueExacto: { fechaInicio, fechaFin },
+  });
+
+  const total = interseccionRecursos(mapaNoches, noches, "conTarifa").size;
+  if (total === 0) {
+    return construirPayloadDisponibilidad(0, 0);
+  }
+  const disponibles = interseccionRecursos(mapaNoches, noches, "libres").size;
   return construirPayloadDisponibilidad(disponibles, total);
+}
+
+function audienciaDesdeConfiguracion(configuracion, departamentalId) {
+  if (configuracion.propietario_departamental_id == null) return "TODAS";
+  return Number(departamentalId) === Number(configuracion.propietario_departamental_id) ? "PROPIA" : "OTRAS";
 }
 
 async function calcularDisponibilidadServicio(connection, params) {
@@ -518,6 +696,7 @@ async function calcularDisponibilidadServicio(connection, params) {
     departamentalId = null,
     reservaExcluirId = null,
     holdIdExcluir = null,
+    hoy = obtenerFechaCivilArgentina(),
   } = params;
 
   let configuracion = {
@@ -540,7 +719,7 @@ async function calcularDisponibilidadServicio(connection, params) {
     [configuracion] = filas;
   }
   const anticipacion = Number(configuracion.anticipacion_minima_dias || 0);
-  const fechaMinima = sumarDiasFechaCivil(obtenerFechaCivilArgentina(), anticipacion);
+  const fechaMinima = sumarDiasFechaCivil(hoy, anticipacion);
   if (fechaMinima && fechaInicio < fechaMinima) {
     return { ...construirPayloadDisponibilidad(0, 0), actualizado_en: new Date().toISOString() };
   }
@@ -567,10 +746,9 @@ async function calcularDisponibilidadServicio(connection, params) {
           adultos,
           ninos,
           bebes,
+          totalPersonas,
           modeloTarifa: configuracion.modelo_tarifa,
-          audienciaDepartamental: configuracion.propietario_departamental_id == null
-            ? "TODAS"
-            : (Number(departamentalId) === Number(configuracion.propietario_departamental_id) ? "PROPIA" : "OTRAS"),
+          audienciaDepartamental: audienciaDesdeConfiguracion(configuracion, departamentalId),
           reservaExcluirId,
           holdIdExcluir,
         });
@@ -627,6 +805,33 @@ async function obtenerSnapshotDisponibilidad(connection, params) {
   return resultados;
 }
 
+function maximoFechaCivil(...fechas) {
+  return fechas.filter(Boolean).sort().pop() || null;
+}
+
+function calendarioVacio({ fechaInicio, fechaFin, nochesCantidad = 0, horizonteDias = HORIZONTE_ALTERNATIVAS_DIAS }) {
+  return {
+    fechas_habilitadas: [],
+    rangos_disponibles: [],
+    sugerencia: null,
+    noches: [],
+    noches_cantidad: nochesCantidad,
+    fecha_inicio_solicitada: fechaInicio || null,
+    fecha_fin_solicitada: fechaFin || null,
+    horizonte_dias: horizonteDias,
+  };
+}
+
+/**
+ * Busca estadias alternativas de la misma cantidad de noches alrededor de la
+ * fecha pedida (hacia atras hasta hoy + anticipacion y hacia adelante hasta el
+ * horizonte). Todo se resuelve en memoria con una sola carga de contexto:
+ * evita las ~5 consultas por dia candidato del enfoque anterior.
+ *
+ * Devuelve las fechas de inicio validas, los rangos mas cercanos ordenados por
+ * fecha, la sugerencia (el rango mas proximo a lo pedido) y el estado de cada
+ * noche de la ventana para pintar calendarios.
+ */
 async function obtenerCalendarioAlternativoServicio(connection, params) {
   const {
     servicioId,
@@ -640,63 +845,264 @@ async function obtenerCalendarioAlternativoServicio(connection, params) {
     horizonteDias = HORIZONTE_ALTERNATIVAS_DIAS,
     maxResultados = MAX_RANGOS_ALTERNATIVOS,
     holdIdExcluir = null,
+    reservaExcluirId = null,
+    hoy = obtenerFechaCivilArgentina(),
+    servicio: servicioPrecargado = null,
+    incluirNoches = true,
   } = params;
 
   const noches = obtenerNochesReserva(fechaInicio, fechaFin);
-  if (noches.length === 0) {
-    return {
-      fechas_habilitadas: [],
-      rangos_disponibles: [],
-    };
-  }
-
   const nochesCantidad = noches.length;
-  const fechasHabilitadas = [];
-  const rangosDisponibles = [];
+  const vacio = calendarioVacio({ fechaInicio, fechaFin, nochesCantidad, horizonteDias });
+  if (nochesCantidad === 0) return vacio;
 
-  for (let i = 0; i <= horizonteDias; i++) {
-    if (fechasHabilitadas.length >= maxResultados) {
-      break;
-    }
+  const servicio = servicioPrecargado
+    || (await obtenerServicios(connection, { servicioId: Number(servicioId) }))[0]
+    || null;
+  if (!servicio) return vacio;
 
-    const nuevaFechaInicio = sumarDiasFechaCivil(fechaInicio, i);
-    const nuevaFechaFin = sumarDiasFechaCivil(nuevaFechaInicio, nochesCantidad);
+  const personas = Number.isFinite(Number(totalPersonas)) && Number(totalPersonas) > 0
+    ? Number(totalPersonas)
+    : Number(adultos || 0) + Number(ninos || 0) + Number(bebes || 0);
+  if (servicio.modelo_tarifa === "PRECIO_UNICO" && personas !== 1) return vacio;
 
-    const disponibilidad = await calcularDisponibilidadServicio(connection, {
-      servicioId,
-      fechaInicio: nuevaFechaInicio,
-      fechaFin: nuevaFechaFin,
-      adultos,
-      ninos,
-      bebes,
-      totalPersonas,
-      departamentalId,
+  const horizonte = Number.isInteger(Number(horizonteDias)) && Number(horizonteDias) >= 0
+    ? Number(horizonteDias)
+    : HORIZONTE_ALTERNATIVAS_DIAS;
+  const anticipacion = Number(servicio.anticipacion_minima_dias || 0);
+  const primerInicioPermitido = maximoFechaCivil(hoy, sumarDiasFechaCivil(hoy, anticipacion));
+  const inicioVentana = maximoFechaCivil(primerInicioPermitido, sumarDiasFechaCivil(fechaInicio, -horizonte));
+  const ultimoInicio = sumarDiasFechaCivil(fechaInicio, horizonte);
+  if (!inicioVentana || !ultimoInicio || inicioVentana > ultimoInicio) return vacio;
+  const finVentana = sumarDiasFechaCivil(ultimoInicio, nochesCantidad);
+  const nochesVentana = obtenerNochesReserva(inicioVentana, finVentana, 2000);
+  if (nochesVentana.length === 0) return vacio;
+
+  const esCamping = servicio.tipo_codigo === "CUPO_NUMERADO";
+  let disponiblesPorNoche = new Map();
+  let conTarifaPorNoche = new Map();
+  let lugaresRango;
+
+  if (esCamping) {
+    const maxPersonas = Number(servicio.max_personas_reserva);
+    if (Number.isInteger(maxPersonas) && maxPersonas > 0 && personas > maxPersonas) return vacio;
+    const contexto = await cargarContextoCamping(connection, {
+      servicioId: Number(servicio.id),
+      fechaDesde: inicioVentana,
+      fechaHasta: finVentana,
+      reservaExcluirId,
       holdIdExcluir,
     });
+    if (!contexto) return vacio;
+    const mapa = calcularNochesCamping(contexto, { noches: nochesVentana });
+    for (const noche of nochesVentana) {
+      const datos = mapa.get(noche);
+      disponiblesPorNoche.set(noche, datos && datos.parcelas !== null ? datos.libres : 0);
+      conTarifaPorNoche.set(noche, Boolean(datos && datos.parcelas !== null));
+    }
+    lugaresRango = (nochesEstadia) => {
+      let minimo = null;
+      for (const noche of nochesEstadia) {
+        if (!conTarifaPorNoche.get(noche)) return 0;
+        const libres = disponiblesPorNoche.get(noche) || 0;
+        minimo = minimo === null ? libres : Math.min(minimo, libres);
+        if (minimo === 0) return 0;
+      }
+      return minimo || 0;
+    };
+  } else {
+    const contexto = await cargarContextoNoCamping(connection, {
+      servicioId: Number(servicio.id),
+      fechaDesde: inicioVentana,
+      fechaHasta: finVentana,
+      modeloTarifa: servicio.modelo_tarifa,
+      audienciaDepartamental: audienciaDesdeConfiguracion(servicio, departamentalId),
+      reservaExcluirId,
+      holdIdExcluir,
+    });
+    if (contexto.recursoIds.length === 0) return vacio;
+    const categorias = categoriasBusquedaDesdePersonas({ adultos, ninos, bebes });
+    const mapa = calcularNochesNoCamping(contexto, {
+      noches: nochesVentana,
+      categorias,
+      totalPersonas: personas,
+      bloqueExacto: null,
+    });
+    for (const noche of nochesVentana) {
+      const datos = mapa.get(noche);
+      disponiblesPorNoche.set(noche, datos ? datos.libres.size : 0);
+      conTarifaPorNoche.set(noche, Boolean(datos && datos.conTarifa.size > 0));
+    }
+    lugaresRango = (nochesEstadia) => interseccionRecursos(mapa, nochesEstadia, "libres").size;
+  }
 
-    if (disponibilidad.disponibles > 0) {
-      fechasHabilitadas.push(nuevaFechaInicio);
-      rangosDisponibles.push({
-        fecha_inicio: nuevaFechaInicio,
-        fecha_fin: nuevaFechaFin,
-        lugares_disponibles: disponibilidad.disponibles,
+  const candidatos = [];
+  for (let inicio = inicioVentana; inicio && inicio <= ultimoInicio; inicio = sumarDiasFechaCivil(inicio, 1)) {
+    const nochesEstadia = obtenerNochesReserva(inicio, sumarDiasFechaCivil(inicio, nochesCantidad));
+    const lugares = lugaresRango(nochesEstadia);
+    if (lugares > 0) {
+      const distancia = Math.abs(diferenciaDiasCivil(fechaInicio, inicio) || 0);
+      candidatos.push({
+        fecha_inicio: inicio,
+        fecha_fin: sumarDiasFechaCivil(inicio, nochesCantidad),
+        lugares_disponibles: lugares,
+        distancia_dias: distancia,
       });
     }
   }
 
+  const porCercania = [...candidatos].sort((a, b) =>
+    a.distancia_dias - b.distancia_dias
+    // A igual distancia, primero la fecha posterior a la pedida.
+    || (b.fecha_inicio >= fechaInicio ? 1 : 0) - (a.fecha_inicio >= fechaInicio ? 1 : 0)
+    || a.fecha_inicio.localeCompare(b.fecha_inicio)
+  );
+  const limite = Number.isInteger(Number(maxResultados)) && Number(maxResultados) > 0
+    ? Number(maxResultados)
+    : MAX_RANGOS_ALTERNATIVOS;
+  const masCercanos = porCercania.slice(0, limite)
+    .sort((a, b) => a.fecha_inicio.localeCompare(b.fecha_inicio));
+
   return {
-    fechas_habilitadas: fechasHabilitadas,
-    rangos_disponibles: rangosDisponibles,
+    fechas_habilitadas: candidatos.map((candidato) => candidato.fecha_inicio),
+    rangos_disponibles: masCercanos,
+    sugerencia: porCercania[0] || null,
+    noches: incluirNoches
+      ? nochesVentana.map((noche) => ({
+        fecha: noche,
+        disponibles: disponiblesPorNoche.get(noche) || 0,
+        con_tarifa: Boolean(conTarifaPorNoche.get(noche)),
+      }))
+      : [],
+    noches_cantidad: nochesCantidad,
+    fecha_inicio_solicitada: fechaInicio,
+    fecha_fin_solicitada: fechaFin,
+    horizonte_dias: horizonte,
   };
+}
+
+/**
+ * Estado noche por noche de UN recurso concreto (para el calendario del paso
+ * "Fechas" de la reserva): ocupado por reserva/hold/bloque o sin cupo.
+ */
+async function obtenerOcupacionNochesRecurso(connection, {
+  servicio,
+  recursoId,
+  fechaDesde,
+  fechaHasta,
+  reservaExcluirId = null,
+  holdIdExcluir = null,
+}) {
+  const noches = obtenerNochesReserva(fechaDesde, fechaHasta, 2000);
+  const resultado = new Map();
+  if (noches.length === 0) return resultado;
+
+  if (servicio.tipo_codigo === "CUPO_NUMERADO") {
+    const contexto = await cargarContextoCamping(connection, {
+      servicioId: Number(servicio.id),
+      fechaDesde,
+      fechaHasta,
+      reservaExcluirId,
+      holdIdExcluir,
+    });
+    if (!contexto) {
+      for (const noche of noches) resultado.set(noche, { ocupado: true, motivo: "SIN_CUPO" });
+      return resultado;
+    }
+    const mapa = calcularNochesCamping(contexto, { noches });
+    for (const noche of noches) {
+      const datos = mapa.get(noche);
+      if (!datos || datos.parcelas === null) {
+        resultado.set(noche, { ocupado: true, motivo: "SIN_CUPO" });
+      } else if (datos.libres <= 0) {
+        resultado.set(noche, { ocupado: true, motivo: "COMPLETO" });
+      } else {
+        resultado.set(noche, { ocupado: false, motivo: null, lugares: datos.libres });
+      }
+    }
+    return resultado;
+  }
+
+  const id = Number(recursoId);
+  const placeholders = "?";
+  const filtroExclusion = reservaExcluirId ? " AND r.id <> ?" : "";
+  const paramsExclusion = reservaExcluirId ? [reservaExcluirId] : [];
+  const [reservas] = await connection.query(
+    `
+      SELECT r.recurso_id,
+             DATE_FORMAT(r.fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
+             DATE_FORMAT(r.fecha_fin, '%Y-%m-%d') AS fecha_fin
+      FROM reserva r
+      LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+      WHERE r.recurso_id IN (${placeholders})
+        AND r.fecha_inicio < ?
+        AND r.fecha_fin > ?
+        AND COALESCE(r.estado_reserva_id, 1) <> ?
+        AND COALESCE(er.nombre, '') NOT IN (${ESTADOS_RESERVA_LIBERAN.map(() => "?").join(",")})${filtroExclusion}
+    `,
+    [id, fechaHasta, fechaDesde, ESTADO_RESERVA_CANCELADA_ID, ...ESTADOS_RESERVA_LIBERAN, ...paramsExclusion]
+  );
+  const holds = await listarHoldsActivosRecursos(connection, {
+    recursoIds: [id],
+    fechaInicio: fechaDesde,
+    fechaFin: fechaHasta,
+    holdIdExcluir,
+  });
+  const bloques = await consultarTolerante(
+    connection,
+    `
+      SELECT bfr.recurso_id, bf.modalidad, bfr.estado AS estado_recurso,
+             DATE_FORMAT(bf.fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
+             DATE_FORMAT(bf.fecha_fin, '%Y-%m-%d') AS fecha_fin
+      FROM bloque_fecha_recurso bfr
+      INNER JOIN bloque_fecha bf ON bf.id = bfr.bloque_fecha_id
+      WHERE bfr.recurso_id IN (${placeholders})
+        AND bf.estado = 'ACTIVO'
+        AND bfr.estado IN ('DISPONIBLE', 'SORTEO', 'VENTA_DIRECTA')
+        AND bf.fecha_inicio < ?
+        AND bf.fecha_fin > ?
+    `,
+    [id, fechaHasta, fechaDesde]
+  );
+  for (const noche of noches) {
+    if (reservas.some((reserva) => ocupaNoche(reserva, noche))) {
+      resultado.set(noche, { ocupado: true, motivo: "RESERVADO" });
+    } else if (holds.some((hold) => ocupaNoche(hold, noche))) {
+      resultado.set(noche, { ocupado: true, motivo: "RETENIDO" });
+    } else {
+      const bloque = bloques.find((item) => ocupaNoche(item, noche));
+      if (bloque) {
+        resultado.set(noche, {
+          ocupado: true,
+          motivo: bloque.modalidad === "SORTEO" && bloque.estado_recurso !== "VENTA_DIRECTA" ? "SORTEO" : "BLOQUE",
+          bloque: { fecha_inicio: bloque.fecha_inicio, fecha_fin: bloque.fecha_fin, modalidad: bloque.modalidad },
+        });
+      } else {
+        resultado.set(noche, { ocupado: false, motivo: null });
+      }
+    }
+  }
+  return resultado;
 }
 
 module.exports = {
   HORIZONTE_ALTERNATIVAS_DIAS,
+  MAX_RANGOS_ALTERNATIVOS,
   UMBRAL_ULTIMOS_LUGARES,
+  calcularNochesCamping,
+  calcularNochesNoCamping,
+  categoriasBusquedaDesdePersonas,
+  cubreNoche,
+  interseccionRecursos,
+  obtenerCapacidadRecursos,
+  obtenerOcupacionNochesRecurso,
+  ocupaNoche,
   parsearParametrosBusquedaDisponibilidad,
   parsearServicioIdsCsv,
   obtenerServicios,
   calcularDisponibilidadServicio,
   obtenerSnapshotDisponibilidad,
   obtenerCalendarioAlternativoServicio,
+  recursoAdmitePersonas,
+  tarifasCubrenTodasLasNoches,
 };

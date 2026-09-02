@@ -964,6 +964,49 @@ async function obtenerRecursosRetenidos(connection, {
   }
 }
 
+async function listarHoldsActivosRecursos(connection, {
+  recursoIds,
+  fechaInicio,
+  fechaFin,
+  holdIdExcluir = null,
+}) {
+  const ids = [...new Set((recursoIds || []).map(normalizarIdPositivo).filter(Boolean))];
+  const inicio = normalizarFechaCivil(fechaInicio);
+  const fin = normalizarFechaCivil(fechaFin);
+  if (ids.length === 0 || !inicio || !fin) return [];
+  const placeholders = ids.map(() => "?").join(",");
+  const params = [...ids, fin, inicio];
+  let filtro = "";
+  if (holdIdExcluir) {
+    filtro = " AND id <> ?";
+    params.push(holdIdExcluir);
+  }
+  try {
+    const [rows] = await connection.query(
+      `SELECT id, recurso_id, numero_parcela,
+              DATE_FORMAT(fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
+              DATE_FORMAT(fecha_fin, '%Y-%m-%d') AS fecha_fin
+         FROM ${TABLA_HOLDS}
+        WHERE recurso_id IN (${placeholders})
+          AND estado = 'ACTIVO'
+          AND vence_en > NOW(6)
+          AND fecha_inicio < ?
+          AND fecha_fin > ?${filtro}`,
+      params
+    );
+    return rows.map((row) => ({
+      id: Number(row.id),
+      recurso_id: Number(row.recurso_id),
+      numero_parcela: row.numero_parcela == null ? null : Number(row.numero_parcela),
+      fecha_inicio: row.fecha_inicio,
+      fecha_fin: row.fecha_fin,
+    }));
+  } catch (error) {
+    if (esErrorTablaHoldNoMigrada(error)) return [];
+    throw error;
+  }
+}
+
 async function contarHoldsActivosRecurso(connection, {
   recursoId,
   fechaInicio,
@@ -1197,6 +1240,7 @@ module.exports = {
   hashTokenHold,
   iniciarMantenimientoHolds,
   liberarHoldTurismo,
+  listarHoldsActivosRecursos,
   mapearHold,
   normalizarTokenHold,
   obtenerBloquesRecursosRetenidos,

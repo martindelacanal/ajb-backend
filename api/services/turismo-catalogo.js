@@ -285,11 +285,21 @@ async function servicioVisibleParaActor(connection, cabecera, servicioId, { recu
   const recursoJoin = rid
     ? "INNER JOIN recurso r ON r.servicio_id = s.id AND r.id = ? AND r.activo = 1"
     : "";
-  const recursoSelect = rid ? "r.cupo_maximo AS recurso_cupo_maximo" : "NULL AS recurso_cupo_maximo";
+  // Capacidad real de la unidad: el cupo del catalogo o, si no esta cargado,
+  // la caracteristica "Personas" (filtro PERSONAS) del recurso.
+  const recursoSelect = rid
+    ? `COALESCE(NULLIF(r.cupo_maximo, 0), (
+         SELECT COALESCE(fr.valor_numero, fr.cantidad)
+           FROM filtro_recurso fr INNER JOIN filtro f ON f.id = fr.filtro_id
+          WHERE fr.recurso_id = r.id AND f.codigo = 'PERSONAS'
+          LIMIT 1
+       )) AS recurso_cupo_maximo`
+    : "NULL AS recurso_cupo_maximo";
   const [rows] = await connection.query(
     `SELECT s.id, s.tipo_servicio_id, s.propietario_departamental_id,
             s.modelo_tarifa, s.unidad_cobro, s.permite_acompanantes,
-            s.max_personas_reserva, ${recursoSelect}, ts.codigo AS tipo_codigo
+            s.max_personas_reserva, s.anticipacion_minima_dias,
+            ${recursoSelect}, ts.codigo AS tipo_codigo
        FROM servicio s
        INNER JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id AND ts.activo = 1
        ${recursoJoin}
