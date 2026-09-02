@@ -182,6 +182,9 @@ const puedeGestionarNoticias = (cabecera) => (
 const ESTADOS_NOTICIA = ["BORRADOR", "PUBLICADA", "ARCHIVADA"];
 const MAX_IMAGENES_GALERIA = 12;
 const MAX_LARGO_CUERPO = 120000;
+const MAX_NOTICIAS_DESTACADAS = 5;
+const LOCK_NOTICIAS_DESTACADAS_TIMEOUT_SEGUNDOS = 5;
+const EXPRESION_NOMBRE_LOCK_DESTACADAS = "CONCAT('noticias_destacadas:', DATABASE())";
 
 // La condición de visibilidad pública se reutiliza en todos los listados sin token.
 const CONDICION_PUBLICA = "n.eliminado = 0 AND n.estado = 'PUBLICADA' AND (n.fecha_publicacion IS NULL OR n.fecha_publicacion <= NOW())";
@@ -213,7 +216,7 @@ function normalizarIdsExcluidos(valor) {
   if (valor === undefined || valor === null || valor === "") return [];
   if (typeof valor !== "string") return null;
   const partes = valor.split(",");
-  if (partes.length > 6) return null;
+  if (partes.length > MAX_NOTICIAS_DESTACADAS) return null;
 
   const ids = [];
   for (const parte of partes) {
@@ -284,6 +287,88 @@ function crearErrorHttp(mensaje, statusCode = 400) {
   const error = new Error(mensaje);
   error.statusCode = statusCode;
   return error;
+}
+
+async function adquirirLockNoticiasDestacadas(connection) {
+  const [filas] = await connection.query(
+    `SELECT GET_LOCK(${EXPRESION_NOMBRE_LOCK_DESTACADAS}, ?) AS adquirido`,
+    [LOCK_NOTICIAS_DESTACADAS_TIMEOUT_SEGUNDOS]
+  );
+  const adquirido = filas?.[0]?.adquirido;
+  if (adquirido === null || adquirido === undefined) {
+    throw crearErrorHttp("No se pudo coordinar la actualización de noticias destacadas", 500);
+  }
+  if (Number(adquirido) !== 1) {
+    throw crearErrorHttp(
+      "Hay otra actualización de noticias destacadas en curso. Intentá nuevamente.",
+      409
+    );
+  }
+}
+
+async function liberarLockNoticiasDestacadas(connection) {
+  const [filas] = await connection.query(
+    `SELECT RELEASE_LOCK(${EXPRESION_NOMBRE_LOCK_DESTACADAS}) AS liberado`
+  );
+  return Number(filas?.[0]?.liberado) === 1;
+}
+
+async function liberarConexionGestionNoticias(connection, lockDestacadasAdquirido, contexto) {
+  if (!connection) return;
+
+  let reutilizable = true;
+  if (lockDestacadasAdquirido) {
+    try {
+      reutilizable = await liberarLockNoticiasDestacadas(connection);
+      if (!reutilizable) {
+        console.error(`No se pudo liberar el lock de noticias destacadas (${contexto})`);
+      }
+    } catch (error) {
+      reutilizable = false;
+      console.error(`No se pudo liberar el lock de noticias destacadas (${contexto}):`, error);
+    }
+  }
+
+  try {
+    if (reutilizable) {
+      connection.release();
+    } else {
+      // Un advisory lock vive mientras viva la conexión. Si no pudimos liberarlo,
+      // se destruye la conexión para que nunca vuelva al pool reteniendo el lock.
+      connection.destroy();
+    }
+  } catch (error) {
+    console.error(`No se pudo devolver la conexión de noticias al pool (${contexto}):`, error);
+    try {
+      connection.destroy();
+    } catch (destroyError) {
+      console.error(`No se pudo destruir la conexión de noticias (${contexto}):`, destroyError);
+    }
+  }
+}
+
+async function validarCupoNoticiasDestacadas(connection, destacada, noticiaId = null) {
+  if (destacada !== 1) return;
+
+  const params = [];
+  let excluirActual = "";
+  if (noticiaId !== null) {
+    excluirActual = " AND id <> ?";
+    params.push(noticiaId);
+  }
+
+  const [filas] = await connection.query(
+    `SELECT COUNT(*) AS total
+     FROM noticia
+     WHERE eliminado = 0 AND destacada = 1${excluirActual}`,
+    params
+  );
+  if (Number(filas?.[0]?.total || 0) >= MAX_NOTICIAS_DESTACADAS) {
+    throw crearErrorHttp(
+      `Solo se pueden destacar hasta ${MAX_NOTICIAS_DESTACADAS} noticias`,
+      409
+    );
+  }
 }
 
 function validarDatosNoticia(body) {
@@ -530,7 +615,7 @@ router.get("/noticias/publicas/destacadas", async (req, res) => {
        LEFT JOIN departamental d ON d.id = n.departamental_id
        WHERE ${CONDICION_PUBLICA} AND n.destacada = 1
        ORDER BY ${ORDEN_FEED}
-       LIMIT 6`
+       LIMIT ${MAX_NOTICIAS_DESTACADAS}`
     );
     const destacadas = await Promise.all(filas.map((fila) => firmarNoticia(fila)));
     habilitarCachePublica(res);
@@ -714,9 +799,14 @@ router.get("/admin/noticias/apoyos", verifyToken, async (req, res) => {
     const [departamentales] = await db.query(
       "SELECT id, nombre FROM departamental WHERE habilitado = 'Y' ORDER BY nombre ASC"
     );
+    const [[conteoDestacadas]] = await db.query(
+      "SELECT COUNT(*) AS total FROM noticia WHERE eliminado = 0 AND destacada = 1"
+    );
     res.status(200).json({
       categorias: categorias.map((fila) => fila.categoria),
       departamentales: departamentales.map((fila) => ({ id: Number(fila.id), nombre: fila.nombre })),
+      destacadas: Number(conteoDestacadas?.total || 0),
+      max_destacadas: MAX_NOTICIAS_DESTACADAS,
     });
   } catch (error) {
     console.error("Error al obtener los apoyos del editor de noticias:", error);
@@ -760,6 +850,8 @@ router.get("/admin/noticias/:id(\\d+)", verifyToken, async (req, res) => {
 
 router.post("/admin/noticias", verifyToken, manejarUploadNoticia, async (req, res) => {
   let connection;
+  let transaccionIniciada = false;
+  let lockDestacadasAdquirido = false;
   let commitExitoso = false;
   const mediasSubidasS3 = [];
   try {
@@ -793,7 +885,13 @@ router.post("/admin/noticias", verifyToken, manejarUploadNoticia, async (req, re
     }
 
     connection = await db.getConnection();
+    if (datos.destacada === 1) {
+      await adquirirLockNoticiasDestacadas(connection);
+      lockDestacadasAdquirido = true;
+    }
     await connection.beginTransaction();
+    transaccionIniciada = true;
+    await validarCupoNoticiasDestacadas(connection, datos.destacada);
     const portadaDb = descriptorPersistible(mediaPortada);
     const [resultado] = await connection.query(
       `INSERT INTO noticia
@@ -820,21 +918,37 @@ router.post("/admin/noticias", verifyToken, manejarUploadNoticia, async (req, re
       );
     }
     await connection.commit();
+    transaccionIniciada = false;
     commitExitoso = true;
+    await liberarConexionGestionNoticias(connection, lockDestacadasAdquirido, "creación");
+    connection = undefined;
+    lockDestacadasAdquirido = false;
 
     res.status(201).json({ success: true, id: noticiaId, message: "Noticia creada" });
   } catch (error) {
-    if (connection && !commitExitoso) {
+    if (connection && transaccionIniciada) {
       try {
         await connection.rollback();
+        transaccionIniciada = false;
       } catch (rollbackError) {
         console.error("No se pudo revertir la creación de la noticia:", rollbackError);
+        connection.destroy();
+        connection = undefined;
+        transaccionIniciada = false;
+        lockDestacadasAdquirido = false;
       }
+    }
+    if (connection) {
+      await liberarConexionGestionNoticias(connection, lockDestacadasAdquirido, "creación fallida");
+      connection = undefined;
+      lockDestacadasAdquirido = false;
     }
     if (!commitExitoso) {
       for (const media of mediasSubidasS3) {
         try {
-          await noticiaMedia.eliminar(media);
+          // Si COMMIT se aplicó pero se perdió su respuesta, la referencia ya
+          // existe y no debe borrarse. Si hubo rollback, se elimina normalmente.
+          await eliminarMediaSinReferencias(mysqlConnection.promise(), media);
         } catch (deleteError) {
           console.error("No se pudieron limpiar todos los archivos de la noticia luego del error:", deleteError);
         }
@@ -843,12 +957,14 @@ router.post("/admin/noticias", verifyToken, manejarUploadNoticia, async (req, re
     console.error("Error al crear la noticia:", error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al crear la noticia");
   } finally {
-    if (connection) connection.release();
+    await liberarConexionGestionNoticias(connection, lockDestacadasAdquirido, "creación");
   }
 });
 
 router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async (req, res) => {
   let connection;
+  let transaccionIniciada = false;
+  let lockDestacadasAdquirido = false;
   let commitExitoso = false;
   const mediasNuevasS3 = [];
   const mediasABorrarS3 = [];
@@ -880,17 +996,34 @@ router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async
       return res.status(400).json("La departamental es inválida");
     }
 
+    // Las transformaciones y subidas S3 se hacen antes de tomar el advisory
+    // lock. Si luego falla la transacción, el catch elimina estas variantes.
+    const mediaPortadaNueva = req.files?.imagen?.[0]
+      ? await noticiaMedia.procesarYSubir(req.files.imagen[0], "portadas")
+      : null;
+    if (mediaPortadaNueva) mediasNuevasS3.push(mediaPortadaNueva);
+
+    const mediasGaleriaNuevas = [];
+    for (const file of req.files?.galeria || []) {
+      const media = await noticiaMedia.procesarYSubir(file, "galeria");
+      mediasNuevasS3.push(media);
+      mediasGaleriaNuevas.push(media);
+    }
+
     connection = await db.getConnection();
+    await adquirirLockNoticiasDestacadas(connection);
+    lockDestacadasAdquirido = true;
     await connection.beginTransaction();
+    transaccionIniciada = true;
     const [existentes] = await connection.query(
       "SELECT * FROM noticia WHERE id = ? AND eliminado = 0 LIMIT 1 FOR UPDATE",
       [noticiaId]
     );
     if (existentes.length === 0) {
-      await connection.rollback();
-      return res.status(404).json("Noticia no encontrada");
+      throw crearErrorHttp("Noticia no encontrada", 404);
     }
     const existente = existentes[0];
+    await validarCupoNoticiasDestacadas(connection, datos.destacada, noticiaId);
 
     // Publicar por primera vez sin fecha explícita equivale a publicar ahora.
     if (datos.estado === "PUBLICADA" && !datos.fechaPublicacion) {
@@ -898,9 +1031,8 @@ router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async
     }
 
     let mediaPortada = descriptorDesdeNoticia(existente);
-    if (req.files?.imagen?.[0]) {
-      mediaPortada = await noticiaMedia.procesarYSubir(req.files.imagen[0], "portadas");
-      mediasNuevasS3.push(mediaPortada);
+    if (mediaPortadaNueva) {
+      mediaPortada = mediaPortadaNueva;
       if (existente.imagen_archivo) mediasABorrarS3.push(descriptorDesdeNoticia(existente));
     } else if (quitarImagen === 1 && existente.imagen_archivo) {
       mediasABorrarS3.push(descriptorDesdeNoticia(existente));
@@ -923,13 +1055,12 @@ router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async
       }
     }
 
-    const archivosGaleriaNuevos = req.files?.galeria || [];
-    if (archivosGaleriaNuevos.length > 0) {
+    if (mediasGaleriaNuevas.length > 0) {
       const [[{ totalGaleria }]] = await connection.query(
         "SELECT COUNT(*) AS totalGaleria FROM noticia_imagen WHERE noticia_id = ?",
         [noticiaId]
       );
-      if (Number(totalGaleria) + archivosGaleriaNuevos.length > MAX_IMAGENES_GALERIA) {
+      if (Number(totalGaleria) + mediasGaleriaNuevas.length > MAX_IMAGENES_GALERIA) {
         throw crearErrorHttp(`La galería admite hasta ${MAX_IMAGENES_GALERIA} imágenes`, 400);
       }
       const [[{ maxOrden }]] = await connection.query(
@@ -937,9 +1068,7 @@ router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async
         [noticiaId]
       );
       let ordenSiguiente = Number(maxOrden) + 1;
-      for (const file of archivosGaleriaNuevos) {
-        const media = await noticiaMedia.procesarYSubir(file, "galeria");
-        mediasNuevasS3.push(media);
+      for (const media of mediasGaleriaNuevas) {
         await connection.query(
           `INSERT INTO noticia_imagen
              (noticia_id, archivo, ancho, alto, mime, variantes, orden)
@@ -967,7 +1096,11 @@ router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async
       ]
     );
     await connection.commit();
+    transaccionIniciada = false;
     commitExitoso = true;
+    await liberarConexionGestionNoticias(connection, lockDestacadasAdquirido, "actualización");
+    connection = undefined;
+    lockDestacadasAdquirido = false;
 
     // Recién después del commit se limpian de S3 las versiones reemplazadas.
     for (const media of mediasABorrarS3) {
@@ -980,17 +1113,29 @@ router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async
 
     res.status(200).json({ success: true, id: noticiaId, message: "Noticia actualizada" });
   } catch (error) {
-    if (connection && !commitExitoso) {
+    if (connection && transaccionIniciada) {
       try {
         await connection.rollback();
+        transaccionIniciada = false;
       } catch (rollbackError) {
         console.error("No se pudo revertir la actualización de la noticia:", rollbackError);
+        connection.destroy();
+        connection = undefined;
+        transaccionIniciada = false;
+        lockDestacadasAdquirido = false;
       }
+    }
+    if (connection) {
+      await liberarConexionGestionNoticias(connection, lockDestacadasAdquirido, "actualización fallida");
+      connection = undefined;
+      lockDestacadasAdquirido = false;
     }
     if (!commitExitoso) {
       for (const media of mediasNuevasS3) {
         try {
-          await noticiaMedia.eliminar(media);
+          // Evita borrar una variante que sí quedó referenciada si COMMIT fue
+          // efectivo pero su confirmación no llegó a la aplicación.
+          await eliminarMediaSinReferencias(mysqlConnection.promise(), media);
         } catch (deleteError) {
           console.error("No se pudieron limpiar todas las variantes nuevas de la noticia:", deleteError);
         }
@@ -999,12 +1144,15 @@ router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async
     console.error("Error al actualizar la noticia:", error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al actualizar la noticia");
   } finally {
-    if (connection) connection.release();
+    await liberarConexionGestionNoticias(connection, lockDestacadasAdquirido, "actualización");
   }
 });
 
 // Acciones rápidas del listado: destacar y cambiar estado sin pasar por el editor.
 router.put("/admin/noticias/:id(\\d+)/flags", verifyToken, async (req, res) => {
+  let connection;
+  let transaccionIniciada = false;
+  let lockDestacadasAdquirido = false;
   try {
     const cabecera = getCabecera(req);
     if (!puedeGestionarNoticias(cabecera)) return res.status(401).json("No autorizado");
@@ -1014,10 +1162,12 @@ router.put("/admin/noticias/:id(\\d+)/flags", verifyToken, async (req, res) => {
 
     const cambios = [];
     const params = [];
+    let destacadaSolicitada;
 
     if (req.body.destacada !== undefined) {
       const destacada = normalizarBooleanoBinario(req.body.destacada);
       if (destacada === null) return res.status(400).json("El valor de destacada es inválido");
+      destacadaSolicitada = destacada;
       cambios.push("destacada = ?");
       params.push(destacada);
     }
@@ -1033,16 +1183,58 @@ router.put("/admin/noticias/:id(\\d+)/flags", verifyToken, async (req, res) => {
     if (cambios.length === 0) return res.status(400).json("No hay cambios para aplicar");
 
     const db = mysqlConnection.promise();
-    const [resultado] = await db.query(
+    connection = await db.getConnection();
+    if (destacadaSolicitada !== undefined) {
+      await adquirirLockNoticiasDestacadas(connection);
+      lockDestacadasAdquirido = true;
+    }
+    await connection.beginTransaction();
+    transaccionIniciada = true;
+
+    const [existentes] = await connection.query(
+      "SELECT id FROM noticia WHERE id = ? AND eliminado = 0 LIMIT 1 FOR UPDATE",
+      [noticiaId]
+    );
+    if (existentes.length === 0) {
+      await connection.rollback();
+      transaccionIniciada = false;
+      return res.status(404).json("Noticia no encontrada");
+    }
+
+    await validarCupoNoticiasDestacadas(connection, destacadaSolicitada, noticiaId);
+    await connection.query(
       `UPDATE noticia SET ${cambios.join(", ")} WHERE id = ? AND eliminado = 0`,
       [...params, noticiaId]
     );
-    if (resultado.affectedRows === 0) return res.status(404).json("Noticia no encontrada");
+    await connection.commit();
+    transaccionIniciada = false;
+    await liberarConexionGestionNoticias(connection, lockDestacadasAdquirido, "actualización de indicadores");
+    connection = undefined;
+    lockDestacadasAdquirido = false;
 
     res.status(200).json({ success: true, id: noticiaId, message: "Noticia actualizada" });
   } catch (error) {
+    if (connection && transaccionIniciada) {
+      try {
+        await connection.rollback();
+        transaccionIniciada = false;
+      } catch (rollbackError) {
+        console.error("No se pudo revertir la actualización de los indicadores de la noticia:", rollbackError);
+        connection.destroy();
+        connection = undefined;
+        transaccionIniciada = false;
+        lockDestacadasAdquirido = false;
+      }
+    }
+    if (connection) {
+      await liberarConexionGestionNoticias(connection, lockDestacadasAdquirido, "actualización fallida de indicadores");
+      connection = undefined;
+      lockDestacadasAdquirido = false;
+    }
     console.error("Error al actualizar los indicadores de la noticia:", error);
-    res.status(500).json("Error al actualizar la noticia");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al actualizar la noticia");
+  } finally {
+    await liberarConexionGestionNoticias(connection, lockDestacadasAdquirido, "actualización de indicadores");
   }
 });
 
@@ -1071,8 +1263,13 @@ router.delete("/admin/noticias/:id(\\d+)", verifyToken, async (req, res) => {
 });
 
 router.__test = Object.freeze({
+  MAX_NOTICIAS_DESTACADAS,
   verifyToken,
   validarDatosNoticia,
+  validarCupoNoticiasDestacadas,
+  adquirirLockNoticiasDestacadas,
+  liberarLockNoticiasDestacadas,
+  liberarConexionGestionNoticias,
   sanitizarCuerpoNoticia,
   normalizarFechaPublicacion,
   normalizarIdPositivo,
