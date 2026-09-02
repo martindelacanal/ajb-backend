@@ -8,7 +8,7 @@
 // Uso:
 //   node scripts/migrar-beneficios.js                     → esquema + seeds + GRANTs a miajb_runtime (develop)
 //   node scripts/migrar-beneficios.js --skip-grants       → esquema + seeds, sin intentar los GRANTs
-//   node scripts/migrar-beneficios.js --allow-production  → obligatorio si DB_HOST no es localhost (no hace GRANTs)
+//   node scripts/migrar-beneficios.js --allow-production  → obligatorio si DB_HOST no es localhost (también otorga GRANTs al runtime del RDS)
 //
 // En develop el backend corre como miajb_runtime, que no tiene CREATE: correr con la cuenta
 // administrativa local pasando las credenciales por entorno (dotenv no pisa lo ya definido):
@@ -333,35 +333,56 @@ const CODIGOS_SIN_PERMISO_GRANT = new Set([
   "ER_PASSWORD_NO_MATCH",
 ]);
 
-function sqlGrants(connection) {
+// El runtime existe en las dos bases con hosts distintos ('localhost' en develop, la IP
+// privada del EC2 en la RDS): se buscan en mysql.user para no adivinarlos.
+async function cuentasRuntime(connection) {
+  try {
+    const [filas] = await connection.query(
+      "SELECT user, host FROM mysql.user WHERE user = ?",
+      [USUARIO_RUNTIME]
+    );
+    if (filas.length > 0) return filas.map((fila) => ({ user: fila.user, host: fila.host }));
+  } catch (error) {
+    if (!CODIGOS_SIN_PERMISO_GRANT.has(error.code)) throw error;
+  }
+  return [{ user: USUARIO_RUNTIME, host: HOST_RUNTIME }];
+}
+
+function sqlGrants(connection, cuentas) {
   const esquema = connection.escapeId(process.env.DB_DATABASE);
-  const cuenta = `${connection.escape(USUARIO_RUNTIME)}@${connection.escape(HOST_RUNTIME)}`;
-  return TABLAS.map(
-    (tabla) => `GRANT SELECT, INSERT, UPDATE, DELETE ON ${esquema}.${connection.escapeId(tabla)} TO ${cuenta}`
-  );
+  const sentencias = [];
+  for (const cuenta of cuentas) {
+    const destino = `${connection.escape(cuenta.user)}@${connection.escape(cuenta.host)}`;
+    for (const tabla of TABLAS) {
+      sentencias.push(`GRANT SELECT, INSERT, UPDATE, DELETE ON ${esquema}.${connection.escapeId(tabla)} TO ${destino}`);
+    }
+  }
+  return sentencias;
 }
 
 async function otorgarGrantsRuntime(connection) {
   if (process.env.DB_USER === USUARIO_RUNTIME) {
     console.warn(
       `Conectado como ${USUARIO_RUNTIME}: no puede otorgarse permisos a sí mismo. ` +
-        "Corré los GRANTs de BD/MIGRACION_BENEFICIOS.md con la cuenta administrativa local."
+        "Corré los GRANTs de BD/MIGRACION_BENEFICIOS.md con la cuenta administrativa (root local / admin del RDS)."
     );
     return;
   }
-  const sentencias = sqlGrants(connection);
+  const cuentas = await cuentasRuntime(connection);
+  const etiqueta = cuentas.map((cuenta) => `'${cuenta.user}'@'${cuenta.host}'`).join(", ");
+  const sentencias = sqlGrants(connection, cuentas);
   try {
     for (const sentencia of sentencias) {
       await connection.query(sentencia);
     }
     await connection.query("FLUSH PRIVILEGES");
-    console.log(`  ✔ GRANT SELECT, INSERT, UPDATE, DELETE sobre ${TABLAS.length} tablas a '${USUARIO_RUNTIME}'@'${HOST_RUNTIME}' + FLUSH PRIVILEGES`);
+    console.log(`  ✔ GRANT SELECT, INSERT, UPDATE, DELETE sobre ${TABLAS.length} tablas a ${etiqueta} + FLUSH PRIVILEGES`);
   } catch (error) {
     if (!CODIGOS_SIN_PERMISO_GRANT.has(error.code)) throw error;
     console.warn(
-      `  · Aviso: no se pudieron otorgar los permisos a '${USUARIO_RUNTIME}'@'${HOST_RUNTIME}' ` +
+      `  · Aviso: no se pudieron otorgar los permisos a ${etiqueta} ` +
         `(${error.code}: ${error.message}).\n` +
-        "    El esquema quedó creado igual. Corré con la cuenta administrativa local:\n" +
+        "    El esquema quedó creado igual. Corré con la cuenta administrativa:\n" +
         sentencias.map((sentencia) => `      ${sentencia};`).join("\n") +
         "\n      FLUSH PRIVILEGES;"
     );
@@ -409,15 +430,14 @@ async function main() {
     }
     console.log("Esquema listo.");
 
-    if (esProduccion) {
-      console.log("Producción: el backend usa la cuenta admin del RDS, no se otorgan GRANTs.");
-      return;
-    }
     if (omiteGrants) {
       console.log("Se omite el intento de GRANTs (--skip-grants).");
       return;
     }
-    console.log(`Otorgando DML sobre las tablas nuevas a '${USUARIO_RUNTIME}'@'${HOST_RUNTIME}'...`);
+    // En producción el backend TAMBIÉN corre como miajb_runtime (desde la IP privada del
+    // EC2), así que los GRANTs hacen falta en las dos bases: sin ellos, cada endpoint
+    // nuevo responde 500 con "SELECT command denied".
+    console.log(`Otorgando DML sobre las tablas nuevas a '${USUARIO_RUNTIME}'...`);
     await otorgarGrantsRuntime(connection);
   } finally {
     await connection.end();
