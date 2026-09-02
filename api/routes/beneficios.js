@@ -28,7 +28,7 @@ const { verificarTokenConAutorizacionActual } = require("../security/autorizacio
 const multer = require("multer");
 const crypto = require("crypto");
 const sharp = require("sharp");
-const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, CopyObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const { normalizarFechaCivil } = require("../services/valores-dominio");
 const { esDniValido, DNI_MENSAJE } = require("../security/dni");
@@ -151,6 +151,19 @@ function contenidoCoincideConMime(file) {
 async function subirArchivoBeneficio({ buffer, contentType, extension }, prefijo) {
   const key = `beneficios/${prefijo}_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.${extension}`;
   await uploadBufferToS3({ key, buffer, contentType });
+  return key;
+}
+
+// Copia un objeto ya subido a una key nueva del mismo prefijo (p. ej. "aplicar la imagen
+// del pin a todas las sucursales"): el navegador no baja el binario de S3 (sin CORS).
+async function copiarObjetoS3(keyOrigen, prefijo) {
+  const extension = String(keyOrigen).split(".").pop().toLowerCase().replace(/[^a-z0-9]/g, "") || "bin";
+  const key = `beneficios/${prefijo}_${Date.now()}_${crypto.randomBytes(6).toString("hex")}.${extension}`;
+  await s3.send(new CopyObjectCommand({
+    Bucket: bucketName,
+    CopySource: `${bucketName}/${keyOrigen}`.split("/").map(encodeURIComponent).join("/"),
+    Key: key,
+  }));
   return key;
 }
 
@@ -593,6 +606,13 @@ function normalizarSucursales(valor, { cantidadPines = 0, maximo = 50 } = {}) {
       indicesUsados.add(indice);
       imagenIndex = indice;
     }
+    // "Aplicar a todos los pines": id de la sucursal (del mismo beneficio) cuya imagen
+    // el backend copia en S3 al guardar. Solo tiene sentido si no viene imagen nueva.
+    let copiarImagenDe = null;
+    if (valorInformado(item.copiar_imagen_de) && imagenIndex === null) {
+      copiarImagenDe = normalizarIdPositivo(item.copiar_imagen_de);
+      if (copiarImagenDe === null) return { error: `La imagen a copiar en la sucursal ${posicion} es inválida` };
+    }
     salida.push({
       id,
       direccion,
@@ -600,6 +620,7 @@ function normalizarSucursales(valor, { cantidadPines = 0, maximo = 50 } = {}) {
       longitud: longitud.value,
       etiqueta,
       imagen_index: imagenIndex,
+      copiar_imagen_de: copiarImagenDe,
       quitar_imagen: normalizarBooleano(item.quitar_imagen),
       orden: i,
     });
@@ -646,7 +667,7 @@ function calcularCupo(cupoMaximo, inscriptos) {
 // ---------------------------------------------------------------------------
 const MAX_LARGO_HTML = 200 * 1024;
 const ETIQUETAS_HTML_PERMITIDAS = new Set([
-  "p", "br", "h2", "h3", "strong", "b", "em", "i", "u", "s",
+  "p", "br", "h2", "h3", "strong", "b", "em", "i", "u", "s", "strike",
   "ul", "ol", "li", "a", "span", "img", "div", "blockquote",
 ]);
 const ETIQUETAS_SIN_CIERRE = new Set(["br", "img"]);
@@ -697,10 +718,16 @@ function sanitizarHtmlBeneficio(html) {
     const esCierre = /^\s*\//.test(interior);
     const nombre = interior.replace(/^\s*\/?\s*/, "").split(/[\s/>]/)[0].toLowerCase();
     if (!ETIQUETAS_HTML_PERMITIDAS.has(nombre)) return "";
-    if (esCierre) return ETIQUETAS_SIN_CIERRE.has(nombre) ? "" : `</${nombre}>`;
+    if (esCierre) {
+      if (ETIQUETAS_SIN_CIERRE.has(nombre)) return "";
+      // <strike> (lo que genera execCommand('strikeThrough')) se normaliza a <s>
+      return `</${nombre === "strike" ? "s" : nombre}>`;
+    }
     switch (nombre) {
       case "br":
         return "<br>";
+      case "strike":
+        return "<s>";
       case "a": {
         const url = leerAtributo(interior, "href") || "";
         if (/^(https?:\/\/|mailto:)/i.test(url)) {
@@ -726,7 +753,8 @@ function sanitizarHtmlBeneficio(html) {
         if (EMBEDS_PERMITIDOS.has(embed) && REF_EMBED_RE.test(ref)) {
           return `<div data-embed="${embed}" data-ref="${ref}">`;
         }
-        return "<div>";
+        // Chrome envuelve en <div> los bloques alineados con justifyCenter/Right
+        return `<div${estilosPermitidos(leerAtributo(interior, "style"), ["text-align"])}>`;
       }
       default:
         return `<${nombre}>`;
@@ -1764,15 +1792,25 @@ router.get("/beneficios/publicados/:id(\\d+)", verifyToken, async (req, res) => 
     const departamentalId = departamentalDeCabecera(cabecera);
     const db = mysqlConnection.promise();
 
+    // Un afiliado con inscripción activa puede seguir viendo (y cancelar) un beneficio que
+    // dejó de ser publicable (venció, se deshabilitó, se observó): el detalle avisa con
+    // publicable=false y el front oculta el CTA de inscribirse.
     const [rows] = await db.query(
-      `SELECT b.*, r.nombre AS rubro_nombre, ${SELECT_INSCRIPTOS} AS inscriptos
+      `SELECT b.*, r.nombre AS rubro_nombre, ${SELECT_INSCRIPTOS} AS inscriptos,
+              (b.id = ? AND ${CONDICION_PUBLICABLE}) AS publicable,
+              EXISTS (SELECT 1 FROM beneficio_inscripcion bi_a
+                      WHERE bi_a.beneficio_id = b.id AND bi_a.usuario_id = ? AND bi_a.activa = 1) AS tiene_inscripcion
        FROM beneficio b
        INNER JOIN beneficio_rubro r ON r.id = b.rubro_id
-       WHERE b.id = ? AND ${CONDICION_PUBLICABLE}`,
-      [beneficioId, departamentalId]
+       WHERE b.id = ? AND b.eliminado = 0`,
+      [beneficioId, departamentalId, usuarioId, beneficioId]
     );
     if (rows.length === 0) return res.status(404).json("El beneficio no está disponible");
     const beneficio = rows[0];
+    const publicable = Number(beneficio.publicable) === 1;
+    if (!publicable && Number(beneficio.tiene_inscripcion) !== 1) {
+      return res.status(404).json("El beneficio no está disponible");
+    }
 
     const [imagenes] = await db.query(
       "SELECT id, archivo, orden FROM beneficio_imagen WHERE beneficio_id = ? ORDER BY orden, id",
@@ -1815,6 +1853,7 @@ router.get("/beneficios/publicados/:id(\\d+)", verifyToken, async (req, res) => 
       cupo: calcularCupo(beneficio.cupo_maximo, beneficio.inscriptos),
       inscripto: inscripcion !== null,
       inscripcion,
+      publicable,
     });
   } catch (error) {
     registrarErrorRuta(error);
@@ -2734,6 +2773,15 @@ router.put("/beneficios/:id(\\d+)", verifyToken, manejarUploadBeneficio, async (
         objetosSubidos.push(key);
         if (imagenKey) objetosEliminarTrasCommit.push(imagenKey);
         imagenKey = key;
+      } else if (sucursal.copiar_imagen_de !== null) {
+        // Copia server-side de la imagen del pin de otra sucursal del mismo beneficio
+        const fuente = sucursalesPorId.get(sucursal.copiar_imagen_de);
+        if (fuente && fuente.imagen_archivo && fuente.id !== sucursal.id) {
+          const key = await copiarObjetoS3(fuente.imagen_archivo, "pin");
+          objetosSubidos.push(key);
+          if (imagenKey) objetosEliminarTrasCommit.push(imagenKey);
+          imagenKey = key;
+        }
       } else if (sucursal.quitar_imagen === 1 && imagenKey) {
         objetosEliminarTrasCommit.push(imagenKey);
         imagenKey = null;
