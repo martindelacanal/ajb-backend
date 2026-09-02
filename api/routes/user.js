@@ -90,6 +90,14 @@ const {
   obtenerRecursosRetenidos,
   validarHoldParaReservaEnTransaccion,
 } = require("../services/turismo-reserva-holds");
+const {
+  calcularDescuentos,
+  construirPersonasParaDescuento,
+  guardarReservaDescuentos,
+  obtenerDescuentosReserva,
+  obtenerDescuentosReservaCrudos,
+  resolverDescuentosSolicitados,
+} = require("../services/descuentos-reserva");
 
 const HISTORIAL_USUARIO_LEGIBLE = crearEnriquecimientoHistorial(
   CATALOGOS_HISTORIAL_USUARIO
@@ -9115,6 +9123,85 @@ async function crearReservaSalud(connection, {
   return reservaSaludId;
 }
 
+// ---------------------------------------------------------------------------
+// Descuentos de turismo (cupones con hashtag y tipos de viaje). El cálculo vive
+// en services/descuentos-reserva.js y es el mismo que usa la previsualización.
+// ---------------------------------------------------------------------------
+function normalizarDescuentosSolicitados(body) {
+  const descuentos = body?.descuentos;
+  if (!descuentos || typeof descuentos !== "object" || Array.isArray(descuentos)) {
+    return { cupon_codigo: null, tipo_viaje_id: null, informado: false };
+  }
+  const cupon = descuentos.cupon_codigo ?? descuentos.cupon ?? null;
+  const tipoViaje = descuentos.tipo_viaje_id ?? null;
+  return {
+    cupon_codigo: cupon === "" ? null : cupon,
+    tipo_viaje_id: tipoViaje === "" ? null : tipoViaje,
+    informado: true,
+  };
+}
+
+// El subsidio por salud (100%) sólo se ofrece en los servicios donde el área
+// lo habilitó explícitamente (servicio.descuento_salud_estado = 'HABILITADO').
+async function asegurarDescuentoSaludHabilitado(connection, servicioId) {
+  const [rows] = await connection.query(
+    "SELECT descuento_salud_estado FROM servicio WHERE id = ? LIMIT 1",
+    [servicioId]
+  );
+  if (!rows.length || rows[0].descuento_salud_estado !== "HABILITADO") {
+    throw crearErrorNegocio(
+      "El subsidio de alojamiento por salud no está habilitado para este servicio",
+      422,
+      "DESCUENTO_SALUD_NO_HABILITADO"
+    );
+  }
+}
+
+/**
+ * Resuelve y calcula los descuentos de una reserva a partir de la cotización
+ * recién calculada por el backend. En una edición sin datos nuevos de descuento
+ * se conservan los que la reserva ya tenía.
+ */
+async function aplicarDescuentosReserva(connection, {
+  cabecera,
+  descuentos,
+  servicioId,
+  usuarioTitular,
+  tarifaBase,
+  adicionalesTotal,
+  reservaId = null,
+}) {
+  const existentes = reservaId ? await obtenerDescuentosReservaCrudos(connection, reservaId) : [];
+  let solicitados = descuentos;
+  if (!descuentos?.informado && existentes.length > 0) {
+    solicitados = {
+      cupon_codigo: existentes.find((item) => item.tipo === "CUPON")?.codigo || null,
+      tipo_viaje_id: existentes.find((item) => item.tipo === "TIPO_VIAJE")?.regla_id || null,
+      informado: true,
+    };
+  }
+  const { reglas } = await resolverDescuentosSolicitados(connection, {
+    cuponCodigo: solicitados?.cupon_codigo || null,
+    tipoViajeId: solicitados?.tipo_viaje_id || null,
+    departamentalId: normalizarIdPositivo(usuarioTitular?.departamental_id),
+    servicioId,
+    usuarioId: normalizarIdPositivo(usuarioTitular?.id),
+    excluirReservaId: reservaId,
+    esStaff: cabecera.rol !== "afiliado",
+    existentes,
+    estricto: true,
+    // Estamos dentro de la transacción del alta/edición: bloquea la regla para
+    // que dos reservas simultáneas no superen usos_maximos / usos_por_afiliado.
+    bloquearReglas: true,
+  });
+  const adicionalesCentavos = decimalACentavos(adicionalesTotal ?? 0) ?? 0;
+  return calcularDescuentos({
+    personas: construirPersonasParaDescuento(tarifaBase.personas),
+    adicionalesCentavos,
+    reglas,
+  });
+}
+
 router.post("/reserva", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -9169,6 +9256,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
       }
 
       const porSalud = normalizarPorSalud(req.body);
+      const descuentosSolicitados = normalizarDescuentosSolicitados(req.body);
 
       const modalidadSolicitada = normalizarModalidad(modalidad);
       const bloqueFechaIdSolicitado = normalizarIdPositivo(bloque_fecha_id);
@@ -9203,6 +9291,9 @@ router.post("/reserva", verifyToken, async (req, res) => {
         }
         if (servicioVisibleTitular.modelo_tarifa !== "PRECIO_UNICO" && !regimenIdReserva) {
           throw crearErrorNegocio("El régimen es requerido para este servicio", 400, "REGIMEN_REQUERIDO");
+        }
+        if (porSalud) {
+          await asegurarDescuentoSaludHabilitado(connection, servicioIdReserva);
         }
         const esReservaCamping = servicioVisibleTitular.tipo_codigo === "CUPO_NUMERADO";
         const errorReglasCamping = validarReglasCampingReserva(servicioVisibleTitular, personas, usuarioTitular);
@@ -9362,15 +9453,27 @@ router.post("/reserva", verifyToken, async (req, res) => {
           tarifaBaseCalculada.personas,
           temporadaTarifaIdReserva
         );
-        const precioTotalCentavos = sumarCentavos(
+        const resultadoDescuentos = await aplicarDescuentosReserva(connection, {
+          cabecera,
+          descuentos: descuentosSolicitados,
+          servicioId: servicioIdReserva,
+          usuarioTitular,
+          tarifaBase: tarifaBaseCalculada,
+          adicionalesTotal: resultadoAdicionales.total,
+        });
+        const precioBrutoCentavos = sumarCentavos(
           decimalACentavos(tarifaBaseCalculada.total),
           decimalACentavos(resultadoAdicionales.total)
         );
-        if (precioTotalCentavos === null) {
+        const precioTotalCentavos = precioBrutoCentavos === null
+          ? null
+          : precioBrutoCentavos - resultadoDescuentos.total_descuento_centavos;
+        if (precioTotalCentavos === null || precioTotalCentavos < 0) {
           throw crearErrorNegocio("El total calculado de la reserva no es valido", 409, "TARIFA_INVALIDA");
         }
         const personasCalculadas = tarifaBaseCalculada.personas;
         const montoAdicionales = resultadoAdicionales.total;
+        const montoDescuentos = resultadoDescuentos.total_descuento;
         const adicionalesProcesados = resultadoAdicionales.items;
         const precioTotalReserva = centavosANumero(precioTotalCentavos);
 
@@ -9392,8 +9495,9 @@ router.post("/reserva", verifyToken, async (req, res) => {
           `INSERT INTO reserva (
             estado_reserva_id, modalidad, sorteo_id, bloque_fecha_id, servicio_id,
             regimen_id, recurso_id, usuario_id,
-            firma_archivo, precio_total, fecha_inicio, fecha_fin, observaciones, monto_adicionales
-          ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            firma_archivo, precio_total, fecha_inicio, fecha_fin, observaciones, monto_adicionales,
+            monto_descuentos
+          ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             ESTADO_RESERVA_INICIADA_ID,
             modalidadReserva,
@@ -9407,7 +9511,8 @@ router.post("/reserva", verifyToken, async (req, res) => {
             fechaInicioReserva,
             fechaFinReserva,
             observaciones || null,
-            montoAdicionales
+            montoAdicionales,
+            montoDescuentos
           ]
         );
 
@@ -9511,6 +9616,20 @@ router.post("/reserva", verifyToken, async (req, res) => {
 
         await insertarTarifasFamiliaresCalculadas(connection, reservasFamiliaresIds);
 
+        // Cupón / tipo de viaje aplicados: snapshot en reserva_descuento + auditoría
+        const descuentosGuardados = await guardarReservaDescuentos(connection, {
+          reservaId,
+          usuarioId: usuarioReservaId,
+          departamentalId: normalizarIdPositivo(usuarioTitular.departamental_id),
+          servicioId: servicioIdReserva,
+          resultado: resultadoDescuentos,
+          actorId: cabecera.id,
+          req,
+          esAlta: true,
+          registrarHistorialReserva: (campos, observacionesHistorial) =>
+            registrarHistorialReserva(connection, reservaId, "UPDATE", cabecera.id, req, campos, observacionesHistorial),
+        });
+
         // Viaje por motivos de salud: crea el trámite de subsidio para Servicios Sociales
         let reservaSaludId = null;
         if (porSalud) {
@@ -9581,6 +9700,8 @@ router.post("/reserva", verifyToken, async (req, res) => {
           precio_total: precioTotalReserva,
           total_tarifa: tarifaBaseCalculada.total,
           monto_adicionales: montoAdicionales,
+          monto_descuentos: montoDescuentos,
+          descuentos: descuentosGuardados,
           reserva_salud_id: reservaSaludId
         });
 
@@ -9670,6 +9791,9 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
     if (!servicioConvenio || servicioConvenio.tipo_codigo !== "CONVENIO_HOTELERO") {
       await connection.rollback();
       return res.status(404).json("Convenio hotelero no disponible");
+    }
+    if (porSalud) {
+      await asegurarDescuentoSaludHabilitado(connection, hoteles[0].servicio_id);
     }
     const errorReglasConvenio = validarReglasCampingReserva(servicioConvenio, personas, usuarioTitular);
     if (errorReglasConvenio) {
@@ -9839,6 +9963,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         firma_base64,
         adicionales
       } = req.body;
+      const descuentosSolicitados = normalizarDescuentosSolicitados(req.body);
 
       // Validar campos requeridos
       if (!reservaId || !nombre || !fecha_inicio || !fecha_fin || !servicio_id ||
@@ -10021,15 +10146,31 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           tarifaBaseCalculada.personas,
           temporadaTarifaIdReserva
         );
-        const precioTotalCentavos = sumarCentavos(
+        const resultadoDescuentos = await aplicarDescuentosReserva(connection, {
+          cabecera,
+          descuentos: descuentosSolicitados,
+          servicioId: servicioIdReserva,
+          usuarioTitular: {
+            id: reservaActual.usuario_id,
+            departamental_id: reservaActual.usuario_departamental_id,
+          },
+          tarifaBase: tarifaBaseCalculada,
+          adicionalesTotal: resultadoAdicionales.total,
+          reservaId,
+        });
+        const precioBrutoCentavos = sumarCentavos(
           decimalACentavos(tarifaBaseCalculada.total),
           decimalACentavos(resultadoAdicionales.total)
         );
-        if (precioTotalCentavos === null) {
+        const precioTotalCentavos = precioBrutoCentavos === null
+          ? null
+          : precioBrutoCentavos - resultadoDescuentos.total_descuento_centavos;
+        if (precioTotalCentavos === null || precioTotalCentavos < 0) {
           throw crearErrorNegocio("El total calculado de la reserva no es valido", 409, "TARIFA_INVALIDA");
         }
         const usuariosIds = tarifaBaseCalculada.personas;
         const montoAdicionales = resultadoAdicionales.total;
+        const montoDescuentos = resultadoDescuentos.total_descuento;
         const adicionalesProcesados = resultadoAdicionales.items;
         const precioTotalReserva = centavosANumero(precioTotalCentavos);
 
@@ -10065,6 +10206,9 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         if (Number(datosAnteriores.monto_adicionales) !== Number(montoAdicionales)) {
             cambiosReserva.push({ campo: 'monto_adicionales', valorAnterior: datosAnteriores.monto_adicionales, valorNuevo: montoAdicionales });
         }
+        if (Number(datosAnteriores.monto_descuentos || 0) !== Number(montoDescuentos)) {
+            cambiosReserva.push({ campo: 'monto_descuentos', valorAnterior: datosAnteriores.monto_descuentos || 0, valorNuevo: montoDescuentos });
+        }
         if (firmaArchivo) {
              cambiosReserva.push({ campo: 'firma_archivo', valorAnterior: datosAnteriores.firma_archivo, valorNuevo: firmaArchivo });
         }
@@ -10092,7 +10236,8 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
             fecha_inicio = ?, 
             fecha_fin = ?, 
             observaciones = ?,
-            monto_adicionales = ?
+            monto_adicionales = ?,
+            monto_descuentos = ?
           WHERE id = ?
         `;
 
@@ -10106,6 +10251,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           fechaFinReserva,
           observaciones || null,
           montoAdicionales,
+          montoDescuentos,
           reservaId
         ];
 
@@ -10157,6 +10303,20 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           await guardarAdicionalesReserva(connection, reservaId, adicionalesProcesados);
         }
 
+        // Sincroniza cupón / tipo de viaje con el nuevo total (conserva comprobantes)
+        const descuentosGuardados = await guardarReservaDescuentos(connection, {
+          reservaId,
+          usuarioId: reservaActual.usuario_id,
+          departamentalId: normalizarIdPositivo(reservaActual.usuario_departamental_id),
+          servicioId: servicioIdReserva,
+          resultado: resultadoDescuentos,
+          actorId: cabecera.id,
+          req,
+          eliminarArchivo: deleteFileFromS3,
+          registrarHistorialReserva: (campos, observacionesHistorial) =>
+            registrarHistorialReserva(connection, reservaId, "UPDATE", cabecera.id, req, campos, observacionesHistorial),
+        });
+
         // Confirmar transacción
         if (esReservaCamping) {
           if (Number.isInteger(numeroParcelaReserva) && numeroParcelaReserva > 0) {
@@ -10199,7 +10359,9 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           id: parseInt(reservaId),
           precio_total: precioTotalReserva,
           total_tarifa: tarifaBaseCalculada.total,
-          monto_adicionales: montoAdicionales
+          monto_adicionales: montoAdicionales,
+          monto_descuentos: montoDescuentos,
+          descuentos: descuentosGuardados
         });
 
       } catch (transactionError) {
@@ -10269,6 +10431,7 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
             r.numero_parcela,
             r.precio_total as total_tarifa,
             r.monto_adicionales,
+            r.monto_descuentos,
             r.fecha_inicio,
             r.fecha_fin,
             r.observaciones,
@@ -10414,6 +10577,8 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
         // Construir respuesta para edición
         const respuesta = {
           id: reserva.id,
+          // Titular: lo usa el staff para consultar descuentos en nombre del afiliado
+          usuario_id: Number(reserva.usuario_id),
           numero_reserva: numeroReserva,
           numero_parcela: reserva.numero_parcela !== null && reserva.numero_parcela !== undefined
             ? Number(reserva.numero_parcela)
@@ -10477,7 +10642,11 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
 
         respuesta.adicionales = adicionalesFormateados;
         respuesta.monto_adicionales = reserva.monto_adicionales || 0;
-        
+        respuesta.monto_descuentos = Number(reserva.monto_descuentos || 0);
+        respuesta.descuentos = await obtenerDescuentosReserva(connection, reservaId, {
+          firmarArchivo: getSignedFileUrlFromS3,
+        });
+
         res.status(200).json(respuesta);
 
       } catch (queryError) {
@@ -10524,6 +10693,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
             r.numero_parcela,
             r.precio_total as total_tarifa,
             r.monto_adicionales,
+            r.monto_descuentos,
             r.fecha_inicio,
             r.fecha_fin,
             r.observaciones,
@@ -10734,6 +10904,11 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           }
         }
 
+        // Cupón / tipo de viaje aplicados a la reserva, con sus comprobantes
+        const descuentos = await obtenerDescuentosReserva(connection, reservaId, {
+          firmarArchivo: getSignedFileUrlFromS3,
+        });
+
         // Hilo de mensajes de la reserva (chat afiliado ↔ departamental/admin)
         const [observacionesHilo] = await connection.query(
           `SELECT o.id, o.usuario_id, o.usuario_rol, o.mensaje, o.estado_reserva_id, o.fecha_creacion,
@@ -10886,6 +11061,8 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           adicionales: adicionalesFormateados,
           es_por_salud: puedeVerSalud && Number(reserva.es_por_salud) === 1,
           salud,
+          monto_descuentos: Number(reserva.monto_descuentos || 0),
+          descuentos,
           observaciones_hilo: observacionesHilo
         };
 

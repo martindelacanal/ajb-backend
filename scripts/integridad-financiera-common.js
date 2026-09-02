@@ -558,6 +558,11 @@ async function runDataPreflight(connection) {
     );
   }
 
+  // Los descuentos de turismo (cupones / tipos de viaje) se restan del total:
+  // precio_total = familiares + adicionales - monto_descuentos. Antes de la
+  // migración de descuentos la columna no existe y se asume 0.
+  const tieneMontoDescuentos = Boolean(await columnInfo(connection, "reserva", "monto_descuentos"));
+  const descuentosSql = tieneMontoDescuentos ? "COALESCE(r.monto_descuentos, 0)" : "0";
   report.metrics.reservation_totals = await queryOne(
     connection,
     `SELECT
@@ -565,31 +570,32 @@ async function runDataPreflight(connection) {
          WHEN precio_total IS NULL AND total_nulo_valido = 0 THEN 1
          WHEN precio_total IS NOT NULL
           AND excepcion_subsidio = 0
-          AND ABS(precio_total - (familiares + adicionales)) > 0.011 THEN 1
+          AND ABS(precio_total - (familiares + adicionales - descuentos)) > 0.011 THEN 1
          ELSE 0
        END), 0) AS discrepantes,
        COALESCE(SUM(CASE
          WHEN excepcion_subsidio = 0
           AND adicionales > 0
-          AND ABS(precio_total - (familiares + 2 * adicionales)) <= 0.011 THEN 1
+          AND ABS(precio_total - (familiares + 2 * adicionales - descuentos)) <= 0.011 THEN 1
          ELSE 0
        END), 0) AS doble_adicional_exacto,
        COALESCE(ROUND(SUM(CASE
          WHEN excepcion_subsidio = 0
           AND adicionales > 0
-          AND ABS(precio_total - (familiares + 2 * adicionales)) <= 0.011 THEN adicionales
+          AND ABS(precio_total - (familiares + 2 * adicionales - descuentos)) <= 0.011 THEN adicionales
          ELSE 0
        END), 2), 0) AS exceso_total
       FROM (
         SELECT r.precio_total,
                COALESCE(f.total, 0) AS familiares,
                COALESCE(a.total, 0) AS adicionales,
+               ${descuentosSql} AS descuentos,
                CASE
                  WHEN r.es_por_salud = 1
                   AND rs.estado = 'APROBADA'
                   AND r.precio_total = 0
                   AND rs.precio_cubierto IS NOT NULL
-                  AND ABS(rs.precio_cubierto - (COALESCE(f.total, 0) + COALESCE(a.total, 0))) <= 0.011
+                  AND ABS(rs.precio_cubierto - (COALESCE(f.total, 0) + COALESCE(a.total, 0) - ${descuentosSql})) <= 0.011
                  THEN 1 ELSE 0
                END AS excepcion_subsidio,
                CASE
@@ -798,7 +804,9 @@ async function runDataPreflight(connection) {
              r.es_por_salud = 1
              AND r.precio_total = 0
              AND rs.precio_cubierto IS NOT NULL
-             AND ABS(rs.precio_cubierto - (COALESCE(f.total, 0) + COALESCE(a.total, 0))) <= 0.011
+             AND ABS(rs.precio_cubierto - (COALESCE(f.total, 0) + COALESCE(a.total, 0) - ${
+               (await columnInfo(connection, "reserva", "monto_descuentos")) ? "COALESCE(r.monto_descuentos, 0)" : "0"
+             })) <= 0.011
            )) AS subsidios_aprobados_inconsistentes`
   );
   report.metrics.workflow_consistency.ciclos_familiares = Number((await queryOne(

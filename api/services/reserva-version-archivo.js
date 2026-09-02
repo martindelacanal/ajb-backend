@@ -64,15 +64,34 @@ async function archivarVersionReservaAntesDeReemplazo(
          INNER JOIN reserva_salud rs ON rs.id = rsa.reserva_salud_id
         WHERE rs.reserva_id = ? ORDER BY rs.id, rsa.id`,
     ],
+    ["descuentos", "SELECT * FROM reserva_descuento WHERE reserva_id = ? ORDER BY id"],
+    [
+      "descuentos_archivos",
+      `SELECT rda.*
+         FROM reserva_descuento_archivo rda
+         INNER JOIN reserva_descuento rd ON rd.id = rda.reserva_descuento_id
+        WHERE rd.reserva_id = ? ORDER BY rd.id, rda.id`,
+    ],
     ["observaciones", "SELECT * FROM reserva_observacion WHERE reserva_id = ? ORDER BY id"],
     ["convenio_propuestas", "SELECT * FROM reserva_convenio_propuesta WHERE reserva_id = ? ORDER BY id"],
     ["sorteo_respuestas", "SELECT * FROM sorteo_adjudicacion_respuesta WHERE reserva_id = ? ORDER BY id"],
     ["bloques_recurso", "SELECT * FROM bloque_fecha_recurso WHERE reserva_id = ? ORDER BY id"],
   ];
   const contenido = { formato_version: 1, reserva: reservas[0] };
+  // Las tablas del módulo Descuentos pueden no existir todavía en una base sin
+  // esa migración: el archivo no debe bloquear la edición por eso.
+  const tablasOpcionales = new Set(["descuentos", "descuentos_archivos"]);
   for (const [clave, sql] of consultas) {
-    const [rows] = await connection.query(sql, [reservaId]);
-    contenido[clave] = rows;
+    try {
+      const [rows] = await connection.query(sql, [reservaId]);
+      contenido[clave] = rows;
+    } catch (error) {
+      if (tablasOpcionales.has(clave) && error?.code === "ER_NO_SUCH_TABLE") {
+        contenido[clave] = [];
+        continue;
+      }
+      throw error;
+    }
   }
 
   const canonical = jsonCanonico(contenido);

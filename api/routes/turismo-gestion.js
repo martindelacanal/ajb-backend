@@ -45,8 +45,11 @@ const {
   registrarHistorialTurismo,
   tieneAreaTurismo,
 } = require("../services/turismo-catalogo");
+const { registrarHistorialDescuento } = require("../services/descuentos-reserva");
 
 const router = express.Router();
+
+const ESTADOS_DESCUENTO_SALUD = new Set(["DESHABILITADO", "PENDIENTE", "HABILITADO"]);
 
 const TEMPORADAS_REGLA = new Set(["ALTA", "BAJA", "UNICA", "PERSONALIZADA"]);
 const MIME_IMAGEN_PERMITIDO = new Set(["image/jpeg", "image/png", "image/webp"]);
@@ -556,6 +559,13 @@ function presentarServicio(servicio, cabecera = null) {
     propietario_nombre: servicio.propietario_departamental_nombre || null,
     captura_personas: Number(servicio.permite_acompanantes) === 1 ? "GRUPO" : "SOLO_TITULAR",
     capacidad_maxima: servicio.max_personas_reserva,
+    // Descuento médico (subsidio por salud 100%) ofrecido al reservar este servicio
+    descuento_salud_estado: ESTADOS_DESCUENTO_SALUD.has(servicio.descuento_salud_estado)
+      ? servicio.descuento_salud_estado
+      : "DESHABILITADO",
+    descuento_salud_habilitado: servicio.descuento_salud_estado === "HABILITADO",
+    descuento_salud_motivo: servicio.descuento_salud_motivo || null,
+    descuento_salud_fecha_solicitud: servicio.descuento_salud_fecha_solicitud || null,
     ...(cabecera ? permisosServicio(servicio, cabecera) : {}),
   };
 }
@@ -2759,6 +2769,179 @@ router.put("/gestion/turismo/servicios/:id/convenio", verifyToken, async (req, r
   } catch (error) {
     if (connection) await connection.rollback();
     return responderError(res, error, "Error al guardar el convenio hotelero");
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Descuento médico por servicio (subsidio de alojamiento por salud, 100%).
+// admin / admin-central lo habilitan o deshabilitan directamente; una
+// departamental sólo puede pedirlo para sus propios servicios y queda
+// PENDIENTE hasta que un rol superior lo apruebe.
+// ---------------------------------------------------------------------------
+async function registrarCambioDescuentoSalud(connection, { servicio, estadoAnterior, estadoNuevo, operacion, resumen, motivo = null, cabecera, req }) {
+  await registrarHistorialTurismo(connection, {
+    servicioId: servicio.id,
+    entidadTipo: "DESCUENTO_SALUD",
+    entidadId: servicio.id,
+    operacion,
+    resumen,
+    anterior: { descuento_salud_estado: estadoAnterior },
+    nuevo: { descuento_salud_estado: estadoNuevo, motivo },
+    usuarioId: cabecera.id,
+    req,
+  });
+  await registrarHistorialDescuento(connection, {
+    servicioId: servicio.id,
+    entidadTipo: "SERVICIO_SALUD",
+    entidadId: servicio.id,
+    operacion,
+    resumen,
+    anterior: { descuento_salud_estado: estadoAnterior },
+    nuevo: { descuento_salud_estado: estadoNuevo, motivo },
+    usuarioId: cabecera.id,
+    req,
+  });
+}
+
+router.put("/gestion/turismo/servicios/:id/descuento-salud", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = exigirGestion(req);
+    const servicioId = normalizarIdPositivo(req.params.id);
+    const habilitado = normalizarBooleano(req.body?.habilitado);
+    if (!servicioId || habilitado === undefined || habilitado === null) {
+      throw crearErrorCatalogo("Los datos no son válidos", 400, "DESCUENTO_SALUD_DATOS_INVALIDOS");
+    }
+    const motivo = normalizarTexto(req.body?.motivo, { nullable: true, maximo: 1000 });
+    if (motivo === undefined) throw crearErrorCatalogo("El motivo no es válido", 400, "DESCUENTO_SALUD_MOTIVO_INVALIDO");
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const anterior = await obtenerServicioGestionAutorizado(connection, cabecera, servicioId, { forUpdate: true });
+    const estadoAnterior = anterior.descuento_salud_estado || "DESHABILITADO";
+    const esAdministrador = esAdministradorTurismo(cabecera);
+    let estadoNuevo;
+    let operacion;
+    let resumen;
+    if (habilitado === 1) {
+      if (estadoAnterior === "HABILITADO") {
+        throw crearErrorCatalogo("El descuento médico ya está habilitado en este servicio", 409, "DESCUENTO_SALUD_YA_HABILITADO");
+      }
+      if (esAdministrador) {
+        estadoNuevo = "HABILITADO";
+        operacion = "ENABLE";
+        resumen = `Descuento médico habilitado en “${anterior.nombre}”`;
+      } else {
+        if (estadoAnterior === "PENDIENTE") {
+          throw crearErrorCatalogo("La solicitud ya está pendiente de aprobación", 409, "DESCUENTO_SALUD_YA_PENDIENTE");
+        }
+        estadoNuevo = "PENDIENTE";
+        operacion = "SUBMIT";
+        resumen = `La departamental solicitó habilitar el descuento médico en “${anterior.nombre}”`;
+      }
+    } else {
+      if (estadoAnterior === "DESHABILITADO") {
+        throw crearErrorCatalogo("El descuento médico ya está deshabilitado en este servicio", 409, "DESCUENTO_SALUD_YA_DESHABILITADO");
+      }
+      estadoNuevo = "DESHABILITADO";
+      operacion = estadoAnterior === "PENDIENTE" && !esAdministrador ? "WITHDRAW" : "DISABLE";
+      resumen = estadoAnterior === "PENDIENTE" && !esAdministrador
+        ? `La departamental retiró la solicitud de descuento médico de “${anterior.nombre}”`
+        : `Descuento médico deshabilitado en “${anterior.nombre}”`;
+    }
+    await connection.query(
+      `UPDATE servicio
+          SET descuento_salud_estado = ?,
+              descuento_salud_solicitado_por_usuario_id = ?,
+              descuento_salud_fecha_solicitud = ?,
+              descuento_salud_motivo = ?
+        WHERE id = ?`,
+      [
+        estadoNuevo,
+        estadoNuevo === "PENDIENTE" ? cabecera.id : null,
+        estadoNuevo === "PENDIENTE" ? new Date() : null,
+        estadoNuevo === "DESHABILITADO" ? motivo : null,
+        servicioId,
+      ]
+    );
+    await registrarCambioDescuentoSalud(connection, {
+      servicio: anterior, estadoAnterior, estadoNuevo, operacion, resumen, motivo, cabecera, req,
+    });
+    if (estadoNuevo === "PENDIENTE") {
+      await notificarRevisores(
+        connection, anterior, "TURISMO_DESCUENTO_SALUD_PENDIENTE",
+        `Descuento médico pendiente: ${anterior.nombre}`,
+        `La departamental pidió habilitar el subsidio por salud (100%) en “${anterior.nombre}”. Revisalo en Turismo → Servicios.`,
+        cabecera.id
+      );
+    }
+    const nuevo = await obtenerServicioGestion(connection, servicioId);
+    await connection.commit();
+    return res.status(200).json(presentarServicio(nuevo, cabecera));
+  } catch (error) {
+    if (connection) await connection.rollback();
+    return responderError(res, error, "Error al cambiar el descuento médico del servicio");
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+router.post("/gestion/turismo/servicios/:id/descuento-salud/aprobacion", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = exigirGestion(req);
+    if (!puedeAprobarTurismo(cabecera)) {
+      throw crearErrorCatalogo("Solo un administrador puede resolver la solicitud", 403, "APROBACION_TURISMO_NO_AUTORIZADA");
+    }
+    const servicioId = normalizarIdPositivo(req.params.id);
+    const accion = String(req.body?.accion || req.body?.estado || "").trim().toUpperCase();
+    const aprobar = ["APROBAR", "APROBADO", "HABILITAR"].includes(accion);
+    const rechazar = ["RECHAZAR", "RECHAZADO"].includes(accion);
+    if (!servicioId || (!aprobar && !rechazar)) {
+      throw crearErrorCatalogo("La acción no es válida", 400, "DESCUENTO_SALUD_ACCION_INVALIDA");
+    }
+    const motivo = normalizarTexto(req.body?.motivo ?? req.body?.observacion, { nullable: true, maximo: 1000 });
+    if (motivo === undefined) throw crearErrorCatalogo("El motivo no es válido", 400, "DESCUENTO_SALUD_MOTIVO_INVALIDO");
+    if (rechazar && !motivo) throw crearErrorCatalogo("Indicá el motivo del rechazo", 400, "DESCUENTO_SALUD_MOTIVO_REQUERIDO");
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const anterior = await obtenerServicioGestion(connection, servicioId, { forUpdate: true });
+    if (!anterior) throw crearErrorCatalogo("Servicio no encontrado", 404, "SERVICIO_NO_ENCONTRADO");
+    if (anterior.descuento_salud_estado !== "PENDIENTE") {
+      throw crearErrorCatalogo("No hay una solicitud pendiente para este servicio", 409, "DESCUENTO_SALUD_NO_PENDIENTE");
+    }
+    const estadoNuevo = aprobar ? "HABILITADO" : "DESHABILITADO";
+    await connection.query(
+      "UPDATE servicio SET descuento_salud_estado = ?, descuento_salud_motivo = ? WHERE id = ?",
+      [estadoNuevo, aprobar ? null : motivo, servicioId]
+    );
+    await registrarCambioDescuentoSalud(connection, {
+      servicio: anterior,
+      estadoAnterior: "PENDIENTE",
+      estadoNuevo,
+      operacion: aprobar ? "APPROVE" : "REJECT",
+      resumen: aprobar
+        ? `Descuento médico aprobado en “${anterior.nombre}”${motivo ? `: ${motivo}` : ""}`
+        : `Solicitud de descuento médico rechazada en “${anterior.nombre}”: ${motivo}`,
+      motivo,
+      cabecera,
+      req,
+    });
+    await notificarPropietaria(
+      connection, anterior, "TURISMO_DESCUENTO_SALUD_RESUELTO",
+      aprobar ? "Descuento médico aprobado" : "Descuento médico rechazado",
+      aprobar
+        ? `Ya podés ofrecer el subsidio por salud (100%) en “${anterior.nombre}”.`
+        : `La solicitud de descuento médico para “${anterior.nombre}” fue rechazada. Motivo: ${motivo}`,
+      cabecera.id
+    );
+    const nuevo = await obtenerServicioGestion(connection, servicioId);
+    await connection.commit();
+    return res.status(200).json(presentarServicio(nuevo, cabecera));
+  } catch (error) {
+    if (connection) await connection.rollback();
+    return responderError(res, error, "Error al resolver la solicitud de descuento médico");
   } finally {
     if (connection) connection.release();
   }

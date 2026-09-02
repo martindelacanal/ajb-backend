@@ -922,6 +922,8 @@ function responderResumenConSaludOculta(propietarioId) {
     if (/FROM reserva_familiar rf/i.test(sql)) return [[]];
     if (/FROM reserva_adicional\s+WHERE reserva_id/i.test(sql)) return [[]];
     if (/FROM reserva_observacion o/i.test(sql)) return [[]];
+    // Cupones / tipos de viaje aplicados a la reserva (módulo Descuentos)
+    if (/FROM reserva_descuento rd/i.test(sql)) return [[]];
     if (/\b(?:FROM|JOIN)\s+reserva_salud(?:_archivo)?\b/i.test(sql)) {
       throw new Error(`No debió consultar datos médicos: ${sql}`);
     }
