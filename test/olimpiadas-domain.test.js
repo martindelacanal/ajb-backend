@@ -112,7 +112,7 @@ test("olimpiadas rechaza reactivación o edición cuando el cupo quedó completo
 test("olimpiadas impide quitar disciplinas usadas o bajar cupos bajo la ocupación", async () => {
   const usada = {
     async query() {
-      return [[{ disciplina_id: 4, departamental_id: 2, inscripciones: 3, validadas: 2 }]];
+      return [[{ disciplina_id: 4, departamental_id: 2, inscripciones: 3, activas: 2 }]];
     },
   };
   await assert.rejects(

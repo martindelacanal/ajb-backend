@@ -28,7 +28,8 @@
     "migrate:preferencias-modulos-contacto": "node scripts/migrar-preferencias-modulos-contacto.js",
     "seed:login-gallery": "node scripts/seed-login-gallery.js",
     "mail:verificar": "node scripts/probar-correo.js --solo-verificar",
-    "mail:probar": "node scripts/probar-correo.js"
+    "mail:probar": "node scripts/probar-correo.js",
+    "migrate:olimpiadas-v2": "node scripts/migrar-olimpiadas-v2.js"
   },
   "keywords": [],
   "author": "",

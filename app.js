@@ -126,6 +126,8 @@ app.get('/api/healthz', async (_req, res) => {
 const userRoute = require('./api/routes/user');
 const coseguroRoute = require('./api/routes/coseguro');
 const olimpiadasRoute = require('./api/routes/olimpiadas');
+const olimpiadasBonosRoute = require('./api/routes/olimpiadas-bonos');
+const olimpiadasContenidoRoute = require('./api/routes/olimpiadas-contenido');
 const trasladosRoute = require('./api/routes/traslados');
 const noticiasRoute = require('./api/routes/noticias');
 const dashboardRoute = require('./api/routes/dashboard');
@@ -138,6 +140,8 @@ app.use('/api', turismoGestionRoute);
 app.use('/api', descuentosRoute);
 app.use('/api',userRoute);
 app.use('/api',coseguroRoute);
+app.use('/api', olimpiadasBonosRoute);
+app.use('/api', olimpiadasContenidoRoute);
 app.use('/api',olimpiadasRoute);
 app.use('/api',trasladosRoute);
 app.use('/api',noticiasRoute);
