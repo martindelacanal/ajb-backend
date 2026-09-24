@@ -24,6 +24,7 @@ const {
   sumarCentavos,
   sumarDiasFechaCivil,
 } = require("../api/services/valores-dominio");
+const { esMenorDe2 } = require("../api/services/descuento-adicionales");
 
 const MARKER = "[AJB-DEMO:v1]";
 const LEGACY_SEASON_NAME = "Temporada de prueba (seed)";
@@ -158,13 +159,16 @@ function canonicalAdditionalPricing(participants, basePriceCents, nights) {
   let sourceParticipantIndex = null;
   for (let index = 0; index < participants.length; index += 1) {
     const participant = participants[index];
+    // Los menores de 2 años (100%) no cuentan para el descuento del adicional:
+    // misma regla que services/descuento-adicionales.js.
+    if (esMenorDe2({ tipo_persona_id: participant.typeId })) continue;
     const usesPercentage = participant.usesPercentage === true ||
       participant.usesPercentage === 1 || participant.usesPercentage === "1";
     const basisPoints = decimalAPuntosBase(participant.discountPercent ?? 0);
     if (usesPercentage && basisPoints === null) {
       throw new Error("Una tarifa participante del adicional demo tiene un porcentaje invalido");
     }
-    // Replica obtenerMejorDescuentoDia: el mayor porcentaje gana y un empate
+    // Replica obtenerMejorDescuentoAdicionalesDia: el mayor porcentaje gana y un empate
     // conserva la primera persona del orden canonico de la reserva.
     if (usesPercentage && basisPoints > discountBasisPoints) {
       discountBasisPoints = basisPoints;

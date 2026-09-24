@@ -168,14 +168,30 @@ test("el adicional replica el mayor descuento canonico por noche y conserva su t
   assert.equal(pricing.subtotalCents, 1_302);
   assert.deepEqual(pricing.details.map((detail) => detail.date), ["2026-08-23", "2026-08-24"]);
 
-  const free = canonicalAdditionalPricing(
+  // Los menores de 2 años (100%) no cuentan: el adicional toma el siguiente
+  // mayor descuento y, si no hay otro, se cobra entero.
+  const withBaby = canonicalAdditionalPricing(
+    [
+      { typeId: 1, tariffId: 101, usesPercentage: true, discountPercent: 35 },
+      { typeId: 5, tariffId: 501, usesPercentage: true, discountPercent: 100 },
+    ],
+    500_000,
+    ["2026-08-23", "2026-08-24"]
+  );
+  assert.equal(withBaby.discountBasisPoints, 3_500);
+  assert.equal(withBaby.sourceTariffId, 101);
+  assert.equal(withBaby.unitPriceCents, 325_000);
+  assert.equal(withBaby.subtotalCents, 650_000);
+
+  const onlyBaby = canonicalAdditionalPricing(
     [{ typeId: 5, tariffId: 501, usesPercentage: true, discountPercent: 100 }],
     500_000,
     ["2026-08-23"]
   );
-  assert.equal(free.unitPriceCents, 0);
-  assert.equal(free.subtotalCents, 0);
-  assert.equal(free.sourceTariffId, 501);
+  assert.equal(onlyBaby.unitPriceCents, 500_000);
+  assert.equal(onlyBaby.subtotalCents, 500_000);
+  assert.equal(onlyBaby.discountBasisPoints, 0);
+  assert.equal(onlyBaby.sourceTariffId, null);
   assert.throws(
     () => canonicalAdditionalPricing(
       [{ typeId: 1, tariffId: 101, usesPercentage: true, discountPercent: "invalido" }],

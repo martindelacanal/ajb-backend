@@ -176,6 +176,43 @@ test("PUT /familiares/:id/vinculo transfiere grupo y departamental juntos", asyn
   assert.deepEqual(actualizacion.params, ["S", 10, 3, "S", 9, 33]);
 });
 
+test("PUT /familiares/:id/vinculo con N deja a la persona como acompañante vinculada al afiliado", async () => {
+  conexionActual = crearConexion(({ sql }) => {
+    if (sql.startsWith("SELECT id, departamental_id FROM usuario WHERE id")) {
+      return [[{ id: 10, departamental_id: 9 }]];
+    }
+    if (sql.startsWith("SELECT id, usuario_familiar_id")) {
+      return [[{
+        id: 33,
+        usuario_familiar_id: 10,
+        es_familiar: "S",
+        parentesco_id: 3,
+        departamental_id: 9,
+        password: null,
+        email: null,
+      }]];
+    }
+    return [{ affectedRows: 1, insertId: 1 }];
+  });
+
+  const req = crearRequest({ params: { id: "33" }, body: { es_familiar: "N" } });
+  const res = crearRespuesta();
+
+  await obtenerHandler("/familiares/:id/vinculo", "put")(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(conexionActual.estado.commits, 1);
+  const actualizacion = conexionActual.estado.consultas.find(({ sql }) =>
+    sql.startsWith("UPDATE usuario SET es_familiar = ?")
+  );
+  assert.ok(actualizacion);
+  // Sigue vinculada (usuario_familiar_id = 10) y conserva su parentesco.
+  assert.deepEqual(actualizacion.params, ["N", 10, null, "N", 9, 33]);
+  assert.ok(!conexionActual.estado.consultas.some(({ sql, params }) =>
+    sql.startsWith("INSERT INTO historial_usuario") && params?.[2] === "usuario_familiar_id"
+  ));
+});
+
 test("los flujos familiares rechazan titulares sin departamental valida", async () => {
   conexionActual = crearConexion(({ sql }) => {
     if (sql.startsWith("SELECT id, departamental_id FROM usuario WHERE id")) {

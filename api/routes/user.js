@@ -101,6 +101,7 @@ const {
   obtenerDescuentosReservaCrudos,
   resolverDescuentosSolicitados,
 } = require("../services/descuentos-reserva");
+const { obtenerMejorDescuentoAdicionalesDia } = require("../services/descuento-adicionales");
 
 const HISTORIAL_USUARIO_LEGIBLE = crearEnriquecimientoHistorial(
   CATALOGOS_HISTORIAL_USUARIO
@@ -9067,64 +9068,17 @@ async function obtenerNombreAdicional(connection, cache, adicionalId) {
   return nombre;
 }
 
-async function obtenerMejorDescuentoDia(connection, recursoId, regimenId, personas, fecha, temporadaTarifaId = null) {
-  let maxDescuentoPuntosBase = 0;
-  let tarifaIdMax = null;
-
-  for (const persona of personas) {
-    if (!persona.tipo_persona_id || persona.edad === undefined) continue;
-
-    const filtroTemporada = temporadaTarifaId
-      ? "AND temporada_tarifa_id = ?"
-      : `AND (temporada_tarifa_id IS NULL OR temporada_tarifa_id IN (
-           SELECT id FROM temporada_tarifa WHERE COALESCE(origen, 'GENERAL') = 'GENERAL'
-         ))`;
-    const [rows] = await connection.query(
-      `SELECT id, usa_porcentaje, porcentaje_descuento
-       FROM tarifa 
-       WHERE recurso_id = ? 
-         AND tipo_persona_id = ? 
-         AND regimen_id = ?
-         AND (edad_minima IS NULL OR edad_minima <= ?)
-         AND (edad_maxima IS NULL OR edad_maxima >= ?)
-         AND fecha_inicio <= ?
-         AND fecha_fin >= ?
-         ${filtroTemporada}
-       ORDER BY fecha_inicio ASC`,
-      [
-        recursoId,
-        persona.tipo_persona_id,
-        regimenId,
-        persona.edad,
-        persona.edad,
-        fecha,
-        fecha,
-        ...(temporadaTarifaId ? [temporadaTarifaId] : [])
-      ]
-    );
-
-    if (rows.length > 1) {
-      throw crearErrorNegocio(`Hay mas de una tarifa aplicable para la fecha ${fecha}`, 409, "TARIFA_AMBIGUA");
-    }
-    if (rows.length > 0) {
-      const tarifa = rows[0];
-      const usaPorcentaje = tarifa.usa_porcentaje === 1 || tarifa.usa_porcentaje === true || tarifa.usa_porcentaje === "1";
-      const puntosBase = decimalAPuntosBase(tarifa.porcentaje_descuento ?? 0);
-      if (usaPorcentaje && puntosBase === null) {
-        throw crearErrorNegocio(`La tarifa de la fecha ${fecha} tiene un porcentaje invalido`, 409, "TARIFA_INVALIDA");
-      }
-      if (usaPorcentaje && puntosBase > maxDescuentoPuntosBase) {
-        maxDescuentoPuntosBase = puntosBase;
-        tarifaIdMax = tarifa.id;
-      }
-    }
-  }
-  
-  return {
-    porcentaje_descuento: maxDescuentoPuntosBase / 100,
-    porcentaje_puntos_base: maxDescuentoPuntosBase,
-    tarifa_id: tarifaIdMax,
-  };
+// Descuento de los adicionales para una noche: el mayor % entre las tarifas de
+// las personas, SIN contar a los menores de 2 años (su 100% dejaría gratis
+// todos los adicionales). La regla vive en services/descuento-adicionales.js.
+function obtenerMejorDescuentoDia(connection, recursoId, regimenId, personas, fecha, temporadaTarifaId = null) {
+  return obtenerMejorDescuentoAdicionalesDia(connection, {
+    recursoId,
+    regimenId,
+    personas,
+    fecha,
+    temporadaTarifaId,
+  });
 }
 
 async function calcularAdicionalesReserva(connection, adicionales, recursoId, regimenId, fechaInicio, fechaFin, personas, temporadaTarifaId = null, opciones = {}) {
@@ -14244,7 +14198,10 @@ router.put("/familiares/:id/vinculo", verifyToken, async (req, res) => {
     if (esFamiliar === "S" && parentescoId && parentescoId !== persona.parentesco_id) {
       cambios.push({ campo: "parentesco_id", valorAnterior: persona.parentesco_id, valorNuevo: parentescoId });
     }
-    const usuarioFamiliarIdNuevo = esFamiliar === "S" ? actorId : null;
+    // Los acompañantes de viaje (N) siguen vinculados al afiliado: la tabla de
+    // familiares y acompañantes los lista por usuario_familiar_id. Con NULL la
+    // persona desaparecía de la lista y no se podía volver a sumar al grupo.
+    const usuarioFamiliarIdNuevo = actorId;
     if (normalizarIdPositivo(persona.usuario_familiar_id) !== usuarioFamiliarIdNuevo) {
       cambios.push({
         campo: "usuario_familiar_id",

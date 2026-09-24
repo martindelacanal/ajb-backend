@@ -5,6 +5,7 @@ Los comandos están separados deliberadamente:
 - `verificar-integridad-financiera.js`: auditoría exclusivamente de lectura;
 - `migrar-integridad-financiera.js`: migración idempotente de esquema, dry-run por defecto;
 - `corregir-doble-adicional-reservas.js`: corrección monetaria por manifiesto aprobado, dry-run por defecto;
+- `corregir-descuento-adicionales-bebe.js`: recalcula adicionales que tomaron el 100% de un menor de 2 años (ver `BD/CORRECCION_DESCUENTO_ADICIONALES_BEBE.md`), mismo patrón de manifiesto;
 - `limpiar-datos-prueba-inconsistentes.js`: retiro transaccional de datos de prueba históricos que no se pueden reconstruir con certeza;
 - `seed-demo-integral.js`: dataset demostrativo coherente e idempotente, dry-run por defecto;
 - `configurar-usuario-runtime.js`: provisión de una cuenta de aplicación con privilegios mínimos.
