@@ -81,10 +81,10 @@ function normalizarModalidadHold(valor) {
 function normalizarTokenHold(token, { requerido = true } = {}) {
   if (token === undefined || token === null || token === "") {
     if (!requerido) return null;
-    throw crearErrorHold("Falta el token de la reserva temporal.", 400, "HOLD_TOKEN_REQUERIDO");
+    throw crearErrorHold("Falta la reserva temporal. Volvé a elegir el alojamiento.", 400, "HOLD_TOKEN_REQUERIDO");
   }
   if (typeof token !== "string") {
-    throw crearErrorHold("El token de la reserva temporal no es válido.", 400, "HOLD_TOKEN_INVALIDO");
+    throw crearErrorHold("La reserva temporal no es válida. Volvé a elegir el alojamiento.", 400, "HOLD_TOKEN_INVALIDO");
   }
   const normalizado = token.trim();
   if (
@@ -92,7 +92,7 @@ function normalizarTokenHold(token, { requerido = true } = {}) {
     normalizado.length > TOKEN_MAX_LENGTH ||
     !/^[A-Za-z0-9._~-]+$/.test(normalizado)
   ) {
-    throw crearErrorHold("El token de la reserva temporal no es válido.", 400, "HOLD_TOKEN_INVALIDO");
+    throw crearErrorHold("La reserva temporal no es válida. Volvé a elegir el alojamiento.", 400, "HOLD_TOKEN_INVALIDO");
   }
   return normalizado;
 }
@@ -598,7 +598,7 @@ async function adquirirHoldTurismo(db, params) {
       );
       if (tokenExistente.length > 0) {
         throw crearErrorHold(
-          "Generá un nuevo token para iniciar otra reserva temporal.",
+          "Esa reserva temporal ya se usó. Volvé a elegir el alojamiento para iniciar otra.",
           409,
           "HOLD_TOKEN_REUTILIZADO"
         );

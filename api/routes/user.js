@@ -365,6 +365,18 @@ async function deleteFileFromS3(key) {
 }
 // S3 FIN
 
+// Multer arma los errores de límite en inglés ("File too large", "Too many files"…)
+// y el front los muestra tal cual: se traducen por código. Los errores propios del
+// fileFilter ya vienen en español y se respetan.
+function mensajeErrorUpload(error, { tamanio, cantidad, porDefecto }) {
+  if (error instanceof multer.MulterError) {
+    if (error.code === "LIMIT_FILE_SIZE" && tamanio) return tamanio;
+    if ((error.code === "LIMIT_FILE_COUNT" || error.code === "LIMIT_UNEXPECTED_FILE") && cantidad) return cantidad;
+    return porDefecto;
+  }
+  return error?.message || porDefecto;
+}
+
 const uploadConvenioHotel = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -390,7 +402,11 @@ const procesarUploadConvenioHotel = uploadConvenioHotel.fields([
 function manejarUploadConvenioHotel(req, res, next) {
   procesarUploadConvenioHotel(req, res, (error) => {
     if (error) {
-      return res.status(400).json(error.message || "No se pudieron procesar los archivos");
+      return res.status(400).json(mensajeErrorUpload(error, {
+        tamanio: "Cada archivo puede pesar hasta 10 MB",
+        cantidad: "Podés subir hasta 10 fotos y un PDF tarifario",
+        porDefecto: "No se pudieron procesar los archivos",
+      }));
     }
     return validarContenidoArchivos(req, res, next);
   });
@@ -413,7 +429,11 @@ const uploadTurismoPropuesta = multer({
 function manejarUploadTurismoPropuesta(req, res, next) {
   uploadTurismoPropuesta(req, res, (error) => {
     if (error) {
-      return res.status(400).json(error.message || "No se pudo procesar la imagen");
+      return res.status(400).json(mensajeErrorUpload(error, {
+        tamanio: "La imagen puede pesar hasta 8 MB",
+        cantidad: "Subí una sola imagen",
+        porDefecto: "No se pudo procesar la imagen",
+      }));
     }
     return validarContenidoArchivos(req, res, next);
   });
@@ -436,7 +456,11 @@ const uploadTurismoTestimonio = multer({
 function manejarUploadTurismoTestimonio(req, res, next) {
   uploadTurismoTestimonio(req, res, (error) => {
     if (error) {
-      return res.status(400).json(error.message || "No se pudo procesar la foto");
+      return res.status(400).json(mensajeErrorUpload(error, {
+        tamanio: "La foto puede pesar hasta 5 MB",
+        cantidad: "Subí una sola foto",
+        porDefecto: "No se pudo procesar la foto",
+      }));
     }
     return validarContenidoArchivos(req, res, next);
   });
@@ -455,14 +479,18 @@ const uploadLoginImagen = multer({
     ) {
       return cb(null, true);
     }
-    return cb(new Error("Solo se permiten imagenes JPG, PNG o WebP"));
+    return cb(new Error("Solo se permiten imágenes JPG, PNG o WebP"));
   },
 }).single("imagen");
 
 function manejarUploadLoginImagen(req, res, next) {
   uploadLoginImagen(req, res, (error) => {
     if (error) {
-      return res.status(400).json(error.message || "No se pudo procesar la imagen");
+      return res.status(400).json(mensajeErrorUpload(error, {
+        tamanio: "La imagen puede pesar hasta 15 MB",
+        cantidad: "Subí una sola imagen",
+        porDefecto: "No se pudo procesar la imagen",
+      }));
     }
     return validarContenidoArchivos(req, res, next);
   });
@@ -14874,10 +14902,13 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
         SELECT 
           u.id,
           CASE 
-            WHEN r.nombre = 'admin' THEN 'Admin'
+            WHEN r.nombre = 'admin' THEN 'Administrador'
+            WHEN r.nombre = 'admin-central' THEN 'Administrador central'
             WHEN r.nombre = 'afiliado' THEN 'Afiliado'
             WHEN r.nombre = 'departamental' THEN 'Departamental'
             WHEN r.nombre = 'invitado' THEN 'Invitado'
+            WHEN r.nombre = 'auditor' THEN 'Auditor'
+            WHEN r.nombre = 'prensa' THEN 'Prensa'
             ELSE r.nombre
           END AS rol,
           r.nombre AS rol_codigo,
@@ -15030,16 +15061,22 @@ router.get("/rol", verifyToken, async (req, res) => {
         .promise()
         .query("SELECT id, nombre FROM rol ORDER BY id ASC");
 
+      // nombre = etiqueta visible; codigo = rol.nombre crudo, para que el front
+      // compare contra el código y no contra la etiqueta.
       const rolesMap = {
-        admin: "Admin",
+        admin: "Administrador",
+        "admin-central": "Administrador central",
         afiliado: "Afiliado",
         departamental: "Departamental",
-        invitado: "Invitado"
+        invitado: "Invitado",
+        auditor: "Auditor",
+        prensa: "Prensa"
       };
 
       const roles = rows.map(r => ({
         id: r.id,
-        nombre: rolesMap[r.nombre] || r.nombre
+        nombre: rolesMap[r.nombre] || r.nombre,
+        codigo: r.nombre
       }));
 
       res.status(200).json(roles);
@@ -15055,7 +15092,8 @@ router.get("/rol", verifyToken, async (req, res) => {
 
       const roles = rows.map(r => ({
         id: r.id,
-        nombre: rolesMap[r.nombre] || r.nombre
+        nombre: rolesMap[r.nombre] || r.nombre,
+        codigo: r.nombre
       }));
 
       res.status(200).json(roles);
@@ -17619,7 +17657,11 @@ const uploadFotoPerfil = multer({
 function manejarUploadFotoPerfil(req, res, next) {
   uploadFotoPerfil.single('foto')(req, res, (error) => {
     if (error) {
-      res.status(400).json(error.message || 'No se pudo procesar la foto');
+      res.status(400).json(mensajeErrorUpload(error, {
+        tamanio: 'La foto puede pesar hasta 5 MB',
+        cantidad: 'Subí una sola foto',
+        porDefecto: 'No se pudo procesar la foto',
+      }));
       return;
     }
     validarContenidoArchivos(req, res, next);

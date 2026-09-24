@@ -161,7 +161,19 @@ test("fechas, vigencia y resumen de texto", () => {
   assert.equal(T.describirVigencia({}), null);
   assert.equal(T.resumenHtml("<p>Hola   <b>mundo</b></p>"), "Hola mundo");
   assert.equal(T.resumenHtml("<p>" + "x".repeat(200) + "</p>", 10).length, 10);
-  assert.equal(T.describirMotivoCorreo({ motivo: "error_smtp", error: "boom" }), "Error SMTP: boom");
+  assert.equal(T.describirMotivoCorreo({ motivo: "error_smtp", error: "boom" }), "El servidor de correo no aceptó el envío");
+  assert.equal(
+    T.describirMotivoCorreo({ motivo: "error_smtp", error: "Connection timeout", codigo: "ETIMEDOUT" }),
+    "El servidor de correo no respondió a tiempo"
+  );
+  assert.equal(
+    T.describirMotivoCorreo({ motivo: "error_smtp", error: "Invalid login: 535 Incorrect authentication data", codigo: "EAUTH" }),
+    "El servidor de correo rechazó las credenciales"
+  );
+  assert.equal(
+    T.describirMotivoCorreo({ motivo: "error_smtp", error: "Mailbox unavailable", codigo: 550 }),
+    "El servidor de correo rechazó el envío (código 550)"
+  );
 });
 
 test("normalizarListaIds y flags", () => {

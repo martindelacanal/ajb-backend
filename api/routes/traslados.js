@@ -191,7 +191,7 @@ function verifyToken(req, res, next) {
           return res.status(403).json("El módulo de Traslados está disponible únicamente para administradores");
         }
       } catch (_parseError) {
-        return res.status(403).json("Error en el token");
+        return res.status(403).json("Tu sesión no es válida. Volvé a iniciar sesión.");
       }
       return next();
     },

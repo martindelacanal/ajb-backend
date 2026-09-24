@@ -6,11 +6,12 @@
 // con inscripción abierta, bloques de venta directa, cupos de camping y
 // adicionales por recurso) en los 4 servicios propios del catálogo.
 //
-// Idempotente: cada pieza lleva el marcador [AJB-CLIENTE-2026] en el nombre y
-// se omite si ya existe. Los rangos de tarifa se recortan para no solaparse
-// con las temporadas ya cargadas (mismo criterio que la pantalla de
-// temporadas: nunca dos temporadas generales o de bloque activo sobre el
-// mismo recurso y noche).
+// Idempotente: cada pieza se busca por su nombre exacto y se omite si ya existe
+// (el marcador [AJB-CLIENTE-2026] sólo queda en el historial de temporadas; se
+// sacó de los nombres porque se veía en la portada del afiliado). Los rangos
+// de tarifa se recortan para no solaparse con las temporadas ya cargadas
+// (mismo criterio que la pantalla de temporadas: nunca dos temporadas
+// generales o de bloque activo sobre el mismo recurso y noche).
 //
 // Uso (dry-run por defecto):
 //   DB_HOST=localhost DB_USER=root DB_PASSWORD=... DB_DATABASE=db_miajb node scripts/seed-turismo-cliente-2026.js
@@ -105,20 +106,20 @@ const SERVICIOS = [
 ];
 
 const TEMPORADA_BAJA = {
-  nombre: `${MARCADOR} Primavera 2026`,
+  nombre: `Primavera 2026`,
   inicio: "2026-09-08",
   fin: "2026-12-14",
   tipo: "baja",
 };
 const TEMPORADA_ALTA = {
-  nombre: `${MARCADOR} Verano 2027`,
+  nombre: `Verano 2027`,
   inicio: "2026-12-15",
   fin: "2027-03-07",
   tipo: "alta",
 };
 
 const SORTEO = {
-  nombre: `${MARCADOR} Sorteo Verano 2027 · 1ª quincena de enero`,
+  nombre: `Sorteo Verano 2027 · 1ª quincena de enero`,
   descripcion: "Inscribite y participá por una semana en enero en Miramar o en el Parador de la Montaña. Se adjudica por sorteo al cierre de la inscripción.",
   inscripcionDesde: "2026-09-02",
   inscripcionHasta: "2026-10-31",
@@ -126,7 +127,7 @@ const SORTEO = {
 
 const BLOQUES = [
   {
-    nombre: `${MARCADOR} Miramar · 1ª quincena de enero`,
+    nombre: `Miramar · 1ª quincena de enero`,
     servicio: "MIRAMAR_CABANAS",
     modalidad: "SORTEO",
     inicio: "2027-01-02",
@@ -135,7 +136,7 @@ const BLOQUES = [
     tipo: "alta",
   },
   {
-    nombre: `${MARCADOR} Parador · 1ª quincena de enero`,
+    nombre: `Parador · 1ª quincena de enero`,
     servicio: "PARADOR_MONTANA",
     modalidad: "SORTEO",
     inicio: "2027-01-02",
@@ -144,7 +145,7 @@ const BLOQUES = [
     tipo: "alta",
   },
   {
-    nombre: `${MARCADOR} Miramar · Carnaval 2027`,
+    nombre: `Miramar · Carnaval 2027`,
     servicio: "MIRAMAR_CABANAS",
     modalidad: "BLOQUE",
     inicio: "2027-02-13",
@@ -153,7 +154,7 @@ const BLOQUES = [
     tipo: "alta",
   },
   {
-    nombre: `${MARCADOR} Parador · Semana Santa 2027`,
+    nombre: `Parador · Semana Santa 2027`,
     servicio: "PARADOR_MONTANA",
     modalidad: "BLOQUE",
     inicio: "2027-03-31",
@@ -289,7 +290,7 @@ async function main() {
       ocupadosPorRecurso.get(clave).push({ inicio: fila.fecha_inicio, fin: fila.fecha_fin, nombre: fila.nombre });
     }
 
-    const [temporadasExistentes] = await connection.query("SELECT id, nombre FROM temporada_tarifa WHERE nombre LIKE ?", [`${MARCADOR}%`]);
+    const [temporadasExistentes] = await connection.query("SELECT id, nombre FROM temporada_tarifa WHERE nombre IN (?)", [[TEMPORADA_BAJA.nombre, TEMPORADA_ALTA.nombre]]);
     const temporadasPorNombre = new Map(temporadasExistentes.map((row) => [row.nombre, Number(row.id)]));
 
     // Bloques → sus rangos quedan fuera de la temporada general de sus recursos.

@@ -19,7 +19,7 @@ function parsearCabecera(authData) {
     }
     return { ...cabecera, id: usuarioId };
   } catch (_error) {
-    throw new ErrorSesionUsuario("La sesion no contiene un usuario valido");
+    throw new ErrorSesionUsuario("La sesión no contiene un usuario válido");
   }
 }
 
@@ -51,7 +51,7 @@ async function actualizarAutorizacionSesion(authData, db) {
   );
 
   if (!usuarios.length) {
-    throw new ErrorSesionUsuario("El usuario de la sesion ya no existe");
+    throw new ErrorSesionUsuario("El usuario de la sesión ya no existe");
   }
   if (!usuarioHabilitado(usuarios[0].habilitado)) {
     throw new ErrorSesionUsuario("Usuario inhabilitado");
@@ -75,7 +75,11 @@ function verificarTokenConAutorizacionActual({
   if (!coincidencia) return res.status(401).json(mensajeAuthorization);
 
   return jwt.verify(coincidencia[1], jwtSecret, async (error, authData) => {
-    if (error) return res.status(403).json("Error en el token");
+    if (error) {
+      return res.status(403).json(error.name === "TokenExpiredError"
+        ? "Tu sesión venció. Volvé a iniciar sesión."
+        : "Tu sesión no es válida. Volvé a iniciar sesión.");
+    }
     try {
       await actualizarAutorizacionSesion(authData, db);
       req.data = authData;

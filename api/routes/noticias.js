@@ -139,7 +139,7 @@ const uploadImagenesNoticia = multer({
     if (campoValido && MIME_IMAGEN_NOTICIA_PERMITIDO.has(file.mimetype)) {
       return cb(null, true);
     }
-    return cb(new Error("Solo se permiten imagenes JPG, PNG o WebP"));
+    return cb(new Error("Solo se permiten imágenes JPG, PNG o WebP"));
   },
 }).fields([
   { name: "imagen", maxCount: 1 },
@@ -153,6 +153,15 @@ function manejarUploadNoticia(req, res, next) {
   }
   uploadImagenesNoticia(req, res, (error) => {
     if (error) {
+      // Multer arma los errores de límite en inglés ("File too large", "Unexpected field"…):
+      // se traducen por código; los del fileFilter ya vienen en español.
+      if (error instanceof multer.MulterError) {
+        if (error.code === "LIMIT_FILE_SIZE") return res.status(400).json("Cada imagen puede pesar hasta 10 MB");
+        if (error.code === "LIMIT_FILE_COUNT" || error.code === "LIMIT_UNEXPECTED_FILE") {
+          return res.status(400).json("Podés subir una imagen de portada y hasta 8 en la galería");
+        }
+        return res.status(400).json("No se pudo procesar la imagen");
+      }
       return res.status(400).json(error.message || "No se pudo procesar la imagen");
     }
     return validarContenidoArchivos(req, res, next);
@@ -167,7 +176,7 @@ function verifyToken(req, res, next) {
     jwt,
     jwtSecret: process.env.JWT_SECRET,
     db: mysqlConnection.promise(),
-    mensajeAuthorization: "Se requiere Authorization: Bearer <token>",
+    mensajeAuthorization: "Tu sesión no es válida. Volvé a iniciar sesión.",
   });
 }
 

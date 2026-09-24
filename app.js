@@ -86,7 +86,7 @@ app.use('/api/signin', (req, res, next) => {
   if (estado.fallos >= MAX_INTENTOS_LOGIN) {
     const segundos = Math.max(1, Math.ceil((VENTANA_LOGIN_MS - (ahora - estado.inicio)) / 1000));
     res.setHeader('Retry-After', String(segundos));
-    res.status(429).json('Demasiados intentos. Intente nuevamente mas tarde.');
+    res.status(429).json('Demasiados intentos. Probá de nuevo más tarde.');
     return;
   }
 
@@ -147,6 +147,11 @@ app.use('/api',trasladosRoute);
 app.use('/api',noticiasRoute);
 app.use('/api',dashboardRoute);
 app.use('/api',beneficiosRoute);
+// Sin esto, una ruta /api que no existe cae en el finalhandler de Express, que
+// responde una página HTML en inglés ("Cannot GET /api/…") y el front la mostraría.
+app.use('/api', (_req, res) => {
+  res.status(404).json('No encontramos el recurso solicitado');
+});
 app.use('/imagenes', express.static(path.join(__dirname, 'imagenes'), {
   dotfiles: 'deny',
   fallthrough: false,
@@ -160,11 +165,11 @@ app.use((error, req, res, next) => {
     return;
   }
   if (error?.type === 'entity.too.large') {
-    res.status(413).json('El contenido enviado supera el limite permitido');
+    res.status(413).json('El contenido enviado supera el límite permitido');
     return;
   }
   if (error?.type === 'entity.parse.failed') {
-    res.status(400).json('El contenido JSON es invalido');
+    res.status(400).json('El contenido enviado no es válido');
     return;
   }
   next(error);

@@ -274,7 +274,7 @@ function verifyToken(req, res, next) {
     jwt,
     jwtSecret: process.env.JWT_SECRET,
     db: mysqlConnection.promise(),
-    mensajeAuthorization: "Se requiere Authorization: Bearer <token>",
+    mensajeAuthorization: "Tu sesión no es válida. Volvé a iniciar sesión.",
   });
 }
 

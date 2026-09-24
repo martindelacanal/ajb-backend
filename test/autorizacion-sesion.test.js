@@ -90,7 +90,7 @@ test("el middleware no consulta la base con un token invalido", () => {
   const req = { headers: { authorization: "Bearer token-invalido" } };
   const res = {
     status(value) { assert.equal(value, 403); return this; },
-    json(value) { assert.equal(value, "Error en el token"); },
+    json(value) { assert.equal(value, "Tu sesión no es válida. Volvé a iniciar sesión."); },
   };
 
   verificarTokenConAutorizacionActual({

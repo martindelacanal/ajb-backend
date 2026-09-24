@@ -349,7 +349,7 @@ function verifyToken(req, res, next) {
     jwt,
     jwtSecret: process.env.JWT_SECRET,
     db: mysqlConnection.promise(),
-    mensajeAuthorization: "Se requiere Authorization: Bearer <token>",
+    mensajeAuthorization: "Tu sesión no es válida. Volvé a iniciar sesión.",
   });
 }
 
@@ -1080,6 +1080,31 @@ const MARCADOR_MENSAJE_CORREO = "%%MENSAJE_BENEFICIO%%";
 const FUENTE_CORREO = "'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif";
 const MENSAJE_INSCRIPCION_POR_DEFECTO = "Tu inscripción quedó registrada. La institución fue notificada de tu interés.";
 
+// resultado.error es el error.message de nodemailer (en inglés: "Connection timeout",
+// "Invalid login: 535…"); se muestra en snackbars, tooltips y notificaciones, así que
+// se describe por código. El mensaje original queda en el log del servicio de correo.
+const MOTIVOS_ERROR_SMTP = {
+  ETIMEDOUT: "El servidor de correo no respondió a tiempo",
+  EAUTH: "El servidor de correo rechazó las credenciales",
+  ENOAUTH: "El servidor de correo rechazó las credenciales",
+  ECONNECTION: "No se pudo conectar con el servidor de correo",
+  ESOCKET: "No se pudo conectar con el servidor de correo",
+  EDNS: "No se encontró el servidor de correo",
+  ETLS: "Falló la conexión segura con el servidor de correo",
+  EENVELOPE: "El servidor de correo rechazó la dirección de destino",
+  EMESSAGE: "El servidor de correo rechazó el mensaje",
+  EPROTOCOL: "El servidor de correo respondió de forma inesperada",
+};
+
+function describirErrorSmtp(resultado) {
+  const codigo = resultado?.codigo;
+  if (codigo && MOTIVOS_ERROR_SMTP[codigo]) return MOTIVOS_ERROR_SMTP[codigo];
+  if (Number.isInteger(Number(codigo)) && Number(codigo) >= 400) {
+    return `El servidor de correo rechazó el envío (código ${Number(codigo)})`;
+  }
+  return "El servidor de correo no aceptó el envío";
+}
+
 function describirMotivoCorreo(resultado) {
   switch (resultado?.motivo) {
     case "sin_configurar": return "El correo saliente no está configurado en el servidor";
@@ -1088,7 +1113,7 @@ function describirMotivoCorreo(resultado) {
     case "destinatario_invalido": return "La dirección de correo de destino es inválida";
     case "asunto_invalido": return "El asunto del correo es inválido";
     case "cuerpo_vacio": return "El correo no tiene contenido";
-    case "error_smtp": return `Error SMTP: ${resultado.error || "sin detalle"}`;
+    case "error_smtp": return describirErrorSmtp(resultado);
     default: return resultado?.motivo || resultado?.error || "Motivo desconocido";
   }
 }

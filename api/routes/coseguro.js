@@ -173,9 +173,26 @@ const uploadCoseguro = multer({
   },
 });
 
+// Multer arma los errores de límite en inglés ("File too large", "Too many files",
+// "Field value too long"…) y el front los muestra tal cual: se traducen por código.
+// Los errores propios del fileFilter ya vienen en español y se respetan.
+function mensajeErrorMulter(error, porDefecto, mensajes = {}) {
+  if (!(error instanceof multer.MulterError)) return error?.message || porDefecto;
+  if (error.code === "LIMIT_FILE_SIZE" && mensajes.tamanio) return mensajes.tamanio;
+  if ((error.code === "LIMIT_FILE_COUNT" || error.code === "LIMIT_UNEXPECTED_FILE") && mensajes.cantidad) return mensajes.cantidad;
+  if (error.code === "LIMIT_FIELD_VALUE" && mensajes.campo) return mensajes.campo;
+  return porDefecto;
+}
+
 function manejarUploadCoseguro(req, res, next) {
   uploadCoseguro.any()(req, res, (error) => {
-    if (error) return res.status(400).json(error.message || "No se pudieron procesar los archivos");
+    if (error) {
+      return res.status(400).json(mensajeErrorMulter(error, "No se pudieron procesar los archivos", {
+        tamanio: `Cada archivo puede pesar hasta ${MAX_ARCHIVO_COSEGURO_BYTES / 1024 / 1024} MB`,
+        cantidad: "Podés subir hasta 20 archivos por vez",
+        campo: `La firma puede pesar hasta ${MAX_FIRMA_BYTES / 1024 / 1024} MB`,
+      }));
+    }
     const totalBytes = (req.files || []).reduce((total, file) => total + (file.buffer?.length || 0), 0);
     if (totalBytes > MAX_TOTAL_COSEGURO_BYTES) return res.status(400).json("Los archivos superan el máximo total de 50 MB");
     for (const file of req.files || []) {
@@ -200,7 +217,12 @@ const uploadCsv = multer({
 
 function manejarUploadCsv(req, res, next) {
   uploadCsv.any()(req, res, (error) => {
-    if (error) return res.status(400).json(error.message || "No se pudo procesar el archivo CSV");
+    if (error) {
+      return res.status(400).json(mensajeErrorMulter(error, "No se pudo procesar el archivo CSV", {
+        tamanio: "El archivo CSV puede pesar hasta 5 MB",
+        cantidad: "Subí un solo archivo CSV",
+      }));
+    }
     return next();
   });
 }
@@ -216,7 +238,7 @@ function verifyToken(req, res, next) {
     jwt,
     jwtSecret: process.env.JWT_SECRET,
     db: mysqlConnection.promise(),
-    mensajeAuthorization: "Se requiere Authorization: Bearer <token>",
+    mensajeAuthorization: "Tu sesión no es válida. Volvé a iniciar sesión.",
   });
 }
 
@@ -3110,7 +3132,7 @@ router.post("/coseguro/estado-masivo", verifyToken, async (req, res) => {
     const ids = normalizarListaIdsPositivos(req.body.ids);
     const estadoNuevo = normalizarIdPositivo(req.body.estado_id);
     if (!ids) return res.status(400).json("La lista de solicitudes contiene IDs inválidos");
-    if (estadoNuevo !== ESTADO.PENDIENTE_ACREDITACION) return res.status(400).json("Este endpoint solo permite pasar a 'Pendiente de acreditación'");
+    if (estadoNuevo !== ESTADO.PENDIENTE_ACREDITACION) return res.status(400).json("Esta acción solo permite pasar a 'Pendiente de acreditación'");
 
     const db = mysqlConnection.promise();
     connection = await db.getConnection();
@@ -3507,6 +3529,30 @@ router.get("/coseguro/arca/estado", verifyToken, async (req, res) => {
   }
 });
 
+// El error de constatarComprobante puede venir de arca.js (en español) o de fetch,
+// fs y node-forge (en inglés: "fetch failed", "ENOENT…", "Invalid PEM…"). Al diálogo
+// solo llega un motivo legible; el detalle técnico queda en el log.
+function motivoErrorArca(error) {
+  const mensaje = String(error?.message || "");
+  if (error?.faultWsaa) return `rechazó el acceso del sistema (${error.faultWsaa})`;
+  if (/^ARCA no está configurado/.test(mensaje)) return "la integración con ARCA no está configurada";
+  if (/^Los datos del comprobante para ARCA/.test(mensaje)) return "los datos del comprobante no son válidos para consultar ARCA";
+  // Un fault del WSCDC es un problema del servicio o de la autorización, no de los
+  // datos (esos vuelven en <Errors> dentro de una respuesta normal). ARCA suele
+  // mandarlo en español: se muestra tal cual salvo el genérico en inglés de .NET.
+  if (/^WSCDC: /.test(mensaje)) {
+    const fault = mensaje.slice("WSCDC: ".length).trim();
+    if (fault && !/server was unable|unexpected|exception/i.test(fault)) return `el servicio respondió «${fault}»`;
+    return "el servicio devolvió un error. Probá de nuevo más tarde";
+  }
+  if (/^(WSAA|WSCDC) devolvió HTTP 5\d\d/.test(mensaje)) return "el servicio no está respondiendo. Probá de nuevo más tarde";
+  if (/^(WSAA|WSCDC) devolvió HTTP /.test(mensaje)) return `el servicio rechazó la consulta (${mensaje.replace(/^(WSAA|WSCDC) devolvió /, "")})`;
+  if (/^WSAA no devolvió token/.test(mensaje)) return "no se obtuvo la autorización de acceso. Probá de nuevo más tarde";
+  if (["ENOENT", "EACCES", "EISDIR"].includes(error?.code)) return "el servidor no pudo leer el certificado de ARCA";
+  if (/PEM|ASN\.1|private key|certificate/i.test(mensaje)) return "el certificado de ARCA configurado en el servidor no es válido";
+  return "el servicio no respondió (probá de nuevo más tarde)";
+}
+
 // POST /coseguro/solicitudes/:id/constatar-arca — valida la factura contra ARCA
 // body: { cbte_tipo (código ARCA, ej 11 = Factura C), cod_autorizacion (CAE/CAI) }
 router.post("/coseguro/solicitudes/:id/constatar-arca", verifyToken, async (req, res) => {
@@ -3550,7 +3596,7 @@ router.post("/coseguro/solicitudes/:id/constatar-arca", verifyToken, async (req,
     } catch (error) {
       console.log("Error WSAA/WSCDC:", error.message);
       // Errores típicos: servicio no autorizado en ARCA, certificado vencido, ARCA caído
-      return res.status(502).json(`No se pudo consultar ARCA: ${error.message}`);
+      return res.status(502).json(`No se pudo consultar ARCA: ${motivoErrorArca(error)}`);
     }
 
     // Guardar el resultado en la verificación de la solicitud + historial
