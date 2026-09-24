@@ -47,9 +47,11 @@ require.cache[connectionPath] = {
 };
 
 const userRouter = require("../api/routes/user");
+const descuentosRouter = require("../api/routes/descuentos");
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 app.use("/api", userRouter);
+app.use("/api", descuentosRouter);
 
 const consoleLogOriginal = console.log;
 test.before(() => {
@@ -1009,6 +1011,92 @@ test("Mis gestiones no proyecta ni une datos de salud con Coseguro apagado", asy
   assert.equal(response.status, 200);
   assert.equal(response.body.results[0].es_por_salud, 0);
   assert.equal(response.body.results[0].salud_estado, null);
+});
+
+test("Mis gestiones ordena la columna ID por prefijo y número del código", async () => {
+  const ordenes = [];
+  setDatabaseHandler(async (sql) => {
+    if (/SELECT g\.tipo, COUNT\(\*\) AS total FROM \(/i.test(sql)) {
+      return [[{ tipo: "turismo", total: 0 }]];
+    }
+    if (/SELECT g\.\* FROM \(/i.test(sql)) {
+      ordenes.push(sql.match(/ORDER BY [^\n]+/)[0].trim());
+      return [[]];
+    }
+    throw new Error(`Consulta inesperada: ${sql}`);
+  });
+
+  const token = tokenFor({ id: 100, rol: "afiliado" });
+  for (const orderType of ["asc", "desc"]) {
+    const response = await request(`/api/mis-gestiones?orderBy=codigo&orderType=${orderType}`, { token });
+    assert.equal(response.status, 200);
+  }
+
+  assert.deepEqual(ordenes, [
+    "ORDER BY SUBSTRING_INDEX(g.codigo, '-', 1) ASC, g.id ASC, g.fecha_creacion DESC, g.tipo ASC, g.id DESC",
+    "ORDER BY SUBSTRING_INDEX(g.codigo, '-', 1) DESC, g.id DESC, g.fecha_creacion DESC, g.tipo ASC, g.id DESC",
+  ]);
+});
+
+test("El contexto de descuentos solo muestra el estado médico del servicio a quien puede usarlo", async () => {
+  async function consultarContexto(claims, { titularCoseguro, estadoServicio = "HABILITADO", query = "" }) {
+    setDatabaseHandler(async (sql) => {
+      if (/FROM servicio s INNER JOIN tipo_servicio ts/i.test(sql)) {
+        return [[{
+          id: 5,
+          nombre: "Hotel de prueba",
+          descuento_salud_estado: estadoServicio,
+          activo: 1,
+          estado_aprobacion: "APROBADO",
+          tipo_codigo: "HOTEL",
+        }]];
+      }
+      if (/FROM usuario u INNER JOIN rol r ON r\.id = u\.rol_id\s+WHERE u\.id = \? LIMIT 1/i.test(sql)) {
+        return [[{
+          id: 100,
+          nombre: "Ana",
+          apellido: "Pérez",
+          departamental_id: 7,
+          modulo_coseguro: titularCoseguro,
+          modulo_turismo: 1,
+          rol: "afiliado",
+        }]];
+      }
+      if (/r\.tipo = 'TIPO_VIAJE'/i.test(sql)) return [[]];
+      throw new Error(`Consulta inesperada: ${sql}`);
+    });
+    const response = await request(`/api/descuentos/contexto?servicio_id=5${query}`, { token: tokenFor(claims) });
+    assert.equal(response.status, 200);
+    return response.body;
+  }
+
+  const sinCoseguro = await consultarContexto(
+    { id: 100, rol: "afiliado", departamental_id: 7, modulo_coseguro: 0 },
+    { titularCoseguro: 0 }
+  );
+  assert.equal(sinCoseguro.salud_habilitado, false);
+  assert.equal(sinCoseguro.salud_estado_servicio, null);
+
+  const pendiente = await consultarContexto(
+    { id: 100, rol: "afiliado", departamental_id: 7, modulo_coseguro: 1 },
+    { titularCoseguro: 1, estadoServicio: "PENDIENTE" }
+  );
+  assert.equal(pendiente.salud_habilitado, false);
+  assert.equal(pendiente.salud_estado_servicio, null);
+
+  const conCoseguro = await consultarContexto(
+    { id: 100, rol: "afiliado", departamental_id: 7, modulo_coseguro: 1 },
+    { titularCoseguro: 1 }
+  );
+  assert.equal(conCoseguro.salud_habilitado, true);
+  assert.equal(conCoseguro.salud_estado_servicio, "HABILITADO");
+
+  const admin = await consultarContexto(
+    { id: 1, rol: "admin" },
+    { titularCoseguro: 0, estadoServicio: "PENDIENTE", query: "&usuario_id=100" }
+  );
+  assert.equal(admin.salud_habilitado, false);
+  assert.equal(admin.salud_estado_servicio, "PENDIENTE");
 });
 
 test("notificaciones excluye Traslados para departamental pero no para admin", async () => {

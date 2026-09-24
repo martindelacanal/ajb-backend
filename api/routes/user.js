@@ -13516,7 +13516,12 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
       estado: "g.estado",
       importe: "g.importe",
     };
-    const orderBy = COLUMNAS_ORDEN_GESTIONES[req.query.orderBy] || "g.fecha_creacion";
+    // "codigo" ordena como se lee el ID en pantalla: primero el prefijo
+    // (B-, C-, T-, TR-) y después el número, los dos en la dirección pedida.
+    const ordenGestionesSql =
+      req.query.orderBy === "codigo"
+        ? `SUBSTRING_INDEX(g.codigo, '-', 1) ${orderType}, g.id ${orderType}`
+        : `${COLUMNAS_ORDEN_GESTIONES[req.query.orderBy] || "g.fecha_creacion"} ${orderType}`;
 
     const puedeVerSalud = puedeVerDatosSaludReserva(cabecera);
     const esPorSaludTurismoSql = puedeVerSalud ? "r.es_por_salud" : "0";
@@ -13724,7 +13729,7 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
 
     const [rows] = await db.query(
       `SELECT g.* FROM (${unionSql}) g ${where}
-       ORDER BY ${orderBy} ${orderType}, g.fecha_creacion DESC, g.tipo ASC, g.id DESC
+       ORDER BY ${ordenGestionesSql}, g.fecha_creacion DESC, g.tipo ASC, g.id DESC
        LIMIT ? OFFSET ?`,
       [...unionParams, ...paramsFinal, pageSize, (page - 1) * pageSize]
     );
@@ -14875,12 +14880,14 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
             WHEN r.nombre = 'invitado' THEN 'Invitado'
             ELSE r.nombre
           END AS rol,
+          r.nombre AS rol_codigo,
           u.nombre,
           u.apellido,
           DATE_FORMAT(u.fecha_nacimiento, '%d/%m/%Y') AS fecha_nacimiento,
           u.documento,
           COALESCE(u.legajo, '') AS legajo,
           u.habilitado,
+          u.modulo_coseguro,
           DATE_FORMAT(u.fecha_creacion, '%d/%m/%Y') AS fecha_creacion
         FROM usuario u
         LEFT JOIN rol r ON u.rol_id = r.id
@@ -14923,6 +14930,95 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
   } catch (error) {
     registrarErrorRuta(error);
     res.status(500).json("Error interno");
+  }
+});
+
+// PUT /usuarios/:id/modulo-coseguro - Acceso rápido desde la tabla de usuarios:
+// el admin habilita o deshabilita el módulo Coseguro de una cuenta afiliada.
+// El cambio queda auditado en historial_usuario dentro de la misma transacción.
+router.put("/usuarios/:id/modulo-coseguro", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "admin") {
+      return res.status(401).json("No autorizado");
+    }
+
+    const usuarioId = normalizarIdPositivo(req.params.id);
+    if (!usuarioId) {
+      return res.status(400).json("ID de usuario inválido");
+    }
+
+    const moduloCoseguro = normalizarBooleanoBinarioEstricto(req.body?.modulo_coseguro);
+    if (moduloCoseguro === null) {
+      return res.status(400).json("El valor de modulo_coseguro es inválido");
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+
+    const [usuarios] = await connection.query(
+      `SELECT u.id, u.modulo_coseguro, u.nombre, u.apellido, r.nombre AS rol
+       FROM usuario u
+       INNER JOIN rol r ON r.id = u.rol_id
+       WHERE u.id = ?
+       FOR UPDATE`,
+      [usuarioId]
+    );
+
+    if (usuarios.length === 0) {
+      throw crearErrorNegocio("Usuario no encontrado", 404);
+    }
+
+    const usuario = usuarios[0];
+    if (usuario.rol !== "afiliado") {
+      throw crearErrorNegocio("Solo se puede cambiar el módulo Coseguro a cuentas de afiliado", 422);
+    }
+
+    const valorAnterior = usuario.modulo_coseguro === null || usuario.modulo_coseguro === undefined
+      ? null
+      : Number(usuario.modulo_coseguro);
+
+    if (valorAnterior === moduloCoseguro) {
+      await connection.rollback();
+      return res.status(200).json({ id: usuarioId, modulo_coseguro: moduloCoseguro });
+    }
+
+    await connection.query(
+      "UPDATE usuario SET modulo_coseguro = ? WHERE id = ?",
+      [moduloCoseguro, usuarioId]
+    );
+
+    await registrarHistorial(
+      connection,
+      usuarioId,
+      "UPDATE",
+      "usuario",
+      cabecera.id,
+      req,
+      [{ campo: "modulo_coseguro", valorAnterior, valorNuevo: moduloCoseguro }],
+      "Módulo Coseguro cambiado desde la tabla de usuarios"
+    );
+
+    await connection.commit();
+    return res.status(200).json({ id: usuarioId, modulo_coseguro: moduloCoseguro });
+  } catch (error) {
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error("No se pudo revertir el cambio del módulo Coseguro", rollbackError?.code || rollbackError);
+      }
+    }
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json(error.message);
+    }
+    registrarErrorRuta(error);
+    return res.status(500).json("Error al actualizar el módulo Coseguro");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
   }
 });
 

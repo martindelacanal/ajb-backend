@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 
 const router = require("../api/routes/coseguro");
 const {
+  consultarSolicitudesParaExportar,
   filtrosEstadisticas,
   idsPositivosIguales,
   normalizarEnteroSeguro,
@@ -102,6 +103,44 @@ test("coseguro falla cerrado ante filtros numéricos, fechas o rangos inválidos
     }).params,
     [7, "2026-01-01", "2026-01-31", 9, 10, 20]
   );
+});
+
+test("coseguro exporta con el mismo filtro por fecha de solicitud que el listado", async () => {
+  const consultas = [];
+  const db = {
+    query: async (sql, params) => {
+      consultas.push({ sql, params });
+      return [[]];
+    },
+  };
+  const cabecera = { rol: "admin" };
+
+  const filas = await consultarSolicitudesParaExportar(db, cabecera, {
+    estado_id: [7],
+    fecha_solicitud_desde: "2026-03-01",
+    fecha_solicitud_hasta: "2026-03-31",
+  });
+  assert.deepEqual(filas, []);
+  assert.equal(consultas.length, 1);
+  const { sql, params } = consultas[0];
+  assert.ok(sql.includes("DATE(s.fecha_creacion) >= ?"), sql);
+  assert.ok(sql.includes("DATE(s.fecha_creacion) <= ?"), sql);
+  // La fecha de solicitud no se confunde con la del comprobante
+  assert.ok(!sql.includes("s.fecha_comprobante >=") && !sql.includes("s.fecha_comprobante <="), sql);
+  assert.deepEqual(params, [7, "2026-03-01", "2026-03-31"]);
+
+  for (const filtros of [
+    { fecha_solicitud_desde: "31/03/2026" },
+    { fecha_solicitud_hasta: "2026-02-30" },
+    { fecha_solicitud_desde: "2026-03-31", fecha_solicitud_hasta: "2026-03-01" },
+  ]) {
+    await assert.rejects(
+      consultarSolicitudesParaExportar(db, cabecera, filtros),
+      (error) => error.statusCode === 400,
+      JSON.stringify(filtros)
+    );
+  }
+  assert.equal(consultas.length, 1);
 });
 
 test("coseguro no admite IDs decimales o exponenciales en el CSV", () => {

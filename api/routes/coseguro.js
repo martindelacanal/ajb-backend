@@ -2866,10 +2866,14 @@ async function consultarSolicitudesParaExportar(db, cabecera, filtros) {
   const conceptoFiltroId = normalizarIdOpcional(filtros.concepto_id, "Concepto");
   const fechaDesde = normalizarFechaFiltro(filtros.fecha_desde, "Fecha desde");
   const fechaHasta = normalizarFechaFiltro(filtros.fecha_hasta, "Fecha hasta");
+  // Mismo filtro por fecha de solicitud que el listado: el CSV respeta lo que se ve en la tabla
+  const solicitudDesde = normalizarFechaFiltro(filtros.fecha_solicitud_desde, "Fecha de solicitud desde");
+  const solicitudHasta = normalizarFechaFiltro(filtros.fecha_solicitud_hasta, "Fecha de solicitud hasta");
   const importeMin = normalizarImporteFiltro(filtros.importe_min, "Importe mínimo");
   const importeMax = normalizarImporteFiltro(filtros.importe_max, "Importe máximo");
   const conDuplicados = normalizarBooleanoOpcional(filtros.con_duplicados, "Filtro de duplicados");
   validarRangoFiltros(fechaDesde, fechaHasta, "fechas de comprobante");
+  validarRangoFiltros(solicitudDesde, solicitudHasta, "fechas de solicitud");
   validarRangoFiltros(importeMin, importeMax, "importes");
 
   if (cabecera.rol === "departamental") {
@@ -2905,6 +2909,14 @@ async function consultarSolicitudesParaExportar(db, cabecera, filtros) {
   if (fechaHasta) {
     condiciones.push("s.fecha_comprobante <= ?");
     params.push(fechaHasta);
+  }
+  if (solicitudDesde) {
+    condiciones.push("DATE(s.fecha_creacion) >= ?");
+    params.push(solicitudDesde);
+  }
+  if (solicitudHasta) {
+    condiciones.push("DATE(s.fecha_creacion) <= ?");
+    params.push(solicitudHasta);
   }
   if (importeMin !== null) {
     condiciones.push("COALESCE(s.importe_autorizado, s.importe) >= ?");
@@ -3988,6 +4000,7 @@ router.__test = Object.freeze({
   adquirirBloqueoDuplicados,
   buscarDuplicadosComprobante,
   calcularReintegroEstimado,
+  consultarSolicitudesParaExportar,
   decodificarFirmaBase64,
   detectarMimeArchivo,
   importeACentavos,

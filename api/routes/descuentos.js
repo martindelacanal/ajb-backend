@@ -244,12 +244,15 @@ router.get("/descuentos/contexto", verifyToken, async (req, res) => {
       usuarioId: titular?.id || null,
       incluirOcultos: cabecera.rol !== "afiliado",
     });
+    const saludHabilitado = saludDisponiblePara(cabecera, titular, servicio);
     return res.status(200).json({
       servicio_id: Number(servicio.id),
       servicio_nombre: servicio.nombre,
       titular_id: titular ? Number(titular.id) : null,
-      salud_habilitado: saludDisponiblePara(cabecera, titular, servicio),
-      salud_estado_servicio: servicio.descuento_salud_estado,
+      salud_habilitado: saludHabilitado,
+      // El afiliado sin acceso al descuento médico no ve el estado del servicio.
+      salud_estado_servicio:
+        cabecera.rol !== "afiliado" || saludHabilitado ? servicio.descuento_salud_estado : null,
       cupones_habilitados: true,
       tipos_viaje: tiposViaje,
     });
