@@ -14,6 +14,8 @@ const MODULOS_NOTIFICACION = {
   traslados: { prefijos: ["TRASLADO"] },
   olimpiadas: { prefijos: ["OLIMPIADA"] },
   beneficios: { prefijos: ["BENEFICIO"] },
+  // Cambios de datos de familiares pedidos por el afiliado (FAMILIAR_CAMBIO_*).
+  familiares: { prefijos: ["FAMILIAR"] },
 };
 
 function construirCondicion(def) {

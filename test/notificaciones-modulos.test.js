@@ -27,3 +27,11 @@ test("Salud conserva prioridad propia y otras excluye todos los modulos", () => 
   assert.ok(otras.params.includes("RESERVA_SALUD%"));
   assert.equal(condicionModuloNotificacion("constructor"), null);
 });
+
+test("Familiares agrupa los cambios de datos pedidos por el afiliado y otras los excluye", () => {
+  const familiares = condicionModuloNotificacion("familiares");
+  assert.equal(familiares.sql, "(n.tipo LIKE ?)");
+  assert.deepEqual(familiares.params, ["FAMILIAR%"]);
+  const otras = condicionModuloNotificacion("otras");
+  assert.ok(otras.params.includes("FAMILIAR%"));
+});

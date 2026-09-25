@@ -188,7 +188,12 @@ test("GET perfil permite a la departamental sin area Turismo consultar un afilia
   assert.equal(response.body.success, true);
   assert.equal(response.body.data.id, 200);
   assert.equal(response.body.data.departamental_id, 7);
-  assert.equal(databaseCalls.filter(({ sql }) => /WHERE u\.id = \?/i.test(sql)).length, 2);
+  // Sesión + objetivo (los permisos de services/usuarios-datos.js ahora también
+  // miran el rol del objetivo) + ficha completa.
+  assert.equal(databaseCalls.filter(({ sql }) => /WHERE u\.id = \?/i.test(sql)).length, 3);
+  assert.equal(response.body.data.tiene_cuenta, false);
+  assert.ok(response.body.data.campos_editables.includes("documento"));
+  assert.ok(!response.body.data.campos_editables.includes("rol_id"));
 });
 
 test("PUT perfil permite editar contacto y modulos propios sin area Turismo", async () => {
@@ -225,8 +230,9 @@ test("GET perfil mantiene bloqueado al afiliado de otra jurisdiccion", async () 
 
   assert.equal(response.status, 403);
   assert.equal(response.body.success, false);
+  // Se lee al objetivo para decidir el permiso, pero nunca la ficha completa.
   assert.equal(
-    databaseCalls.some(({ sql }) => /LEFT JOIN rol r[\s\S]+WHERE u\.id = \?/i.test(sql)),
+    databaseCalls.some(({ sql }) => /LEFT JOIN tipo_persona tp[\s\S]+WHERE u\.id = \?/i.test(sql)),
     false
   );
 });

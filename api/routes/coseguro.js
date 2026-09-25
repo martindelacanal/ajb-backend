@@ -38,6 +38,12 @@ const {
   cerrarGuardiaArchivoReserva,
   limpiarTokenGuardiaArchivoReserva,
 } = require("../services/reserva-version-archivo");
+const { DNI_MENSAJE, esDniValido } = require("../security/dni");
+const {
+  actualizarDatosUsuario,
+  contextoDesdeRequest,
+} = require("../services/usuarios-datos");
+const { obtenerCambiosPendientesPorPersona, solicitarCambioFamiliar } = require("../services/familiares-cambios");
 
 // ---------------------------------------------------------------------------
 // S3
@@ -1172,9 +1178,20 @@ router.get("/coseguro/perfil", verifyToken, async (req, res) => {
       [usuarioId]
     );
 
+    // Pedido de cambio de datos en revisión (p. ej. el DNI que el afiliado cargó
+    // y todavía no aprobó la departamental).
+    const pendientes = await obtenerCambiosPendientesPorPersona(db, familiares.map((f) => f.id));
     res.status(200).json({
       usuario: usuarios[0],
-      familiares: familiares.map((f) => ({ ...f, dni_cargado: f.documento !== null && Number(f.documento) > 0 })),
+      familiares: familiares.map((f) => {
+        const cambioPendiente = pendientes.get(Number(f.id)) || null;
+        return {
+          ...f,
+          dni_cargado: f.documento !== null && Number(f.documento) > 0,
+          dni_en_revision: Boolean(cambioPendiente && cambioPendiente.campos.includes("documento")),
+          cambio_pendiente: cambioPendiente,
+        };
+      }),
     });
   } catch (error) {
     registrarErrorRuta(error);
@@ -1185,36 +1202,124 @@ router.get("/coseguro/perfil", verifyToken, async (req, res) => {
 // ---------------------------------------------------------------------------
 // PUT /coseguro/familiares/:id/documento — carga obligatoria del DNI del familiar
 // ---------------------------------------------------------------------------
+// Staff (admin, admin-central, departamental con área Coseguro): pasa por
+// services/usuarios-datos.js, que controla la jurisdicción (departamental sólo
+// sobre afiliados/invitados de su sede), la regla de 6 a 8 dígitos, el DNI
+// único y deja historial. Los errores se devuelven como texto plano, como el
+// resto de este router.
+async function actualizarDocumentoFamiliarStaff(req, res, cabecera, familiarId) {
+  if (!tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
+  if (!familiarId) return res.status(400).json("ID inválido");
+  const documento = String(req.body?.documento ?? "").replace(/[\s.-]/g, "");
+  if (!esDniValido(documento)) return res.status(400).json(DNI_MENSAJE);
+
+  let connection;
+  try {
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const [familiares] = await connection.query(
+      "SELECT id, usuario_familiar_id FROM usuario WHERE id = ? FOR UPDATE",
+      [familiarId]
+    );
+    if (familiares.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Familiar no encontrado");
+    }
+    if (!normalizarIdPositivo(familiares[0].usuario_familiar_id)) {
+      await connection.rollback();
+      return res.status(422).json("La persona indicada no es un familiar a cargo de un afiliado");
+    }
+    const resultado = await actualizarDatosUsuario(connection, {
+      actor: cabecera,
+      usuarioId: familiarId,
+      cambios: { documento },
+      contexto: {
+        origen: "coseguro",
+        observaciones: "DNI del familiar cargado desde Coseguro médico",
+        ...contextoDesdeRequest(req),
+      },
+    });
+    await connection.commit();
+    return res.status(200).json({
+      success: true,
+      message: resultado.cambios.length > 0 ? "DNI actualizado" : "El DNI no cambió",
+      advertencias: resultado.advertencias,
+      propagaciones: resultado.propagaciones,
+    });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    registrarErrorRuta(error);
+    if (error?.statusCode) return res.status(error.statusCode).json(error.message);
+    return res.status(500).json("Error al actualizar el DNI del familiar");
+  } finally {
+    if (connection) connection.release();
+  }
+}
+
 router.put("/coseguro/familiares/:id/documento", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     const familiarId = normalizarIdPositivo(req.params.id);
-    const documento = normalizarDigitos(req.body.documento, 9);
-    if (!familiarId) return res.status(400).json("ID inválido");
-    if (!documento || documento.length < 6) return res.status(400).json("El DNI debe tener al menos 6 dígitos");
-
-    const db = mysqlConnection.promise();
-    const [familiares] = await db.query("SELECT id, usuario_familiar_id FROM usuario WHERE id = ?", [familiarId]);
-    if (familiares.length === 0) return res.status(404).json("Familiar no encontrado");
-
-    const esPropio = idsPositivosIguales(familiares[0].usuario_familiar_id, cabecera.id);
-    if (cabecera.rol === "afiliado" && !esPropio) return res.status(401).json("No autorizado");
-    if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
-
-    try {
-      await db.query("UPDATE usuario SET documento = ? WHERE id = ?", [Number(documento), familiarId]);
-    } catch (error) {
-      if (error && error.code === "ER_DUP_ENTRY") {
-        return res.status(409).json("Ya existe otro usuario con ese DNI en el sistema");
-      }
-      throw error;
+    if (ROLES_GESTION.includes(cabecera.rol)) {
+      return await actualizarDocumentoFamiliarStaff(req, res, cabecera, familiarId);
     }
-    res.status(200).json({ success: true, message: "DNI actualizado" });
+    // Afiliado: el DNI de un familiar a cargo NO se escribe directo. Queda en un
+    // pedido de cambio PENDIENTE que aprueba la departamental del titular
+    // (services/familiares-cambios.js); hasta entonces el coseguro de ese
+    // familiar sigue pidiendo el DNI. Responde 202 {pendiente:true}.
+    if (cabecera.rol !== "afiliado" || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
+    if (!familiarId) return res.status(400).json("ID inválido");
+    const documento = String(req.body?.documento ?? "").replace(/[\s.-]/g, "");
+    if (!esDniValido(documento)) return res.status(400).json(DNI_MENSAJE);
+    return await pedirDocumentoFamiliarAfiliado(req, res, cabecera, familiarId, documento);
   } catch (error) {
     registrarErrorRuta(error);
     res.status(500).json("Error al actualizar el DNI del familiar");
   }
 });
+
+async function pedirDocumentoFamiliarAfiliado(req, res, cabecera, familiarId, documento) {
+  let connection;
+  try {
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const [familiares] = await connection.query(
+      "SELECT id, nombre, usuario_familiar_id FROM usuario WHERE id = ?",
+      [familiarId]
+    );
+    if (familiares.length === 0) {
+      await connection.rollback();
+      return res.status(404).json("Familiar no encontrado");
+    }
+    if (!idsPositivosIguales(familiares[0].usuario_familiar_id, cabecera.id)) {
+      await connection.rollback();
+      return res.status(401).json("No autorizado");
+    }
+    const resultado = await solicitarCambioFamiliar(connection, {
+      actor: cabecera,
+      personaId: familiarId,
+      datos: { documento },
+    });
+    await connection.commit();
+    const nombre = familiares[0].nombre || "tu familiar";
+    return res.status(202).json({
+      success: true,
+      pendiente: true,
+      solicitud_id: resultado.solicitud_id,
+      codigo: resultado.codigo,
+      reemplazada: resultado.reemplazada,
+      message: `Enviamos el DNI de ${nombre} a tu departamental para que lo apruebe. ` +
+        `Cuando lo apruebe vas a poder cargar el reintegro de ${nombre}; te avisamos por notificación.`,
+    });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    if (error?.statusCode) return res.status(error.statusCode).json(error.message);
+    registrarErrorRuta(error);
+    return res.status(500).json("Error al enviar el DNI del familiar");
+  } finally {
+    if (connection) connection.release();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // GET /coseguro/afiliados-buscar — búsqueda de afiliados (staff, para carga presencial)
@@ -1445,7 +1550,7 @@ async function validarDatosSolicitud(db, cabecera, body, opciones) {
       errores.push("El familiar seleccionado no figura a cargo del afiliado titular");
       familiarId = null;
     } else if (!familiares[0].documento || Number(familiares[0].documento) <= 0) {
-      errores.push(`Falta cargar el DNI de ${familiares[0].nombre} ${familiares[0].apellido}. Actualizalo antes de continuar.`);
+      errores.push(`Falta cargar el DNI de ${familiares[0].nombre} ${familiares[0].apellido}. Cargalo antes de continuar (si ya se pidió el cambio, tiene que aprobarlo la departamental).`);
     }
   }
 
@@ -1689,7 +1794,18 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
     }
 
     // Guardar CUIL/CBU en el perfil del afiliado para las próximas solicitudes
-    await connection.query("UPDATE usuario SET cuil = ?, cbu = ? WHERE id = ?", [datos.cuil_afiliado, datos.cbu, usuarioId]);
+    // (con historial_usuario; la ruta ya autorizó al actor sobre el afiliado).
+    await actualizarDatosUsuario(connection, {
+      actor: cabecera,
+      usuarioId,
+      cambios: { cuil: datos.cuil_afiliado, cbu: datos.cbu },
+      contexto: {
+        origen: "coseguro",
+        observaciones: `CUIL/CBU tomados de la solicitud de reintegro #${solicitudId}`,
+        ...contextoDesdeRequest(req),
+      },
+      opciones: { propagar: false, autorizacionPrevia: true },
+    });
 
     await registrarHistorial(connection, {
       solicitud_id: solicitudId,
@@ -2395,8 +2511,19 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
       }
     }
 
-    // Actualizar CUIL/CBU del afiliado
-    await connection.query("UPDATE usuario SET cuil = ?, cbu = ? WHERE id = ?", [datos.cuil_afiliado, datos.cbu, solicitud.usuario_id]);
+    // Actualizar CUIL/CBU del afiliado (con historial_usuario; la ruta ya
+    // autorizó la edición de esta solicitud)
+    await actualizarDatosUsuario(connection, {
+      actor: cabecera,
+      usuarioId: solicitud.usuario_id,
+      cambios: { cuil: datos.cuil_afiliado, cbu: datos.cbu },
+      contexto: {
+        origen: "coseguro",
+        observaciones: `CUIL/CBU corregidos en la solicitud de reintegro #${solicitudId}`,
+        ...contextoDesdeRequest(req),
+      },
+      opciones: { propagar: false, autorizacionPrevia: true },
+    });
 
     if (estadoNuevo) {
       const mensajeRevision = normalizarTexto(req.body.mensaje_revision);

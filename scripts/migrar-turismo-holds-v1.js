@@ -124,6 +124,15 @@ const MIGRATION_CHECKSUM = crypto
   .update(JSON.stringify({ revision: MIGRATION_REVISION, definition: TABLE_DEFINITION, ddl: CREATE_TABLE_SQL.trim() }))
   .digest("hex");
 
+// Columnas que agrega la migración v2 (scripts/migrar-turismo-holds-v2-latido.js).
+// Van fuera de TABLE_DEFINITION a propósito: el checksum de v1 no cambia y el
+// --check de v1 las acepta (sólo si coinciden en tipo y son NULL-ables).
+const COLUMNAS_TOLERADAS_V2 = new Map([
+  ["vence_max_en", { tipo: "datetime(6)", nullable: "YES" }],
+  ["ultimo_latido_en", { tipo: "datetime(6)", nullable: "YES" }],
+  ["motivo_cierre", { tipo: "varchar(24)", nullable: "YES" }],
+]);
+
 function parsearArgumentos(argv = process.argv.slice(2)) {
   const check = argv.includes("--check");
   const apply = argv.includes("--apply");
@@ -263,10 +272,24 @@ function validarEsquemaExacto(esquema) {
     nombre,
     { tipo: tipo.toLowerCase(), nullable },
   ]));
-  if (esquema.columns.length !== columnasEsperadas.size) {
+  const columnasV1 = [];
+  for (const columna of esquema.columns) {
+    const toleradaV2 = COLUMNAS_TOLERADAS_V2.get(columna.COLUMN_NAME);
+    if (!toleradaV2) {
+      columnasV1.push(columna);
+      continue;
+    }
+    if (
+      String(columna.COLUMN_TYPE || "").toLowerCase() !== toleradaV2.tipo ||
+      String(columna.IS_NULLABLE || "").toUpperCase() !== toleradaV2.nullable
+    ) {
+      throw new Error(`Columna v2 incompatible ${TABLE_NAME}.${columna.COLUMN_NAME}`);
+    }
+  }
+  if (columnasV1.length !== columnasEsperadas.size) {
     throw new Error(`${TABLE_NAME} tiene una cantidad de columnas incompatible`);
   }
-  for (const columna of esquema.columns) {
+  for (const columna of columnasV1) {
     const esperada = columnasEsperadas.get(columna.COLUMN_NAME);
     if (!esperada) throw new Error(`Columna inesperada ${TABLE_NAME}.${columna.COLUMN_NAME}`);
     if (String(columna.COLUMN_TYPE || "").toLowerCase() !== esperada.tipo) {

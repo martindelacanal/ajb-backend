@@ -19,6 +19,8 @@
     "migrate:reservas-plazos:check": "node scripts/migrar-reservas-plazos-v1.js --check",
     "migrate:turismo-holds": "node scripts/migrar-turismo-holds-v1.js --apply --confirm=APLICAR_TURISMO_HOLDS",
     "migrate:turismo-holds:check": "node scripts/migrar-turismo-holds-v1.js --check",
+    "migrate:turismo-holds-v2": "node scripts/migrar-turismo-holds-v2-latido.js",
+    "migrate:turismo-holds-v2:check": "node scripts/migrar-turismo-holds-v2-latido.js --check",
     "migrate:turismo-catalogo:check": "node scripts/migrar-catalogo-turismo-v1.js --check --target=develop",
     "migrate:turismo-catalogo:apply": "node scripts/migrar-catalogo-turismo-v1.js --apply --target=develop --confirm=APLICAR_CATALOGO_TURISMO_DEVELOP",
     "migrate:webauthn": "node scripts/migrar-webauthn-v1.js --check --target=develop",
@@ -29,7 +31,10 @@
     "seed:login-gallery": "node scripts/seed-login-gallery.js",
     "mail:verificar": "node scripts/probar-correo.js --solo-verificar",
     "mail:probar": "node scripts/probar-correo.js",
-    "migrate:olimpiadas-v2": "node scripts/migrar-olimpiadas-v2.js"
+    "migrate:olimpiadas-v2": "node scripts/migrar-olimpiadas-v2.js",
+    "migrate:familiares-cambios": "node scripts/migrar-familiares-cambios.js",
+    "migrate:indices-familia": "node scripts/migrar-indices-familia.js",
+    "migrate:indices-familia:check": "node scripts/migrar-indices-familia.js --check"
   },
   "keywords": [],
   "author": "",

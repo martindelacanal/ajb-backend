@@ -278,10 +278,18 @@ test("historial de usuarios rechaza IDs, claims y roles no validos sin leer hist
       status: 403,
     },
     {
+      // admin-central ahora gestiona afiliados/invitados (ver el test de
+      // abajo); el rol sin acceso al historial ajeno es el auditor.
       nombre: "rol no autorizado",
       path: "/api/tabla/historial-usuario/222",
-      claims: { rol: "admin-central", departamental_id: 7 },
+      claims: { rol: "auditor", departamental_id: 7 },
       status: 403,
+    },
+    {
+      nombre: "admin-central sin ID",
+      path: "/api/tabla/historial-usuario",
+      claims: { rol: "admin-central" },
+      status: 400,
     },
   ];
 
@@ -315,6 +323,35 @@ test("historial de usuarios mantiene el acceso propio y aplica alcance en ambas 
     assert.ok(call.params.includes(222));
     assert.ok(call.params.includes(7));
   }
+});
+
+test("historial de usuarios: admin-central ve afiliados de cualquier departamental pero no staff", async () => {
+  const responder = (rolObjetivo) => async (sql, params) => {
+    if (/FROM usuario u[\s\S]+LEFT JOIN rol r[\s\S]+WHERE u\.id = \?/i.test(sql) && !/historial_usuario/i.test(sql)) {
+      return [[{ id: params[0], rol_id: rolObjetivo === "afiliado" ? 2 : 3, departamental_id: 22, usuario_familiar_id: null, rol_nombre: rolObjetivo }]];
+    }
+    if (/COUNT\(\*\)\s+as total/i.test(sql)) return [[{ total: 1 }]];
+    return [[{ id: 601, usuario_id: 222, observaciones: "historial" }]];
+  };
+
+  setDatabaseHandler(responder("afiliado"));
+  const permitido = await request("/api/tabla/historial-usuario/222", {
+    token: tokenFor({ id: 11, rol: "admin-central" }),
+  });
+  assert.equal(permitido.status, 200);
+  const historyQueries = databaseCalls.filter(({ sql }) => /FROM historial_usuario/i.test(sql));
+  assert.equal(historyQueries.length, 2);
+  for (const call of historyQueries) {
+    assert.match(call.sql, /h\.usuario_id = \?/);
+    assert.doesNotMatch(call.sql, /u\.departamental_id = \?/);
+  }
+
+  setDatabaseHandler(responder("departamental"));
+  const bloqueado = await request("/api/tabla/historial-usuario/222", {
+    token: tokenFor({ id: 11, rol: "admin-central" }),
+  });
+  assert.equal(bloqueado.status, 403);
+  assert.equal(databaseCalls.filter(({ sql }) => /FROM historial_usuario/i.test(sql)).length, 0);
 });
 
 test("historial global de usuarios sigue disponible para admin", async () => {

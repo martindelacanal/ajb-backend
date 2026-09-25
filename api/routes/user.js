@@ -91,6 +91,7 @@ const {
   obtenerHoldIdActivoPorToken,
   obtenerNumerosParcelasRetenidas,
   obtenerRecursosRetenidos,
+  renovarLatidoHoldTurismo,
   validarHoldParaReservaEnTransaccion,
 } = require("../services/turismo-reserva-holds");
 const {
@@ -102,6 +103,25 @@ const {
   resolverDescuentosSolicitados,
 } = require("../services/descuentos-reserva");
 const { obtenerMejorDescuentoAdicionalesDia } = require("../services/descuento-adicionales");
+const {
+  actualizarDatosUsuario,
+  autorizarEdicionUsuario,
+  camposEditables: camposEditablesUsuario,
+  cargarUsuarioObjetivo,
+  contextoDesdeRequest,
+  cuerpoErrorUsuario,
+  extraerCambiosUsuario,
+  puedeGestionarUsuario,
+  resumenResultado,
+} = require("../services/usuarios-datos");
+const {
+  contarPendientesEnSubconsulta: contarCambiosFamiliaresPendientes,
+  cuerpoErrorCambio,
+  extraerDatosSolicitados,
+  obtenerCambiosPendientesPorPersona,
+  solicitarCambioFamiliar,
+  solicitarCambioVinculo,
+} = require("../services/familiares-cambios");
 
 const HISTORIAL_USUARIO_LEGIBLE = crearEnriquecimientoHistorial(
   CATALOGOS_HISTORIAL_USUARIO
@@ -1417,8 +1437,18 @@ router.post("/turismo/reserva-holds", verifyToken, async (req, res) => {
         Number(req.body.adultos || 0) + Number(req.body.ninos || 0) + Number(req.body.bebes || 0) || null
       ),
       holdToken: req.body.hold_token,
+      // Latido (v2): sólo los bundles que lo declaran reciben el plazo corto.
+      soportaLatido: req.body.soporta_latido === true,
+      reanudar: req.body.reanudar === true,
+      reemplazarHoldPropio: req.body.reemplazar_hold_propio === true,
     });
-    const { creado, hold_anterior: holdAnterior, ...respuesta } = resultado;
+    const {
+      creado,
+      hold_anterior: holdAnterior,
+      hold_liberado: holdLiberado,
+      ...respuesta
+    } = resultado;
+    if (holdLiberado) emitirInvalidacionDisponibilidad(req, holdLiberado, "HOLD_LIBERADO");
     if (holdAnterior) emitirInvalidacionDisponibilidad(req, holdAnterior, "HOLD_REEMPLAZADO");
     emitirInvalidacionDisponibilidad(req, respuesta, respuesta.reemplazado ? "HOLD_REEMPLAZADO" : "HOLD_CREADO");
     return res.status(creado ? 201 : 200).json(respuesta);
@@ -1468,6 +1498,29 @@ router.delete("/turismo/reserva-holds/:id", verifyToken, async (req, res) => {
     if (responderErrorHold(res, error)) return;
     registrarErrorRuta(error);
     return res.status(500).json({ message: "No pudimos liberar la reserva temporal.", codigo: "HOLD_ERROR_INTERNO" });
+  }
+});
+
+// Latido del formulario de reserva: body { hold_token, segundo_plano? }.
+// Nunca revive un hold; los códigos HOLD_LATIDO_PERDIDO (409), HOLD_VENCIDO
+// (410), HOLD_REEMPLAZADO (409) y HOLD_NO_ACTIVO (409) le dicen al front qué hacer.
+router.post("/turismo/reserva-holds/:id/latido", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!puedeUsarHoldsTurismo(cabecera)) {
+      return res.status(401).json({ message: "No autorizado", codigo: "HOLD_NO_AUTORIZADO" });
+    }
+    const resultado = await renovarLatidoHoldTurismo(mysqlConnection.promise(), {
+      actorUsuarioId: cabecera.id,
+      holdId: req.params.id,
+      holdToken: req.body?.hold_token,
+      segundoPlano: req.body?.segundo_plano === true,
+    });
+    return res.status(200).json(resultado);
+  } catch (error) {
+    if (responderErrorHold(res, error)) return;
+    registrarErrorRuta(error);
+    return res.status(500).json({ message: "No pudimos renovar la reserva temporal.", codigo: "HOLD_ERROR_INTERNO" });
   }
 });
 
@@ -12038,7 +12091,10 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
           return res.status(404).json("No se encontró el acompañante con el ID especificado");
         }
 
-        return res.status(200).json(usuario[0]);
+        // Pedido de cambio de datos en revisión (services/familiares-cambios.js):
+        // el diálogo del afiliado lo precarga y ofrece retirarlo.
+        const cambiosPendientes = await obtenerCambiosPendientesPorPersona(db, [specific_id]);
+        return res.status(200).json({ ...usuario[0], cambio_pendiente: cambiosPendientes.get(specific_id) || null });
       }
 
       // Lógica original cuando no viene ID específico
@@ -12184,9 +12240,141 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
   }
 });
 
+// PUT /acompaniantes/:id para el personal (admin, admin-central y departamental
+// con área Turismo): edita la ficha completa de la persona, incluido el DNI, con
+// las mismas reglas que /configuracion/usuario/:id (services/usuarios-datos.js:
+// jurisdicción, lista blanca por rol, DNI único, historial y propagación). La
+// rama del afiliado y el PUT masivo (sin id) siguen en la ruta de abajo.
+const ROLES_STAFF_EDICION_PERSONAS = ["admin", "admin-central", "departamental"];
+const CAMPOS_PERSONA_STAFF = [
+  "nombre", "apellido", "documento", "fecha_nacimiento", "telefono", "email",
+  "parentesco_id", "tipo_persona_id", "es_familiar", "password",
+];
+
+async function actualizarPersonaPorStaff(req, res, cabecera, personaId) {
+  if (cabecera.rol !== "admin" && !tieneAreaTurismo(cabecera)) {
+    return res.status(401).json({ success: false, message: "No autorizado" });
+  }
+  let persona = null;
+  if (req.body && (req.body.nombre !== undefined || req.body.apellido !== undefined || req.body.documento !== undefined)) {
+    persona = req.body;
+  } else if (Array.isArray(req.body?.personas) && req.body.personas.length > 0) {
+    persona = req.body.personas[0];
+  }
+  if (!persona || typeof persona !== "object") {
+    return res.status(400).json({ success: false, message: "Faltan datos de la persona a actualizar" });
+  }
+  const cambios = {};
+  for (const campo of CAMPOS_PERSONA_STAFF) {
+    if (persona[campo] !== undefined) cambios[campo] = persona[campo];
+  }
+  if (cambios.documento === undefined && persona.dni !== undefined) cambios.documento = persona.dni;
+
+  let connection;
+  try {
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const resultado = await actualizarDatosUsuario(connection, {
+      actor: cabecera,
+      usuarioId: personaId,
+      cambios,
+      contexto: { origen: "acompaniantes", ...contextoDesdeRequest(req) },
+    });
+    if (resultado.cambios.length === 0) {
+      await connection.rollback();
+      return res.status(200).json({ success: true, message: "No hay cambios para actualizar", ...resumenResultado(resultado) });
+    }
+    await connection.commit();
+    return res.status(200).json({ success: true, message: "Usuario actualizado correctamente", ...resumenResultado(resultado) });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    registrarErrorRuta(error);
+    if (error?.statusCode) return res.status(error.statusCode).json(cuerpoErrorUsuario(error));
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
+  } finally {
+    if (connection) connection.release();
+  }
+}
+
+// PUT /acompaniantes/:id con rol afiliado: los cambios sobre un familiar o
+// acompañante NO se aplican directo. Quedan en un pedido PENDIENTE (o
+// reemplazan al que ya había) que aprueba la departamental del titular
+// (services/familiares-cambios.js) y se responde 202 {pendiente:true}. El front
+// usa POST /familiares/:id/cambios; esto cubre a los clientes viejos. Si la
+// persona es el propio afiliado, sólo se aplican los datos de su perfil
+// (nombre, apellido, teléfono y contraseña), como en Mi perfil.
+async function actualizarPersonaPorAfiliado(req, res, cabecera, personaId) {
+  let persona = null;
+  const body = req.body || {};
+  if (["nombre", "apellido", "documento", "dni", "telefono"].some((campo) => body[campo] !== undefined)) {
+    persona = body;
+  } else if (Array.isArray(body.personas) && body.personas.length > 0) {
+    persona = body.personas[0];
+  }
+  if (!persona || typeof persona !== "object") {
+    return res.status(400).json({ success: false, message: "Faltan datos de la persona a actualizar" });
+  }
+
+  let connection;
+  try {
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    if (personaId === normalizarIdPositivo(cabecera.id)) {
+      const cambios = {};
+      for (const campo of ["nombre", "apellido", "telefono", "password"]) {
+        if (persona[campo] !== undefined) cambios[campo] = persona[campo];
+      }
+      const resultado = await actualizarDatosUsuario(connection, {
+        actor: cabecera,
+        usuarioId: personaId,
+        cambios,
+        contexto: {
+          origen: "acompaniantes",
+          observaciones: "Datos propios actualizados desde Familiares y acompañantes",
+          ...contextoDesdeRequest(req),
+        },
+      });
+      await connection.commit();
+      return res.status(200).json({
+        success: true,
+        message: resultado.cambios.length > 0 ? "Datos actualizados correctamente" : "No hay cambios para actualizar",
+        ...resumenResultado(resultado),
+      });
+    }
+
+    const resultado = await solicitarCambioFamiliar(connection, {
+      actor: cabecera,
+      personaId,
+      datos: extraerDatosSolicitados(persona),
+    });
+    await connection.commit();
+    return res.status(202).json({
+      success: true,
+      pendiente: true,
+      message: `${resultado.reemplazada ? "Actualizamos tu pedido de cambios." : "Enviamos los cambios a tu departamental."} ` +
+        "Quedan en revisión hasta que los apruebe; mientras tanto se usan los datos actuales.",
+      ...resultado,
+    });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    if (error?.statusCode) return res.status(error.statusCode).json(cuerpoErrorCambio(error));
+    registrarErrorRuta(error);
+    return res.status(500).json({ success: false, message: "Error interno del servidor" });
+  } finally {
+    if (connection) connection.release();
+  }
+}
+
 router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
+    const personaIdStaff = normalizarIdPositivo(req.params.id);
+    if (personaIdStaff && ROLES_STAFF_EDICION_PERSONAS.includes(cabecera.rol)) {
+      return await actualizarPersonaPorStaff(req, res, cabecera, personaIdStaff);
+    }
+    if (personaIdStaff && cabecera.rol === "afiliado") {
+      return await actualizarPersonaPorAfiliado(req, res, cabecera, personaIdStaff);
+    }
     if (
       cabecera.rol === "admin" ||
       cabecera.rol === "afiliado" ||
@@ -12195,179 +12383,10 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
       const { usuarioId, personas } = req.body;
       const specific_id = normalizarIdPositivo(req.params.id);
 
-      // Si viene un ID específico, actualizar directamente ese usuario
+      // Con ID: admin / admin-central / departamental van por actualizarPersonaPorStaff
+      // y el afiliado por actualizarPersonaPorAfiliado (pedido con aprobación).
       if (specific_id) {
-        let persona;
-
-        if (req.body.nombre && req.body.apellido) {
-          persona = req.body;
-        } else if (personas && Array.isArray(personas) && personas.length > 0) {
-          persona = personas[0];
-        } else {
-          return res.status(400).json({
-            success: false,
-            message: "Faltan datos de la persona a actualizar"
-          });
-        }
-
-        if (!persona.nombre || !persona.apellido) {
-          return res.status(400).json({
-            success: false,
-            message: "Nombre y apellido son requeridos"
-          });
-        }
-
-        let fechaFormateada = formatearFechaSQL(persona.fecha_nacimiento);
-        let tipoPersonaId = normalizarIdPositivo(persona.tipo_persona_id);
-        let parentescoId = persona.parentesco_id ? normalizarIdPositivo(persona.parentesco_id) : null;
-        if (!fechaFormateada || !tipoPersonaId || (persona.parentesco_id && !parentescoId)) {
-          return res.status(400).json({ success: false, message: "Fecha, parentesco o tipo de persona no válido" });
-        }
-
-        let connection;
-        try {
-          connection = await mysqlConnection.promise().getConnection();
-          await connection.beginTransaction();
-
-          // Obtener datos anteriores del usuario para el historial
-          const [usuarioAnterior] = await connection.query(
-            "SELECT * FROM usuario WHERE id = ? FOR UPDATE",
-            [specific_id]
-          );
-
-          if (usuarioAnterior.length === 0) {
-            throw crearErrorNegocio("Usuario no encontrado", 404);
-          }
-          if (!(await puedeAccederUsuarioRelacionado(connection, cabecera, specific_id))) {
-            throw crearErrorNegocio("No tienes permisos para modificar esta persona", 403);
-          }
-
-          const datosAnteriores = usuarioAnterior[0];
-          if (cabecera.rol === "afiliado") {
-            fechaFormateada = formatearFechaSQL(datosAnteriores.fecha_nacimiento);
-            tipoPersonaId = normalizarIdPositivo(datosAnteriores.tipo_persona_id);
-            parentescoId = normalizarIdPositivo(datosAnteriores.parentesco_id);
-          }
-
-          // Preparar campos para comparar cambios
-          const cambios = [];
-
-          if (datosAnteriores.nombre !== persona.nombre) {
-            cambios.push({
-              campo: 'nombre',
-              valorAnterior: datosAnteriores.nombre,
-              valorNuevo: persona.nombre
-            });
-          }
-
-          if (datosAnteriores.apellido !== persona.apellido) {
-            cambios.push({
-              campo: 'apellido',
-              valorAnterior: datosAnteriores.apellido,
-              valorNuevo: persona.apellido
-            });
-          }
-
-          if (datosAnteriores.fecha_nacimiento !== fechaFormateada) {
-            cambios.push({
-              campo: 'fecha_nacimiento',
-              valorAnterior: datosAnteriores.fecha_nacimiento,
-              valorNuevo: fechaFormateada
-            });
-          }
-
-          if (datosAnteriores.telefono !== (persona.telefono || null)) {
-            cambios.push({
-              campo: 'telefono',
-              valorAnterior: datosAnteriores.telefono,
-              valorNuevo: persona.telefono || null
-            });
-          }
-
-          if (Number(datosAnteriores.parentesco_id || 0) !== Number(parentescoId || 0)) {
-            cambios.push({
-              campo: 'parentesco_id',
-              valorAnterior: datosAnteriores.parentesco_id,
-              valorNuevo: parentescoId
-            });
-          }
-
-          if (Number(datosAnteriores.tipo_persona_id) !== tipoPersonaId) {
-            cambios.push({
-              campo: 'tipo_persona_id',
-              valorAnterior: datosAnteriores.tipo_persona_id,
-              valorNuevo: tipoPersonaId
-            });
-          }
-
-          // Preparar los campos para actualizar
-          let updateFields = [
-            "nombre = ?",
-            "apellido = ?",
-            "fecha_nacimiento = ?",
-            "telefono = ?",
-            "parentesco_id = ?",
-            "tipo_persona_id = ?"
-          ];
-
-          let updateValues = [
-            persona.nombre,
-            persona.apellido,
-            fechaFormateada,
-            persona.telefono || null,
-            parentescoId,
-            tipoPersonaId
-          ];
-
-          // Si viene password, hashearlo y agregarlo a la actualización
-          if (persona.password && (cabecera.rol === "admin" || Number(cabecera.id) === specific_id)) {
-            let passwordHash = await bcryptjs.hash(persona.password, 8);
-            updateFields.push("password = ?");
-            updateValues.push(passwordHash);
-
-            cambios.push({
-              campo: 'password',
-              valorAnterior: '[OCULTO]',
-              valorNuevo: '[MODIFICADO]'
-            });
-          }
-
-          updateValues.push(specific_id);
-          const updateQuery = `UPDATE usuario SET ${updateFields.join(', ')} WHERE id = ?`;
-
-          const [result] = await connection.query(updateQuery, updateValues);
-
-          // Registrar cambios en el historial si hubo modificaciones
-          if (cambios.length > 0) {
-            await registrarHistorial(
-              connection,
-              specific_id,
-              'UPDATE',
-              'usuario',
-              cabecera.id,
-              req,
-              cambios,
-              'Usuario actualizado directamente por ID'
-            );
-          }
-
-          await connection.commit();
-
-          return res.status(200).json({
-            success: result.affectedRows > 0,
-            message: result.affectedRows > 0 ? "Usuario actualizado correctamente" : "No se encontró el usuario o no se realizaron cambios"
-          });
-
-        } catch (updateError) {
-          if (connection) {
-            await connection.rollback();
-          }
-          throw updateError;
-        } finally {
-          if (connection) {
-            connection.release();
-          }
-        }
+        return res.status(401).json({ success: false, message: "No autorizado" });
       }
 
       // Lógica original cuando no viene ID específico
@@ -12399,10 +12418,23 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
 
         let usuariosModificados = 0;
         const errores = [];
+        // Personas ya cargadas cuyos datos el afiliado quiso cambiar desde la
+        // reserva: no se tocan (se piden desde Familiares y acompañantes y los
+        // aprueba la departamental). crearOBuscarUsuariosReserva usa los datos de
+        // la base para las personas existentes, así que la reserva no cambia.
+        const ignoradas = [];
+        // Staff: lo que devolvió actualizarDatosUsuario para cada persona.
+        const advertencias = [];
+        const propagaciones = [];
+        const reservasAfectadas = [];
 
         // Procesar cada persona
-        for (const persona of personas) {
+        for (const [indicePersona, persona] of personas.entries()) {
           try {
+            if (!persona || typeof persona !== "object") {
+              errores.push(`Persona ${indicePersona + 1}: datos inválidos`);
+              continue;
+            }
             if (!persona.dni) {
               errores.push(`Persona ${persona.nombre} ${persona.apellido}: DNI es requerido`);
               continue;
@@ -12411,7 +12443,7 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
             // Buscar usuario por documento y obtener todos sus datos para el historial
             const [usuarioExistente] = await connection.query(
               `SELECT * FROM usuario WHERE documento = ?`,
-              [persona.dni]
+              [String(persona.dni).replace(/[\s.-]/g, "")]
             );
 
             if (usuarioExistente.length === 0) {
@@ -12420,7 +12452,90 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
 
             const usuario = usuarioExistente[0];
 
-            // Verificar permisos
+            if (cabecera.rol !== "afiliado") {
+              // Staff (admin / departamental con área Turismo): cada persona ya
+              // cargada pasa por actualizarDatosUsuario (services/usuarios-datos.js),
+              // igual que PUT /acompaniantes/:id: autoriza con puedeGestionarUsuario
+              // (una departamental no edita a otro miembro del staff ni a personas
+              // de otra sede), aplica las reglas de tipo / edad / parentesco, deja
+              // historial estricto y propaga a los otros módulos. Cada persona va
+              // en su propio SAVEPOINT: si una falla se revierte sólo lo suyo y
+              // se informa en `errores`, como antes.
+              const idOpcional = (valor) => (
+                valor === undefined || valor === null || valor === "" || Number(valor) === 0 ? undefined : valor
+              );
+              const textoOpcional = (valor) => (
+                valor === undefined || valor === null || String(valor).trim() === "" ? undefined : valor
+              );
+              const fechaStaff = textoOpcional(persona.fechaNacimiento);
+              const cambiosPersona = {
+                nombre: persona.nombre,
+                apellido: persona.apellido,
+                fecha_nacimiento: fechaStaff === undefined ? undefined : (formatearFechaSQL(fechaStaff) || fechaStaff),
+                // Teléfono vacío = no se toca (el formulario lo manda vacío cuando
+                // la persona no tenía uno cargado).
+                telefono: textoOpcional(persona.telefono),
+                tipo_persona_id: idOpcional(persona.tipoPersonaId),
+                parentesco_id: idOpcional(persona.parentescoId),
+              };
+              // Elegir un parentesco al cargar un viaje no debe sumar ni sacar a
+              // alguien del grupo familiar (afecta su coseguro como familiar a
+              // cargo): si el cambio alteraría es_familiar, no se aplica acá.
+              if (
+                cambiosPersona.parentesco_id !== undefined &&
+                usuario.usuario_familiar_id &&
+                esFamiliarPorParentesco(normalizarIdPositivo(cambiosPersona.parentesco_id)) !== (usuario.es_familiar === "S" ? "S" : "N")
+              ) {
+                cambiosPersona.parentesco_id = undefined;
+                advertencias.push({
+                  codigo: "VINCULO_NO_CAMBIADO_DESDE_RESERVA",
+                  mensaje: `El parentesco de ${usuario.nombre} ${usuario.apellido} no se cambió desde la reserva porque la sumaría o la sacaría del grupo familiar. Cambialo desde su ficha.`,
+                  persona_id: Number(usuario.id),
+                });
+              }
+              const savepoint = `acompaniante_${indicePersona}`;
+              await connection.query(`SAVEPOINT ${savepoint}`);
+              try {
+                const resultadoPersona = await actualizarDatosUsuario(connection, {
+                  actor: cabecera,
+                  usuarioId: usuario.id,
+                  cambios: cambiosPersona,
+                  contexto: {
+                    origen: "acompaniantes",
+                    observaciones: "Datos actualizados por el personal al cargar una reserva",
+                    ...contextoDesdeRequest(req),
+                  },
+                });
+                await connection.query(`RELEASE SAVEPOINT ${savepoint}`);
+                if (resultadoPersona.cambios.length > 0) usuariosModificados++;
+                const personaId = Number(usuario.id);
+                advertencias.push(...resultadoPersona.advertencias.map((aviso) => ({ ...aviso, persona_id: personaId })));
+                propagaciones.push(...resultadoPersona.propagaciones);
+                reservasAfectadas.push(...resultadoPersona.reservasAfectadas.map((reserva) => ({ ...reserva, persona_id: personaId })));
+              } catch (errorPersona) {
+                // Un deadlock revierte la transacción entera (y con ella el
+                // SAVEPOINT): seguir el loop escribiría en autocommit. Se aborta
+                // todo el pedido y el catch de la transacción hace rollback.
+                if (!errorPersona?.statusCode && (errorPersona?.errno === 1213 || errorPersona?.code === "ER_LOCK_DEADLOCK")) {
+                  errorPersona.abortarMasivo = true;
+                  throw errorPersona;
+                }
+                try {
+                  await connection.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+                } catch (errorRollback) {
+                  errorRollback.abortarMasivo = true;
+                  throw errorRollback;
+                }
+                if (!errorPersona?.statusCode) registrarErrorRuta(errorPersona);
+                errores.push(
+                  `Persona ${persona.nombre} ${persona.apellido}: ` +
+                    (errorPersona?.statusCode ? errorPersona.message : "no se pudo actualizar")
+                );
+              }
+              continue;
+            }
+
+            // Afiliado: verificar permisos
             const tienePermisos = await puedeAccederUsuarioRelacionado(connection, cabecera, usuario.id);
 
             if (!tienePermisos) {
@@ -12437,11 +12552,9 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
               errores.push(`Persona ${persona.nombre} ${persona.apellido}: fecha, parentesco o tipo inválido`);
               continue;
             }
-            if (cabecera.rol === "afiliado") {
-              fechaNacimiento = normalizarFecha(usuario.fecha_nacimiento);
-              parentescoId = normalizarIdPositivo(usuario.parentesco_id);
-              tipoPersonaId = normalizarIdPositivo(usuario.tipo_persona_id);
-            }
+            fechaNacimiento = normalizarFecha(usuario.fecha_nacimiento);
+            parentescoId = normalizarIdPositivo(usuario.parentesco_id);
+            tipoPersonaId = normalizarIdPositivo(usuario.tipo_persona_id);
 
             // Función auxiliar para normalizar teléfonos
             const normalizarTelefono = (telefono) => {
@@ -12499,45 +12612,18 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
               });
             }
 
-            // Verificar si hay cambios
+            // El afiliado nunca actualiza personas existentes desde la reserva.
             if (cambios.length > 0) {
-              // Actualizar el usuario
-              await connection.query(
-                `UPDATE usuario SET 
-                   nombre = ?, 
-                   apellido = ?, 
-                   fecha_nacimiento = ?, 
-                   telefono = ?, 
-                   parentesco_id = ?,
-                   tipo_persona_id = ?
-                 WHERE id = ?`,
-                [
-                  persona.nombre,
-                  persona.apellido,
-                  fechaNacimiento,
-                  persona.telefono || null,
-                  parentescoId,
-                  tipoPersonaId,
-                  usuario.id
-                ]
-              );
-
-              // Registrar cambios en el historial
-              await registrarHistorial(
-                connection,
-                usuario.id,
-                'UPDATE',
-                'usuario',
-                cabecera.id,
-                req,
-                cambios,
-                'Usuario actualizado mediante gestión de acompañantes'
-              );
-
-              usuariosModificados++;
+              ignoradas.push({
+                persona_id: usuario.id,
+                dni: String(persona.dni),
+                nombre: usuario.nombre,
+                apellido: usuario.apellido,
+                campos: cambios.map(({ campo }) => campo),
+              });
             }
-
           } catch (personaError) {
+            if (personaError?.abortarMasivo) throw personaError;
             errores.push(`Error procesando ${persona.nombre} ${persona.apellido}: ${personaError.message}`);
           }
         }
@@ -12547,7 +12633,12 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
         const success = usuariosModificados > 0;
         let message = "";
 
-        if (success) {
+        if (cabecera.rol === "afiliado") {
+          message = ignoradas.length > 0
+            ? "Los datos de las personas ya cargadas no se cambian desde la reserva: si algo cambió, pedilo desde Familiares y acompañantes y tu departamental lo revisa."
+            : "No hay datos para actualizar";
+          if (errores.length > 0) message += `. Errores: ${errores.join('; ')}`;
+        } else if (success) {
           message = `Se actualizaron ${usuariosModificados} usuario(s) correctamente`;
           if (errores.length > 0) {
             message += `. Errores: ${errores.join('; ')}`;
@@ -12560,9 +12651,18 @@ router.put("/acompaniantes/:id?", verifyToken, async (req, res) => {
           }
         }
 
+        // crear-reserva sólo mira `success` (y sigue igual si falla): el resto
+        // es informativo. errores/advertencias/propagaciones/reservasAfectadas
+        // sólo traen datos para el staff.
         res.status(200).json({
           success,
-          message
+          message,
+          actualizadas: usuariosModificados,
+          ignoradas,
+          errores,
+          advertencias,
+          propagaciones,
+          reservasAfectadas,
         });
 
       } catch (transactionError) {
@@ -12633,6 +12733,7 @@ router.get("/tipo_persona", verifyToken, async (req, res) => {
     const cabecera = JSON.parse(req.data.data);
     if (
       cabecera.rol === "admin" ||
+      cabecera.rol === "admin-central" ||
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
@@ -12654,6 +12755,7 @@ router.get("/parentesco", verifyToken, async (req, res) => {
     const cabecera = JSON.parse(req.data.data);
     if (
       cabecera.rol === "admin" ||
+      cabecera.rol === "admin-central" ||
       cabecera.rol === "afiliado" ||
       cabecera.rol === "departamental"
     ) {
@@ -12673,7 +12775,8 @@ router.get("/parentesco", verifyToken, async (req, res) => {
 router.get("/departamental", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (cabecera.rol !== "admin") {
+    // admin-central la necesita para asignar la departamental de un afiliado.
+    if (!["admin", "admin-central"].includes(cabecera.rol)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -13781,6 +13884,10 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
 
   // Universo del afiliado: familiares del grupo + acompañantes de viaje sin
   // cuenta propia (vinculados directamente o a través de reservas compartidas).
+  // Es el mismo que personaEnUniversoAfiliado (services/familiares-cambios.js):
+  // por reservas compartidas sólo entra quien no integra el grupo de OTRO
+  // afiliado (usuario_familiar_id NULL o el propio). Si no coincidieran, la
+  // tabla listaría personas que después dan 403 PERSONA_FUERA_DEL_GRUPO.
   const baseQuery = `
     SELECT
       u.id,
@@ -13818,16 +13925,19 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
           u.password IS NULL AND (u.email IS NULL OR u.email = '')
           AND (
             (u.usuario_familiar_id = ? AND (u.es_familiar IS NULL OR u.es_familiar = 'N'))
-            OR u.id IN (
-              SELECT rf5.usuario_id
-              FROM reserva_familiar rf5
-              WHERE rf5.reserva_id IN (SELECT rf6.reserva_id FROM reserva_familiar rf6 WHERE rf6.usuario_id = ?)
+            OR (
+              (u.usuario_familiar_id IS NULL OR u.usuario_familiar_id = ?)
+              AND u.id IN (
+                SELECT rf5.usuario_id
+                FROM reserva_familiar rf5
+                WHERE rf5.reserva_id IN (SELECT rf6.reserva_id FROM reserva_familiar rf6 WHERE rf6.usuario_id = ?)
+              )
             )
           )
         )
       )
   `;
-  const baseParams = [usuarioId, usuarioId, usuarioId, usuarioId, usuarioId, usuarioId, usuarioId];
+  const baseParams = Array(8).fill(usuarioId);
 
   const condiciones = [];
   const paramsFiltro = [];
@@ -13892,6 +14002,9 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
        FROM (${baseQuery}) base`,
       baseParams
     );
+    // Pedidos de cambio de datos en revisión (services/familiares-cambios.js).
+    const cambiosPendientes = await obtenerCambiosPendientesPorPersona(db, rows.map((row) => row.id));
+    const pendientesUniverso = await contarCambiosFamiliaresPendientes(db, baseQuery, baseParams);
 
     const formatearFecha = (fecha) => {
       if (!fecha) return null;
@@ -13921,6 +14034,7 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
         viajes_compartidos: Number(row.viajes_compartidos) || 0,
         ultimo_viaje: formatearFecha(row.ultimo_viaje_fecha),
         fecha_creacion: row.fecha_creacion,
+        cambio_pendiente: cambiosPendientes.get(Number(row.id)) || null,
       })),
       numOfPages: Math.ceil(numOfResults / resultsPerPage),
       totalItems: numOfResults,
@@ -13932,6 +14046,7 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
         familiares: Number(statsRows[0].familiares) || 0,
         acompaniantes: Number(statsRows[0].acompaniantes) || 0,
         listos_coseguro: Number(statsRows[0].listos_coseguro) || 0,
+        pendientes: pendientesUniverso,
       },
     });
   } catch (error) {
@@ -13941,8 +14056,11 @@ router.post("/tabla/acompaniantes", verifyToken, async (req, res) => {
 });
 
 // POST /familiares - Alta de un familiar del grupo familiar (rol afiliado).
-// El familiar queda vinculado con usuario_familiar_id + es_familiar = 'S' y por
-// eso también queda disponible como "familiar a cargo" en el coseguro médico.
+// Una persona NUEVA se crea en el acto (201): queda vinculada con
+// usuario_familiar_id + es_familiar = 'S' y por eso también disponible como
+// "familiar a cargo" en el coseguro médico. Si el DNI ya es de un acompañante
+// sin cuenta de su grupo, no se duplica: se pide sumarlo al grupo familiar y el
+// pedido queda PENDIENTE de la departamental (202 {pendiente:true, solicitud_id}).
 router.post("/familiares", verifyToken, async (req, res) => {
   let connection;
   try {
@@ -14024,41 +14142,27 @@ router.post("/familiares", verifyToken, async (req, res) => {
         }
 
         // Si ya viajó con el afiliado (o quedó vinculada como acompañante) y no
-        // tiene cuenta propia, se la promueve a familiar en lugar de duplicarla.
+        // tiene cuenta propia, no se la duplica: se pide sumarla al grupo
+        // familiar. Como todo cambio del afiliado sobre su grupo, queda
+        // PENDIENTE hasta que la departamental lo apruebe (services/familiares-cambios.js).
         if (esDelGrupo && sinCuenta) {
-          await connection.query(
-            "UPDATE usuario SET es_familiar = 'S', parentesco_id = ?, departamental_id = ? WHERE id = ?",
-            [parentescoId, titularDepartamentalId, persona.id]
-          );
-          const cambios = [
-            { campo: "es_familiar", valorAnterior: persona.es_familiar, valorNuevo: "S" },
-          ];
-          if (Number(persona.parentesco_id) !== parentescoId) {
-            cambios.push({ campo: "parentesco_id", valorAnterior: persona.parentesco_id, valorNuevo: parentescoId });
-          }
-          if (Number(persona.departamental_id) !== titularDepartamentalId) {
-            cambios.push({
-              campo: "departamental_id",
-              valorAnterior: persona.departamental_id,
-              valorNuevo: titularDepartamentalId,
-            });
-          }
-          await registrarHistorial(
-            connection,
-            persona.id,
-            "UPDATE",
-            "usuario",
-            actorId,
-            req,
-            cambios,
-            "Acompañante de viaje promovido a familiar del grupo familiar"
-          );
+          const pedido = await solicitarCambioVinculo(connection, {
+            actor: cabecera,
+            personaId: persona.id,
+            esFamiliar: "S",
+            parentescoId,
+          });
           await connection.commit();
-          return res.status(200).json({
+          return res.status(202).json({
             success: true,
+            pendiente: true,
+            promovido: false,
             id: persona.id,
-            promovido: true,
-            message: "Esa persona ya te acompañó en viajes: la sumamos a tu grupo familiar",
+            solicitud_id: pedido.solicitud_id,
+            codigo: pedido.codigo,
+            reemplazada: pedido.reemplazada,
+            cambio_vinculo: pedido.cambio_vinculo,
+            message: "Esa persona ya te acompañó en viajes, así que no la cargamos de nuevo: le pedimos a tu departamental que la sume a tu grupo familiar. Queda en revisión hasta que lo apruebe.",
           });
         }
 
@@ -14103,6 +14207,10 @@ router.post("/familiares", verifyToken, async (req, res) => {
     if (connection) {
       await connection.rollback();
     }
+    // Errores del pedido de vínculo (409 CAMBIO_PENDIENTE_DE_OTRO, 403, 422…).
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json(cuerpoErrorCambio(error));
+    }
     if (error && error.code === "ER_DUP_ENTRY") {
       return res.status(409).json({ success: false, message: "Ya existe otra persona registrada con ese DNI" });
     }
@@ -14115,9 +14223,17 @@ router.post("/familiares", verifyToken, async (req, res) => {
   }
 });
 
-// PUT /familiares/:id/vinculo - Cambia el vínculo de una persona con el afiliado.
-// Body: { es_familiar: 'S' | 'N', parentesco_id? } — 'S' suma la persona al grupo
-// familiar (coseguro), 'N' la deja solo como acompañante de viaje.
+// PUT /familiares/:id/vinculo - El afiliado pide cambiar el vínculo de una persona.
+// Body: { es_familiar: 'S' | 'N', parentesco_id? } — 'S' pide sumarla al grupo
+// familiar (coseguro) con parentesco Pareja / Hijo / Familiar; 'N' pide dejarla
+// sólo como acompañante de viaje. NO se aplica acá: queda como pedido PENDIENTE
+// (services/familiares-cambios.js → solicitarCambioVinculo) que aprueba la
+// departamental desde Cambios de familiares; al aprobarse, la persona queda en
+// el grupo del afiliado (usuario_familiar_id) con la departamental del titular.
+// Sumar a alguien sin grupo (usuario_familiar_id NULL) sólo si no tiene cuenta y
+// compartió una reserva con el afiliado; nunca a quien integra el grupo de otro.
+// 202 {success, pendiente:true, message, solicitud_id, codigo, reemplazada,
+//      campos, datos_propuestos, cambios, cambio_vinculo, version}
 router.put("/familiares/:id/vinculo", verifyToken, async (req, res) => {
   let connection;
   try {
@@ -14143,120 +14259,38 @@ router.put("/familiares/:id/vinculo", verifyToken, async (req, res) => {
 
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
-    const [titulares] = await connection.query(
-      "SELECT id, departamental_id FROM usuario WHERE id = ? AND habilitado = 'Y' FOR UPDATE",
-      [actorId]
-    );
-    if (titulares.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ success: false, message: "Usuario no encontrado" });
-    }
-    const titularDepartamentalId = normalizarIdPositivo(titulares[0].departamental_id);
-    if (!titularDepartamentalId) {
-      await connection.rollback();
-      return res.status(409).json({
-        success: false,
-        message: "El titular no tiene una departamental valida asignada",
-      });
-    }
-    const [personas] = await connection.query(
-      `SELECT id, usuario_familiar_id, es_familiar, parentesco_id, departamental_id, password, email
-       FROM usuario WHERE id = ? FOR UPDATE`,
-      [personaId]
-    );
-    if (personas.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ success: false, message: "Persona no encontrada" });
-    }
-
-    const persona = personas[0];
-    const esDelGrupo = normalizarIdPositivo(persona.usuario_familiar_id) === actorId;
-    const sinCuenta = persona.password === null && (persona.email === null || persona.email === "");
-
-    if (esFamiliar === "N" && !esDelGrupo) {
-      await connection.rollback();
-      return res.status(401).json({ success: false, message: "No autorizado" });
-    }
-
-    if (!esDelGrupo) {
-      // Solo se puede sumar al grupo a alguien sin cuenta propia que haya
-      // compartido al menos una reserva con el afiliado.
-      const [comparte] = await connection.query(
-        `SELECT COUNT(*) AS c
-         FROM reserva_familiar rf
-         WHERE rf.usuario_id = ?
-           AND rf.reserva_id IN (SELECT rf2.reserva_id FROM reserva_familiar rf2 WHERE rf2.usuario_id = ?)`,
-        [personaId, actorId]
-      );
-      if (!sinCuenta || Number(comparte[0].c) === 0) {
-        await connection.rollback();
-        return res.status(401).json({ success: false, message: "No autorizado" });
-      }
-    }
-
-    const cambios = [{ campo: "es_familiar", valorAnterior: persona.es_familiar, valorNuevo: esFamiliar }];
-    if (esFamiliar === "S" && parentescoId && parentescoId !== persona.parentesco_id) {
-      cambios.push({ campo: "parentesco_id", valorAnterior: persona.parentesco_id, valorNuevo: parentescoId });
-    }
-    // Los acompañantes de viaje (N) siguen vinculados al afiliado: la tabla de
-    // familiares y acompañantes los lista por usuario_familiar_id. Con NULL la
-    // persona desaparecía de la lista y no se podía volver a sumar al grupo.
-    const usuarioFamiliarIdNuevo = actorId;
-    if (normalizarIdPositivo(persona.usuario_familiar_id) !== usuarioFamiliarIdNuevo) {
-      cambios.push({
-        campo: "usuario_familiar_id",
-        valorAnterior: persona.usuario_familiar_id,
-        valorNuevo: usuarioFamiliarIdNuevo,
-      });
-    }
-    if (esFamiliar === "S" && Number(persona.departamental_id) !== titularDepartamentalId) {
-      cambios.push({
-        campo: "departamental_id",
-        valorAnterior: persona.departamental_id,
-        valorNuevo: titularDepartamentalId,
-      });
-    }
-
-    await connection.query(
-      `UPDATE usuario
-       SET es_familiar = ?,
-           usuario_familiar_id = ?,
-           parentesco_id = COALESCE(?, parentesco_id),
-           departamental_id = CASE WHEN ? = 'S' THEN ? ELSE departamental_id END
-       WHERE id = ?`,
-      [
-        esFamiliar,
-        usuarioFamiliarIdNuevo,
-        esFamiliar === "S" ? parentescoId : null,
-        esFamiliar,
-        titularDepartamentalId,
-        personaId,
-      ]
-    );
-
-    await registrarHistorial(
-      connection,
+    const pedido = await solicitarCambioVinculo(connection, {
+      actor: cabecera,
       personaId,
-      "UPDATE",
-      "usuario",
-      actorId,
-      req,
-      cambios,
-      esFamiliar === "S"
-        ? "Persona sumada al grupo familiar por el afiliado"
-        : "Persona quitada del grupo familiar por el afiliado"
-    );
-
+      esFamiliar,
+      parentescoId: esFamiliar === "S" ? parentescoId : null,
+    });
     await connection.commit();
 
-    res.status(200).json({
+    const base = esFamiliar === "S"
+      ? "Le pedimos a tu departamental que sume a esta persona a tu grupo familiar."
+      : "Le pedimos a tu departamental que quite a esta persona de tu grupo familiar.";
+    res.status(202).json({
       success: true,
-      message: esFamiliar === "S" ? "Persona sumada a tu grupo familiar" : "Persona quitada de tu grupo familiar",
+      pendiente: true,
+      message: pedido.reemplazada
+        ? `${base} Lo sumamos a tu pedido en revisión; mientras tanto sigue como está.`
+        : `${base} Queda en revisión hasta que lo apruebe; mientras tanto sigue como está.`,
+      ...pedido,
     });
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        registrarErrorRuta(rollbackError);
+      }
+    }
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json(cuerpoErrorCambio(error));
+    }
     registrarErrorRuta(error);
-    res.status(500).json({ success: false, message: "Error al actualizar el vínculo" });
+    res.status(500).json({ success: false, message: "Error al pedir el cambio de vínculo" });
   } finally {
     if (connection) connection.release();
   }
@@ -14268,11 +14302,31 @@ router.get("/tabla/historial-usuario/:id?", verifyToken, async (req, res) => {
     const cabecera = JSON.parse(req.data.data);
     if (
       cabecera.rol === "admin" ||
+      cabecera.rol === "admin-central" ||
       cabecera.rol === "departamental"
     ) {
       const userId = req.params.id === undefined ? null : normalizarIdPositivo(req.params.id);
       if (req.params.id !== undefined && !userId) {
         return res.status(400).json("ID de usuario invalido");
+      }
+
+      // admin-central: sólo el historial de una persona que puede gestionar
+      // (afiliados e invitados de cualquier departamental, o el propio).
+      if (cabecera.rol === "admin-central") {
+        if (!userId) {
+          return res.status(400).json("El ID de usuario es requerido");
+        }
+        const [objetivos] = await mysqlConnection.promise().execute(
+          `SELECT u.id, u.rol_id, u.departamental_id, u.usuario_familiar_id, r.nombre AS rol_nombre
+             FROM usuario u
+             LEFT JOIN rol r ON r.id = u.rol_id
+            WHERE u.id = ?
+            LIMIT 1`,
+          [userId]
+        );
+        if (objetivos.length === 0 || !puedeGestionarUsuario(cabecera, objetivos[0])) {
+          return res.status(403).json("No autorizado");
+        }
       }
 
       const esDepartamental = cabecera.rol === "departamental";
@@ -14736,6 +14790,7 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
     const cabecera = JSON.parse(req.data.data);
     if (
       cabecera.rol === "admin" ||
+      cabecera.rol === "admin-central" ||
       cabecera.rol === "departamental"
     ) {
       let buscar = req.query.search;
@@ -14790,6 +14845,11 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
         whereConditions.push(`u.rol_id IN (2, 4)`);
       }
 
+      // admin-central gestiona afiliados e invitados de todas las departamentales
+      if (cabecera.rol === "admin-central") {
+        whereConditions.push(`u.rol_id IN (2, 4)`);
+      }
+
       // Filtro por roles
       if (filters.roles && Array.isArray(filters.roles) && filters.roles.length > 0) {
         const placeholders = filters.roles.map(() => '?').join(',');
@@ -14836,9 +14896,9 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
         queryParams.push(filters.fecha_creacion_maxima);
       }
 
-      // Filtro departamentales_ids (solo admin)
+      // Filtro departamentales_ids (admin y admin-central, que ven todas)
       if (
-        cabecera.rol === "admin" &&
+        (cabecera.rol === "admin" || cabecera.rol === "admin-central") &&
         filters.departamentales_ids &&
         Array.isArray(filters.departamentales_ids) &&
         filters.departamentales_ids.length > 0
@@ -15037,7 +15097,8 @@ router.get("/rol", verifyToken, async (req, res) => {
       }));
 
       res.status(200).json(roles);
-    } else if (cabecera.rol === "departamental") {
+    } else if (cabecera.rol === "departamental" || cabecera.rol === "admin-central") {
+      // Roles de las personas que gestionan (services/usuarios-datos.js).
       const [rows] = await mysqlConnection
         .promise()
         .query("SELECT id, nombre FROM rol WHERE nombre IN ('afiliado', 'invitado') ORDER BY id ASC");
@@ -17626,6 +17687,10 @@ function manejarUploadFotoPerfil(req, res, next) {
 }
 
 // GET /configuracion/usuario/:id? - Obtener datos del usuario
+// Mismos permisos que para editar (services/usuarios-datos.js →
+// puedeGestionarUsuario): admin ve a todos; admin-central, a afiliados e
+// invitados; departamental, a afiliados e invitados de su departamental; el
+// resto de los roles, sólo su propio perfil.
 router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -17633,24 +17698,23 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
     if (!userId) {
       return res.status(400).json({ success: false, message: "ID de usuario inválido" });
     }
-    const db = mysqlConnection.promise();
-
-    // Verificar permisos
-    let tienePermisos = false;
-
-    if (cabecera.rol === "admin") {
-      tienePermisos = true;
-    } else if (cabecera.rol === "departamental") {
-      tienePermisos = await puedeAccederUsuarioPorJurisdiccion(db, cabecera, userId);
-    } else if (cabecera.rol === "afiliado") {
-      // Afiliado solo puede verse a sí mismo
-      tienePermisos = userId === normalizarIdPositivo(cabecera.id);
-    } else if (["admin-central", "auditor"].includes(cabecera.rol)) {
-      // Roles del módulo de coseguro: solo pueden ver su propio perfil
-      tienePermisos = userId === normalizarIdPositivo(cabecera.id);
+    const esPropio = userId === normalizarIdPositivo(cabecera.id);
+    const rolesGestion = ["admin", "admin-central", "departamental"];
+    if (!esPropio && !rolesGestion.includes(cabecera.rol)) {
+      return res.status(403).json({ success: false, message: "No tienes permisos para ver este usuario" });
     }
 
-    if (!tienePermisos) {
+    const db = mysqlConnection.promise();
+    let objetivo;
+    try {
+      objetivo = await cargarUsuarioObjetivo(db, userId, { actor: cabecera });
+    } catch (error) {
+      if (error?.statusCode === 404) {
+        return res.status(404).json({ success: false, message: "Usuario no encontrado" });
+      }
+      throw error;
+    }
+    if (!puedeGestionarUsuario(cabecera, objetivo)) {
       return res.status(403).json({
         success: false,
         message: "No tienes permisos para ver este usuario"
@@ -17658,42 +17722,50 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
     }
 
     // Obtener datos del usuario
-    const [usuario] = await mysqlConnection
-      .promise()
-      .query(
-        `SELECT
-          u.id,
-          u.rol_id,
-          u.area_turismo,
-          u.area_coseguro,
-          u.modulo_turismo,
-          u.modulo_coseguro,
-          u.modulo_olimpiadas,
-          u.departamental_id,
-          d.nombre as departamental_nombre,
-          u.tipo_persona_id,
-          tp.nombre as tipo_persona_nombre,
-          u.nombre,
-          u.apellido,
-          u.fecha_nacimiento,
-          u.documento,
-          u.email,
-          u.telefono,
-          u.direccion,
-          u.dependencia_judicial,
-          u.legajo,
-          u.cuil,
-          u.cbu,
-          u.foto_archivo,
-          u.habilitado,
-          r.nombre as rol_nombre
-        FROM usuario u
-        LEFT JOIN rol r ON r.id = u.rol_id
-        LEFT JOIN tipo_persona tp ON tp.id = u.tipo_persona_id
-        LEFT JOIN departamental d ON d.id = u.departamental_id
-        WHERE u.id = ?`,
-        [userId]
-      );
+    const [usuario] = await db.query(
+      `SELECT
+        u.id,
+        u.rol_id,
+        u.area_turismo,
+        u.area_coseguro,
+        u.modulo_turismo,
+        u.modulo_coseguro,
+        u.modulo_olimpiadas,
+        u.departamental_id,
+        d.nombre as departamental_nombre,
+        u.tipo_persona_id,
+        tp.nombre as tipo_persona_nombre,
+        u.parentesco_id,
+        p.nombre as parentesco_nombre,
+        u.es_familiar,
+        u.usuario_familiar_id,
+        t.id as titular_id,
+        t.nombre as titular_nombre,
+        t.apellido as titular_apellido,
+        u.nombre,
+        u.apellido,
+        u.fecha_nacimiento,
+        u.documento,
+        u.email,
+        u.telefono,
+        u.direccion,
+        u.dependencia_judicial,
+        u.legajo,
+        u.cuil,
+        u.cbu,
+        u.foto_archivo,
+        u.habilitado,
+        CASE WHEN u.password IS NOT NULL AND COALESCE(r.nombre, '') <> 'invitado' THEN 1 ELSE 0 END as tiene_cuenta,
+        r.nombre as rol_nombre
+      FROM usuario u
+      LEFT JOIN rol r ON r.id = u.rol_id
+      LEFT JOIN tipo_persona tp ON tp.id = u.tipo_persona_id
+      LEFT JOIN departamental d ON d.id = u.departamental_id
+      LEFT JOIN parentesco p ON p.id = u.parentesco_id
+      LEFT JOIN usuario t ON t.id = u.usuario_familiar_id
+      WHERE u.id = ?`,
+      [userId]
+    );
 
     if (usuario.length === 0) {
       return res.status(404).json({
@@ -17702,7 +17774,16 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
       });
     }
 
-    const usuarioData = usuario[0];
+    const { titular_id: titularId, titular_nombre: titularNombre, titular_apellido: titularApellido, ...usuarioData } = usuario[0];
+    // Familiar o acompañante: a quién pertenece el grupo.
+    usuarioData.titular = titularId
+      ? { id: titularId, nombre: titularNombre, apellido: titularApellido }
+      : null;
+    // true si la persona inicia sesión con su DNI (misma condición que /signin):
+    // cambiarle el DNI le cambia el usuario de ingreso.
+    usuarioData.tiene_cuenta = Number(usuarioData.tiene_cuenta) === 1;
+    // Campos que quien consulta puede modificar con PUT /configuracion/usuario/:id.
+    usuarioData.campos_editables = [...camposEditablesUsuario(cabecera, objetivo)];
 
     // Si tiene foto, prepararla para envío (como base64 o URL)
     if (usuarioData.foto_archivo) {
@@ -17719,7 +17800,7 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
         usuarioData.foto_data = null;
       }
     }
-    
+
     res.status(200).json({
       success: true,
       data: usuarioData
@@ -17735,13 +17816,18 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
 });
 
 // PUT /configuracion/usuario/:id - Actualizar datos del usuario
+// Permisos por rol, validaciones, DNI único, historial estricto y propagación a
+// otros módulos viven en services/usuarios-datos.js (actualizarDatosUsuario).
+// Acá sólo se resuelve la foto (multer + S3) y se arma la respuesta, que suma a
+// { success, message } los arrays cambios, propagaciones, advertencias y
+// reservasAfectadas.
 router.put("/configuracion/usuario/:id", verifyToken, manejarUploadFotoPerfil, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     const userId = normalizarIdPositivo(req.params.id);
 
     // Validar que el ID sea válido
-    if (!userId || isNaN(userId)) {
+    if (!userId) {
       return res.status(400).json({
         success: false,
         message: "ID de usuario inválido"
@@ -17754,454 +17840,60 @@ router.put("/configuracion/usuario/:id", verifyToken, manejarUploadFotoPerfil, a
       connection = await mysqlConnection.promise().getConnection();
       await connection.beginTransaction();
 
-      // Obtener datos actuales del usuario
-      const [usuarioActual] = await connection.query(
-        "SELECT * FROM usuario WHERE id = ? FOR UPDATE",
-        [userId]
-      );
+      const cambios = extraerCambiosUsuario(req.body);
+      const quitarFoto = normalizarBoolean(req.body?.quitar_foto);
 
-      if (usuarioActual.length === 0) {
-        throw crearErrorNegocio("Usuario no encontrado", 404);
-      }
-
-      const datosAnteriores = usuarioActual[0];
-
-      // Verificar permisos y determinar qué campos puede editar
-      let camposPermitidos = [];
-      let tienePermisos = false;
-
-      if (cabecera.rol === "admin") {
-        tienePermisos = true;
-        camposPermitidos = [
-          'rol_id', 'area_turismo', 'area_coseguro', 'modulo_turismo', 'modulo_coseguro', 'modulo_olimpiadas',
-          'departamental_id', 'tipo_persona_id', 'nombre', 'apellido',
-          'fecha_nacimiento', 'documento', 'password', 'email', 'telefono', 'direccion', 'dependencia_judicial',
-          'legajo', 'cuil', 'cbu', 'foto_archivo', 'habilitado'
-        ];
-      } else if (cabecera.rol === "departamental") {
-        tienePermisos = await puedeAccederUsuarioPorJurisdiccion(connection, cabecera, userId);
-        camposPermitidos = [
-          'tipo_persona_id', 'nombre', 'apellido', 'fecha_nacimiento',
-          'documento', 'password', 'email', 'telefono', 'direccion', 'dependencia_judicial', 'legajo',
-          'modulo_turismo', 'modulo_coseguro', 'modulo_olimpiadas',
-          'cuil', 'cbu', 'foto_archivo', 'habilitado'
-        ];
-      } else if (cabecera.rol === "afiliado") {
-        // Solo puede editarse a sí mismo
-        if (userId === normalizarIdPositivo(cabecera.id)) {
-          tienePermisos = true;
+      if (req.file || quitarFoto) {
+        // Se autoriza antes de subir nada a S3.
+        const { objetivo, permitidos } = await autorizarEdicionUsuario(connection, cabecera, userId);
+        if (!permitidos.has("foto_archivo")) {
+          const error = crearErrorNegocio("No tenés permiso para modificar la foto de este usuario", 403, "CAMPO_NO_PERMITIDO");
+          error.campo = "foto_archivo";
+          throw error;
         }
-        camposPermitidos = [
-          'nombre', 'apellido',
-          'password', 'email', 'telefono', 'direccion', 'dependencia_judicial',
-          'cuil', 'cbu', 'foto_archivo'
-        ];
-      } else if (["admin-central", "auditor"].includes(cabecera.rol)) {
-        // Roles del módulo de coseguro: solo editan su propio perfil (datos personales)
-        if (userId === normalizarIdPositivo(cabecera.id)) {
-          tienePermisos = true;
-        }
-        camposPermitidos = [
-          'nombre', 'apellido',
-          'password', 'email', 'telefono', 'direccion', 'dependencia_judicial', 'cuil', 'cbu', 'foto_archivo'
-        ];
-      }
-
-      if (!tienePermisos) {
-        throw crearErrorNegocio("No tienes permisos para modificar este usuario", 403);
-      }
-
-      // Preparar campos para actualizar
-      const updateFields = [];
-      const updateValues = [];
-      const cambios = [];
-      let rolFinalId = normalizarIdPositivo(datosAnteriores.rol_id);
-      let departamentalFinalId = normalizarIdPositivo(datosAnteriores.departamental_id);
-      let tipoPersonaFinalId = normalizarIdPositivo(datosAnteriores.tipo_persona_id);
-      let fechaNacimientoFinal = formatearFechaSQL(datosAnteriores.fecha_nacimiento);
-
-      // Función auxiliar para formatear fechas
-      const formatearFecha = (fecha) => formatearFechaSQL(fecha);
-
-      // Procesar cada campo permitido
-      if (camposPermitidos.includes('rol_id') && req.body.rol_id !== undefined) {
-        const nuevoValor = normalizarIdPositivo(req.body.rol_id);
-        if (!nuevoValor) throw crearErrorNegocio("Rol inválido", 400);
-        const [rolesValidos] = await connection.query("SELECT id FROM rol WHERE id = ?", [nuevoValor]);
-        if (rolesValidos.length === 0) throw crearErrorNegocio("Rol inexistente", 400);
-        rolFinalId = nuevoValor;
-        if (datosAnteriores.rol_id !== nuevoValor) {
-          updateFields.push('rol_id = ?');
-          updateValues.push(nuevoValor);
-          cambios.push({
-            campo: 'rol_id',
-            valorAnterior: datosAnteriores.rol_id,
-            valorNuevo: nuevoValor
-          });
-        }
-      }
-
-      if (camposPermitidos.includes('departamental_id') && req.body.departamental_id !== undefined) {
-        const nuevoValor = req.body.departamental_id === "" ? null : normalizarIdPositivo(req.body.departamental_id);
-        if (req.body.departamental_id !== "" && !nuevoValor) throw crearErrorNegocio("Departamental inválida", 400);
-        if (nuevoValor !== null) {
-          const [departamentalesValidas] = await connection.query(
-            "SELECT id FROM departamental WHERE id = ? AND habilitado = 'Y'",
-            [nuevoValor]
-          );
-          if (departamentalesValidas.length === 0) throw crearErrorNegocio("Departamental inexistente o deshabilitada", 400);
-        }
-        departamentalFinalId = nuevoValor;
-        if (datosAnteriores.departamental_id !== nuevoValor) {
-          updateFields.push('departamental_id = ?');
-          updateValues.push(nuevoValor);
-          cambios.push({
-            campo: 'departamental_id',
-            valorAnterior: datosAnteriores.departamental_id,
-            valorNuevo: nuevoValor
-          });
-        }
-      }
-
-      // Áreas habilitadas (solo staff departamental / admin-central): "1"/"0" desde el FormData
-      for (const campoArea of ['area_turismo', 'area_coseguro']) {
-        if (camposPermitidos.includes(campoArea) && req.body[campoArea] !== undefined) {
-          const nuevoValor = normalizarBooleanoBinarioEstricto(req.body[campoArea]);
-          if (nuevoValor === null) throw crearErrorNegocio(`El valor de ${campoArea} es inválido`, 400);
-          if (Number(datosAnteriores[campoArea]) !== nuevoValor) {
-            updateFields.push(`${campoArea} = ?`);
-            updateValues.push(nuevoValor);
-            cambios.push({
-              campo: campoArea,
-              valorAnterior: datosAnteriores[campoArea],
-              valorNuevo: nuevoValor
+        if (req.file) {
+          try {
+            const fotoHash = crypto.randomBytes(16).toString('hex');
+            const extension = getSafeFileExtension(req.file.originalname, req.file.mimetype);
+            const nombreArchivo = `perfil_${fotoHash}.${extension}`;
+            await uploadBufferToS3({
+              key: nombreArchivo,
+              buffer: req.file.buffer,
+              contentType: req.file.mimetype || getMimeTypeFromFileName(nombreArchivo, "image/jpeg"),
+            });
+            fotoNuevaSubida = nombreArchivo;
+            // Nota: NO borramos la foto anterior según requerimiento
+            cambios.foto_archivo = nombreArchivo;
+          } catch (fotoError) {
+            console.error('Error guardando foto:', fotoError);
+            await connection.rollback();
+            return res.status(500).json({
+              success: false,
+              message: "Error al guardar la foto"
             });
           }
+        } else if (objetivo.foto_archivo) {
+          // Quitar la foto de perfil (el objeto en S3 se conserva, igual que al
+          // reemplazarla)
+          cambios.foto_archivo = null;
         }
       }
 
-      // Módulos visibles para cuentas afiliadas. Admin y departamental pueden
-      // gestionarlos desde el perfil; el afiliado no puede cambiarlos.
-      for (const campoModulo of ['modulo_turismo', 'modulo_coseguro', 'modulo_olimpiadas']) {
-        if (camposPermitidos.includes(campoModulo) && req.body[campoModulo] !== undefined) {
-          const nuevoValor = normalizarBooleanoBinarioEstricto(req.body[campoModulo]);
-          if (nuevoValor === null) throw crearErrorNegocio(`El valor de ${campoModulo} es inválido`, 400);
-          if (Number(datosAnteriores[campoModulo]) !== nuevoValor) {
-            updateFields.push(`${campoModulo} = ?`);
-            updateValues.push(nuevoValor);
-            cambios.push({
-              campo: campoModulo,
-              valorAnterior: datosAnteriores[campoModulo],
-              valorNuevo: nuevoValor
-            });
-          }
-        }
-      }
-
-      if (camposPermitidos.includes('tipo_persona_id') && req.body.tipo_persona_id !== undefined) {
-        const nuevoValor = req.body.tipo_persona_id === "" ? null : normalizarIdPositivo(req.body.tipo_persona_id);
-        if (req.body.tipo_persona_id !== "" && !nuevoValor) throw crearErrorNegocio("Tipo de persona inválido", 400);
-        if (nuevoValor !== null) {
-          const [tiposValidos] = await connection.query("SELECT id FROM tipo_persona WHERE id = ?", [nuevoValor]);
-          if (tiposValidos.length === 0) throw crearErrorNegocio("Tipo de persona inexistente", 400);
-        }
-        tipoPersonaFinalId = nuevoValor;
-        if (datosAnteriores.tipo_persona_id !== nuevoValor) {
-          updateFields.push('tipo_persona_id = ?');
-          updateValues.push(nuevoValor);
-          cambios.push({
-            campo: 'tipo_persona_id',
-            valorAnterior: datosAnteriores.tipo_persona_id,
-            valorNuevo: nuevoValor
-          });
-        }
-      }
-
-      if (camposPermitidos.includes('nombre') && req.body.nombre !== undefined) {
-        const nuevoValor = normalizarTexto(req.body.nombre);
-        if (!nuevoValor || nuevoValor.length > 45) throw crearErrorNegocio("Nombre inválido", 400);
-        if (datosAnteriores.nombre !== nuevoValor) {
-          updateFields.push('nombre = ?');
-          updateValues.push(nuevoValor);
-          cambios.push({
-            campo: 'nombre',
-            valorAnterior: datosAnteriores.nombre,
-            valorNuevo: nuevoValor
-          });
-        }
-      }
-
-      if (camposPermitidos.includes('apellido') && req.body.apellido !== undefined) {
-        const nuevoValor = normalizarTexto(req.body.apellido);
-        if (!nuevoValor || nuevoValor.length > 45) throw crearErrorNegocio("Apellido inválido", 400);
-        if (datosAnteriores.apellido !== nuevoValor) {
-          updateFields.push('apellido = ?');
-          updateValues.push(nuevoValor);
-          cambios.push({
-            campo: 'apellido',
-            valorAnterior: datosAnteriores.apellido,
-            valorNuevo: nuevoValor
-          });
-        }
-      }
-
-      if (camposPermitidos.includes('fecha_nacimiento') && req.body.fecha_nacimiento !== undefined) {
-        const fechaFormateada = formatearFecha(req.body.fecha_nacimiento);
-        const fechaAnteriorFormateada = formatearFecha(datosAnteriores.fecha_nacimiento);
-        if (!fechaFormateada || calcularEdadEnFecha(fechaFormateada, obtenerFechaCivilHoyArgentina()) === null) {
-          throw crearErrorNegocio("Fecha de nacimiento inválida", 400);
-        }
-        if (fechaAnteriorFormateada !== fechaFormateada) {
-          updateFields.push('fecha_nacimiento = ?');
-          updateValues.push(fechaFormateada);
-          cambios.push({
-            campo: 'fecha_nacimiento',
-            valorAnterior: fechaAnteriorFormateada,
-            valorNuevo: fechaFormateada
-          });
-        }
-        fechaNacimientoFinal = fechaFormateada;
-      }
-
-      if (camposPermitidos.includes('documento') && req.body.documento !== undefined) {
-        const documentoTexto = normalizarTexto(req.body.documento);
-        const nuevoValor = esDniValido(documentoTexto) ? Number(documentoTexto) : null;
-        if (!nuevoValor) throw crearErrorNegocio("Documento inválido", 400);
-        if (Number(datosAnteriores.documento) !== nuevoValor) {
-          updateFields.push('documento = ?');
-          updateValues.push(nuevoValor);
-          cambios.push({
-            campo: 'documento',
-            valorAnterior: datosAnteriores.documento,
-            valorNuevo: nuevoValor
-          });
-        }
-      }
-
-      if (camposPermitidos.includes('email') && req.body.email !== undefined) {
-        const nuevoValor = normalizarTexto(req.body.email).toLowerCase();
-        if (!nuevoValor || nuevoValor.length > 45 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(nuevoValor)) {
-          throw crearErrorNegocio("Email inválido", 400);
-        }
-        if (datosAnteriores.email !== nuevoValor) {
-          const [emailsExistentes] = await connection.query(
-            "SELECT id FROM usuario WHERE LOWER(TRIM(email)) = ? AND id <> ? LIMIT 1 FOR UPDATE",
-            [nuevoValor, userId]
-          );
-          if (emailsExistentes.length > 0) throw crearErrorNegocio("Ya existe un usuario con ese email", 409);
-          updateFields.push('email = ?');
-          updateValues.push(nuevoValor);
-          cambios.push({
-            campo: 'email',
-            valorAnterior: datosAnteriores.email,
-            valorNuevo: nuevoValor
-          });
-        }
-      }
-
-      if (camposPermitidos.includes('telefono') && req.body.telefono !== undefined) {
-        const nuevoValor = normalizarTexto(req.body.telefono) || null;
-        if (nuevoValor && nuevoValor.length > 15) throw crearErrorNegocio("Teléfono inválido", 400);
-        if (datosAnteriores.telefono !== nuevoValor) {
-          updateFields.push('telefono = ?');
-          updateValues.push(nuevoValor);
-          cambios.push({
-            campo: 'telefono',
-            valorAnterior: datosAnteriores.telefono,
-            valorNuevo: nuevoValor
-          });
-        }
-      }
-
-      for (const campoContacto of ['direccion', 'dependencia_judicial']) {
-        if (camposPermitidos.includes(campoContacto) && req.body[campoContacto] !== undefined) {
-          const nuevoValor = normalizarTexto(req.body[campoContacto]) || null;
-          if (nuevoValor && nuevoValor.length > 50) {
-            throw crearErrorNegocio(
-              campoContacto === 'direccion' ? "Dirección inválida" : "Dependencia judicial inválida",
-              400
-            );
-          }
-          if (datosAnteriores[campoContacto] !== nuevoValor) {
-            updateFields.push(`${campoContacto} = ?`);
-            updateValues.push(nuevoValor);
-            cambios.push({
-              campo: campoContacto,
-              valorAnterior: datosAnteriores[campoContacto],
-              valorNuevo: nuevoValor
-            });
-          }
-        }
-      }
-
-      if (camposPermitidos.includes('legajo') && req.body.legajo !== undefined) {
-        const nuevoValor = normalizarTexto(req.body.legajo) || null;
-        if (nuevoValor && nuevoValor.length > 45) throw crearErrorNegocio("Legajo inválido", 400);
-        if (datosAnteriores.legajo !== nuevoValor) {
-          updateFields.push('legajo = ?');
-          updateValues.push(nuevoValor);
-          cambios.push({
-            campo: 'legajo',
-            valorAnterior: datosAnteriores.legajo,
-            valorNuevo: nuevoValor
-          });
-        }
-      }
-
-      if (camposPermitidos.includes('habilitado') && req.body.habilitado !== undefined) {
-        const nuevoValor = normalizarSiNoEstricto(req.body.habilitado);
-        if (nuevoValor === null) throw crearErrorNegocio("Estado habilitado inválido", 400);
-        if (datosAnteriores.habilitado !== nuevoValor) {
-          updateFields.push('habilitado = ?');
-          updateValues.push(nuevoValor);
-          cambios.push({
-            campo: 'habilitado',
-            valorAnterior: datosAnteriores.habilitado,
-            valorNuevo: nuevoValor
-          });
-        }
-      }
-
-      if (camposPermitidos.includes('cuil') && req.body.cuil !== undefined) {
-        const nuevoValor = normalizarTexto(req.body.cuil) || null;
-        if (nuevoValor && !validarCuitCuil(nuevoValor)) {
-          throw crearErrorNegocio("El CUIL es inválido", 400);
-        }
-        if (datosAnteriores.cuil !== nuevoValor) {
-          updateFields.push('cuil = ?');
-          updateValues.push(nuevoValor);
-          cambios.push({
-            campo: 'cuil',
-            valorAnterior: datosAnteriores.cuil,
-            valorNuevo: nuevoValor
-          });
-        }
-      }
-
-      if (camposPermitidos.includes('cbu') && req.body.cbu !== undefined) {
-        const nuevoValor = normalizarTexto(req.body.cbu) || null;
-        if (nuevoValor && !validarCbu(nuevoValor)) {
-          throw crearErrorNegocio("El CBU es inválido", 400);
-        }
-        if (datosAnteriores.cbu !== nuevoValor) {
-          updateFields.push('cbu = ?');
-          updateValues.push(nuevoValor);
-          cambios.push({
-            campo: 'cbu',
-            valorAnterior: datosAnteriores.cbu,
-            valorNuevo: nuevoValor
-          });
-        }
-      }
-
-      // Procesar password si viene
-      if (
-        camposPermitidos.includes('password') &&
-        (cabecera.rol === "admin" || userId === normalizarIdPositivo(cabecera.id)) &&
-        typeof req.body.password === "string" && req.body.password.trim() !== ''
-      ) {
-        if (req.body.password.length < 8 || req.body.password.length > 128) {
-          throw crearErrorNegocio("La contraseña debe tener entre 8 y 128 caracteres", 400);
-        }
-        const passwordHash = await bcryptjs.hash(req.body.password, 8);
-        updateFields.push('password = ?');
-        updateValues.push(passwordHash);
-        cambios.push({
-          campo: 'password',
-          valorAnterior: '[OCULTO]',
-          valorNuevo: '[MODIFICADO]'
-        });
-      }
-
-      const [rolFinalRows] = rolFinalId
-        ? await connection.query("SELECT nombre FROM rol WHERE id = ?", [rolFinalId])
-        : [[]];
-      if (rolFinalRows.length === 0) throw crearErrorNegocio("El usuario debe tener un rol válido", 400);
-      if (rolFinalRows[0].nombre === "afiliado") {
-        if (!departamentalFinalId || !tipoPersonaFinalId || !fechaNacimientoFinal
-          || calcularEdadEnFecha(fechaNacimientoFinal, obtenerFechaCivilHoyArgentina()) === null) {
-          throw crearErrorNegocio(
-            "Los afiliados requieren departamental, tipo de persona y fecha de nacimiento válidos",
-            400
-          );
-        }
-      }
-
-      // Procesar foto si viene
-      if (camposPermitidos.includes('foto_archivo') && req.file) {
-        try {
-          // Generar nombre único para la foto
-          const fotoHash = crypto.randomBytes(16).toString('hex');
-          const extension = getSafeFileExtension(req.file.originalname, req.file.mimetype);
-          const nombreArchivo = `perfil_${fotoHash}.${extension}`;
-          await uploadBufferToS3({
-            key: nombreArchivo,
-            buffer: req.file.buffer,
-            contentType: req.file.mimetype || getMimeTypeFromFileName(nombreArchivo, "image/jpeg"),
-          });
-          fotoNuevaSubida = nombreArchivo;
-
-          // Actualizar campo en base de datos
-          updateFields.push('foto_archivo = ?');
-          updateValues.push(nombreArchivo);
-          cambios.push({
-            campo: 'foto_archivo',
-            valorAnterior: datosAnteriores.foto_archivo,
-            valorNuevo: nombreArchivo
-          });
-
-          // Nota: NO borramos la foto anterior según requerimiento
-        } catch (fotoError) {
-          console.error('Error guardando foto:', fotoError);
-          await connection.rollback();
-          return res.status(500).json({
-            success: false,
-            message: "Error al guardar la foto"
-          });
-        }
-      } else if (
-        camposPermitidos.includes('foto_archivo') &&
-        normalizarBoolean(req.body.quitar_foto) &&
-        datosAnteriores.foto_archivo
-      ) {
-        // Quitar la foto de perfil (el objeto en S3 se conserva, igual que al
-        // reemplazarla)
-        updateFields.push('foto_archivo = ?');
-        updateValues.push(null);
-        cambios.push({
-          campo: 'foto_archivo',
-          valorAnterior: datosAnteriores.foto_archivo,
-          valorNuevo: null
-        });
-      }
+      const resultado = await actualizarDatosUsuario(connection, {
+        actor: cabecera,
+        usuarioId: userId,
+        cambios,
+        contexto: { origen: "configuracion", ...contextoDesdeRequest(req) },
+      });
 
       // Si no hay cambios, retornar
-      if (updateFields.length === 0) {
+      if (resultado.cambios.length === 0) {
         await connection.rollback();
         return res.status(200).json({
           success: true,
-          message: "No hay cambios para actualizar"
+          message: "No hay cambios para actualizar",
+          ...resumenResultado(resultado)
         });
-      }
-
-      // Ejecutar actualización
-      updateValues.push(userId);
-      const updateQuery = `UPDATE usuario SET ${updateFields.join(', ')} WHERE id = ?`;
-
-      const [result] = await connection.query(updateQuery, updateValues);
-
-      // Registrar cambios en el historial
-      if (cambios.length > 0) {
-        await registrarHistorial(
-          connection,
-          userId,
-          'UPDATE',
-          'usuario',
-          cabecera.id,
-          req,
-          cambios,
-          'Actualización de configuración de usuario'
-        );
       }
 
       await connection.commit();
@@ -18209,7 +17901,8 @@ router.put("/configuracion/usuario/:id", verifyToken, manejarUploadFotoPerfil, a
 
       res.status(200).json({
         success: true,
-        message: "Usuario actualizado correctamente"
+        message: "Usuario actualizado correctamente",
+        ...resumenResultado(resultado)
       });
 
     } catch (updateError) {
@@ -18233,7 +17926,7 @@ router.put("/configuracion/usuario/:id", verifyToken, manejarUploadFotoPerfil, a
   } catch (error) {
     registrarErrorRuta(error);
     if (error?.statusCode) {
-      return res.status(error.statusCode).json({ success: false, message: error.message });
+      return res.status(error.statusCode).json(cuerpoErrorUsuario(error));
     }
     if (error?.code === "ER_DUP_ENTRY") {
       return res.status(409).json({ success: false, message: "Ya existe un usuario con esos datos" });

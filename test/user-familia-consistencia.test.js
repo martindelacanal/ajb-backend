@@ -88,24 +88,75 @@ function crearConexion(resolverQuery) {
   };
 }
 
-test("POST /familiares hereda la departamental al promover un acompanante", async () => {
-  conexionActual = crearConexion(({ sql }) => {
+// Todo cambio del afiliado sobre el vínculo de una persona de su grupo queda
+// como pedido PENDIENTE (services/familiares-cambios.js); la aplicación con
+// usuario_familiar_id + departamental del titular se prueba en
+// test/familiares-cambios-vinculo.test.js (aprobación).
+function personaCompleta(extra = {}) {
+  return {
+    id: 22,
+    rol_id: 4,
+    rol_nombre: "invitado",
+    nombre: "Ana",
+    apellido: "Perez",
+    documento: 40111222,
+    fecha_nacimiento: "2010-05-20",
+    telefono: null,
+    tipo_persona_id: 2,
+    parentesco_id: 4,
+    es_familiar: "N",
+    usuario_familiar_id: 10,
+    departamental_id: null,
+    password: null,
+    email: null,
+    habilitado: "Y",
+    ...extra,
+  };
+}
+
+// Respuestas del flujo de pedidos (universo, ficha, departamental, catálogo,
+// alta de la solicitud y aviso a la departamental).
+function resolverPedido(persona, { titularDepartamental = 7, insertId = 41 } = {}) {
+  return ({ sql, params }) => {
     if (sql.startsWith("SELECT id, departamental_id FROM usuario WHERE id")) {
-      return [[{ id: 10, departamental_id: 7 }]];
+      return [[{ id: 10, departamental_id: titularDepartamental }]];
     }
-    if (sql.includes("FROM usuario WHERE documento")) {
-      return [[{
-        id: 22,
-        usuario_familiar_id: 10,
-        es_familiar: "N",
-        parentesco_id: 4,
-        departamental_id: null,
-        password: null,
-        email: null,
-      }]];
+    if (sql.startsWith("SELECT id, usuario_familiar_id, es_familiar, parentesco_id, departamental_id, password, email FROM usuario WHERE documento")) {
+      return [[persona]];
     }
-    return [{ affectedRows: 1, insertId: 1 }];
-  });
+    if (sql.startsWith("SELECT u.id FROM usuario u WHERE u.id = ? AND u.id <> ?")) return [[{ id: persona.id }]];
+    if (sql.startsWith("SELECT u.*, r.nombre AS rol_nombre FROM usuario u")) return [[persona]];
+    if (sql.startsWith("SELECT id, usuario_familiar_id, departamental_id FROM usuario WHERE id = ?")) {
+      return [[{ id: params[0], usuario_familiar_id: null, departamental_id: titularDepartamental }]];
+    }
+    if (sql === "SELECT id FROM familiar_cambio_solicitud WHERE pendiente_persona = ?") return [[]];
+    if (sql.startsWith("SELECT id FROM parentesco WHERE id = ?")) return [[{ id: params[0] }]];
+    if (sql.startsWith("INSERT INTO familiar_cambio_solicitud")) return [{ affectedRows: 1, insertId }];
+    if (sql.startsWith("SELECT id, nombre FROM tipo_persona")) return [[{ id: 2, nombre: "Invitados familiares" }]];
+    if (sql.startsWith("SELECT id, nombre FROM parentesco")) {
+      return [[{ id: 2, nombre: "Pareja" }, { id: 3, nombre: "Hijo" }, { id: 4, nombre: "Familiar" }]];
+    }
+    if (sql.startsWith("SELECT u.id, u.nombre, u.apellido, u.rol_id")) {
+      return [[{ id: 10, nombre: "Martina", apellido: "Rodriguez", rol_id: 2, departamental_id: titularDepartamental }]];
+    }
+    if (sql.startsWith("SELECT u.id FROM usuario u INNER JOIN rol r")) return [[{ id: 3 }]];
+    if (sql.startsWith("INSERT INTO notificacion")) return [{ affectedRows: 1, insertId: 1 }];
+    throw new Error(`Consulta inesperada: ${sql}`);
+  };
+}
+
+function solicitudInsertada() {
+  const insercion = conexionActual.estado.consultas.find(({ sql }) => sql.startsWith("INSERT INTO familiar_cambio_solicitud"));
+  assert.ok(insercion, "no se creó el pedido");
+  return {
+    params: insercion.params,
+    anteriores: JSON.parse(insercion.params[3]),
+    propuestos: JSON.parse(insercion.params[4]),
+  };
+}
+
+test("POST /familiares con el DNI de un acompañante del grupo pide sumarlo (202) sin tocar su ficha", async () => {
+  conexionActual = crearConexion(resolverPedido(personaCompleta()));
 
   const req = crearRequest({
     body: {
@@ -121,42 +172,32 @@ test("POST /familiares hereda la departamental al promover un acompanante", asyn
 
   await obtenerHandler("/familiares", "post")(req, res);
 
-  assert.equal(res.statusCode, 200);
-  assert.equal(res.payload.promovido, true);
+  assert.equal(res.statusCode, 202, JSON.stringify(res.payload));
+  assert.equal(res.payload.pendiente, true);
+  assert.equal(res.payload.solicitud_id, 41);
+  assert.equal(res.payload.id, 22);
+  assert.equal(res.payload.cambio_vinculo.descripcion, "Pasa a integrar el grupo familiar como Hijo");
   assert.equal(conexionActual.estado.commits, 1);
   assert.equal(conexionActual.estado.rollbacks, 0);
-  const actualizacion = conexionActual.estado.consultas.find(({ sql }) =>
-    sql.startsWith("UPDATE usuario SET es_familiar = 'S'")
-  );
-  assert.ok(actualizacion);
-  assert.match(actualizacion.sql, /departamental_id = \?/);
-  assert.deepEqual(actualizacion.params, [3, 7, 22]);
-  assert.ok(conexionActual.estado.consultas.some(({ sql, params }) =>
-    sql.startsWith("INSERT INTO historial_usuario") && params[2] === "departamental_id" && params[4] === 7
-  ));
+  // Nada se escribe en la ficha ni en su historial hasta que se apruebe.
+  assert.ok(!conexionActual.estado.consultas.some(({ sql }) => sql.startsWith("UPDATE usuario")));
+  assert.ok(!conexionActual.estado.consultas.some(({ sql }) => sql.startsWith("INSERT INTO historial_usuario")));
+  const { params, anteriores, propuestos } = solicitudInsertada();
+  // persona, solicitante y departamental del titular
+  assert.deepEqual(params.slice(0, 3), [22, 10, 7]);
+  assert.deepEqual(propuestos, { parentesco_id: 3, es_familiar: "S" });
+  assert.deepEqual(anteriores, { parentesco_id: 4, es_familiar: "N" });
+  const aviso = conexionActual.estado.consultas.find(({ sql }) => sql.startsWith("INSERT INTO notificacion"));
+  assert.equal(aviso.params[1], "FAMILIAR_CAMBIO_SOLICITADO");
+  assert.equal(aviso.params[2], "Martina Rodriguez pidió sumar a Ana Perez a su grupo familiar");
 });
 
-test("PUT /familiares/:id/vinculo transfiere grupo y departamental juntos", async () => {
-  conexionActual = crearConexion(({ sql }) => {
-    if (sql.startsWith("SELECT id, departamental_id FROM usuario WHERE id")) {
-      return [[{ id: 10, departamental_id: 9 }]];
-    }
-    if (sql.startsWith("SELECT id, usuario_familiar_id")) {
-      return [[{
-        id: 33,
-        usuario_familiar_id: null,
-        es_familiar: "N",
-        parentesco_id: 4,
-        departamental_id: 2,
-        password: null,
-        email: null,
-      }]];
-    }
-    if (sql.startsWith("SELECT COUNT(*) AS c")) {
-      return [[{ c: 1 }]];
-    }
-    return [{ affectedRows: 1, insertId: 1 }];
-  });
+test("PUT /familiares/:id/vinculo S de alguien sin grupo que viajó con el afiliado queda pendiente (202)", async () => {
+  conexionActual = crearConexion(resolverPedido(personaCompleta({
+    id: 33,
+    usuario_familiar_id: null,
+    departamental_id: 2,
+  }), { titularDepartamental: 9 }));
 
   const req = crearRequest({
     params: { id: "33" },
@@ -166,51 +207,54 @@ test("PUT /familiares/:id/vinculo transfiere grupo y departamental juntos", asyn
 
   await obtenerHandler("/familiares/:id/vinculo", "put")(req, res);
 
-  assert.equal(res.statusCode, 200);
+  assert.equal(res.statusCode, 202, JSON.stringify(res.payload));
+  assert.equal(res.payload.pendiente, true);
+  assert.match(res.payload.message, /Queda en revisión/);
   assert.equal(conexionActual.estado.commits, 1);
-  const actualizacion = conexionActual.estado.consultas.find(({ sql }) =>
-    sql.startsWith("UPDATE usuario SET es_familiar = ?")
-  );
-  assert.ok(actualizacion);
-  assert.match(actualizacion.sql, /departamental_id = CASE WHEN \? = 'S' THEN \?/);
-  assert.deepEqual(actualizacion.params, ["S", 10, 3, "S", 9, 33]);
+  assert.ok(!conexionActual.estado.consultas.some(({ sql }) => sql.startsWith("UPDATE usuario")));
+  const { params, propuestos } = solicitudInsertada();
+  assert.deepEqual(params.slice(0, 3), [33, 10, 9]);
+  assert.deepEqual(propuestos, { parentesco_id: 3, es_familiar: "S" });
 });
 
-test("PUT /familiares/:id/vinculo con N deja a la persona como acompañante vinculada al afiliado", async () => {
-  conexionActual = crearConexion(({ sql }) => {
-    if (sql.startsWith("SELECT id, departamental_id FROM usuario WHERE id")) {
-      return [[{ id: 10, departamental_id: 9 }]];
-    }
-    if (sql.startsWith("SELECT id, usuario_familiar_id")) {
-      return [[{
-        id: 33,
-        usuario_familiar_id: 10,
-        es_familiar: "S",
-        parentesco_id: 3,
-        departamental_id: 9,
-        password: null,
-        email: null,
-      }]];
-    }
-    return [{ affectedRows: 1, insertId: 1 }];
-  });
+test("PUT /familiares/:id/vinculo con N queda pendiente y no toca la ficha", async () => {
+  conexionActual = crearConexion(resolverPedido(personaCompleta({
+    id: 33,
+    usuario_familiar_id: 10,
+    es_familiar: "S",
+    parentesco_id: 3,
+    departamental_id: 9,
+  }), { titularDepartamental: 9 }));
 
   const req = crearRequest({ params: { id: "33" }, body: { es_familiar: "N" } });
   const res = crearRespuesta();
 
   await obtenerHandler("/familiares/:id/vinculo", "put")(req, res);
 
-  assert.equal(res.statusCode, 200);
-  assert.equal(conexionActual.estado.commits, 1);
-  const actualizacion = conexionActual.estado.consultas.find(({ sql }) =>
-    sql.startsWith("UPDATE usuario SET es_familiar = ?")
-  );
-  assert.ok(actualizacion);
-  // Sigue vinculada (usuario_familiar_id = 10) y conserva su parentesco.
-  assert.deepEqual(actualizacion.params, ["N", 10, null, "N", 9, 33]);
-  assert.ok(!conexionActual.estado.consultas.some(({ sql, params }) =>
-    sql.startsWith("INSERT INTO historial_usuario") && params?.[2] === "usuario_familiar_id"
-  ));
+  assert.equal(res.statusCode, 202, JSON.stringify(res.payload));
+  assert.equal(res.payload.cambio_vinculo.descripcion, "Deja el grupo familiar; queda como acompañante de viaje");
+  assert.ok(!conexionActual.estado.consultas.some(({ sql }) => sql.startsWith("UPDATE usuario")));
+  const { propuestos, anteriores } = solicitudInsertada();
+  assert.deepEqual(propuestos, { es_familiar: "N" });
+  assert.deepEqual(anteriores, { es_familiar: "S" });
+});
+
+test("PUT /familiares/:id/vinculo: nunca se suma a quien integra el grupo de otro afiliado", async () => {
+  conexionActual = crearConexion(({ sql }) => {
+    // Fuera del universo del afiliado 10 (usuario_familiar_id de otro).
+    if (sql.startsWith("SELECT u.id FROM usuario u WHERE u.id = ? AND u.id <> ?")) return [[]];
+    throw new Error(`Consulta inesperada: ${sql}`);
+  });
+
+  const req = crearRequest({ params: { id: "33" }, body: { es_familiar: "S", parentesco_id: 3 } });
+  const res = crearRespuesta();
+
+  await obtenerHandler("/familiares/:id/vinculo", "put")(req, res);
+
+  assert.equal(res.statusCode, 403);
+  assert.equal(res.payload.codigo, "PERSONA_FUERA_DEL_GRUPO");
+  assert.equal(conexionActual.estado.commits, 0);
+  assert.equal(conexionActual.estado.rollbacks, 1);
 });
 
 test("los flujos familiares rechazan titulares sin departamental valida", async () => {
