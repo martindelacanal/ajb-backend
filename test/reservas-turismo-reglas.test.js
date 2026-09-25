@@ -5,6 +5,7 @@ const path = require("node:path");
 
 const {
   ESTADO_APROBADA,
+  ESTADO_CANCELADA,
   ESTADO_RECHAZADA,
   ESTADO_VERIFICADA,
   PLAZO_RESPUESTA_HORAS,
@@ -60,7 +61,15 @@ test("solo admin aprueba o rechaza una reserva verificada", () => {
 test("departamental verifica/rechaza Iniciada y afiliado solo cancela la propia", () => {
   assert.equal(transicion("departamental", "Iniciada", "Verificada").valido, true);
   assert.equal(transicion("departamental", "Iniciada", "Rechazada").valido, true);
-  assert.equal(transicion("afiliado", "Iniciada", "Cancelada").valido, true);
+  const cancelacion = transicion("afiliado", "Iniciada", "Cancelada");
+  assert.equal(cancelacion.valido, true);
+  assert.equal(cancelacion.estadoDestino, ESTADO_CANCELADA);
+  assert.equal(cancelacion.accion, "CANCELAR");
+  assert.equal(transicion("departamental", "Iniciada", "Rechazada").estadoDestino, ESTADO_RECHAZADA);
+
+  for (const actual of ["Verificada", "Aprobada", "Rechazada", "Cancelada"]) {
+    assert.equal(transicion("afiliado", actual, "Cancelada").valido, false, actual);
+  }
 
   const ajena = transicion("afiliado", "Iniciada", "Cancelada", {
     usuarioId: 10,
@@ -249,4 +258,21 @@ test("las rutas publican los contratos nuevos y el servidor inicia el mantenimie
   assert.match(userSource, /PROPUESTA_CONVENIO_VENCIDA/);
   assert.match(userSource, /\["Verificada", "Aprobada", "Rechazada", "Cancelada"\]/);
   assert.match(serverSource, /iniciarMantenimientoReservas\(mysqlConnection\.promise\(\)\)/);
+});
+
+test("Cancelada y Rechazada son bajas: ninguna consulta de ocupación excluye sólo un id", () => {
+  const userSource = fs.readFileSync(rutaUser, "utf8");
+
+  assert.match(userSource, /const ESTADO_RESERVA_CANCELADA_ID = 13;/);
+  assert.match(
+    userSource,
+    /ESTADOS_RESERVA_BAJA_IDS = Object\.freeze\(\[ESTADO_RESERVA_RECHAZADA_ID, ESTADO_RESERVA_CANCELADA_ID\]\)/
+  );
+  assert.doesNotMatch(userSource, /estado_reserva_id, (\?|1)\) <> \?/);
+  assert.doesNotMatch(userSource, /ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID\]/);
+  // La baja (cancelación o rechazo) libera el recurso del bloque
+  assert.match(userSource, /const esBaja = \[ESTADO_RECHAZADA, ESTADO_CANCELADA\]\.includes\(transicion\.estadoDestino\)/);
+  assert.match(userSource, /if \(esBaja\) \{\s*await liberarRecursoBloqueReserva/);
+  // La cancelación integral de un sorteo sólo toca las inscripciones vivas
+  assert.doesNotMatch(userSource, /UPDATE reserva SET estado_reserva_id = \?, fecha_modificacion = NOW\(\) WHERE sorteo_id = \?"/);
 });

@@ -5,6 +5,7 @@ const ESTADO_INICIADA = "Iniciada";
 const ESTADO_VERIFICADA = "Verificada";
 const ESTADO_APROBADA = "Aprobada";
 const ESTADO_RECHAZADA = "Rechazada";
+const ESTADO_CANCELADA = "Cancelada";
 const ESTADO_PROPUESTA_CONVENIO = "Propuesta convenio";
 const ESTADO_CONVENIO_RECHAZADO = "Convenio rechazado";
 const MODALIDAD_FECHA_LIBRE = "FECHA_LIBRE";
@@ -42,9 +43,10 @@ function obtenerEstadoAltaTurismo(rol) {
 /**
  * Valida el flujo de estados de las reservas regulares de turismo.
  *
- * "Cancelada" se conserva como alias de compatibilidad de la API, pero el
- * catalogo real persiste "Rechazada". La accion original se tiene en cuenta
- * para que un afiliado no pueda hacerse pasar por un usuario revisor.
+ * "Cancelada" es la baja pedida por quien la solicita (el afiliado sobre su
+ * reserva Iniciada) y persiste como tal; "Rechazada" es la baja que decide
+ * Turismo. Ambas liberan el recurso y comparten los permisos por rol, pero el
+ * afiliado solo puede cancelar, nunca rechazar.
  */
 function validarTransicionTurismo({
   rol,
@@ -155,7 +157,7 @@ function validarTransicionTurismo({
 
     return {
       valido: true,
-      estadoDestino: ESTADO_RECHAZADA,
+      estadoDestino: esCancelacion ? ESTADO_CANCELADA : ESTADO_RECHAZADA,
       accion: esCancelacion ? "CANCELAR" : "RECHAZAR",
     };
   }
@@ -527,6 +529,7 @@ function iniciarMantenimientoReservas(db, {
 
 module.exports = {
   ESTADO_APROBADA,
+  ESTADO_CANCELADA,
   ESTADO_CONVENIO_RECHAZADO,
   ESTADO_INICIADA,
   ESTADO_RECHAZADA,

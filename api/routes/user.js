@@ -70,6 +70,7 @@ const {
 } = require("../services/sorteos-vigencia");
 const {
   ESTADO_APROBADA,
+  ESTADO_CANCELADA,
   ESTADO_CONVENIO_RECHAZADO,
   ESTADO_INICIADA,
   ESTADO_RECHAZADA,
@@ -3528,7 +3529,15 @@ router.delete("/admin/sorteos/:id", verifyToken, async (req, res) => {
         `Cancelación integral del sorteo ${sorteoId}`
       );
     }
-    await connection.query("UPDATE reserva SET estado_reserva_id = ?, fecha_modificacion = NOW() WHERE sorteo_id = ?", [estadoCancelacionId, sorteoId]);
+    // Sólo las que seguían vivas (las mismas que quedan en el historial): una
+    // inscripción ya rechazada, cancelada o no adjudicada conserva su estado.
+    const reservasCancelables = reservas.map((reserva) => Number(reserva.id));
+    if (reservasCancelables.length > 0) {
+      await connection.query(
+        "UPDATE reserva SET estado_reserva_id = ?, fecha_modificacion = NOW() WHERE id IN (?)",
+        [estadoCancelacionId, reservasCancelables]
+      );
+    }
     await connection.query(
       `UPDATE bloque_fecha_recurso bfr
        INNER JOIN bloque_fecha bf ON bf.id = bfr.bloque_fecha_id
@@ -3741,10 +3750,10 @@ router.put("/admin/bloques/:id", verifyToken, async (req, res) => {
     const [reservas] = await connection.query(
       `SELECT id FROM reserva
        WHERE bloque_fecha_id = ?
-         AND COALESCE(estado_reserva_id, ?) <> ?
+         AND COALESCE(estado_reserva_id, ?) NOT IN (?)
        LIMIT 1
        FOR UPDATE`,
-      [bloqueId, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+      [bloqueId, ESTADO_RESERVA_INICIADA_ID, ESTADOS_RESERVA_BAJA_IDS]
     );
     if (reservas.length > 0) {
       await connection.rollback();
@@ -4411,11 +4420,11 @@ router.put("/admin/sorteos/inscripciones/:id/adjudicar", verifyToken, async (req
           AND recurso_id = ?
           AND fecha_inicio < ?
           AND fecha_fin > ?
-          AND COALESCE(estado_reserva_id, ?) <> ?
+          AND COALESCE(estado_reserva_id, ?) NOT IN (?)
         LIMIT 1
         FOR UPDATE
       `,
-      [reservaId, recursoId, reserva.fecha_fin, reserva.fecha_inicio, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+      [reservaId, recursoId, reserva.fecha_fin, reserva.fecha_inicio, ESTADO_RESERVA_INICIADA_ID, ESTADOS_RESERVA_BAJA_IDS]
     );
     if (conflictos.length > 0) {
       await connection.rollback();
@@ -4581,9 +4590,9 @@ router.put("/admin/sorteos/:id/cerrar", verifyToken, async (req, res) => {
       `SELECT id, estado_reserva_id
        FROM reserva
        WHERE sorteo_id = ? AND modalidad = 'SORTEO' AND recurso_id IS NULL
-         AND COALESCE(estado_reserva_id, ?) <> ?
+         AND COALESCE(estado_reserva_id, ?) NOT IN (?)
        FOR UPDATE`,
-      [sorteoId, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+      [sorteoId, ESTADO_RESERVA_INICIADA_ID, ESTADOS_RESERVA_BAJA_IDS]
     );
     const estadoNoAdjudicadaId = await obtenerEstadoReservaId(connection, "No adjudicada", ESTADO_RESERVA_RECHAZADA_ID);
     for (const inscripcion of inscripcionesNoAdjudicadas) {
@@ -4598,8 +4607,8 @@ router.put("/admin/sorteos/:id/cerrar", verifyToken, async (req, res) => {
       );
     }
     await connection.query(
-      "UPDATE reserva SET estado_reserva_id = ? WHERE sorteo_id = ? AND modalidad = 'SORTEO' AND recurso_id IS NULL AND COALESCE(estado_reserva_id, ?) <> ?",
-      [estadoNoAdjudicadaId, sorteoId, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+      "UPDATE reserva SET estado_reserva_id = ? WHERE sorteo_id = ? AND modalidad = 'SORTEO' AND recurso_id IS NULL AND COALESCE(estado_reserva_id, ?) NOT IN (?)",
+      [estadoNoAdjudicadaId, sorteoId, ESTADO_RESERVA_INICIADA_ID, ESTADOS_RESERVA_BAJA_IDS]
     );
 
     await connection.query(
@@ -4933,9 +4942,9 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
           WHERE recurso_id IN (${placeholders})
             AND fecha_inicio < ?
             AND fecha_fin > ?
-            AND COALESCE(estado_reserva_id, ?) <> ?
+            AND COALESCE(estado_reserva_id, ?) NOT IN (?)
         `,
-        [...recursosIds, fecha_fin, fecha_inicio, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+        [...recursosIds, fecha_fin, fecha_inicio, ESTADO_RESERVA_INICIADA_ID, ESTADOS_RESERVA_BAJA_IDS]
       );
       const recursosOcupadosSet = new Set(reservasSolapadasRecursos.map((reserva) => Number(reserva.recurso_id)));
       const recursosRetenidosSet = await obtenerRecursosRetenidos(db, {
@@ -6063,9 +6072,12 @@ async function notificarAdministradoresTurismo(connection, tipo, titulo, mensaje
   }
 }
 
-const ESTADO_RESERVA_CANCELADA_ID = 4;
 const ESTADO_RESERVA_INICIADA_ID = 1;
 const ESTADO_RESERVA_RECHAZADA_ID = 4;
+// Alta en el catálogo con id fijo por scripts/migrar-estado-reserva-cancelada.js
+const ESTADO_RESERVA_CANCELADA_ID = 13;
+// Bajas que liberan el recurso: las reservas en estos estados no ocupan lugar
+const ESTADOS_RESERVA_BAJA_IDS = Object.freeze([ESTADO_RESERVA_RECHAZADA_ID, ESTADO_RESERVA_CANCELADA_ID]);
 const MODALIDAD_FECHA_LIBRE = "FECHA_LIBRE";
 const MODALIDAD_BLOQUE = "BLOQUE";
 const MODALIDAD_SORTEO = "SORTEO";
@@ -7460,10 +7472,10 @@ async function ejecutarMantenimientoBloquesAlta(connection) {
             FROM reserva r
             WHERE r.bloque_fecha_id = bf.id
               AND r.recurso_id = bfr.recurso_id
-              AND COALESCE(r.estado_reserva_id, ?) <> ?
+              AND COALESCE(r.estado_reserva_id, ?) NOT IN (?)
           )
       `,
-      [ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+      [ESTADO_RESERVA_INICIADA_ID, ESTADOS_RESERVA_BAJA_IDS]
     );
 
     await connection.query(
@@ -7496,10 +7508,10 @@ async function ejecutarMantenimientoBloquesAlta(connection) {
             FROM reserva r
             WHERE r.bloque_fecha_id = bf.id
               AND r.recurso_id = bfr.recurso_id
-              AND COALESCE(r.estado_reserva_id, ?) <> ?
+              AND COALESCE(r.estado_reserva_id, ?) NOT IN (?)
           )
       `,
-      [ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+      [ESTADO_RESERVA_INICIADA_ID, ESTADOS_RESERVA_BAJA_IDS]
     );
 
     await connection.query(
@@ -7563,12 +7575,12 @@ async function obtenerInscripcionSorteoActiva(connection, usuarioId, { forUpdate
       WHERE r.usuario_id = ?
         AND r.modalidad = 'SORTEO'
         AND r.recurso_id IS NULL
-        AND COALESCE(r.estado_reserva_id, ?) <> ?
+        AND COALESCE(r.estado_reserva_id, ?) NOT IN (?)
         AND COALESCE(er.nombre, '') NOT IN ('Adjudicada', 'No adjudicada', 'Cancelada', 'Rechazada')
       ORDER BY r.fecha_creacion DESC, r.id DESC
       LIMIT 1${lockSql}
     `,
-    [usuarioIdNormalizado, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+    [usuarioIdNormalizado, ESTADO_RESERVA_INICIADA_ID, ESTADOS_RESERVA_BAJA_IDS]
   );
 
   if (rows.length === 0) {
@@ -8834,10 +8846,10 @@ async function bloquearYValidarDisponibilidadReserva(connection, {
        AND r.fecha_fin > ?
        ${filtroReserva}
        AND COALESCE(er.nombre, '') NOT IN ('Cancelada', 'Rechazada', 'No adjudicada')
-       AND COALESCE(r.estado_reserva_id, ?) <> ?
+       AND COALESCE(r.estado_reserva_id, ?) NOT IN (?)
      LIMIT 1
      FOR UPDATE`,
-    [...params, ESTADO_RESERVA_INICIADA_ID, ESTADO_RESERVA_CANCELADA_ID]
+    [...params, ESTADO_RESERVA_INICIADA_ID, ESTADOS_RESERVA_BAJA_IDS]
   );
   if (conflictos.length > 0) {
     throw crearErrorNegocio(
@@ -8972,7 +8984,7 @@ async function asignarNumeroParcelaCamping(connection, {
     recursoId,
     fechaFin,
     fechaInicio,
-    ESTADO_RESERVA_CANCELADA_ID
+    ESTADOS_RESERVA_BAJA_IDS
   ];
 
   let query = `
@@ -8982,7 +8994,7 @@ async function asignarNumeroParcelaCamping(connection, {
       AND numero_parcela IS NOT NULL
       AND fecha_inicio < ?
       AND fecha_fin > ?
-      AND COALESCE(estado_reserva_id, 1) <> ?
+      AND COALESCE(estado_reserva_id, 1) NOT IN (?)
   `;
 
   if (reservaIdExcluir !== null && reservaIdExcluir !== undefined) {
@@ -9050,7 +9062,7 @@ async function validarNumeroParcelaCampingExistente(connection, { reservaId, rec
        AND numero_parcela = ?
        AND fecha_inicio < ?
        AND fecha_fin > ?
-       AND COALESCE(estado_reserva_id, 1) <> ?
+       AND COALESCE(estado_reserva_id, 1) NOT IN (?)
      FOR UPDATE`,
     [
       reservaId,
@@ -9058,7 +9070,7 @@ async function validarNumeroParcelaCampingExistente(connection, { reservaId, rec
       Number(numeroParcela),
       fechaFin,
       fechaInicio,
-      ESTADO_RESERVA_CANCELADA_ID
+      ESTADOS_RESERVA_BAJA_IDS
     ]
   );
 
@@ -11925,9 +11937,12 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
       throw crearErrorNegocio(transicion.mensaje, transicion.statusCode, transicion.codigo);
     }
 
-    const fallbackEstadoId = transicion.estadoDestino === ESTADO_VERIFICADA
-      ? 2
-      : (transicion.estadoDestino === ESTADO_APROBADA ? 3 : ESTADO_RESERVA_RECHAZADA_ID);
+    const fallbackEstadoId = {
+      [ESTADO_VERIFICADA]: 2,
+      [ESTADO_APROBADA]: 3,
+      [ESTADO_CANCELADA]: ESTADO_RESERVA_CANCELADA_ID,
+    }[transicion.estadoDestino] || ESTADO_RESERVA_RECHAZADA_ID;
+    const esBaja = [ESTADO_RECHAZADA, ESTADO_CANCELADA].includes(transicion.estadoDestino);
     const estadoId = await obtenerEstadoReservaId(
       connection,
       transicion.estadoDestino,
@@ -11972,7 +11987,7 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
       `Cambio de estado: ${reservaActual.estado_nombre} → ${transicion.estadoDestino}`
     );
 
-    if (transicion.estadoDestino === ESTADO_RECHAZADA) {
+    if (esBaja) {
       await liberarRecursoBloqueReserva(connection, reservaId);
       await connection.query(
         `UPDATE sorteo_adjudicacion_respuesta
@@ -11988,6 +12003,9 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
       [ESTADO_RECHAZADA]: observacionesNormalizadas
         ? `Tu reserva fue rechazada. Motivo: ${observacionesNormalizadas}`
         : "Tu reserva fue rechazada.",
+      [ESTADO_CANCELADA]: observacionesNormalizadas
+        ? `Tu reserva fue cancelada. Motivo: ${observacionesNormalizadas}`
+        : "Tu reserva fue cancelada.",
     };
     if (Number(reservaActual.usuario_id) !== Number(cabecera.id)) {
       await insertarNotificacion(
@@ -13534,6 +13552,7 @@ const COLORES_ESTADO_RESERVA = {
   "Verificada": { color: "#FEF9C3", color_texto: "#A16207" },
   "Aprobada": { color: "#D1FAE5", color_texto: "#047857" },
   "Rechazada": { color: "#FEE2E2", color_texto: "#B91C1C" },
+  "Cancelada": { color: "#F1F5F9", color_texto: "#475569" },
   "Utilizada": { color: "#E5E7EB", color_texto: "#374151" },
   "Solicitud sorteo": { color: "#EDE9FE", color_texto: "#6D28D9" },
   "Adjudicada": { color: "#DCFCE7", color_texto: "#15803D" },

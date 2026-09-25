@@ -34,7 +34,9 @@
     "migrate:olimpiadas-v2": "node scripts/migrar-olimpiadas-v2.js",
     "migrate:familiares-cambios": "node scripts/migrar-familiares-cambios.js",
     "migrate:indices-familia": "node scripts/migrar-indices-familia.js",
-    "migrate:indices-familia:check": "node scripts/migrar-indices-familia.js --check"
+    "migrate:indices-familia:check": "node scripts/migrar-indices-familia.js --check",
+    "migrate:estado-reserva-cancelada": "node scripts/migrar-estado-reserva-cancelada.js",
+    "migrate:estado-reserva-cancelada:check": "node scripts/migrar-estado-reserva-cancelada.js --check"
   },
   "keywords": [],
   "author": "",
