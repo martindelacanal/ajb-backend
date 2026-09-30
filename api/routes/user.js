@@ -13569,24 +13569,40 @@ const COLOR_ESTADO_GESTION_DEFECTO = { color: "#F3F4F6", color_texto: "#4B5563" 
 const COSEGURO_ESTADO_EXPORTADO = 8;
 const COSEGURO_ESTADO_PENDIENTE_ACREDITACION = 9;
 
-// Catálogos de estados para armar los filtros del listado unificado
+// Estados presentes en el historial completo del afiliado. Independientes de
+// la página, la búsqueda y las fechas que esté consultando en el listado.
 router.get("/mis-gestiones/catalogos", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
   if (cabecera.rol !== "afiliado") return res.status(401).json("No autorizado");
   try {
     const db = mysqlConnection.promise();
     const [estadosTurismo] = tieneModuloTurismo(cabecera)
-      ? await db.query("SELECT id, nombre FROM estado_reserva ORDER BY id")
+      ? await db.query(
+        `SELECT er.id, er.nombre FROM estado_reserva er
+         WHERE EXISTS (SELECT 1 FROM reserva r
+           WHERE r.usuario_id = ? AND r.estado_reserva_id = er.id)
+         ORDER BY er.id`,
+        [cabecera.id]
+      )
       : [[]];
     const [estadosCoseguro] = tieneModuloCoseguro(cabecera)
       ? await db.query(
-        `SELECT id, COALESCE(nombre_afiliado, nombre) AS nombre, color, color_texto
-         FROM coseguro_estado WHERE id <> ? ORDER BY id`,
-        [COSEGURO_ESTADO_EXPORTADO]
+        `SELECT e.id, COALESCE(e.nombre_afiliado, e.nombre) AS nombre, e.color, e.color_texto
+         FROM coseguro_estado e
+         WHERE e.id <> ? AND EXISTS (SELECT 1 FROM coseguro_solicitud cs
+           WHERE cs.usuario_id = ? AND cs.eliminado = 0
+             AND CASE WHEN cs.estado_id = ? THEN ? ELSE cs.estado_id END = e.id)
+         ORDER BY e.id`,
+        [COSEGURO_ESTADO_EXPORTADO, cabecera.id, COSEGURO_ESTADO_EXPORTADO, COSEGURO_ESTADO_PENDIENTE_ACREDITACION]
       )
       : [[]];
     const [estadosBeneficios] = await db.query(
-      "SELECT id, nombre, color, color_texto FROM beneficio_inscripcion_estado ORDER BY orden"
+      `SELECT be.id, be.nombre, be.color, be.color_texto FROM beneficio_inscripcion_estado be
+       WHERE EXISTS (SELECT 1 FROM beneficio_inscripcion bi
+         INNER JOIN beneficio b ON b.id = bi.beneficio_id
+         WHERE bi.usuario_id = ? AND bi.eliminado = 0 AND bi.estado_id = be.id)
+       ORDER BY be.orden`,
+      [cabecera.id]
     );
     res.json({
       estados_turismo: estadosTurismo.map((estado) => ({
@@ -13653,6 +13669,8 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         NULL AS importe,
         NULL AS comprobante,
         NULL AS beneficiario,
+        NULL AS proveedor,
+        NULL AS tipo_icono,
         ${esPorSaludTurismoSql} AS es_por_salud,
         ${estadoSaludTurismoSql} AS salud_estado,
         r.fecha_creacion
@@ -13680,6 +13698,8 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         COALESCE(cs.importe_autorizado, cs.importe_estimado, cs.importe) AS importe,
         CONCAT(COALESCE(CONCAT(cs.comprobante_pto_venta, '-'), ''), cs.comprobante_numero) AS comprobante,
         CASE WHEN cs.familiar_usuario_id IS NOT NULL THEN CONCAT(fam.nombre, ' ', fam.apellido) ELSE NULL END AS beneficiario,
+        cs.emisor_nombre AS proveedor,
+        t.icono AS tipo_icono,
         0 AS es_por_salud,
         NULL AS salud_estado,
         cs.fecha_creacion
@@ -13706,6 +13726,8 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         NULL AS importe,
         NULL AS comprobante,
         NULL AS beneficiario,
+        NULL AS proveedor,
+        NULL AS tipo_icono,
         0 AS es_por_salud,
         NULL AS salud_estado,
         ts.fecha_creacion
@@ -13736,6 +13758,8 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         NULL AS importe,
         NULL AS comprobante,
         NULL AS beneficiario,
+        NULL AS proveedor,
+        NULL AS tipo_icono,
         0 AS es_por_salud,
         NULL AS salud_estado,
         bi.fecha_creacion
@@ -13766,9 +13790,10 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         OR g.comprobante LIKE ? OR g.beneficiario LIKE ? OR g.fecha_inicio LIKE ? OR g.fecha_fin LIKE ?
         OR REPLACE(g.modalidad, '_', ' ') LIKE ? OR CAST(g.importe AS CHAR) LIKE ?
         OR DATE_FORMAT(g.fecha_creacion, '%d/%m/%Y %H:%i') LIKE ?
-        OR (CASE WHEN g.es_por_salud = 1 THEN 'Por salud' ELSE '' END) LIKE ? OR g.salud_estado LIKE ?)`);
+        OR (CASE WHEN g.es_por_salud = 1 THEN 'Por salud' ELSE '' END) LIKE ? OR g.salud_estado LIKE ?
+        OR g.proveedor LIKE ?)`);
       const like = `%${search}%`;
-      params.push(...Array(14).fill(like));
+      params.push(...Array(15).fill(like));
     }
 
     // estados=T1,T3,C7 → cada token filtra dentro de su propio módulo

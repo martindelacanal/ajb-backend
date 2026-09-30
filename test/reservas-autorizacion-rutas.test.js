@@ -1038,6 +1038,74 @@ test("Mis gestiones ordena la columna ID por prefijo y número del código", asy
   ]);
 });
 
+test("Catálogos de gestiones usan el historial propio completo y agrupan Exportado como Pendiente de acreditación", async () => {
+  setDatabaseHandler(async (sql, params) => {
+    assert.doesNotMatch(sql, /LIMIT|OFFSET|fecha_creacion\s*[<>]/i);
+    if (/FROM estado_reserva er/i.test(sql)) {
+      assert.match(sql, /EXISTS[\s\S]+r.usuario_id = \?[\s\S]+r.estado_reserva_id = er.id/);
+      assert.deepEqual(params, [100]);
+      return [[{ id: 1, nombre: "Iniciada" }]];
+    }
+    if (/FROM coseguro_estado e/i.test(sql)) {
+      assert.match(sql, /cs.usuario_id = \? AND cs.eliminado = 0/);
+      assert.match(sql, /CASE WHEN cs.estado_id = \? THEN \? ELSE cs.estado_id END = e.id/);
+      assert.deepEqual(params, [8, 100, 8, 9]);
+      return [[{ id: 9, nombre: "Pendiente de acreditación" }]];
+    }
+    if (/FROM beneficio_inscripcion_estado be/i.test(sql)) {
+      assert.match(sql, /bi.usuario_id = \? AND bi.eliminado = 0 AND bi.estado_id = be.id/);
+      assert.deepEqual(params, [100]);
+      return [[{ id: 2, nombre: "Aprobada" }]];
+    }
+    throw new Error(`Consulta inesperada: ${sql}`);
+  });
+  const response = await request("/api/mis-gestiones/catalogos?page=2&search=ausente&fecha_desde=2099-01-01", {
+    token: tokenFor({ id: 100, rol: "afiliado" }),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body.estados_turismo.map(e => e.id), [1]);
+  assert.deepEqual(response.body.estados_coseguro.map(e => e.id), [9]);
+  assert.deepEqual(response.body.estados_beneficios.map(e => e.id), [2]);
+});
+
+test("Catálogos no consultan módulos deshabilitados ni admiten roles de staff", async () => {
+  setDatabaseHandler(async (sql) => {
+    assert.match(sql, /FROM beneficio_inscripcion_estado be/);
+    return [[]];
+  });
+  const response = await request("/api/mis-gestiones/catalogos", {
+    token: tokenFor({ id: 100, rol: "afiliado", modulo_turismo: 0, modulo_coseguro: 0 }),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body.estados_turismo, []);
+  assert.deepEqual(response.body.estados_coseguro, []);
+  const cantidad = databaseCalls.filter(c => !esConsultaAutorizacion(c.sql)).length;
+  const staff = await request("/api/mis-gestiones/catalogos", { token: tokenFor({ rol: "admin" }) });
+  assert.equal(staff.status, 401);
+  assert.equal(databaseCalls.filter(c => !esConsultaAutorizacion(c.sql)).length, cantidad);
+});
+
+test("Mis gestiones devuelve icono y proveedor de Coseguro y permite buscarlo", async () => {
+  setDatabaseHandler(async (sql, params) => {
+    assert.match(sql, /cs.emisor_nombre AS proveedor/);
+    assert.match(sql, /t.icono AS tipo_icono/);
+    assert.match(sql, /g.proveedor LIKE \?/);
+    assert.equal(params.filter(p => p === "%Farmacia de prueba%").length, 15);
+    if (/SELECT g.tipo, COUNT\(\*\)/i.test(sql)) return [[{ tipo: "coseguro", total: 1 }]];
+    if (/SELECT g.\* FROM/i.test(sql)) {
+      return [[{ id: 5, tipo: "coseguro", codigo: "C-5", proveedor: "Farmacia de prueba", tipo_icono: "medication" }]];
+    }
+    throw new Error(`Consulta inesperada: ${sql}`);
+  });
+  const response = await request("/api/mis-gestiones?tipo=coseguro&search=Farmacia%20de%20prueba", {
+    token: tokenFor({ id: 100, rol: "afiliado" }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.totalItems, 1);
+  assert.equal(response.body.results[0].proveedor, "Farmacia de prueba");
+  assert.equal(response.body.results[0].tipo_icono, "medication");
+});
+
 test("El contexto de descuentos solo muestra el estado médico del servicio a quien puede usarlo", async () => {
   async function consultarContexto(claims, { titularCoseguro, estadoServicio = "HABILITADO", query = "" }) {
     setDatabaseHandler(async (sql) => {
