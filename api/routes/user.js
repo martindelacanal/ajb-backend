@@ -13666,7 +13666,9 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         COALESCE(r.modalidad, 'FECHA_LIBRE') AS modalidad,
         DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') AS fecha_inicio,
         DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') AS fecha_fin,
-        NULL AS importe,
+        -- Total neto guardado: incluye adicionales y descuentos. NULL indica
+        -- falta de cotización; 0 es una reserva bonificada (también por salud).
+        r.precio_total AS importe,
         NULL AS comprobante,
         NULL AS beneficiario,
         NULL AS proveedor,
