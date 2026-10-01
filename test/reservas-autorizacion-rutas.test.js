@@ -1106,6 +1106,57 @@ test("Mis gestiones devuelve icono y proveedor de Coseguro y permite buscarlo", 
   assert.equal(response.body.results[0].tipo_icono, "medication");
 });
 
+test("Mis gestiones informa el precio neto guardado de Turismo, incluido sorteo y convenio cotizados", async () => {
+  const gestiones = [
+    { id: 41, tipo: "turismo", codigo: "T-41", modalidad: "FECHA_LIBRE", importe: "125500.50", estado: "Iniciada" },
+    { id: 42, tipo: "turismo", codigo: "T-42", modalidad: "SORTEO", importe: "99000.00", estado: "Solicitud sorteo" },
+    { id: 43, tipo: "turismo", codigo: "T-43", modalidad: "CONVENIO", importe: "150000.00", estado: "Propuesta convenio" },
+  ];
+  setDatabaseHandler(async (sql, params) => {
+    const turismoSql = sql.split("UNION ALL")[0];
+    assert.match(turismoSql, /r\.precio_total AS importe/);
+    // El total almacenado ya incluye extras y descuentos: la bandeja no
+    // recalcula el precio con tarifas actuales ni lo confunde con un saldo.
+    assert.doesNotMatch(turismoSql, /monto_adicionales|monto_descuentos|recibo/);
+    assert.deepEqual(params.slice(0, 2), [100, 1]);
+    if (/SELECT g.tipo, COUNT\(\*\)/i.test(sql)) return [[{ tipo: "turismo", total: gestiones.length }]];
+    if (/SELECT g.\* FROM/i.test(sql)) return [[...gestiones]];
+    throw new Error(`Consulta inesperada: ${sql}`);
+  });
+
+  const response = await request("/api/mis-gestiones?tipo=turismo", {
+    token: tokenFor({ id: 100, rol: "afiliado" }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.totalItems, gestiones.length);
+  assert.deepEqual(response.body.results.map(({ codigo, importe }) => ({ codigo, importe })),
+    gestiones.map(({ codigo, importe }) => ({ codigo, importe })));
+});
+
+test("Mis gestiones conserva el cero bonificado por salud y NULL cuando Turismo aún no tiene cotización", async () => {
+  const gestiones = [
+    { id: 51, tipo: "turismo", codigo: "T-51", modalidad: "FECHA_LIBRE", importe: "0.00", estado: "Confirmada" },
+    { id: 52, tipo: "turismo", codigo: "T-52", modalidad: "CONVENIO", importe: null, estado: "Solicitud convenio" },
+    { id: 53, tipo: "turismo", codigo: "T-53", modalidad: "SORTEO", importe: null, estado: "Solicitud sorteo" },
+  ];
+  setDatabaseHandler(async (sql) => {
+    assert.match(sql, /r\.precio_total AS importe/);
+    assert.doesNotMatch(sql, /COALESCE\(r\.precio_total/);
+    // El precio bonificado persiste en reserva. No exige leer datos de
+    // salud ni tener Coseguro habilitado para mostrar el importe propio.
+    assert.doesNotMatch(sql, /LEFT JOIN reserva_salud/);
+    if (/SELECT g.tipo, COUNT\(\*\)/i.test(sql)) return [[{ tipo: "turismo", total: gestiones.length }]];
+    if (/SELECT g.\* FROM/i.test(sql)) return [[...gestiones]];
+    throw new Error(`Consulta inesperada: ${sql}`);
+  });
+
+  const response = await request("/api/mis-gestiones?tipo=turismo", {
+    token: tokenFor({ id: 100, rol: "afiliado", modulo_coseguro: 0 }),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body.results.map(gestion => gestion.importe), ["0.00", null, null]);
+});
+
 test("El contexto de descuentos solo muestra el estado médico del servicio a quien puede usarlo", async () => {
   async function consultarContexto(claims, { titularCoseguro, estadoServicio = "HABILITADO", query = "" }) {
     setDatabaseHandler(async (sql) => {
