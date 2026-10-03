@@ -13401,6 +13401,11 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     typeof filters.estado === "string" && filters.estado.trim() !== "" && filters.estado !== "Todas"
       ? filters.estado.trim()
       : null;
+  // Selects rápidos del listado: departamental del afiliado (sólo admin; la
+  // departamental ya ve únicamente la suya) y servicio reservado.
+  const departamentalFiltro =
+    cabecera.rol === "admin" ? normalizarIdPositivo(filters.departamental_id) : null;
+  const servicioFiltro = normalizarIdPositivo(filters.servicio_id);
   const fecha_incio = filters.startDate || "2023-01-01";
   const fecha_fin = filters.endDate || "2070-12-31";
   const fromDate = normalizarFechaCivil(fecha_incio);
@@ -13422,11 +13427,12 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     modalidad: "COALESCE(r.modalidad, 'FECHA_LIBRE')",
     servicio: "COALESCE(s.nombre, 'Convenio hotelero')",
     recurso: "COALESCE(rec.nombre, ch.nombre, 'Pendiente de adjudicación')",
-    afiliado: "u.documento",
+    afiliado: "CONCAT_WS(', ', u.apellido, u.nombre)",
     fecha_inicio: "r.fecha_inicio",
     fecha_fin: "r.fecha_fin",
     fecha_creacion: "r.fecha_creacion",
     observaciones: "COALESCE(r.observaciones, '')",
+    importe: "COALESCE(r.precio_total, 0)",
   };
   const orderByKey = Object.prototype.hasOwnProperty.call(columnasOrdenReservas, req.query.orderBy)
     ? req.query.orderBy
@@ -13444,8 +13450,10 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       OR bf.nombre LIKE ? OR CAST(u.documento AS CHAR) LIKE ? OR DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') LIKE ?
       OR DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') LIKE ? OR DATE_FORMAT(r.fecha_creacion, '%d/%m/%Y') LIKE ?
       OR r.observaciones LIKE ?
-      OR CAST((SELECT COUNT(*) FROM reserva_observacion ro_busqueda WHERE ro_busqueda.reserva_id = r.id) AS CHAR) LIKE ?)`;
-    querySearchParams.push(...Array(15).fill(like));
+      OR CAST((SELECT COUNT(*) FROM reserva_observacion ro_busqueda WHERE ro_busqueda.reserva_id = r.id) AS CHAR) LIKE ?
+      OR u.apellido LIKE ? OR u.nombre LIKE ? OR CONCAT_WS(' ', u.nombre, u.apellido) LIKE ?
+      OR CONCAT_WS(', ', u.apellido, u.nombre) LIKE ?)`;
+    querySearchParams.push(...Array(19).fill(like));
   }
 
   const queryParams = [...querySearchParams];
@@ -13458,10 +13466,13 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       COALESCE(r.modalidad, 'FECHA_LIBRE') AS modalidad,
       bf.nombre AS bloque,
       u.documento AS afiliado,
+      u.nombre AS afiliado_nombre,
+      u.apellido AS afiliado_apellido,
       DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') AS fecha_inicio,
       DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') AS fecha_fin,
       COALESCE(r.observaciones, '') AS observaciones,
       DATE_FORMAT(r.fecha_creacion, '%d/%m/%Y') AS fecha_creacion,
+      r.precio_total AS importe,
       (SELECT COUNT(*) FROM reserva_observacion ro WHERE ro.reserva_id = r.id) AS mensajes
     FROM reserva r
     INNER JOIN estado_reserva er ON r.estado_reserva_id = er.id
@@ -13475,6 +13486,8 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
       ${toDate ? "AND r.fecha_fin <= ?" : ""}
       ${estadoFiltro ? "AND er.nombre = ?" : ""}
+      ${departamentalFiltro ? "AND u.departamental_id = ?" : ""}
+      ${servicioFiltro ? "AND s.id = ?" : ""}
   `;
 
   if (fromDate) {
@@ -13485,6 +13498,12 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
   }
   if (estadoFiltro) {
     queryParams.push(estadoFiltro);
+  }
+  if (departamentalFiltro) {
+    queryParams.push(departamentalFiltro);
+  }
+  if (servicioFiltro) {
+    queryParams.push(servicioFiltro);
   }
 
   if (cabecera.rol === "departamental") {
@@ -13502,6 +13521,8 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     if (fromDate) countParams.push(fromDate);
     if (toDate) countParams.push(toDate);
     if (estadoFiltro) countParams.push(estadoFiltro);
+    if (departamentalFiltro) countParams.push(departamentalFiltro);
+    if (servicioFiltro) countParams.push(servicioFiltro);
     if (cabecera.rol === "departamental") countParams.push(departamentalId);
 
     let countQuery = `
@@ -13518,6 +13539,8 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
         ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
         ${toDate ? "AND r.fecha_fin <= ?" : ""}
         ${estadoFiltro ? "AND er.nombre = ?" : ""}
+        ${departamentalFiltro ? "AND u.departamental_id = ?" : ""}
+        ${servicioFiltro ? "AND s.id = ?" : ""}
         ${cabecera.rol === "departamental" ? "AND u.departamental_id = ?" : ""}
     `;
 
