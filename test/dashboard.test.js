@@ -37,53 +37,67 @@ function resultadoPara(sql, params = []) {
       departamentales_total: 20,
       departamentales_habilitadas: 19,
       departamentales_con_usuarios: 9,
+      composicion_titulares: 70,
+      composicion_familiares: 30,
+      composicion_personal: 11,
     }]];
   }
   if (sql.includes("dashboard:turismo")) {
     return [[
-      { estado_id: 1, nombre: "Iniciada", cantidad: 4, actividad_30_dias: 2, proximas_30_dias: 0, proximas_7_dias: 0 },
-      { estado_id: 2, nombre: "Verificada", cantidad: 3, actividad_30_dias: 1, proximas_30_dias: 0, proximas_7_dias: 0 },
-      { estado_id: 3, nombre: "Aprobada", cantidad: 9, actividad_30_dias: 2, proximas_30_dias: 5, proximas_7_dias: 2 },
+      { estado_id: 1, nombre: "Iniciada", cantidad: 4, mas_antiguo: new Date("2026-06-01T12:00:00.000Z"), actividad_30_dias: 2, proximas_30_dias: 0, proximas_7_dias: 0 },
+      { estado_id: 2, nombre: "Verificada", cantidad: 3, mas_antiguo: new Date("2026-08-01T13:00:00.000Z"), actividad_30_dias: 1, proximas_30_dias: 0, proximas_7_dias: 0 },
+      { estado_id: 3, nombre: "Aprobada", cantidad: 9, mas_antiguo: new Date("2026-05-01T13:00:00.000Z"), actividad_30_dias: 2, proximas_30_dias: 5, proximas_7_dias: 2 },
+      { estado_id: 4, nombre: "Rechazada", cantidad: 0, mas_antiguo: null, actividad_30_dias: 0, proximas_30_dias: 0, proximas_7_dias: 0 },
     ]];
   }
   if (sql.includes("dashboard:coseguro")) {
     return [[
-      { estado_id: 1, nombre: "Solicitud iniciada", cantidad: 2, actividad_30_dias: 2, importe_total: 1000, importe_acreditado_30_dias: 0 },
-      { estado_id: 3, nombre: "Solicitud revisada", cantidad: 1, actividad_30_dias: 1, importe_total: 800, importe_acreditado_30_dias: 0 },
-      { estado_id: 4, nombre: "Aprobado por departamental", cantidad: 4, actividad_30_dias: 2, importe_total: 2000, importe_acreditado_30_dias: 0 },
-      { estado_id: 9, nombre: "Pendiente de acreditación", cantidad: 2, actividad_30_dias: 0, importe_total: 1450.5, importe_acreditado_30_dias: 0 },
-      { estado_id: 10, nombre: "Liquidado", cantidad: 3, actividad_30_dias: 0, importe_total: 5200, importe_acreditado_30_dias: 3100.25 },
+      { estado_id: 1, nombre: "Solicitud iniciada", cantidad: 2, mas_antiguo: new Date("2026-08-05T15:00:00.000Z"), actividad_30_dias: 2, importe_total: 1000, importe_acreditado_30_dias: 0 },
+      // Texto sin huso (como llegaría con dateStrings): se lee en hora argentina.
+      { estado_id: 3, nombre: "Solicitud revisada", cantidad: 1, mas_antiguo: "2026-07-20 09:15:00", actividad_30_dias: 1, importe_total: 800, importe_acreditado_30_dias: 0 },
+      { estado_id: 4, nombre: "Aprobado por departamental", cantidad: 4, mas_antiguo: new Date("2026-07-28T10:00:00.000Z"), actividad_30_dias: 2, importe_total: 2000, importe_acreditado_30_dias: 0 },
+      { estado_id: 9, nombre: "Pendiente de acreditación", cantidad: 2, mas_antiguo: new Date("2026-08-09T18:30:00.000Z"), actividad_30_dias: 0, importe_total: 1450.5, importe_acreditado_30_dias: 0 },
+      { estado_id: 10, nombre: "Liquidado", cantidad: 3, mas_antiguo: new Date("2026-01-09T18:30:00.000Z"), actividad_30_dias: 0, importe_total: 5200, importe_acreditado_30_dias: 3100.25 },
     ]];
   }
   if (sql.includes("dashboard:traslados")) {
     return [[
-      { estado_id: 1, nombre: "Iniciada", cantidad: 6, actividad_30_dias: 3, concretados_30_dias: 0 },
+      { estado_id: 1, nombre: "Iniciada", cantidad: 6, mas_antiguo: new Date("2026-08-11T12:00:00.000Z"), actividad_30_dias: 3, concretados_30_dias: 0 },
       { estado_id: 2, nombre: "Concretada", cantidad: 5, actividad_30_dias: 1, concretados_30_dias: 2 },
       { estado_id: 3, nombre: "Cancelada", cantidad: 1, actividad_30_dias: 0, concretados_30_dias: 0 },
     ]];
   }
   if (sql.includes("dashboard:noticias")) {
     return [[
-      { estado: "BORRADOR", cantidad: 3, actividad_30_dias: 2, publicadas: 0, programadas: 0, destacadas: 0 },
+      { estado: "BORRADOR", cantidad: 3, mas_antiguo: new Date("2026-08-12T23:30:00.000Z"), actividad_30_dias: 2, publicadas: 0, programadas: 0, destacadas: 0 },
       { estado: "PUBLICADA", cantidad: 8, actividad_30_dias: 3, publicadas: 7, programadas: 1, destacadas: 2 },
       { estado: "ARCHIVADA", cantidad: 4, actividad_30_dias: 0, publicadas: 0, programadas: 0, destacadas: 0 },
     ]];
+  }
+  if (sql.includes("dashboard:olimpiadas_por_validar")) {
+    return [[{ cantidad: 4, mas_antiguo: new Date("2026-08-02T14:00:00.000Z") }]];
+  }
+  if (sql.includes("dashboard:familiares_pendientes")) {
+    return [[{ cantidad: 2, mas_antiguo: new Date("2026-08-06T14:00:00.000Z") }]];
+  }
+  if (sql.includes("dashboard:beneficios")) {
+    return [[{ publicados: 5, por_aprobar: 1, mas_antiguo: "2026-08-10 08:00:00", inscripciones_30_dias: 9 }]];
   }
   if (sql.includes("dashboard:olimpiadas")) {
     return [[{ ediciones_activas: 1, inscripciones_activas: 46, actividad_30_dias: 11 }]];
   }
   if (sql.includes("dashboard:evolucion")) {
     return [[
-      { mes: "2026-07", reservas: 5, usuarios: 8, coseguro: 4, traslados: 2, noticias: 3 },
-      { mes: "2026-08", reservas: 7, usuarios: 3, coseguro: 6, traslados: 1, noticias: 2 },
+      { mes: "2026-07", reservas: 5, usuarios: 8, coseguro: 4, traslados: 2, noticias: 3, olimpiadas: 6, beneficios: 1 },
+      { mes: "2026-08", reservas: 7, usuarios: 3, coseguro: 6, traslados: 1, noticias: 2, olimpiadas: 2, beneficios: 4 },
     ]];
   }
   if (sql.includes("dashboard:conversaciones")) {
     return [[
-      { modulo: "reservas", sin_responder: 2 },
-      { modulo: "coseguro", sin_responder: 1 },
-      { modulo: "traslados", sin_responder: 0 },
-      { modulo: "olimpiadas", sin_responder: 3 },
+      { modulo: "reservas", sin_responder: 2, mas_antiguo: new Date("2026-08-10T11:00:00.000Z") },
+      { modulo: "coseguro", sin_responder: 1, mas_antiguo: new Date("2026-08-12T11:00:00.000Z") },
+      { modulo: "traslados", sin_responder: 0, mas_antiguo: null },
+      { modulo: "olimpiadas", sin_responder: 3, mas_antiguo: new Date("2026-08-01T11:00:00.000Z") },
     ]];
   }
   if (sql.includes("dashboard:actividad_diaria")) {
@@ -106,7 +120,7 @@ function resultadoPara(sql, params = []) {
   }
   if (sql.includes("dashboard:actividad_agrupada")) {
     return [[
-      { periodo: "2026-W32", reservas: 2, usuarios: 1, coseguro: 0, traslados: 0, noticias: 1 },
+      { periodo: "2026-W32", reservas: 2, usuarios: 1, coseguro: 0, traslados: 0, noticias: 1, olimpiadas: 3, beneficios: 2 },
     ]];
   }
   throw new Error(`Consulta de prueba inesperada: ${sql}`);
@@ -212,18 +226,44 @@ test("dashboard entrega agregados estables, sin datos personales y con autorizac
   assert.deepEqual(response.body.conversaciones, {
     reservas: 2, coseguro: 1, traslados: 0, olimpiadas: 3, total: 6,
   });
-  assert.equal(response.body.atencion.total, 27);
+  // 27 de las bandejas de siempre + 2 familiares + 4 olimpiadas + 1 beneficio.
+  assert.equal(response.body.atencion.total, 34);
   assert.equal(response.body.evolucion.length, 6);
   assert.equal(response.body.actividad_diaria.length, 14);
   assert.ok(response.body.actividad_diaria.every((dia) => /^\d{4}-\d{2}-\d{2}$/.test(dia.dia)));
-  assert.equal(databaseCalls.length, 12);
+  assert.equal(databaseCalls.length, 15);
+
+  const items = Object.fromEntries(response.body.atencion.items.map((item) => [item.clave, item]));
+  // Antigüedad: mínimo de las filas que suman cada bandeja, en ISO.
+  assert.equal(items.reservas_por_aprobar.mas_antiguo, "2026-08-01T13:00:00.000Z");
+  assert.equal(items.coseguro_por_revisar.mas_antiguo, "2026-07-20T12:15:00.000Z");
+  assert.equal(items.coseguro_por_acreditar.mas_antiguo, "2026-08-09T18:30:00.000Z");
+  assert.equal(items.traslados_activos.mas_antiguo, "2026-08-11T12:00:00.000Z");
+  assert.equal(items.noticias_borrador.mas_antiguo, "2026-08-12T23:30:00.000Z");
+  assert.equal(items.chat_olimpiadas.mas_antiguo, "2026-08-01T11:00:00.000Z");
+  assert.equal(items.chat_traslados.cantidad, 0);
+  assert.equal(items.chat_traslados.mas_antiguo, null);
+  assert.deepEqual(
+    [items.familiares_por_aprobar, items.olimpiadas_por_validar, items.beneficios_por_aprobar]
+      .map(({ modulo, cantidad, ruta, prioridad, mas_antiguo }) => ({ modulo, cantidad, ruta, prioridad, mas_antiguo })),
+    [
+      { modulo: "familiares", cantidad: 2, ruta: "/cambios-familiares", prioridad: "alta", mas_antiguo: "2026-08-06T14:00:00.000Z" },
+      { modulo: "olimpiadas", cantidad: 4, ruta: "/olimpiadas-admin", prioridad: "alta", mas_antiguo: "2026-08-02T14:00:00.000Z" },
+      { modulo: "beneficios", cantidad: 1, ruta: "/beneficios-admin", prioridad: "alta", mas_antiguo: "2026-08-10T11:00:00.000Z" },
+    ]
+  );
+  assert.deepEqual(response.body.modulos.beneficios, { publicados: 5, por_aprobar: 1, inscripciones_30_dias: 9 });
+  assert.deepEqual(response.body.resumen_red.usuarios.composicion, { titulares: 70, familiares: 30, personal: 11 });
+  const julio = response.body.evolucion.find((mes) => mes.mes === "2026-07");
+  assert.equal(julio.olimpiadas, 6);
+  assert.equal(julio.beneficios, 1);
 
   const evolucion = databaseCalls.find((call) => call.sql.includes("dashboard:evolucion"));
-  assert.equal(evolucion.params.length, 5);
+  assert.equal(evolucion.params.length, 7);
   assert.ok(evolucion.params.every((value) => /^\d{4}-\d{2}-01$/.test(value)));
 
   const actividadDiaria = databaseCalls.find((call) => call.sql.includes("dashboard:actividad_diaria"));
-  assert.equal(actividadDiaria.params.length, 5);
+  assert.equal(actividadDiaria.params.length, 7);
   assert.ok(actividadDiaria.params.every((value) => /^\d{4}-\d{2}-\d{2}$/.test(value)));
 
   const serializado = JSON.stringify(response.body);
@@ -294,10 +334,13 @@ test("la actividad agrupada por semana completa los períodos ISO y rellena vac�
   assert.deepEqual(response.body.buckets.map((bucket) => bucket.periodo), ["2026-W31", "2026-W32", "2026-W33"]);
   assert.equal(response.body.buckets[0].inicio, "2026-07-27");
   assert.equal(response.body.buckets[1].reservas, 2);
+  assert.equal(response.body.buckets[1].olimpiadas, 3);
+  assert.equal(response.body.buckets[1].beneficios, 2);
   assert.equal(response.body.buckets[2].reservas, 0);
+  assert.equal(response.body.buckets[2].olimpiadas, 0);
 
   const llamada = databaseCalls.find((call) => call.sql.includes("dashboard:actividad_agrupada"));
-  assert.equal(llamada.params.length, 10);
+  assert.equal(llamada.params.length, 14);
   assert.equal(llamada.params[0], "2026-07-27");
   assert.equal(llamada.params[1], "2026-08-17");
 });
@@ -339,7 +382,7 @@ test("la evolución siempre completa seis meses en orden y rellena meses sin act
   ], meses);
   assert.equal(evolucion.length, 6);
   assert.deepEqual(evolucion[0], {
-    mes: "2025-08", reservas: 0, usuarios: 0, coseguro: 0, traslados: 0, noticias: 0,
+    mes: "2025-08", reservas: 0, usuarios: 0, coseguro: 0, traslados: 0, noticias: 0, olimpiadas: 0, beneficios: 0,
   });
   assert.equal(evolucion[2].reservas, 2);
 });
@@ -357,5 +400,85 @@ test("el servicio comparte cargas concurrentes y reutiliza el agregado reciente"
 
   assert.strictEqual(primero, segundo);
   assert.strictEqual(primero, tercero);
-  assert.equal(databaseCalls.length, 11);
+  assert.equal(databaseCalls.length, 14);
+});
+
+test("la antigüedad de una bandeja sale en ISO y es null cuando está en cero", () => {
+  const { masAntiguoIso } = dashboardTest;
+  assert.equal(masAntiguoIso(0, [new Date("2026-08-01T10:00:00.000Z")]), null);
+  assert.equal(masAntiguoIso(3, [null, undefined, "no es fecha"]), null);
+  assert.equal(
+    masAntiguoIso(2, ["2026-08-03 10:00:00", new Date("2026-08-02T20:00:00.000Z"), "2026-08-04"]),
+    "2026-08-02T20:00:00.000Z"
+  );
+});
+
+test("las bandejas opcionales cuya consulta falló no se agregan", () => {
+  const respuesta = dashboardTest.construirRespuesta({
+    generadoEn: new Date("2026-08-13T12:00:00.000Z"),
+    meses: dashboardTest.obtenerVentanaMeses(new Date("2026-08-13T12:00:00.000Z")),
+    dias: dashboardTest.obtenerVentanaDias(new Date("2026-08-13T12:00:00.000Z"), 14),
+    redRows: [{}],
+    turismoRows: [{ estado_id: 2, nombre: "Verificada", cantidad: 1, mas_antiguo: new Date("2026-08-10T12:00:00.000Z") }],
+    coseguroRows: [],
+    trasladosRows: [],
+    noticiasRows: [],
+    olimpiadasRows: [{}],
+    evolucionRows: [],
+    conversacionesRows: [],
+    actividadDiariaRows: [],
+    destinosRows: [],
+    presenciaRows: [],
+    familiaresRows: null,
+    olimpiadasPorValidarRows: [{ cantidad: 0, mas_antiguo: null }],
+    beneficiosRows: null,
+  });
+  const claves = respuesta.atencion.items.map((item) => item.clave);
+  assert.equal(claves.includes("familiares_por_aprobar"), false);
+  assert.equal(claves.includes("beneficios_por_aprobar"), false);
+  assert.equal(claves.includes("olimpiadas_por_validar"), true);
+  assert.equal(respuesta.modulos.beneficios, undefined);
+  assert.equal(respuesta.atencion.total, 1);
+  assert.equal(respuesta.atencion.items[0].mas_antiguo, "2026-08-10T12:00:00.000Z");
+  assert.deepEqual(respuesta.resumen_red.usuarios.composicion, { titulares: 0, familiares: 0, personal: 0 });
+});
+
+test("una consulta opcional que falla devuelve null y el tablero responde igual", async () => {
+  const { consultaOpcional } = dashboardTest;
+  const avisoOriginal = console.warn;
+  const avisos = [];
+  console.warn = (...args) => avisos.push(args.join(" "));
+  try {
+    const fallida = await consultaOpcional({
+      query: async () => { throw Object.assign(new Error("sin permiso"), { code: "ER_TABLEACCESS_DENIED_ERROR" }); },
+    }, "SELECT 1");
+    assert.equal(fallida, null);
+    assert.ok(avisos.some((aviso) => aviso.includes("ER_TABLEACCESS_DENIED_ERROR")));
+
+    const conexionSinBeneficios = {
+      promise() {
+        return {
+          query: async (sql, params = []) => {
+            if (sql.includes("dashboard:beneficios")) {
+              throw Object.assign(new Error("tabla ausente"), { code: "ER_NO_SUCH_TABLE" });
+            }
+            return resultadoPara(sql, params);
+          },
+        };
+      },
+    };
+    const servicio = crearServicioDashboard({
+      conexion: conexionSinBeneficios,
+      ahora: () => new Date("2026-08-13T12:00:00.000Z"),
+      cacheMs: 30000,
+    });
+    const respuesta = await servicio.obtener();
+    const claves = respuesta.atencion.items.map((item) => item.clave);
+    assert.equal(claves.includes("beneficios_por_aprobar"), false);
+    assert.equal(claves.includes("familiares_por_aprobar"), true);
+    assert.equal(respuesta.modulos.beneficios, undefined);
+    assert.equal(respuesta.atencion.total, 33);
+  } finally {
+    console.warn = avisoOriginal;
+  }
 });

@@ -8,6 +8,11 @@ const SQL_RED = `
     COALESCE(SUM(u.fecha_creacion >= NOW() - INTERVAL 30 DAY), 0) AS usuarios_nuevos_30_dias,
     COALESCE(SUM(u.es_familiar = 'S'), 0) AS usuarios_familiares,
     COALESCE(SUM(u.rol_id IN (1, 3, 5, 6)), 0) AS usuarios_staff,
+    -- Composición del padrón habilitado (roles: 1 admin, 2 afiliado,
+    -- 3 departamental, 4 invitado, 5 admin-central, 6 auditor, 7 prensa).
+    COALESCE(SUM(u.habilitado = 'Y' AND u.rol_id = 2 AND u.usuario_familiar_id IS NULL), 0) AS composicion_titulares,
+    COALESCE(SUM(u.habilitado = 'Y' AND u.es_familiar = 'S'), 0) AS composicion_familiares,
+    COALESCE(SUM(u.habilitado = 'Y' AND u.rol_id IN (1, 3, 5, 6, 7)), 0) AS composicion_personal,
     (SELECT COUNT(*) FROM departamental) AS departamentales_total,
     (SELECT COUNT(*) FROM departamental d WHERE d.habilitado = 'Y') AS departamentales_habilitadas,
     (
@@ -24,6 +29,7 @@ const SQL_TURISMO = `
     er.id AS estado_id,
     er.nombre,
     COUNT(r.id) AS cantidad,
+    MIN(r.fecha_creacion) AS mas_antiguo,
     COALESCE(SUM(r.fecha_creacion >= NOW() - INTERVAL 30 DAY), 0) AS actividad_30_dias,
     COALESCE(SUM(
       r.fecha_inicio >= CURDATE()
@@ -46,6 +52,7 @@ const SQL_COSEGURO = `
     ce.id AS estado_id,
     ce.nombre,
     COUNT(s.id) AS cantidad,
+    MIN(s.fecha_creacion) AS mas_antiguo,
     COALESCE(SUM(s.fecha_creacion >= NOW() - INTERVAL 30 DAY), 0) AS actividad_30_dias,
     COALESCE(SUM(COALESCE(s.importe_autorizado, s.importe, 0)), 0) AS importe_total,
     COALESCE(SUM(
@@ -64,6 +71,7 @@ const SQL_TRASLADOS = `
     te.id AS estado_id,
     te.nombre,
     COUNT(ts.id) AS cantidad,
+    MIN(ts.fecha_creacion) AS mas_antiguo,
     COALESCE(SUM(ts.fecha_creacion >= NOW() - INTERVAL 30 DAY), 0) AS actividad_30_dias,
     COALESCE(SUM(ts.fecha_concretada >= NOW() - INTERVAL 30 DAY), 0) AS concretados_30_dias
   FROM traslado_estado te
@@ -77,6 +85,7 @@ const SQL_NOTICIAS = `
   SELECT
     estados.estado,
     COUNT(n.id) AS cantidad,
+    MIN(n.fecha_creacion) AS mas_antiguo,
     COALESCE(SUM(n.fecha_creacion >= NOW() - INTERVAL 30 DAY), 0) AS actividad_30_dias,
     COALESCE(SUM(
       n.estado = 'PUBLICADA'
@@ -134,7 +143,9 @@ const SQL_EVOLUCION = `
     SUM(actividad.modulo = 'usuarios') AS usuarios,
     SUM(actividad.modulo = 'coseguro') AS coseguro,
     SUM(actividad.modulo = 'traslados') AS traslados,
-    SUM(actividad.modulo = 'noticias') AS noticias
+    SUM(actividad.modulo = 'noticias') AS noticias,
+    SUM(actividad.modulo = 'olimpiadas') AS olimpiadas,
+    SUM(actividad.modulo = 'beneficios') AS beneficios
   FROM (
     SELECT fecha_creacion, 'reservas' AS modulo
     FROM reserva
@@ -155,13 +166,23 @@ const SQL_EVOLUCION = `
     SELECT fecha_creacion, 'noticias' AS modulo
     FROM noticia
     WHERE eliminado = 0 AND fecha_creacion >= ?
+    UNION ALL
+    SELECT fecha_creacion, 'olimpiadas' AS modulo
+    FROM olimpiada_inscripcion
+    WHERE eliminado = 0 AND fecha_creacion >= ?
+    UNION ALL
+    SELECT fecha_creacion, 'beneficios' AS modulo
+    FROM beneficio_inscripcion
+    WHERE eliminado = 0 AND fecha_creacion >= ?
   ) actividad
   GROUP BY DATE_FORMAT(actividad.fecha_creacion, '%Y-%m')
   ORDER BY mes`;
 
 const SQL_CONVERSACIONES = `
   /* dashboard:conversaciones */
-  SELECT 'reservas' AS modulo, COUNT(*) AS sin_responder
+  -- mas_antiguo: el último mensaje del afiliado más viejo entre los hilos que
+  -- esperan respuesta (la antigüedad de la bandeja de mensajes).
+  SELECT 'reservas' AS modulo, COUNT(*) AS sin_responder, MIN(ro.fecha_creacion) AS mas_antiguo
   FROM reserva_observacion ro
   INNER JOIN (
     SELECT reserva_id, MAX(id) AS ultimo_id
@@ -170,7 +191,7 @@ const SQL_CONVERSACIONES = `
   ) ult ON ult.ultimo_id = ro.id
   WHERE ro.usuario_rol = 'afiliado'
   UNION ALL
-  SELECT 'coseguro', COUNT(*)
+  SELECT 'coseguro', COUNT(*), MIN(co.fecha_creacion)
   FROM coseguro_observacion co
   INNER JOIN (
     SELECT solicitud_id, MAX(id) AS ultimo_id
@@ -181,7 +202,7 @@ const SQL_CONVERSACIONES = `
   INNER JOIN coseguro_estado ces ON ces.id = cs.estado_id AND ces.nombre <> 'Solicitud cancelada'
   WHERE co.usuario_rol = 'afiliado'
   UNION ALL
-  SELECT 'traslados', COUNT(*)
+  SELECT 'traslados', COUNT(*), MIN(tro.fecha_creacion)
   FROM traslado_observacion tro
   INNER JOIN (
     SELECT solicitud_id, MAX(id) AS ultimo_id
@@ -192,7 +213,7 @@ const SQL_CONVERSACIONES = `
   INNER JOIN traslado_estado tes ON tes.id = tsol.estado_id AND tes.nombre <> 'Cancelada'
   WHERE tro.usuario_rol = 'afiliado'
   UNION ALL
-  SELECT 'olimpiadas', COUNT(*)
+  SELECT 'olimpiadas', COUNT(*), MIN(oo.fecha_creacion)
   FROM olimpiada_inscripcion_observacion oo
   INNER JOIN (
     SELECT inscripcion_id, MAX(id) AS ultimo_id
@@ -218,9 +239,46 @@ const SQL_ACTIVIDAD_DIARIA = `
     SELECT fecha_creacion FROM traslado_solicitud WHERE eliminado = 0 AND fecha_creacion >= ?
     UNION ALL
     SELECT fecha_creacion FROM noticia WHERE eliminado = 0 AND fecha_creacion >= ?
+    UNION ALL
+    SELECT fecha_creacion FROM olimpiada_inscripcion WHERE eliminado = 0 AND fecha_creacion >= ?
+    UNION ALL
+    SELECT fecha_creacion FROM beneficio_inscripcion WHERE eliminado = 0 AND fecha_creacion >= ?
   ) actividad
   GROUP BY DATE_FORMAT(actividad.fecha_creacion, '%Y-%m-%d')
   ORDER BY dia`;
+
+// Bandejas nuevas: cada una va en una consulta opcional (si falla, el tablero
+// responde igual y ese ítem no se agrega).
+const SQL_FAMILIARES_PENDIENTES = `
+  /* dashboard:familiares_pendientes */
+  SELECT COUNT(*) AS cantidad, MIN(f.fecha_creacion) AS mas_antiguo
+  FROM familiar_cambio_solicitud f
+  WHERE f.estado = 'PENDIENTE'`;
+
+const SQL_OLIMPIADAS_POR_VALIDAR = `
+  /* dashboard:olimpiadas_por_validar */
+  SELECT COUNT(*) AS cantidad, MIN(oi.fecha_creacion) AS mas_antiguo
+  FROM olimpiada_inscripcion oi
+  INNER JOIN olimpiada o ON o.id = oi.olimpiada_id AND o.eliminado = 0
+  WHERE oi.eliminado = 0 AND oi.estado = 'PENDIENTE'`;
+
+// "Por aprobar" cuenta sólo Pendiente (estado_id = 1): Observado (2) espera a
+// la departamental, no al staff central.
+const SQL_BENEFICIOS = `
+  /* dashboard:beneficios */
+  SELECT
+    COALESCE(SUM(b.estado_id = 3 AND b.habilitado = 1
+      AND (b.fecha_vigencia_desde IS NULL OR b.fecha_vigencia_desde <= CURDATE())
+      AND (b.fecha_vigencia_hasta IS NULL OR b.fecha_vigencia_hasta >= CURDATE())), 0) AS publicados,
+    COALESCE(SUM(b.estado_id = 1), 0) AS por_aprobar,
+    MIN(CASE WHEN b.estado_id = 1 THEN b.fecha_creacion END) AS mas_antiguo,
+    (
+      SELECT COUNT(*)
+      FROM beneficio_inscripcion bi
+      WHERE bi.eliminado = 0 AND bi.fecha_creacion >= NOW() - INTERVAL 30 DAY
+    ) AS inscripciones_30_dias
+  FROM beneficio b
+  WHERE b.eliminado = 0`;
 
 const SQL_DESTINOS = `
   /* dashboard:destinos */
@@ -266,7 +324,9 @@ function construirSqlActividadAgrupada(formatoSql) {
     SUM(actividad.modulo = 'usuarios') AS usuarios,
     SUM(actividad.modulo = 'coseguro') AS coseguro,
     SUM(actividad.modulo = 'traslados') AS traslados,
-    SUM(actividad.modulo = 'noticias') AS noticias
+    SUM(actividad.modulo = 'noticias') AS noticias,
+    SUM(actividad.modulo = 'olimpiadas') AS olimpiadas,
+    SUM(actividad.modulo = 'beneficios') AS beneficios
   FROM (
     SELECT fecha_creacion, 'reservas' AS modulo
     FROM reserva
@@ -287,10 +347,21 @@ function construirSqlActividadAgrupada(formatoSql) {
     SELECT fecha_creacion, 'noticias' AS modulo
     FROM noticia
     WHERE eliminado = 0 AND fecha_creacion >= ? AND fecha_creacion < ?
+    UNION ALL
+    SELECT fecha_creacion, 'olimpiadas' AS modulo
+    FROM olimpiada_inscripcion
+    WHERE eliminado = 0 AND fecha_creacion >= ? AND fecha_creacion < ?
+    UNION ALL
+    SELECT fecha_creacion, 'beneficios' AS modulo
+    FROM beneficio_inscripcion
+    WHERE eliminado = 0 AND fecha_creacion >= ? AND fecha_creacion < ?
   ) actividad
   GROUP BY periodo
   ORDER BY periodo`;
 }
+
+// Cantidad de subconsultas de la UNION de actividad (un par desde/hasta cada una).
+const MODULOS_ACTIVIDAD = 7;
 
 function esFechaIso(texto) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(texto || ""))) return false;
@@ -405,6 +476,8 @@ function completarPeriodos(rows, periodos) {
       coseguro: aEntero(row.coseguro),
       traslados: aEntero(row.traslados),
       noticias: aEntero(row.noticias),
+      olimpiadas: aEntero(row.olimpiadas),
+      beneficios: aEntero(row.beneficios),
     };
   });
 }
@@ -418,7 +491,7 @@ function crearServicioActividad({ conexion }) {
     const { config, periodos } = validacion;
     const desdeSql = periodos[0].inicio;
     const hastaSql = aTextoIso(finExclusivoPeriodos(params.granularidad, validacion.fechaHasta));
-    const parametros = [desdeSql, hastaSql, desdeSql, hastaSql, desdeSql, hastaSql, desdeSql, hastaSql, desdeSql, hastaSql];
+    const parametros = Array.from({ length: MODULOS_ACTIVIDAD }, () => [desdeSql, hastaSql]).flat();
     const [rows] = await conexion.promise().query(construirSqlActividadAgrupada(config.formatoSql), parametros);
     return {
       granularidad: params.granularidad,
@@ -467,6 +540,61 @@ function porEstado(rows) {
     nombre: String(row.nombre || ""),
     cantidad: aEntero(row.cantidad),
   }));
+}
+
+// --- Antigüedad de las bandejas ---------------------------------------------
+// mysql2 entrega los DATETIME como Date (la conexión usa -03:00); los textos
+// sin huso que pudieran llegar se leen en hora argentina.
+const HUSO_ARGENTINA = "-03:00";
+
+function aInstante(valor) {
+  if (valor === null || valor === undefined || valor === "") return null;
+  if (valor instanceof Date) return Number.isNaN(valor.getTime()) ? null : valor;
+  const texto = String(valor).trim();
+  const partes = /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?))?$/.exec(texto);
+  const fecha = partes
+    ? new Date(`${partes[1]}T${partes[2] || "00:00:00"}${HUSO_ARGENTINA}`)
+    : new Date(texto);
+  return Number.isNaN(fecha.getTime()) ? null : fecha;
+}
+
+// El más viejo de los valores, en ISO; null si la bandeja está en cero o no
+// hay fecha válida.
+function masAntiguoIso(cantidad, valores) {
+  if (!(cantidad > 0)) return null;
+  let minimo = null;
+  for (const valor of valores) {
+    const instante = aInstante(valor);
+    if (instante && (!minimo || instante.getTime() < minimo.getTime())) minimo = instante;
+  }
+  return minimo ? minimo.toISOString() : null;
+}
+
+// Mismas listas de estados que cantidadEstado: sólo cuentan las filas con
+// solicitudes en ese estado.
+function fechasEstado(rows, nombres, campo = "nombre") {
+  const permitidos = new Set(Array.isArray(nombres) ? nombres : [nombres]);
+  return rows
+    .filter((row) => permitidos.has(row[campo]) && aEntero(row.cantidad) > 0)
+    .map((row) => row.mas_antiguo);
+}
+
+function fechasConversacion(rows, modulo) {
+  return rows
+    .filter((row) => String(row.modulo) === modulo && aEntero(row.sin_responder) > 0)
+    .map((row) => row.mas_antiguo);
+}
+
+// Consulta de una bandeja opcional: si falla (tabla o permiso ausente en un
+// entorno), el tablero responde igual y ese ítem no se agrega.
+async function consultaOpcional(db, sql, params = []) {
+  try {
+    const [rows] = await db.query(sql, params);
+    return Array.isArray(rows) ? rows : [];
+  } catch (error) {
+    console.warn("Consulta opcional del tablero omitida:", error?.code || error?.message);
+    return null;
+  }
 }
 
 function mesActualArgentina(fecha) {
@@ -540,6 +668,8 @@ function completarEvolucion(rows, meses) {
       coseguro: aEntero(row.coseguro),
       traslados: aEntero(row.traslados),
       noticias: aEntero(row.noticias),
+      olimpiadas: aEntero(row.olimpiadas),
+      beneficios: aEntero(row.beneficios),
     };
   });
 }
@@ -559,6 +689,10 @@ function construirRespuesta({
   actividadDiariaRows,
   destinosRows,
   presenciaRows,
+  // Consultas opcionales: null (o ausentes) = la consulta falló → sin ítem.
+  familiaresRows = null,
+  olimpiadasPorValidarRows = null,
+  beneficiosRows = null,
 }) {
   const red = redRows[0] || {};
   const olimpiadas = olimpiadasRows[0] || {};
@@ -613,6 +747,7 @@ function construirRespuesta({
     })),
   };
 
+  const coseguroPorRevisar = ["Solicitud iniciada", "Solicitud revisada", "Aprobado por departamental"];
   const itemsAtencion = [
     {
       modulo: "turismo",
@@ -621,6 +756,7 @@ function construirRespuesta({
       cantidad: turismo.por_aprobar,
       ruta: "/reservas",
       prioridad: PRIORIDAD_ATENCION.ALTA,
+      mas_antiguo: masAntiguoIso(turismo.por_aprobar, fechasEstado(turismoRows, "Verificada")),
     },
     {
       modulo: "coseguro",
@@ -629,6 +765,10 @@ function construirRespuesta({
       cantidad: coseguro.por_revisar + coseguro.pendientes_central,
       ruta: "/coseguro-medico",
       prioridad: PRIORIDAD_ATENCION.ALTA,
+      mas_antiguo: masAntiguoIso(
+        coseguro.por_revisar + coseguro.pendientes_central,
+        fechasEstado(coseguroRows, coseguroPorRevisar)
+      ),
     },
     {
       modulo: "coseguro",
@@ -637,6 +777,10 @@ function construirRespuesta({
       cantidad: coseguro.pendientes_acreditacion,
       ruta: "/coseguro-medico",
       prioridad: PRIORIDAD_ATENCION.MEDIA,
+      mas_antiguo: masAntiguoIso(
+        coseguro.pendientes_acreditacion,
+        fechasEstado(coseguroRows, "Pendiente de acreditación")
+      ),
     },
     {
       modulo: "traslados",
@@ -645,6 +789,7 @@ function construirRespuesta({
       cantidad: traslados.activos,
       ruta: "/traslados-admin",
       prioridad: PRIORIDAD_ATENCION.MEDIA,
+      mas_antiguo: masAntiguoIso(traslados.activos, fechasEstado(trasladosRows, "Iniciada")),
     },
     {
       modulo: "noticias",
@@ -653,7 +798,58 @@ function construirRespuesta({
       cantidad: noticias.borradores,
       ruta: "/noticias-admin",
       prioridad: PRIORIDAD_ATENCION.MEDIA,
+      mas_antiguo: masAntiguoIso(noticias.borradores, fechasEstado(noticiasRows, "BORRADOR", "estado")),
     },
+  ];
+
+  if (Array.isArray(familiaresRows)) {
+    const fila = familiaresRows[0] || {};
+    const cantidad = aEntero(fila.cantidad);
+    itemsAtencion.push({
+      modulo: "familiares",
+      clave: "familiares_por_aprobar",
+      etiqueta: "Cambios de familiares por aprobar",
+      cantidad,
+      ruta: "/cambios-familiares",
+      prioridad: PRIORIDAD_ATENCION.ALTA,
+      mas_antiguo: masAntiguoIso(cantidad, [fila.mas_antiguo]),
+    });
+  }
+
+  if (Array.isArray(olimpiadasPorValidarRows)) {
+    const fila = olimpiadasPorValidarRows[0] || {};
+    const cantidad = aEntero(fila.cantidad);
+    itemsAtencion.push({
+      modulo: "olimpiadas",
+      clave: "olimpiadas_por_validar",
+      etiqueta: "Inscripciones por validar",
+      cantidad,
+      ruta: "/olimpiadas-admin",
+      prioridad: PRIORIDAD_ATENCION.ALTA,
+      mas_antiguo: masAntiguoIso(cantidad, [fila.mas_antiguo]),
+    });
+  }
+
+  let beneficios = null;
+  if (Array.isArray(beneficiosRows)) {
+    const fila = beneficiosRows[0] || {};
+    beneficios = {
+      publicados: aEntero(fila.publicados),
+      por_aprobar: aEntero(fila.por_aprobar),
+      inscripciones_30_dias: aEntero(fila.inscripciones_30_dias),
+    };
+    itemsAtencion.push({
+      modulo: "beneficios",
+      clave: "beneficios_por_aprobar",
+      etiqueta: "Beneficios por aprobar",
+      cantidad: beneficios.por_aprobar,
+      ruta: "/beneficios-admin",
+      prioridad: PRIORIDAD_ATENCION.ALTA,
+      mas_antiguo: masAntiguoIso(beneficios.por_aprobar, [fila.mas_antiguo]),
+    });
+  }
+
+  itemsAtencion.push(
     {
       modulo: "turismo",
       clave: "chat_reservas",
@@ -661,6 +857,7 @@ function construirRespuesta({
       cantidad: conversaciones.reservas,
       ruta: "/reservas",
       prioridad: PRIORIDAD_ATENCION.MEDIA,
+      mas_antiguo: masAntiguoIso(conversaciones.reservas, fechasConversacion(conversacionesRows, "reservas")),
     },
     {
       modulo: "coseguro",
@@ -669,6 +866,7 @@ function construirRespuesta({
       cantidad: conversaciones.coseguro,
       ruta: "/coseguro-medico",
       prioridad: PRIORIDAD_ATENCION.MEDIA,
+      mas_antiguo: masAntiguoIso(conversaciones.coseguro, fechasConversacion(conversacionesRows, "coseguro")),
     },
     {
       modulo: "traslados",
@@ -677,6 +875,7 @@ function construirRespuesta({
       cantidad: conversaciones.traslados,
       ruta: "/traslados-admin",
       prioridad: PRIORIDAD_ATENCION.MEDIA,
+      mas_antiguo: masAntiguoIso(conversaciones.traslados, fechasConversacion(conversacionesRows, "traslados")),
     },
     {
       modulo: "olimpiadas",
@@ -685,8 +884,9 @@ function construirRespuesta({
       cantidad: conversaciones.olimpiadas,
       ruta: "/olimpiadas-admin",
       prioridad: PRIORIDAD_ATENCION.MEDIA,
-    },
-  ];
+      mas_antiguo: masAntiguoIso(conversaciones.olimpiadas, fechasConversacion(conversacionesRows, "olimpiadas")),
+    }
+  );
 
   return {
     generado_en: generadoEn.toISOString(),
@@ -702,6 +902,11 @@ function construirRespuesta({
         nuevos_30_dias: aEntero(red.usuarios_nuevos_30_dias),
         familiares: aEntero(red.usuarios_familiares),
         staff: aEntero(red.usuarios_staff),
+        composicion: {
+          titulares: aEntero(red.composicion_titulares),
+          familiares: aEntero(red.composicion_familiares),
+          personal: aEntero(red.composicion_personal),
+        },
       },
       departamentales: {
         total: aEntero(red.departamentales_total),
@@ -723,6 +928,7 @@ function construirRespuesta({
         inscripciones_activas: aEntero(olimpiadas.inscripciones_activas),
         actividad_30_dias: aEntero(olimpiadas.actividad_30_dias),
       },
+      ...(beneficios ? { beneficios } : {}),
     },
     evolucion: completarEvolucion(evolucionRows, meses),
     actividad_diaria: completarActividadDiaria(actividadDiariaRows, dias),
@@ -745,18 +951,25 @@ function crearServicioDashboard({ conexion, ahora = () => new Date(), cacheMs = 
     const desde = `${meses[0]}-01`;
     const desdeDia = dias[0];
     const db = conexion.promise();
-    const resultados = await Promise.all([
-      db.query(SQL_RED),
-      db.query(SQL_TURISMO),
-      db.query(SQL_COSEGURO),
-      db.query(SQL_TRASLADOS),
-      db.query(SQL_NOTICIAS),
-      db.query(SQL_OLIMPIADAS),
-      db.query(SQL_EVOLUCION, [desde, desde, desde, desde, desde]),
-      db.query(SQL_CONVERSACIONES),
-      db.query(SQL_ACTIVIDAD_DIARIA, [desdeDia, desdeDia, desdeDia, desdeDia, desdeDia]),
-      db.query(SQL_DESTINOS),
-      db.query(SQL_PRESENCIA),
+    const [resultados, opcionales] = await Promise.all([
+      Promise.all([
+        db.query(SQL_RED),
+        db.query(SQL_TURISMO),
+        db.query(SQL_COSEGURO),
+        db.query(SQL_TRASLADOS),
+        db.query(SQL_NOTICIAS),
+        db.query(SQL_OLIMPIADAS),
+        db.query(SQL_EVOLUCION, Array(MODULOS_ACTIVIDAD).fill(desde)),
+        db.query(SQL_CONVERSACIONES),
+        db.query(SQL_ACTIVIDAD_DIARIA, Array(MODULOS_ACTIVIDAD).fill(desdeDia)),
+        db.query(SQL_DESTINOS),
+        db.query(SQL_PRESENCIA),
+      ]),
+      Promise.all([
+        consultaOpcional(db, SQL_FAMILIARES_PENDIENTES),
+        consultaOpcional(db, SQL_OLIMPIADAS_POR_VALIDAR),
+        consultaOpcional(db, SQL_BENEFICIOS),
+      ]),
     ]);
 
     return construirRespuesta({
@@ -774,6 +987,9 @@ function crearServicioDashboard({ conexion, ahora = () => new Date(), cacheMs = 
       actividadDiariaRows: resultados[8][0],
       destinosRows: resultados[9][0],
       presenciaRows: resultados[10][0],
+      familiaresRows: opcionales[0],
+      olimpiadasPorValidarRows: opcionales[1],
+      beneficiosRows: opcionales[2],
     });
   }
 
@@ -811,7 +1027,12 @@ module.exports = {
     obtenerVentanaDias,
     completarActividadDiaria,
     resumirConversaciones,
+    consultaOpcional,
+    masAntiguoIso,
     SQL_EVOLUCION,
     SQL_ACTIVIDAD_DIARIA,
+    SQL_FAMILIARES_PENDIENTES,
+    SQL_OLIMPIADAS_POR_VALIDAR,
+    SQL_BENEFICIOS,
   },
 };
