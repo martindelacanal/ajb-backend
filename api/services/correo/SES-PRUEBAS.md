@@ -1,5 +1,17 @@
 # SES de pruebas y cambio al dominio definitivo
 
+## Decisión vigente al 07/10/2026
+
+- Beneficios debe enviar correos a los destinatarios configurados por el cliente,
+  manteniendo por ahora el remitente `no-responder@miajbpruebas.com.ar`.
+- Las reservas familiares utilizan solo notificaciones internas. Se retiraron
+  el envío SMTP y su worker de reintentos; se conservan las columnas históricas.
+- El servidor tiene `MAIL_ENABLED=true`, `MAIL_TEST_MODE=false` y redirección vacía.
+  Esta configuración no elimina las restricciones de AWS: SES continúa en sandbox
+  hasta que AWS apruebe el acceso a producción en `sa-east-1`.
+- Los estados de agosto documentados a continuación son antecedentes; no cambian
+  esta decisión ni autorizan tocar el dominio definitivo o su DNS.
+
 Decision actualizada el 28/08/2026: usar `miajbpruebas.com.ar`, cuyo registro inicio
 Martin en NIC Argentina, con DNS en Route 53. No depender de cambios de Cesar o
 Maxi para probar el nuevo sistema. `miajb.org.ar` sigue siendo el dominio final.

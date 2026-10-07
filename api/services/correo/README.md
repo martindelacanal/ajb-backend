@@ -10,6 +10,17 @@ La estrategia vigente y las plantillas de configuración por entorno están en
 [`SES-PRUEBAS.md`](./SES-PRUEBAS.md). Cambiar los ejemplos del repositorio no
 activa el correo: hay que verificar SES, aplicar el `.env` y validar la entrega.
 
+## Alcance por módulo
+
+- **Beneficios:** correo de confirmación al afiliado y aviso a la institución
+  cuando el beneficio tiene una dirección de aviso configurada. Se admiten
+  direcciones válidas de cualquier dominio; la entrega depende de SES y sus permisos.
+- **Reservas familiares:** únicamente notificaciones internas para solicitar la
+  aprobación del titular y comunicar su decisión. No se envían correos ni se
+  reintentan los registros históricos de correo de estas solicitudes.
+
+Las notificaciones internas no dependen de las variables `MAIL_*`.
+
 ## Archivos
 
 | Archivo | Rol |

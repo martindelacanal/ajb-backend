@@ -105,7 +105,7 @@ const {
 } = require("../services/descuentos-reserva");
 const {
   ESTADO_PENDIENTE_TITULAR, MENSAJE_CBU, esFamiliar, obtenerGrupoReserva, exigirCbu,
-  validarAdultoResponsable, registrarSolicitudTitular, enviarCorreoSolicitudTitular,
+  validarAdultoResponsable, registrarSolicitudTitular,
   asegurarSinSolicitudTitularPendiente, decidirSolicitudTitular,
 } = require("../services/reservas-familiares");
 const {
@@ -4404,7 +4404,6 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
         titularId: grupoReserva.titular.id, estadoDestino: "Solicitud sorteo" });
     }
     await connection.commit();
-    if (requiereAprobacionTitular) void enviarCorreoSolicitudTitular(mysqlConnection.promise(), reservaId).catch(registrarErrorRuta);
     res.status(201).json({
       id: reservaId,
       numero_reserva: `${reservaId}`,
@@ -10102,10 +10101,6 @@ router.post("/reserva", verifyToken, async (req, res) => {
           estadoRespuesta = ESTADO_PENDIENTE_TITULAR;
         }
         await connection.commit();
-        if (requiereAprobacionTitular) {
-          void enviarCorreoSolicitudTitular(mysqlConnection.promise(), reservaId)
-            .catch((error) => registrarErrorRuta(error));
-        }
         emitirInvalidacionDisponibilidad(
           req,
           holdReservaValidado?.hold || {
@@ -10355,7 +10350,6 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
         titularId: grupoReserva.titular.id, estadoDestino: "Solicitud convenio" });
     }
     await connection.commit();
-    if (requiereAprobacionTitular) void enviarCorreoSolicitudTitular(mysqlConnection.promise(), reservaId).catch(registrarErrorRuta);
 
     res.status(201).json({
       id: reservaId,
