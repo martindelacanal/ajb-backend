@@ -135,7 +135,9 @@ function participantFingerprint(participant) {
 function pricePolicyForType(typeName, baseCents, highSeason = false) {
   const name = normalizeName(typeName);
   let discountBasisPoints = 0;
-  if (name.includes("menores de 2") || name.includes("bebe")) discountBasisPoints = 10_000;
+  if (name.includes("menores de 2") || name.includes("bebe")) {
+    return { priceCents: 0, usesPercentage: false, discountPercent: 0 };
+  }
   else if (name.includes("afiliad")) discountBasisPoints = highSeason ? 2_500 : 3_500;
   else if (name.includes("familiar")) discountBasisPoints = highSeason ? 1_000 : 2_000;
   const priceCents = aplicarDescuentoEnPuntosBase(baseCents, discountBasisPoints);
@@ -214,15 +216,35 @@ function resolveAdditionalSourceTariffId(low) {
   return asPositiveId(participant.tariffId, "tarifa fuente del descuento del adicional");
 }
 
+function ageBandsForType(type) {
+  const name = normalizeName(type.nombre);
+  return Number(type.id) === 5 || name.includes("menores de 2") || name.includes("bebe")
+    ? [{ ageMin: 0, ageMax: 1 }]
+    : [{ ageMin: 2, ageMax: 17 }, { ageMin: 18, ageMax: null }];
+}
+
+function tariffSpecKey(spec) {
+  return `${spec.resourceId}:${spec.typeId}:${spec.ageMin}:${spec.ageMax ?? ""}`;
+}
+
+function tariffForParticipant(specs, participant) {
+  const matches = specs.filter((spec) => spec.typeId === participant.typeId &&
+    participant.age >= spec.ageMin && (spec.ageMax === null || participant.age <= spec.ageMax));
+  if (matches.length !== 1) throw new Error("Falta una tarifa demo unica para la edad del participante");
+  return matches[0];
+}
+
 function buildTariffSpecs(types, resourceIds, regimenId, start, end, baseCents, highSeason = false) {
-  return resourceIds.flatMap((resourceId) => types.map((type) => ({
+  return resourceIds.flatMap((resourceId) => types.flatMap((type) => ageBandsForType(type).map((band) => ({
     resourceId: asPositiveId(resourceId, "recurso"),
     typeId: asPositiveId(type.id, "tipo de persona"),
     regimenId: asPositiveId(regimenId, "regimen"),
     start,
     end,
-    ...pricePolicyForType(type.nombre, baseCents, highSeason),
-  })));
+    ...band,
+    ...(band.ageMin === 0 ? { priceCents: 0, usesPercentage: false, discountPercent: 0 }
+      : pricePolicyForType(type.nombre, baseCents, highSeason)),
+  }))));
 }
 
 function buildDefaultSchedule(today, lowStart = null) {
@@ -305,7 +327,7 @@ function publicManifest(plan) {
       end: plan.high.end,
       resource_count: plan.high.resourceIds.length,
       tariff_rows: plan.high.tariffSpecs.length,
-      includes_free_minor_rate: plan.high.tariffSpecs.some((spec) => spec.priceCents === 0 && spec.discountPercent === 100),
+      includes_free_minor_rate: plan.high.tariffSpecs.some((spec) => spec.priceCents === 0 && spec.ageMin === 0 && spec.ageMax === 1),
     },
     raffle: {
       action: plan.high.action,
@@ -584,19 +606,19 @@ async function tryReusableSeason(connection, season, context) {
     const end = sumarDiasFechaCivil(start, LOW_NIGHTS);
     if (end > season.fecha_fin) break;
     const [matrixRows] = await connection.query(
-      `SELECT tipo_persona_id, COUNT(*) AS total
+      `SELECT tipo_persona_id, edad_minima, edad_maxima
          FROM tarifa
         WHERE temporada_tarifa_id = ? AND recurso_id = ? AND regimen_id = ?
-          AND edad_minima IS NULL AND edad_maxima IS NULL
           AND fecha_inicio <= ? AND fecha_fin >= ?
-        GROUP BY tipo_persona_id
-        ORDER BY tipo_persona_id`,
+        ORDER BY tipo_persona_id, edad_minima`,
       [season.id, context.resourceId, context.regimenId, start, end]
     );
-    const matrix = new Map(matrixRows.map((row) => [Number(row.tipo_persona_id), Number(row.total)]));
+    const matrix = new Set(matrixRows.map((row) => `${row.tipo_persona_id}:${row.edad_minima}:${row.edad_maxima ?? ""}`));
+    const expected = context.types.flatMap((type) => ageBandsForType(type)
+      .map((band) => `${type.id}:${band.ageMin}:${band.ageMax ?? ""}`));
     if (
-      matrix.size !== context.types.length ||
-      context.types.some((type) => matrix.get(type.id) !== 1)
+      matrix.size !== matrixRows.length || matrix.size !== expected.length ||
+      expected.some((key) => !matrix.has(key))
     ) continue;
     const participants = await loadEligibleParticipants(
       connection,
@@ -773,10 +795,8 @@ async function planNewLowDataset(connection, catalog, today, forUpdate) {
     LOW_BASE_CENTS,
     false
   );
-  const specByType = new Map(specs.map((spec) => [spec.typeId, spec]));
   const ratedParticipants = participants.map((participant) => {
-    const spec = specByType.get(participant.typeId);
-    if (!spec) throw new Error("Falta una tarifa demo para un tipo de participante");
+    const spec = tariffForParticipant(specs, participant);
     return { ...participant, tariffId: null, ...spec };
   });
   return composeLowPlan({
@@ -1008,18 +1028,21 @@ async function validateExistingHigh(connection, catalog, roots, today, forUpdate
     throw new Error("El sorteo demo contiene recursos ajenos a Cabañas");
   }
   const [tariffRows] = await connection.query(
-    `SELECT recurso_id, tipo_persona_id, precio, usa_porcentaje, porcentaje_descuento,
+    `SELECT recurso_id, tipo_persona_id, edad_minima, edad_maxima, precio, usa_porcentaje, porcentaje_descuento,
             DATE_FORMAT(fecha_inicio, '%Y-%m-%d') fecha_inicio,
             DATE_FORMAT(fecha_fin, '%Y-%m-%d') fecha_fin
        FROM tarifa WHERE temporada_tarifa_id = ? AND regimen_id = ? ORDER BY recurso_id, tipo_persona_id${suffix}`,
     [roots.season.id, catalog.regimen.id]
   );
-  if (tariffRows.length !== resourceIds.length * catalog.types.length) {
+  const bandsPerResource = catalog.types.reduce((total, type) => total + ageBandsForType(type).length, 0);
+  if (tariffRows.length !== resourceIds.length * bandsPerResource) {
     throw new Error("La matriz de tarifas del sorteo demo no esta completa");
   }
   const tariffSpecs = tariffRows.map((row) => ({
     resourceId: asPositiveId(row.recurso_id),
     typeId: asPositiveId(row.tipo_persona_id),
+    ageMin: row.edad_minima === null ? null : Number(row.edad_minima),
+    ageMax: row.edad_maxima === null ? null : Number(row.edad_maxima),
     regimenId: catalog.regimen.id,
     start: row.fecha_inicio,
     end: row.fecha_fin,
@@ -1027,9 +1050,9 @@ async function validateExistingHigh(connection, catalog, roots, today, forUpdate
     usesPercentage: Number(row.usa_porcentaje) === 1,
     discountPercent: Number(row.porcentaje_descuento || 0),
   }));
-  const matrixKeys = new Set(tariffSpecs.map((spec) => `${spec.resourceId}:${spec.typeId}`));
+  const matrixKeys = new Set(tariffSpecs.map(tariffSpecKey));
   const expectedKeys = new Set(resourceIds.flatMap((resourceId) =>
-    catalog.types.map((type) => `${resourceId}:${type.id}`)
+    catalog.types.flatMap((type) => ageBandsForType(type).map((band) => tariffSpecKey({ resourceId, typeId: type.id, ...band })))
   ));
   const minorRows = tariffSpecs.filter((spec) => spec.typeId === catalog.minorTypeId);
   if (
@@ -1038,7 +1061,7 @@ async function validateExistingHigh(connection, catalog, roots, today, forUpdate
     [...expectedKeys].some((key) => !matrixKeys.has(key)) ||
     tariffSpecs.some((spec) => spec.priceCents === null || spec.start !== block.fecha_inicio || spec.end !== block.fecha_fin) ||
     minorRows.length !== resourceIds.length ||
-    minorRows.some((spec) => spec.priceCents !== 0 || spec.discountPercent !== 100 || !spec.usesPercentage)
+    minorRows.some((spec) => spec.priceCents !== 0 || spec.discountPercent !== 0 || spec.usesPercentage)
   ) {
     throw new Error("La matriz del sorteo demo no conserva sus importes y rangos");
   }
@@ -1213,12 +1236,14 @@ async function insertSeasonAndRates(connection, {
          (recurso_id, tipo_persona_id, regimen_id, temporada_tarifa_id,
           edad_minima, edad_maxima, precio, fecha_inicio, fecha_fin,
           precio_por_persona, usa_porcentaje, porcentaje_descuento, parcelas_disponibles)
-       VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, 'Y', ?, ?, NULL)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Y', ?, ?, NULL)`,
       [
         spec.resourceId,
         spec.typeId,
         spec.regimenId,
         seasonId,
+        spec.ageMin,
+        spec.ageMax,
         money(spec.priceCents),
         start,
         end,
@@ -1226,7 +1251,7 @@ async function insertSeasonAndRates(connection, {
         spec.discountPercent,
       ]
     );
-    tariffIds.set(`${spec.resourceId}:${spec.typeId}`, asPositiveId(result.insertId, "tarifa creada"));
+    tariffIds.set(tariffSpecKey(spec), asPositiveId(result.insertId, "tarifa creada"));
   }
   let additionalTariffId = null;
   if (additional) {
@@ -1264,7 +1289,8 @@ async function applyLowDataset(connection, plan) {
     low.seasonId = created.seasonId;
     low.additional.id = created.additionalTariffId;
     for (const participant of low.participants) {
-      participant.tariffId = created.tariffIds.get(`${low.resourceId}:${participant.typeId}`);
+      const spec = tariffForParticipant(low.newTariffSpecs, participant);
+      participant.tariffId = created.tariffIds.get(tariffSpecKey(spec));
     }
   }
 
@@ -1508,7 +1534,8 @@ async function postAssert(connection, plan) {
             (SELECT COUNT(*) FROM temporada_tipo_persona_porcentaje p
               WHERE p.temporada_tarifa_id = bf.temporada_tarifa_id) percentage_count,
             (SELECT COUNT(*) FROM tarifa t WHERE t.temporada_tarifa_id = bf.temporada_tarifa_id
-              AND t.tipo_persona_id = ? AND t.precio = 0 AND t.usa_porcentaje = 1 AND t.porcentaje_descuento = 100) free_minor_count
+              AND t.tipo_persona_id = ? AND t.edad_minima = 0 AND t.edad_maxima = 1
+              AND t.precio = 0 AND t.usa_porcentaje = 0 AND t.porcentaje_descuento = 0) free_minor_count
        FROM sorteo s INNER JOIN bloque_fecha bf ON bf.sorteo_id = s.id
       WHERE s.nombre = ? AND bf.nombre = ?`,
     [plan.catalog.minorTypeId, RAFFLE_NAME, BLOCK_NAME]
@@ -1518,7 +1545,7 @@ async function postAssert(connection, plan) {
     !high || high.sorteo_estado !== "ACTIVO" || high.bloque_estado !== "ACTIVO" ||
     Number(high.resource_count) !== plan.high.resourceIds.length ||
     Number(high.available_count) !== plan.high.resourceIds.length ||
-    Number(high.tariff_count) !== plan.high.resourceIds.length * plan.catalog.types.length ||
+    Number(high.tariff_count) !== plan.high.tariffSpecs.length ||
     Number(high.percentage_count) !== plan.catalog.types.length ||
     Number(high.free_minor_count) !== plan.high.resourceIds.length
   ) {
@@ -1628,17 +1655,21 @@ module.exports = {
   LEGACY_SEASON_NAME,
   LOW_BASE_CENTS,
   MARKER,
+  ageBandsForType,
   assertZeroOrOne,
   buildDefaultSchedule,
   buildTariffSpecs,
   canonicalAdditionalPricing,
   fingerprint,
+  insertSeasonAndRates,
   main,
   manifestHash,
   naturalNameMatches,
   normalizeName,
   pricePolicyForType,
   publicManifest,
+  tariffForParticipant,
+  tariffSpecKey,
   validateApplyArguments,
 };
 

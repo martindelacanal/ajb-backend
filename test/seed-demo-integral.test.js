@@ -14,11 +14,14 @@ const {
   buildDefaultSchedule,
   buildTariffSpecs,
   canonicalAdditionalPricing,
+  insertSeasonAndRates,
   manifestHash,
   naturalNameMatches,
   normalizeName,
   pricePolicyForType,
   publicManifest,
+  tariffForParticipant,
+  tariffSpecKey,
   validateApplyArguments,
 } = require("../scripts/seed-demo-integral");
 
@@ -68,7 +71,7 @@ function fakePlan() {
       enrollmentEnd: "2026-08-16",
       resourceIds: [12, 13],
       tariffSpecs: [
-        { priceCents: 0, discountPercent: 100 },
+        { priceCents: 0, discountPercent: 0, ageMin: 0, ageMax: 1 },
         { priceCents: 4_875_000, discountPercent: 25 },
       ],
     },
@@ -145,8 +148,8 @@ test("las tarifas porcentuales usan centavos y 100 por ciento produce cero", () 
   });
   assert.deepEqual(pricePolicyForType("Menores de 2 años", HIGH_BASE_CENTS, true), {
     priceCents: 0,
-    usesPercentage: true,
-    discountPercent: 100,
+    usesPercentage: false,
+    discountPercent: 0,
   });
 });
 
@@ -202,7 +205,7 @@ test("el adicional replica el mayor descuento canonico por noche y conserva su t
   );
 });
 
-test("construye la matriz completa por recurso y tipo", () => {
+test("construye la matriz completa por recurso, tipo y categoría etaria", () => {
   const rows = buildTariffSpecs(
     [
       { id: 1, nombre: "Afiliados" },
@@ -215,10 +218,45 @@ test("construye la matriz completa por recurso y tipo", () => {
     HIGH_BASE_CENTS,
     true
   );
-  assert.equal(rows.length, 4);
+  assert.equal(rows.length, 6);
   assert.deepEqual(new Set(rows.map((row) => row.resourceId)), new Set([11, 12]));
   assert.equal(rows.filter((row) => row.typeId === 5 && row.priceCents === 0).length, 2);
   assert.ok(rows.every((row) => row.regimenId === 3));
+  for (const resourceId of [11, 12]) {
+    assert.deepEqual(rows.filter((row) => row.resourceId === resourceId).map((row) =>
+      [row.typeId, row.ageMin, row.ageMax]), [[1, 2, 17], [1, 18, null], [5, 0, 1]]);
+  }
+});
+
+test("selecciona tarifas diferentes para 1, 2, 17 y 18 años y reconoce alias de bebés", () => {
+  const specs = buildTariffSpecs([{ id: 1, nombre: "Afiliado" }, { id: 5, nombre: "Menores de 2 años" },
+    { id: 9, nombre: "Bebés" }], [11], 3, "2026-09-01", "2026-09-06", LOW_BASE_CENTS);
+  const get = (typeId, age) => tariffForParticipant(specs, { typeId, age });
+  assert.equal(get(5, 1).ageMin, 0);
+  assert.equal(get(1, 2).ageMin, 2);
+  assert.equal(get(1, 17).ageMax, 17);
+  assert.equal(get(1, 18).ageMin, 18);
+  assert.equal(get(9, 1).priceCents, 0);
+  assert.equal(get(9, 1).usesPercentage, false);
+  assert.throws(() => get(5, 2), /edad del participante/);
+  assert.throws(() => get(1, 1), /edad del participante/);
+});
+
+test("persistencia del seed conserva los rangos y devuelve IDs por banda sin colisiones", async () => {
+  const specs = buildTariffSpecs([{ id: 1, nombre: "Afiliado" }, { id: 5, nombre: "Menores de 2 años" }],
+    [11], 3, "2026-09-01", "2026-09-06", LOW_BASE_CENTS);
+  const inserted = [];
+  const connection = { async query(sql, params) {
+    if (/INSERT INTO tarifa\s/.test(sql)) inserted.push(params);
+    return [{ insertId: inserted.length + 100 }];
+  } };
+  const result = await insertSeasonAndRates(connection, {
+    name: "Demo", origin: "GENERAL", start: "2026-09-01", end: "2026-09-06",
+    tariffSpecs: specs, types: [{ id: 1 }, { id: 5 }], actorId: 1,
+  });
+  assert.deepEqual(inserted.map((params) => params.slice(4, 6)), [[2, 17], [18, null], [0, 1]]);
+  assert.equal(result.tariffIds.size, 3);
+  assert.notEqual(result.tariffIds.get(tariffSpecKey(specs[0])), result.tariffIds.get(tariffSpecKey(specs[1])));
 });
 
 test("las fechas civiles conservan noches, ventanas y orden cronologico", () => {

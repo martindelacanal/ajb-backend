@@ -143,7 +143,7 @@ test("identifica a los menores de 2 años por tipo de persona", () => {
 });
 
 test("la cotizacion de adicionales de user.js delega en el servicio", () => {
-  const fuente = fs.readFileSync(path.resolve(__dirname, "../api/routes/user.js"), "utf8");
+  const fuente = fs.readFileSync(path.resolve(__dirname, "../api/routes/user.js"), "utf8").replace(/\r\n/g, "\n");
   assert.match(fuente, /require\("\.\.\/services\/descuento-adicionales"\)/);
   const inicio = fuente.indexOf("function obtenerMejorDescuentoDia(");
   assert.ok(inicio > 0);

@@ -104,6 +104,7 @@ const {
   resolverDescuentosSolicitados,
 } = require("../services/descuentos-reserva");
 const { obtenerMejorDescuentoAdicionalesDia } = require("../services/descuento-adicionales");
+const { validarRangosEdadTemporada } = require("../services/temporadas-edades");
 const {
   actualizarDatosUsuario,
   autorizarEdicionUsuario,
@@ -15501,6 +15502,8 @@ function validarConfiguracionTemporada({
             }
             tiposVistos.add(tipoPersonaId);
             tipoPersona.tipoPersonaId = tipoPersonaId;
+            const errorEdades = validarRangosEdadTemporada(tipoPersonaId, tipoPersona.rangosEdad);
+            if (errorEdades) return `El recurso ${recursoId}: ${errorEdades}`;
             const edades = [];
             for (const rangoEdad of tipoPersona.rangosEdad) {
               const minimoRaw = rangoEdad?.edadMinima ?? rangoEdad?.edad_minima;
@@ -17134,9 +17137,9 @@ function validarYNormalizarFlujoDescuentoEscalonado(body) {
         }
         edadMaxima = edadMaximaResultado.value;
 
-        if (edadMaxima <= edadMinima) {
+        if (edadMaxima < edadMinima) {
           return {
-            error: `${prefijoRango}.edad_maxima debe ser mayor que edad_minima`,
+            error: `${prefijoRango}.edad_maxima debe ser mayor o igual que edad_minima`,
           };
         }
       }
@@ -17149,6 +17152,9 @@ function validarYNormalizarFlujoDescuentoEscalonado(body) {
     }
 
     rangosNormalizados.sort((a, b) => a.orden - b.orden);
+
+    const errorEdades = validarRangosEdadTemporada(tipoPersonaIdResultado.value, rangosNormalizados);
+    if (errorEdades) return { error: `${prefijoRegla}: ${errorEdades}` };
 
     for (let ordenEsperado = 0; ordenEsperado < rangosNormalizados.length; ordenEsperado++) {
       if (rangosNormalizados[ordenEsperado].orden !== ordenEsperado) {
