@@ -53,8 +53,11 @@ async function resolverAccesoFamiliar(usuario, db) {
 }
 
 function rutaPermitidaFamiliar(req) {
-  const ruta = String(req.path || req.url || '').split('?')[0];
-  if ((req.method === 'POST' && ruta === '/familiares') || /^\/familiares\/\d+\/vinculo\/?$/.test(ruta)) return false;
+  // Express admite rutas sin distinguir mayúsculas y con barra final. Aplicar
+  // la misma normalización evita que esas variantes salteen las exclusiones.
+  const ruta = String(req.path || req.url || '').split('?')[0].replace(/\/+$/, '').toLowerCase();
+  const metodo = String(req.method || '').toUpperCase();
+  if ((metodo === 'POST' && ruta === '/familiares') || /^\/familiares\/\d+\/vinculo$/.test(ruta)) return false;
   // Los handlers conservan sus controles de propiedad y ámbito de grupo.
   return /^\/(?:sesion\/permisos|configuracion\/usuario(?:\/\d+)?|usuario|notificaciones(?:\/.*)?|mis-gestiones(?:\/catalogos)?|turismo(?:\/.*)?|reserva(?:\/.*)?|reservas\/aprobaciones-titular|servicios(?:\/.*)?|lugares|recursos|adicionales|regimen|tipo_persona|parentesco|acompaniantes(?:\/\d+)?|tabla\/acompaniantes|familiares(?:\/.*)?|convenios-hoteleros(?:\/.*)?|sorteos(?:\/.*)?|filtros\/para-recursos|descuentos(?:\/.*)?|observaciones\/turismo\/\d+\/lectura|webauthn(?:\/.*)?)\/?$/.test(ruta);
 }

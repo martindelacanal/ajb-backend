@@ -1,7 +1,7 @@
 "use strict";
 
 const { calcularEdadEnFecha, normalizarFechaCivil } = require("./valores-dominio");
-const { enviarCorreoPlantilla, urlAplicacion } = require("./correo");
+const { enviarCorreoPlantilla, urlAplicacion, estadoCorreo } = require("./correo");
 const { obtenerFechaCivilArgentina } = require("./valores-dominio");
 const ESTADO_PENDIENTE_TITULAR = "Pendiente_Aprobacion_Titular";
 const MENSAJE_CBU = "Para realizar reservas de hospedaje es obligatorio tener cargado tu CBU en tu perfil. Haz clic aquí para actualizar tus datos bancarios";
@@ -164,6 +164,11 @@ async function decidirSolicitudTitular(connection, { reservaId, actorId, accion 
 
 async function enviarCorreoSolicitudTitular(db, reservaId) {
   // Outbox durable: la solicitud se confirma primero; una caída SMTP se reintenta.
+  // Un envío desviado a pruebas no entrega la aprobación al titular. Conservar
+  // la fila pendiente, sin consumir el intento ni marcarla como entregada, para
+  // que el worker la retome cuando vuelva la configuración de envíos reales.
+  const configuracion = estadoCorreo();
+  if (configuracion.modoPruebas || configuracion.redirigirA) return;
   const [rows] = await db.query(
     `SELECT a.reserva_id, u.email, u.nombre, r.fecha_inicio, r.fecha_fin
        FROM reserva_aprobacion_titular a

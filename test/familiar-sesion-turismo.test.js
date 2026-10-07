@@ -39,8 +39,12 @@ test('revocar vínculo familiar invalida un JWT anterior en la siguiente petici�
 });
 
 test('la cuenta familiar invitada no habilita módulos ajenos a turismo', () => {
-  assert.equal(rutaPermitidaFamiliar({ method: 'POST', path: '/familiares' }), false);
-  assert.equal(rutaPermitidaFamiliar({ method: 'PUT', path: '/familiares/42/vinculo' }), false);
+  for (const path of ['/familiares', '/familiares/', '/Familiares', '/FAMILIARES/']) {
+    assert.equal(rutaPermitidaFamiliar({ method: 'POST', path }), false, path);
+  }
+  for (const path of ['/familiares/42/vinculo', '/familiares/42/vinculo/', '/FAMILIARES/42/VINCULO/']) {
+    assert.equal(rutaPermitidaFamiliar({ method: 'PUT', path }), false, path);
+  }
   for (const path of ['/credencial-digital', '/beneficios/1/inscripciones', '/traslados', '/coseguro/solicitudes', '/admin/turismo/politicas-cancelacion']) {
     assert.equal(rutaPermitidaFamiliar({ path }), false, path);
   }
