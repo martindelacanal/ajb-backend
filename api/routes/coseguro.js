@@ -2206,6 +2206,92 @@ const ETIQUETAS_CAMPOS = {
   periodo_prestacion: "Período de la prestación",
 };
 
+function parsearCamposCentral(body, { periodoOriginal = null } = {}) {
+  const campos = {};
+  if (body.importe_autorizado !== undefined) {
+    const vacio = !valorOpcionalInformado(body.importe_autorizado);
+    campos.importe_autorizado = vacio ? null : normalizarImporte(body.importe_autorizado);
+    if (!vacio && campos.importe_autorizado === null) {
+      throw crearErrorHttp("El importe autorizado debe ser un monto no negativo, con hasta dos decimales", 400);
+    }
+  }
+  for (const campo of ["imputacion_id", "imputacion_detalle_id"]) {
+    if (body[campo] !== undefined) {
+      campos[campo] = normalizarIdOpcional(body[campo], ETIQUETAS_CAMPOS[campo]);
+    }
+  }
+  if (body.periodo_prestacion !== undefined) {
+    const periodo = String(body.periodo_prestacion || "").trim();
+    if (periodo !== "" && !/^\d{4}-(0[1-9]|1[0-2])$/.test(periodo)) {
+      // Los registros antiguos pueden conservar su período sin reinterpretarlo.
+      // Una edición del valor debe usar el formato actual de mes y año.
+      if (typeof body.periodo_prestacion !== "string" || body.periodo_prestacion !== periodoOriginal) {
+        throw crearErrorHttp("El período de prestación debe tener formato YYYY-MM", 400);
+      }
+      campos.periodo_prestacion = periodoOriginal;
+    } else {
+      campos.periodo_prestacion = periodo || null;
+    }
+  }
+  return campos;
+}
+
+async function validarCamposCentral(connection, solicitud, campos, { aprobar = false } = {}) {
+  const cambios = { ...campos };
+  const tieneCampo = (campo) => Object.prototype.hasOwnProperty.call(cambios, campo);
+  if (tieneCampo("imputacion_id") && !idsPositivosIguales(cambios.imputacion_id, solicitud.imputacion_id) &&
+      !tieneCampo("imputacion_detalle_id")) {
+    // Un detalle pertenece a una cuenta: no se arrastra al elegir otro C.I.C.
+    cambios.imputacion_detalle_id = null;
+  }
+  const efectivos = { ...solicitud, ...cambios };
+  if (aprobar) {
+    const importe = normalizarImporte(efectivos.importe_autorizado);
+    if (importe === null) {
+      throw crearErrorHttp("Completá el importe autorizado para aprobar por Servicios Sociales", 400);
+    }
+    cambios.importe_autorizado = importe;
+  }
+  if (aprobar || tieneCampo("imputacion_id") || tieneCampo("imputacion_detalle_id")) {
+    const imputacionId = normalizarIdPositivo(efectivos.imputacion_id);
+    const detalleId = normalizarIdOpcional(efectivos.imputacion_detalle_id, "Detalle de imputación");
+    if (!imputacionId) {
+      if (aprobar) throw crearErrorHttp("Completá el C.I.C. para aprobar por Servicios Sociales", 400);
+      if (detalleId) throw crearErrorHttp("Seleccioná un C.I.C. para el detalle de imputación", 400);
+      cambios.cic_codigo = null;
+    } else {
+      const [cuentas] = await connection.query(
+        "SELECT codigo FROM coseguro_imputacion WHERE id = ? AND tipo = 'CUENTA' AND activo = 1",
+        [imputacionId]
+      );
+      const codigo = normalizarTexto(cuentas[0]?.codigo);
+      if (!codigo) throw crearErrorHttp("El C.I.C. debe corresponder a una cuenta activa con código válido", 400);
+      cambios.cic_codigo = codigo;
+      if (detalleId) {
+        const [detalles] = await connection.query(
+          "SELECT id FROM coseguro_imputacion WHERE id = ? AND tipo = 'DETALLE' AND parent_id = ? AND activo = 1",
+          [detalleId, imputacionId]
+        );
+        if (detalles.length === 0) throw crearErrorHttp("El detalle de imputación no pertenece al C.I.C. seleccionado", 400);
+      }
+      if (aprobar) {
+        cambios.imputacion_id = imputacionId;
+        cambios.imputacion_detalle_id = detalleId;
+      }
+    }
+  }
+  return cambios;
+}
+
+function validarAprobacionCentral(cabecera, solicitud) {
+  if (!["admin-central", "admin"].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) {
+    throw crearErrorHttp("No tenés permisos para aprobar por Servicios Sociales", 403);
+  }
+  if (!transicionesDisponibles(cabecera, solicitud.estado_id, false).includes(ESTADO.APROBADA_CENTRAL)) {
+    throw crearErrorHttp("La solicitud debe estar aprobada por departamental para aprobar por Servicios Sociales", 409);
+  }
+}
+
 router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, async (req, res) => {
   let connection;
   let transaccionIniciada = false;
@@ -2214,6 +2300,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     const cabecera = getCabecera(req);
     const solicitudId = normalizarIdPositivo(req.params.id);
     if (!solicitudId) return res.status(400).json("ID inválido");
+    const aprobarServiciosSociales = normalizarBooleanoOpcional(req.body.aprobar_servicios_sociales, "Aprobación por Servicios Sociales");
     const db = mysqlConnection.promise();
 
     const [rows] = await db.query("SELECT * FROM coseguro_solicitud WHERE id = ? AND eliminado = 0", [solicitudId]);
@@ -2222,6 +2309,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     if (!puedeEditarSolicitud(cabecera, solicitud)) {
       return res.status(401).json("No tenés permisos para modificar esta solicitud en su estado actual");
     }
+    if (aprobarServiciosSociales) validarAprobacionCentral(cabecera, solicitud);
 
     let validacion = await validarDatosSolicitud(db, cabecera, req.body, {
       usuarioId: solicitud.usuario_id,
@@ -2282,41 +2370,9 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     }
 
     // Campos exclusivos de servicios sociales / admin
-    const camposCentral = {};
-    if (["admin-central", "admin"].includes(cabecera.rol)) {
-      if (req.body.importe_autorizado !== undefined) {
-        const vacio = req.body.importe_autorizado === null || String(req.body.importe_autorizado).trim() === "";
-        const importeAutorizado = vacio ? null : normalizarImporte(req.body.importe_autorizado);
-        if (!vacio && importeAutorizado === null) {
-          return res.status(400).json("El importe autorizado debe ser un monto no negativo, con hasta dos decimales");
-        }
-        camposCentral.importe_autorizado = importeAutorizado;
-      }
-      if (req.body.imputacion_id !== undefined) {
-        const vacio = !valorOpcionalInformado(req.body.imputacion_id);
-        camposCentral.imputacion_id = vacio ? null : normalizarIdPositivo(req.body.imputacion_id);
-        if (!vacio && !camposCentral.imputacion_id) return res.status(400).json("Imputación inválida");
-      }
-      if (req.body.imputacion_detalle_id !== undefined) {
-        const vacio = !valorOpcionalInformado(req.body.imputacion_detalle_id);
-        camposCentral.imputacion_detalle_id = vacio ? null : normalizarIdPositivo(req.body.imputacion_detalle_id);
-        if (!vacio && !camposCentral.imputacion_detalle_id) return res.status(400).json("Detalle de imputación inválido");
-      }
-      if (req.body.periodo_prestacion !== undefined) {
-        const periodo = String(req.body.periodo_prestacion || "").trim();
-        if (periodo !== "" && !/^\d{4}-(0[1-9]|1[0-2])$/.test(periodo)) {
-          return res.status(400).json("El período de prestación debe tener formato YYYY-MM");
-        }
-        camposCentral.periodo_prestacion = periodo || null;
-      }
-      if (camposCentral.imputacion_id) {
-        const [imps] = await db.query("SELECT codigo FROM coseguro_imputacion WHERE id = ? AND tipo = 'CUENTA'", [camposCentral.imputacion_id]);
-        if (imps.length === 0) return res.status(400).json("Imputación inválida");
-        camposCentral.cic_codigo = imps[0].codigo;
-      } else if (camposCentral.imputacion_id === null && req.body.imputacion_id !== undefined) {
-        camposCentral.cic_codigo = null;
-      }
-    }
+    let camposCentral = ["admin-central", "admin"].includes(cabecera.rol)
+      ? parsearCamposCentral(req.body, { periodoOriginal: solicitud.periodo_prestacion })
+      : {};
 
     connection = await db.getConnection();
     bloqueoDuplicadosAdquirido = await adquirirBloqueoDuplicados(connection);
@@ -2332,6 +2388,11 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     if (!puedeEditarSolicitud(cabecera, solicitud)) {
       throw crearErrorHttp("No tenés permisos para modificar esta solicitud en su estado actual", 409);
     }
+    if (aprobarServiciosSociales) validarAprobacionCentral(cabecera, solicitud);
+    camposCentral = ["admin-central", "admin"].includes(cabecera.rol)
+      ? parsearCamposCentral(req.body, { periodoOriginal: solicitud.periodo_prestacion })
+      : {};
+    camposCentral = await validarCamposCentral(connection, solicitud, camposCentral, { aprobar: aprobarServiciosSociales });
 
     validacion = await validarDatosSolicitud(connection, cabecera, req.body, {
       usuarioId: solicitud.usuario_id,
@@ -2450,7 +2511,11 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
 
     // Reenvío del afiliado: si estaba en "Revisar solicitud", pasa a "Solicitud revisada"
     let estadoNuevo = null;
-    if (cabecera.rol === "afiliado" && solicitud.estado_id === ESTADO.REVISAR) {
+    if (aprobarServiciosSociales) {
+      estadoNuevo = ESTADO.APROBADA_CENTRAL;
+      sets.push("estado_id = ?", "fecha_aprobacion_central = NOW()", "aprobado_central_usuario_id = ?");
+      setParams.push(estadoNuevo, cabecera.id);
+    } else if (cabecera.rol === "afiliado" && solicitud.estado_id === ESTADO.REVISAR) {
       estadoNuevo = ESTADO.REVISADA;
       sets.push("estado_id = ?");
       setParams.push(estadoNuevo);
@@ -2525,7 +2590,17 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
       opciones: { propagar: false, autorizacionPrevia: true },
     });
 
-    if (estadoNuevo) {
+    if (aprobarServiciosSociales) {
+      await registrarHistorial(connection, {
+        solicitud_id: solicitudId,
+        usuario_id: cabecera.id,
+        usuario_rol: cabecera.rol,
+        tipo_operacion: "CAMBIO_ESTADO",
+        estado_anterior_id: solicitud.estado_id,
+        estado_nuevo_id: estadoNuevo,
+      });
+      await notificarCambioEstadoAfiliado(connection, solicitud, solicitud.estado_id, estadoNuevo, null);
+    } else if (estadoNuevo) {
       const mensajeRevision = normalizarTexto(req.body.mensaje_revision);
       await registrarHistorial(connection, {
         solicitud_id: solicitudId,
@@ -2554,7 +2629,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     // Re-constatar en ARCA en segundo plano si cambiaron los datos del comprobante
     if (constatacionDesactualizada) void constatarArcaAutomatico(solicitudId);
 
-    res.status(200).json({ success: true, message: "Solicitud actualizada correctamente", estado_id: estadoNuevo || solicitud.estado_id });
+    res.status(200).json({ success: true, message: aprobarServiciosSociales ? "Solicitud guardada y aprobada por Servicios Sociales" : "Solicitud actualizada correctamente", estado_id: estadoNuevo || solicitud.estado_id });
   } catch (error) {
     if (connection && transaccionIniciada) await connection.rollback();
     registrarErrorRuta(error);
@@ -2658,33 +2733,26 @@ router.put("/coseguro/solicitudes/:id/estado", verifyToken, async (req, res) => 
       params.push(cabecera.id);
     }
     if (estadoNuevo === ESTADO.APROBADA_CENTRAL) {
+      validarAprobacionCentral(cabecera, solicitud);
+      const camposCentral = await validarCamposCentral(connection, solicitud,
+        parsearCamposCentral(req.body, { periodoOriginal: solicitud.periodo_prestacion }), { aprobar: true });
+      for (const [campo, valorNuevo] of Object.entries(camposCentral)) {
+        sets.push(`${campo} = ?`);
+        params.push(valorNuevo);
+        if (String(solicitud[campo] ?? "") !== String(valorNuevo ?? "")) {
+          await registrarHistorial(connection, {
+            solicitud_id: solicitudId,
+            usuario_id: cabecera.id,
+            usuario_rol: cabecera.rol,
+            tipo_operacion: "UPDATE",
+            campo_modificado: ETIQUETAS_CAMPOS[campo],
+            valor_anterior: solicitud[campo],
+            valor_nuevo: valorNuevo,
+          });
+        }
+      }
       sets.push("fecha_aprobacion_central = NOW()", "aprobado_central_usuario_id = ?");
       params.push(cabecera.id);
-      // Cobertura automática: si Servicios Sociales no fijó un importe manual, al aprobar
-      // se autoriza el estimado (importe * porcentaje del tipo, con tope). Sigue siendo
-      // editable después desde el formulario de edición.
-      const importeAutorizadoActual = normalizarImporte(solicitud.importe_autorizado);
-      const importeEstimado = normalizarImporte(solicitud.importe_estimado);
-      if (solicitud.importe_autorizado !== null && solicitud.importe_autorizado !== undefined && importeAutorizadoActual === null) {
-        throw crearErrorHttp("El importe autorizado guardado no es válido", 409);
-      }
-      if (solicitud.importe_estimado !== null && solicitud.importe_estimado !== undefined && importeEstimado === null) {
-        throw crearErrorHttp("El importe estimado guardado no es válido", 409);
-      }
-      if (importeAutorizadoActual === null && importeEstimado !== null) {
-        sets.push("importe_autorizado = ?");
-        params.push(importeEstimado);
-        await registrarHistorial(connection, {
-          solicitud_id: solicitudId,
-          usuario_id: cabecera.id,
-          usuario_rol: cabecera.rol,
-          tipo_operacion: "UPDATE",
-          campo_modificado: ETIQUETAS_CAMPOS.importe_autorizado,
-          valor_anterior: null,
-          valor_nuevo: importeEstimado,
-          observacion: `Aplicado automáticamente por cobertura del ${Number(solicitud.porcentaje_cobertura_aplicado)}%`,
-        });
-      }
     }
     if (estadoNuevo === ESTADO.LIQUIDADO) {
       const fechaPagoInformada = req.body.fecha_pago !== undefined && req.body.fecha_pago !== null && String(req.body.fecha_pago).trim() !== "";
