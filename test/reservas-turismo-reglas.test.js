@@ -67,8 +67,12 @@ test("departamental verifica/rechaza Iniciada y afiliado solo cancela la propia"
   assert.equal(cancelacion.accion, "CANCELAR");
   assert.equal(transicion("departamental", "Iniciada", "Rechazada").estadoDestino, ESTADO_RECHAZADA);
 
-  for (const actual of ["Verificada", "Aprobada", "Rechazada", "Cancelada"]) {
+  for (const actual of ["Rechazada", "Cancelada"]) {
     assert.equal(transicion("afiliado", actual, "Cancelada").valido, false, actual);
+  }
+
+  for (const actual of ["Verificada", "Aprobada", "Pendiente_Aprobacion_Titular"]) {
+    assert.equal(transicion("afiliado", actual, "Cancelada").valido, true);
   }
 
   const ajena = transicion("afiliado", "Iniciada", "Cancelada", {

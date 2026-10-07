@@ -10,7 +10,7 @@ const bcryptjs = require("bcryptjs");
 
 const { normalizarCredencialesSignin } = require("../security/signin-input");
 const { DNI_MENSAJE, esDniValido } = require("../security/dni");
-const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
+const { verificarTokenConAutorizacionActual, resolverAccesoFamiliar, ErrorSesionUsuario } = require("../security/autorizacion-sesion");
 const { emitirTokenSesion } = require("../security/token-sesion");
 const { condicionModuloNotificacion } = require("../services/notificaciones-modulos");
 const {
@@ -103,6 +103,14 @@ const {
   obtenerDescuentosReservaCrudos,
   resolverDescuentosSolicitados,
 } = require("../services/descuentos-reserva");
+const {
+  ESTADO_PENDIENTE_TITULAR, MENSAJE_CBU, esFamiliar, obtenerGrupoReserva, exigirCbu,
+  validarAdultoResponsable, registrarSolicitudTitular, enviarCorreoSolicitudTitular,
+  asegurarSinSolicitudTitularPendiente, decidirSolicitudTitular,
+} = require("../services/reservas-familiares");
+const {
+  validarAceptacionPolitica, guardarAceptacionPolitica, confirmarCancelacionPolitica,
+} = require("../services/politica-cancelacion");
 const { obtenerMejorDescuentoAdicionalesDia } = require("../services/descuento-adicionales");
 const { validarRangosEdadTemporada } = require("../services/temporadas-edades");
 const {
@@ -705,10 +713,11 @@ router.post("/signin", async (req, res) => {
   const query = `
     SELECT u.id, u.nombre, u.apellido, u.documento, u.email, u.password, u.departamental_id, rol.nombre AS rol, u.habilitado,
            u.area_turismo, u.area_coseguro,
-           u.modulo_turismo, u.modulo_coseguro, u.modulo_olimpiadas
+           u.modulo_turismo, u.modulo_coseguro, u.modulo_olimpiadas, u.rol_id, u.es_familiar, u.usuario_familiar_id
     FROM usuario as u
     INNER JOIN rol ON rol.id = u.rol_id
-    WHERE u.documento = ? AND u.password IS NOT NULL AND u.rol_id <> 4
+    WHERE u.documento = ? AND u.password IS NOT NULL
+      AND (u.rol_id <> 4 OR (u.es_familiar = 'S' AND u.usuario_familiar_id IS NOT NULL))
   `;
   const queryParams = [documento];
 
@@ -722,9 +731,11 @@ router.post("/signin", async (req, res) => {
           let data = rows[0];
 
           try {
+            data = await resolverAccesoFamiliar(data, mysqlConnection.promise());
             const token = await emitirTokenSesion({ data, recordar });
             res.status(200).json({ token, data });
           } catch (tokenError) {
+            if (tokenError instanceof ErrorSesionUsuario) return res.status(403).json(tokenError.message);
             console.error("Error al emitir token de acceso:", tokenError);
             res.status(500).json("Error interno");
           }
@@ -755,6 +766,9 @@ router.get("/sesion/permisos", verifyToken, (req, res) => {
       modulo_turismo: cabecera.modulo_turismo,
       modulo_coseguro: cabecera.modulo_coseguro,
       modulo_olimpiadas: cabecera.modulo_olimpiadas,
+      es_familiar: cabecera.es_familiar,
+      acceso_familiar_turismo: cabecera.acceso_familiar_turismo,
+      titular_usuario_id: cabecera.titular_usuario_id,
     });
   } catch (_error) {
     return res.status(403).json("Error en la sesion");
@@ -1230,14 +1244,14 @@ router.get("/servicios", verifyToken, async (req, res) => {
               return true;
             };
 
-            // Procesar adultos (mayores de 5 años)
+            // Procesar adultos (18 años o más)
             if (adultos > 0) {
               const [tarifasAdultos] = await db.query(`
       SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
       FROM tarifa t
       INNER JOIN recurso r ON t.recurso_id = r.id
       WHERE r.servicio_id = ?
-        AND (t.edad_maxima IS NULL OR t.edad_maxima > 5)
+        AND (t.edad_maxima IS NULL OR t.edad_maxima >= 18)
         AND t.fecha_inicio <= ?
         AND t.fecha_fin >= ?
     `, [servicio.id, fechaString, fechaString]);
@@ -1252,7 +1266,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
       FROM tarifa t
       INNER JOIN recurso r ON t.recurso_id = r.id
       WHERE r.servicio_id = ?
-        AND (t.edad_minima IS NULL OR t.edad_minima <= 5)
+        AND (t.edad_minima IS NULL OR t.edad_minima <= 17)
         AND (t.edad_maxima IS NULL OR t.edad_maxima >= 2)
         AND t.fecha_inicio <= ?
         AND t.fecha_fin >= ?
@@ -1414,6 +1428,77 @@ function puedeUsarHoldsTurismo(cabecera) {
     && tieneAreaTurismo(cabecera);
 }
 
+router.get("/turismo/reserva-elegibilidad", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (!puedeUsarHoldsTurismo(cabecera)) return res.status(403).json({ message: "No autorizado" });
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const { grupoReserva, requiereAprobacionTitular } = await resolverTitularReservaAlta(
+      connection, cabecera, req.query.usuario_id, { validarCbuObligatorio: false });
+    await connection.commit();
+    return res.json({ puede_reservar: grupoReserva.cbuCompleto, cbu_completo: grupoReserva.cbuCompleto,
+      requiere_aprobacion_titular: requiereAprobacionTitular, titular_usuario_id: Number(grupoReserva.titular.id),
+      mensaje: grupoReserva.cbuCompleto ? null : MENSAJE_CBU });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    registrarErrorRuta(error);
+    return res.status(error.statusCode || 500).json({ message: error.statusCode ? error.message : "No se pudo verificar el perfil", codigo: error.codigo });
+  } finally { if (connection) connection.release(); }
+});
+
+router.get("/reservas/aprobaciones-titular", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "afiliado" || !tieneAreaTurismo(cabecera)) return res.status(403).json({ message: "No autorizado" });
+    const db = mysqlConnection.promise();
+    const [reservas] = await db.query(
+      `SELECT r.id, er.nombre AS estado, u.nombre AS solicitante_nombre, u.apellido AS solicitante_apellido,
+              COALESCE(s.nombre, 'Convenio hotelero') AS servicio, COALESCE(rec.nombre, ch.nombre) AS recurso,
+              DATE_FORMAT(r.fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
+              DATE_FORMAT(r.fecha_fin, '%Y-%m-%d') AS fecha_fin, r.precio_total, r.modalidad,
+              a.fecha_solicitud, a.correo_enviado_en
+         FROM reserva_aprobacion_titular a INNER JOIN reserva r ON r.id = a.reserva_id
+         INNER JOIN estado_reserva er ON er.id = r.estado_reserva_id
+         INNER JOIN usuario u ON u.id = a.solicitante_usuario_id
+         LEFT JOIN recurso rec ON rec.id = r.recurso_id
+         LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
+         LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
+        WHERE a.titular_usuario_id = ? AND a.decision = 'PENDIENTE' AND er.nombre = ?
+        ORDER BY a.fecha_solicitud DESC LIMIT 100`, [cabecera.id, ESTADO_PENDIENTE_TITULAR]);
+    return res.json({ reservas: reservas.map((reserva) => ({ ...reserva, puede_aprobar_titular: true })) });
+  } catch (error) {
+    registrarErrorRuta(error);
+    return res.status(500).json({ message: "No se pudieron cargar las solicitudes de tus familiares" });
+  }
+});
+
+router.put("/reserva/:id/aprobacion-titular", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "afiliado" || !tieneAreaTurismo(cabecera)) return res.status(403).json({ message: "No autorizado" });
+    const reservaId = normalizarIdPositivo(req.params.id);
+    if (!reservaId) return res.status(400).json({ message: "Reserva inválida" });
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const reserva = await decidirSolicitudTitular(connection, { reservaId, actorId: cabecera.id, accion: req.body.accion });
+    if (req.body.accion === "APROBAR") {
+      await notificarStaffTurismo(connection, cabecera.departamental_id, "RESERVA_TITULAR_APROBADA",
+        `Reserva #${reservaId} aprobada por el titular`, "El titular aprobó la solicitud de su familiar. Ya está disponible para gestión administrativa.",
+        { reserva_id: reservaId, estado: reserva.estado }, cabecera.id);
+    }
+    await connection.commit();
+    emitirInvalidacionDisponibilidad(req, reserva, "RESERVA_RESPUESTA_TITULAR");
+    return res.json({ success: true, reserva: { id: reservaId, estado: reserva.estado }, estado: reserva.estado });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    registrarErrorRuta(error);
+    return res.status(error.statusCode || 500).json({ message: error.statusCode ? error.message : "No se pudo responder la solicitud", codigo: error.codigo });
+  } finally { if (connection) connection.release(); }
+});
+
 router.post("/turismo/reserva-holds", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -1424,6 +1509,7 @@ router.post("/turismo/reserva-holds", verifyToken, async (req, res) => {
     const titularId = cabecera.rol === "afiliado"
       ? actorId
       : normalizarIdPositivo(req.body.titular_usuario_id ?? req.body.usuario_id);
+    await resolverTitularReservaAlta(mysqlConnection.promise(), cabecera, titularId);
     const resultado = await adquirirHoldTurismo(mysqlConnection.promise(), {
       actorUsuarioId: actorId,
       actorRol: cabecera.rol,
@@ -3988,6 +4074,7 @@ router.get("/admin/sorteos/:id/inscripciones", verifyToken, async (req, res) => 
         LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
         WHERE r.sorteo_id = ?
           AND r.modalidad = 'SORTEO'
+          AND er.nombre <> 'Pendiente_Aprobacion_Titular'
         ORDER BY r.fecha_creacion ASC
       `,
       [sorteoId]
@@ -4195,26 +4282,11 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
 
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
-    const usuarioReservaId = cabecera.rol === "afiliado"
-      ? normalizarIdPositivo(cabecera.id)
-      : normalizarIdPositivo(req.body.usuario_id);
-    if (!usuarioReservaId) {
-      throw crearErrorNegocio("Debes indicar un afiliado titular para la inscripción", 400);
-    }
-    const [titulares] = await connection.query(
-      `SELECT u.id, u.habilitado, r.nombre AS rol
-       FROM usuario u
-       INNER JOIN rol r ON r.id = u.rol_id
-       WHERE u.id = ?
-       FOR UPDATE`,
-      [usuarioReservaId]
-    );
-    if (titulares.length === 0 || titulares[0].rol !== "afiliado" || titulares[0].habilitado !== "Y") {
-      throw crearErrorNegocio("El titular debe ser un afiliado habilitado", 422);
-    }
-    if (cabecera.rol === "departamental" && !(await puedeAccederUsuarioRelacionado(connection, cabecera, usuarioReservaId))) {
-      throw crearErrorNegocio("No puedes inscribir afiliados de otra departamental", 403);
-    }
+    const { usuarioReservaId, grupoReserva, requiereAprobacionTitular } = await resolverTitularReservaAlta(connection, cabecera, req.body.usuario_id);
+    const politicaAceptada = await validarAceptacionPolitica(connection, {
+      aceptada: req.body.politica_cancelacion_aceptada,
+      politicaId: req.body.politica_cancelacion_id, version: req.body.politica_cancelacion_version,
+    });
     await ejecutarMantenimientoBloquesAlta(connection);
 
     const bloque = await obtenerBloqueConRecursos(connection, bloqueFechaId, { forUpdate: true });
@@ -4286,6 +4358,7 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
     );
 
     const reservaId = reservaResult.insertId;
+    await guardarAceptacionPolitica(connection, { reservaId, usuarioId: cabecera.id, politica: politicaAceptada });
     if (cotizacion.adicionales.length > 0) {
       await guardarAdicionalesReserva(connection, reservaId, cotizacion.adicionales);
     }
@@ -4326,11 +4399,17 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
       `Inscripcion al sorteo ${sorteoId}, bloque ${bloqueFechaId}`
     );
 
+    if (requiereAprobacionTitular) {
+      await registrarSolicitudTitular(connection, { reservaId, solicitanteId: usuarioReservaId,
+        titularId: grupoReserva.titular.id, estadoDestino: "Solicitud sorteo" });
+    }
     await connection.commit();
+    if (requiereAprobacionTitular) void enviarCorreoSolicitudTitular(mysqlConnection.promise(), reservaId).catch(registrarErrorRuta);
     res.status(201).json({
       id: reservaId,
       numero_reserva: `${reservaId}`,
-      estado: "Solicitud sorteo",
+      estado: requiereAprobacionTitular ? ESTADO_PENDIENTE_TITULAR : "Solicitud sorteo",
+      requiere_aprobacion_titular: requiereAprobacionTitular,
       mensaje: "Inscripcion al sorteo creada correctamente",
       fecha_creacion: new Date().toISOString(),
       precio_total: cotizacion.precio_total,
@@ -4384,7 +4463,7 @@ router.put("/admin/sorteos/inscripciones/:id/adjudicar", verifyToken, async (req
     }
 
     const reserva = reservas[0];
-    if (reserva.recurso_id || esEstadoReservaTerminal(reserva.estado_nombre)) {
+    if (reserva.recurso_id || reserva.estado_nombre === ESTADO_PENDIENTE_TITULAR || esEstadoReservaTerminal(reserva.estado_nombre)) {
       throw crearErrorNegocio("La inscripción ya no puede ser adjudicada", 409);
     }
     const bloque = await obtenerBloqueConRecursos(connection, reserva.bloque_fecha_id, { forUpdate: true });
@@ -4531,7 +4610,7 @@ router.put("/admin/sorteos/inscripciones/:id/no-adjudicada", verifyToken, async 
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
     const [reservas] = await connection.query(
-      "SELECT id, estado_reserva_id, recurso_id FROM reserva WHERE id = ? AND modalidad = 'SORTEO' FOR UPDATE",
+      "SELECT id, estado_reserva_id, recurso_id FROM reserva WHERE id = ? AND modalidad = 'SORTEO' AND estado_reserva_id NOT IN (SELECT id FROM estado_reserva WHERE nombre = 'Pendiente_Aprobacion_Titular') FOR UPDATE",
       [reservaId]
     );
     if (reservas.length === 0) throw crearErrorNegocio("Inscripción no encontrada", 404);
@@ -6166,6 +6245,7 @@ function normalizarIdPositivo(valor) {
 
 async function resolverTitularReservaAlta(connection, cabecera, usuarioIdRaw, {
   requiereCoseguro = false,
+  validarCbuObligatorio = true,
 } = {}) {
   const esRolCargaAdministrativa = ["admin", "departamental"].includes(cabecera.rol);
   if (
@@ -6205,7 +6285,7 @@ async function resolverTitularReservaAlta(connection, cabecera, usuarioIdRaw, {
 
   const [usuariosTitulares] = await connection.query(
     `SELECT u.id, u.nombre, u.apellido, u.documento, u.usuario_familiar_id, u.departamental_id,
-            u.habilitado, u.modulo_turismo, u.modulo_coseguro, r.nombre AS rol
+            u.habilitado, u.cbu, u.email, u.es_familiar, u.parentesco_id, u.modulo_turismo, u.modulo_coseguro, r.nombre AS rol
        FROM usuario u
        INNER JOIN rol r ON r.id = u.rol_id
       WHERE u.id = ?
@@ -6233,14 +6313,14 @@ async function resolverTitularReservaAlta(connection, cabecera, usuarioIdRaw, {
       );
     }
   }
-  if (usuarioTitular.habilitado !== "Y" || usuarioTitular.rol !== "afiliado") {
+  if (usuarioTitular.habilitado !== "Y" || (usuarioTitular.rol !== "afiliado" && !(usuarioTitular.rol === "invitado" && esFamiliar(usuarioTitular)))) {
     throw crearErrorNegocio(
       "El titular debe ser un afiliado habilitado",
       422,
       "TITULAR_NO_AFILIADO"
     );
   }
-  if (Number(usuarioTitular.modulo_turismo) !== 1) {
+  if (Number(usuarioTitular.modulo_turismo) !== 1 && !(usuarioTitular.rol === "invitado" && esFamiliar(usuarioTitular))) {
     throw crearErrorNegocio(
       "El afiliado titular no tiene habilitado el módulo Turismo",
       403,
@@ -6255,7 +6335,14 @@ async function resolverTitularReservaAlta(connection, cabecera, usuarioIdRaw, {
     );
   }
 
-  return { esRolCargaAdministrativa, usuarioReservaId, usuarioTitular };
+  const grupoReserva = await obtenerGrupoReserva(connection, usuarioTitular, { forUpdate: true });
+  if (validarCbuObligatorio) {
+    exigirCbu(grupoReserva);
+    await asegurarSinSolicitudTitularPendiente(connection, usuarioReservaId);
+  }
+  return { esRolCargaAdministrativa, usuarioReservaId, usuarioTitular, grupoReserva,
+    requiereAprobacionTitular: !esRolCargaAdministrativa && grupoReserva.requiereAprobacionTitular };
+
 }
 
 function normalizarEnteroNoNegativoOpcional(valor, maximo = Number.MAX_SAFE_INTEGER) {
@@ -6814,14 +6901,14 @@ async function resolverPersonasCotizacionAutorizadas(connection, cabecera, {
   }
 
   const [titulares] = await connection.query(
-    `SELECT u.id, u.habilitado, r.nombre AS rol
+    `SELECT u.id, u.habilitado, r.nombre AS rol, u.usuario_familiar_id, u.es_familiar, u.parentesco_id
        FROM usuario u
        INNER JOIN rol r ON r.id = u.rol_id
       WHERE u.id = ?
       LIMIT 1`,
     [titularId]
   );
-  if (titulares.length === 0 || titulares[0].rol !== "afiliado" || titulares[0].habilitado !== "Y") {
+  if (titulares.length === 0 || (titulares[0].rol !== "afiliado" && !(cabecera.rol === "afiliado" && titulares[0].rol === "invitado" && esFamiliar(titulares[0]))) || titulares[0].habilitado !== "Y") {
     throw crearErrorNegocio("El titular debe ser un afiliado habilitado", 422);
   }
 
@@ -6837,6 +6924,12 @@ async function resolverPersonasCotizacionAutorizadas(connection, cabecera, {
     crearSiNoExiste: false,
     fechaIngreso,
   });
+}
+
+function tipoPersonaEnIngreso(persona) {
+  if (persona.edad < 2) return 5;
+  if (Number(persona.tipo_persona_id) === 5) return esFamiliarPorParentesco(persona.parentesco_id) === "S" ? 2 : 3;
+  return Number(persona.tipo_persona_id);
 }
 
 async function crearOBuscarUsuariosReserva(connection, personas, {
@@ -6913,6 +7006,7 @@ async function crearOBuscarUsuariosReserva(connection, personas, {
       if (!Number.isInteger(personaAutorizada.edad) || personaAutorizada.edad < 0 || personaAutorizada.edad > 130) {
         throw crearErrorNegocio(`La fecha de nacimiento de personas[${indice}] no es valida`, 409);
       }
+      personaAutorizada.tipo_persona_id = tipoPersonaEnIngreso(personaAutorizada);
     } else {
       if (personaId) {
         throw crearErrorNegocio("La persona indicada no existe", 404);
@@ -7008,6 +7102,7 @@ async function crearOBuscarUsuariosReserva(connection, personas, {
     });
   }
 
+  validarAdultoResponsable(usuariosIds, fechaIngresoNormalizada);
   return usuariosIds;
 }
 
@@ -9596,10 +9691,11 @@ router.post("/reserva", verifyToken, async (req, res) => {
         const {
           esRolCargaAdministrativa,
           usuarioReservaId,
-          usuarioTitular,
+          usuarioTitular, grupoReserva, requiereAprobacionTitular,
         } = await resolverTitularReservaAlta(connection, cabecera, req.body.usuario_id, {
           requiereCoseguro: Boolean(porSalud),
         });
+
         const servicioVisibleTitular = await servicioVisibleParaActor(
           connection,
           { rol: "afiliado", departamental_id: usuarioTitular.departamental_id },
@@ -9621,12 +9717,16 @@ router.post("/reserva", verifyToken, async (req, res) => {
           throw crearErrorNegocio(errorReglasCamping, 422, "CAPACIDAD_SERVICIO_EXCEDIDA");
         }
 
+        const politicaAceptada = await validarAceptacionPolitica(connection, {
+          aceptada: req.body.politica_cancelacion_aceptada,
+          politicaId: req.body.politica_cancelacion_id, version: req.body.politica_cancelacion_version,
+        });
         // Se controla antes de consultar disponibilidad para que, si la unica
         // reserva iniciada ya vencio, quede rechazada y libere el recurso en
         // esta misma transaccion. Tambien cubre altas hechas por admin para un
         // afiliado, que igualmente deben respetar la unicidad.
         const altaQuedaIniciada = obtenerEstadoAltaTurismo(cabecera.rol) === ESTADO_INICIADA;
-        if (usuarioTitular.rol === "afiliado" && altaQuedaIniciada) {
+        if (altaQuedaIniciada) {
           const reservaIniciada = await asegurarSinReservaIniciadaAfiliado(
             connection,
             usuarioReservaId
@@ -9837,6 +9937,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
         );
 
         const reservaId = reservaResult.insertId;
+        await guardarAceptacionPolitica(connection, { reservaId, usuarioId: cabecera.id, politica: politicaAceptada });
         let estadoRespuesta = ESTADO_INICIADA;
         const esAltaDepartamental = obtenerEstadoAltaTurismo(cabecera.rol) === ESTADO_VERIFICADA;
         const registrarHitoAlta = esAltaDepartamental
@@ -9995,7 +10096,16 @@ router.post("/reserva", verifyToken, async (req, res) => {
           });
         }
 
+        if (requiereAprobacionTitular) {
+          await registrarSolicitudTitular(connection, { reservaId, solicitanteId: usuarioReservaId,
+            titularId: grupoReserva.titular.id, estadoDestino: ESTADO_INICIADA });
+          estadoRespuesta = ESTADO_PENDIENTE_TITULAR;
+        }
         await connection.commit();
+        if (requiereAprobacionTitular) {
+          void enviarCorreoSolicitudTitular(mysqlConnection.promise(), reservaId)
+            .catch((error) => registrarErrorRuta(error));
+        }
         emitirInvalidacionDisponibilidad(
           req,
           holdReservaValidado?.hold || {
@@ -10015,6 +10125,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
           numero_reserva: numeroReserva,
           numero_parcela: numeroParcelaAsignada,
           estado: estadoRespuesta,
+          requiere_aprobacion_titular: requiereAprobacionTitular,
           mensaje: "Reserva creada exitosamente",
           fecha_creacion: new Date().toISOString(),
           precio_total: precioTotalReserva,
@@ -10089,10 +10200,11 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
     const {
       esRolCargaAdministrativa,
       usuarioReservaId,
-      usuarioTitular,
+      usuarioTitular, grupoReserva, requiereAprobacionTitular,
     } = await resolverTitularReservaAlta(connection, cabecera, req.body.usuario_id, {
       requiereCoseguro: Boolean(porSalud),
     });
+
 
     const [hoteles] = await connection.query(
       "SELECT id, nombre, servicio_id FROM convenio_hotel WHERE id = ? AND activo = 1 LIMIT 1",
@@ -10120,6 +10232,10 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
       throw crearErrorNegocio(errorReglasConvenio, 422, "CAPACIDAD_SERVICIO_EXCEDIDA");
     }
 
+    const politicaAceptada = await validarAceptacionPolitica(connection, {
+      aceptada: req.body.politica_cancelacion_aceptada,
+      politicaId: req.body.politica_cancelacion_id, version: req.body.politica_cancelacion_version,
+    });
     const firmaFileName = `firma_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.png`;
     await uploadBase64ToS3({
       key: firmaFileName,
@@ -10178,6 +10294,7 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
     );
 
     const reservaId = reservaResult.insertId;
+    await guardarAceptacionPolitica(connection, { reservaId, usuarioId: cabecera.id, politica: politicaAceptada });
     for (const persona of usuariosIds) {
       await connection.query(
         `
@@ -10195,7 +10312,7 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
           persona.usuario_id,
           persona.tipo_persona_id || null,
           persona.parentesco_id || null,
-          persona.edad || null,
+          persona.edad ?? null,
         ]
       );
     }
@@ -10233,12 +10350,18 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
       });
     }
 
+    if (requiereAprobacionTitular) {
+      await registrarSolicitudTitular(connection, { reservaId, solicitanteId: usuarioReservaId,
+        titularId: grupoReserva.titular.id, estadoDestino: "Solicitud convenio" });
+    }
     await connection.commit();
+    if (requiereAprobacionTitular) void enviarCorreoSolicitudTitular(mysqlConnection.promise(), reservaId).catch(registrarErrorRuta);
 
     res.status(201).json({
       id: reservaId,
       numero_reserva: `${reservaId}`,
-      estado: "Solicitud convenio",
+      estado: requiereAprobacionTitular ? ESTADO_PENDIENTE_TITULAR : "Solicitud convenio",
+      requiere_aprobacion_titular: requiereAprobacionTitular,
       mensaje: "Solicitud de convenio hotelero creada exitosamente",
       fecha_creacion: new Date().toISOString(),
       reserva_salud_id: reservaSaludId,
@@ -10318,7 +10441,9 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         const [reservaExistente] = await connection.query(
           `SELECT r.*, er.nombre AS estado_nombre,
                   u.departamental_id AS usuario_departamental_id,
-                  u.documento AS usuario_documento
+                  u.documento AS usuario_documento,
+                  u.cbu AS usuario_cbu, u.usuario_familiar_id, u.es_familiar, u.parentesco_id,
+                  EXISTS(SELECT 1 FROM reserva_aprobacion_titular a WHERE a.reserva_id = r.id) AS tiene_aprobacion_titular
            FROM reserva r
            LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
            INNER JOIN usuario u ON u.id = r.usuario_id
@@ -10351,6 +10476,11 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
             409,
             "RESERVA_NO_EDITABLE_POR_ESTADO"
           );
+        }
+        if (Number(reservaActual.tiene_aprobacion_titular) === 1) {
+          throw crearErrorNegocio(
+            "La reserva conserva los datos aprobados por el titular. Para modificarlos, cancelá esta reserva y enviá una nueva solicitud.",
+            409, "RESERVA_APROBACION_TITULAR_NO_EDITABLE");
         }
         if ([MODALIDAD_SORTEO, MODALIDAD_CONVENIO].includes(reservaActual.modalidad)) {
           throw crearErrorNegocio("Esta modalidad no se puede editar desde la reserva general", 409);
@@ -10389,6 +10519,13 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
             "RANGO_HISTORICO_NO_EDITABLE"
           );
         }
+
+        const grupoEdicion = await obtenerGrupoReserva(connection, {
+          id: reservaActual.usuario_id, cbu: reservaActual.usuario_cbu,
+          usuario_familiar_id: reservaActual.usuario_familiar_id,
+          es_familiar: reservaActual.es_familiar, parentesco_id: reservaActual.parentesco_id,
+        }, { forUpdate: true });
+        exigirCbu(grupoEdicion);
 
         const numeroParcelaAnteriorRaw = reservaActual.numero_parcela;
         let numeroParcelaReserva = numeroParcelaAnteriorRaw !== null && numeroParcelaAnteriorRaw !== undefined
@@ -10756,7 +10893,7 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
             r.fecha_fin,
             r.observaciones,
             r.fecha_creacion,
-            DATE_ADD(r.fecha_creacion, INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR) AS fecha_vencimiento_respuesta,
+            DATE_ADD(COALESCE((SELECT a.fecha_respuesta FROM reserva_aprobacion_titular a WHERE a.reserva_id = r.id AND a.decision = 'APROBADA'), r.fecha_creacion), INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR) AS fecha_vencimiento_respuesta,
             COALESCE(r.modalidad, 'FECHA_LIBRE') as modalidad,
             r.sorteo_id,
             r.bloque_fecha_id,
@@ -11018,9 +11155,10 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
             r.fecha_fin,
             r.observaciones,
             r.fecha_creacion,
-            DATE_ADD(r.fecha_creacion, INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR) AS fecha_vencimiento_respuesta,
+            DATE_ADD(COALESCE((SELECT a.fecha_respuesta FROM reserva_aprobacion_titular a WHERE a.reserva_id = r.id AND a.decision = 'APROBADA'), r.fecha_creacion), INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR) AS fecha_vencimiento_respuesta,
             r.firma_archivo,
             r.usuario_id,
+            EXISTS(SELECT 1 FROM reserva_aprobacion_titular at WHERE at.reserva_id = r.id) AS tiene_aprobacion_titular,
             r.es_por_salud,
             COALESCE(r.modalidad, 'FECHA_LIBRE') as modalidad,
             r.sorteo_id,
@@ -11076,9 +11214,14 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
 
         const reserva = reservaInfo[0];
 
-        // Si el rol es afiliado, verificar que la reserva le pertenezca
+        const [aprobacionesTitular] = cabecera.rol === "afiliado" && Number(reserva.usuario_id) !== Number(cabecera.id)
+          ? await connection.query(
+            "SELECT decision FROM reserva_aprobacion_titular WHERE reserva_id = ? AND titular_usuario_id = ?",
+            [reservaId, cabecera.id]) : [[]];
+        const esTitularAutorizado = aprobacionesTitular.length > 0;
+        // Propietario y titular asociado pueden revisar el detalle completo.
         if (cabecera.rol === "afiliado") {
-          if (Number(reserva.usuario_id) !== Number(cabecera.id)) {
+          if (Number(reserva.usuario_id) !== Number(cabecera.id) && !esTitularAutorizado) {
             return res.status(403).json("No tienes permisos para ver esta reserva");
           }
         }
@@ -11137,7 +11280,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
         let viaja_titular = false;
 
         personas.forEach(persona => {
-          if (persona.edad > 5) {
+          if (persona.edad >= 18) {
             adultos++;
           } else if (persona.edad >= 2) {
             ninos++;
@@ -11386,6 +11529,15 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           observaciones_hilo: observacionesHilo
         };
 
+        respuesta.puede_editar = Number(reserva.tiene_aprobacion_titular) !== 1
+          && reserva.estado === ESTADO_INICIADA
+          && [MODALIDAD_FECHA_LIBRE, MODALIDAD_BLOQUE].includes(reserva.modalidad)
+          && (cabecera.rol !== "afiliado" || Number(reserva.usuario_id) === Number(cabecera.id));
+        respuesta.puede_cancelar = Number(reserva.usuario_id) === Number(cabecera.id)
+          && [ESTADO_INICIADA, ESTADO_VERIFICADA, ESTADO_APROBADA, ESTADO_PENDIENTE_TITULAR].includes(reserva.estado)
+          && [MODALIDAD_FECHA_LIBRE, MODALIDAD_BLOQUE].includes(reserva.modalidad)
+          && formatearFechaSQL(reserva.fecha_inicio) >= obtenerFechaCivilHoyArgentina();
+        respuesta.puede_aprobar_titular = esTitularAutorizado && aprobacionesTitular[0].decision === "PENDIENTE" && reserva.estado === ESTADO_PENDIENTE_TITULAR;
         respuesta.convenio_hotel = convenioHotel;
         respuesta.convenio_propuesta = convenioPropuesta;
         if (convenioHotel) {
@@ -11938,6 +12090,16 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
       throw crearErrorNegocio(transicion.mensaje, transicion.statusCode, transicion.codigo);
     }
 
+    let cancelacion = null;
+    if (transicion.estadoDestino === ESTADO_CANCELADA) {
+      if (formatearFechaSQL(reservaActual.fecha_inicio) < obtenerFechaCivilHoyArgentina()) {
+        throw crearErrorNegocio("La fecha de ingreso ya pasó", 409, "RESERVA_FECHA_VENCIDA");
+      }
+      cancelacion = await confirmarCancelacionPolitica(connection, {
+        reserva: reservaActual, usuarioId: cabecera.id,
+        confirmada: req.body.cancelacion_confirmada, cotizacion: req.body.cancelacion_cotizacion,
+      });
+    }
     const fallbackEstadoId = {
       [ESTADO_VERIFICADA]: 2,
       [ESTADO_APROBADA]: 3,
@@ -11990,6 +12152,7 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
 
     if (esBaja) {
       await liberarRecursoBloqueReserva(connection, reservaId);
+      await connection.query("UPDATE reserva_aprobacion_titular SET decision = 'CANCELADA', fecha_respuesta = NOW() WHERE reserva_id = ? AND decision = 'PENDIENTE'", [reservaId]);
       await connection.query(
         `UPDATE sorteo_adjudicacion_respuesta
             SET estado = 'RECHAZADA', fecha_respuesta = COALESCE(fecha_respuesta, NOW())
@@ -12042,6 +12205,7 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
     await connection.commit();
     return res.status(200).json({
       success: true,
+      cancelacion,
       message: `Reserva ${transicion.estadoDestino.toLowerCase()} exitosamente`,
       reserva: {
         id: reservaId,
@@ -12078,7 +12242,7 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
       (cabecera.rol === "departamental" && tieneAreaTurismo(cabecera))
     ) {
       const db = mysqlConnection.promise();
-      const usuario_id = normalizarIdPositivo(req.query.usuario_id);
+      let usuario_id = normalizarIdPositivo(req.query.usuario_id);
       const specific_id = normalizarIdPositivo(req.params.id); // ID específico opcional
 
       if (req.params.id !== undefined && specific_id === null) {
@@ -12113,6 +12277,10 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
         // Pedido de cambio de datos en revisión (services/familiares-cambios.js):
         // el diálogo del afiliado lo precarga y ofrece retirarlo.
         const cambiosPendientes = await obtenerCambiosPendientesPorPersona(db, [specific_id]);
+        const fechaConsulta = req.query.fecha_ingreso === undefined ? obtenerFechaCivilHoyArgentina() : normalizarFechaCivil(req.query.fecha_ingreso);
+        if (!fechaConsulta) return res.status(400).json("La fecha de ingreso no es válida");
+        usuario[0].edad = calcularEdadEnFecha(formatearFechaSQL(usuario[0].fecha_nacimiento), fechaConsulta);
+        usuario[0].tipo_persona_id = tipoPersonaEnIngreso(usuario[0]);
         return res.status(200).json({ ...usuario[0], cambio_pendiente: cambiosPendientes.get(specific_id) || null });
       }
 
@@ -12131,22 +12299,29 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
         return res.status(403).json("No autorizado para consultar este grupo familiar");
       }
 
-      // Construir filtros de edad basados en fecha de nacimiento
+      const familiaConsulta = await obtenerUsuarioPrincipalFamilia(db, usuario_id);
+      const consultarTitular = Number(familiaConsulta.usuarioFamiliarPrincipalId) !== usuario_id;
+      usuario_id = Number(familiaConsulta.usuarioFamiliarPrincipalId);
+      const fechaIngreso = req.query.fecha_ingreso === undefined
+        ? obtenerFechaCivilHoyArgentina() : normalizarFechaCivil(req.query.fecha_ingreso);
+      if (!fechaIngreso) return res.status(400).json("La fecha de ingreso no es válida");
+      const edadSql = `TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, '${fechaIngreso}')`;
+      // Construir filtros por la edad cumplida al check-in.
       let ageFilters = [];
 
-      // Si adultos > 0, incluir personas mayores de 5 años
+      // Si adultos > 0, incluir personas de 18 años o más
       if (adultos && adultos > 0) {
-        ageFilters.push("TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) > 5");
+        ageFilters.push(`${edadSql} >= 18`);
       }
 
-      // Si niños > 0, incluir personas entre 2 y 5 años
+      // Si niños > 0, incluir personas entre 2 y 17 años
       if (ninos && ninos > 0) {
-        ageFilters.push("(TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) >= 2 AND TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) <= 5)");
+        ageFilters.push(`(${edadSql} >= 2 AND ${edadSql} < 18)`);
       }
 
       // Si bebés > 0, incluir personas menores de 2 años
       if (bebes && bebes > 0) {
-        ageFilters.push("TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) < 2");
+        ageFilters.push(`${edadSql} < 2`);
       }
 
       // Si no se especifica ningún filtro de edad, no aplicar filtros
@@ -12179,7 +12354,7 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
             u.telefono,
             u.parentesco_id,
             u.tipo_persona_id,
-            TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) as edad
+            ${edadSql} as edad
           FROM usuario u
           WHERE u.usuario_familiar_id = ? ${ageFilterClause}`,
           [usuario_id]
@@ -12190,7 +12365,7 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
       });
 
       // 2. Obtener el usuario familiar principal (si el usuario actual tiene usuario_familiar_id)
-      if (usuarioPrincipal[0].usuario_familiar_id) {
+      if (consultarTitular || usuarioPrincipal[0].usuario_familiar_id) {
         const [familiarPrincipal] = await mysqlConnection
           .promise()
           .query(
@@ -12203,10 +12378,10 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
               u.telefono,
               u.parentesco_id,
               u.tipo_persona_id,
-              TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) as edad
+              ${edadSql} as edad
             FROM usuario u
             WHERE u.id = ? ${ageFilterClause}`,
-            [usuarioPrincipal[0].usuario_familiar_id]
+            [usuarioPrincipal[0].usuario_familiar_id || usuario_id]
           );
 
         if (familiarPrincipal.length > 0) {
@@ -12227,7 +12402,7 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
             u.telefono,
             u.parentesco_id,
             u.tipo_persona_id,
-            TIMESTAMPDIFF(YEAR, u.fecha_nacimiento, CURDATE()) as edad
+            ${edadSql} as edad
           FROM usuario u
           INNER JOIN reserva_familiar rf ON u.id = rf.usuario_id
           WHERE rf.reserva_id IN (
@@ -12247,7 +12422,7 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
       });
 
       // Convertir Map a Array
-      const resultado = Array.from(acompaniantes.values());
+      const resultado = Array.from(acompaniantes.values()).map((persona) => ({ ...persona, tipo_persona_id: tipoPersonaEnIngreso(persona) }));
 
       res.status(200).json(resultado);
     } else {
@@ -13482,7 +13657,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
     LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
     INNER JOIN usuario u ON r.usuario_id = u.id
-    WHERE 1=1
+    WHERE er.nombre <> 'Pendiente_Aprobacion_Titular'
       ${queryBuscar}
       ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
       ${toDate ? "AND r.fecha_fin <= ?" : ""}
@@ -13535,7 +13710,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
       LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
       INNER JOIN usuario u ON r.usuario_id = u.id
-      WHERE 1=1
+      WHERE er.nombre <> 'Pendiente_Aprobacion_Titular'
         ${queryBuscar}
         ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
         ${toDate ? "AND r.fecha_fin <= ?" : ""}
@@ -13572,6 +13747,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
 
 // Colores pastel para los estados de reserva (misma estética que coseguro_estado)
 const COLORES_ESTADO_RESERVA = {
+  "Pendiente_Aprobacion_Titular": { color: "#FEF3C7", color_texto: "#92400E" },
   "Iniciada": { color: "#E3F2FD", color_texto: "#1565C0" },
   "Verificada": { color: "#FEF9C3", color_texto: "#A16207" },
   "Aprobada": { color: "#D1FAE5", color_texto: "#047857" },
@@ -17830,7 +18006,8 @@ router.get("/configuracion/usuario/:id?", verifyToken, async (req, res) => {
         u.cbu,
         u.foto_archivo,
         u.habilitado,
-        CASE WHEN u.password IS NOT NULL AND COALESCE(r.nombre, '') <> 'invitado' THEN 1 ELSE 0 END as tiene_cuenta,
+        CASE WHEN u.password IS NOT NULL AND (COALESCE(r.nombre, '') <> 'invitado'
+          OR (u.es_familiar = 'S' AND u.usuario_familiar_id IS NOT NULL)) THEN 1 ELSE 0 END as tiene_cuenta,
         r.nombre as rol_nombre
       FROM usuario u
       LEFT JOIN rol r ON r.id = u.rol_id
