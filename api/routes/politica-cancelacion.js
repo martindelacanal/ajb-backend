@@ -36,7 +36,7 @@ function puedeLeerPolitica(actor) {
 router.get("/turismo/politica-cancelacion", verifyToken, async (req, res) => {
   try {
     if (!puedeLeerPolitica(actorDe(req))) throw errorPolitica("No autorizado", 403, "POLITICA_NO_AUTORIZADA");
-    const politica = await obtenerPoliticaVigente(mysqlConnection.promise());
+    const politica = await obtenerPoliticaVigente(mysqlConnection.promise(), { servicioId: req.query.servicio_id });
     // El motivo de los cambios y la identidad de sus autores son de auditoría.
     const { motivo, creada_por, autor_nombre, ...publica } = politica;
     return res.json({ politica: publica, fecha_actual: obtenerFechaCivilArgentina(), zona_horaria: ZONA_HORARIA });
@@ -44,10 +44,21 @@ router.get("/turismo/politica-cancelacion", verifyToken, async (req, res) => {
 });
 
 router.get("/admin/turismo/politicas-cancelacion", verifyToken, async (req, res) => {
+  let connection;
   try {
     if (!esAdministradorTurismo(actorDe(req))) throw errorPolitica("Sólo un administrador de Turismo puede consultar la auditoría", 403, "POLITICA_NO_AUTORIZADA");
-    return res.json(await listarPoliticas(mysqlConnection.promise()));
-  } catch (error) { return responderError(res, error); }
+    connection = await mysqlConnection.promise().getConnection();
+    // Historial, catálogo y versiones deben corresponder al mismo instante:
+    // una publicación concurrente no puede mezclar plantilla vieja y versión nueva.
+    await connection.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    await connection.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
+    const resultado = await listarPoliticas(connection);
+    await connection.commit();
+    return res.json(resultado);
+  } catch (error) {
+    if (connection) await connection.rollback().catch(registrarErrorRuta);
+    return responderError(res, error);
+  } finally { if (connection) connection.release(); }
 });
 
 router.post("/admin/turismo/politicas-cancelacion", verifyToken, async (req, res) => {
@@ -58,7 +69,8 @@ router.post("/admin/turismo/politicas-cancelacion", verifyToken, async (req, res
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
     const politica = await crearVersionPolitica(connection, {
-      versionActual: req.body?.version_actual,
+      serviciosIds: req.body?.servicios_ids,
+      versionesActuales: req.body?.versiones_actuales,
       titulo: req.body?.titulo,
       motivo: req.body?.motivo,
       reglas: req.body?.reglas,

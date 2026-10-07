@@ -109,7 +109,7 @@ const {
   asegurarSinSolicitudTitularPendiente, decidirSolicitudTitular,
 } = require("../services/reservas-familiares");
 const {
-  validarAceptacionPolitica, guardarAceptacionPolitica, confirmarCancelacionPolitica,
+  validarAceptacionPolitica, guardarAceptacionPolitica, confirmarCancelacionPolitica, obtenerCancelacionRegistrada,
 } = require("../services/politica-cancelacion");
 const { obtenerMejorDescuentoAdicionalesDia } = require("../services/descuento-adicionales");
 const { validarRangosEdadTemporada } = require("../services/temporadas-edades");
@@ -4283,10 +4283,6 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
     const { usuarioReservaId, grupoReserva, requiereAprobacionTitular } = await resolverTitularReservaAlta(connection, cabecera, req.body.usuario_id);
-    const politicaAceptada = await validarAceptacionPolitica(connection, {
-      aceptada: req.body.politica_cancelacion_aceptada,
-      politicaId: req.body.politica_cancelacion_id, version: req.body.politica_cancelacion_version,
-    });
     await ejecutarMantenimientoBloquesAlta(connection);
 
     const bloque = await obtenerBloqueConRecursos(connection, bloqueFechaId, { forUpdate: true });
@@ -4295,6 +4291,12 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
       return res.status(404).json("Bloque no encontrado para el sorteo");
     }
     validarBloqueInscripcionAbierta(bloque);
+
+    const politicaAceptada = await validarAceptacionPolitica(connection, {
+      servicioId: bloque.servicio_id,
+      aceptada: req.body.politica_cancelacion_aceptada,
+      politicaId: req.body.politica_cancelacion_id, version: req.body.politica_cancelacion_version,
+    });
 
     const inscripcionExistente = await obtenerInscripcionSorteoActiva(connection, usuarioReservaId, { forUpdate: true });
 
@@ -9717,6 +9719,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
         }
 
         const politicaAceptada = await validarAceptacionPolitica(connection, {
+          servicioId: servicioIdReserva,
           aceptada: req.body.politica_cancelacion_aceptada,
           politicaId: req.body.politica_cancelacion_id, version: req.body.politica_cancelacion_version,
         });
@@ -10228,6 +10231,7 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
     }
 
     const politicaAceptada = await validarAceptacionPolitica(connection, {
+      servicioId: hoteles[0].servicio_id,
       aceptada: req.body.politica_cancelacion_aceptada,
       politicaId: req.body.politica_cancelacion_id, version: req.body.politica_cancelacion_version,
     });
@@ -10437,6 +10441,8 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                   u.departamental_id AS usuario_departamental_id,
                   u.documento AS usuario_documento,
                   u.cbu AS usuario_cbu, u.usuario_familiar_id, u.es_familiar, u.parentesco_id,
+                  EXISTS(SELECT 1 FROM reserva_politica_cancelacion pc WHERE pc.reserva_id = r.id) AS tiene_politica_aceptada,
+                  COALESCE(r.servicio_id, (SELECT rec.servicio_id FROM recurso rec WHERE rec.id = r.recurso_id)) AS servicio_original_id,
                   EXISTS(SELECT 1 FROM reserva_aprobacion_titular a WHERE a.reserva_id = r.id) AS tiene_aprobacion_titular
            FROM reserva r
            LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
@@ -10478,6 +10484,12 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         }
         if ([MODALIDAD_SORTEO, MODALIDAD_CONVENIO].includes(reservaActual.modalidad)) {
           throw crearErrorNegocio("Esta modalidad no se puede editar desde la reserva general", 409);
+        }
+        if (Number(reservaActual.tiene_politica_aceptada) === 1
+          && normalizarIdPositivo(reservaActual.servicio_original_id) !== servicioIdReserva) {
+          throw crearErrorNegocio(
+            "La reserva conserva la política aceptada para su servicio. Para cambiar de servicio, cancelá esta reserva y creá una nueva.",
+            409, "RESERVA_SERVICIO_POLITICA_ACEPTADA");
         }
         const configuracionServicioReserva = await servicioVisibleParaActor(
           connection,
@@ -11531,6 +11543,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           && [ESTADO_INICIADA, ESTADO_VERIFICADA, ESTADO_APROBADA, ESTADO_PENDIENTE_TITULAR].includes(reserva.estado)
           && [MODALIDAD_FECHA_LIBRE, MODALIDAD_BLOQUE].includes(reserva.modalidad)
           && formatearFechaSQL(reserva.fecha_inicio) >= obtenerFechaCivilHoyArgentina();
+        respuesta.cancelacion = await obtenerCancelacionRegistrada(connection, { reservaId: reserva.id });
         respuesta.puede_aprobar_titular = esTitularAutorizado && aprobacionesTitular[0].decision === "PENDIENTE" && reserva.estado === ESTADO_PENDIENTE_TITULAR;
         respuesta.convenio_hotel = convenioHotel;
         respuesta.convenio_propuesta = convenioPropuesta;
