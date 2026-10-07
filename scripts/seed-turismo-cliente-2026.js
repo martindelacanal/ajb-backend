@@ -201,11 +201,11 @@ function filasTarifaPersona({ recursoId, regimenId, temporadaId, rango, lista, p
     const usaPorcentaje = porcentaje > 0 ? 1 : 0;
     const precioAdulto = redondear(lista * (1 - porcentaje / 100));
     const precioNino = redondear(lista * 0.5 * (1 - porcentaje / 100));
-    filas.push([recursoId, tipoPersonaId, regimenId, temporadaId, 6, null, precioAdulto, rango.inicio, rango.fin, "Y", usaPorcentaje, usaPorcentaje ? porcentaje : null, parcelas]);
-    filas.push([recursoId, tipoPersonaId, regimenId, temporadaId, 2, 5, precioNino, rango.inicio, rango.fin, "Y", usaPorcentaje, usaPorcentaje ? porcentaje : null, parcelas]);
+    filas.push([recursoId, tipoPersonaId, regimenId, temporadaId, 18, null, precioAdulto, rango.inicio, rango.fin, "Y", usaPorcentaje, usaPorcentaje ? porcentaje : null, parcelas]);
+    filas.push([recursoId, tipoPersonaId, regimenId, temporadaId, 2, 17, precioNino, rango.inicio, rango.fin, "Y", usaPorcentaje, usaPorcentaje ? porcentaje : null, parcelas]);
   }
   // Menores de 2 años: sin cargo.
-  filas.push([recursoId, TIPOS_PERSONA.MENORES_2, regimenId, temporadaId, 0, 1, 0, rango.inicio, rango.fin, "Y", 1, 100, parcelas]);
+  filas.push([recursoId, TIPOS_PERSONA.MENORES_2, regimenId, temporadaId, 0, 1, 0, rango.inicio, rango.fin, "Y", 0, 0, parcelas]);
   return filas;
 }
 
