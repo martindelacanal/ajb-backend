@@ -7,8 +7,19 @@
 - Las reservas familiares utilizan solo notificaciones internas. Se retiraron
   el envío SMTP y su worker de reintentos; se conservan las columnas históricas.
 - El servidor tiene `MAIL_ENABLED=true`, `MAIL_TEST_MODE=false` y redirección vacía.
-  Esta configuración no elimina las restricciones de AWS: SES continúa en sandbox
-  hasta que AWS apruebe el acceso a producción en `sa-east-1`.
+  Esta configuración no elimina las restricciones de AWS.
+- La política IAM `AmazonSesSendingAccess` ya se guardó con el ajuste en
+  `AllowMiajbPruebasNoResponderOnly`: se retiraron las condiciones `ses:Recipients`
+  y `Null` que limitaban el destino al Gmail de pruebas, y el ARN de esa identidad.
+  Se conservaron el remitente exacto `no-responder@miajbpruebas.com.ar`, los recursos
+  de la identidad `miajbpruebas.com.ar` y del configuration set `miajb-envios`,
+  y el statement del dominio definitivo íntegro. La política versionada en
+  `perfiles/ses-smtp-policy.json` refleja este cambio aplicado.
+- Se envió la solicitud de acceso a producción de SES en `sa-east-1`; la consola
+  confirmó `Success` y muestra `Under review`. SES continúa en sandbox hasta la
+  aprobación de AWS, con 200 destinatarios por 24 horas y 1 por segundo. La entrega
+  a destinatarios no verificados todavía no está habilitada; retirar la restricción
+  de IAM no elimina este límite de SES.
 - Los estados de agosto documentados a continuación son antecedentes; no cambian
   esta decisión ni autorizan tocar el dominio definitivo o su DNS.
 
@@ -191,13 +202,18 @@ Reutilizar las credenciales SMTP existentes de `sa-east-1` solo despues de
 comprobar su estado y permisos. El CSV descargado no se sube al repositorio,
 no se comparte con terceros y no se muestra en los logs.
 
-Politica aplicada el 28/08/2026: `perfiles/ses-smtp-policy.json`. Es la politica
-inline `AmazonSesSendingAccess` del grupo `AWSSESSendingGroupDoNotRename`,
+El registro que sigue es histórico del 28/08/2026, incluida la restricción de
+destinatarios de pruebas retirada el 07/10/2026. Consultar la
+[decisión vigente](#decisión-vigente-al-07102026) para el estado actual;
+`perfiles/ses-smtp-policy.json` contiene la política actualizada el 07/10/2026.
+
+La politica aplicada el 28/08/2026 era la politica inline
+`AmazonSesSendingAccess` del grupo `AWSSESSendingGroupDoNotRename`,
 que contiene al usuario `ses-smtp-user.miajb`. La vista Permissions de ese
 usuario muestra una sola politica, heredada de ese grupo; no se observaron
 politicas adicionales de envio ni acceso a la consola habilitado.
 
-La politica tiene dos statements acotados a `ses:SendRawEmail`: conserva como
+La politica histórica tenía dos statements acotados a `ses:SendRawEmail`: conserva como
 preparacion futura `no-responder@miajb.org.ar` y agrega
 `no-responder@miajbpruebas.com.ar`.
 Cada uno autoriza el ARN de su identidad y el del configuration set utilizado,
