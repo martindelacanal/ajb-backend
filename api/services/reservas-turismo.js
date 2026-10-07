@@ -117,7 +117,7 @@ function validarTransicionTurismo({
   }
 
   if (destino === normalizarEstado(ESTADO_RECHAZADA)) {
-    if (actual === normalizarEstado(ESTADO_VERIFICADA) && rolNormalizado !== "admin") {
+    if (actual === normalizarEstado(ESTADO_VERIFICADA) && rolNormalizado !== "admin" && !esCancelacion) {
       return {
         valido: false,
         statusCode: 403,
@@ -127,12 +127,12 @@ function validarTransicionTurismo({
     }
 
     if (rolNormalizado === "afiliado") {
-      if (!esCancelacion || !esPropietario || actual !== normalizarEstado(ESTADO_INICIADA)) {
+      if (!esCancelacion || !esPropietario || !["iniciada", "verificada", "aprobada", "pendiente_aprobacion_titular"].includes(actual)) {
         return {
           valido: false,
           statusCode: 403,
           codigo: "TRANSICION_NO_AUTORIZADA",
-          mensaje: "Solo puedes cancelar una reserva propia que aun esta iniciada",
+          mensaje: "Solo puedes cancelar una reserva propia que esté activa",
         };
       }
     } else if (rolNormalizado === "departamental" && actual !== normalizarEstado(ESTADO_INICIADA)) {
@@ -360,7 +360,7 @@ async function asegurarSinReservaIniciadaAfiliado(connection, usuarioId) {
             DATE_FORMAT(r.fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
             DATE_FORMAT(r.fecha_fin, '%Y-%m-%d') AS fecha_fin,
             r.fecha_creacion,
-            (r.fecha_creacion <= DATE_SUB(NOW(), INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR)) AS vencida
+            (COALESCE((SELECT a.fecha_respuesta FROM reserva_aprobacion_titular a WHERE a.reserva_id = r.id AND a.decision = 'APROBADA'), r.fecha_creacion) <= DATE_SUB(NOW(), INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR)) AS vencida
        FROM reserva r
       WHERE r.usuario_id = ?
         AND r.estado_reserva_id = ?
@@ -422,7 +422,7 @@ async function expirarPendientes72Horas(db, { limite = 100 } = {}) {
          FROM reserva r
         WHERE r.estado_reserva_id = ?
           AND ${FILTRO_SQL_MODALIDAD_TURISMO_REGULAR}
-          AND r.fecha_creacion <= DATE_SUB(NOW(), INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR)
+          AND COALESCE((SELECT a.fecha_respuesta FROM reserva_aprobacion_titular a WHERE a.reserva_id = r.id AND a.decision = 'APROBADA'), r.fecha_creacion) <= DATE_SUB(NOW(), INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR)
         ORDER BY r.fecha_creacion ASC, r.id ASC
         LIMIT ${limiteSeguro}
         FOR UPDATE SKIP LOCKED`,
@@ -541,6 +541,7 @@ module.exports = {
   expirarPropuestaConvenioEnTransaccion,
   expirarReservaTurismoEnTransaccion,
   iniciarMantenimientoReservas,
+  liberarRecursoBloque,
   normalizarModalidadTurismo,
   obtenerEstadoAltaTurismo,
   validarTransicionTurismo,
