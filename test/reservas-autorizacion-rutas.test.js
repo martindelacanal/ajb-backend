@@ -158,6 +158,8 @@ function responderReservaEdicion({
   modalidad = "FECHA_LIBRE",
   departamentalEditorId = 7,
   tieneAprobacionTitular = false,
+  tienePoliticaAceptada = false,
+  servicioOriginalId = 1,
 } = {}) {
   return async (sql) => {
     if (/FROM usuario u[\s\S]+INNER JOIN rol r[\s\S]+WHERE u\.id = \?/i.test(sql)) {
@@ -182,6 +184,8 @@ function responderReservaEdicion({
         usuario_departamental_id: usuarioDepartamentalId,
         estado_nombre: estado,
         tiene_aprobacion_titular: tieneAprobacionTitular ? 1 : 0,
+        tiene_politica_aceptada: tienePoliticaAceptada ? 1 : 0,
+        servicio_original_id: servicioOriginalId,
         modalidad,
         fecha_inicio: "2099-01-10",
         fecha_fin: "2099-01-13",
@@ -262,6 +266,18 @@ test("una edición autorizada vuelve a exigir CBU antes de cambiar recurso o pas
   assert.equal(response.status, 422);
   assert.equal(response.body.codigo, "CBU_REQUERIDO");
   assert.equal(databaseCalls.some(({ sql }) => /UPDATE reserva|DELETE FROM reserva_familiar/.test(sql)), false);
+});
+
+test("editar no traslada una reserva con política aceptada a otro servicio", async () => {
+  for (const rol of ["afiliado", "admin", "departamental"]) {
+    setDatabaseHandler(responderReservaEdicion({ usuarioId: 100, usuarioDepartamentalId: 7, tienePoliticaAceptada: true, servicioOriginalId: 1 }));
+    const response = await request("/api/reserva/77", {
+      method: "PUT", token: tokenFor({ id: 100, rol, departamental_id: 7 }), body: bodyEdicion({ servicio_id: 2 }),
+    });
+    assert.equal(response.status, 409, rol);
+    assert.equal(response.body.codigo, "RESERVA_SERVICIO_POLITICA_ACEPTADA");
+    assert.equal(databaseCalls.some(({ sql }) => /UPDATE reserva|DELETE FROM reserva_familiar/.test(sql)), false);
+  }
 });
 
 function responderLecturaFueraDeJurisdiccion(modalidad) {
@@ -870,8 +886,7 @@ test("recursos y adicionales siguen accesibles con Turismo habilitado", async ()
 test("el alta departamental revierte Iniciada y Verificada si falla el segundo hito de historial", async () => {
   let insercionesHistorial = 0;
   setDatabaseHandler(async (sql) => {
-    if (/SELECT politica_id FROM politica_cancelacion_vigente/.test(sql)) return [[{ politica_id: 1 }]];
-    if (/SELECT \* FROM politica_cancelacion WHERE/.test(sql)) return [[{
+    if (/SELECT p\.\* FROM politica_cancelacion p/.test(sql)) return [[{
       id: 1, version: 1, titulo: "Cancelación", reglas_json: [{ dias_desde: 0, dias_hasta: null, porcentaje_reintegro: 100 }],
     }]];
     if (/INSERT INTO reserva_politica_cancelacion/.test(sql)) return [{ affectedRows: 1 }];
@@ -994,16 +1009,16 @@ test("el alta departamental revierte Iniciada y Verificada si falla el segundo h
   );
 });
 
-function responderResumenConSaludOculta(propietarioId, tieneAprobacionTitular = false) {
+function responderResumenConSaludOculta(propietarioId, tieneAprobacionTitular = false, cancelacion = null) {
   return async (sql) => {
     if (/r\.numero_parcela[\s\S]+FROM reserva r[\s\S]+WHERE r\.id = \?/i.test(sql)) {
       return [[{
         id: 77,
         usuario_id: propietarioId,
         tiene_aprobacion_titular: tieneAprobacionTitular ? 1 : 0,
-        es_por_salud: 1,
+        es_por_salud: cancelacion ? 0 : 1,
         modalidad: "FECHA_LIBRE",
-        estado: "Iniciada",
+        estado: cancelacion ? "Cancelada" : "Iniciada",
         firma_archivo: null,
         convenio_hotel_id: null,
         fecha_creacion: "2099-01-01 10:00:00",
@@ -1014,12 +1029,13 @@ function responderResumenConSaludOculta(propietarioId, tieneAprobacionTitular = 
     if (/SELECT id, departamental_id FROM usuario WHERE id IN/i.test(sql)) {
       return [[
         { id: 100, departamental_id: 7 },
-        { id: propietarioId, departamental_id: 7 },
+        ...(propietarioId === 100 ? [] : [{ id: propietarioId, departamental_id: 7 }]),
       ]];
     }
     if (/FROM reserva_familiar rf/i.test(sql)) return [[]];
     if (/FROM reserva_adicional\s+WHERE reserva_id/i.test(sql)) return [[]];
     if (/FROM reserva_observacion o/i.test(sql)) return [[]];
+    if (/FROM reserva_cancelacion_politica/i.test(sql)) return [cancelacion ? [cancelacion] : []];
     // Cupones / tipos de viaje aplicados a la reserva (módulo Descuentos)
     if (/FROM reserva_descuento rd/i.test(sql)) return [[]];
     if (/\b(?:FROM|JOIN)\s+reserva_salud(?:_archivo)?\b/i.test(sql)) {
@@ -1037,6 +1053,24 @@ test("el resumen oculta la acción de edición cuando el titular ya aprobó el c
   assert.equal(response.status, 200);
   assert.equal(response.body.puede_editar, false);
   assert.equal(response.body.puede_cancelar, true);
+});
+
+test("detalle de reserva cancelada muestra cálculo histórico al dueño y al personal autorizado", async () => {
+  const cancelacion = { cancelada_en: "2020-01-01 12:00:00", fecha_calculo_civil: "2020-01-01", fecha_checkin_civil: "2020-01-08",
+    dias_previos: 7, porcentaje_reintegro: "50.00", monto_base: "1000.01", monto_reintegro: "500.01", tipo_base: "TOTAL_RESERVA",
+    snapshot_json: { politica: { id: 1, version: 1, titulo: "Inicial", reglas: [{ dias_desde: 0, dias_hasta: null, porcentaje_reintegro: 50 }], motivo: "interno", creada_por: 1 }, origen_politica: "ACEPTADA" } };
+  for (const claims of [{ id: 100, rol: "afiliado", modulo_coseguro: 0 }, { id: 100, rol: "admin", area_coseguro: 0 },
+    { id: 100, rol: "departamental", departamental_id: 7, area_turismo: 1, area_coseguro: 0 }]) {
+    setDatabaseHandler(responderResumenConSaludOculta(100, false, cancelacion));
+    const response = await request("/api/reserva/77/resumen", { token: tokenFor(claims) });
+    assert.equal(response.status, 200, claims.rol);
+    assert.equal(response.body.cancelacion.fecha_calculo, "2020-01-01");
+    assert.equal(response.body.cancelacion.dias_previos, 7);
+    assert.equal(response.body.cancelacion.monto_reintegro, 500.01);
+    assert.equal(response.body.cancelacion.politica.creada_por, undefined);
+    assert.equal(response.body.puede_cancelar, false);
+    assert.ok(!databaseCalls.some(({ sql }) => /FROM politica_cancelacion p/.test(sql)));
+  }
 });
 
 test("el resumen oculta salud a afiliado sin Coseguro y departamental solo Turismo", async () => {
