@@ -703,6 +703,7 @@ test("cambiar el parentesco recalcula es_familiar y corrige la etiqueta en reser
   const [consultaReservas] = consultas(conexion, /FROM reserva_familiar rf INNER JOIN reserva r/);
   assert.deepEqual(consultaReservas.params[1], [1, 2, 3, 6, 7, 9, 10, 11]);
   assert.match(consultaReservas.sql, /FOR UPDATE OF rf$/);
+  assert.match(consultaReservas.sql, /NOT EXISTS \(SELECT 1 FROM reserva_aprobacion_titular a WHERE a.reserva_id = r.id\)/);
   assert.deepEqual(consultas(conexion, /^UPDATE reserva_familiar/)[0].params, [2, 90]);
   // Nunca toca el precio (lo protege el trigger ajb_rf_guard_bu).
   assert.doesNotMatch(consultas(conexion, /^UPDATE reserva_familiar/)[0].sql, /precio/);

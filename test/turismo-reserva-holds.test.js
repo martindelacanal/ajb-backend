@@ -265,7 +265,7 @@ test("dos adquisiciones concurrentes del mismo recurso dejan un solo ganador", a
         if (/FROM usuario u[\s\S]*INNER JOIN rol/i.test(sql)) {
           return [params.map((id) => ({
             id,
-            habilitado: "Y",
+            habilitado: "Y", cbu: "2850590940090418135201",
             departamental_id: 1,
             modulo_turismo: 1,
             rol: "afiliado",
@@ -424,7 +424,7 @@ function crearBaseSimulada() {
     if (/GET_LOCK/.test(sql)) return [[{ adquirido: 1 }]];
     if (/RELEASE_LOCK/.test(sql)) return [[{}]];
     if (/FROM usuario u[\s\S]*INNER JOIN rol/i.test(sql)) {
-      return [params.map((id) => ({ id, habilitado: "Y", departamental_id: 1, modulo_turismo: 1, rol: "afiliado" }))];
+      return [params.map((id) => ({ id, habilitado: "Y", cbu: "2850590940090418135201", departamental_id: 1, modulo_turismo: 1, rol: "afiliado" }))];
     }
     if (/SELECT r\.id, r\.servicio_id[\s\S]*FROM recurso r/i.test(sql)) {
       return [params.map(Number).filter((id) => recursos.has(id)).map((id) => recursos.get(id))];

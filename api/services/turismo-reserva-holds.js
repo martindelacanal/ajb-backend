@@ -1,3 +1,4 @@
+const { esFamiliar, obtenerGrupoReserva, exigirCbu } = require("./reservas-familiares");
 "use strict";
 
 const crypto = require("crypto");
@@ -307,7 +308,8 @@ async function bloquearYValidarUsuarios(connection, datos) {
   const ids = [...new Set([datos.actorUsuarioId, datos.titularUsuarioId].filter(Boolean))].sort((a, b) => a - b);
   const placeholders = ids.map(() => "?").join(",");
   const [rows] = await connection.query(
-    `SELECT u.id, u.habilitado, u.departamental_id, u.area_turismo, u.modulo_turismo, r.nombre AS rol
+    `SELECT u.id, u.habilitado, u.departamental_id, u.area_turismo, u.modulo_turismo,
+              u.cbu, u.usuario_familiar_id, u.es_familiar, u.parentesco_id, r.nombre AS rol
        FROM usuario u
        INNER JOIN rol r ON r.id = u.rol_id
       WHERE u.id IN (${placeholders})
@@ -320,7 +322,8 @@ async function bloquearYValidarUsuarios(connection, datos) {
   if (!actor || actor.habilitado !== "Y") {
     throw crearErrorHold("La sesión ya no está habilitada.", 403, "HOLD_NO_AUTORIZADO");
   }
-  const rolActual = String(actor.rol || "").trim().toLowerCase();
+  const rolPersistido = String(actor.rol || "").trim().toLowerCase();
+  const rolActual = rolPersistido === "invitado" && esFamiliar(actor) ? "afiliado" : rolPersistido;
   datos.actorRol = rolActual;
   datos.actorDepartamentalId = normalizarIdPositivo(actor.departamental_id);
   if (!['admin', 'departamental', 'afiliado'].includes(rolActual)) {
@@ -334,10 +337,12 @@ async function bloquearYValidarUsuarios(connection, datos) {
     if (datos.titularUsuarioId !== datos.actorUsuarioId) {
       throw crearErrorHold("No tienes permisos para reservar para otra persona.", 403, "HOLD_NO_AUTORIZADO");
     }
-    if (actor.modulo_turismo != null && Number(actor.modulo_turismo) !== 1) {
+    if (actor.modulo_turismo != null && Number(actor.modulo_turismo) !== 1 && rolPersistido !== "invitado") {
       throw crearErrorHold("No tienes habilitado el módulo Turismo.", 403, "HOLD_NO_AUTORIZADO");
     }
-    datos.departamentalVisibilidadId = normalizarIdPositivo(actor.departamental_id);
+    const grupo = await obtenerGrupoReserva(connection, actor, { forUpdate: true });
+    exigirCbu(grupo);
+    datos.departamentalVisibilidadId = normalizarIdPositivo(grupo.titular.departamental_id ?? actor.departamental_id);
     return;
   }
 
@@ -367,6 +372,7 @@ async function bloquearYValidarUsuarios(connection, datos) {
       "HOLD_NO_AUTORIZADO"
     );
   }
+  exigirCbu(await obtenerGrupoReserva(connection, titular, { forUpdate: true }));
   datos.departamentalVisibilidadId = normalizarIdPositivo(titular.departamental_id);
 }
 

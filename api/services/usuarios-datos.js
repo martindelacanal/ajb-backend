@@ -1235,6 +1235,7 @@ async function propagarParentesco(connection, ctx) {
        FROM reserva_familiar rf
        INNER JOIN reserva r ON r.id = rf.reserva_id
       WHERE rf.usuario_id = ? AND r.estado_reserva_id IN (?) AND r.fecha_fin >= ?
+        AND NOT EXISTS (SELECT 1 FROM reserva_aprobacion_titular a WHERE a.reserva_id = r.id)
       ORDER BY rf.reserva_id, rf.id
       FOR UPDATE OF rf`,
     [objetivo.id, ESTADOS_RESERVA_ABIERTA, hoy]

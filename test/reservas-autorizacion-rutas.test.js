@@ -20,6 +20,7 @@ const transactionalConnection = {
     if (esConsultaAutorizacion(sql)) {
       return usuarioSesionActual ? [[usuarioSesionActual]] : [[]];
     }
+    if (/er.nombre = \? LIMIT 1 FOR UPDATE/.test(sql) && /FROM reserva r/.test(sql)) return [[]];
     return databaseHandler(sql, params);
   },
   async execute(sql, params = []) {
@@ -156,6 +157,7 @@ function responderReservaEdicion({
   usuarioDepartamentalId = 8,
   modalidad = "FECHA_LIBRE",
   departamentalEditorId = 7,
+  tieneAprobacionTitular = false,
 } = {}) {
   return async (sql) => {
     if (/FROM usuario u[\s\S]+INNER JOIN rol r[\s\S]+WHERE u\.id = \?/i.test(sql)) {
@@ -169,6 +171,7 @@ function responderReservaEdicion({
         area_coseguro: 1,
         modulo_turismo: 1,
         modulo_coseguro: 1,
+    cbu: "2850590940090418135201",
         modulo_olimpiadas: 1,
       }]];
     }
@@ -178,6 +181,7 @@ function responderReservaEdicion({
         usuario_id: usuarioId,
         usuario_departamental_id: usuarioDepartamentalId,
         estado_nombre: estado,
+        tiene_aprobacion_titular: tieneAprobacionTitular ? 1 : 0,
         modalidad,
         fecha_inicio: "2099-01-10",
         fecha_fin: "2099-01-13",
@@ -228,6 +232,36 @@ test("PUT /reserva/:id autoriza propietario y jurisdiccion antes de revelar el e
   });
   assert.equal(departamental.status, 403);
   assert.equal(databaseCalls.filter(({ sql }) => /UPDATE reserva/i.test(sql)).length, 0);
+});
+
+test("la edición no puede alterar una reserva ya aprobada por el titular, ni siendo staff", async () => {
+  for (const rol of ["afiliado", "admin", "departamental"]) {
+    setDatabaseHandler(responderReservaEdicion({ usuarioId: 100, usuarioDepartamentalId: 7, tieneAprobacionTitular: true }));
+    const response = await request("/api/reserva/77", {
+      method: "PUT", token: tokenFor({ id: 100, rol, departamental_id: 7 }),
+      body: bodyEdicion({ fecha_inicio: "2099-03-10", fecha_fin: "2099-03-13" }),
+    });
+    assert.equal(response.status, 409, rol);
+    assert.equal(response.body.codigo, "RESERVA_APROBACION_TITULAR_NO_EDITABLE");
+    assert.equal(databaseCalls.some(({ sql }) => /UPDATE reserva|DELETE FROM reserva_familiar/.test(sql)), false);
+  }
+});
+
+test("una edición autorizada vuelve a exigir CBU antes de cambiar recurso o pasajeros", async () => {
+  setDatabaseHandler(async (sql) => {
+    if (/FROM reserva r[\s\S]+FOR UPDATE/.test(sql)) return [[{
+      id: 77, usuario_id: 100, usuario_departamental_id: 7, estado_nombre: "Iniciada", modalidad: "FECHA_LIBRE",
+      fecha_inicio: "2099-01-10", fecha_fin: "2099-01-13", usuario_cbu: " ",
+    }]];
+    if (/SELECT s\.id, s\.tipo_servicio_id[\s\S]+FROM servicio s/.test(sql)) return [[configuracionServicioVisible()]];
+    throw new Error(`No debe avanzar sin CBU: ${sql}`);
+  });
+  const response = await request("/api/reserva/77", {
+    method: "PUT", token: tokenFor({ id: 100, rol: "afiliado" }), body: bodyEdicion(),
+  });
+  assert.equal(response.status, 422);
+  assert.equal(response.body.codigo, "CBU_REQUERIDO");
+  assert.equal(databaseCalls.some(({ sql }) => /UPDATE reserva|DELETE FROM reserva_familiar/.test(sql)), false);
 });
 
 function responderLecturaFueraDeJurisdiccion(modalidad) {
@@ -397,6 +431,7 @@ function responderTitularParaAlta(overrides = {}) {
     rol: "afiliado",
     modulo_turismo: 1,
     modulo_coseguro: 1,
+    cbu: "2850590940090418135201",
     ...overrides,
   };
   return async (sql) => {
@@ -417,6 +452,57 @@ const altasTurismo = [
     body: (overrides) => bodyConvenio({ usuario_id: 200, ...overrides }),
   },
 ];
+
+test("ningún alta ni hold inicia hospedaje sin CBU y no se exponen datos bancarios", async () => {
+  for (const endpoint of ["/api/reserva", "/api/convenios-hoteleros/3/reservas", "/api/turismo/reserva-holds"] ) {
+    setDatabaseHandler(responderTitularParaAlta({ cbu: "   " }));
+    const response = await request(endpoint, {
+      method: "POST", token: tokenFor({ rol: "admin" }),
+      body: { ...bodyEdicion({ usuario_id: 200 }), ...bodyConvenio({ usuario_id: 200 }) },
+    });
+    assert.equal(response.status, 422, endpoint);
+    assert.equal(response.body.codigo, "CBU_REQUERIDO", endpoint);
+    assert.equal(databaseCalls.some(({ sql }) => /INSERT INTO reserva|INSERT INTO turismo_reserva_hold/.test(sql)), false);
+  }
+  setDatabaseHandler(responderTitularParaAlta({ cbu: "2850590940090418135201" }));
+  const elegibilidad = await request("/api/turismo/reserva-elegibilidad?usuario_id=200", { token: tokenFor({ rol: "admin" }) });
+  assert.equal(elegibilidad.status, 200);
+  assert.equal(elegibilidad.body.cbu_completo, true);
+  assert.equal(elegibilidad.body.puede_reservar, true);
+  assert.equal(JSON.stringify(elegibilidad.body).includes("2850590940090418135201"), false);
+});
+
+test("elegibilidad familiar usa su titular y descarta un usuario_id manipulado", async () => {
+  setDatabaseHandler(async (sql, params) => {
+    if (/SELECT u.id, u.nombre/.test(sql)) return [[params[0] === 100
+      ? { id: 100, rol: "invitado", habilitado: "Y", es_familiar: "S", parentesco_id: 3, usuario_familiar_id: 200 }
+      : { id: 200, rol: "afiliado", habilitado: "Y", modulo_turismo: 1, cbu: "123", usuario_familiar_id: null }]];
+    throw new Error(`Consulta no prevista: ${sql}`);
+  });
+  const response = await request("/api/turismo/reserva-elegibilidad?usuario_id=999", {
+    token: tokenFor({ id: 100, rol: "afiliado" }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.requiere_aprobacion_titular, true);
+  assert.equal(response.body.titular_usuario_id, 200);
+  assert.equal(databaseCalls.some(({ params }) => params.includes(999)), false);
+});
+
+test("la aprobación del titular exige autenticación, titular asociado y excluye al staff", async () => {
+  setDatabaseHandler(async (sql) => {
+    if (/SELECT solicitante_usuario_id/.test(sql)) return [[]];
+    throw new Error(`No debe acceder a la reserva ajena: ${sql}`);
+  });
+  const sinSesion = await request("/api/reserva/77/aprobacion-titular", { method: "PUT", body: { accion: "APROBAR" } });
+  assert.equal(sinSesion.status, 401);
+  for (const rol of ["admin", "departamental", "afiliado"]) {
+    const response = await request("/api/reserva/77/aprobacion-titular", {
+      method: "PUT", token: tokenFor({ id: 999, rol }), body: { accion: "APROBAR" },
+    });
+    assert.equal(response.status, 403, rol);
+  }
+  assert.equal(databaseCalls.some(({ sql }) => /UPDATE reserva/.test(sql)), false);
+});
 
 test("staff no puede crear turismo regular ni convenio para un titular con Turismo apagado", async () => {
   for (const alta of altasTurismo) {
@@ -446,6 +532,7 @@ test("un convenio no admite reservas si su servicio no es visible para la depart
         habilitado: "Y",
         modulo_turismo: 1,
         modulo_coseguro: 1,
+    cbu: "2850590940090418135201",
         rol: "afiliado",
       }]];
     }
@@ -537,6 +624,7 @@ test("SOLO_TITULAR y la capacidad se validan antes de insertar reservas regulare
           habilitado: "Y",
           modulo_turismo: 1,
           modulo_coseguro: 1,
+    cbu: "2850590940090418135201",
           rol: "afiliado",
         }]];
       }
@@ -782,6 +870,11 @@ test("recursos y adicionales siguen accesibles con Turismo habilitado", async ()
 test("el alta departamental revierte Iniciada y Verificada si falla el segundo hito de historial", async () => {
   let insercionesHistorial = 0;
   setDatabaseHandler(async (sql) => {
+    if (/SELECT politica_id FROM politica_cancelacion_vigente/.test(sql)) return [[{ politica_id: 1 }]];
+    if (/SELECT \* FROM politica_cancelacion WHERE/.test(sql)) return [[{
+      id: 1, version: 1, titulo: "Cancelación", reglas_json: [{ dias_desde: 0, dias_hasta: null, porcentaje_reintegro: 100 }],
+    }]];
+    if (/INSERT INTO reserva_politica_cancelacion/.test(sql)) return [{ affectedRows: 1 }];
     if (/SELECT u\.id, u\.nombre[\s\S]+FOR UPDATE/i.test(sql)) {
       return [[{
         id: 200,
@@ -792,6 +885,7 @@ test("el alta departamental revierte Iniciada y Verificada si falla el segundo h
         habilitado: "Y",
         modulo_turismo: 1,
         modulo_coseguro: 1,
+    cbu: "2850590940090418135201",
         rol: "afiliado",
       }]];
     }
@@ -884,6 +978,7 @@ test("el alta departamental revierte Iniciada y Verificada si falla el segundo h
     token: tokenFor({ id: 100, rol: "departamental", departamental_id: 7 }),
     body: bodyEdicion({
       usuario_id: 200,
+      politica_cancelacion_aceptada: true, politica_cancelacion_id: 1, politica_cancelacion_version: 1,
       personas: [{ id: 200, dni: "12345678" }],
     }),
   });
@@ -899,12 +994,13 @@ test("el alta departamental revierte Iniciada y Verificada si falla el segundo h
   );
 });
 
-function responderResumenConSaludOculta(propietarioId) {
+function responderResumenConSaludOculta(propietarioId, tieneAprobacionTitular = false) {
   return async (sql) => {
     if (/r\.numero_parcela[\s\S]+FROM reserva r[\s\S]+WHERE r\.id = \?/i.test(sql)) {
       return [[{
         id: 77,
         usuario_id: propietarioId,
+        tiene_aprobacion_titular: tieneAprobacionTitular ? 1 : 0,
         es_por_salud: 1,
         modalidad: "FECHA_LIBRE",
         estado: "Iniciada",
@@ -932,6 +1028,16 @@ function responderResumenConSaludOculta(propietarioId) {
     throw new Error(`Consulta inesperada: ${sql}`);
   };
 }
+
+test("el resumen oculta la acción de edición cuando el titular ya aprobó el contenido", async () => {
+  setDatabaseHandler(responderResumenConSaludOculta(100, true));
+  const response = await request("/api/reserva/77/resumen", {
+    token: tokenFor({ id: 100, rol: "afiliado", modulo_coseguro: 0 }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.puede_editar, false);
+  assert.equal(response.body.puede_cancelar, true);
+});
 
 test("el resumen oculta salud a afiliado sin Coseguro y departamental solo Turismo", async () => {
   const casos = [

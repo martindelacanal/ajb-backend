@@ -29,6 +29,36 @@ function usuarioHabilitado(valor) {
   return !["N", "NO", "0", "FALSE"].includes(normalizado);
 }
 
+// Un familiar invitado usa la experiencia de autogestión exclusivamente para
+// turismo. La relación y el titular se vuelven a comprobar en cada petición.
+async function resolverAccesoFamiliar(usuario, db) {
+  if (String(usuario.rol).toLowerCase() !== 'invitado') return usuario;
+  const titularId = Number(usuario.usuario_familiar_id);
+  if (String(usuario.es_familiar).toUpperCase() !== 'S' || !Number.isSafeInteger(titularId) || titularId <= 0 || titularId === Number(usuario.id)) {
+    throw new ErrorSesionUsuario('El invitado no tiene un vínculo familiar habilitado');
+  }
+  const [titulares] = await db.query(
+    `SELECT id, rol_id, habilitado, modulo_turismo, departamental_id, usuario_familiar_id
+       FROM usuario WHERE id = ? LIMIT 1`, [titularId]);
+  const titular = titulares[0];
+  if (!titular || Number(titular.rol_id) !== 2 || !usuarioHabilitado(titular.habilitado) || titular.usuario_familiar_id) {
+    throw new ErrorSesionUsuario('El titular del grupo familiar no está habilitado');
+  }
+  return { ...usuario, rol: 'afiliado', es_familiar: 'S', acceso_familiar_turismo: true,
+    titular_usuario_id: titularId, departamental_id: titular.departamental_id,
+    area_turismo: 1, area_coseguro: 0,
+    modulo_turismo: (titular.modulo_turismo == null || Number(titular.modulo_turismo) === 1) &&
+      (usuario.modulo_turismo == null || Number(usuario.modulo_turismo) === 1) ? 1 : 0,
+    modulo_coseguro: 0, modulo_olimpiadas: 0 };
+}
+
+function rutaPermitidaFamiliar(req) {
+  const ruta = String(req.path || req.url || '').split('?')[0];
+  if ((req.method === 'POST' && ruta === '/familiares') || /^\/familiares\/\d+\/vinculo\/?$/.test(ruta)) return false;
+  // Los handlers conservan sus controles de propiedad y ámbito de grupo.
+  return /^\/(?:sesion\/permisos|configuracion\/usuario(?:\/\d+)?|usuario|notificaciones(?:\/.*)?|mis-gestiones(?:\/catalogos)?|turismo(?:\/.*)?|reserva(?:\/.*)?|reservas\/aprobaciones-titular|servicios(?:\/.*)?|lugares|recursos|adicionales|regimen|tipo_persona|parentesco|acompaniantes(?:\/\d+)?|tabla\/acompaniantes|familiares(?:\/.*)?|convenios-hoteleros(?:\/.*)?|sorteos(?:\/.*)?|filtros\/para-recursos|descuentos(?:\/.*)?|observaciones\/turismo\/\d+\/lectura|webauthn(?:\/.*)?)\/?$/.test(ruta);
+}
+
 async function actualizarAutorizacionSesion(authData, db) {
   const cabecera = parsearCabecera(authData);
   const [usuarios] = await db.query(
@@ -42,7 +72,9 @@ async function actualizarAutorizacionSesion(authData, db) {
        u.area_coseguro,
        u.modulo_turismo,
        u.modulo_coseguro,
-       u.modulo_olimpiadas
+       u.modulo_olimpiadas,
+       u.es_familiar,
+       u.usuario_familiar_id
      FROM usuario u
      INNER JOIN rol r ON r.id = u.rol_id
      WHERE u.id = ?
@@ -57,7 +89,7 @@ async function actualizarAutorizacionSesion(authData, db) {
     throw new ErrorSesionUsuario("Usuario inhabilitado");
   }
 
-  const actualizada = { ...cabecera, ...usuarios[0] };
+  const actualizada = { ...cabecera, acceso_familiar_turismo: false, titular_usuario_id: null, ...await resolverAccesoFamiliar(usuarios[0], db) };
   authData.data = JSON.stringify(actualizada);
   return actualizada;
 }
@@ -81,7 +113,10 @@ function verificarTokenConAutorizacionActual({
         : "Tu sesión no es válida. Volvé a iniciar sesión.");
     }
     try {
-      await actualizarAutorizacionSesion(authData, db);
+      const permisos = await actualizarAutorizacionSesion(authData, db);
+      if (permisos.acceso_familiar_turismo && !rutaPermitidaFamiliar(req)) {
+        return res.status(403).json('La cuenta familiar solo tiene acceso a turismo y a sus datos personales');
+      }
       req.data = authData;
       return next();
     } catch (sessionError) {
@@ -95,6 +130,8 @@ function verificarTokenConAutorizacionActual({
 }
 
 module.exports = {
+  resolverAccesoFamiliar,
+  rutaPermitidaFamiliar,
   ErrorSesionUsuario,
   actualizarAutorizacionSesion,
   parsearCabecera,
