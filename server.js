@@ -437,7 +437,6 @@ io.on("connection", (socket) => {
 
 server.listen(port);
 iniciarMantenimientoReservas(mysqlConnection.promise());
-require("./api/services/reservas-familiares").iniciarReintentosCorreoTitular(mysqlConnection.promise());
 iniciarMantenimientoHolds(mysqlConnection.promise(), {
     onExpirados: async (holds) => {
         for (const hold of holds) {

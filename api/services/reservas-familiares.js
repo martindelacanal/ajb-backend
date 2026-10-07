@@ -1,7 +1,6 @@
 "use strict";
 
 const { calcularEdadEnFecha, normalizarFechaCivil } = require("./valores-dominio");
-const { enviarCorreoPlantilla, urlAplicacion, estadoCorreo } = require("./correo");
 const { obtenerFechaCivilArgentina } = require("./valores-dominio");
 const ESTADO_PENDIENTE_TITULAR = "Pendiente_Aprobacion_Titular";
 const MENSAJE_CBU = "Para realizar reservas de hospedaje es obligatorio tener cargado tu CBU en tu perfil. Haz clic aquí para actualizar tus datos bancarios";
@@ -162,59 +161,6 @@ async function decidirSolicitudTitular(connection, { reservaId, actorId, accion 
   return { ...reserva, estado: destino };
 }
 
-async function enviarCorreoSolicitudTitular(db, reservaId) {
-  // Outbox durable: la solicitud se confirma primero; una caída SMTP se reintenta.
-  // Un envío desviado a pruebas no entrega la aprobación al titular. Conservar
-  // la fila pendiente, sin consumir el intento ni marcarla como entregada, para
-  // que el worker la retome cuando vuelva la configuración de envíos reales.
-  const configuracion = estadoCorreo();
-  if (configuracion.modoPruebas || configuracion.redirigirA) return;
-  const [rows] = await db.query(
-    `SELECT a.reserva_id, u.email, u.nombre, r.fecha_inicio, r.fecha_fin
-       FROM reserva_aprobacion_titular a
-       INNER JOIN usuario u ON u.id = a.titular_usuario_id
-       INNER JOIN reserva r ON r.id = a.reserva_id
-      WHERE a.reserva_id = ? AND a.decision = 'PENDIENTE' AND a.correo_enviado_en IS NULL`, [reservaId]);
-  if (!rows.length) return;
-  const row = rows[0];
-  const [claim] = await db.query(
-    `UPDATE reserva_aprobacion_titular SET correo_ultimo_intento_en = NOW(), correo_intentos = correo_intentos + 1
-      WHERE reserva_id = ? AND correo_enviado_en IS NULL
-        AND (correo_ultimo_intento_en IS NULL OR correo_ultimo_intento_en < DATE_SUB(NOW(), INTERVAL 5 MINUTE))`, [reservaId]);
-  if (claim.affectedRows !== 1) return;
-  const resultado = await enviarCorreoPlantilla({
-    para: row.email, asunto: `Reserva #${reservaId}: aprobación del titular`,
-    titulo: "Un familiar solicita tu aprobación", saludo: `Hola, ${row.nombre}`,
-    parrafos: ["Un integrante de tu grupo familiar envió una solicitud de hospedaje. Ingresá con tu cuenta para revisar y aprobar o rechazar la reserva."],
-    datos: [{ etiqueta: "Reserva", valor: `#${reservaId}` },
-      { etiqueta: "Ingreso", valor: normalizarFechaCivil(row.fecha_inicio) },
-      { etiqueta: "Salida", valor: normalizarFechaCivil(row.fecha_fin) }],
-    boton: { texto: "Revisar y aprobar reserva", url: urlAplicacion(`/mis-gestiones?aprobacion_reserva=${reservaId}`) },
-  });
-  await db.query(`UPDATE reserva_aprobacion_titular SET correo_enviado_en = IF(?, NOW(), NULL), correo_error = ? WHERE reserva_id = ?`,
-    [resultado.enviado ? 1 : 0, resultado.enviado ? null : String(resultado.motivo || "error_smtp").slice(0, 255), reservaId]);
-}
-
-function iniciarReintentosCorreoTitular(db) {
-  let activo = false;
-  const ejecutar = async () => {
-    if (activo) return;
-    activo = true;
-    try {
-      const [rows] = await db.query(`SELECT reserva_id FROM reserva_aprobacion_titular
-        WHERE decision = 'PENDIENTE' AND correo_enviado_en IS NULL
-          AND (correo_ultimo_intento_en IS NULL OR correo_ultimo_intento_en < DATE_SUB(NOW(), INTERVAL 5 MINUTE))
-        ORDER BY fecha_solicitud LIMIT 30`);
-      for (const row of rows) await enviarCorreoSolicitudTitular(db, row.reserva_id);
-    } catch (error) { console.error("No se pudo reintentar correo de aprobación del titular:", error.code || error.message); }
-    finally { activo = false; }
-  };
-  const timer = setInterval(() => void ejecutar(), 60_000);
-  timer.unref?.();
-  return () => clearInterval(timer);
-}
-
 module.exports = { ESTADO_PENDIENTE_TITULAR, MENSAJE_CBU, MENSAJE_ADULTO, esFamiliar,
   obtenerGrupoReserva, exigirCbu, validarAdultoResponsable, registrarSolicitudTitular,
-  asegurarSinSolicitudTitularPendiente, decidirSolicitudTitular,
-  enviarCorreoSolicitudTitular, iniciarReintentosCorreoTitular };
+  asegurarSinSolicitudTitularPendiente, decidirSolicitudTitular };
