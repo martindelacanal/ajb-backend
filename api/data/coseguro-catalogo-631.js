@@ -1,8 +1,10 @@
 "use strict";
 
 // Fuente: Plan_de_Cuentas_631.xlsx, hoja «Plan de Cuentas», entregado por el cliente.
-// Las filas sin descripción y los rubros no son prestaciones seleccionables.
+// Todas las filas con código y título son seleccionables, incluidas las cuentas 00.
+const { completarAdjuntos } = require("./coseguro-limites-archivos");
 const GRUPOS = [
+  { codigo: "631.000", nombre: "General", icono: "health_and_safety" },
   { codigo: "631.100", nombre: "Internaciones", icono: "local_hospital" },
   { codigo: "631.200", nombre: "Medicina", icono: "stethoscope" },
   { codigo: "631.300", nombre: "Bioquímica", icono: "biotech" },
@@ -13,35 +15,42 @@ const GRUPOS = [
 ].sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
 
 const FILAS = [
-  ["631.103", "Internaciones", "local_hospital", ["Internación geriátrica", "Otros"]],
-  ["631.105", "Acompañante terapéutico", "accessibility_new"],
-  ["631.202", "Bono de consulta", "confirmation_number"],
-  ["631.203", "Honorarios médicos particulares / excepciones", "stethoscope"],
-  ["631.205", "Médicos coordinadores de zona", "medical_services"],
-  ["631.206", "Prácticas médicas", "medical_services", ["Con cobertura IOMA", "Sin cobertura IOMA"]],
-  ["631.301", "Prácticas bioquímicas", "biotech", ["Bono bioquímico", "Prácticas no autorizadas IOMA"]],
-  ["631.401", "Pago a farmacia sindical", "local_pharmacy"],
-  ["631.402", "Pago a otras farmacias", "local_pharmacy"],
-  ["631.403", "Medicamentos", "medication"],
-  ["631.501", "Odontología por excepción", "dentistry"],
-  ["631.502", "Odontología", "dentistry"],
-  ["631.503", "Prótesis odontológicas", "dentistry"],
-  ["631.504", "Tratamiento de ortodoncia", "dentistry"],
-  ["631.505", "Auditoría odontológica", "fact_check"],
-  ["631.601", "Psiquiatría", "neurology"],
-  ["631.602", "Psicología", "psychology", ["Terapia individual", "Terapia familiar y otras"]],
-  ["631.603", "Prestaciones paramédicas", "healing", ["Enfermería", "Instrumentación quirúrgica", "Curso preparto", "Anestesista", "Fonoaudiología", "Terapia ocupacional"]],
-  ["631.604", "Cristales", "visibility"],
-  ["631.605", "Armazón", "eyeglasses"],
-  ["631.606", "Hospedaje", "hotel", ["Reintegros por hospedaje de salud", "Convenios por hospedaje"]],
-  ["631.607", "Material descartable", "sanitizer"],
-  ["631.608", "Ortopedia", "accessible"],
-  ["631.609", "Kinesiología", "sports_gymnastics"],
-  ["631.611", "Otras prestaciones", "health_and_safety"],
-  ["631.612", "Rehabilitación", "physical_therapy"],
-  ["631.613", "Subsidio por fallecimiento", "volunteer_activism"],
-  ["631.614", "Subsidio por celiaquía", "no_food"],
-  ["511.701", "Subsidio por nacimiento / adopción", "child_care"],
+  ["631.000", "GASTOS EN PRESTACIONES", "health_and_safety"],
+  ["631.100", "INTERNACIONES Y GASTOS SANATORIALES", "local_hospital"],
+  ["631.103", "REINTEGROS INTERNACIONES", "local_hospital", ["Internación geriátrica", "Otros"]],
+  ["631.105", "ACOMPAÑANTE TERAPEUTICO", "accessibility_new"],
+  ["631.200", "SERVICIOS MEDICOS", "stethoscope"],
+  ["631.202", "BONO DE CONSULTA", "confirmation_number"],
+  ["631.203", "HONORARIOS MEDICOS PARTICULARES/EXCEPCIONES", "stethoscope"],
+  ["631.205", "MEDICOS COORDINADORES DE ZONA", "medical_services"],
+  ["631.206", "PRACTICAS MEDICAS", "medical_services", ["Con cobertura IOMA", "Sin cobertura IOMA"]],
+  ["631.300", "PRESTACIONES BIOQUIMICAS", "biotech"],
+  ["631.301", "PRESTACIONES PRACTICAS BIOQUIMICAS", "biotech", ["Bono bioquímico", "Prácticas no autorizadas IOMA"]],
+  ["631.400", "MEDICAMENTOS AMBULATORIOS", "medication"],
+  ["631.401", "PAGO A FARMACIA SINDICAL", "local_pharmacy"],
+  ["631.402", "PAGO A OTRAS FARMACIAS", "local_pharmacy"],
+  ["631.403", "REINTEGRO DE MEDICAMENTOS", "medication"],
+  ["631.500", "PRACTICAS ODONTOLOGICAS", "dentistry"],
+  ["631.501", "REINTEGROS ODONTOLOGICOS POR EXCEPCION", "dentistry"],
+  ["631.502", "REINTEGROS ODONTOLOGICOS", "dentistry"],
+  ["631.503", "SUBSIDIOS PROTESIS ODONTOLOGICAS", "dentistry"],
+  ["631.504", "SUBSIDIOS POR TRATAMIENTO DE ORTODONCIA", "dentistry"],
+  ["631.505", "AUDITORIA ODONTOLOGICA", "fact_check"],
+  ["631.600", "PRESTACIONES VARIAS", "health_and_safety"],
+  ["631.601", "REINTEGROS POR PSIQUIATRIA", "neurology"],
+  ["631.602", "REINTEGROS POR PSICOLOGIA", "psychology", ["Terapia individual", "Terapia familiar y otras"]],
+  ["631.603", "PRESTACIONES PARAMEDICAS", "healing", ["Enfermería", "Instrumentación quirúrgica", "Curso preparto", "Anestesista", "Fonoaudiología", "Terapia ocupacional"]],
+  ["631.604", "REINTEGRO POR CRISTALES", "visibility"],
+  ["631.605", "REINTEGRO POR AMAZON", "eyeglasses"],
+  ["631.606", "HOSPEDAJE", "hotel", ["Reintegros por hospedaje de salud", "Convenios por hospedaje"]],
+  ["631.607", "REINTEGRO POR MATERIAL DESCARTABLE", "sanitizer"],
+  ["631.608", "REINTEGRO ORTOPEDIA", "accessible"],
+  ["631.609", "REINTEGRO KINESIOLOGIA", "sports_gymnastics"],
+  ["631.611", "OTRAS PRESTACIONES", "health_and_safety"],
+  ["631.612", "REINTEGROS POR REHABILITACION", "physical_therapy"],
+  ["631.613", "SUBSIDIOS FALLECIMIENTOS", "volunteer_activism"],
+  ["631.614", "SUBSIDIOS CELIAQUIA", "no_food"],
+  ["511.701", "SUBSIDIO POR NACIMIENTO - ADOPCION", "child_care"],
 ];
 
 function adjuntosPara(codigo) {
@@ -58,7 +67,7 @@ const TIPOS = FILAS.map(([codigo, nombre, icono, conceptos = []]) => {
   return { codigo, nombre, icono, grupo_codigo: grupo.codigo, grupo_nombre: grupo.nombre, grupo_icono: grupo.icono,
     conceptos: conceptos.sort((a, b) => a.localeCompare(b, "es")),
     requiere_pto_venta: ["631.202", "511.701", "631.611", "631.613", "631.614"].includes(codigo) ? 0 : 1,
-    adjuntos: adjuntosPara(codigo) };
+    adjuntos: completarAdjuntos(adjuntosPara(codigo)) };
 }).sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
 
 function normalizarCicCodigo(valor) {

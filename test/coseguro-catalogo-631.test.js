@@ -6,13 +6,18 @@ const { seleccionarTipoLegado, seleccionarConceptosLegados, resolverImputacionMi
 const { validarDatosSolicitud, validarCamposCentral, parsearCamposCentral, filtrosEstadisticas, transicionesDisponibles, completarConceptosSolicitudes } = require('../api/routes/coseguro').__test;
 const { mapearTipoReintegroPublico } = require('../api/services/publico');
 
-test('catálogo reproduce las 29 cuentas con nombre del Excel, sin rubros ni códigos vacíos', () => {
-  const codigos = ['631.103','631.105','631.202','631.203','631.205','631.206','631.301','631.401','631.402','631.403','631.501','631.502','631.503','631.504','631.505','631.601','631.602','631.603','631.604','631.605','631.606','631.607','631.608','631.609','631.611','631.612','631.613','631.614','511.701'];
+test('catálogo reproduce las 36 cuentas con título literal del Excel, incluidos los códigos 00', () => {
+  const codigos = ['631.000','631.100','631.103','631.105','631.200','631.202','631.203','631.205','631.206','631.300','631.301','631.400','631.401','631.402','631.403','631.500','631.501','631.502','631.503','631.504','631.505','631.600','631.601','631.602','631.603','631.604','631.605','631.606','631.607','631.608','631.609','631.611','631.612','631.613','631.614','511.701'];
   assert.deepEqual(TIPOS.map((t) => t.codigo).sort(), codigos.sort());
   assert.equal(TIPOS.flatMap((t) => t.conceptos).length, 16);
   assert.equal(TIPOS.filter((t) => t.conceptos.length).length, 6);
   assert.deepEqual(TIPOS.find((t) => t.codigo === '631.602').conceptos, ['Terapia familiar y otras','Terapia individual']);
-  assert.equal(TIPOS.find((t) => t.codigo === '631.605').nombre, 'Armazón');
+  assert.equal(TIPOS.find((t) => t.codigo === '631.605').nombre, 'REINTEGRO POR AMAZON');
+  const titulos = ['GASTOS EN PRESTACIONES','INTERNACIONES Y GASTOS SANATORIALES','REINTEGROS INTERNACIONES','ACOMPAÑANTE TERAPEUTICO','SERVICIOS MEDICOS','BONO DE CONSULTA','HONORARIOS MEDICOS PARTICULARES/EXCEPCIONES','MEDICOS COORDINADORES DE ZONA','PRACTICAS MEDICAS','PRESTACIONES BIOQUIMICAS','PRESTACIONES PRACTICAS BIOQUIMICAS','MEDICAMENTOS AMBULATORIOS','PAGO A FARMACIA SINDICAL','PAGO A OTRAS FARMACIAS','REINTEGRO DE MEDICAMENTOS','PRACTICAS ODONTOLOGICAS','REINTEGROS ODONTOLOGICOS POR EXCEPCION','REINTEGROS ODONTOLOGICOS','SUBSIDIOS PROTESIS ODONTOLOGICAS','SUBSIDIOS POR TRATAMIENTO DE ORTODONCIA','AUDITORIA ODONTOLOGICA','PRESTACIONES VARIAS','REINTEGROS POR PSIQUIATRIA','REINTEGROS POR PSICOLOGIA','PRESTACIONES PARAMEDICAS','REINTEGRO POR CRISTALES','REINTEGRO POR AMAZON','HOSPEDAJE','REINTEGRO POR MATERIAL DESCARTABLE','REINTEGRO ORTOPEDIA','REINTEGRO KINESIOLOGIA','OTRAS PRESTACIONES','REINTEGROS POR REHABILITACION','SUBSIDIOS FALLECIMIENTOS','SUBSIDIOS CELIAQUIA','SUBSIDIO POR NACIMIENTO - ADOPCION'];
+  // Valores copiados de la columna B del Excel; no se quitan palabras ni se corrigen títulos.
+  const porCodigo = TIPOS.slice().sort((a,b) => a.codigo.localeCompare(b.codigo));
+  assert.deepEqual(porCodigo.map((t) => t.nombre), [titulos.at(-1), ...titulos.slice(0,-1)]);
+  for (const tipo of TIPOS) assert.deepEqual(tipo.adjuntos.at(-1), {key:'OTROS_COMPROBANTES',label:'Otros comprobantes',requerido:0});
   for (const tipo of TIPOS) assert.ok(GRUPOS.some((g) => g.codigo === tipo.grupo_codigo));
   assert.deepEqual(TIPOS.map((t) => t.nombre), TIPOS.map((t) => t.nombre).sort((a,b) => a.localeCompare(b,'es')));
 });
@@ -101,4 +106,9 @@ test('remigrar conserva la cuenta conocida reasignada por el personal y los cód
   assert.deepEqual(resolverImputacionMigrada({cic_codigo:'631.203'},{grupo_codigo:'631.600'},tipo,tipos),{codigo:'631.203',imputacionId:11});
   assert.deepEqual(resolverImputacionMigrada({cic_codigo:'888123'},{grupo_codigo:'631.600'},tipo,tipos),{codigo:'888.123',imputacionId:null});
   assert.deepEqual(resolverImputacionMigrada({cic_codigo:'631.203'},{grupo_codigo:null},tipo,tipos),{codigo:'631.602',imputacionId:10});
+});
+
+test('remigrar un tipo ya clasificado conserva su tipo y no reinterpreta conceptos legados', () => {
+  const tipo = seleccionarTipoLegado({tipo_reintegro_id:10,concepto_id:7},[{id:10,codigo:'631.611',grupo_codigo:'631.600'}],[{id:7,codigo:'631.603',nombre:'Enfermería'}]);
+  assert.equal(tipo.codigo,'631.611');
 });

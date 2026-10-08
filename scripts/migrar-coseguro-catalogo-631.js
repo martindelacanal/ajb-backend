@@ -85,6 +85,7 @@ function seleccionarTipoLegado(solicitud, tiposViejos, conceptosViejos) {
   const tipoViejo = tiposViejos.find((t) => t.id === solicitud.tipo_reintegro_id);
   const conceptoViejo = conceptosViejos.find((c) => c.id === solicitud.concepto_id);
   let codigo = normalizarCicCodigo(tipoViejo?.codigo);
+  if (tipoViejo?.grupo_codigo) return TIPOS.find((t) => t.codigo === codigo) || TIPOS.find((t) => t.codigo === "631.611");
   // «Otros» era el único tipo genérico: rescatar la prestación declarada en el concepto.
   if (codigo === "631.611" && conceptoViejo?.codigo) codigo = normalizarCicCodigo(conceptoViejo.codigo);
   if (normalizarNombre(conceptoViejo?.nombre) === "marcos" && codigo === "631.604") codigo = "631.605";
@@ -142,22 +143,26 @@ async function ejecutarMigracion(db, { checkOnly = false } = {}) {
       await db.query("UPDATE coseguro_imputacion SET activo = 0");
       await db.query("INSERT INTO coseguro_imputacion (codigo, descripcion, tipo, activo, orden) VALUES ('631.000', 'Gastos en prestaciones', 'RUBRO', 1, 0) ON DUPLICATE KEY UPDATE descripcion = VALUES(descripcion), activo = 1");
       const [[raiz]] = await db.query("SELECT id FROM coseguro_imputacion WHERE codigo = '631.000'");
-      for (const grupo of GRUPOS.filter((g) => g.codigo.startsWith("631."))) {
+      for (const grupo of GRUPOS.filter((g) => g.codigo.startsWith("631.") && g.codigo !== "631.000")) {
         await db.query("INSERT INTO coseguro_imputacion (codigo, descripcion, tipo, parent_id, activo, orden) VALUES (?, ?, 'RUBRO', ?, 1, ?) ON DUPLICATE KEY UPDATE descripcion = VALUES(descripcion), parent_id = VALUES(parent_id), activo = 1", [grupo.codigo, grupo.nombre, raiz.id, Number(grupo.codigo.replace('.', ''))]);
       }
-      const [rubros] = await db.query("SELECT id, codigo FROM coseguro_imputacion WHERE tipo = 'RUBRO'");
+      const [rubros] = await db.query("SELECT id, codigo FROM coseguro_imputacion WHERE codigo IN ('631.000','631.100','631.200','631.300','631.400','631.500','631.600')");
       const tiposNuevos = [];
       const usados = new Set();
       for (const [orden, tipo] of TIPOS.entries()) {
-        const parentId = rubros.find((r) => r.codigo === tipo.grupo_codigo)?.id || null;
+        const parentId = tipo.codigo === "631.000" ? null
+          : tipo.codigo === tipo.grupo_codigo ? raiz.id
+          : rubros.find((r) => r.codigo === tipo.grupo_codigo)?.id || null;
         await db.query("INSERT INTO coseguro_imputacion (codigo, descripcion, tipo, parent_id, activo, orden) VALUES (?, ?, 'CUENTA', ?, 1, ?) ON DUPLICATE KEY UPDATE descripcion = VALUES(descripcion), tipo = 'CUENTA', parent_id = VALUES(parent_id), activo = 1, orden = VALUES(orden)", [tipo.codigo, tipo.nombre, parentId, Number(tipo.codigo.replace('.', ''))]);
         const [[cuenta]] = await db.query("SELECT id FROM coseguro_imputacion WHERE codigo = ?", [tipo.codigo]);
-        const anterior = tiposViejos.find((t) => t.nombre === tipo.nombre) || tiposViejos.find((t) => t.codigo === tipo.codigo && !usados.has(t.id));
+        const anterior = tiposViejos.find((t) => t.codigo === tipo.codigo && !usados.has(t.id))
+          || tiposViejos.find((t) => t.nombre === tipo.nombre && !usados.has(t.id));
         const parametros = [tipo.nombre, tipo.icono, cuenta.id, tipo.requiere_pto_venta, JSON.stringify(tipo.adjuntos), orden + 1, tipo.grupo_codigo, tipo.grupo_nombre, tipo.grupo_icono, ["631.503", "631.504", "631.613", "631.614", "511.701"].includes(tipo.codigo) ? 1 : 0];
         let id;
         if (anterior) {
           id = anterior.id;
-          await db.query("UPDATE coseguro_tipo_reintegro SET nombre=?, icono=?, imputacion_id=?, imputacion_detalle_id=NULL, requiere_pto_venta=?, adjuntos_config=?, orden=?, grupo_codigo=?, grupo_nombre=?, grupo_icono=?, es_subsidio=?, activo=1 WHERE id=?", [...parametros, id]);
+          // Mantener la cobertura y la clasificación de subsidio configuradas por el personal.
+          await db.query("UPDATE coseguro_tipo_reintegro SET nombre=?, icono=?, imputacion_id=?, imputacion_detalle_id=NULL, requiere_pto_venta=?, adjuntos_config=?, orden=?, grupo_codigo=?, grupo_nombre=?, grupo_icono=?, activo=1 WHERE id=?", [...parametros.slice(0, 9), id]);
         } else {
           const [resultado] = await db.query("INSERT INTO coseguro_tipo_reintegro (nombre, icono, imputacion_id, requiere_pto_venta, adjuntos_config, orden, grupo_codigo, grupo_nombre, grupo_icono, es_subsidio, activo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)", parametros);
           id = resultado.insertId;
@@ -222,7 +227,15 @@ async function ejecutarMigracion(db, { checkOnly = false } = {}) {
       const [historial] = await db.query("SELECT id, campo_modificado, valor_anterior, valor_nuevo FROM coseguro_historial WHERE campo_modificado IN ('Tipo de reintegro','Concepto','tipo_reintegro_id','concepto_id')");
       for (const fila of historial) {
         const mapa = /concepto/i.test(fila.campo_modificado) ? mapeoConceptos : mapeoTipos;
-        const remap = (valor) => /^\d+$/.test(String(valor || '')) && mapa.has(Number(valor)) ? mapa.get(Number(valor)) : valor;
+        const remap = (valor) => {
+          if (/^\d+$/.test(String(valor || '')) && mapa.has(Number(valor))) return mapa.get(Number(valor));
+          if (/tipo/i.test(fila.campo_modificado)) {
+            const previo = tiposViejos.find((t) => normalizarNombre(t.nombre) === normalizarNombre(valor));
+            const nuevo = previo && tiposNuevos.find((t) => t.id === mapeoTipos.get(previo.id));
+            if (nuevo) return nuevo.nombre;
+          }
+          return valor;
+        };
         const anterior = remap(fila.valor_anterior), nuevo = remap(fila.valor_nuevo);
         if (anterior !== fila.valor_anterior || nuevo !== fila.valor_nuevo) await db.query("UPDATE coseguro_historial SET valor_anterior=?, valor_nuevo=? WHERE id=?", [anterior, nuevo, fila.id]);
       }
