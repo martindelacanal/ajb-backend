@@ -198,8 +198,11 @@ const MAX_NOTICIAS_DESTACADAS = 5;
 const LOCK_NOTICIAS_DESTACADAS_TIMEOUT_SEGUNDOS = 5;
 const EXPRESION_NOMBRE_LOCK_DESTACADAS = "CONCAT('noticias_destacadas:', DATABASE())";
 
-// La condición de visibilidad pública se reutiliza en todos los listados sin token.
-const CONDICION_PUBLICA = "n.eliminado = 0 AND n.estado = 'PUBLICADA' AND (n.fecha_publicacion IS NULL OR n.fecha_publicacion <= NOW())";
+// Publicada, ya vigente y no eliminada: lo que puede verse en el portal de una departamental.
+const CONDICION_VIGENTE = "n.eliminado = 0 AND n.estado = 'PUBLICADA' AND (n.fecha_publicacion IS NULL OR n.fecha_publicacion <= NOW())";
+// La portada pública (todos los listados sin token) deja afuera, además, las noticias que la
+// redacción marcó sólo para el portal de sus departamentales (en_portada_publica = 0).
+const CONDICION_PUBLICA = `${CONDICION_VIGENTE} AND n.en_portada_publica = 1`;
 const ORDEN_FEED = "n.orden DESC, COALESCE(n.fecha_publicacion, n.fecha_creacion) DESC, n.id DESC";
 
 // ── Alcance por departamental ────────────────────────────────────────────────
@@ -217,7 +220,8 @@ const COLADOR_ES = new Intl.Collator("es", { sensitivity: "base", numeric: true 
 
 // ── Portal departamental del afiliado ────────────────────────────────────────
 const MENSAJE_SOLO_AFILIADOS = "Sólo los afiliados ven el portal de su departamental";
-const CONDICION_PORTAL = `${CONDICION_PUBLICA} AND ${CONDICION_ALCANCE_PORTAL}`;
+// El portal muestra también las noticias que no salen en la portada pública.
+const CONDICION_PORTAL = `${CONDICION_VIGENTE} AND ${CONDICION_ALCANCE_PORTAL}`;
 const MAX_PAGINA_PORTAL = 30;
 const DIAS_RESUMEN_POR_DEFECTO = 14;
 const TOPE_RESUMEN_NUEVAS = 99;
@@ -353,6 +357,40 @@ function departamentalHeredado({ alcanceTodas, departamentales } = {}) {
 // Sólo un 0 explícito restringe la noticia a algunas departamentales.
 function esAlcanceTodas(valor) {
   return !(valor === 0 || valor === "0" || valor === false);
+}
+
+// ── Portada pública ─────────────────────────────────────────────────────────
+// Una noticia para algunas departamentales puede quedar sólo en sus portales
+// (en_portada_publica = 0). Lo que va a todas las departamentales sale siempre en la portada.
+const MENSAJE_DESTACADA_SIN_PORTADA = "Una noticia que no sale en la portada pública no se puede destacar";
+
+// null = no vino en el pedido (el editor anterior no lo manda).
+function normalizarPortadaPublica(valor) {
+  if (!valorPresente(valor)) return { value: null };
+  const normalizado = normalizarBooleanoBinario(typeof valor === "string" ? valor.trim() : valor);
+  if (normalizado === null) return { error: "El valor de portada pública es inválido" };
+  return { value: normalizado };
+}
+
+// Sólo un 0 explícito saca la noticia de la portada pública.
+function esPortadaPublica(valor) {
+  return !(valor === 0 || valor === "0" || valor === false);
+}
+
+// Fija en datos el valor final de en_portada_publica (existente = fila guardada en un PUT,
+// null al crear) y apaga "destacada", que sólo existe en la portada pública.
+function resolverPortadaPublica(datos, existente = null) {
+  let enPortadaPublica;
+  if (datos.alcanceTodas === 1) {
+    enPortadaPublica = 1;
+  } else if (datos.enPortadaPublica === 0 || datos.enPortadaPublica === 1) {
+    enPortadaPublica = datos.enPortadaPublica;
+  } else {
+    enPortadaPublica = existente && !esPortadaPublica(existente.en_portada_publica) ? 0 : 1;
+  }
+  datos.enPortadaPublica = enPortadaPublica;
+  if (enPortadaPublica === 0) datos.destacada = 0;
+  return datos;
 }
 
 function compararDepartamentales(a, b) {
@@ -739,6 +777,9 @@ function validarDatosNoticia(body) {
   const alcance = normalizarAlcanceNoticia(body);
   if (alcance.error) return { error: alcance.error };
 
+  const portadaPublica = normalizarPortadaPublica(body.en_portada_publica);
+  if (portadaPublica.error) return { error: portadaPublica.error };
+
   if (typeof body.cuerpo === "string" && body.cuerpo.length > MAX_LARGO_CUERPO) {
     return { error: "El cuerpo de la noticia es demasiado largo" };
   }
@@ -759,6 +800,9 @@ function validarDatosNoticia(body) {
       departamentales: alcance.value.departamentales,
       // Columna heredada: el id si hay exactamente una departamental; si no, NULL.
       departamentalId: departamentalHeredado(alcance.value),
+      // null = no vino (editor anterior): al crear vale 1 y al editar se conserva lo guardado.
+      // El valor final lo fija resolverPortadaPublica().
+      enPortadaPublica: portadaPublica.value,
       cuerpo,
       fechaPublicacion: fechaPublicacion.value,
     },
@@ -832,6 +876,7 @@ async function firmarNoticia(fila, { conCuerpo = false, departamentalesPorNotici
     departamentales: alcance.departamentales,
     departamental_id: alcance.departamental_id,
     departamental_nombre: alcance.departamental_nombre,
+    en_portada_publica: alcance.alcance_todas || esPortadaPublica(fila.en_portada_publica),
     destacada: fila.destacada === 1 || fila.destacada === true,
     orden: Number(fila.orden || 0),
     estado: fila.estado,
@@ -895,7 +940,7 @@ async function firmarGaleria(filas) {
 
 // Las departamentales (y el resumen departamental_nombre) salen de noticia_departamental.
 const CAMPOS_NOTICIA = `
-  n.id, n.titulo, n.bajada, n.categoria, n.alcance_todas,
+  n.id, n.titulo, n.bajada, n.categoria, n.alcance_todas, n.en_portada_publica,
   n.destacada, n.orden, n.estado, n.fecha_publicacion, n.fecha_creacion, n.fecha_modificacion,
   n.imagen_archivo, n.imagen_ancho, n.imagen_alto, n.imagen_mime, n.imagen_variantes
 `;
@@ -1379,6 +1424,8 @@ router.post("/admin/noticias", verifyToken, manejarUploadNoticia, async (req, re
     if (datos.estado === "PUBLICADA" && !datos.fechaPublicacion) {
       datos.fechaPublicacion = new Date();
     }
+    // Sin el dato (editor anterior), una noticia nueva sale en la portada pública.
+    resolverPortadaPublica(datos);
 
     const mediaPortada = req.files?.imagen?.[0]
       ? await noticiaMedia.procesarYSubir(req.files.imagen[0], "portadas")
@@ -1405,13 +1452,13 @@ router.post("/admin/noticias", verifyToken, manejarUploadNoticia, async (req, re
       `INSERT INTO noticia
          (titulo, bajada, cuerpo, categoria, alcance_todas, departamental_id,
           imagen_archivo, imagen_ancho, imagen_alto, imagen_mime, imagen_variantes,
-          destacada, orden, estado, fecha_publicacion, creado_por_usuario_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          destacada, orden, estado, fecha_publicacion, creado_por_usuario_id, en_portada_publica)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         datos.titulo, datos.bajada, datos.cuerpo, datos.categoria, datos.alcanceTodas, datos.departamentalId,
         portadaDb.archivo, portadaDb.ancho, portadaDb.alto, portadaDb.mime, serializarVariantesDb(portadaDb),
         datos.destacada, datos.orden, datos.estado, datos.fechaPublicacion,
-        cabecera.id,
+        cabecera.id, datos.enPortadaPublica,
       ]
     );
     const noticiaId = resultado.insertId;
@@ -1555,6 +1602,9 @@ router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async
         datos.departamentalId = null;
       }
     }
+    // Sin el dato (editor anterior) se conserva lo guardado; una noticia fuera de la portada
+    // pública no puede quedar destacada.
+    resolverPortadaPublica(datos, existente);
     await validarCupoNoticiasDestacadas(connection, datos.destacada, noticiaId);
 
     // Publicar por primera vez sin fecha explícita equivale a publicar ahora.
@@ -1618,12 +1668,12 @@ router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async
       `UPDATE noticia
        SET titulo = ?, bajada = ?, cuerpo = ?, categoria = ?, alcance_todas = ?, departamental_id = ?,
            imagen_archivo = ?, imagen_ancho = ?, imagen_alto = ?, imagen_mime = ?, imagen_variantes = ?,
-           destacada = ?, orden = ?, estado = ?, fecha_publicacion = ?
+           destacada = ?, orden = ?, estado = ?, fecha_publicacion = ?, en_portada_publica = ?
        WHERE id = ?`,
       [
         datos.titulo, datos.bajada, datos.cuerpo, datos.categoria, datos.alcanceTodas, datos.departamentalId,
         portadaDb.archivo, portadaDb.ancho, portadaDb.alto, portadaDb.mime, serializarVariantesDb(portadaDb),
-        datos.destacada, datos.orden, datos.estado, datos.fechaPublicacion,
+        datos.destacada, datos.orden, datos.estado, datos.fechaPublicacion, datos.enPortadaPublica,
         noticiaId,
       ]
     );
@@ -1726,13 +1776,17 @@ router.put("/admin/noticias/:id(\\d+)/flags", verifyToken, async (req, res) => {
     transaccionIniciada = true;
 
     const [existentes] = await connection.query(
-      "SELECT id FROM noticia WHERE id = ? AND eliminado = 0 LIMIT 1 FOR UPDATE",
+      "SELECT id, en_portada_publica FROM noticia WHERE id = ? AND eliminado = 0 LIMIT 1 FOR UPDATE",
       [noticiaId]
     );
     if (existentes.length === 0) {
       await connection.rollback();
       transaccionIniciada = false;
       return res.status(404).json("Noticia no encontrada");
+    }
+    // El carrusel de destacadas es de la portada pública.
+    if (destacadaSolicitada === 1 && !esPortadaPublica(existentes[0].en_portada_publica)) {
+      throw crearErrorHttp(MENSAJE_DESTACADA_SIN_PORTADA, 409);
     }
 
     await validarCupoNoticiasDestacadas(connection, destacadaSolicitada, noticiaId);
@@ -1837,6 +1891,13 @@ router.__test = Object.freeze({
   resumirDepartamentales,
   serializarAlcanceNoticia,
   validarDepartamentalesAlcance,
+  // Portada pública
+  CONDICION_PUBLICA,
+  CONDICION_VIGENTE,
+  MENSAJE_DESTACADA_SIN_PORTADA,
+  esPortadaPublica,
+  normalizarPortadaPublica,
+  resolverPortadaPublica,
 });
 
 module.exports = router;

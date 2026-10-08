@@ -70,7 +70,7 @@ function crearConexion({ totalDestacadas, noticiaId = 23, insertId = 71 }) {
           imagen_archivo: null,
         }]];
       }
-      if (/SELECT id FROM noticia/.test(sql)) {
+      if (/SELECT id(, en_portada_publica)? FROM noticia/.test(sql)) {
         eventos.push("select_noticia");
         return [[{ id: noticiaId }]];
       }

@@ -901,8 +901,10 @@ test("POST guarda el alcance en la transacción: noticia + filas puente antes de
   const insert = paramsInsertNoticia(conexionActual);
   assert.match(insert.sql, /\(titulo, bajada, cuerpo, categoria, alcance_todas, departamental_id,/);
   assert.deepEqual(insert.params.slice(4, 6), [0, null]);
-  assert.equal(insert.params.length, 16);
-  assert.match(insert.sql, /VALUES \((\?, ){15}\?\)$/);
+  assert.equal(insert.params.length, 17);
+  assert.match(insert.sql, /VALUES \((\?, ){16}\?\)$/);
+  // Sin el dato, una noticia nueva sale en la portada pública (último parámetro).
+  assert.equal(insert.params[16], 1);
   const puente = insertPuente(conexionActual);
   assert.match(puente.sql, /VALUES \(\?, \?\), \(\?, \?\)$/);
   assert.deepEqual(puente.params, [71, 7, 71, 1]);
