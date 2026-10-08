@@ -421,6 +421,7 @@ function puedeEditarSolicitud(cabecera, solicitud) {
 
 function puedeEliminarSolicitud(cabecera, solicitud) {
   if (!tieneAreaCoseguro(cabecera)) return false;
+  if (solicitud.fecha_aprobacion_central || solicitud.aprobado_central_usuario_id) return false;
   const estados = ESTADOS_ELIMINACION_POR_ROL[cabecera.rol] || [];
   if (!estados.includes(solicitud.estado_id)) return false;
   if (cabecera.rol === "departamental") return idsPositivosIguales(solicitud.departamental_id, cabecera.departamental_id);
@@ -658,6 +659,81 @@ function calcularReintegroEstimado(tipo, importe) {
   };
 }
 
+function coberturaParaSolicitud(tipo, solicitud, importe) {
+  if (!solicitud || !idsPositivosIguales(tipo.id, solicitud.tipo_reintegro_id)) {
+    return { ...calcularReintegroEstimado(tipo, importe), modo: tipo.modo_cobertura, tope: tipo.tope_reintegro ?? null, fecha: moment().utcOffset(-180).format("YYYY-MM-DD HH:mm:ss"), origen: "CONFIGURACION" };
+  }
+  const modo = solicitud.modo_cobertura_aplicado || (solicitud.porcentaje_cobertura_aplicado != null ? "PORCENTAJE" : "MANUAL");
+  const tope = solicitud.tope_reintegro_aplicado ?? null;
+  // Una corrección ajena al importe no debe modificar la estimación histórica.
+  const mismosImportes = importeACentavos(importe) === importeACentavos(solicitud.importe);
+  const calculo = mismosImportes
+    ? { porcentaje: solicitud.porcentaje_cobertura_aplicado ?? null, estimado: solicitud.importe_estimado ?? null }
+    : calcularReintegroEstimado({ modo_cobertura: modo, porcentaje_cobertura: solicitud.porcentaje_cobertura_aplicado, tope_reintegro: tope }, importe);
+  return { ...calculo, modo, tope, fecha: solicitud.cobertura_fecha_aplicada || null, origen: solicitud.cobertura_origen_aplicado || "LEGADO" };
+}
+
+async function obtenerTitularReasignacion(db, cabecera, solicitud, body, { bloquear = false } = {}) {
+  const usuarioId = body.usuario_id === undefined ? Number(solicitud.usuario_id) : normalizarIdPositivo(body.usuario_id);
+  if (!usuarioId) throw crearErrorHttp("Afiliado inválido", 400);
+  if (idsPositivosIguales(usuarioId, solicitud.usuario_id)) return { id: usuarioId, departamental_id: solicitud.departamental_id };
+  if (!ROLES_GESTION.includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) {
+    throw crearErrorHttp("No tenés permisos para reasignar la solicitud", 403);
+  }
+  const [usuarios] = await db.query(
+    `SELECT u.id, u.departamental_id, u.habilitado, u.usuario_familiar_id, u.nombre, u.apellido, u.cuil, u.cbu, r.nombre AS rol
+     FROM usuario u INNER JOIN rol r ON r.id = u.rol_id WHERE u.id = ?${bloquear ? " FOR UPDATE" : ""}`, [usuarioId]
+  );
+  const titular = usuarios[0];
+  if (!titular) throw crearErrorHttp("Afiliado no encontrado", 404);
+  if (titular.rol !== "afiliado" || titular.habilitado !== "Y" || titular.usuario_familiar_id != null) {
+    throw crearErrorHttp("El titular debe ser un afiliado principal habilitado", 422);
+  }
+  if (cabecera.rol === "departamental" && !idsPositivosIguales(titular.departamental_id, cabecera.departamental_id)) {
+    throw crearErrorHttp("El afiliado pertenece a otra departamental", 403);
+  }
+  for (const [campo, etiqueta] of [["cuil_afiliado", "CUIL"], ["cbu", "CBU"]]) {
+    const datoNuevo = normalizarDigitos(body[campo], campo === "cbu" ? 22 : 11);
+    const datoAnterior = normalizarDigitos(solicitud[campo], campo === "cbu" ? 22 : 11);
+    const datoTitular = normalizarDigitos(titular[campo === "cuil_afiliado" ? "cuil" : "cbu"], campo === "cbu" ? 22 : 11);
+    if (datoNuevo && datoNuevo === datoAnterior && datoNuevo !== datoTitular) {
+      throw crearErrorHttp(`Revisá el ${etiqueta} del nuevo afiliado: no se pueden trasladar los datos del titular anterior`, 400);
+    }
+  }
+  return titular;
+}
+
+function validarAprobacionDepartamental(cabecera, solicitud) {
+  if (!["departamental", "admin"].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) {
+    throw crearErrorHttp("No tenés permisos para aprobar por departamental", 403);
+  }
+  if (!transicionesDisponibles(cabecera, solicitud.estado_id, false).includes(ESTADO.APROBADA_DEPTO) || !puedeVerSolicitud(cabecera, solicitud)) {
+    throw crearErrorHttp("La solicitud no puede aprobarse por departamental en su estado actual", 409);
+  }
+}
+
+async function validarSolicitudParaAprobacionDepartamental(db, cabecera, solicitud) {
+  const [conceptos] = await db.query("SELECT concepto_id FROM coseguro_solicitud_concepto WHERE solicitud_id = ? ORDER BY concepto_id", [solicitud.id]);
+  const validacion = await validarDatosSolicitud(db, cabecera, {
+    ...solicitud, concepto_ids: conceptos.map((c) => c.concepto_id),
+    fecha_comprobante: solicitud.fecha_comprobante instanceof Date ? moment(solicitud.fecha_comprobante).format("YYYY-MM-DD") : solicitud.fecha_comprobante,
+  }, { usuarioId: solicitud.usuario_id, fechaOriginal: solicitud.fecha_comprobante });
+  const [archivos] = await db.query("SELECT id, tipo_adjunto, sha256, archivo, tamanio FROM coseguro_archivo WHERE solicitud_id = ? FOR UPDATE", [solicitud.id]);
+  if (!archivos.length) validacion.errores.push("La solicitud debe conservar al menos un comprobante adjunto");
+  for (const adjunto of validacion.tipo?.adjuntos_config || []) {
+    if (Number(adjunto.requerido) === 1 && !archivos.some((archivo) => archivo.tipo_adjunto === adjunto.key)) validacion.errores.push(`Falta adjuntar: ${adjunto.label}`);
+  }
+  if (validacion.errores.length) throw crearErrorHttp(validacion.errores.join(" | "), 400);
+}
+
+async function notificarAprobacionDepartamental(connection, solicitud, estadoAnterior = ESTADO.INICIADA) {
+  await notificarCambioEstadoAfiliado(connection, solicitud, estadoAnterior, ESTADO.APROBADA_DEPTO, null);
+  await notificarUsuariosPorRol(connection, "admin-central", "COSEGURO_PARA_CONTROL",
+    `Solicitud #${solicitud.id} aprobada por departamental`,
+    `La solicitud de reintegro #${solicitud.id} quedó lista para el control de Servicios Sociales.`,
+    { solicitud_id: solicitud.id, estado_id: ESTADO.APROBADA_DEPTO });
+}
+
 function normalizarFecha(valor) {
   return normalizarFechaCivil(valor);
 }
@@ -736,6 +812,22 @@ async function insertarNotificacion(connection, usuarioId, tipo, titulo, mensaje
     `INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, ?, ?, ?, ?)`,
     [usuarioId, tipo, titulo, mensaje, JSON.stringify(payload || {})]
   );
+}
+
+async function registrarReasignacion(connection, cabecera, solicitud, usuarioNuevoId) {
+  const originalId = solicitud.usuario_original_id || solicitud.usuario_id;
+  await registrarHistorial(connection, { solicitud_id: solicitud.id, usuario_id: cabecera.id, usuario_rol: cabecera.rol,
+    tipo_operacion: "UPDATE", campo_modificado: "Afiliado titular", valor_anterior: solicitud.usuario_id, valor_nuevo: usuarioNuevoId,
+    observacion: `Solicitud reasignada. Afiliado original: #${originalId}` });
+  const destinatarios = new Set([Number(originalId), Number(solicitud.usuario_id), Number(usuarioNuevoId)]);
+  for (const usuarioId of destinatarios) {
+    await insertarNotificacion(connection, usuarioId, "COSEGURO_REASIGNADA", `Solicitud de reintegro #${solicitud.id} reasignada`,
+      usuarioId === Number(usuarioNuevoId)
+        ? `La solicitud de reintegro #${solicitud.id} fue asignada a tu grupo familiar.`
+        : `La solicitud de reintegro #${solicitud.id} fue reasignada a otro afiliado para corregir quién recibió la prestación.`,
+      { solicitud_id: solicitud.id, estado_id: solicitud.estado_id, usuario_anterior_id: solicitud.usuario_id, usuario_nuevo_id: usuarioNuevoId, usuario_original_id: originalId,
+        reasignacion: usuarioId === Number(usuarioNuevoId) ? "entrante" : "saliente" });
+  }
 }
 
 async function notificarUsuariosDepartamental(connection, departamentalId, tipo, titulo, mensaje, payload) {
@@ -1201,6 +1293,26 @@ router.get("/coseguro/cobertura", verifyToken, async (req, res) => {
   }
 });
 
+router.get("/coseguro/cobertura/historial", verifyToken, async (req, res) => {
+  try {
+    const cabecera = getCabecera(req);
+    if (!ROLES_COBERTURA.includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
+    const tipoId = normalizarIdOpcional(req.query.tipo_reintegro_id, "Tipo de reintegro");
+    const [historial] = await mysqlConnection.promise().query(
+      `SELECT h.*, t.nombre AS tipo_nombre, u.nombre AS usuario_nombre, u.apellido AS usuario_apellido
+       FROM coseguro_cobertura_historial h
+       LEFT JOIN coseguro_tipo_reintegro t ON t.id = h.tipo_reintegro_id
+       LEFT JOIN usuario u ON u.id = h.usuario_id
+       ${tipoId ? "WHERE h.tipo_reintegro_id = ?" : ""}
+       ORDER BY h.fecha DESC, h.id DESC`, tipoId ? [tipoId] : []
+    );
+    res.status(200).json({ historial });
+  } catch (error) {
+    registrarErrorRuta(error);
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al obtener el historial de cobertura");
+  }
+});
+
 router.put("/coseguro/cobertura", verifyToken, async (req, res) => {
   let connection;
   try {
@@ -1240,11 +1352,29 @@ router.put("/coseguro/cobertura", verifyToken, async (req, res) => {
     connection = await db.getConnection();
     await connection.beginTransaction();
     for (const item of normalizados) {
+      const [tiposActuales] = await connection.query(
+        "SELECT id, modo_cobertura, porcentaje_cobertura, tope_reintegro, es_subsidio FROM coseguro_tipo_reintegro WHERE id = ? FOR UPDATE", [item.id]
+      );
+      const anterior = tiposActuales.find((tipo) => idsPositivosIguales(tipo.id, item.id));
+      if (!anterior) throw crearErrorHttp("Tipo de reintegro inválido", 400);
+      const esSubsidioNuevo = item.esSubsidio ?? Number(anterior.es_subsidio);
+      const tieneCambios = String(anterior.modo_cobertura) !== item.modo ||
+        String(anterior.porcentaje_cobertura ?? "") !== String(item.porcentaje ?? "") ||
+        String(anterior.tope_reintegro ?? "") !== String(item.tope ?? "") || Number(anterior.es_subsidio) !== esSubsidioNuevo;
+      if (!tieneCambios) continue;
       await connection.query(
         `UPDATE coseguro_tipo_reintegro
             SET modo_cobertura = ?, porcentaje_cobertura = ?, tope_reintegro = ?, es_subsidio = COALESCE(?, es_subsidio)
           WHERE id = ?`,
         [item.modo, item.porcentaje, item.tope, item.esSubsidio, item.id]
+      );
+      await connection.query(
+        `INSERT INTO coseguro_cobertura_historial
+          (tipo_reintegro_id, usuario_id, usuario_rol, origen, modo_anterior, modo_nuevo,
+           porcentaje_anterior, porcentaje_nuevo, tope_anterior, tope_nuevo, es_subsidio_anterior, es_subsidio_nuevo)
+         VALUES (?, ?, ?, 'CAMBIO', ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [item.id, cabecera.id, cabecera.rol, anterior.modo_cobertura, item.modo,
+          anterior.porcentaje_cobertura, item.porcentaje, anterior.tope_reintegro, item.tope, anterior.es_subsidio, esSubsidioNuevo]
       );
     }
     await connection.commit();
@@ -1257,7 +1387,7 @@ router.put("/coseguro/cobertura", verifyToken, async (req, res) => {
   } catch (error) {
     if (connection) await connection.rollback();
     registrarErrorRuta(error);
-    res.status(500).json("Error al actualizar la configuración de cobertura");
+    res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al actualizar la configuración de cobertura");
   } finally {
     if (connection) connection.release();
   }
@@ -1766,6 +1896,8 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
   try {
     const cabecera = getCabecera(req);
     if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
+    const aprobarDepartamental = normalizarBooleanoOpcional(req.body.aprobar_departamental, "Aprobación por departamental");
+    if (aprobarDepartamental) validarAprobacionDepartamental(cabecera, { estado_id: ESTADO.INICIADA, departamental_id: cabecera.departamental_id });
     validarLimitesArchivos(req.files);
     const db = mysqlConnection.promise();
 
@@ -1791,6 +1923,9 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
         !idsPositivosIguales(titular.departamental_id, cabecera.departamental_id)) {
       return res.status(403).json("El afiliado pertenece a otra departamental");
     }
+    const titularOriginal = await obtenerTitularReasignacion(db, cabecera,
+      { usuario_id: usuarioId, departamental_id: titular.departamental_id },
+      { usuario_id: req.body.usuario_original_id ?? usuarioId });
 
     let validacion = await validarDatosSolicitud(db, cabecera, req.body, { usuarioId });
 
@@ -1845,7 +1980,7 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
       );
     }
 
-    const departamentalId = titular.departamental_id !== null ? titular.departamental_id : (cabecera.departamental_id || null);
+    let departamentalId = titular.departamental_id !== null ? titular.departamental_id : (cabecera.departamental_id || null);
 
     const verificacion = {
       cuit_emisor_valido: datos.emisor_cuit ? validarCuit(datos.emisor_cuit) : null,
@@ -1878,6 +2013,10 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
         !idsPositivosIguales(titularBloqueado.departamental_id, cabecera.departamental_id)) {
       throw crearErrorHttp("El afiliado pertenece a otra departamental", 403);
     }
+    departamentalId = titularBloqueado.departamental_id ?? (cabecera.departamental_id || null);
+    await obtenerTitularReasignacion(connection, cabecera,
+      { usuario_id: usuarioId, departamental_id: titularBloqueado.departamental_id },
+      { usuario_id: titularOriginal.id }, { bloquear: true });
 
     validacion = await validarDatosSolicitud(connection, cabecera, req.body, { usuarioId });
     if (validacion.tipo) {
@@ -1926,7 +2065,8 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
     }
 
     // Foto de la cobertura vigente: el afiliado ve desde el inicio cuánto se le reintegraría
-    const cobertura = calcularReintegroEstimado(validacion.tipo, datos.importe);
+    const cobertura = coberturaParaSolicitud(validacion.tipo, null, datos.importe);
+    const estadoInicial = aprobarDepartamental ? ESTADO.APROBADA_DEPTO : ESTADO.INICIADA;
 
     const [resultado] = await connection.query(
       `INSERT INTO coseguro_solicitud
@@ -1934,19 +2074,24 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
          tipo_reintegro_id, concepto_id, fecha_comprobante, comprobante_pto_venta, comprobante_numero,
          emisor_nombre, emisor_cuit, importe, porcentaje_cobertura_aplicado, importe_estimado,
          cuil_afiliado, cbu, observaciones, cantidad_sesiones,
-         periodo_prestacion, firma_archivo, extraccion_ia, verificacion, duplicado_forzado)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         periodo_prestacion, firma_archivo, extraccion_ia, verificacion, duplicado_forzado,
+         usuario_original_id, modo_cobertura_aplicado, tope_reintegro_aplicado, cobertura_fecha_aplicada, cobertura_origen_aplicado)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        usuarioId, datos.familiar_usuario_id, departamentalId, cabecera.id, ESTADO.INICIADA,
+        usuarioId, datos.familiar_usuario_id, departamentalId, cabecera.id, estadoInicial,
         datos.tipo_reintegro_id, datos.concepto_id, datos.fecha_comprobante, datos.comprobante_pto_venta,
         datos.comprobante_numero, datos.emisor_nombre, datos.emisor_cuit, datos.importe,
         cobertura.porcentaje, cobertura.estimado, datos.cuil_afiliado,
         datos.cbu, datos.observaciones, datos.cantidad_sesiones, datos.periodo_prestacion, firmaArchivo,
          extraccionIA ? JSON.stringify(extraccionIA) : null, JSON.stringify(verificacion),
          duplicadoComprobanteForzado,
+         titularOriginal.id, cobertura.modo, cobertura.tope, cobertura.fecha, cobertura.origen,
       ]
     );
     const solicitudId = resultado.insertId;
+    if (aprobarDepartamental) await connection.query(
+      "UPDATE coseguro_solicitud SET fecha_aprobacion_departamental = NOW(), aprobado_departamental_usuario_id = ? WHERE id = ?", [cabecera.id, solicitudId]
+    );
     await guardarConceptosSolicitud(connection, solicitudId, validacion.concepto_ids);
     await connection.query(
       `UPDATE coseguro_solicitud s INNER JOIN coseguro_tipo_reintegro t ON t.id = s.tipo_reintegro_id
@@ -1989,11 +2134,16 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
       observacion: cabecera.rol === "afiliado" ? "Solicitud cargada por el afiliado" : `Solicitud cargada presencialmente por ${cabecera.rol}`,
     });
 
-    // Avisar a la departamental que entró una solicitud nueva
-    await notificarUsuariosDepartamental(connection, departamentalId, "COSEGURO_NUEVA",
+    if (aprobarDepartamental) {
+      await registrarHistorial(connection, { solicitud_id: solicitudId, usuario_id: cabecera.id, usuario_rol: cabecera.rol,
+        tipo_operacion: "CAMBIO_ESTADO", estado_anterior_id: ESTADO.INICIADA, estado_nuevo_id: estadoInicial });
+      await notificarAprobacionDepartamental(connection, { id: solicitudId, usuario_id: usuarioId });
+    } else await notificarUsuariosDepartamental(connection, departamentalId, "COSEGURO_NUEVA",
       `Nueva solicitud de reintegro #${solicitudId}`,
       `${titular.apellido}, ${titular.nombre} cargó una solicitud de reintegro para revisar.`,
       { solicitud_id: solicitudId, estado_id: ESTADO.INICIADA });
+    if (!idsPositivosIguales(titularOriginal.id, usuarioId)) await registrarReasignacion(connection, cabecera,
+      { id: solicitudId, usuario_id: titularOriginal.id, estado_id: estadoInicial }, usuarioId);
 
     await connection.commit();
     transaccionIniciada = false;
@@ -2002,7 +2152,7 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
     // Constatación en ARCA en segundo plano (si la IA leyó el CAE del comprobante)
     void constatarArcaAutomatico(solicitudId);
 
-    res.status(201).json({ success: true, id: solicitudId, message: "Solicitud de reintegro enviada correctamente" });
+    res.status(201).json({ success: true, id: solicitudId, estado_id: estadoInicial, message: aprobarDepartamental ? "Solicitud guardada y aprobada por departamental" : "Solicitud de reintegro enviada correctamente" });
   } catch (error) {
     if (connection && transaccionIniciada) {
       try { await connection.rollback(); } catch (rollbackError) { registrarErrorRuta(rollbackError); }
@@ -2193,7 +2343,7 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
       `SELECT s.id, s.usuario_id, s.familiar_usuario_id, s.departamental_id, s.estado_id,
               s.tipo_reintegro_id, s.concepto_id, s.fecha_comprobante, s.comprobante_pto_venta,
               s.comprobante_numero, s.emisor_nombre, s.emisor_cuit, s.importe, s.importe_autorizado,
-              s.porcentaje_cobertura_aplicado, s.importe_estimado,
+              s.porcentaje_cobertura_aplicado, s.importe_estimado, s.fecha_aprobacion_central, s.aprobado_central_usuario_id,
               s.cantidad_sesiones, s.cic_codigo, s.fecha_creacion, s.fecha_modificacion, s.fecha_pago,
               u.nombre AS afiliado_nombre, u.apellido AS afiliado_apellido, u.documento AS afiliado_documento,
               fam.nombre AS familiar_nombre, fam.apellido AS familiar_apellido,
@@ -2245,6 +2395,7 @@ router.get("/coseguro/solicitudes/:id", verifyToken, async (req, res) => {
 
     const [rows] = await db.query(
       `SELECT s.*, u.nombre AS afiliado_nombre, u.apellido AS afiliado_apellido, u.documento AS afiliado_documento,
+              original.nombre AS afiliado_original_nombre, original.apellido AS afiliado_original_apellido, original.documento AS afiliado_original_documento,
               u.email AS afiliado_email, u.telefono AS afiliado_telefono,
               fam.nombre AS familiar_nombre, fam.apellido AS familiar_apellido, fam.documento AS familiar_documento,
               pfam.nombre AS familiar_parentesco,
@@ -2261,6 +2412,7 @@ router.get("/coseguro/solicitudes/:id", verifyToken, async (req, res) => {
               CAST(s.extraccion_ia AS CHAR) AS extraccion_ia_str, CAST(s.verificacion AS CHAR) AS verificacion_str
        FROM coseguro_solicitud s
        INNER JOIN usuario u ON u.id = s.usuario_id
+       LEFT JOIN usuario original ON original.id = s.usuario_original_id
        LEFT JOIN usuario fam ON fam.id = s.familiar_usuario_id
        LEFT JOIN parentesco pfam ON pfam.id = fam.parentesco_id
        LEFT JOIN departamental d ON d.id = s.departamental_id
@@ -2377,6 +2529,13 @@ const ETIQUETAS_CAMPOS = {
   emisor_cuit: "CUIT emisor",
   importe: "Importe",
   porcentaje_cobertura_aplicado: "Porcentaje de cobertura",
+  modo_cobertura_aplicado: "Modo de cobertura",
+  tope_reintegro_aplicado: "Tope de cobertura",
+  cobertura_fecha_aplicada: "Fecha de configuración de cobertura",
+  cobertura_origen_aplicado: "Origen de la cobertura",
+  usuario_original_id: "Afiliado original",
+  departamental_id: "Departamental",
+  firma_archivo: "Firma",
   importe_estimado: "Reintegro estimado",
   cuil_afiliado: "CUIL",
   cbu: "CBU",
@@ -2501,6 +2660,8 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     const solicitudId = normalizarIdPositivo(req.params.id);
     if (!solicitudId) return res.status(400).json("ID inválido");
     const aprobarServiciosSociales = normalizarBooleanoOpcional(req.body.aprobar_servicios_sociales, "Aprobación por Servicios Sociales");
+    const aprobarDepartamental = normalizarBooleanoOpcional(req.body.aprobar_departamental, "Aprobación por departamental");
+    if (aprobarDepartamental && aprobarServiciosSociales) throw crearErrorHttp("Seleccioná una sola etapa de aprobación", 400);
     const db = mysqlConnection.promise();
 
     const [rows] = await db.query("SELECT * FROM coseguro_solicitud WHERE id = ? AND eliminado = 0", [solicitudId]);
@@ -2510,9 +2671,11 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
       return res.status(401).json("No tenés permisos para modificar esta solicitud en su estado actual");
     }
     if (aprobarServiciosSociales) validarAprobacionCentral(cabecera, solicitud);
+    if (aprobarDepartamental) validarAprobacionDepartamental(cabecera, solicitud);
+    let titularAsignado = await obtenerTitularReasignacion(db, cabecera, solicitud, req.body);
 
     let validacion = await validarDatosSolicitud(db, cabecera, req.body, {
-      usuarioId: solicitud.usuario_id,
+      usuarioId: titularAsignado.id,
       fechaOriginal: solicitud.fecha_comprobante,
     });
 
@@ -2545,7 +2708,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
       emisor_cuit: datos.emisor_cuit,
       comprobante_pto_venta: datos.comprobante_pto_venta,
       comprobante_numero: datos.comprobante_numero,
-      usuario_id: solicitud.usuario_id,
+      usuario_id: titularAsignado.id,
       excluirId: solicitudId,
     });
     if (duplicadosComprobante.length > 0 && !forzarDuplicado) {
@@ -2590,13 +2753,16 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
       throw crearErrorHttp("No tenés permisos para modificar esta solicitud en su estado actual", 409);
     }
     if (aprobarServiciosSociales) validarAprobacionCentral(cabecera, solicitud);
+    if (aprobarDepartamental) validarAprobacionDepartamental(cabecera, solicitud);
+    titularAsignado = await obtenerTitularReasignacion(connection, cabecera, solicitud, req.body, { bloquear: true });
+    const reasignada = !idsPositivosIguales(titularAsignado.id, solicitud.usuario_id);
     camposCentral = ["admin-central", "admin"].includes(cabecera.rol)
       ? parsearCamposCentral(req.body, { periodoOriginal: solicitud.periodo_prestacion })
       : {};
     camposCentral = await validarCamposCentral(connection, solicitud, camposCentral, { aprobar: aprobarServiciosSociales });
 
     validacion = await validarDatosSolicitud(connection, cabecera, req.body, {
-      usuarioId: solicitud.usuario_id,
+      usuarioId: titularAsignado.id,
       fechaOriginal: solicitud.fecha_comprobante,
     });
     if (validacion.errores.length > 0) throw crearErrorHttp(validacion.errores.join(" | "), 400);
@@ -2630,7 +2796,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
       emisor_cuit: datos.emisor_cuit,
       comprobante_pto_venta: datos.comprobante_pto_venta,
       comprobante_numero: datos.comprobante_numero,
-      usuario_id: solicitud.usuario_id,
+      usuario_id: titularAsignado.id,
       excluirId: solicitudId,
     });
     if (duplicadosComprobanteFinales.length > 0 && !forzarDuplicado) {
@@ -2654,6 +2820,13 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
 
     // Diff de campos para el historial
     const camposEditables = { ...datos };
+    if (reasignada) {
+      camposEditables.usuario_id = titularAsignado.id;
+      camposEditables.departamental_id = titularAsignado.departamental_id;
+      // Conservar el origen inmutable; la firma previa pertenece al titular anterior.
+      if (!solicitud.usuario_original_id) camposEditables.usuario_original_id = solicitud.usuario_id;
+      camposEditables.firma_archivo = null;
+    }
     if (!idsPositivosIguales(datos.tipo_reintegro_id, solicitud.tipo_reintegro_id) && !("imputacion_id" in camposCentral) && !("cic_codigo" in camposCentral)) {
       const [cuentasTipo] = await connection.query("SELECT codigo FROM coseguro_imputacion WHERE id = ?", [validacion.tipo.imputacion_id]);
       camposEditables.imputacion_id = validacion.tipo.imputacion_id;
@@ -2667,9 +2840,13 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
         tipo_operacion: "UPDATE", campo_modificado: "Conceptos", valor_anterior: JSON.stringify(idsAnteriores), valor_nuevo: JSON.stringify(validacion.concepto_ids) });
     }
     // La estimación de cobertura acompaña al importe/tipo vigentes de la solicitud
-    const cobertura = calcularReintegroEstimado(validacion.tipo, datos.importe);
+    const cobertura = coberturaParaSolicitud(validacion.tipo, solicitud, datos.importe);
     camposEditables.porcentaje_cobertura_aplicado = cobertura.porcentaje;
     camposEditables.importe_estimado = cobertura.estimado;
+    camposEditables.modo_cobertura_aplicado = cobertura.modo;
+    camposEditables.tope_reintegro_aplicado = cobertura.tope;
+    camposEditables.cobertura_fecha_aplicada = cobertura.fecha;
+    camposEditables.cobertura_origen_aplicado = cobertura.origen;
     if (!("periodo_prestacion" in camposCentral)) {
       // si central no lo tocó, se mantiene el derivado de la fecha de comprobante
       camposEditables.periodo_prestacion = datos.periodo_prestacion;
@@ -2704,8 +2881,10 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     const camposCambiados = new Set();
     for (const [campo, valorNuevo] of Object.entries(todosLosCampos)) {
       const valorAnterior = solicitud[campo];
-      const anteriorNormalizado = valorAnterior instanceof Date ? moment(valorAnterior).format("YYYY-MM-DD") : valorAnterior;
-      const iguales = String(anteriorNormalizado ?? "") === String(valorNuevo ?? "");
+      const formatoFecha = campo === "cobertura_fecha_aplicada" ? "YYYY-MM-DD HH:mm:ss" : "YYYY-MM-DD";
+      const anteriorNormalizado = valorAnterior instanceof Date ? moment(valorAnterior).format(formatoFecha) : valorAnterior;
+      const nuevoNormalizado = valorNuevo instanceof Date ? moment(valorNuevo).format(formatoFecha) : valorNuevo;
+      const iguales = String(anteriorNormalizado ?? "") === String(nuevoNormalizado ?? "");
       if (!iguales) {
         camposCambiados.add(campo);
         await registrarHistorial(connection, {
@@ -2715,7 +2894,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
           tipo_operacion: "UPDATE",
           campo_modificado: ETIQUETAS_CAMPOS[campo] || campo,
           valor_anterior: anteriorNormalizado,
-          valor_nuevo: valorNuevo,
+          valor_nuevo: nuevoNormalizado,
         });
       }
     }
@@ -2738,6 +2917,10 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
       estadoNuevo = ESTADO.REVISADA;
       sets.push("estado_id = ?");
       setParams.push(estadoNuevo);
+    } else if (aprobarDepartamental) {
+      estadoNuevo = ESTADO.APROBADA_DEPTO;
+      sets.push("estado_id = ?", "fecha_aprobacion_departamental = NOW()", "aprobado_departamental_usuario_id = ?");
+      setParams.push(estadoNuevo, cabecera.id);
     }
 
     setParams.push(solicitudId, solicitud.estado_id);
@@ -2803,7 +2986,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     // autorizó la edición de esta solicitud)
     await actualizarDatosUsuario(connection, {
       actor: cabecera,
-      usuarioId: solicitud.usuario_id,
+      usuarioId: titularAsignado.id,
       cambios: { cuil: datos.cuil_afiliado, cbu: datos.cbu },
       contexto: {
         origen: "coseguro",
@@ -2813,7 +2996,9 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
       opciones: { propagar: false, autorizacionPrevia: true },
     });
 
-    if (aprobarServiciosSociales) {
+    const solicitudAsignada = { ...solicitud, usuario_id: titularAsignado.id, departamental_id: titularAsignado.departamental_id };
+    if (reasignada) await registrarReasignacion(connection, cabecera, solicitud, titularAsignado.id);
+    if (aprobarServiciosSociales || aprobarDepartamental) {
       await registrarHistorial(connection, {
         solicitud_id: solicitudId,
         usuario_id: cabecera.id,
@@ -2822,7 +3007,8 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
         estado_anterior_id: solicitud.estado_id,
         estado_nuevo_id: estadoNuevo,
       });
-      await notificarCambioEstadoAfiliado(connection, solicitud, solicitud.estado_id, estadoNuevo, null);
+      if (aprobarDepartamental) await notificarAprobacionDepartamental(connection, solicitudAsignada, solicitud.estado_id);
+      else await notificarCambioEstadoAfiliado(connection, solicitudAsignada, solicitud.estado_id, estadoNuevo, null);
     } else if (estadoNuevo) {
       const mensajeRevision = normalizarTexto(req.body.mensaje_revision);
       await registrarHistorial(connection, {
@@ -2853,7 +3039,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     // Re-constatar en ARCA en segundo plano si cambiaron los datos del comprobante
     if (constatacionDesactualizada) void constatarArcaAutomatico(solicitudId);
 
-    res.status(200).json({ success: true, message: aprobarServiciosSociales ? "Solicitud guardada y aprobada por Servicios Sociales" : "Solicitud actualizada correctamente", estado_id: estadoNuevo || solicitud.estado_id });
+    res.status(200).json({ success: true, message: aprobarServiciosSociales ? "Solicitud guardada y aprobada por Servicios Sociales" : aprobarDepartamental ? "Solicitud guardada y aprobada por departamental" : "Solicitud actualizada correctamente", estado_id: estadoNuevo || solicitud.estado_id });
   } catch (error) {
     if (connection && transaccionIniciada) {
       try { await connection.rollback(); } catch (rollbackError) { registrarErrorRuta(rollbackError); }
@@ -2956,6 +3142,8 @@ router.put("/coseguro/solicitudes/:id/estado", verifyToken, async (req, res) => 
     const sets = ["estado_id = ?"];
     const params = [estadoNuevo];
     if (estadoNuevo === ESTADO.APROBADA_DEPTO) {
+      validarAprobacionDepartamental(cabecera, solicitud);
+      await validarSolicitudParaAprobacionDepartamental(connection, cabecera, solicitud);
       sets.push("fecha_aprobacion_departamental = NOW()", "aprobado_departamental_usuario_id = ?");
       params.push(cabecera.id);
     }
@@ -4499,6 +4687,12 @@ router.__test = Object.freeze({
   normalizarListaIdsPositivos,
   parsearCsvLiquidacion,
   puedeVerSubsidio,
+  puedeEliminarSolicitud,
+  coberturaParaSolicitud,
+  obtenerTitularReasignacion,
+  registrarReasignacion,
+  validarAprobacionDepartamental,
+  validarSolicitudParaAprobacionDepartamental,
   tieneAreaCoseguro,
   validarContenidoArchivo,
   validarLimitesArchivos,

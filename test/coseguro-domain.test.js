@@ -8,6 +8,8 @@ const {
   adquirirBloqueoDuplicados,
   buscarDuplicadosComprobante,
   calcularReintegroEstimado,
+  coberturaParaSolicitud,
+  puedeEliminarSolicitud,
   decodificarFirmaBase64,
   normalizarFecha,
   normalizarImporte,
@@ -148,4 +150,26 @@ test("coseguro requiere esquema Bearer estricto", () => {
     verifyToken({ headers: { authorization } }, res, () => assert.fail("no debe continuar"));
     assert.equal(res.codigo, 401, authorization);
   }
+});
+
+test("departamental elimina aprobado propio sólo antes de cualquier aprobación de Servicios Sociales", () => {
+  const actor = { rol: "departamental", departamental_id: 7, area_coseguro: 1 };
+  assert.equal(puedeEliminarSolicitud(actor, { estado_id: 4, departamental_id: 7 }), true);
+  assert.equal(puedeEliminarSolicitud(actor, { estado_id: 4, departamental_id: 8 }), false);
+  for (const estado_id of [7, 8, 9, 10, 11]) assert.equal(puedeEliminarSolicitud(actor, { estado_id, departamental_id: 7 }), false);
+  assert.equal(puedeEliminarSolicitud(actor, { estado_id: 2, departamental_id: 7, fecha_aprobacion_central: "2026-10-01" }), false);
+  assert.equal(puedeEliminarSolicitud({ rol: "admin" }, { estado_id: 4, aprobado_central_usuario_id: 100 }), false);
+});
+
+test("editar conserva incluso la estimación legado sin inferir configuración actual", () => {
+  const tipo = { id: 1, modo_cobertura: "PORCENTAJE", porcentaje_cobertura: 90, tope_reintegro: 300 };
+  const solicitud = { tipo_reintegro_id: 1, importe: 100, porcentaje_cobertura_aplicado: 50, importe_estimado: 20 };
+  assert.deepEqual(coberturaParaSolicitud(tipo, solicitud, 100), { porcentaje: 50, estimado: 20, modo: "PORCENTAJE", tope: null, fecha: null, origen: "LEGADO" });
+  const manual = { ...solicitud, porcentaje_cobertura_aplicado: null, importe_estimado: null, modo_cobertura_aplicado: "MANUAL" };
+  assert.equal(coberturaParaSolicitud(tipo, manual, 200).estimado, null);
+  const cambioTipo = coberturaParaSolicitud({ ...tipo, id: 2 }, solicitud, 100);
+  assert.equal(cambioTipo.porcentaje, 90);
+  assert.equal(cambioTipo.estimado, 90);
+  assert.equal(cambioTipo.origen, "CONFIGURACION");
+  assert.ok(cambioTipo.fecha);
 });

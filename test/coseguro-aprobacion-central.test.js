@@ -92,8 +92,16 @@ async function consultar(sql, params = []) {
     return [[{ ...solicitud }]];
   }
   if (/FROM coseguro_tipo_reintegro/.test(sql)) {
-    return [[{ id: 1, nombre: "Consulta", requiere_pto_venta: 0, adjuntos_config: "[]", modo_cobertura: "MANUAL" }]];
+    return [[{ id: 1, nombre: "Consulta", requiere_pto_venta: 0, adjuntos_config: "[]", modo_cobertura: "MANUAL", ...escenario.tipo }]];
   }
+  if (/FROM usuario u INNER JOIN rol r ON r.id = u.rol_id\s+WHERE u.id = \?/.test(sql)) {
+    return [[{ id: params[0], rol: "afiliado", habilitado: "Y", usuario_familiar_id: null, departamental_id: 7,
+      cuil: "20301112220", cbu: "0140999861000000123452", ...escenario.titular,
+      ...(/FOR UPDATE/.test(sql) ? escenario.titularConcurrente : {}) }]];
+  }
+  if (/FROM usuario WHERE id = \? AND usuario_familiar_id = \?/.test(sql)) return [params[1] === escenario.familiarTitular ? [{ id: params[0], documento: 30111222, nombre: "Familiar", apellido: "Nuevo" }] : []];
+  if (/WHERE r.nombre = \? AND u.habilitado/.test(sql)) return [[{ id: 101 }]];
+  if (/WHERE r.nombre = 'departamental'/.test(sql)) return [[{ id: 102 }]];
   if (/FROM coseguro_concepto/.test(sql)) return [[{ id: 2, nombre: "Bono bioquímico" }]];
   if (/SELECT concepto_id FROM coseguro_solicitud_concepto/.test(sql)) return [[{ concepto_id: 2 }]];
   if (/(?:DELETE FROM|INSERT INTO) coseguro_solicitud_concepto/.test(sql)) return [{ affectedRows: 1 }];
@@ -118,6 +126,8 @@ async function consultar(sql, params = []) {
     actualizacionPendiente = { sql, params };
     return [{ affectedRows: 1 }];
   }
+  if (/INSERT INTO coseguro_solicitud\s/.test(sql)) return [{ insertId: 22, affectedRows: 1 }];
+  if (/UPDATE coseguro_solicitud s INNER JOIN coseguro_tipo_reintegro/.test(sql)) return [{ affectedRows: 1 }];
   if (/INSERT INTO coseguro_historial/.test(sql)) {
     if (escenario.fallaHistorial && params[3] === "CAMBIO_ESTADO") throw new Error("Historial no disponible");
     return [{ affectedRows: 1 }];
@@ -128,13 +138,13 @@ async function consultar(sql, params = []) {
   throw new Error(`Consulta inesperada: ${sql}`);
 }
 
-async function request(body, { editar = false } = {}) {
+async function request(body, { editar = false, crear = false } = {}) {
   const server = app.listen(0, "127.0.0.1");
   await new Promise((resolve) => server.once("listening", resolve));
   try {
     const token = jwt.sign({ data: JSON.stringify({ id: 100, rol: escenario.rol }) }, process.env.JWT_SECRET);
-    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/coseguro/solicitudes/21${editar ? "" : "/estado"}`, {
-      method: "PUT",
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/coseguro/solicitudes${crear ? "" : `/21${editar ? "" : "/estado"}`}`, {
+      method: crear ? "POST" : "PUT",
       headers: body instanceof FormData ? { authorization: `Bearer ${token}` } : { authorization: `Bearer ${token}`, "content-type": "application/json" },
       body: body instanceof FormData ? body : JSON.stringify(body),
     });
@@ -427,4 +437,110 @@ test("editar elimina la copia S3 subida si falla su persistencia y revierte la t
   assert.ok(eventos.includes("rollback"));
   assert.ok(eventos.indexOf("s3-delete") > eventos.indexOf("s3-put"));
   assert.equal(actualizacionConfirmada,null);
+});
+
+test("cobertura automática conserva foto histórica y admite autorizado distinto al sugerido", async () => {
+  preparar({ tipo: { modo_cobertura: "PORCENTAJE", porcentaje_cobertura: 90, tope_reintegro: 1000 },
+    solicitud: { modo_cobertura_aplicado: "PORCENTAJE", porcentaje_cobertura_aplicado: 50, importe_estimado: 40,
+      tope_reintegro_aplicado: 40, cobertura_origen_aplicado: "CONFIGURACION", cobertura_fecha_aplicada: "2026-01-10 10:00:00" } });
+  const respuesta = await request(formulario({ importe: 200, importe_autorizado: 75, cic_codigo: "631.301", aprobar_servicios_sociales: true }), { editar: true });
+  assert.equal(respuesta.status, 200, JSON.stringify(respuesta.body));
+  const campos = camposActualizados();
+  assert.equal(campos.importe_autorizado, 75);
+  assert.equal(campos.importe_estimado, 40);
+  assert.equal(campos.porcentaje_cobertura_aplicado, 50);
+  assert.equal(campos.tope_reintegro_aplicado, 40);
+  assert.equal(campos.cobertura_fecha_aplicada, "2026-01-10 10:00:00");
+});
+
+test("departamental guarda y aprueba desde iniciada con auditoría y notificaciones", async () => {
+  preparar({ rol: "departamental", solicitud: { estado_id: 1 } });
+  const respuesta = await request(formulario({ aprobar_departamental: true }), { editar: true });
+  assert.equal(respuesta.status, 200, JSON.stringify(respuesta.body));
+  assert.equal(camposActualizados().estado_id, 4);
+  assert.equal(camposActualizados().aprobado_departamental_usuario_id, 100);
+  assert.ok(llamadas.some(({ sql, params }) => /INSERT INTO coseguro_historial/.test(sql) && params[3] === "CAMBIO_ESTADO" && params[4] === 1 && params[5] === 4));
+  assert.ok(llamadas.some(({ sql, params }) => /INSERT INTO notificacion/.test(sql) && params[1] === "COSEGURO_PARA_CONTROL"));
+});
+
+test("aprobación departamental rechaza obligatorios incompletos y no persiste", async () => {
+  for (const editar of [false, true]) {
+    preparar({ rol: "departamental", solicitud: { estado_id: 1, cbu: null } });
+    const respuesta = await request(editar ? formulario({ aprobar_departamental: true }) : { estado_id: 4 }, { editar });
+    assert.equal(respuesta.status, 400);
+    assert.match(respuesta.body, /CBU/);
+    assert.equal(actualizacionConfirmada, null);
+  }
+});
+
+test("reasignación valida jurisdicción bajo bloqueo, familiar nuevo y origen inmutable", async () => {
+  preparar({ rol: "departamental", familiarTitular: 12, solicitud: { usuario_original_id: 8, firma_archivo: "firma-original.png" } });
+  const respuesta = await request(formulario({ usuario_id: 12, usuario_original_id: 999, familiar_usuario_id: 13 }), { editar: true });
+  assert.equal(respuesta.status, 200, JSON.stringify(respuesta.body));
+  const campos = camposActualizados();
+  assert.equal(campos.usuario_id, 12);
+  assert.equal(campos.familiar_usuario_id, 13);
+  assert.equal(campos.firma_archivo, null);
+  assert.ok(!("usuario_original_id" in campos));
+  const notificaciones = llamadas.filter(({ sql, params }) => /INSERT INTO notificacion/.test(sql) && params[1] === "COSEGURO_REASIGNADA");
+  assert.deepEqual(notificaciones.map(({params}) => params[0]), [8, 9, 12]);
+  assert.equal(JSON.parse(notificaciones[0].params[4]).reasignacion, "saliente");
+  assert.equal(JSON.parse(notificaciones[2].params[4]).reasignacion, "entrante");
+  preparar({ rol: "departamental", titularConcurrente: { departamental_id: 99 } });
+  const concurrente = await request(formulario({ usuario_id: 12 }), { editar: true });
+  assert.equal(concurrente.status, 403);
+  assert.ok(eventos.includes("rollback"));
+  assert.equal(actualizacionConfirmada, null);
+});
+
+test("reasignar al mismo afiliado no notifica; otro familiar titular se rechaza", async () => {
+  preparar({ rol: "departamental" });
+  const igual = await request(formulario({ usuario_id: 9 }), { editar: true });
+  assert.equal(igual.status, 200);
+  assert.ok(!llamadas.some(({ sql, params }) => /INSERT INTO notificacion/.test(sql) && params[1] === "COSEGURO_REASIGNADA"));
+  preparar({ rol: "departamental", familiarTitular: 9 });
+  const familiarViejo = await request(formulario({ usuario_id: 12, familiar_usuario_id: 13 }), { editar: true });
+  assert.equal(familiarViejo.status, 400);
+  assert.match(familiarViejo.body, /no figura a cargo/);
+  assert.equal(actualizacionConfirmada, null);
+});
+
+test("reasignación no traslada CUIL/CBU anterior a un perfil distinto", async () => {
+  preparar({ rol: "departamental", titular: { cuil: "20111111112", cbu: "otro" } });
+  const respuesta = await request(formulario({ usuario_id: 12 }), { editar: true });
+  assert.equal(respuesta.status, 400);
+  assert.match(respuesta.body, /no se pueden trasladar/);
+  assert.equal(actualizacionConfirmada, null);
+});
+
+test("reasignación y notificaciones quedan juntas en transacción y puede volver al original", async () => {
+  preparar({ rol: "departamental", solicitud: { usuario_id: 12, usuario_original_id: 9 } });
+  const respuesta = await request(formulario({ usuario_id: 9 }), { editar: true });
+  assert.equal(respuesta.status, 200);
+  assert.equal(camposActualizados().usuario_id, 9);
+  const notificaciones = llamadas.filter(({ sql, params }) => /INSERT INTO notificacion/.test(sql) && params[1] === "COSEGURO_REASIGNADA");
+  assert.deepEqual(notificaciones.map(({params}) => params[0]), [9, 12]);
+  preparar({ rol: "departamental", solicitud: { estado_id: 1 }, fallaHistorial: true });
+  const falla = await request(formulario({ usuario_id: 12, aprobar_departamental: true }), { editar: true });
+  assert.equal(falla.status, 500);
+  assert.equal(actualizacionConfirmada, null);
+  assert.ok(eventos.includes("rollback"));
+});
+
+test("departamental crea y aprueba en una transacción y no crea para otra departamental", async () => {
+  preparar({ rol: "departamental" });
+  const respuesta = await request(formularioConArchivo("FACTURA", { usuario_id: 9, aprobar_departamental: true, forzar_antiguedad: 1 }), { crear: true });
+  assert.equal(respuesta.status, 201, JSON.stringify(respuesta.body));
+  assert.equal(respuesta.body.estado_id, 4);
+  const insercion = llamadas.find(({sql}) => /INSERT INTO coseguro_solicitud\s/.test(sql));
+  assert.equal(insercion.params.length, 29);
+  assert.equal(insercion.params[4], 4);
+  assert.equal(insercion.params[24], 9);
+  assert.equal(insercion.params[28], "CONFIGURACION");
+  assert.ok(eventos.includes("commit"));
+  assert.ok(llamadas.some(({sql,params}) => /INSERT INTO notificacion/.test(sql) && params[1] === "COSEGURO_PARA_CONTROL"));
+  preparar({ rol: "departamental", titular: { departamental_id: 99 } });
+  const otra = await request(formularioConArchivo("FACTURA", { usuario_id: 12, aprobar_departamental: true }), { crear: true });
+  assert.equal(otra.status, 403);
+  assert.ok(!eventos.includes("commit"));
 });
