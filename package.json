@@ -6,6 +6,8 @@
   "scripts": {
     "test": "node --test",
     "test:security": "node --test test/security/authorization.test.js",
+    "migrate:auth:check": "node scripts/migrar-auth-v1.js --check --target=develop",
+    "migrate:auth:apply": "node scripts/migrar-auth-v1.js --apply --target=develop --confirm=APLICAR_AUTH",
     "serve": "nodemon server.js",
     "start": "node server.js",
     "migrate:s3": "node scripts/migrate-images-to-s3.js",

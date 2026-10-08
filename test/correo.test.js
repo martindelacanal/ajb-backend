@@ -14,6 +14,19 @@ const CLAVES_MAIL = [
   "MAIL_TLS_ESTRICTO", "MAIL_DEBUG",
 ];
 
+test("correos de autenticación nunca se redirigen ni se envían con SMTP inseguro o depuración", async () => {
+  for (const opcion of [{ MAIL_TEST_MODE: "true", MAIL_REDIRECT_TO: "pruebas@example.test" },
+    { MAIL_REDIRECT_TO: "pruebas@example.test" }, { MAIL_DEBUG: "true" }, { MAIL_TLS_ESTRICTO: "false" }]) {
+    await conEntorno({ MAIL_HOST: "smtp.example.test", MAIL_USER: "usuario", MAIL_PASSWORD: "clave",
+      MAIL_FROM: "acceso@example.test", ...opcion }, async () => {
+      const resultado = await correo.enviarCorreoPlantilla({ para: "persona@example.test", autenticacion: true,
+        asunto: "Código", parrafos: ["Código secreto"] });
+      assert.equal(resultado.enviado, false);
+      assert.equal(resultado.motivo, "configuracion_insegura_autenticacion");
+    });
+  }
+});
+
 /** Ejecuta la prueba con un entorno de correo controlado y luego lo restaura. */
 async function conEntorno(valores, ejecutar) {
   const previo = {};

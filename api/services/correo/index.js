@@ -107,8 +107,15 @@ async function enviarCorreo({
   responderA = "",
   adjuntos = [],
   encabezados = {},
+  autenticacion = false,
 } = {}) {
   const config = configuracionCorreo();
+
+  // Un código de acceso nunca puede terminar en una casilla de redirección,
+  // un log SMTP de depuración ni una conexión sin validación TLS.
+  if (autenticacion && (config.modoPruebas || config.redirigirA || config.depurar || !config.tlsEstricto)) {
+    return { enviado: false, motivo: "configuracion_insegura_autenticacion" };
+  }
 
   if (config.bloqueadoPorPruebas) {
     return { enviado: false, ...BLOQUEO_PRUEBAS };
@@ -203,6 +210,7 @@ async function enviarCorreoPlantilla({
   responderA = "",
   adjuntos = [],
   encabezados = {},
+  autenticacion = false,
   ...contenido
 } = {}) {
   const { html, texto, adjuntos: adjuntosPlantilla } = construirCorreoHtml({
@@ -220,6 +228,7 @@ async function enviarCorreoPlantilla({
     cco,
     responderA,
     encabezados,
+    autenticacion,
     adjuntos: [...adjuntosPlantilla, ...(Array.isArray(adjuntos) ? adjuntos : [])],
   });
 }

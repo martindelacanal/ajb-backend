@@ -2,6 +2,7 @@ const http = require('http');
 const jwt = require('jsonwebtoken');
 const app = require('./app');
 const mysqlConnection = require('./api/connection/connection');
+const { actualizarAutorizacionSesion, ErrorSesionUsuario } = require('./api/security/autorizacion-sesion');
 const {
     obtenerOrigenesPermitidos,
     crearValidadorCors,
@@ -227,20 +228,8 @@ io.use(async (socket, next) => {
             return;
         }
 
-        const [usuarios] = await mysqlConnection.promise().query(
-            `SELECT u.id, u.documento, u.departamental_id, u.area_turismo, u.area_coseguro,
-                    u.modulo_turismo, u.modulo_coseguro, u.modulo_olimpiadas,
-                    r.nombre AS rol
-             FROM usuario u
-             INNER JOIN rol r ON r.id = u.rol_id
-             WHERE u.id = ? AND u.habilitado = 'Y'
-             LIMIT 1`,
-            [datosToken.id]
-        );
-        if (usuarios.length !== 1) {
-            next(new Error("No autorizado"));
-            return;
-        }
+        const usuarios = [await actualizarAutorizacionSesion(tokenVerificado, mysqlConnection.promise())];
+        socket.data.tokenSesion = token;
 
         socket.data.auth = {
             id: Number(usuarios[0].id),
@@ -262,6 +251,36 @@ io.use(async (socket, next) => {
 });
 
 io.on("connection", (socket) => {
+    const validarSesionActual = async () => {
+        try {
+            const payload = jwt.verify(socket.data.tokenSesion, process.env.JWT_SECRET);
+            const usuario = await actualizarAutorizacionSesion(payload, mysqlConnection.promise());
+            Object.assign(socket.data.auth, {
+                rol: String(usuario.rol || "").trim().toLowerCase(),
+                departamentalId: usuario.departamental_id == null ? null : Number(usuario.departamental_id),
+                area_turismo: usuario.area_turismo, area_coseguro: usuario.area_coseguro,
+                modulo_turismo: usuario.modulo_turismo, modulo_coseguro: usuario.modulo_coseguro,
+                modulo_olimpiadas: usuario.modulo_olimpiadas,
+            });
+            return true;
+        } catch (error) {
+            if (!(error instanceof ErrorSesionUsuario) && !["TokenExpiredError", "JsonWebTokenError", "NotBeforeError"].includes(error?.name)) {
+                // Una falla de infraestructura no revoca un dispositivo recordado.
+                // Cerrar el transporte permite que Socket.IO reintente la conexión.
+                socket.conn.close();
+                return false;
+            }
+            socket.emit(error?.name === "TokenExpiredError" ? "sesion:expirada" : "sesion:finalizada");
+            socket.disconnect(true);
+            return false;
+        }
+    };
+    socket.use(async (_packet, next) => {
+        if (await validarSesionActual()) next();
+        else next(new Error("No autorizado"));
+    });
+    const validarSesionTimer = setInterval(() => { void validarSesionActual(); }, 15000);
+    validarSesionTimer.unref();
     socket.data.disponibilidadSubs = new Map();
     socket.data.disponibilidadTimer = null;
     socket.data.procesandoDisponibilidad = false;
@@ -423,6 +442,7 @@ io.on("connection", (socket) => {
 
 
     socket.on('disconnect', () => {
+        clearInterval(validarSesionTimer);
         limpiarTimerDisponibilidad(socket);
         if (socket.data.disponibilidadSubs) {
             socket.data.disponibilidadSubs.clear();

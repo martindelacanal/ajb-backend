@@ -42,6 +42,7 @@ function opcionesDeTransporte(config) {
     host: config.host,
     port: config.puerto,
     secure: config.seguro,
+    requireTLS: config.tlsEstricto,
     auth: { user: config.usuario, pass: config.password },
     // Nombre con el que nos presentamos en EHLO. Sin esto nodemailer manda
     // "[127.0.0.1]" (cuando el hostname no tiene punto) y el filtro de salida

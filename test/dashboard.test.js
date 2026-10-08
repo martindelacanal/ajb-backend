@@ -195,8 +195,8 @@ test("dashboard rechaza un administrador inhabilitado despues de validar su esta
   databaseCalls.length = 0;
   const response = await request("/api/admin/dashboard", tokenFor({ id: 12, rol: "admin" }));
 
-  assert.equal(response.status, 403);
-  assert.equal(response.body, "Usuario inhabilitado");
+  assert.equal(response.status, 401);
+  assert.deepEqual(response.body, { mensaje: "Usuario inhabilitado", code: "SESSION_REVOKED" });
   assert.equal(databaseCalls.length, 1);
 });
 
