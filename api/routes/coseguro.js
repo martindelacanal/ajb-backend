@@ -16,6 +16,8 @@
 const { GRUPOS, normalizarCicCodigo } = require("../data/coseguro-catalogo-631");
 const { LIMITES_ARCHIVOS, ADJUNTO_OTROS, completarAdjuntos } = require("../data/coseguro-limites-archivos");
 const express = require("express");
+const { notificarParticipantesChat } = require("../services/chat-notificaciones");
+const { crearNotificacion } = require("../services/notificaciones");
 const router = express.Router();
 const mysqlConnection = require("../connection/connection");
 const { registrarErrorRuta } = require("../services/errores");
@@ -808,10 +810,7 @@ async function registrarHistorial(connection, datos) {
 }
 
 async function insertarNotificacion(connection, usuarioId, tipo, titulo, mensaje, payload) {
-  await connection.query(
-    `INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, ?, ?, ?, ?)`,
-    [usuarioId, tipo, titulo, mensaje, JSON.stringify(payload || {})]
-  );
+  return crearNotificacion(connection, { usuarioId, tipo, titulo, mensaje, payload });
 }
 
 async function registrarReasignacion(connection, cabecera, solicitud, usuarioNuevoId) {
@@ -3279,18 +3278,12 @@ router.post("/coseguro/solicitudes/:id/observaciones", verifyToken, async (req, 
       observacion: mensaje,
     });
 
-    if (cabecera.rol === "afiliado") {
-      await notificarUsuariosDepartamental(connection, solicitud.departamental_id,
-        estadoNuevo ? "COSEGURO_REVISADA" : "COSEGURO_OBSERVACION",
-        estadoNuevo ? `Solicitud de reintegro #${solicitudId} revisada` : `Nueva observación en la solicitud #${solicitudId}`,
-        `El afiliado escribió: ${mensaje}`,
-        { solicitud_id: solicitudId, estado_id: estadoNuevo || solicitud.estado_id });
-    } else {
-      await insertarNotificacion(connection, solicitud.usuario_id, "COSEGURO_OBSERVACION",
-        `Nueva observación en tu solicitud #${solicitudId}`,
-        mensaje,
-        { solicitud_id: solicitudId, estado_id: solicitud.estado_id });
-    }
+    await notificarParticipantesChat(connection, {
+      modulo: "coseguro", entidadId: solicitudId,
+      entidad: { ...solicitud, estado_id: estadoNuevo || solicitud.estado_id }, autorId: cabecera.id,
+      tipo: "COSEGURO_OBSERVACION", titulo: `Nuevo mensaje en la solicitud #${solicitudId}`,
+      mensaje, payload: { solicitud_id: solicitudId, estado_id: estadoNuevo || solicitud.estado_id },
+    });
 
     await connection.commit();
     res.status(201).json({ success: true, message: "Observación registrada", estado_id: estadoNuevo || solicitud.estado_id });

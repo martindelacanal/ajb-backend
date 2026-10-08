@@ -20,6 +20,7 @@
  * Inscripción: 1 Inscripto / 2 Cancelada (libera cupo y permite reinscribirse).
  */
 const express = require("express");
+const { crearNotificacion } = require("../services/notificaciones");
 const router = express.Router();
 const mysqlConnection = require("../connection/connection");
 const { registrarErrorRuta } = require("../services/errores");
@@ -1022,10 +1023,7 @@ function acotarTituloNotificacion(titulo) {
 }
 
 async function insertarNotificacion(connection, usuarioId, tipo, titulo, mensaje, payload) {
-  await connection.query(
-    `INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, ?, ?, ?, ?)`,
-    [usuarioId, tipo, acotarTituloNotificacion(titulo), mensaje, JSON.stringify(payload || {})]
-  );
+  return crearNotificacion(connection, { usuarioId, tipo, titulo, mensaje, payload });
 }
 
 // Equipo de una departamental (rol departamental, habilitados), salvo el autor
@@ -2988,10 +2986,11 @@ router.post("/beneficios/:id(\\d+)/observaciones", verifyToken, async (req, res)
       const nombreDep = (await nombreDepartamental(connection, cabecera.departamental_id)) || "La departamental";
       await notificarSuperiores(connection, "BENEFICIO_OBSERVACION", titulo, `${nombreDep} escribió: ${mensaje}`, payload, cabecera.id);
     } else {
-      await notificarUsuariosDepartamental(
-        connection, beneficio.departamental_id, "BENEFICIO_OBSERVACION", titulo, `Administración escribió: ${mensaje}`, payload, cabecera.id
-      );
+      await notificarSuperiores(connection, "BENEFICIO_OBSERVACION", titulo, mensaje, payload, cabecera.id);
     }
+    await notificarUsuariosDepartamental(
+      connection, beneficio.departamental_id, "BENEFICIO_OBSERVACION", titulo, mensaje, payload, cabecera.id
+    );
 
     await connection.commit();
     res.status(201).json({ success: true, message: "Mensaje enviado" });

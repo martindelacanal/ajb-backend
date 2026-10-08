@@ -163,7 +163,7 @@ function reservationHistoryResponder(targetDepartamentalId) {
 }
 
 test("tabla de reservas rechaza roles no autorizados antes de consultar la base", async (t) => {
-  for (const rol of ["auditor", "admin-central", "afiliado", "invitado"]) {
+  for (const rol of ["auditor", "afiliado", "invitado"]) {
     await t.test(rol, async () => {
       setDatabaseHandler(tableResponder);
 
@@ -196,6 +196,22 @@ test("tabla de reservas conserva el acceso global de admin", async () => {
   for (const call of reservationQueries) {
     assert.doesNotMatch(call.sql, /u\.departamental_id = \?/);
   }
+});
+
+test("administración central accede a reservas sólo con Turismo habilitado", async () => {
+  setDatabaseHandler(tableResponder);
+  const permitida = await request("/api/tabla/reservas?page=1", {
+    method: "POST", token: tokenFor({ rol: "admin-central", area_turismo: 1 }), body: {},
+  });
+  assert.equal(permitida.status, 200);
+  assert.equal(permitida.body.results.length, 1);
+
+  setDatabaseHandler(tableResponder);
+  const denegada = await request("/api/tabla/reservas?page=1", {
+    method: "POST", token: tokenFor({ rol: "admin-central", area_turismo: 0 }), body: {},
+  });
+  assert.equal(denegada.status, 403);
+  assert.equal(consultasDeNegocio().length, 0);
 });
 
 test("tabla de reservas limita al departamental en datos y conteo", async () => {

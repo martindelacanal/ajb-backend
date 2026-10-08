@@ -1,4 +1,5 @@
 "use strict";
+const { crearNotificacion } = require("../services/notificaciones");
 
 const crypto = require("crypto");
 const express = require("express");
@@ -46,6 +47,7 @@ const {
   tieneAreaTurismo,
 } = require("../services/turismo-catalogo");
 const { registrarHistorialDescuento } = require("../services/descuentos-reserva");
+const { obtenerMensajesServicio, registrarMensajeServicio } = require("../services/turismo-conversaciones");
 
 const router = express.Router();
 
@@ -438,9 +440,11 @@ async function guardarConvenioEnServicio(connection, servicioId, body, datosServ
   return obtenerConvenioServicio(connection, servicioId);
 }
 
-async function reemplazarVisibilidad(connection, servicioId, alcance, ids) {
+async function reemplazarVisibilidad(connection, servicioId, alcance, ids, propietaria = null) {
   await connection.query("DELETE FROM servicio_departamental_visible WHERE servicio_id = ?", [servicioId]);
   if (alcance !== "SELECCIONADAS") return;
+  // La propietaria participa siempre; la selección agrega otras sedes.
+  ids = [...new Set([...(ids || []), ...(propietaria ? [Number(propietaria)] : [])])];
   if (!Array.isArray(ids) || ids.length === 0) {
     throw crearErrorCatalogo("Seleccioná al menos una departamental", 400, "SERVICIO_ALCANCE_SIN_DEPARTAMENTALES");
   }
@@ -461,10 +465,7 @@ async function reemplazarVisibilidad(connection, servicioId, alcance, ids) {
 }
 
 async function insertarNotificacion(connection, usuarioId, tipo, titulo, mensaje, payload) {
-  await connection.query(
-    "INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, ?, ?, ?, ?)",
-    [usuarioId, tipo, titulo, mensaje, JSON.stringify(payload || {})]
-  );
+  return crearNotificacion(connection, { usuarioId, tipo, titulo, mensaje, payload });
 }
 
 async function notificarRevisores(connection, servicio, tipo, titulo, mensaje, excluirUsuarioId = null) {
@@ -544,7 +545,8 @@ function permisosServicio(servicio, cabecera) {
     && Number(servicio.propietario_departamental_id) === Number(cabecera.departamental_id);
   return {
     puede_editar: administrador || propio,
-    puede_aprobar: administrador && servicio.estado_aprobacion === "PENDIENTE",
+    puede_aprobar: administrador && ["PENDIENTE", "EN_REVISION"].includes(servicio.estado_aprobacion),
+    puede_chatear: administrador || propio,
     es_propio: propio,
   };
 }
@@ -905,8 +907,11 @@ router.get("/gestion/turismo/servicios/:id", verifyToken, async (req, res) => {
       cuposPorRecurso.get(recursoId).push(cupo);
     }
     const servicioPresentado = await presentarServicioConConfiguracion(db, servicio, cabecera);
+    const observaciones = servicioPresentado.puede_chatear
+      ? await obtenerMensajesServicio(db, servicioId) : [];
     return res.status(200).json({
       ...servicioPresentado,
+      observaciones_hilo: observaciones,
       departamentales_visibles: departamentales,
       departamentales,
       imagenes: imagenesServicioFirmadas,
@@ -927,6 +932,7 @@ router.get("/gestion/turismo/servicios/:id", verifyToken, async (req, res) => {
       convenio_hotel: convenios[0] || null,
       recursos: recursos.map((recurso) => ({
         ...recurso,
+        estado_aprobacion: servicio.estado_aprobacion,
         imagenes: imagenesPorRecurso.get(Number(recurso.id)) || [],
         caracteristicas: valoresPorRecurso.get(Number(recurso.id)) || [],
         cupos: cuposPorRecurso.get(Number(recurso.id)) || [],
@@ -993,7 +999,7 @@ router.post("/gestion/turismo/servicios", verifyToken, async (req, res) => {
       ]
     );
     const servicioId = Number(resultado.insertId);
-    await reemplazarVisibilidad(connection, servicioId, datos.alcance_departamental, departamentales);
+    await reemplazarVisibilidad(connection, servicioId, datos.alcance_departamental, departamentales, propietaria);
     const convenio = tipoServicio.codigo === "CONVENIO_HOTELERO"
       ? await guardarConvenioEnServicio(connection, servicioId, payload, datos)
       : null;
@@ -1059,7 +1065,7 @@ router.put("/gestion/turismo/servicios/:id", verifyToken, async (req, res) => {
     }
     const convenioAnterior = await obtenerConvenioServicio(connection, servicioId);
     let propietaria = anterior.propietario_departamental_id;
-    if (esAdministradorTurismo(cabecera)) {
+    if (esAdministradorTurismo(cabecera) && payload.propietario_departamental_id !== undefined) {
       propietaria = payload.propietario_departamental_id == null || payload.propietario_departamental_id === ""
         ? null : normalizarIdPositivo(payload.propietario_departamental_id);
       if (payload.propietario_departamental_id && !propietaria) throw crearErrorCatalogo("Departamental inválida", 400);
@@ -1092,7 +1098,7 @@ router.put("/gestion/turismo/servicios/:id", verifyToken, async (req, res) => {
     if (Number(actualizacion.affectedRows) !== 1) {
       throw crearErrorCatalogo("El servicio fue modificado por otra persona. Volvé a cargarlo.", 409, "SERVICIO_VERSION_DESACTUALIZADA");
     }
-    await reemplazarVisibilidad(connection, servicioId, datos.alcance_departamental, departamentales);
+    await reemplazarVisibilidad(connection, servicioId, datos.alcance_departamental, departamentales, propietaria);
     let convenio = null;
     if (tipoServicio.codigo === "CONVENIO_HOTELERO") {
       convenio = await guardarConvenioEnServicio(connection, servicioId, payload, datos, convenioAnterior);
@@ -1128,6 +1134,55 @@ router.put("/gestion/turismo/servicios/:id", verifyToken, async (req, res) => {
   }
 });
 
+router.get("/gestion/turismo/servicios/:id/observaciones", verifyToken, async (req, res) => {
+  try {
+    const cabecera = exigirGestion(req);
+    const servicioId = normalizarIdPositivo(req.params.id);
+    if (!servicioId) throw crearErrorCatalogo("ID inválido", 400);
+    const db = mysqlConnection.promise();
+    await obtenerServicioGestionAutorizado(db, cabecera, servicioId);
+    return res.status(200).json({ observaciones_hilo: await obtenerMensajesServicio(db, servicioId) });
+  } catch (error) {
+    return responderError(res, error, "Error al obtener la conversación del servicio");
+  }
+});
+
+router.post("/gestion/turismo/servicios/:id/observaciones", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = exigirGestion(req);
+    const servicioId = normalizarIdPositivo(req.params.id);
+    const mensaje = normalizarTexto(req.body?.mensaje, { nullable: false, maximo: 5000 });
+    const recursoId = req.body?.recurso_id == null ? null : normalizarIdPositivo(req.body.recurso_id);
+    if (!servicioId || !mensaje || (req.body?.recurso_id != null && !recursoId)) {
+      throw crearErrorCatalogo("El mensaje o el recurso no son válidos", 400, "CHAT_MENSAJE_INVALIDO");
+    }
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    const servicio = await obtenerServicioGestionAutorizado(connection, cabecera, servicioId, { forUpdate: true });
+    if (recursoId) {
+      const [recursos] = await connection.query("SELECT id FROM recurso WHERE id = ? AND servicio_id = ?", [recursoId, servicioId]);
+      if (!recursos.length) throw crearErrorCatalogo("El recurso no pertenece al servicio", 400, "CHAT_RECURSO_AJENO");
+    }
+    const mensajeId = await registrarMensajeServicio(connection, { servicio, cabecera, mensaje, recursoId });
+    await registrarHistorialTurismo(connection, {
+      servicioId, recursoId, entidadTipo: "SERVICIO", entidadId: servicioId,
+      operacion: "OBSERVACION", resumen: mensaje, usuarioId: cabecera.id, req,
+    });
+    await notificarRevisores(connection, servicio, "TURISMO_SERVICIO_OBSERVACION",
+      `Nuevo mensaje en ${servicio.nombre}`, mensaje, cabecera.id);
+    await notificarPropietaria(connection, servicio, "TURISMO_SERVICIO_OBSERVACION",
+      `Nuevo mensaje en ${servicio.nombre}`, mensaje, cabecera.id);
+    await connection.commit();
+    return res.status(201).json({ success: true, id: mensajeId, message: "Mensaje enviado" });
+  } catch (error) {
+    if (connection) await connection.rollback();
+    return responderError(res, error, "Error al enviar el mensaje del servicio");
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
 async function cambiarEstadoAprobacion(req, res, estadoDestino) {
   let connection;
   try {
@@ -1141,17 +1196,17 @@ async function cambiarEstadoAprobacion(req, res, estadoDestino) {
     if (req.body?.motivo !== undefined && motivo === undefined) {
       throw crearErrorCatalogo("El motivo no es válido", 400, "APROBACION_MOTIVO_INVALIDO");
     }
-    if (estadoDestino === "RECHAZADO" && !motivo) {
-      throw crearErrorCatalogo("Indicá el motivo del rechazo", 400, "APROBACION_MOTIVO_REQUERIDO");
+    if (["RECHAZADO", "EN_REVISION"].includes(estadoDestino) && !motivo) {
+      throw crearErrorCatalogo("Indicá el motivo de la revisión o del rechazo", 400, "APROBACION_MOTIVO_REQUERIDO");
     }
 
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
     const anterior = await obtenerServicioGestion(connection, servicioId, { forUpdate: true });
     if (!anterior) throw crearErrorCatalogo("Servicio no encontrado", 404, "SERVICIO_NO_ENCONTRADO");
-    if (anterior.estado_aprobacion !== "PENDIENTE") {
+    if (!["PENDIENTE", "EN_REVISION"].includes(anterior.estado_aprobacion)) {
       throw crearErrorCatalogo(
-        "Solo se pueden revisar servicios pendientes",
+        "Solo se pueden revisar servicios pendientes o en revisión",
         409,
         "SERVICIO_NO_ESTA_PENDIENTE"
       );
@@ -1169,30 +1224,38 @@ async function cambiarEstadoAprobacion(req, res, estadoDestino) {
     }
     await connection.query(
       "UPDATE servicio SET estado_aprobacion = ?, motivo_revision = ?, version = version + 1 WHERE id = ?",
-      [estadoDestino, estadoDestino === "RECHAZADO" ? motivo : null, servicioId]
+      [estadoDestino, ["RECHAZADO", "EN_REVISION"].includes(estadoDestino) ? motivo : null, servicioId]
     );
     const nuevo = await obtenerServicioGestion(connection, servicioId);
     await registrarHistorialTurismo(connection, {
       servicioId,
       entidadTipo: "SERVICIO",
       entidadId: servicioId,
-      operacion: estadoDestino === "APROBADO" ? "APPROVE" : "REJECT",
+      operacion: estadoDestino === "APROBADO" ? "APPROVE" : estadoDestino === "EN_REVISION" ? "REVIEW" : "REJECT",
       resumen: estadoDestino === "APROBADO"
         ? `Servicio “${nuevo.nombre}” aprobado`
-        : `Servicio “${nuevo.nombre}” rechazado: ${motivo}`,
+        : estadoDestino === "EN_REVISION" ? `Servicio “${nuevo.nombre}” en revisión: ${motivo}`
+          : `Servicio “${nuevo.nombre}” rechazado: ${motivo}`,
       anterior,
       nuevo: { ...nuevo, motivo: motivo || null },
       usuarioId: cabecera.id,
       req,
     });
+    await registrarMensajeServicio(connection, {
+      servicio: nuevo, cabecera,
+      mensaje: motivo || `El servicio fue ${estadoDestino === "APROBADO" ? "aprobado" : "revisado"}.`,
+    });
     await notificarPropietaria(
       connection,
       nuevo,
-      estadoDestino === "APROBADO" ? "TURISMO_SERVICIO_APROBADO" : "TURISMO_SERVICIO_RECHAZADO",
-      estadoDestino === "APROBADO" ? "Servicio de Turismo aprobado" : "Servicio de Turismo rechazado",
+      `TURISMO_SERVICIO_${estadoDestino}`,
+      estadoDestino === "APROBADO" ? "Servicio de Turismo aprobado"
+        : estadoDestino === "EN_REVISION" ? "Servicio de Turismo en revisión" : "Servicio de Turismo rechazado",
       estadoDestino === "APROBADO"
         ? `El servicio “${nuevo.nombre}” fue aprobado y ya puede publicarse.`
-        : `El servicio “${nuevo.nombre}” fue rechazado. Motivo: ${motivo}`,
+        : estadoDestino === "EN_REVISION"
+          ? `El servicio “${nuevo.nombre}” necesita ajustes. Revisá el chat: ${motivo}`
+          : `El servicio “${nuevo.nombre}” fue rechazado. Motivo: ${motivo}`,
       cabecera.id
     );
     await connection.commit();
@@ -1211,14 +1274,20 @@ router.post("/gestion/turismo/servicios/:id/aprobar", verifyToken, (req, res) =>
 router.post("/gestion/turismo/servicios/:id/rechazar", verifyToken, (req, res) =>
   cambiarEstadoAprobacion(req, res, "RECHAZADO"));
 
+router.post("/gestion/turismo/servicios/:id/revisar", verifyToken, (req, res) =>
+  cambiarEstadoAprobacion(req, res, "EN_REVISION"));
+
 router.post("/gestion/turismo/servicios/:id/aprobacion", verifyToken, async (req, res) => {
-  const accion = String(req.body?.estado || req.body?.accion || "").trim().toUpperCase();
+  const accion = String(req.body?.estado_aprobacion || req.body?.estado || req.body?.accion || "").trim().toUpperCase();
   req.body = {
     ...(req.body || {}),
     motivo: req.body?.motivo ?? req.body?.observacion,
   };
   if (["APROBAR", "APROBADO"].includes(accion)) return cambiarEstadoAprobacion(req, res, "APROBADO");
-  if (["RECHAZAR", "RECHAZADO", "SOLICITAR_CAMBIOS"].includes(accion)) {
+  if (["EN_REVISION", "REVISAR", "SOLICITAR_CAMBIOS"].includes(accion)) {
+    return cambiarEstadoAprobacion(req, res, "EN_REVISION");
+  }
+  if (["RECHAZAR", "RECHAZADO"].includes(accion)) {
     return cambiarEstadoAprobacion(req, res, "RECHAZADO");
   }
   if (accion !== "ENVIAR" && accion !== "PENDIENTE") {
@@ -1230,6 +1299,10 @@ router.post("/gestion/turismo/servicios/:id/aprobacion", verifyToken, async (req
     const cabecera = exigirGestion(req);
     const servicioId = normalizarIdPositivo(req.params.id);
     if (!servicioId) throw crearErrorCatalogo("ID inválido", 400);
+    const motivo = normalizarTexto(req.body?.motivo, { nullable: true, maximo: 1000 });
+    if (req.body?.motivo !== undefined && motivo === undefined) {
+      throw crearErrorCatalogo("La observación no es válida", 400, "APROBACION_MOTIVO_INVALIDO");
+    }
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
     const anterior = await obtenerServicioGestionAutorizado(connection, cabecera, servicioId, { forUpdate: true });
@@ -1243,12 +1316,13 @@ router.post("/gestion/turismo/servicios/:id/aprobacion", verifyToken, async (req
     const nuevo = await obtenerServicioGestion(connection, servicioId);
     await registrarHistorialTurismo(connection, {
       servicioId, entidadTipo: "SERVICIO", entidadId: servicioId, operacion: "SUBMIT",
-      resumen: `Servicio “${nuevo.nombre}” enviado a aprobación`, anterior, nuevo,
+      resumen: `Servicio “${nuevo.nombre}” enviado a aprobación`, anterior, nuevo: { ...nuevo, motivo: motivo || null },
       usuarioId: cabecera.id, req,
     });
+    if (motivo) await registrarMensajeServicio(connection, { servicio: nuevo, cabecera, mensaje: motivo });
     await notificarRevisores(
       connection, nuevo, "TURISMO_SERVICIO_PENDIENTE", `Servicio pendiente: ${nuevo.nombre}`,
-      `El servicio “${nuevo.nombre}” fue enviado a aprobación.`, cabecera.id
+      `El servicio “${nuevo.nombre}” fue enviado a aprobación.${motivo ? ` Observación: ${motivo}` : ""}`, cabecera.id
     );
     await connection.commit();
     return res.status(200).json(presentarServicio(nuevo, cabecera));
@@ -3032,3 +3106,4 @@ router.get("/gestion/turismo/servicios/:id/historial", verifyToken, async (req, 
 });
 
 module.exports = router;
+router.__test = { reemplazarVisibilidad, permisosServicio, cambiarEstadoAprobacion, marcarPendientePorCambioDepartamental };

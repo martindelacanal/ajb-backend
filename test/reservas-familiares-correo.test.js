@@ -105,9 +105,9 @@ test("cada modalidad guarda la solicitud y notifica internamente al titular sin 
     await registrarSolicitudTitular(connection, { reservaId: 7, solicitanteId: 20, titularId: 10, estadoDestino });
     await connection.commit();
     const notificacion = estado.notificaciones.at(-1);
-    assert.match(notificacion.sql, /'RESERVA_APROBACION_TITULAR'/);
+    assert.equal(notificacion.params[1], 'RESERVA_APROBACION_TITULAR');
     assert.equal(notificacion.params[0], 10);
-    assert.deepEqual(JSON.parse(notificacion.params.at(-1)), {
+    assert.deepEqual(JSON.parse(notificacion.params[4]), {
       reserva_id: 7, estado: ESTADO_PENDIENTE_TITULAR, url: "/mis-gestiones?aprobacion_reserva=7",
     });
     assert.deepEqual(estado.solicitud, [7, 20, 10, estadoDestino]);
@@ -148,9 +148,9 @@ for (const [accion, destino] of [["APROBAR", "Iniciada"], ["RECHAZAR", "Rechazad
     assert.equal(response.status, 200);
     assert.equal(response.body.estado, destino);
     assert.deepEqual(transacciones, ["begin", "commit"]);
-    const respuesta = estado.notificaciones.find(({ sql }) => /'RESERVA_RESPUESTA_TITULAR'/.test(sql));
+    const respuesta = estado.notificaciones.find(({ params }) => params[1] === 'RESERVA_RESPUESTA_TITULAR');
     assert.equal(respuesta.params[0], 20);
-    assert.equal(JSON.parse(respuesta.params.at(-1)).estado, destino);
+    assert.equal(JSON.parse(respuesta.params[4]).estado, destino);
     assert.equal(estado.historial.length, 1);
     comprobarSinCorreo();
   });
