@@ -137,6 +137,11 @@ const beneficiosRoute = require('./api/routes/beneficios');
 const descuentosRoute = require('./api/routes/descuentos');
 const familiaresCambiosRoute = require('./api/routes/familiares-cambios');
 const politicaCancelacionRoute = require('./api/routes/politica-cancelacion');
+const publicoRoute = require('./api/routes/publico');
+const turismoPlacasRoute = require('./api/routes/turismo-placas');
+// Portada pública (sin token) y placas de turismo: rutas propias, sin middleware global.
+app.use('/api', publicoRoute);
+app.use('/api', turismoPlacasRoute);
 app.use('/api', webauthnRoute);
 app.use('/api', politicaCancelacionRoute);
 app.use('/api', turismoGestionRoute);

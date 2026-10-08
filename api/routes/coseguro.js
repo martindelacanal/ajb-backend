@@ -1068,6 +1068,20 @@ router.get("/coseguro/catalogos", verifyToken, async (req, res) => {
 // ---------------------------------------------------------------------------
 const ROLES_COBERTURA = ["admin", "admin-central"];
 
+// es_subsidio: el tipo es un subsidio/obsequio (p. ej. nacimiento) y la portada lo
+// publica aparte. Se expone como boolean.
+function conEsSubsidioBooleano(tipo) {
+  return { ...tipo, es_subsidio: Number(tipo.es_subsidio) === 1 };
+}
+
+// En el PUT es opcional: undefined/null = se conserva el valor actual.
+function normalizarEsSubsidio(valor) {
+  if (valor === undefined || valor === null) return null;
+  if (valor === true || valor === 1 || valor === "1" || valor === "true") return 1;
+  if (valor === false || valor === 0 || valor === "0" || valor === "false") return 0;
+  return undefined;
+}
+
 router.get("/coseguro/cobertura", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
@@ -1075,12 +1089,13 @@ router.get("/coseguro/cobertura", verifyToken, async (req, res) => {
 
     const [tipos] = await mysqlConnection.promise().query(
       `SELECT t.id, t.nombre, t.icono, t.orden, t.activo, t.modo_cobertura, t.porcentaje_cobertura, t.tope_reintegro,
+              t.es_subsidio,
               (SELECT COUNT(*) FROM coseguro_solicitud s WHERE s.tipo_reintegro_id = t.id AND s.eliminado = 0) AS solicitudes
        FROM coseguro_tipo_reintegro t
        WHERE t.activo = 1
        ORDER BY t.orden`
     );
-    res.status(200).json({ tipos });
+    res.status(200).json({ tipos: tipos.map(conEsSubsidioBooleano) });
   } catch (error) {
     registrarErrorRuta(error);
     res.status(500).json("Error al obtener la configuración de cobertura");
@@ -1102,6 +1117,10 @@ router.put("/coseguro/cobertura", verifyToken, async (req, res) => {
       const id = normalizarIdPositivo(item.id);
       if (!id) continue;
       const modo = String(item.modo_cobertura || "").toUpperCase() === "PORCENTAJE" ? "PORCENTAJE" : "MANUAL";
+      const esSubsidio = normalizarEsSubsidio(item.es_subsidio);
+      if (esSubsidio === undefined) {
+        errores.push(`El indicador de subsidio de "${normalizarTexto(item.nombre) || `tipo #${id}`}" es inválido`);
+      }
       let porcentaje = null;
       let tope = null;
       if (modo === "PORCENTAJE") {
@@ -1113,7 +1132,7 @@ router.put("/coseguro/cobertura", verifyToken, async (req, res) => {
         tope = topeVacio ? null : normalizarImporte(item.tope_reintegro, { permiteCero: false });
         if (!topeVacio && tope === null) errores.push(`El tope de "${normalizarTexto(item.nombre) || `tipo #${id}`}" debe ser un monto mayor a 0, con hasta dos decimales`);
       }
-      normalizados.push({ id, modo, porcentaje, tope });
+      normalizados.push({ id, modo, porcentaje, tope, esSubsidio });
     }
     if (errores.length > 0) return res.status(400).json(errores.join(" | "));
     if (normalizados.length === 0) return res.status(400).json("No se recibieron tipos de reintegro válidos");
@@ -1123,17 +1142,19 @@ router.put("/coseguro/cobertura", verifyToken, async (req, res) => {
     await connection.beginTransaction();
     for (const item of normalizados) {
       await connection.query(
-        "UPDATE coseguro_tipo_reintegro SET modo_cobertura = ?, porcentaje_cobertura = ?, tope_reintegro = ? WHERE id = ?",
-        [item.modo, item.porcentaje, item.tope, item.id]
+        `UPDATE coseguro_tipo_reintegro
+            SET modo_cobertura = ?, porcentaje_cobertura = ?, tope_reintegro = ?, es_subsidio = COALESCE(?, es_subsidio)
+          WHERE id = ?`,
+        [item.modo, item.porcentaje, item.tope, item.esSubsidio, item.id]
       );
     }
     await connection.commit();
 
     const [tipos] = await db.query(
-      `SELECT id, nombre, icono, orden, activo, modo_cobertura, porcentaje_cobertura, tope_reintegro
+      `SELECT id, nombre, icono, orden, activo, modo_cobertura, porcentaje_cobertura, tope_reintegro, es_subsidio
        FROM coseguro_tipo_reintegro WHERE activo = 1 ORDER BY orden`
     );
-    res.status(200).json({ success: true, message: "Cobertura actualizada correctamente", tipos });
+    res.status(200).json({ success: true, message: "Cobertura actualizada correctamente", tipos: tipos.map(conEsSubsidioBooleano) });
   } catch (error) {
     if (connection) await connection.rollback();
     registrarErrorRuta(error);
