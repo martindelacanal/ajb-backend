@@ -1,8 +1,19 @@
-const MODULOS_CHAT = new Set(["turismo", "coseguro", "traslados", "olimpiadas", "beneficios"]);
+const MODULOS_CHAT = new Set(["turismo", "turismo-gestion", "coseguro", "traslados", "olimpiadas", "beneficios"]);
 const MAX_MENSAJES_SINCRONIZACION = 100;
 const ESTADOS_COSEGURO_AUDITOR = new Set([7, 8, 9, 10]);
 
 const CONFIGURACION_CHAT = {
+    "turismo-gestion": {
+        entidadSql: `SELECT propietario_departamental_id FROM servicio WHERE id = ? LIMIT 1`,
+        mensajesSql: `SELECT o.id, o.usuario_id, o.usuario_rol, o.mensaje, o.recurso_id,
+                             o.estado_aprobacion AS estado_nombre, o.fecha_creacion,
+                             COALESCE(o.usuario_nombre, u.nombre) AS usuario_nombre,
+                             COALESCE(o.usuario_apellido, u.apellido) AS usuario_apellido
+                      FROM servicio_observacion o
+                      LEFT JOIN usuario u ON u.id = o.usuario_id
+                      WHERE o.servicio_id = ? AND o.id > ?
+                      ORDER BY o.id ASC LIMIT ${MAX_MENSAJES_SINCRONIZACION}`,
+    },
     turismo: {
         entidadSql: `SELECT r.usuario_id, u.departamental_id
                      FROM reserva r
@@ -178,10 +189,16 @@ function puedeAccederSegunEntidad(auth, conversacion, entidad) {
         case "turismo":
             if (!moduloHabilitado(auth, "modulo_turismo")) return false;
             if (auth.rol === "admin") return true;
+            if (auth.rol === "admin-central") return areaHabilitada(auth, "area_turismo");
             if (auth.rol === "afiliado") return idsIguales(entidad.usuario_id, auth.id);
             return auth.rol === "departamental"
                 && areaHabilitada(auth, "area_turismo")
                 && idsIguales(entidad.departamental_id, auth.departamentalId);
+        case "turismo-gestion":
+            if (!areaHabilitada(auth, "area_turismo")) return false;
+            if (["admin", "admin-central"].includes(auth.rol)) return true;
+            return auth.rol === "departamental"
+                && idsIguales(entidad.propietario_departamental_id, auth.departamentalId);
         case "coseguro":
             if (!moduloHabilitado(auth, "modulo_coseguro")) return false;
             if (!areaHabilitada(auth, "area_coseguro")) return false;
@@ -193,7 +210,7 @@ function puedeAccederSegunEntidad(auth, conversacion, entidad) {
             return auth.rol === "admin";
         case "olimpiadas":
             if (!moduloHabilitado(auth, "modulo_olimpiadas")) return false;
-            if (auth.rol === "admin") return true;
+            if (["admin", "admin-central"].includes(auth.rol)) return true;
             if (auth.rol === "departamental") return idsIguales(entidad.departamental_id, auth.departamentalId);
             return auth.rol === "afiliado" && idsIguales(entidad.usuario_id, auth.id);
         case "beneficios":
@@ -226,6 +243,7 @@ function normalizarMensajePersistido(fila) {
         usuario_nombre: fila.usuario_nombre == null ? null : String(fila.usuario_nombre),
         usuario_apellido: fila.usuario_apellido == null ? null : String(fila.usuario_apellido),
         estado_nombre: fila.estado_nombre == null ? null : String(fila.estado_nombre),
+        ...(fila.recurso_id == null ? {} : { recurso_id: normalizarId(fila.recurso_id) }),
     };
 }
 

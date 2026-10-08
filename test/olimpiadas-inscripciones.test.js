@@ -183,7 +183,9 @@ test("edición: el estado se calcula con fechas civiles inclusivas", () => {
   }
 });
 
-test("documentación completa exige foto, certificado y firma", () => {
+test("documentación completa exige foto y certificado sin exigir firma del afiliado", () => {
+  assert.equal(documentacionCompleta({ foto_archivo: "a", certificado_archivo: "b" }), true);
+  assert.equal(documentacionCompleta({ foto_archivo: "a", certificado_archivo: "b", firma_archivo: null }), true);
   assert.equal(documentacionCompleta({ foto_archivo: "a", certificado_archivo: "b", firma_archivo: "c" }), true);
   assert.equal(documentacionCompleta({ foto_archivo: "a", certificado_archivo: null, firma_archivo: "c" }), false);
   assert.equal(documentacionCompleta({}), false);

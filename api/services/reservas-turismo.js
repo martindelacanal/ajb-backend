@@ -1,4 +1,5 @@
 const { obtenerEstadoRecursoTrasLiberacion } = require("./sorteos-vigencia");
+const { crearNotificacion } = require("./notificaciones");
 
 const PLAZO_RESPUESTA_HORAS = 72;
 const ESTADO_INICIADA = "Iniciada";
@@ -219,11 +220,7 @@ async function insertarHistorialAutomatico(connection, {
 }
 
 async function insertarNotificacion(connection, usuarioId, tipo, titulo, mensaje, payload) {
-  if (!Number.isInteger(Number(usuarioId)) || Number(usuarioId) <= 0) return;
-  await connection.query(
-    "INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, ?, ?, ?, ?)",
-    [Number(usuarioId), tipo, titulo, mensaje, JSON.stringify(payload || {})]
-  );
+  return crearNotificacion(connection, { usuarioId, tipo, titulo, mensaje, payload });
 }
 
 async function liberarRecursoBloque(connection, reservaId) {

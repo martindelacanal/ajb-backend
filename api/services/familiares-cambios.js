@@ -1,4 +1,5 @@
 "use strict";
+const { crearNotificacion } = require("./notificaciones");
 
 // ============================================================================
 // Cambios de datos de familiares pedidos por el AFILIADO (con aprobación).
@@ -744,10 +745,7 @@ async function datosUsuario(connection, usuarioId) {
 // Notificaciones
 // ---------------------------------------------------------------------------
 async function insertarNotificacion(connection, usuarioId, tipo, titulo, mensaje, payload) {
-  await connection.query(
-    "INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, ?, ?, ?, ?)",
-    [usuarioId, tipo, acotarTituloNotificacion(titulo), mensaje, JSON.stringify(payload || {})]
-  );
+  return crearNotificacion(connection, { usuarioId, tipo, titulo, mensaje, payload });
 }
 
 /**

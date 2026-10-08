@@ -1,4 +1,5 @@
 "use strict";
+const { crearNotificacion } = require("./notificaciones");
 
 const { calcularEdadEnFecha, normalizarFechaCivil } = require("./valores-dominio");
 const { obtenerFechaCivilArgentina } = require("./valores-dominio");
@@ -68,11 +69,13 @@ async function registrarSolicitudTitular(connection, { reservaId, solicitanteId,
   await connection.query(
     `INSERT INTO reserva_aprobacion_titular (reserva_id, solicitante_usuario_id, titular_usuario_id, estado_destino)
      VALUES (?, ?, ?, ?)`, [reservaId, solicitanteId, titularId, estadoDestino]);
-  await connection.query(
-    `INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, 'RESERVA_APROBACION_TITULAR', ?, ?, ?)`,
-    [titularId, `Reserva #${reservaId} pendiente de tu aprobación`,
-      "Un familiar solicitó una reserva. Revisá los pasajeros, las fechas y el importe para aprobarla o rechazarla.",
-      JSON.stringify({ reserva_id: reservaId, estado: ESTADO_PENDIENTE_TITULAR, url: `/mis-gestiones?aprobacion_reserva=${reservaId}` })]);
+  await crearNotificacion(connection, {
+    usuarioId: titularId,
+    tipo: "RESERVA_APROBACION_TITULAR",
+    titulo: `Reserva #${reservaId} pendiente de tu aprobación`,
+    mensaje: "Un familiar solicitó una reserva. Revisá los pasajeros, las fechas y el importe para aprobarla o rechazarla.",
+    payload: { reserva_id: reservaId, estado: ESTADO_PENDIENTE_TITULAR, url: `/mis-gestiones?aprobacion_reserva=${reservaId}` },
+  });
   await connection.query(
     `INSERT INTO historial_reserva (reserva_id, tipo_operacion, campo_modificado, valor_anterior,
        valor_nuevo, usuario_modificador_id, observaciones) VALUES (?, 'UPDATE', 'estado_reserva_id', NULL, ?, ?, ?)`,
@@ -154,10 +157,13 @@ async function decidirSolicitudTitular(connection, { reservaId, actorId, accion 
     `UPDATE notificacion SET leida = 1, fecha_lectura = COALESCE(fecha_lectura, NOW())
       WHERE usuario_id = ? AND tipo = 'RESERVA_APROBACION_TITULAR'
         AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.reserva_id')) = ?`, [actorId, String(reservaId)]);
-  await connection.query(
-    "INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, 'RESERVA_RESPUESTA_TITULAR', ?, ?, ?)",
-    [reserva.usuario_id, `Reserva #${reservaId}: ${destino}`, `El titular ${accion === "APROBAR" ? "aprobó" : "rechazó"} tu solicitud.`,
-      JSON.stringify({ reserva_id: reservaId, estado: destino, url: "/mis-gestiones" })]);
+  await crearNotificacion(connection, {
+    usuarioId: reserva.usuario_id,
+    tipo: "RESERVA_RESPUESTA_TITULAR",
+    titulo: `Reserva #${reservaId}: ${destino}`,
+    mensaje: `El titular ${accion === "APROBAR" ? "aprobó" : "rechazó"} tu solicitud.`,
+    payload: { reserva_id: reservaId, estado: destino, url: "/mis-gestiones" },
+  });
   return { ...reserva, estado: destino };
 }
 

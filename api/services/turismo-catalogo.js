@@ -2,7 +2,7 @@
 
 const ROLES_GESTION_TURISMO = new Set(["admin", "admin-central", "departamental"]);
 const ROLES_APROBACION_TURISMO = new Set(["admin", "admin-central"]);
-const ESTADOS_APROBACION = new Set(["BORRADOR", "PENDIENTE", "APROBADO", "RECHAZADO"]);
+const ESTADOS_APROBACION = new Set(["BORRADOR", "PENDIENTE", "EN_REVISION", "APROBADO", "RECHAZADO"]);
 const ALCANCES_DEPARTAMENTALES = new Set(["TODAS", "PROPIA", "SELECCIONADAS"]);
 const MODELOS_TARIFA = new Set(["TEMPORADAS", "PRECIO_UNICO"]);
 const UNIDADES_COBRO = new Set([
@@ -267,7 +267,7 @@ function construirVisibilidadServicioSql(cabecera, alias = "s") {
 
   condiciones.push(`(
     ${alias}.alcance_departamental = 'TODAS'
-    OR (${alias}.alcance_departamental = 'PROPIA' AND ${alias}.propietario_departamental_id = ?)
+    OR ${alias}.propietario_departamental_id = ?
     OR (${alias}.alcance_departamental = 'SELECCIONADAS' AND EXISTS (
       SELECT 1 FROM servicio_departamental_visible sdv
        WHERE sdv.servicio_id = ${alias}.id AND sdv.departamental_id = ?

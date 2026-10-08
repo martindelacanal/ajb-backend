@@ -7,6 +7,7 @@
  * historial, notificaciones y reglas de bonos vive acá para que los tres routers hablen igual.
  */
 const jwt = require("jsonwebtoken");
+const { crearNotificacion } = require("./notificaciones");
 const crypto = require("crypto");
 const multer = require("multer");
 const sharp = require("sharp");
@@ -501,10 +502,7 @@ function acotarTituloNotificacion(titulo) {
 }
 
 async function insertarNotificacion(connection, usuarioId, tipo, titulo, mensaje, payload) {
-  await connection.query(
-    `INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, ?, ?, ?, ?)`,
-    [usuarioId, tipo, acotarTituloNotificacion(titulo), mensaje, JSON.stringify(payload || {})]
-  );
+  return crearNotificacion(connection, { usuarioId, tipo, titulo, mensaje, payload });
 }
 
 // Staff que gestiona olimpiadas de una departamental: administración provincial + departamentales de esa sede

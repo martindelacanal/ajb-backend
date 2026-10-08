@@ -11,6 +11,7 @@
  *  3 Cancelada   -> el pedido se dio de baja (por el afiliado o por el staff)
  */
 const express = require("express");
+const { crearNotificacion } = require("../services/notificaciones");
 const router = express.Router();
 const mysqlConnection = require("../connection/connection");
 const { registrarErrorRuta } = require("../services/errores");
@@ -438,10 +439,7 @@ async function registrarHistorial(connection, datos) {
 }
 
 async function insertarNotificacion(connection, usuarioId, tipo, titulo, mensaje, payload) {
-  await connection.query(
-    `INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, ?, ?, ?, ?)`,
-    [usuarioId, tipo, titulo, mensaje, JSON.stringify(payload || {})]
-  );
+  return crearNotificacion(connection, { usuarioId, tipo, titulo, mensaje, payload });
 }
 
 async function notificarUsuariosDepartamental(connection, departamentalId, tipo, titulo, mensaje, payload, excluirUsuarioId) {

@@ -86,6 +86,26 @@ test("autoriza cada room por entidad, rol, departamental y área", () => {
   ), false);
 });
 
+test("admin-central participa en chats de Turismo y Olimpiadas según acceso al módulo", () => {
+  const entidad = { usuario_id: 8, departamental_id: 2 };
+  assert.equal(puedeAccederSegunEntidad({ rol: "admin-central", area_turismo: 1 }, { modulo: "turismo" }, entidad), true);
+  assert.equal(puedeAccederSegunEntidad({ rol: "admin-central", area_turismo: 0 }, { modulo: "turismo" }, entidad), false);
+  assert.equal(puedeAccederSegunEntidad({ rol: "admin-central" }, { modulo: "olimpiadas" }, entidad), true);
+});
+
+test("el hilo de servicio sólo admite superiores y su propietaria en todas las etapas", () => {
+  for (const estado_aprobacion of ["BORRADOR", "PENDIENTE", "EN_REVISION", "APROBADO", "RECHAZADO"]) {
+    const entidad = { propietario_departamental_id: 2, estado_aprobacion };
+    const chat = { modulo: "turismo-gestion", entidadId: 42 };
+    assert.equal(puedeAccederSegunEntidad({ rol: "admin" }, chat, entidad), true);
+    assert.equal(puedeAccederSegunEntidad({ rol: "admin-central", area_turismo: 1 }, chat, entidad), true);
+    assert.equal(puedeAccederSegunEntidad({ rol: "departamental", departamentalId: 2, area_turismo: 1 }, chat, entidad), true);
+    assert.equal(puedeAccederSegunEntidad({ rol: "departamental", departamentalId: 3, area_turismo: 1 }, chat, entidad), false);
+    assert.equal(puedeAccederSegunEntidad({ rol: "afiliado", id: 8 }, chat, entidad), false);
+    assert.equal(puedeAccederSegunEntidad({ rol: "auditor" }, chat, entidad), false);
+  }
+});
+
 function crearSocketFalso(auth) {
   const handlers = new Map();
   const salasUnidas = [];

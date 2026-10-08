@@ -411,7 +411,7 @@ async function bloquearRecursos(connection, recursoIds, servicioIdEsperado, dato
     if (dep) {
       visibilidad = `AND (
         s.alcance_departamental = 'TODAS'
-        OR (s.alcance_departamental = 'PROPIA' AND s.propietario_departamental_id = ?)
+        OR s.propietario_departamental_id = ?
         OR (s.alcance_departamental = 'SELECCIONADAS' AND EXISTS (
           SELECT 1 FROM servicio_departamental_visible sdv
            WHERE sdv.servicio_id = s.id AND sdv.departamental_id = ?

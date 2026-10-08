@@ -197,7 +197,7 @@ function permisosInscripcion({ cabecera, inscripcion, olimpiada, hoy = fechaHoyB
 }
 
 function documentacionCompleta(inscripcion) {
-  return Boolean(inscripcion.foto_archivo && inscripcion.certificado_archivo && inscripcion.firma_archivo);
+  return Boolean(inscripcion.foto_archivo && inscripcion.certificado_archivo);
 }
 
 function textoResumenAcompaniantes({ cantidad, bonos }) {
@@ -1397,7 +1397,6 @@ router.post("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, manejarUploadOli
     if (!actorEsStaff) {
       if (!archivoCertificado) return res.status(400).json("Adjuntá el certificado médico");
       if (!archivoFoto) return res.status(400).json("Adjuntá una foto del afiliado");
-      if (!firmaBase64) return res.status(400).json("Falta la firma");
     }
     if (archivoFoto && !archivoFoto.mimetype?.startsWith("image/")) return res.status(400).json("La foto debe ser una imagen");
 
@@ -1617,7 +1616,7 @@ router.get("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, async (req, res) 
         acompaniantes: lista.length,
         bonos_asignados: bonosPorInscripcion.get(Number(fila.id)) || 0,
         bonos_requeridos: manual !== null ? manual : calculados,
-        documentacion_completa: Boolean(tiene_foto && tiene_certificado && tiene_firma),
+        documentacion_completa: Boolean(tiene_foto && tiene_certificado),
       };
     }));
   } catch (error) {
@@ -2401,12 +2400,10 @@ router.post("/olimpiadas/inscripciones/:id(\\d+)/observaciones", verifyToken, as
       tipo_operacion: "OBSERVACION", observacion: mensaje,
     });
 
-    if (cabecera.rol === "afiliado") {
-      await notificarStaffOlimpiadas(connection, inscripcion.departamental_id, "OLIMPIADA_OBSERVACION",
-        `Nuevo mensaje en la inscripción #${inscripcionId}`,
-        `El afiliado escribió: ${mensaje}`,
-        { inscripcion_id: inscripcionId, olimpiada_id: inscripcion.olimpiada_id });
-    } else {
+    await notificarStaffOlimpiadas(connection, inscripcion.departamental_id, "OLIMPIADA_OBSERVACION",
+      `Nuevo mensaje en la inscripción #${inscripcionId}`, mensaje,
+      { inscripcion_id: inscripcionId, olimpiada_id: inscripcion.olimpiada_id }, cabecera.id);
+    if (Number(inscripcion.usuario_id) !== Number(cabecera.id)) {
       await insertarNotificacion(connection, inscripcion.usuario_id, "OLIMPIADA_OBSERVACION",
         `Nuevo mensaje en tu inscripción a ${inscripcion.olimpiada_nombre}`, mensaje,
         { inscripcion_id: inscripcionId, olimpiada_id: inscripcion.olimpiada_id });

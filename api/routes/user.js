@@ -13,6 +13,7 @@ const { DNI_MENSAJE, esDniValido } = require("../security/dni");
 const { verificarTokenConAutorizacionActual, resolverAccesoFamiliar, ErrorSesionUsuario } = require("../security/autorizacion-sesion");
 const { crearSesion } = require("../security/sesiones-persistentes");
 const { condicionModuloNotificacion } = require("../services/notificaciones-modulos");
+const { crearNotificacion, obtenerPreferenciasNotificaciones, guardarPreferenciasNotificaciones } = require("../services/notificaciones");
 const {
   construirVisibilidadServicioSql,
   cumpleFiltroTipado,
@@ -2777,6 +2778,37 @@ function primerValorQuery(valor) {
   return Array.isArray(valor) ? valor[0] : valor;
 }
 
+router.get("/notificaciones/preferencias", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    const usuarioId = normalizarIdPositivo(cabecera.id);
+    if (!usuarioId || !["admin", "afiliado", "departamental", "admin-central", "auditor"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+    const preferencias = await obtenerPreferenciasNotificaciones(mysqlConnection.promise(), usuarioId);
+    return res.status(200).json({ preferencias });
+  } catch (error) {
+    registrarErrorRuta(error);
+    return res.status(500).json("Error al obtener la configuración de notificaciones");
+  }
+});
+
+router.put("/notificaciones/preferencias", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    const usuarioId = normalizarIdPositivo(cabecera.id);
+    if (!usuarioId || !["admin", "afiliado", "departamental", "admin-central", "auditor"].includes(cabecera.rol)) {
+      return res.status(401).json("No autorizado");
+    }
+    const preferencias = await guardarPreferenciasNotificaciones(mysqlConnection.promise(), usuarioId, req.body);
+    return res.status(200).json({ preferencias });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json(error.message);
+    registrarErrorRuta(error);
+    return res.status(500).json("Error al guardar la configuración de notificaciones");
+  }
+});
+
 router.get("/notificaciones", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -2998,7 +3030,7 @@ router.put("/notificaciones/:id/leida", verifyToken, async (req, res) => {
 // ---------------------------------------------------------------------------
 // La tabla de cada hilo la resuelve api/socket/chat-tiempo-real.js (CONFIGURACION_CHAT);
 // acá solo se valida el nombre del módulo: beneficios -> beneficio_observacion.beneficio_id.
-const MODULOS_OBSERVACION = ["turismo", "coseguro", "traslados", "olimpiadas", "beneficios"];
+const MODULOS_OBSERVACION = ["turismo", "turismo-gestion", "coseguro", "traslados", "olimpiadas", "beneficios"];
 
 router.get("/observaciones/:modulo/:entidadId/lectura", verifyToken, async (req, res) => {
   try {
@@ -4531,17 +4563,12 @@ router.put("/admin/sorteos/inscripciones/:id/adjudicar", verifyToken, async (req
     }
 
     const detallePremioBase = await obtenerDetallePremioParaReserva(connection, reservaId, recursoId);
-    const [notificacionResult] = await connection.query(
-      `
-        INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload)
-        VALUES (?, 'SORTEO_ADJUDICADO', ?, ?, JSON_OBJECT())
-      `,
-      [
-        reserva.usuario_id,
-        "Felicitaciones, fuiste adjudicado",
-        `Ganaste ${detallePremioBase.bloque_nombre || "un bloque"} del sorteo ${detallePremioBase.sorteo_nombre || ""}`.trim()
-      ]
-    );
+    const notificacionResult = await crearNotificacion(connection, {
+      usuarioId: reserva.usuario_id,
+      tipo: "SORTEO_ADJUDICADO",
+      titulo: "Felicitaciones, fuiste adjudicado",
+      mensaje: `Ganaste ${detallePremioBase.bloque_nombre || "un bloque"} del sorteo ${detallePremioBase.sorteo_nombre || ""}`.trim(),
+    });
 
     const [adjudicacionResult] = await connection.query(
       `
@@ -4562,10 +4589,12 @@ router.put("/admin/sorteos/inscripciones/:id/adjudicar", verifyToken, async (req
     const detallePremio = await obtenerPremioSorteoPorAdjudicacion(connection, {
       adjudicacionId: adjudicacionResult.insertId
     });
-    await connection.query(
-      "UPDATE notificacion SET payload = ? WHERE id = ?",
-      [JSON.stringify(detallePremio), notificacionResult.insertId]
-    );
+    if (notificacionResult.insertId) {
+      await connection.query(
+        "UPDATE notificacion SET payload = ? WHERE id = ?",
+        [JSON.stringify(detallePremio), notificacionResult.insertId]
+      );
+    }
 
     await registrarHistorialReserva(
       connection,
@@ -6118,10 +6147,7 @@ async function registrarHistorialReserva(connection, reservaId, tipoOperacion, u
 // (mismo patrón que coseguro/traslados/olimpiadas)
 // ---------------------------------------------------------------------------
 async function insertarNotificacion(connection, usuarioId, tipo, titulo, mensaje, payload) {
-  await connection.query(
-    `INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, ?, ?, ?, ?)`,
-    [usuarioId, tipo, titulo, mensaje, JSON.stringify(payload || {})]
-  );
+  return crearNotificacion(connection, { usuarioId, tipo, titulo, mensaje, payload });
 }
 
 // Staff de turismo involucrado en una reserva: admins globales + usuarios
@@ -6131,6 +6157,7 @@ async function notificarStaffTurismo(connection, departamentalId, tipo, titulo, 
     `SELECT u.id FROM usuario u INNER JOIN rol r ON r.id = u.rol_id
      WHERE u.habilitado = 'Y'
        AND (r.nombre = 'admin'
+         OR (r.nombre = 'admin-central' AND (u.area_turismo IS NULL OR u.area_turismo = 1))
          OR (r.nombre = 'departamental' AND u.departamental_id = ?
              AND (u.area_turismo IS NULL OR u.area_turismo = 1)))`,
     [departamentalId || 0]
@@ -9526,16 +9553,13 @@ async function crearReservaSalud(connection, {
     [usuarioId]
   );
   for (const u of staff) {
-    await connection.query(
-      "INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, ?, ?, ?, ?)",
-      [
-        u.id,
-        "RESERVA_SALUD_NUEVA",
-        `Nueva reserva por salud #${reservaId}`,
-        `${usuarioNombre} solicitó el subsidio de alojamiento por salud. Revisá los certificados médicos en Servicios Sociales.`,
-        JSON.stringify({ reserva_id: reservaId, reserva_salud_id: reservaSaludId, estado: "PENDIENTE" }),
-      ]
-    );
+    await crearNotificacion(connection, {
+      usuarioId: u.id,
+      tipo: "RESERVA_SALUD_NUEVA",
+      titulo: `Nueva reserva por salud #${reservaId}`,
+      mensaje: `${usuarioNombre} solicitó el subsidio de alojamiento por salud. Revisá los certificados médicos en Servicios Sociales.`,
+      payload: { reserva_id: reservaId, reserva_salud_id: reservaSaludId, estado: "PENDIENTE" },
+    });
   }
   return reservaSaludId;
 }
@@ -11136,6 +11160,7 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
     if (
       (
         cabecera.rol === "admin" ||
+        cabecera.rol === "admin-central" ||
         cabecera.rol === "afiliado" ||
         cabecera.rol === "departamental"
       ) && tieneAreaTurismo(cabecera)
@@ -11536,7 +11561,8 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           observaciones_hilo: observacionesHilo
         };
 
-        respuesta.puede_editar = Number(reserva.tiene_aprobacion_titular) !== 1
+        respuesta.puede_editar = ["admin", "afiliado", "departamental"].includes(cabecera.rol)
+          && Number(reserva.tiene_aprobacion_titular) !== 1
           && reserva.estado === ESTADO_INICIADA
           && [MODALIDAD_FECHA_LIBRE, MODALIDAD_BLOQUE].includes(reserva.modalidad)
           && (cabecera.rol !== "afiliado" || Number(reserva.usuario_id) === Number(cabecera.id));
@@ -11580,7 +11606,7 @@ router.post("/reserva/:id/observaciones", verifyToken, async (req, res) => {
   let connection;
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
+    if (!["admin", "admin-central", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -11822,19 +11848,13 @@ router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
       fecha_vencimiento: plazosPropuesta[0]?.fecha_vencimiento || null,
       plazo_respuesta_horas: PLAZO_RESPUESTA_HORAS,
     };
-    await connection.query(
-      `
-        INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload)
-        VALUES (?, ?, ?, ?, ?)
-      `,
-      [
-        reserva.usuario_id,
-        TIPO_NOTIFICACION_CONVENIO_PROPUESTA,
-        "Propuesta de cotización",
-        `Ya tenes una propuesta de cotización para ${reserva.convenio_nombre || "tu convenio hotelero"}. Recordá responderla dentro de las 72 horas.`,
-        JSON.stringify(payload),
-      ]
-    );
+    await crearNotificacion(connection, {
+      usuarioId: reserva.usuario_id,
+      tipo: TIPO_NOTIFICACION_CONVENIO_PROPUESTA,
+      titulo: "Propuesta de cotización",
+      mensaje: `Ya tenes una propuesta de cotización para ${reserva.convenio_nombre || "tu convenio hotelero"}. Recordá responderla dentro de las 72 horas.`,
+      payload,
+    });
 
     await registrarHistorialReserva(
       connection,
@@ -13567,7 +13587,7 @@ router.post("/tabla/temporadas", verifyToken, async (req, res) => {
 
 router.post("/tabla/reservas", verifyToken, async (req, res) => {
   const cabecera = JSON.parse(req.data.data);
-  const rolesPermitidos = ["admin", "departamental"];
+  const rolesPermitidos = ["admin", "admin-central", "departamental"];
   if (!rolesPermitidos.includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
     return res.status(403).json("No autorizado");
   }
@@ -13588,7 +13608,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
   // Selects rápidos del listado: departamental del afiliado (sólo admin; la
   // departamental ya ve únicamente la suya) y servicio reservado.
   const departamentalFiltro =
-    cabecera.rol === "admin" ? normalizarIdPositivo(filters.departamental_id) : null;
+    ["admin", "admin-central"].includes(cabecera.rol) ? normalizarIdPositivo(filters.departamental_id) : null;
   const servicioFiltro = normalizarIdPositivo(filters.servicio_id);
   const fecha_incio = filters.startDate || "2023-01-01";
   const fecha_fin = filters.endDate || "2070-12-31";
@@ -14875,7 +14895,7 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
-      (cabecera.rol === "admin" ||
+      (cabecera.rol === "admin" || cabecera.rol === "admin-central" ||
         cabecera.rol === "departamental") &&
       tieneAreaTurismo(cabecera)
     ) {
