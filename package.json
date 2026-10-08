@@ -12,6 +12,8 @@
     "start": "node server.js",
     "migrate:s3": "node scripts/migrate-images-to-s3.js",
     "migrate:coseguro": "node scripts/migrar-coseguro.js",
+    "migrate:coseguro-auditoria": "node scripts/migrar-coseguro-auditoria-reasignacion.js --check",
+    "migrate:coseguro-auditoria:apply": "node scripts/migrar-coseguro-auditoria-reasignacion.js --apply",
     "migrate:coseguro-catalogo-631": "node scripts/migrar-coseguro-catalogo-631.js --check",
     "migrate:coseguro-catalogo-631:apply": "node scripts/migrar-coseguro-catalogo-631.js --apply",
     "migrate:login-gallery-schema": "node scripts/migrate-login-gallery-schema.js",
