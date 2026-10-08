@@ -159,6 +159,7 @@ test("tipos de reintegro: requisitos sin key interna; porcentaje sólo en modo P
   });
   assert.deepEqual(porcentaje, {
     id: 1, nombre: "Medicamentos", icono: "medication", modo_cobertura: "PORCENTAJE",
+    grupo_codigo: null, grupo_nombre: null, grupo_icono: null, conceptos: [],
     porcentaje_cobertura: 30, tope_reintegro: null, es_subsidio: false,
     requisitos: [{ label: "Receta médica", requerido: true }, { label: "Detalle", requerido: false }],
   });

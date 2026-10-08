@@ -417,14 +417,14 @@ async function migrateMoneyTypes(connection, apply) {
       UPDATE coseguro_solicitud s
       INNER JOIN coseguro_solicitud o
         ON o.id <> s.id
-       AND o.eliminado = 0 AND o.estado_id NOT IN (5, 6)
+       AND o.eliminado = 0 AND o.estado_id NOT IN (5, 6, 11)
        AND ${ptoO} = ${ptoS}
        AND ${numberO} = ${numberS}
        AND (o.usuario_id = s.usuario_id OR
             (${cuitS} IS NOT NULL AND ${cuitO} = ${cuitS}))
          SET s.duplicado_forzado = 1
        WHERE s.duplicado_forzado = 0
-         AND s.eliminado = 0 AND s.estado_id NOT IN (5, 6)
+         AND s.eliminado = 0 AND s.estado_id NOT IN (5, 6, 11)
          AND COALESCE(JSON_EXTRACT(s.verificacion, '$.duplicados_forzados') = TRUE, FALSE)
     `);
   } else {
@@ -1071,7 +1071,7 @@ async function migrateClaims(connection, apply) {
   const numeroNew = "COALESCE(NULLIF(TRIM(LEADING '0' FROM NEW.comprobante_numero), ''), '0')";
   const cuitNew = "NULLIF(REGEXP_REPLACE(COALESCE(NEW.emisor_cuit, ''), '[^0-9]', ''), '')";
   const activeNew =
-    "NEW.eliminado = 0 AND NEW.estado_id NOT IN (5, 6) AND NEW.duplicado_forzado = 0";
+    "NEW.eliminado = 0 AND NEW.estado_id NOT IN (5, 6, 11) AND NEW.duplicado_forzado = 0";
   const insertClaims = `
     IF ${activeNew} THEN
       INSERT INTO coseguro_comprobante_claim

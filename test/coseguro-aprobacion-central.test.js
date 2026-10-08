@@ -51,7 +51,7 @@ function preparar(opciones = {}) {
   actualizacionConfirmada = null;
   escenario = {
     rol: "admin-central",
-    cuenta: { codigo: "631.301" },
+    cuenta: { id: 10, codigo: "631.301" },
     detalleValido: true,
     ...opciones,
   };
@@ -84,7 +84,9 @@ async function consultar(sql, params = []) {
   if (/FROM coseguro_tipo_reintegro/.test(sql)) {
     return [[{ id: 1, nombre: "Consulta", requiere_pto_venta: 0, adjuntos_config: "[]", modo_cobertura: "MANUAL" }]];
   }
-  if (/FROM coseguro_concepto/.test(sql)) return [[{ id: 2 }]];
+  if (/FROM coseguro_concepto/.test(sql)) return [[{ id: 2, nombre: "Bono bioquímico" }]];
+  if (/SELECT concepto_id FROM coseguro_solicitud_concepto/.test(sql)) return [[{ concepto_id: 2 }]];
+  if (/(?:DELETE FROM|INSERT INTO) coseguro_solicitud_concepto/.test(sql)) return [{ affectedRows: 1 }];
   if (/SELECT id, tipo_adjunto, sha256, archivo FROM coseguro_archivo/.test(sql)) {
     return [[{ id: 3, tipo_adjunto: "FACTURA", sha256: null, archivo: "comprobante.pdf" }]];
   }
@@ -105,6 +107,7 @@ async function consultar(sql, params = []) {
   }
   if (/FROM coseguro_estado/.test(sql)) return [[{ nombre: `Estado ${params[0]}` }]];
   if (/INSERT INTO notificacion/.test(sql)) return [{ affectedRows: 1 }];
+  if (/INSERT INTO coseguro_observacion/.test(sql)) return [{ affectedRows: 1 }];
   throw new Error(`Consulta inesperada: ${sql}`);
 }
 
@@ -329,4 +332,37 @@ test("un fallo de historial revierte datos y aprobación en ambos endpoints", as
       assert.ok(!eventos.includes("commit"));
     });
   }
+});
+
+test("C.I.C. escrito por el personal selecciona la cuenta conocida o conserva un código libre", async (t) => {
+  for (const editar of [false, true]) {
+    for (const conocido of [false, true]) {
+      await t.test(`${editar ? 'edición' : 'estado'}: ${conocido ? 'conocido' : 'libre'}`, async () => {
+        preparar({ cuenta: conocido ? { id: 10, codigo: '631.301' } : null });
+        const datos = { importe_autorizado: 20, imputacion_id: null, cic_codigo: conocido ? '631301' : '888.123' };
+        const body = editar ? formulario({ ...datos, aprobar_servicios_sociales: true }) : { ...datos, estado_id: 7 };
+        const resultado = await request(body, { editar });
+        assert.equal(resultado.status, 200, JSON.stringify(resultado.body));
+        const campos = camposActualizados();
+        assert.equal(campos.cic_codigo, conocido ? '631.301' : '888.123');
+        assert.equal(campos.imputacion_id, conocido ? 10 : null);
+        assert.equal(campos.imputacion_detalle_id, null);
+      });
+    }
+  }
+});
+
+test("Servicios Sociales rechaza con estado 11 y motivo obligatorio; la departamental mantiene estado 5", async () => {
+  preparar();
+  const sinMotivo = await request({ estado_id: 11 });
+  assert.equal(sinMotivo.status, 400);
+  assert.equal(actualizacionConfirmada, null);
+  preparar();
+  const central = await request({ estado_id: 11, observacion: 'Prestación no cubierta' });
+  assert.equal(central.status, 200, JSON.stringify(central.body));
+  assert.equal(camposActualizados().estado_id, 11);
+  assert.ok(llamadas.some((l) => /INSERT INTO coseguro_historial/.test(l.sql) && l.params[2] === 'admin-central' && l.params[5] === 11));
+  preparar({ rol: 'departamental' });
+  const departamental = await request({ estado_id: 11, observacion: 'Prestación no cubierta' });
+  assert.equal(departamental.status, 409);
 });

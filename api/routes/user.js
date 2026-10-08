@@ -13900,7 +13900,9 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         e.color AS estado_color,
         e.color_texto AS estado_color_texto,
         COALESCE(t.nombre, 'Reintegro') AS titulo,
-        COALESCE(c.nombre, cs.emisor_nombre) AS subtitulo,
+        COALESCE((SELECT GROUP_CONCAT(cc.nombre ORDER BY cc.nombre SEPARATOR ', ')
+          FROM coseguro_solicitud_concepto sc INNER JOIN coseguro_concepto cc ON cc.id = sc.concepto_id
+          WHERE sc.solicitud_id = cs.id), c.nombre, cs.emisor_nombre) AS subtitulo,
         NULL AS modalidad,
         NULL AS fecha_inicio,
         NULL AS fecha_fin,

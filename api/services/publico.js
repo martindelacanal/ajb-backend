@@ -149,6 +149,12 @@ function mapearTipoReintegroPublico(fila) {
     id: Number(fila.id),
     nombre: fila.nombre,
     icono: textoONulo(fila.icono),
+    grupo_codigo: textoONulo(fila.grupo_codigo),
+    grupo_nombre: textoONulo(fila.grupo_nombre),
+    grupo_icono: textoONulo(fila.grupo_icono),
+    conceptos: parsearAdjuntos(fila.conceptos).filter((c) => c && textoONulo(c.nombre))
+      .map((c) => ({ id: Number(c.id), nombre: textoONulo(c.nombre) }))
+      .sort((a, b) => a.nombre.localeCompare(b.nombre, "es")),
     modo_cobertura: modo,
     porcentaje_cobertura: modo === "PORCENTAJE" ? numeroONulo(fila.porcentaje_cobertura) : null,
     tope_reintegro: modo === "PORCENTAJE" ? numeroONulo(fila.tope_reintegro) : null,

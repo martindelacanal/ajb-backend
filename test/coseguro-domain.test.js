@@ -109,7 +109,7 @@ test("coseguro busca duplicados con la misma identidad canónica que los claims"
   assert.match(consulta.sql, /TRIM\(LEADING '0' FROM s\.comprobante_numero\)/);
   assert.match(consulta.sql, /REGEXP_REPLACE/);
   assert.match(consulta.sql, /LPAD/);
-  assert.deepEqual(consulta.params, [5, 6, "123", "20123456786", 42, "00001", 9]);
+  assert.deepEqual(consulta.params, [5, 6, 11, "123", "20123456786", 42, "00001", 9]);
 });
 
 test("coseguro aplica el modulo al afiliado y conserva el area del staff", () => {
