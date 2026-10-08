@@ -9,6 +9,7 @@
  */
 
 const { textoPlanoDesdeHtml } = require("./correo/plantilla");
+const { conGrupoVisual } = require("../data/coseguro-catalogo-631");
 
 const MAX_IMAGENES_POR_ITEM = 6;
 const MAX_DETALLE_TEXTO = 700;
@@ -144,6 +145,7 @@ function mapearRequisitos(adjuntosConfig) {
 }
 
 function mapearTipoReintegroPublico(fila) {
+  fila = conGrupoVisual(fila);
   const modo = String(fila.modo_cobertura || "").toUpperCase() === "PORCENTAJE" ? "PORCENTAJE" : "MANUAL";
   return {
     id: Number(fila.id),

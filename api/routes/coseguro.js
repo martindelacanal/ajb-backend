@@ -13,7 +13,7 @@
  *  9 Pendiente de acreditación
  * 10 Liquidado (pago acreditado; fecha_pago desde el CSV del auditor)
  */
-const { GRUPOS, normalizarCicCodigo } = require("../data/coseguro-catalogo-631");
+const { GRUPOS, normalizarCicCodigo, conGrupoVisual } = require("../data/coseguro-catalogo-631");
 const { LIMITES_ARCHIVOS, ADJUNTO_OTROS, completarAdjuntos } = require("../data/coseguro-limites-archivos");
 const express = require("express");
 const { notificarParticipantesChat } = require("../services/chat-notificaciones");
@@ -1239,7 +1239,7 @@ router.get("/coseguro/catalogos", verifyToken, async (req, res) => {
     res.status(200).json({
       estados: estadosSalida,
       grupos: GRUPOS,
-      tipos_reintegro: tipos.map((t) => ({ ...t, adjuntos_config: completarAdjuntos(parseJsonSeguro(t.adjuntos_config)) })),
+      tipos_reintegro: tipos.map((t) => ({ ...conGrupoVisual(t), adjuntos_config: completarAdjuntos(parseJsonSeguro(t.adjuntos_config)) })),
       conceptos,
       imputaciones,
       departamentales,
