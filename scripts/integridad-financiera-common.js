@@ -56,11 +56,11 @@ const REQUIRED_TABLES = [
 ];
 
 // La API considera activos todos los comprobantes salvo los rechazados por la
-// departamental (5), cancelados (6) o eliminados lógicamente.
+// departamental (5), cancelados (6), Servicios Sociales (11) o eliminados lógicamente.
 const ACTIVE_RECEIPT_SQL =
-  "eliminado = 0 AND estado_id NOT IN (5, 6) AND duplicado_forzado = 0";
+  "eliminado = 0 AND estado_id NOT IN (5, 6, 11) AND duplicado_forzado = 0";
 const LEGACY_ACTIVE_RECEIPT_SQL =
-  "eliminado = 0 AND estado_id NOT IN (5, 6) AND COALESCE(JSON_EXTRACT(verificacion, '$.duplicados_forzados') = TRUE, FALSE) = FALSE";
+  "eliminado = 0 AND estado_id NOT IN (5, 6, 11) AND COALESCE(JSON_EXTRACT(verificacion, '$.duplicados_forzados') = TRUE, FALSE) = FALSE";
 const CANONICAL_PTO_SQL =
   "LPAD(COALESCE(NULLIF(TRIM(LEADING '0' FROM comprobante_pto_venta), ''), '0'), 5, '0')";
 const CANONICAL_NUMBER_SQL =

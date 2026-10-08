@@ -13,6 +13,7 @@
  *  9 Pendiente de acreditación
  * 10 Liquidado (pago acreditado; fecha_pago desde el CSV del auditor)
  */
+const { GRUPOS, normalizarCicCodigo } = require("../data/coseguro-catalogo-631");
 const express = require("express");
 const router = express.Router();
 const mysqlConnection = require("../connection/connection");
@@ -285,6 +286,7 @@ const ESTADO = {
   EXPORTADO: 8,
   PENDIENTE_ACREDITACION: 9,
   LIQUIDADO: 10,
+  RECHAZADA_CENTRAL: 11,
 };
 
 // Estados en los que cada rol puede editar los datos de la solicitud
@@ -316,7 +318,7 @@ function transicionesDisponibles(cabecera, estadoId, esPropia) {
       })[estadoId] || [];
     case "admin-central":
       return ({
-        [ESTADO.APROBADA_DEPTO]: [ESTADO.APROBADA_CENTRAL, ESTADO.REVISAR, ESTADO.RECHAZADA_DEPTO],
+        [ESTADO.APROBADA_DEPTO]: [ESTADO.APROBADA_CENTRAL, ESTADO.REVISAR, ESTADO.RECHAZADA_CENTRAL],
         [ESTADO.APROBADA_CENTRAL]: [ESTADO.PENDIENTE_ACREDITACION],
         [ESTADO.EXPORTADO]: [ESTADO.PENDIENTE_ACREDITACION],
       })[estadoId] || [];
@@ -330,7 +332,7 @@ function transicionesDisponibles(cabecera, estadoId, esPropia) {
         [ESTADO.INICIADA]: [ESTADO.APROBADA_DEPTO, ESTADO.REVISAR, ESTADO.RECHAZADA_DEPTO],
         [ESTADO.REVISAR]: [ESTADO.APROBADA_DEPTO, ESTADO.RECHAZADA_DEPTO],
         [ESTADO.REVISADA]: [ESTADO.APROBADA_DEPTO, ESTADO.REVISAR, ESTADO.RECHAZADA_DEPTO],
-        [ESTADO.APROBADA_DEPTO]: [ESTADO.APROBADA_CENTRAL, ESTADO.REVISAR, ESTADO.RECHAZADA_DEPTO],
+        [ESTADO.APROBADA_DEPTO]: [ESTADO.APROBADA_CENTRAL, ESTADO.REVISAR, ESTADO.RECHAZADA_CENTRAL],
         [ESTADO.APROBADA_CENTRAL]: [ESTADO.PENDIENTE_ACREDITACION],
         [ESTADO.EXPORTADO]: [ESTADO.PENDIENTE_ACREDITACION, ESTADO.LIQUIDADO],
         [ESTADO.PENDIENTE_ACREDITACION]: [ESTADO.LIQUIDADO],
@@ -455,6 +457,10 @@ function normalizarIdOpcional(valor, nombre) {
 }
 
 function normalizarListaIdsPositivos(valor, { maximoItems = 500 } = {}) {
+  if (typeof valor === "number") valor = [valor];
+  if (typeof valor === "string" && valor.trim().startsWith("[")) {
+    try { valor = JSON.parse(valor); } catch (_) { return null; }
+  }
   const items = Array.isArray(valor)
     ? valor
     : typeof valor === "string"
@@ -464,6 +470,45 @@ function normalizarListaIdsPositivos(valor, { maximoItems = 500 } = {}) {
   const ids = items.map((item) => normalizarIdPositivo(item));
   if (ids.some((id) => id === null)) return null;
   return [...new Set(ids)];
+}
+
+function normalizarDepartamentalesFiltro(filtros) {
+  const valor = filtros.departamental_ids ?? filtros.departamental_id;
+  if (!valorOpcionalInformado(valor) || (Array.isArray(valor) && valor.length === 0)) return null;
+  const ids = normalizarListaIdsPositivos(valor);
+  if (!ids) throw crearErrorHttp("Departamental inválida", 400);
+  return ids;
+}
+
+function normalizarCicFiltro(valor) {
+  if (!valorOpcionalInformado(valor)) return null;
+  const codigo = normalizarCicCodigo(valor);
+  if (!codigo) throw crearErrorHttp("C.I.C. inválido: ingresá un código numérico entero o con un punto", 400);
+  return codigo;
+}
+
+async function guardarConceptosSolicitud(connection, solicitudId, ids) {
+  await connection.query("DELETE FROM coseguro_solicitud_concepto WHERE solicitud_id = ?", [solicitudId]);
+  for (const id of ids) {
+    await connection.query("INSERT INTO coseguro_solicitud_concepto (solicitud_id, concepto_id) VALUES (?, ?)", [solicitudId, id]);
+  }
+}
+
+async function completarConceptosSolicitudes(db, solicitudes) {
+  if (!solicitudes.length) return solicitudes;
+  const [filas] = await db.query(
+    `SELECT sc.solicitud_id, c.id, c.nombre FROM coseguro_solicitud_concepto sc
+     INNER JOIN coseguro_concepto c ON c.id = sc.concepto_id
+     WHERE sc.solicitud_id IN (${solicitudes.map(() => "?").join(",")}) ORDER BY c.nombre, c.id`,
+    solicitudes.map((solicitud) => solicitud.id)
+  );
+  for (const solicitud of solicitudes) {
+    const conceptos = filas.filter((fila) => fila.solicitud_id === solicitud.id).map(({id, nombre}) => ({id, nombre}));
+    solicitud.conceptos = conceptos;
+    solicitud.concepto_ids = conceptos.map(({id}) => id);
+    solicitud.concepto = conceptos.map(({nombre}) => nombre).join(", ") || solicitud.concepto || null;
+  }
+  return solicitudes;
 }
 
 function idsPositivosIguales(izquierda, derecha) {
@@ -814,10 +859,10 @@ async function buscarDuplicadosComprobante(db, { emisor_cuit, comprobante_pto_ve
   const numeroCanonico = String(comprobante_numero).replace(/^0+/, "") || "0";
   const condiciones = [
     "s.eliminado = 0",
-    "s.estado_id NOT IN (?, ?)",
+    "s.estado_id NOT IN (?, ?, ?)",
     "COALESCE(NULLIF(TRIM(LEADING '0' FROM s.comprobante_numero), ''), '0') = ?",
   ];
-  const params = [ESTADO.RECHAZADA_DEPTO, ESTADO.CANCELADA, numeroCanonico];
+  const params = [ESTADO.RECHAZADA_DEPTO, ESTADO.CANCELADA, ESTADO.RECHAZADA_CENTRAL, numeroCanonico];
 
   const alcance = [];
   if (emisor_cuit) {
@@ -865,7 +910,7 @@ async function buscarDuplicadosArchivo(db, hashes, excluirSolicitudId, phashSets
   const resultados = new Map();
 
   if (hashes && hashes.length > 0) {
-    const params = [hashes, ESTADO.RECHAZADA_DEPTO, ESTADO.CANCELADA];
+    const params = [hashes, ESTADO.RECHAZADA_DEPTO, ESTADO.CANCELADA, ESTADO.RECHAZADA_CENTRAL];
     let extra = "";
     if (excluirSolicitudId) {
       extra = " AND s.id <> ?";
@@ -878,7 +923,7 @@ async function buscarDuplicadosArchivo(db, hashes, excluirSolicitudId, phashSets
        INNER JOIN coseguro_solicitud s ON s.id = a.solicitud_id
        INNER JOIN usuario u ON u.id = s.usuario_id
        INNER JOIN coseguro_estado e ON e.id = s.estado_id
-       WHERE a.sha256 IN (?) AND s.eliminado = 0 AND s.estado_id NOT IN (?, ?)${extra}
+       WHERE a.sha256 IN (?) AND s.eliminado = 0 AND s.estado_id NOT IN (?, ?, ?)${extra}
        LIMIT 10`,
       params
     );
@@ -889,7 +934,7 @@ async function buscarDuplicadosArchivo(db, hashes, excluirSolicitudId, phashSets
   // resuelve en memoria: son solo los hashes, no los archivos)
   const setsValidos = (phashSets || []).filter((set) => Array.isArray(set) && set.length > 0);
   if (setsValidos.length > 0) {
-    const params = [ESTADO.RECHAZADA_DEPTO, ESTADO.CANCELADA];
+    const params = [ESTADO.RECHAZADA_DEPTO, ESTADO.CANCELADA, ESTADO.RECHAZADA_CENTRAL];
     let extra = "";
     if (excluirSolicitudId) {
       extra = " AND s.id <> ?";
@@ -902,7 +947,7 @@ async function buscarDuplicadosArchivo(db, hashes, excluirSolicitudId, phashSets
        INNER JOIN coseguro_solicitud s ON s.id = a.solicitud_id
        INNER JOIN usuario u ON u.id = s.usuario_id
        INNER JOIN coseguro_estado e ON e.id = s.estado_id
-       WHERE a.phash IS NOT NULL AND s.eliminado = 0 AND s.estado_id NOT IN (?, ?)${extra}`,
+       WHERE a.phash IS NOT NULL AND s.eliminado = 0 AND s.estado_id NOT IN (?, ?, ?)${extra}`,
       params
     );
     for (const row of rows) {
@@ -1020,16 +1065,17 @@ router.get("/coseguro/catalogos", verifyToken, async (req, res) => {
     const [tipos] = await db.query(
       `SELECT t.id, t.nombre, t.icono, t.imputacion_id, t.imputacion_detalle_id, t.requiere_pto_venta,
               CAST(t.adjuntos_config AS CHAR) AS adjuntos_config, i.codigo AS cic_codigo,
-              t.modo_cobertura, t.porcentaje_cobertura, t.tope_reintegro
+              t.modo_cobertura, t.porcentaje_cobertura, t.tope_reintegro,
+              t.grupo_codigo, t.grupo_nombre, t.grupo_icono
        FROM coseguro_tipo_reintegro t
        LEFT JOIN coseguro_imputacion i ON i.id = t.imputacion_id
-       WHERE t.activo = 1 ORDER BY t.orden`
+       WHERE t.activo = 1 ORDER BY t.nombre`
     );
     const [conceptos] = await db.query(
-      `SELECT c.id, c.nombre, c.imputacion_id, c.imputacion_detalle_id, i.codigo AS cic_codigo
+      `SELECT c.id, c.nombre, c.tipo_reintegro_id, c.imputacion_id, c.imputacion_detalle_id, i.codigo AS cic_codigo
        FROM coseguro_concepto c
        LEFT JOIN coseguro_imputacion i ON i.id = c.imputacion_id
-       WHERE c.activo = 1 ORDER BY c.orden`
+       WHERE c.activo = 1 ORDER BY c.nombre`
     );
     const [imputaciones] = await db.query(
       `SELECT id, codigo, descripcion, tipo, parent_id, activo FROM coseguro_imputacion ORDER BY orden`
@@ -1048,6 +1094,7 @@ router.get("/coseguro/catalogos", verifyToken, async (req, res) => {
 
     res.status(200).json({
       estados: estadosSalida,
+      grupos: GRUPOS,
       tipos_reintegro: tipos.map((t) => ({ ...t, adjuntos_config: parseJsonSeguro(t.adjuntos_config) || [] })),
       conceptos,
       imputaciones,
@@ -1499,12 +1546,22 @@ async function validarDatosSolicitud(db, cabecera, body, opciones) {
     else tipo = { ...tipos[0], adjuntos_config: parseJsonSeguro(tipos[0].adjuntos_config) || [] };
   }
 
-  const conceptoId = normalizarIdPositivo(body.concepto_id);
-  if (!conceptoId) errores.push("Seleccioná el concepto");
-  else {
-    const [conceptos] = await db.query("SELECT id FROM coseguro_concepto WHERE id = ? AND activo = 1", [conceptoId]);
-    if (conceptos.length === 0) errores.push("Concepto inválido");
+  let conceptoIds = [];
+  const conceptosInformados = body.concepto_ids !== undefined ? body.concepto_ids : body.concepto_id;
+  if (valorOpcionalInformado(conceptosInformados) && conceptosInformados !== "[]" && !(Array.isArray(conceptosInformados) && conceptosInformados.length === 0)) {
+    conceptoIds = normalizarListaIdsPositivos(conceptosInformados, { maximoItems: 16 });
+    if (!conceptoIds) { errores.push("Conceptos inválidos"); conceptoIds = []; }
   }
+  if (tipo) {
+    const [conceptosPermitidos] = await db.query(
+      "SELECT id, nombre FROM coseguro_concepto WHERE tipo_reintegro_id = ? AND activo = 1 ORDER BY nombre", [tipoReintegroId]
+    );
+    const idsPermitidos = new Set(conceptosPermitidos.map((concepto) => concepto.id));
+    if (conceptosPermitidos.length && !conceptoIds.length) errores.push("Seleccioná al menos un concepto");
+    if (conceptoIds.some((id) => !idsPermitidos.has(id))) errores.push("Los conceptos deben pertenecer al tipo de reintegro elegido");
+    conceptoIds.sort((a, b) => conceptosPermitidos.findIndex((c) => c.id === a) - conceptosPermitidos.findIndex((c) => c.id === b));
+  }
+  const conceptoId = conceptoIds[0] || null;
 
   const fechaComprobante = normalizarFecha(body.fecha_comprobante);
   if (!fechaComprobante) errores.push("La fecha del comprobante es obligatoria");
@@ -1585,6 +1642,7 @@ async function validarDatosSolicitud(db, cabecera, body, opciones) {
     errores,
     advertencias,
     tipo,
+    concepto_ids: conceptoIds,
     datos: {
       tipo_reintegro_id: tipoReintegroId,
       concepto_id: conceptoId,
@@ -1802,6 +1860,12 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
       ]
     );
     const solicitudId = resultado.insertId;
+    await guardarConceptosSolicitud(connection, solicitudId, validacion.concepto_ids);
+    await connection.query(
+      `UPDATE coseguro_solicitud s INNER JOIN coseguro_tipo_reintegro t ON t.id = s.tipo_reintegro_id
+       LEFT JOIN coseguro_imputacion i ON i.id = t.imputacion_id
+       SET s.imputacion_id = t.imputacion_id, s.cic_codigo = i.codigo WHERE s.id = ?`, [solicitudId]
+    );
 
     for (const [slot, files] of slots.entries()) {
       for (const file of files) {
@@ -1909,7 +1973,8 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
         return res.status(400).json("Filtro de estados inválido");
       }
     }
-    const departamentalFiltroId = normalizarIdOpcional(req.query.departamental_id, "Departamental");
+    const departamentalFiltroIds = normalizarDepartamentalesFiltro(req.query);
+    const cicFiltro = normalizarCicFiltro(req.query.cic_codigo);
     const tipoReintegroFiltroId = normalizarIdOpcional(req.query.tipo_reintegro_id, "Tipo de reintegro");
     const conceptoFiltroId = normalizarIdOpcional(req.query.concepto_id, "Concepto");
     const usuarioFiltroId = normalizarIdOpcional(req.query.usuario_id, "Usuario");
@@ -1943,16 +2008,17 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
       condiciones.push(`s.estado_id IN (${estadosFiltro.map(() => "?").join(",")})`);
       params.push(...estadosFiltro);
     }
-    if (departamentalFiltroId && cabecera.rol !== "departamental" && cabecera.rol !== "afiliado") {
-      condiciones.push("s.departamental_id = ?");
-      params.push(departamentalFiltroId);
+    if (departamentalFiltroIds && cabecera.rol !== "departamental" && cabecera.rol !== "afiliado") {
+      condiciones.push(`s.departamental_id IN (${departamentalFiltroIds.map(() => "?").join(",")})`);
+      params.push(...departamentalFiltroIds);
     }
+    if (cicFiltro) { condiciones.push("s.cic_codigo = ?"); params.push(cicFiltro); }
     if (tipoReintegroFiltroId) {
       condiciones.push("s.tipo_reintegro_id = ?");
       params.push(tipoReintegroFiltroId);
     }
     if (conceptoFiltroId) {
-      condiciones.push("s.concepto_id = ?");
+      condiciones.push("EXISTS (SELECT 1 FROM coseguro_solicitud_concepto scf WHERE scf.solicitud_id = s.id AND scf.concepto_id = ?)");
       params.push(conceptoFiltroId);
     }
     if (usuarioFiltroId && ROLES_STAFF.includes(cabecera.rol)) {
@@ -2003,14 +2069,14 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
     // tolerando cargas sin CUIT).
     const subqueryDuplicados = `(
       SELECT COUNT(DISTINCT s2.id) FROM coseguro_solicitud s2
-      WHERE s2.id <> s.id AND s2.eliminado = 0 AND s2.estado_id NOT IN (${ESTADO.RECHAZADA_DEPTO}, ${ESTADO.CANCELADA})
+      WHERE s2.id <> s.id AND s2.eliminado = 0 AND s2.estado_id NOT IN (${ESTADO.RECHAZADA_DEPTO}, ${ESTADO.CANCELADA}, ${ESTADO.RECHAZADA_CENTRAL})
         AND s2.comprobante_numero = s.comprobante_numero
         AND (s2.usuario_id = s.usuario_id OR s2.emisor_cuit = s.emisor_cuit OR s2.emisor_cuit IS NULL OR s.emisor_cuit IS NULL)
         AND (s2.comprobante_pto_venta = s.comprobante_pto_venta OR s2.comprobante_pto_venta IS NULL OR s.comprobante_pto_venta IS NULL)
     ) + (
       SELECT COUNT(DISTINCT a2.solicitud_id) FROM coseguro_archivo a1
       INNER JOIN coseguro_archivo a2 ON (a2.sha256 = a1.sha256 OR (a1.phash IS NOT NULL AND a2.phash = a1.phash)) AND a2.solicitud_id <> a1.solicitud_id
-      INNER JOIN coseguro_solicitud s3 ON s3.id = a2.solicitud_id AND s3.eliminado = 0 AND s3.estado_id NOT IN (${ESTADO.RECHAZADA_DEPTO}, ${ESTADO.CANCELADA})
+      INNER JOIN coseguro_solicitud s3 ON s3.id = a2.solicitud_id AND s3.eliminado = 0 AND s3.estado_id NOT IN (${ESTADO.RECHAZADA_DEPTO}, ${ESTADO.CANCELADA}, ${ESTADO.RECHAZADA_CENTRAL})
       WHERE a1.solicitud_id = s.id
     )`;
 
@@ -2059,6 +2125,7 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
     );
 
     // Resumen por estado (para chips del listado) con el mismo scope pero sin filtro de estado
+    await completarConceptosSolicitudes(db, rows);
     const results = rows.map((row) => ({
       ...row,
       estado_visible: cabecera.rol === "afiliado" && row.estado_nombre_afiliado ? row.estado_nombre_afiliado : row.estado,
@@ -2176,6 +2243,7 @@ router.get("/coseguro/solicitudes/:id", verifyToken, async (req, res) => {
       );
     }
 
+    await completarConceptosSolicitudes(db, [solicitud]);
     const firmaUrl = solicitud.firma_archivo ? await getSignedFileUrlFromS3(solicitud.firma_archivo).catch(() => null) : null;
 
     res.status(200).json({
@@ -2241,6 +2309,12 @@ function parsearCamposCentral(body, { periodoOriginal = null } = {}) {
       campos[campo] = normalizarIdOpcional(body[campo], ETIQUETAS_CAMPOS[campo]);
     }
   }
+  if (body.cic_codigo !== undefined) {
+    campos.cic_codigo = valorOpcionalInformado(body.cic_codigo) ? normalizarCicCodigo(body.cic_codigo) : null;
+    if (valorOpcionalInformado(body.cic_codigo) && !campos.cic_codigo) {
+      throw crearErrorHttp("El C.I.C. debe ser un código numérico entero o con un punto (máximo 20 caracteres)", 400);
+    }
+  }
   if (body.periodo_prestacion !== undefined) {
     const periodo = String(body.periodo_prestacion || "").trim();
     if (periodo !== "" && !/^\d{4}-(0[1-9]|1[0-2])$/.test(periodo)) {
@@ -2265,6 +2339,14 @@ async function validarCamposCentral(connection, solicitud, campos, { aprobar = f
     // Un detalle pertenece a una cuenta: no se arrastra al elegir otro C.I.C.
     cambios.imputacion_detalle_id = null;
   }
+  if (tieneCampo("cic_codigo")) {
+    const codigo = cambios.cic_codigo;
+    const [cuentas] = codigo ? await connection.query(
+      "SELECT id, codigo FROM coseguro_imputacion WHERE codigo = ? AND tipo = 'CUENTA' AND activo = 1", [codigo]
+    ) : [[]];
+    cambios.imputacion_id = cuentas[0]?.id || null;
+    cambios.imputacion_detalle_id = null;
+  }
   const efectivos = { ...solicitud, ...cambios };
   if (aprobar) {
     const importe = normalizarImporte(efectivos.importe_autorizado);
@@ -2273,19 +2355,20 @@ async function validarCamposCentral(connection, solicitud, campos, { aprobar = f
     }
     cambios.importe_autorizado = importe;
   }
-  if (aprobar || tieneCampo("imputacion_id") || tieneCampo("imputacion_detalle_id")) {
+  if (aprobar || tieneCampo("cic_codigo") || tieneCampo("imputacion_id") || tieneCampo("imputacion_detalle_id")) {
     const imputacionId = normalizarIdPositivo(efectivos.imputacion_id);
     const detalleId = normalizarIdOpcional(efectivos.imputacion_detalle_id, "Detalle de imputación");
     if (!imputacionId) {
-      if (aprobar) throw crearErrorHttp("Completá el C.I.C. para aprobar por Servicios Sociales", 400);
+      const codigoLibre = tieneCampo("cic_codigo") || !tieneCampo("imputacion_id") ? normalizarCicCodigo(efectivos.cic_codigo) : null;
+      if (aprobar && !codigoLibre) throw crearErrorHttp("Completá el C.I.C. para aprobar por Servicios Sociales", 400);
       if (detalleId) throw crearErrorHttp("Seleccioná un C.I.C. para el detalle de imputación", 400);
-      cambios.cic_codigo = null;
+      cambios.cic_codigo = codigoLibre;
     } else {
       const [cuentas] = await connection.query(
         "SELECT codigo FROM coseguro_imputacion WHERE id = ? AND tipo = 'CUENTA' AND activo = 1",
         [imputacionId]
       );
-      const codigo = normalizarTexto(cuentas[0]?.codigo);
+      const codigo = normalizarCicCodigo(cuentas[0]?.codigo);
       if (!codigo) throw crearErrorHttp("El C.I.C. debe corresponder a una cuenta activa con código válido", 400);
       cambios.cic_codigo = codigo;
       if (detalleId) {
@@ -2468,6 +2551,18 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
 
     // Diff de campos para el historial
     const camposEditables = { ...datos };
+    if (!idsPositivosIguales(datos.tipo_reintegro_id, solicitud.tipo_reintegro_id) && !("imputacion_id" in camposCentral) && !("cic_codigo" in camposCentral)) {
+      const [cuentasTipo] = await connection.query("SELECT codigo FROM coseguro_imputacion WHERE id = ?", [validacion.tipo.imputacion_id]);
+      camposEditables.imputacion_id = validacion.tipo.imputacion_id;
+      camposEditables.imputacion_detalle_id = null;
+      camposEditables.cic_codigo = cuentasTipo[0]?.codigo || null;
+    }
+    const [conceptosAnteriores] = await connection.query("SELECT concepto_id FROM coseguro_solicitud_concepto WHERE solicitud_id = ? ORDER BY concepto_id", [solicitudId]);
+    const idsAnteriores = conceptosAnteriores.map((c) => c.concepto_id).sort((a,b) => a-b);
+    if (JSON.stringify(idsAnteriores) !== JSON.stringify([...validacion.concepto_ids].sort((a,b) => a-b))) {
+      await registrarHistorial(connection, { solicitud_id: solicitudId, usuario_id: cabecera.id, usuario_rol: cabecera.rol,
+        tipo_operacion: "UPDATE", campo_modificado: "Conceptos", valor_anterior: JSON.stringify(idsAnteriores), valor_nuevo: JSON.stringify(validacion.concepto_ids) });
+    }
     // La estimación de cobertura acompaña al importe/tipo vigentes de la solicitud
     const cobertura = calcularReintegroEstimado(validacion.tipo, datos.importe);
     camposEditables.porcentaje_cobertura_aplicado = cobertura.porcentaje;
@@ -2551,6 +2646,8 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     if (actualizacionSolicitud.affectedRows !== 1) {
       throw crearErrorHttp("La solicitud cambió mientras se editaba. Recargá e intentá nuevamente.", 409);
     }
+
+    await guardarConceptosSolicitud(connection, solicitudId, validacion.concepto_ids);
 
     // Archivos eliminados
     for (const archivoId of eliminarIds) {
@@ -2743,7 +2840,7 @@ router.put("/coseguro/solicitudes/:id/estado", verifyToken, async (req, res) => 
       throw crearErrorHttp("Transición de estado no permitida para tu rol en el estado actual", 409);
     }
     // Al pedir revisión o rechazar, la observación es obligatoria para que el afiliado sepa qué pasó
-    if ([ESTADO.REVISAR, ESTADO.RECHAZADA_DEPTO].includes(estadoNuevo) && !observacion) {
+    if ([ESTADO.REVISAR, ESTADO.RECHAZADA_DEPTO, ESTADO.RECHAZADA_CENTRAL].includes(estadoNuevo) && !observacion) {
       throw crearErrorHttp("Ingresá una observación para el afiliado explicando el motivo", 400);
     }
 
@@ -3026,6 +3123,7 @@ router.get("/coseguro/afiliado/:usuarioId/historial", verifyToken, async (req, r
       [usuarioId]
     );
 
+    await completarConceptosSolicitudes(db, solicitudes);
     // Detectar repetidos dentro del propio historial (mismo comprobante o misma fecha+importe+emisor)
     const grupos = new Map();
     for (const s of solicitudes) {
@@ -3098,7 +3196,8 @@ async function consultarSolicitudesParaExportar(db, cabecera, filtros) {
   condiciones.push(`s.estado_id IN (${estados.map(() => "?").join(",")})`);
   params.push(...estados);
 
-  const departamentalFiltroId = normalizarIdOpcional(filtros.departamental_id, "Departamental");
+  const departamentalFiltroIds = normalizarDepartamentalesFiltro(filtros);
+  const cicFiltro = normalizarCicFiltro(filtros.cic_codigo);
   const usuarioFiltroId = normalizarIdOpcional(filtros.usuario_id, "Usuario");
   const tipoReintegroFiltroId = normalizarIdOpcional(filtros.tipo_reintegro_id, "Tipo de reintegro");
   const conceptoFiltroId = normalizarIdOpcional(filtros.concepto_id, "Concepto");
@@ -3117,9 +3216,9 @@ async function consultarSolicitudesParaExportar(db, cabecera, filtros) {
   if (cabecera.rol === "departamental") {
     condiciones.push("s.departamental_id = ?");
     params.push(cabecera.departamental_id);
-  } else if (departamentalFiltroId) {
-    condiciones.push("s.departamental_id = ?");
-    params.push(departamentalFiltroId);
+  } else if (departamentalFiltroIds) {
+    condiciones.push(`s.departamental_id IN (${departamentalFiltroIds.map(() => "?").join(",")})`);
+    params.push(...departamentalFiltroIds);
   }
   if (usuarioFiltroId) {
     condiciones.push("s.usuario_id = ?");
@@ -3132,12 +3231,13 @@ async function consultarSolicitudesParaExportar(db, cabecera, filtros) {
     const like = `%${search}%`;
     params.push(like, like, like, like, like, like, like);
   }
+  if (cicFiltro) { condiciones.push("s.cic_codigo = ?"); params.push(cicFiltro); }
   if (tipoReintegroFiltroId) {
     condiciones.push("s.tipo_reintegro_id = ?");
     params.push(tipoReintegroFiltroId);
   }
   if (conceptoFiltroId) {
-    condiciones.push("s.concepto_id = ?");
+    condiciones.push("EXISTS (SELECT 1 FROM coseguro_solicitud_concepto scf WHERE scf.solicitud_id = s.id AND scf.concepto_id = ?)");
     params.push(conceptoFiltroId);
   }
   if (fechaDesde) {
@@ -3173,14 +3273,14 @@ async function consultarSolicitudesParaExportar(db, cabecera, filtros) {
   if (conDuplicados) {
     condiciones.push(`((
       SELECT COUNT(DISTINCT s2.id) FROM coseguro_solicitud s2
-      WHERE s2.id <> s.id AND s2.eliminado = 0 AND s2.estado_id NOT IN (${ESTADO.RECHAZADA_DEPTO}, ${ESTADO.CANCELADA})
+      WHERE s2.id <> s.id AND s2.eliminado = 0 AND s2.estado_id NOT IN (${ESTADO.RECHAZADA_DEPTO}, ${ESTADO.CANCELADA}, ${ESTADO.RECHAZADA_CENTRAL})
         AND s2.comprobante_numero = s.comprobante_numero
         AND (s2.usuario_id = s.usuario_id OR s2.emisor_cuit = s.emisor_cuit OR s2.emisor_cuit IS NULL OR s.emisor_cuit IS NULL)
         AND (s2.comprobante_pto_venta = s.comprobante_pto_venta OR s2.comprobante_pto_venta IS NULL OR s.comprobante_pto_venta IS NULL)
     ) + (
       SELECT COUNT(DISTINCT a2.solicitud_id) FROM coseguro_archivo a1
       INNER JOIN coseguro_archivo a2 ON (a2.sha256 = a1.sha256 OR (a1.phash IS NOT NULL AND a2.phash = a1.phash)) AND a2.solicitud_id <> a1.solicitud_id
-      INNER JOIN coseguro_solicitud s3 ON s3.id = a2.solicitud_id AND s3.eliminado = 0 AND s3.estado_id NOT IN (${ESTADO.RECHAZADA_DEPTO}, ${ESTADO.CANCELADA})
+      INNER JOIN coseguro_solicitud s3 ON s3.id = a2.solicitud_id AND s3.eliminado = 0 AND s3.estado_id NOT IN (${ESTADO.RECHAZADA_DEPTO}, ${ESTADO.CANCELADA}, ${ESTADO.RECHAZADA_CENTRAL})
       WHERE a1.solicitud_id = s.id
     )) > 0`);
   }
@@ -3207,6 +3307,7 @@ async function consultarSolicitudesParaExportar(db, cabecera, filtros) {
      ORDER BY s.id`,
     params
   );
+  await completarConceptosSolicitudes(db, rows);
   return rows;
 }
 
@@ -3563,7 +3664,8 @@ router.post("/coseguro/liquidacion/confirmar", verifyToken, async (req, res) => 
 function filtrosEstadisticas(cabecera, query) {
   const condiciones = ["s.eliminado = 0"];
   const params = [];
-  const departamentalFiltroId = normalizarIdOpcional(query.departamental_id, "Departamental");
+  const departamentalFiltroIds = normalizarDepartamentalesFiltro(query);
+  const cicFiltro = normalizarCicFiltro(query.cic_codigo);
   const tipoReintegroFiltroId = normalizarIdOpcional(query.tipo_reintegro_id, "Tipo de reintegro");
   const conceptoFiltroId = normalizarIdOpcional(query.concepto_id, "Concepto");
   const usuarioFiltroId = normalizarIdOpcional(query.usuario_id, "Usuario");
@@ -3582,9 +3684,9 @@ function filtrosEstadisticas(cabecera, query) {
   if (cabecera.rol === "departamental") {
     condiciones.push("s.departamental_id = ?");
     params.push(cabecera.departamental_id);
-  } else if (departamentalFiltroId) {
-    condiciones.push("s.departamental_id = ?");
-    params.push(departamentalFiltroId);
+  } else if (departamentalFiltroIds) {
+    condiciones.push(`s.departamental_id IN (${departamentalFiltroIds.map(() => "?").join(",")})`);
+    params.push(...departamentalFiltroIds);
   }
   if (fechaDesde) {
     condiciones.push("s.fecha_comprobante >= ?");
@@ -3594,12 +3696,13 @@ function filtrosEstadisticas(cabecera, query) {
     condiciones.push("s.fecha_comprobante <= ?");
     params.push(fechaHasta);
   }
+  if (cicFiltro) { condiciones.push("s.cic_codigo = ?"); params.push(cicFiltro); }
   if (tipoReintegroFiltroId) {
     condiciones.push("s.tipo_reintegro_id = ?");
     params.push(tipoReintegroFiltroId);
   }
   if (conceptoFiltroId) {
-    condiciones.push("s.concepto_id = ?");
+    condiciones.push("EXISTS (SELECT 1 FROM coseguro_solicitud_concepto scf WHERE scf.solicitud_id = s.id AND scf.concepto_id = ?)");
     params.push(conceptoFiltroId);
   }
   if (usuarioFiltroId) {
@@ -3652,19 +3755,20 @@ router.get("/coseguro/estadisticas", verifyToken, async (req, res) => {
       `SELECT c.nombre, COUNT(*) AS cantidad, COALESCE(SUM(s.importe), 0) AS importe,
               COALESCE(SUM(s.importe_autorizado), 0) AS importe_autorizado,
               COALESCE(SUM(s.cantidad_sesiones), 0) AS sesiones
-       FROM coseguro_solicitud s INNER JOIN coseguro_concepto c ON c.id = s.concepto_id
+       FROM coseguro_solicitud s INNER JOIN coseguro_solicitud_concepto sc ON sc.solicitud_id = s.id
+       INNER JOIN coseguro_concepto c ON c.id = sc.concepto_id
        WHERE ${where} GROUP BY c.id, c.nombre ORDER BY cantidad DESC`,
       params
     );
     const [porImputacion] = await db.query(
-      `SELECT COALESCE(i.codigo, '(sin imputar)') AS codigo, COALESCE(i.descripcion, 'Sin imputación asignada') AS descripcion,
+      `SELECT COALESCE(s.cic_codigo, i.codigo, '(sin imputar)') AS codigo, COALESCE(i.descripcion, 'Sin imputación asignada') AS descripcion,
               COALESCE(d.descripcion, '') AS detalle,
               COUNT(*) AS cantidad, COALESCE(SUM(COALESCE(s.importe_autorizado, s.importe)), 0) AS importe
        FROM coseguro_solicitud s
        LEFT JOIN coseguro_imputacion i ON i.id = s.imputacion_id
        LEFT JOIN coseguro_imputacion d ON d.id = s.imputacion_detalle_id
        WHERE ${where}
-       GROUP BY i.id, i.codigo, i.descripcion, d.id, d.descripcion
+       GROUP BY s.cic_codigo, i.id, i.codigo, i.descripcion, d.id, d.descripcion
        ORDER BY importe DESC`,
       params
     );
@@ -3700,7 +3804,9 @@ router.get("/coseguro/estadisticas", verifyToken, async (req, res) => {
         `SELECT DATE_FORMAT(s.fecha_comprobante, '%Y-%m') AS mes, c.nombre AS concepto,
                 COUNT(*) AS solicitudes, COALESCE(SUM(COALESCE(s.cantidad_sesiones, 1)), 0) AS prestaciones,
                 COALESCE(SUM(COALESCE(s.importe_autorizado, s.importe)), 0) AS importe
-         FROM coseguro_solicitud s LEFT JOIN coseguro_concepto c ON c.id = s.concepto_id
+         FROM coseguro_solicitud s
+         LEFT JOIN coseguro_solicitud_concepto sc ON sc.solicitud_id = s.id
+         LEFT JOIN coseguro_concepto c ON c.id = sc.concepto_id
          WHERE ${where}
          GROUP BY mes, c.id, c.nombre ORDER BY mes DESC, prestaciones DESC`,
         params
@@ -4270,6 +4376,13 @@ router.__test = Object.freeze({
   liberarBloqueoDuplicados,
   filtrosEstadisticas,
   normalizarBooleanoOpcional,
+  normalizarCicCodigo,
+  normalizarDepartamentalesFiltro,
+  validarDatosSolicitud,
+  validarCamposCentral,
+  parsearCamposCentral,
+  transicionesDisponibles,
+  completarConceptosSolicitudes,
   normalizarEnteroSeguro,
   normalizarFecha,
   normalizarIdPositivo,

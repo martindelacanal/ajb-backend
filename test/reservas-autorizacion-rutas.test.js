@@ -1160,7 +1160,7 @@ test("Mis gestiones ordena la columna ID por prefijo y número del código", asy
       return [[{ tipo: "turismo", total: 0 }]];
     }
     if (/SELECT g\.\* FROM \(/i.test(sql)) {
-      ordenes.push(sql.match(/ORDER BY [^\n]+/)[0].trim());
+      ordenes.push([...sql.matchAll(/ORDER BY [^\n]+/g)].at(-1)[0].trim());
       return [[]];
     }
     throw new Error(`Consulta inesperada: ${sql}`);
