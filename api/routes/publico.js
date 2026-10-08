@@ -105,11 +105,12 @@ async function obtenerAlojamientoSalud(db) {
 async function obtenerTiposReintegro(db, { soloSubsidios = false } = {}) {
   const [filas] = await db.query(
     `SELECT t.id, t.nombre, t.icono, t.modo_cobertura, t.porcentaje_cobertura, t.tope_reintegro,
-            t.es_subsidio, t.grupo_codigo, t.grupo_nombre, t.grupo_icono,
+            t.es_subsidio, t.grupo_codigo, t.grupo_nombre, t.grupo_icono, i.codigo AS cic_codigo,
             CAST(t.adjuntos_config AS CHAR) AS adjuntos_config,
             (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', c.id, 'nombre', c.nombre))
                FROM coseguro_concepto c WHERE c.tipo_reintegro_id = t.id AND c.activo = 1) AS conceptos
        FROM coseguro_tipo_reintegro t
+       LEFT JOIN coseguro_imputacion i ON i.id = t.imputacion_id
       WHERE t.activo = 1${soloSubsidios ? " AND t.es_subsidio = 1" : ""}
       ORDER BY t.nombre ASC, t.id ASC`
   );

@@ -4,13 +4,13 @@
 // Todas las filas con código y título son seleccionables, incluidas las cuentas 00.
 const { completarAdjuntos } = require("./coseguro-limites-archivos");
 const GRUPOS = [
-  { codigo: "631.000", nombre: "General", icono: "health_and_safety" },
+  { codigo: "631.000", nombre: "Gastos en prestaciones", icono: "health_and_safety" },
   { codigo: "631.100", nombre: "Internaciones", icono: "local_hospital" },
   { codigo: "631.200", nombre: "Medicina", icono: "stethoscope" },
   { codigo: "631.300", nombre: "Bioquímica", icono: "biotech" },
   { codigo: "631.400", nombre: "Medicamentos", icono: "medication" },
   { codigo: "631.500", nombre: "Odontología", icono: "dentistry" },
-  { codigo: "631.600", nombre: "Otras prestaciones", icono: "health_and_safety" },
+  { codigo: "631.600", nombre: "Otros", icono: "health_and_safety" },
   { codigo: "511.700", nombre: "Subsidios", icono: "volunteer_activism" },
 ].sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
 
@@ -62,13 +62,27 @@ function adjuntosPara(codigo) {
 }
 
 const TIPOS = FILAS.map(([codigo, nombre, icono, conceptos = []]) => {
-  const grupoCodigo = `${codigo.slice(0, 5)}00`;
+  const grupoCodigo = ["631.613", "631.614"].includes(codigo) ? "511.700" : codigoRubroContable(codigo);
   const grupo = GRUPOS.find((item) => item.codigo === grupoCodigo);
   return { codigo, nombre, icono, grupo_codigo: grupo.codigo, grupo_nombre: grupo.nombre, grupo_icono: grupo.icono,
     conceptos: conceptos.sort((a, b) => a.localeCompare(b, "es")),
     requiere_pto_venta: ["631.202", "511.701", "631.611", "631.613", "631.614"].includes(codigo) ? 0 : 1,
     adjuntos: completarAdjuntos(adjuntosPara(codigo)) };
 }).sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
+
+// Los grupos son de navegación: no alteran el rubro de la cuenta contable.
+function codigoRubroContable(codigo) {
+  return `${codigo.slice(0, 5)}00`;
+}
+
+// La base conserva la clasificación anterior. Resolverla al leer evita migrar
+// solicitudes o cuentas por cambios que sólo organizan las tarjetas del catálogo.
+function conGrupoVisual(tipo) {
+  const codigo = normalizarCicCodigo(tipo.cic_codigo ?? tipo.codigo);
+  const grupoCodigo = TIPOS.find((item) => item.codigo === codigo)?.grupo_codigo ?? tipo.grupo_codigo;
+  const grupo = GRUPOS.find((item) => item.codigo === grupoCodigo);
+  return grupo ? { ...tipo, grupo_codigo: grupo.codigo, grupo_nombre: grupo.nombre, grupo_icono: grupo.icono } : tipo;
+}
 
 function normalizarCicCodigo(valor) {
   if (typeof valor !== "string" && typeof valor !== "number") return null;
@@ -77,4 +91,4 @@ function normalizarCicCodigo(valor) {
   return /^\d{6}$/.test(codigo) ? `${codigo.slice(0, 3)}.${codigo.slice(3)}` : codigo;
 }
 
-module.exports = { GRUPOS, TIPOS, normalizarCicCodigo };
+module.exports = { GRUPOS, TIPOS, normalizarCicCodigo, codigoRubroContable, conGrupoVisual };

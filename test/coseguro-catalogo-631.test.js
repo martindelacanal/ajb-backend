@@ -1,7 +1,7 @@
 "use strict";
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { TIPOS, GRUPOS, normalizarCicCodigo } = require('../api/data/coseguro-catalogo-631');
+const { TIPOS, GRUPOS, normalizarCicCodigo, codigoRubroContable, conGrupoVisual } = require('../api/data/coseguro-catalogo-631');
 const { seleccionarTipoLegado, seleccionarConceptosLegados, resolverImputacionMigrada } = require('../scripts/migrar-coseguro-catalogo-631');
 const { validarDatosSolicitud, validarCamposCentral, parsearCamposCentral, filtrosEstadisticas, transicionesDisponibles, completarConceptosSolicitudes } = require('../api/routes/coseguro').__test;
 const { mapearTipoReintegroPublico } = require('../api/services/publico');
@@ -25,6 +25,24 @@ test('catálogo reproduce las 36 cuentas con título literal del Excel, incluido
 test('C.I.C. admite entero o punto, normaliza 6 dígitos y rechaza formatos ambiguos', () => {
   for (const [entrada, esperado] of [['631602','631.602'],[631602,'631.602'],[' 631.602 ','631.602'],['123','123'],['123.4','123.4']]) assert.equal(normalizarCicCodigo(entrada), esperado);
   for (const entrada of ['1e3','1.2.3','-1','1,2','1 2','ABC','123456789012345678901', {}, null]) assert.equal(normalizarCicCodigo(entrada), null);
+});
+
+test('los grupos visuales renombran General y Otros y reúnen los subsidios solicitados', () => {
+  assert.equal(GRUPOS.find((grupo) => grupo.codigo === '631.000').nombre, 'Gastos en prestaciones');
+  assert.equal(GRUPOS.find((grupo) => grupo.codigo === '631.600').nombre, 'Otros');
+  assert.deepEqual(TIPOS.filter((tipo) => tipo.grupo_codigo === '511.700').map((tipo) => tipo.codigo).sort(), ['511.701', '631.613', '631.614']);
+  for (const codigo of ['631.503', '631.504']) assert.equal(TIPOS.find((tipo) => tipo.codigo === codigo).grupo_codigo, '631.500');
+  assert.equal(TIPOS.filter((tipo) => tipo.grupo_codigo === '631.000').length, 1);
+});
+
+test('reagrupar tarjetas conserva C.I.C., rubro contable y campos almacenados del reintegro', () => {
+  const fila = { id: 18, cic_codigo: '631614', nombre: 'SUBSIDIOS CELIAQUIA', imputacion_id: 27, grupo_codigo: '631.600', grupo_nombre: 'Otras prestaciones', grupo_icono: 'health_and_safety', porcentaje_cobertura: 40, conceptos: [] };
+  const normalizada = conGrupoVisual(fila);
+  assert.deepEqual(normalizada, { ...fila, grupo_codigo: '511.700', grupo_nombre: 'Subsidios', grupo_icono: 'volunteer_activism' });
+  assert.equal(fila.grupo_codigo, '631.600');
+  for (const codigo of ['631.613', '631.614']) assert.equal(codigoRubroContable(codigo), '631.600');
+  assert.equal(codigoRubroContable('511.701'), '511.700');
+  assert.equal(codigoRubroContable('631.000'), '631.000');
 });
 
 function baseSolicitud(extra) {

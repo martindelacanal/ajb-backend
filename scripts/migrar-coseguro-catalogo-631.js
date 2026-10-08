@@ -3,7 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 const mysql = require("mysql2/promise");
-const { TIPOS, GRUPOS, normalizarCicCodigo } = require("../api/data/coseguro-catalogo-631");
+const { TIPOS, GRUPOS, normalizarCicCodigo, codigoRubroContable, conGrupoVisual } = require("../api/data/coseguro-catalogo-631");
 const { parsearBloquesEnv, crearOpcionesConexion } = require("./migrar-webauthn-v1");
 
 const TABLAS_SNAPSHOT = ["coseguro_imputacion", "coseguro_tipo_reintegro", "coseguro_concepto", "coseguro_solicitud", "coseguro_archivo", "coseguro_historial", "coseguro_observacion", "coseguro_solicitud_concepto", "coseguro_comprobante_claim"];
@@ -75,7 +75,8 @@ async function verificarCatalogo(db) {
     (SELECT COUNT(*) FROM coseguro_solicitud s WHERE s.cic_codigo IS NULL OR s.cic_codigo = '') AS cic_faltantes,
     (SELECT COUNT(*) FROM coseguro_solicitud s JOIN coseguro_imputacion i ON i.id = s.imputacion_id WHERE s.cic_codigo <> i.codigo OR i.activo = 0) AS cic_inconsistente,
     (SELECT COUNT(*) FROM coseguro_solicitud s WHERE s.imputacion_detalle_id IS NOT NULL) AS detalles_obsoletos`);
-  const catalogoCorrecto = tipos.length === TIPOS.length && TIPOS.every((tipo) => tipos.some((t) => t.codigo === tipo.codigo && t.nombre === tipo.nombre && t.grupo_codigo === tipo.grupo_codigo && t.grupo_nombre === tipo.grupo_nombre && t.grupo_icono === tipo.grupo_icono)) && JSON.stringify(esperados) === JSON.stringify(actuales);
+  const tiposVisuales = tipos.map(conGrupoVisual);
+  const catalogoCorrecto = tipos.length === TIPOS.length && TIPOS.every((tipo) => tiposVisuales.some((t) => t.codigo === tipo.codigo && t.nombre === tipo.nombre && t.grupo_codigo === tipo.grupo_codigo && t.grupo_nombre === tipo.grupo_nombre && t.grupo_icono === tipo.grupo_icono)) && JSON.stringify(esperados) === JSON.stringify(actuales);
   const [[estado]] = await db.query("SELECT COUNT(*) AS cantidad FROM coseguro_estado WHERE id = 11 AND nombre = 'Rechazado por Servicios Sociales'");
   const [triggersViejos] = await db.query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE() AND TRIGGER_NAME IN ('ajb_cos_claim_ai', 'ajb_cos_claim_au') AND ACTION_STATEMENT REGEXP 'NOT IN[[:space:]]*[(]5,[[:space:]]*6[)]'");
   return { completo: catalogoCorrecto && Number(estado.cantidad) === 1 && !triggersViejos.length && Object.values(inconsistencias).every((n) => Number(n) === 0), tipos: tipos.length, conceptos: conceptos.length, inconsistencias, triggers_pendientes: triggersViejos.length };
@@ -150,9 +151,10 @@ async function ejecutarMigracion(db, { checkOnly = false } = {}) {
       const tiposNuevos = [];
       const usados = new Set();
       for (const [orden, tipo] of TIPOS.entries()) {
+        const rubroCodigo = codigoRubroContable(tipo.codigo);
         const parentId = tipo.codigo === "631.000" ? null
-          : tipo.codigo === tipo.grupo_codigo ? raiz.id
-          : rubros.find((r) => r.codigo === tipo.grupo_codigo)?.id || null;
+          : tipo.codigo === rubroCodigo ? raiz.id
+          : rubros.find((r) => r.codigo === rubroCodigo)?.id || null;
         await db.query("INSERT INTO coseguro_imputacion (codigo, descripcion, tipo, parent_id, activo, orden) VALUES (?, ?, 'CUENTA', ?, 1, ?) ON DUPLICATE KEY UPDATE descripcion = VALUES(descripcion), tipo = 'CUENTA', parent_id = VALUES(parent_id), activo = 1, orden = VALUES(orden)", [tipo.codigo, tipo.nombre, parentId, Number(tipo.codigo.replace('.', ''))]);
         const [[cuenta]] = await db.query("SELECT id FROM coseguro_imputacion WHERE codigo = ?", [tipo.codigo]);
         const anterior = tiposViejos.find((t) => t.codigo === tipo.codigo && !usados.has(t.id))
