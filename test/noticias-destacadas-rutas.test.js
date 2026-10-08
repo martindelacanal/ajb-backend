@@ -153,8 +153,8 @@ async function ejecutar(handler, { body = {}, params = {} } = {}) {
   return { statusCode, respuesta };
 }
 
-test("POST permite crear la cuarta destacada y libera el lock después del commit", async () => {
-  conexionActual = crearConexion({ totalDestacadas: 3 });
+test("POST permite crear la quinta destacada y libera el lock después del commit", async () => {
+  conexionActual = crearConexion({ totalDestacadas: 4 });
 
   const resultado = await ejecutar(postNoticia, { body: { ...bodyNoticiaDestacada } });
 
@@ -170,8 +170,8 @@ for (const escenario of [
   { nombre: "PUT completo", handler: putNoticia, params: { id: "23" } },
   { nombre: "PUT flags", handler: putFlags, params: { id: "23" }, flags: true },
 ]) {
-  test(`${escenario.nombre} rechaza una quinta destacada, revierte y libera el lock`, async () => {
-    conexionActual = crearConexion({ totalDestacadas: 4 });
+  test(`${escenario.nombre} rechaza una sexta destacada, revierte y libera el lock`, async () => {
+    conexionActual = crearConexion({ totalDestacadas: 5 });
     const body = escenario.flags
       ? { destacada: "1" }
       : { ...bodyNoticiaDestacada };
@@ -179,7 +179,7 @@ for (const escenario of [
     const resultado = await ejecutar(escenario.handler, { body, params: escenario.params });
 
     assert.equal(resultado.statusCode, 409);
-    assert.equal(resultado.respuesta, "Solo se pueden destacar hasta 4 noticias");
+    assert.equal(resultado.respuesta, "Solo se pueden destacar hasta 5 noticias");
     assert.equal(conexionActual.eventos.includes("commit"), false);
     assert.equal(conexionActual.eventos.includes("insert"), false);
     assert.equal(conexionActual.eventos.includes("update"), false);
@@ -187,7 +187,7 @@ for (const escenario of [
   });
 }
 
-test("GET público limita la consulta a cuatro noticias destacadas", async () => {
+test("GET público limita la consulta a cinco noticias destacadas", async () => {
   let consulta;
   consultarPool = async (sql) => {
     consulta = sql;
@@ -198,7 +198,7 @@ test("GET público limita la consulta a cuatro noticias destacadas", async () =>
 
   assert.equal(resultado.statusCode, 200);
   assert.deepEqual(resultado.respuesta, []);
-  assert.match(consulta, /LIMIT 4\s*$/);
+  assert.match(consulta, /LIMIT 5\s*$/);
 });
 
 test("GET apoyos conserva sus campos y suma el conteo y máximo de destacadas", async () => {
@@ -206,7 +206,7 @@ test("GET apoyos conserva sus campos y suma el conteo y máximo de destacadas", 
   consultarPool = async (sql) => {
     if (sql.includes("DISTINCT categoria")) return [[{ categoria: "Gremial" }]];
     if (sql.includes("FROM departamental")) return [[{ id: 4, nombre: "La Plata" }]];
-    if (sql.includes("COUNT(*) AS total")) return [[{ total: "4" }]];
+    if (sql.includes("COUNT(*) AS total")) return [[{ total: "5" }]];
     throw new Error(`SQL de apoyos inesperado: ${sql}`);
   };
 
@@ -216,7 +216,7 @@ test("GET apoyos conserva sus campos y suma el conteo y máximo de destacadas", 
   assert.deepEqual(resultado.respuesta, {
     categorias: ["Gremial"],
     departamentales: [{ id: 4, nombre: "La Plata" }],
-    destacadas: 4,
-    max_destacadas: 4,
+    destacadas: 5,
+    max_destacadas: 5,
   });
 });
