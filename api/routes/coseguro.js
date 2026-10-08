@@ -18,6 +18,7 @@ const { LIMITES_ARCHIVOS, ADJUNTO_OTROS, completarAdjuntos } = require("../data/
 const express = require("express");
 const { notificarParticipantesChat } = require("../services/chat-notificaciones");
 const { crearNotificacion } = require("../services/notificaciones");
+const { generarConstanciaReintegro } = require("../services/coseguro-constancia");
 const router = express.Router();
 const mysqlConnection = require("../connection/connection");
 const { registrarErrorRuta } = require("../services/errores");
@@ -861,6 +862,7 @@ async function notificarCambioEstadoAfiliado(connection, solicitud, estadoAnteri
   if (!nombreNuevo || nombreNuevo === nombreAnterior) return; // p.ej. 8 -> 9: el afiliado ve lo mismo
   const titulo = `Tu solicitud de reintegro #${solicitud.id} cambió de estado`;
   let mensaje = `Nueva situación: ${nombreNuevo}.`;
+  if (estadoNuevoId === ESTADO.APROBADA_CENTRAL) mensaje += " Ya podés imprimir la constancia de reintegro desde el detalle de tu trámite y presentarla ante la Corte.";
   if (observacion) mensaje += ` Observación: ${observacion}`;
   await insertarNotificacion(connection, solicitud.usuario_id, "COSEGURO_ESTADO", titulo, mensaje, {
     solicitud_id: solicitud.id,
@@ -2512,6 +2514,52 @@ router.get("/coseguro/solicitudes/:id", verifyToken, async (req, res) => {
   } catch (error) {
     registrarErrorRuta(error);
     res.status(500).json("Error al obtener el detalle de la solicitud");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /coseguro/solicitudes/:id/constancia — PDF para presentar ante la Corte
+// ---------------------------------------------------------------------------
+router.get("/coseguro/solicitudes/:id/constancia", verifyToken, async (req, res) => {
+  try {
+    const cabecera = getCabecera(req);
+    if (!["afiliado", ...ROLES_STAFF].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
+    const solicitudId = normalizarIdPositivo(req.params.id);
+    if (!solicitudId) return res.status(400).json("ID inválido");
+    const db = mysqlConnection.promise();
+    const [rows] = await db.query(
+      `SELECT s.*, u.nombre AS afiliado_nombre, u.apellido AS afiliado_apellido,
+              u.documento AS afiliado_documento, u.legajo AS afiliado_legajo,
+              u.email AS afiliado_email, u.telefono AS afiliado_telefono,
+              u.direccion AS afiliado_direccion, u.dependencia_judicial AS afiliado_dependencia_judicial,
+              d.nombre AS departamental_nombre, t.nombre AS tipo_reintegro, c.nombre AS concepto,
+              DATE_FORMAT(s.fecha_aprobacion_central, '%Y-%m-%d') AS fecha_aprobacion_central_civil,
+              DATE_FORMAT(s.fecha_comprobante, '%Y-%m-%d') AS fecha_comprobante_civil
+       FROM coseguro_solicitud s
+       INNER JOIN usuario u ON u.id = s.usuario_id
+       LEFT JOIN departamental d ON d.id = s.departamental_id
+       LEFT JOIN coseguro_tipo_reintegro t ON t.id = s.tipo_reintegro_id
+       LEFT JOIN coseguro_concepto c ON c.id = s.concepto_id
+       WHERE s.id = ? AND s.eliminado = 0`,
+      [solicitudId]
+    );
+    if (!rows.length) return res.status(404).json("Solicitud no encontrada");
+    const solicitud = rows[0];
+    if (!puedeVerSolicitud(cabecera, solicitud)) return res.status(401).json("No autorizado");
+    if (![ESTADO.APROBADA_CENTRAL, ESTADO.EXPORTADO, ESTADO.PENDIENTE_ACREDITACION, ESTADO.LIQUIDADO].includes(solicitud.estado_id)) {
+      return res.status(409).json("La constancia está disponible a partir de la aprobación de Servicios Sociales");
+    }
+    await completarConceptosSolicitudes(db, [solicitud]);
+    const pdf = await generarConstanciaReintegro(solicitud);
+    res.set({
+      "Content-Type": "application/pdf",
+      "Content-Disposition": `inline; filename="constancia_reintegro_${solicitudId}.pdf"`,
+      "Cache-Control": "private, no-store",
+    });
+    return res.status(200).send(pdf);
+  } catch (error) {
+    registrarErrorRuta(error);
+    return res.status(500).json("Error al generar la constancia de reintegro");
   }
 });
 
@@ -4673,6 +4721,7 @@ router.__test = Object.freeze({
   parsearCamposCentral,
   transicionesDisponibles,
   completarConceptosSolicitudes,
+  notificarCambioEstadoAfiliado,
   normalizarEnteroSeguro,
   normalizarFecha,
   normalizarIdPositivo,
