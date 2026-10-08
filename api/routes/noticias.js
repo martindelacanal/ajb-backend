@@ -17,6 +17,8 @@ const {
 // ═══════════════════════════════════════════════════════════════════════════
 // NOTICIAS · Portada institucional pública + administración de la redacción.
 // Público: /noticias/publicas* (sin token). Gestión: /admin/noticias* (roles admin y prensa).
+// Portal departamental del afiliado: /noticias/departamental* (rol afiliado): las noticias
+// de su departamental más las que van a todas las departamentales (alcance_todas = 1).
 // ═══════════════════════════════════════════════════════════════════════════
 
 // S3 INICIO
@@ -200,6 +202,29 @@ const EXPRESION_NOMBRE_LOCK_DESTACADAS = "CONCAT('noticias_destacadas:', DATABAS
 const CONDICION_PUBLICA = "n.eliminado = 0 AND n.estado = 'PUBLICADA' AND (n.fecha_publicacion IS NULL OR n.fecha_publicacion <= NOW())";
 const ORDEN_FEED = "n.orden DESC, COALESCE(n.fecha_publicacion, n.fecha_creacion) DESC, n.id DESC";
 
+// ── Alcance por departamental ────────────────────────────────────────────────
+// Una noticia se ve en el portal de todas las departamentales (alcance_todas = 1) o sólo en
+// las de la tabla puente noticia_departamental. La columna heredada noticia.departamental_id
+// guarda el id cuando hay EXACTAMENTE una departamental elegida; NULL en cualquier otro caso.
+const MAX_DEPARTAMENTALES_NOTICIA = 50;
+const MENSAJE_ALCANCE_SIN_DEPARTAMENTALES = "Elegí al menos una departamental o marcá «Todas las departamentales»";
+const MENSAJE_DEPARTAMENTALES_INVALIDAS = "Hay departamentales inválidas en el alcance";
+// Se ve en el portal de una departamental (param: su id; 0 = sólo las de todas).
+const CONDICION_ALCANCE_PORTAL = "(n.alcance_todas = 1 OR EXISTS (SELECT 1 FROM noticia_departamental nd WHERE nd.noticia_id = n.id AND nd.departamental_id = ?))";
+// Elegida específicamente para una departamental (param: su id).
+const CONDICION_SOLO_DEPARTAMENTAL = "(n.alcance_todas = 0 AND EXISTS (SELECT 1 FROM noticia_departamental nd WHERE nd.noticia_id = n.id AND nd.departamental_id = ?))";
+const COLADOR_ES = new Intl.Collator("es", { sensitivity: "base", numeric: true });
+
+// ── Portal departamental del afiliado ────────────────────────────────────────
+const MENSAJE_SOLO_AFILIADOS = "Sólo los afiliados ven el portal de su departamental";
+const CONDICION_PORTAL = `${CONDICION_PUBLICA} AND ${CONDICION_ALCANCE_PORTAL}`;
+const MAX_PAGINA_PORTAL = 30;
+const DIAS_RESUMEN_POR_DEFECTO = 14;
+const TOPE_RESUMEN_NUEVAS = 99;
+const ORIGENES_PORTAL = new Set(["propias", "generales"]);
+
+const SQL_GALERIA_NOTICIA = "SELECT id, archivo, epigrafe, orden, ancho, alto, mime, variantes FROM noticia_imagen WHERE noticia_id = ? ORDER BY orden ASC, id ASC";
+
 function normalizarTexto(valor) {
   if (typeof valor !== "string") return null;
   const texto = valor.trim();
@@ -215,10 +240,10 @@ function normalizarIdPositivo(valor) {
   return null;
 }
 
-function normalizarPaginacion(query, tamanioPorDefecto = 10) {
+function normalizarPaginacion(query, tamanioPorDefecto = 10, tamanioMaximo = 100) {
   const page = query?.page === undefined || query?.page === "" ? 1 : normalizarIdPositivo(query.page);
   const pageSize = query?.pageSize === undefined || query?.pageSize === "" ? tamanioPorDefecto : normalizarIdPositivo(query.pageSize);
-  if (page === null || pageSize === null || page > 1_000_000 || pageSize > 100) return null;
+  if (page === null || pageSize === null || page > 1_000_000 || pageSize > tamanioMaximo) return null;
   return { page, pageSize, start: (page - 1) * pageSize };
 }
 
@@ -242,6 +267,310 @@ function normalizarBooleanoBinario(valor, porDefecto = 0) {
   if (valor === 1 || valor === "1" || valor === true || valor === "true") return 1;
   if (valor === 0 || valor === "0" || valor === false || valor === "false") return 0;
   return null;
+}
+
+function valorPresente(valor) {
+  return valor !== undefined && valor !== null && !(typeof valor === "string" && valor.trim() === "");
+}
+
+// Departamentales elegidas para una noticia: string JSON ("[1,7,9]"), CSV ("1,7,9"),
+// campo multipart repetido (multer arma un array) o array nativo. Devuelve los ids en el
+// orden recibido; null si hay ids inválidos, repetidos o más de MAX_DEPARTAMENTALES_NOTICIA.
+function normalizarListaDepartamentales(valor) {
+  if (valor === undefined || valor === null) return [];
+  let items;
+  if (Array.isArray(valor)) {
+    items = valor;
+  } else if (typeof valor === "number") {
+    items = [valor];
+  } else if (typeof valor === "string") {
+    const texto = valor.trim();
+    if (!texto) return [];
+    if (texto.startsWith("[")) {
+      try {
+        items = JSON.parse(texto);
+      } catch (_error) {
+        return null;
+      }
+      if (!Array.isArray(items)) return null;
+    } else {
+      items = texto.split(",");
+    }
+  } else {
+    return null;
+  }
+
+  if (items.length > MAX_DEPARTAMENTALES_NOTICIA) return null;
+  const ids = [];
+  for (const item of items) {
+    // También se acepta { id } por si el cliente reenvía los objetos que devuelve la API.
+    const id = item !== null && typeof item === "object" && !Array.isArray(item)
+      ? normalizarIdPositivo(item.id)
+      : normalizarIdPositivo(item);
+    if (!id || ids.includes(id)) return null;
+    ids.push(id);
+  }
+  return ids;
+}
+
+// Alcance de la noticia: { alcanceTodas: 1, departamentales: [] } o
+// { alcanceTodas: 0, departamentales: [ids] }.
+// Compatibilidad: el editor anterior no manda alcance_todas sino departamental_id
+// ("" / ausente = todas; un id = sólo esa departamental).
+function normalizarAlcanceNoticia(body = {}) {
+  if (!valorPresente(body.alcance_todas)) {
+    if (valorPresente(body.departamentales)) {
+      const lista = normalizarListaDepartamentales(body.departamentales);
+      if (lista === null) return { error: MENSAJE_DEPARTAMENTALES_INVALIDAS };
+      if (lista.length > 0) return { value: { alcanceTodas: 0, departamentales: lista } };
+    }
+    if (!valorPresente(body.departamental_id)) return { value: { alcanceTodas: 1, departamentales: [] } };
+    const departamentalId = normalizarIdPositivo(body.departamental_id);
+    if (!departamentalId) return { error: "La departamental es inválida" };
+    return { value: { alcanceTodas: 0, departamentales: [departamentalId] } };
+  }
+
+  const alcanceTodas = normalizarBooleanoBinario(
+    typeof body.alcance_todas === "string" ? body.alcance_todas.trim() : body.alcance_todas
+  );
+  if (alcanceTodas === null) return { error: "El alcance de la noticia es inválido" };
+  // Con «Todas las departamentales» la lista no se usa (el editor puede conservarla en el form).
+  if (alcanceTodas === 1) return { value: { alcanceTodas: 1, departamentales: [] } };
+
+  const lista = normalizarListaDepartamentales(body.departamentales);
+  if (lista === null) return { error: MENSAJE_DEPARTAMENTALES_INVALIDAS };
+  if (lista.length === 0) return { error: MENSAJE_ALCANCE_SIN_DEPARTAMENTALES };
+  return { value: { alcanceTodas: 0, departamentales: lista } };
+}
+
+// Valor de la columna heredada noticia.departamental_id.
+function departamentalHeredado({ alcanceTodas, departamentales } = {}) {
+  return alcanceTodas === 0 && Array.isArray(departamentales) && departamentales.length === 1
+    ? departamentales[0]
+    : null;
+}
+
+// Sólo un 0 explícito restringe la noticia a algunas departamentales.
+function esAlcanceTodas(valor) {
+  return !(valor === 0 || valor === "0" || valor === false);
+}
+
+function compararDepartamentales(a, b) {
+  return COLADOR_ES.compare(a.nombre, b.nombre) || a.id - b.id;
+}
+
+// Resumen para chips y tarjetas: "La Plata" · "Azul y La Plata" · "3 departamentales".
+function resumirDepartamentales(departamentales) {
+  const lista = Array.isArray(departamentales) ? departamentales : [];
+  if (lista.length === 0) return null;
+  if (lista.length === 1) return lista[0].nombre;
+  if (lista.length === 2) return `${lista[0].nombre} y ${lista[1].nombre}`;
+  return `${lista.length} departamentales`;
+}
+
+// Campos de alcance de una noticia serializada (orden alfabético en español).
+function serializarAlcanceNoticia(alcanceTodas, departamentales = []) {
+  if (esAlcanceTodas(alcanceTodas)) {
+    return { alcance_todas: true, departamentales: [], departamental_id: null, departamental_nombre: null };
+  }
+  const lista = (Array.isArray(departamentales) ? departamentales : [])
+    .map((departamental) => ({
+      id: Number(departamental.id),
+      nombre: departamental.nombre || `Departamental ${departamental.id}`,
+    }))
+    .sort(compararDepartamentales);
+  return {
+    alcance_todas: false,
+    departamentales: lista,
+    departamental_id: lista.length === 1 ? lista[0].id : null,
+    departamental_nombre: resumirDepartamentales(lista),
+  };
+}
+
+// Departamentales de varias noticias en UNA consulta (nada de N+1). Las noticias para
+// todas las departamentales no tienen filas puente: ni se consultan.
+async function cargarDepartamentalesDeNoticias(db, filas) {
+  const ids = [];
+  for (const fila of filas || []) {
+    const id = Number(fila?.id);
+    if (!esAlcanceTodas(fila?.alcance_todas) && Number.isSafeInteger(id) && id > 0 && !ids.includes(id)) {
+      ids.push(id);
+    }
+  }
+  const mapa = new Map();
+  if (ids.length === 0) return mapa;
+
+  const [filasPuente] = await db.query(
+    `SELECT nd.noticia_id, d.id, d.nombre
+     FROM noticia_departamental nd
+     INNER JOIN departamental d ON d.id = nd.departamental_id
+     WHERE nd.noticia_id IN (${ids.map(() => "?").join(",")})`,
+    ids
+  );
+  for (const fila of filasPuente || []) {
+    const noticiaId = Number(fila.noticia_id);
+    if (!mapa.has(noticiaId)) mapa.set(noticiaId, []);
+    mapa.get(noticiaId).push({ id: Number(fila.id), nombre: fila.nombre });
+  }
+  return mapa;
+}
+
+// Cada id tiene que existir habilitado o, al editar, ya estar asignado a esa noticia
+// (una departamental dada de baja después no traba la edición).
+async function validarDepartamentalesAlcance(db, departamentales, noticiaId = null) {
+  if (!Array.isArray(departamentales) || departamentales.length === 0) return true;
+  const marcadores = departamentales.map(() => "?").join(",");
+  const [filas] = noticiaId
+    ? await db.query(
+      `SELECT d.id FROM departamental d
+       WHERE d.id IN (${marcadores})
+         AND (d.habilitado = 'Y' OR EXISTS (
+           SELECT 1 FROM noticia_departamental nd WHERE nd.noticia_id = ? AND nd.departamental_id = d.id))`,
+      [...departamentales, noticiaId]
+    )
+    : await db.query(
+      `SELECT d.id FROM departamental d WHERE d.id IN (${marcadores}) AND d.habilitado = 'Y'`,
+      departamentales
+    );
+  const validas = new Set((filas || []).map((fila) => Number(fila.id)));
+  return departamentales.every((id) => validas.has(id));
+}
+
+// Reemplaza las filas puente dentro de la transacción de la noticia.
+async function guardarDepartamentalesNoticia(connection, noticiaId, departamentales, { reemplazar = true } = {}) {
+  if (reemplazar) {
+    await connection.query("DELETE FROM noticia_departamental WHERE noticia_id = ?", [noticiaId]);
+  }
+  if (!Array.isArray(departamentales) || departamentales.length === 0) return;
+  await connection.query(
+    `INSERT INTO noticia_departamental (noticia_id, departamental_id)
+     VALUES ${departamentales.map(() => "(?, ?)").join(", ")}`,
+    departamentales.flatMap((departamentalId) => [noticiaId, departamentalId])
+  );
+}
+
+// ── Portal departamental del afiliado ────────────────────────────────────────
+
+// El familiar invitado ya queda afuera en verifyToken (sólo turismo); se vuelve a mirar acá.
+const esAfiliadoDelPortal = (cabecera) => (
+  cabecera?.rol === "afiliado" && !cabecera?.acceso_familiar_turismo
+);
+
+// La cabecera trae la departamental refrescada desde la base en cada pedido.
+function departamentalDeCabecera(cabecera) {
+  return normalizarIdPositivo(cabecera?.departamental_id) || 0;
+}
+
+function normalizarOrigenPortal(valor) {
+  if (valor === undefined || valor === null) return { value: null };
+  if (typeof valor !== "string") return { error: "El origen de las noticias es inválido" };
+  const origen = valor.trim().toLowerCase();
+  if (!origen || origen === "todas") return { value: null };
+  if (!ORIGENES_PORTAL.has(origen)) return { error: "El origen de las noticias es inválido" };
+  return { value: origen };
+}
+
+// WHERE + parámetros del listado del portal (el primer parámetro es la departamental).
+function construirConsultaPortal({
+  departamentalId = 0,
+  origen = null,
+  categoria = null,
+  busqueda = null,
+  idsExcluidos = [],
+} = {}) {
+  const condiciones = [CONDICION_PORTAL];
+  const params = [departamentalId];
+  // Visible + alcance_todas = 0 implica que incluye la departamental del afiliado.
+  if (origen === "propias") condiciones.push("n.alcance_todas = 0");
+  if (origen === "generales") condiciones.push("n.alcance_todas = 1");
+  if (categoria) {
+    condiciones.push("n.categoria = ?");
+    params.push(categoria);
+  }
+  if (busqueda) {
+    condiciones.push("(n.titulo LIKE ? OR n.bajada LIKE ?)");
+    params.push(`%${busqueda}%`, `%${busqueda}%`);
+  }
+  if (idsExcluidos.length > 0) {
+    condiciones.push(`n.id NOT IN (${idsExcluidos.map(() => "?").join(",")})`);
+    params.push(...idsExcluidos);
+  }
+  return { where: condiciones.join(" AND "), params };
+}
+
+function coordenadaOpcional(valor) {
+  if (valor === null || valor === undefined || valor === "") return null;
+  const numero = Number(valor);
+  return Number.isFinite(numero) ? numero : null;
+}
+
+// coordenadas es POINT(lng, lat): lng = ST_X, lat = ST_Y.
+async function obtenerDepartamentalPortal(db, departamentalId) {
+  if (!departamentalId) return null;
+  const [filas] = await db.query(
+    `SELECT d.id, d.nombre, d.direccion, d.localidad,
+            ST_Y(d.coordenadas) AS lat, ST_X(d.coordenadas) AS lng
+     FROM departamental d
+     WHERE d.id = ?
+     LIMIT 1`,
+    [departamentalId]
+  );
+  const fila = filas?.[0];
+  if (!fila) return null;
+  let lat = coordenadaOpcional(fila.lat);
+  let lng = coordenadaOpcional(fila.lng);
+  // POINT(0 0) es un marcador vacío, no una sede en el golfo de Guinea.
+  if (lat === null || lng === null || (lat === 0 && lng === 0)) {
+    lat = null;
+    lng = null;
+  }
+  return {
+    id: Number(fila.id),
+    nombre: fila.nombre || null,
+    direccion: fila.direccion || null,
+    localidad: fila.localidad || null,
+    lat,
+    lng,
+  };
+}
+
+// ISO 8601 estricto ("2026-10-08", "2026-10-08T09:30", "…:15.123Z", "…-03:00"). Sin zona
+// horaria se interpreta en hora argentina (como el resto de la API). Si falta o es inválida:
+// los últimos DIAS_RESUMEN_POR_DEFECTO días.
+const PATRON_FECHA_ISO_8601 = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,9}))?)?(Z|[+-]\d{2}(?::?\d{2})?)?)?$/i;
+
+function normalizarDesdeResumen(valor, ahora = new Date()) {
+  const porDefecto = new Date(ahora.getTime() - DIAS_RESUMEN_POR_DEFECTO * 24 * 60 * 60 * 1000);
+  if (typeof valor !== "string") return porDefecto;
+  const coincidencia = PATRON_FECHA_ISO_8601.exec(valor.trim());
+  if (!coincidencia) return porDefecto;
+
+  const [, anio, mes, dia, hora = "00", minuto = "00", segundo = "00", fraccion = "", zona] = coincidencia;
+  const diasDelMes = new Date(Date.UTC(Number(anio), Number(mes), 0)).getUTCDate();
+  if (
+    Number(anio) < 1970
+    || Number(mes) < 1 || Number(mes) > 12
+    || Number(dia) < 1 || Number(dia) > diasDelMes
+    || Number(hora) > 23 || Number(minuto) > 59 || Number(segundo) > 59
+  ) {
+    return porDefecto;
+  }
+
+  let desplazamiento = "-03:00";
+  if (zona) {
+    if (zona.toUpperCase() === "Z") {
+      desplazamiento = "Z";
+    } else {
+      const compacta = zona.replace(":", "");
+      const horas = compacta.slice(1, 3);
+      const minutos = compacta.slice(3, 5) || "00";
+      if (Number(horas) > 14 || Number(minutos) > 59) return porDefecto;
+      desplazamiento = `${compacta[0]}${horas}:${minutos}`;
+    }
+  }
+  const milisegundos = `${fraccion}000`.slice(0, 3);
+  const fecha = new Date(`${anio}-${mes}-${dia}T${hora}:${minuto}:${segundo}.${milisegundos}${desplazamiento}`);
+  return Number.isNaN(fecha.getTime()) ? porDefecto : fecha;
 }
 
 // Acepta el formato de <input type="datetime-local"> y variantes con segundos.
@@ -407,11 +736,8 @@ function validarDatosNoticia(body) {
     orden = ordenNumero;
   }
 
-  let departamentalId = null;
-  if (body.departamental_id !== undefined && body.departamental_id !== null && body.departamental_id !== "") {
-    departamentalId = normalizarIdPositivo(body.departamental_id);
-    if (!departamentalId) return { error: "La departamental es inválida" };
-  }
+  const alcance = normalizarAlcanceNoticia(body);
+  if (alcance.error) return { error: alcance.error };
 
   if (typeof body.cuerpo === "string" && body.cuerpo.length > MAX_LARGO_CUERPO) {
     return { error: "El cuerpo de la noticia es demasiado largo" };
@@ -429,20 +755,14 @@ function validarDatosNoticia(body) {
       estado,
       destacada,
       orden,
-      departamentalId,
+      alcanceTodas: alcance.value.alcanceTodas,
+      departamentales: alcance.value.departamentales,
+      // Columna heredada: el id si hay exactamente una departamental; si no, NULL.
+      departamentalId: departamentalHeredado(alcance.value),
       cuerpo,
       fechaPublicacion: fechaPublicacion.value,
     },
   };
-}
-
-async function validarDepartamentalExistente(db, departamentalId) {
-  if (!departamentalId) return true;
-  const [filas] = await db.query(
-    "SELECT id FROM departamental WHERE id = ? AND habilitado = 'Y'",
-    [departamentalId]
-  );
-  return filas.length > 0;
 }
 
 function serializarVariantesDb(media) {
@@ -494,17 +814,24 @@ function habilitarCachePublica(res) {
   );
 }
 
-async function firmarNoticia(fila, { conCuerpo = false } = {}) {
+// departamentalesPorNoticia: Map noticia_id → [{ id, nombre }] (cargarDepartamentalesDeNoticias).
+async function firmarNoticia(fila, { conCuerpo = false, departamentalesPorNoticia = null } = {}) {
   const descriptor = descriptorDesdeNoticia(fila);
   const mediaResuelta = await noticiaMedia.resolver(descriptor);
+  const alcance = serializarAlcanceNoticia(
+    fila.alcance_todas,
+    departamentalesPorNoticia?.get(Number(fila.id)) || []
+  );
 
   const noticia = {
     id: Number(fila.id),
     titulo: fila.titulo,
     bajada: fila.bajada || null,
     categoria: fila.categoria,
-    departamental_id: fila.departamental_id === null || fila.departamental_id === undefined ? null : Number(fila.departamental_id),
-    departamental_nombre: fila.departamental_nombre || null,
+    alcance_todas: alcance.alcance_todas,
+    departamentales: alcance.departamentales,
+    departamental_id: alcance.departamental_id,
+    departamental_nombre: alcance.departamental_nombre,
     destacada: fila.destacada === 1 || fila.destacada === true,
     orden: Number(fila.orden || 0),
     estado: fila.estado,
@@ -528,6 +855,24 @@ async function firmarNoticia(fila, { conCuerpo = false } = {}) {
   return noticia;
 }
 
+// Serializa una lista con las departamentales cargadas en una sola consulta.
+async function firmarNoticias(db, filas, opciones = {}) {
+  const departamentalesPorNoticia = await cargarDepartamentalesDeNoticias(db, filas);
+  return Promise.all((filas || []).map((fila) => firmarNoticia(fila, { ...opciones, departamentalesPorNoticia })));
+}
+
+function marcarParaMiDepartamental(noticia, departamentalId) {
+  noticia.para_mi_departamental = departamentalId > 0
+    && noticia.alcance_todas === false
+    && noticia.departamentales.some((departamental) => departamental.id === departamentalId);
+  return noticia;
+}
+
+async function firmarNoticiasDelPortal(db, filas, departamentalId, opciones = {}) {
+  const noticias = await firmarNoticias(db, filas, opciones);
+  return noticias.map((noticia) => marcarParaMiDepartamental(noticia, departamentalId));
+}
+
 async function firmarGaleria(filas) {
   const resultado = [];
   for (const fila of filas || []) {
@@ -548,8 +893,9 @@ async function firmarGaleria(filas) {
   return resultado;
 }
 
+// Las departamentales (y el resumen departamental_nombre) salen de noticia_departamental.
 const CAMPOS_NOTICIA = `
-  n.id, n.titulo, n.bajada, n.categoria, n.departamental_id, d.nombre AS departamental_nombre,
+  n.id, n.titulo, n.bajada, n.categoria, n.alcance_todas,
   n.destacada, n.orden, n.estado, n.fecha_publicacion, n.fecha_creacion, n.fecha_modificacion,
   n.imagen_archivo, n.imagen_ancho, n.imagen_alto, n.imagen_mime, n.imagen_variantes
 `;
@@ -580,9 +926,10 @@ router.get("/noticias/publicas", async (req, res) => {
       condiciones.push("n.categoria = ?");
       params.push(categoria);
     }
+    // Noticias elegidas específicamente para esa departamental (no las de todas).
     const departamentalId = normalizarIdPositivo(req.query.departamental_id);
     if (departamentalId) {
-      condiciones.push("n.departamental_id = ?");
+      condiciones.push(CONDICION_SOLO_DEPARTAMENTAL);
       params.push(departamentalId);
     }
     const busqueda = normalizarTexto(req.query.q);
@@ -600,14 +947,13 @@ router.get("/noticias/publicas", async (req, res) => {
     const [filas] = await db.query(
       `SELECT ${CAMPOS_NOTICIA}
        FROM noticia n
-       LEFT JOIN departamental d ON d.id = n.departamental_id
        WHERE ${where}
        ORDER BY ${ORDEN_FEED}
        LIMIT ? OFFSET ?`,
       [...params, pageSize, (page - 1) * pageSize]
     );
 
-    const results = await Promise.all(filas.map((fila) => firmarNoticia(fila)));
+    const results = await firmarNoticias(db, filas);
     habilitarCachePublica(res);
     res.status(200).json({ results, totalItems, page, pageSize });
   } catch (error) {
@@ -622,12 +968,11 @@ router.get("/noticias/publicas/destacadas", async (req, res) => {
     const [filas] = await db.query(
       `SELECT ${CAMPOS_NOTICIA}
        FROM noticia n
-       LEFT JOIN departamental d ON d.id = n.departamental_id
        WHERE ${CONDICION_PUBLICA} AND n.destacada = 1
        ORDER BY ${ORDEN_FEED}
        LIMIT ${MAX_NOTICIAS_DESTACADAS}`
     );
-    const destacadas = await Promise.all(filas.map((fila) => firmarNoticia(fila)));
+    const destacadas = await firmarNoticias(db, filas);
     habilitarCachePublica(res);
     res.status(200).json(destacadas);
   } catch (error) {
@@ -637,6 +982,7 @@ router.get("/noticias/publicas/destacadas", async (req, res) => {
 });
 
 // Categorías y departamentales con noticias publicadas, para los filtros del feed.
+// Una departamental cuenta las noticias elegidas específicamente para ella.
 router.get("/noticias/publicas/filtros", async (req, res) => {
   try {
     const db = mysqlConnection.promise();
@@ -650,7 +996,8 @@ router.get("/noticias/publicas/filtros", async (req, res) => {
     const [departamentales] = await db.query(
       `SELECT d.id, d.nombre, COUNT(n.id) AS total
        FROM departamental d
-       INNER JOIN noticia n ON n.departamental_id = d.id AND ${CONDICION_PUBLICA}
+       INNER JOIN noticia_departamental nd ON nd.departamental_id = d.id
+       INNER JOIN noticia n ON n.id = nd.noticia_id AND n.alcance_todas = 0 AND ${CONDICION_PUBLICA}
        WHERE d.habilitado = 'Y'
        GROUP BY d.id, d.nombre
        ORDER BY d.nombre ASC`
@@ -675,36 +1022,185 @@ router.get("/noticias/publicas/:id(\\d+)", async (req, res) => {
     const [filas] = await db.query(
       `SELECT ${CAMPOS_NOTICIA}, n.cuerpo
        FROM noticia n
-       LEFT JOIN departamental d ON d.id = n.departamental_id
        WHERE ${CONDICION_PUBLICA} AND n.id = ?
        LIMIT 1`,
       [noticiaId]
     );
     if (filas.length === 0) return res.status(404).json("Noticia no encontrada");
 
-    const noticia = await firmarNoticia(filas[0], { conCuerpo: true });
-
-    const [galeria] = await db.query(
-      "SELECT id, archivo, epigrafe, orden, ancho, alto, mime, variantes FROM noticia_imagen WHERE noticia_id = ? ORDER BY orden ASC, id ASC",
-      [noticiaId]
-    );
-    noticia.galeria = await firmarGaleria(galeria);
+    const [galeria] = await db.query(SQL_GALERIA_NOTICIA, [noticiaId]);
 
     const [relacionadasFilas] = await db.query(
       `SELECT ${CAMPOS_NOTICIA}
        FROM noticia n
-       LEFT JOIN departamental d ON d.id = n.departamental_id
        WHERE ${CONDICION_PUBLICA} AND n.id <> ? AND n.categoria = ?
        ORDER BY ${ORDEN_FEED}
        LIMIT 3`,
-      [noticiaId, noticia.categoria]
+      [noticiaId, filas[0].categoria]
     );
-    noticia.relacionadas = await Promise.all(relacionadasFilas.map((fila) => firmarNoticia(fila)));
+
+    // Una sola consulta para las departamentales de la noticia y de sus relacionadas.
+    const departamentalesPorNoticia = await cargarDepartamentalesDeNoticias(db, [filas[0], ...relacionadasFilas]);
+    const noticia = await firmarNoticia(filas[0], { conCuerpo: true, departamentalesPorNoticia });
+    noticia.galeria = await firmarGaleria(galeria);
+    noticia.relacionadas = await Promise.all(
+      relacionadasFilas.map((fila) => firmarNoticia(fila, { departamentalesPorNoticia }))
+    );
 
     habilitarCachePublica(res);
     res.status(200).json(noticia);
   } catch (error) {
     console.error("Error al obtener la noticia:", error);
+    res.status(500).json("Error al obtener la noticia");
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AFILIADO · Portal de su departamental (rol afiliado)
+// Ve lo publicado para su departamental + lo publicado para todas las departamentales.
+// La departamental sale de la cabecera, que verifyToken refresca desde la base.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function cabeceraDelPortal(req, res) {
+  res.set("Cache-Control", "private, no-store");
+  const cabecera = getCabecera(req);
+  if (!esAfiliadoDelPortal(cabecera)) {
+    res.status(403).json(MENSAJE_SOLO_AFILIADOS);
+    return null;
+  }
+  return cabecera;
+}
+
+router.get("/noticias/departamental", verifyToken, async (req, res) => {
+  try {
+    const cabecera = cabeceraDelPortal(req, res);
+    if (!cabecera) return;
+
+    const paginacion = normalizarPaginacion(req.query, 9, MAX_PAGINA_PORTAL);
+    if (!paginacion) return res.status(400).json("La paginación es inválida");
+    const { page, pageSize, start } = paginacion;
+
+    const origen = normalizarOrigenPortal(req.query.origen);
+    if (origen.error) return res.status(400).json(origen.error);
+    const idsExcluidos = normalizarIdsExcluidos(req.query.exclude_ids);
+    if (idsExcluidos === null) return res.status(400).json("Los IDs excluidos son inválidos");
+
+    const departamentalId = departamentalDeCabecera(cabecera);
+    const consulta = construirConsultaPortal({
+      departamentalId,
+      origen: origen.value,
+      categoria: normalizarTexto(req.query.categoria),
+      busqueda: normalizarTexto(req.query.q),
+      idsExcluidos,
+    });
+
+    const db = mysqlConnection.promise();
+    const departamental = await obtenerDepartamentalPortal(db, departamentalId);
+
+    const [[{ totalItems }]] = await db.query(
+      `SELECT COUNT(*) AS totalItems FROM noticia n WHERE ${consulta.where}`,
+      consulta.params
+    );
+    const [filas] = await db.query(
+      `SELECT ${CAMPOS_NOTICIA}
+       FROM noticia n
+       WHERE ${consulta.where}
+       ORDER BY ${ORDEN_FEED}
+       LIMIT ? OFFSET ?`,
+      [...consulta.params, pageSize, start]
+    );
+
+    // Conteos y categorías de todo lo visible (sin los filtros de categoría, origen ni búsqueda).
+    const [[conteosFila]] = await db.query(
+      `SELECT COUNT(*) AS todas,
+              COALESCE(SUM(n.alcance_todas = 0), 0) AS propias,
+              COALESCE(SUM(n.alcance_todas = 1), 0) AS generales
+       FROM noticia n
+       WHERE ${CONDICION_PORTAL}`,
+      [departamentalId]
+    );
+    const [categoriasFilas] = await db.query(
+      `SELECT n.categoria, COUNT(*) AS total
+       FROM noticia n
+       WHERE ${CONDICION_PORTAL}
+       GROUP BY n.categoria
+       ORDER BY total DESC, n.categoria ASC`,
+      [departamentalId]
+    );
+
+    const results = await firmarNoticiasDelPortal(db, filas, departamentalId);
+    res.status(200).json({
+      departamental,
+      results,
+      totalItems: Number(totalItems || 0),
+      page,
+      pageSize,
+      conteos: {
+        todas: Number(conteosFila?.todas || 0),
+        propias: Number(conteosFila?.propias || 0),
+        generales: Number(conteosFila?.generales || 0),
+      },
+      categorias: (categoriasFilas || []).map((fila) => ({ categoria: fila.categoria, total: Number(fila.total) })),
+    });
+  } catch (error) {
+    console.error("Error al obtener el portal de la departamental:", error);
+    res.status(500).json("Error al obtener las noticias de tu departamental");
+  }
+});
+
+// Aviso de la tarjeta del panel /inicio. Va ANTES de /:id (express evalúa en orden).
+router.get("/noticias/departamental/resumen", verifyToken, async (req, res) => {
+  try {
+    const cabecera = cabeceraDelPortal(req, res);
+    if (!cabecera) return;
+
+    const departamentalId = departamentalDeCabecera(cabecera);
+    const desde = normalizarDesdeResumen(req.query.desde);
+    const db = mysqlConnection.promise();
+    const [[fila]] = await db.query(
+      `SELECT COUNT(*) AS nuevas
+       FROM (
+         SELECT n.id
+         FROM noticia n
+         WHERE ${CONDICION_PORTAL} AND COALESCE(n.fecha_publicacion, n.fecha_creacion) > ?
+         LIMIT ${TOPE_RESUMEN_NUEVAS}
+       ) AS recientes`,
+      [departamentalId, desde]
+    );
+    res.status(200).json({ nuevas: Math.min(TOPE_RESUMEN_NUEVAS, Number(fila?.nuevas || 0)) });
+  } catch (error) {
+    console.error("Error al obtener el resumen del portal de la departamental:", error);
+    res.status(500).json("Error al obtener las novedades de tu departamental");
+  }
+});
+
+router.get("/noticias/departamental/:id(\\d+)", verifyToken, async (req, res) => {
+  try {
+    const cabecera = cabeceraDelPortal(req, res);
+    if (!cabecera) return;
+
+    const noticiaId = normalizarIdPositivo(req.params.id);
+    if (!noticiaId) return res.status(400).json("ID inválido");
+
+    const departamentalId = departamentalDeCabecera(cabecera);
+    const db = mysqlConnection.promise();
+    const [filas] = await db.query(
+      `SELECT ${CAMPOS_NOTICIA}, n.cuerpo
+       FROM noticia n
+       WHERE ${CONDICION_PORTAL} AND n.id = ?
+       LIMIT 1`,
+      [departamentalId, noticiaId]
+    );
+    // Lo que no es visible para su departamental no existe para el afiliado.
+    if (filas.length === 0) return res.status(404).json("Noticia no encontrada");
+
+    const [noticia] = await firmarNoticiasDelPortal(db, filas, departamentalId, { conCuerpo: true });
+    const [galeria] = await db.query(SQL_GALERIA_NOTICIA, [noticiaId]);
+    noticia.galeria = await firmarGaleria(galeria);
+
+    res.status(200).json(noticia);
+  } catch (error) {
+    console.error("Error al obtener la noticia del portal de la departamental:", error);
     res.status(500).json("Error al obtener la noticia");
   }
 });
@@ -757,6 +1253,13 @@ router.get("/admin/noticias", verifyToken, async (req, res) => {
       condiciones.push("(n.titulo LIKE ? OR n.bajada LIKE ?)");
       params.push(`%${busqueda}%`, `%${busqueda}%`);
     }
+    // "Se ve en": noticias que aparecen en el portal de esa departamental (todas + las suyas).
+    if (valorPresente(req.query.visible_en)) {
+      const visibleEn = normalizarIdPositivo(req.query.visible_en);
+      if (!visibleEn) return res.status(400).json("La departamental del filtro es inválida");
+      condiciones.push(CONDICION_ALCANCE_PORTAL);
+      params.push(visibleEn);
+    }
     const where = condiciones.join(" AND ");
 
     const [[{ totalItems }]] = await db.query(
@@ -767,7 +1270,6 @@ router.get("/admin/noticias", verifyToken, async (req, res) => {
     const [filas] = await db.query(
       `SELECT ${CAMPOS_NOTICIA}, u.nombre AS autor_nombre, u.apellido AS autor_apellido
        FROM noticia n
-       LEFT JOIN departamental d ON d.id = n.departamental_id
        LEFT JOIN usuario u ON u.id = n.creado_por_usuario_id
        WHERE ${where}
        ORDER BY ${orderBy} ${orderType}, n.id DESC
@@ -788,7 +1290,7 @@ router.get("/admin/noticias", verifyToken, async (req, res) => {
       conteos.destacadas += Number(fila.destacadas || 0);
     });
 
-    const results = await Promise.all(filas.map((fila) => firmarNoticia(fila)));
+    const results = await firmarNoticias(db, filas);
     res.status(200).json({ results, totalItems, page, pageSize, conteos });
   } catch (error) {
     console.error("Error al obtener las noticias del panel:", error);
@@ -836,7 +1338,6 @@ router.get("/admin/noticias/:id(\\d+)", verifyToken, async (req, res) => {
     const [filas] = await db.query(
       `SELECT ${CAMPOS_NOTICIA}, n.cuerpo, u.nombre AS autor_nombre, u.apellido AS autor_apellido
        FROM noticia n
-       LEFT JOIN departamental d ON d.id = n.departamental_id
        LEFT JOIN usuario u ON u.id = n.creado_por_usuario_id
        WHERE n.eliminado = 0 AND n.id = ?
        LIMIT 1`,
@@ -844,11 +1345,8 @@ router.get("/admin/noticias/:id(\\d+)", verifyToken, async (req, res) => {
     );
     if (filas.length === 0) return res.status(404).json("Noticia no encontrada");
 
-    const noticia = await firmarNoticia(filas[0], { conCuerpo: true });
-    const [galeria] = await db.query(
-      "SELECT id, archivo, epigrafe, orden, ancho, alto, mime, variantes FROM noticia_imagen WHERE noticia_id = ? ORDER BY orden ASC, id ASC",
-      [noticiaId]
-    );
+    const [noticia] = await firmarNoticias(db, filas, { conCuerpo: true });
+    const [galeria] = await db.query(SQL_GALERIA_NOTICIA, [noticiaId]);
     noticia.galeria = await firmarGaleria(galeria);
 
     res.status(200).json(noticia);
@@ -873,8 +1371,8 @@ router.post("/admin/noticias", verifyToken, manejarUploadNoticia, async (req, re
     const datos = parseo.value;
 
     const db = mysqlConnection.promise();
-    if (!(await validarDepartamentalExistente(db, datos.departamentalId))) {
-      return res.status(400).json("La departamental es inválida");
+    if (!(await validarDepartamentalesAlcance(db, datos.departamentales))) {
+      return res.status(400).json(MENSAJE_DEPARTAMENTALES_INVALIDAS);
     }
 
     // Publicar sin fecha explícita equivale a publicar ahora.
@@ -905,18 +1403,19 @@ router.post("/admin/noticias", verifyToken, manejarUploadNoticia, async (req, re
     const portadaDb = descriptorPersistible(mediaPortada);
     const [resultado] = await connection.query(
       `INSERT INTO noticia
-         (titulo, bajada, cuerpo, categoria, departamental_id,
+         (titulo, bajada, cuerpo, categoria, alcance_todas, departamental_id,
           imagen_archivo, imagen_ancho, imagen_alto, imagen_mime, imagen_variantes,
           destacada, orden, estado, fecha_publicacion, creado_por_usuario_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        datos.titulo, datos.bajada, datos.cuerpo, datos.categoria, datos.departamentalId,
+        datos.titulo, datos.bajada, datos.cuerpo, datos.categoria, datos.alcanceTodas, datos.departamentalId,
         portadaDb.archivo, portadaDb.ancho, portadaDb.alto, portadaDb.mime, serializarVariantesDb(portadaDb),
         datos.destacada, datos.orden, datos.estado, datos.fechaPublicacion,
         cabecera.id,
       ]
     );
     const noticiaId = resultado.insertId;
+    await guardarDepartamentalesNoticia(connection, noticiaId, datos.departamentales, { reemplazar: false });
 
     for (let i = 0; i < mediasGaleria.length; i++) {
       const media = descriptorPersistible(mediasGaleria[i]);
@@ -1002,8 +1501,8 @@ router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async
     }
 
     const db = mysqlConnection.promise();
-    if (!(await validarDepartamentalExistente(db, datos.departamentalId))) {
-      return res.status(400).json("La departamental es inválida");
+    if (!(await validarDepartamentalesAlcance(db, datos.departamentales, noticiaId))) {
+      return res.status(400).json(MENSAJE_DEPARTAMENTALES_INVALIDAS);
     }
 
     // Las transformaciones y subidas S3 se hacen antes de tomar el advisory
@@ -1094,17 +1593,19 @@ router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async
     const portadaDb = descriptorPersistible(mediaPortada);
     await connection.query(
       `UPDATE noticia
-       SET titulo = ?, bajada = ?, cuerpo = ?, categoria = ?, departamental_id = ?,
+       SET titulo = ?, bajada = ?, cuerpo = ?, categoria = ?, alcance_todas = ?, departamental_id = ?,
            imagen_archivo = ?, imagen_ancho = ?, imagen_alto = ?, imagen_mime = ?, imagen_variantes = ?,
            destacada = ?, orden = ?, estado = ?, fecha_publicacion = ?
        WHERE id = ?`,
       [
-        datos.titulo, datos.bajada, datos.cuerpo, datos.categoria, datos.departamentalId,
+        datos.titulo, datos.bajada, datos.cuerpo, datos.categoria, datos.alcanceTodas, datos.departamentalId,
         portadaDb.archivo, portadaDb.ancho, portadaDb.alto, portadaDb.mime, serializarVariantesDb(portadaDb),
         datos.destacada, datos.orden, datos.estado, datos.fechaPublicacion,
         noticiaId,
       ]
     );
+    // Mismo commit que la noticia: el alcance nunca queda a medio guardar.
+    await guardarDepartamentalesNoticia(connection, noticiaId, datos.departamentales);
     await connection.commit();
     transaccionIniciada = false;
     commitExitoso = true;
@@ -1287,6 +1788,32 @@ router.__test = Object.freeze({
   normalizarPaginacion,
   normalizarBooleanoBinario,
   puedeGestionarNoticias,
+  // Noticias por departamental
+  CONDICION_ALCANCE_PORTAL,
+  CONDICION_PORTAL,
+  CONDICION_SOLO_DEPARTAMENTAL,
+  DIAS_RESUMEN_POR_DEFECTO,
+  MAX_DEPARTAMENTALES_NOTICIA,
+  MAX_PAGINA_PORTAL,
+  MENSAJE_ALCANCE_SIN_DEPARTAMENTALES,
+  MENSAJE_DEPARTAMENTALES_INVALIDAS,
+  MENSAJE_SOLO_AFILIADOS,
+  TOPE_RESUMEN_NUEVAS,
+  cargarDepartamentalesDeNoticias,
+  construirConsultaPortal,
+  departamentalDeCabecera,
+  departamentalHeredado,
+  esAfiliadoDelPortal,
+  firmarNoticias,
+  guardarDepartamentalesNoticia,
+  normalizarAlcanceNoticia,
+  normalizarDesdeResumen,
+  normalizarListaDepartamentales,
+  normalizarOrigenPortal,
+  obtenerDepartamentalPortal,
+  resumirDepartamentales,
+  serializarAlcanceNoticia,
+  validarDepartamentalesAlcance,
 });
 
 module.exports = router;
