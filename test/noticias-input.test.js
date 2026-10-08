@@ -27,15 +27,15 @@ test("la gestión de noticias rechaza los demás roles", () => {
   assert.equal(puedeGestionarNoticias(null), false);
 });
 
-test("exclude_ids admite hasta cuatro enteros positivos y elimina repetidos", () => {
-  assert.equal(MAX_NOTICIAS_DESTACADAS, 4);
+test("exclude_ids admite hasta cinco enteros positivos y elimina repetidos", () => {
+  assert.equal(MAX_NOTICIAS_DESTACADAS, 5);
   assert.deepEqual(normalizarIdsExcluidos(undefined), []);
   assert.deepEqual(normalizarIdsExcluidos("1, 2,2,900"), [1, 2, 900]);
-  assert.deepEqual(normalizarIdsExcluidos("1,2,3,4"), [1, 2, 3, 4]);
+  assert.deepEqual(normalizarIdsExcluidos("1,2,3,4,5"), [1, 2, 3, 4, 5]);
 });
 
 test("exclude_ids rechaza exceso, valores parciales y formas ambiguas", () => {
-  assert.equal(normalizarIdsExcluidos("1,2,3,4,5"), null);
+  assert.equal(normalizarIdsExcluidos("1,2,3,4,5,6"), null);
   assert.equal(normalizarIdsExcluidos("1,2 OR 1=1"), null);
   assert.equal(normalizarIdsExcluidos("1,,2"), null);
   assert.equal(normalizarIdsExcluidos(["1", "2"]), null);
@@ -56,13 +56,13 @@ test("el cupo no consulta la base cuando la noticia no queda destacada", async (
   assert.equal(consultas, 0);
 });
 
-test("el cupo permite crear la cuarta noticia destacada", async () => {
+test("el cupo permite crear la quinta noticia destacada", async () => {
   const connection = {
     query: async (sql, params) => {
       assert.match(sql, /eliminado = 0 AND destacada = 1/);
       assert.doesNotMatch(sql, /id <> \?/);
       assert.deepEqual(params, []);
-      return [[{ total: 3 }]];
+      return [[{ total: 4 }]];
     },
   };
 
@@ -74,22 +74,22 @@ test("el cupo excluye la noticia actual al editar", async () => {
     query: async (sql, params) => {
       assert.match(sql, /id <> \?/);
       assert.deepEqual(params, [23]);
-      return [[{ total: 3 }]];
+      return [[{ total: 4 }]];
     },
   };
 
   await validarCupoNoticiasDestacadas(connection, 1, 23);
 });
 
-test("el cupo rechaza una quinta noticia destacada con conflicto 409", async () => {
+test("el cupo rechaza una sexta noticia destacada con conflicto 409", async () => {
   const connection = {
-    query: async () => [[{ total: 4 }]],
+    query: async () => [[{ total: 5 }]],
   };
 
   await assert.rejects(
     validarCupoNoticiasDestacadas(connection, 1),
     (error) => error.statusCode === 409
-      && error.message === "Solo se pueden destacar hasta 4 noticias"
+      && error.message === "Solo se pueden destacar hasta 5 noticias"
   );
 });
 

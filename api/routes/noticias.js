@@ -191,9 +191,8 @@ const puedeGestionarNoticias = (cabecera) => (
 const ESTADOS_NOTICIA = ["BORRADOR", "PUBLICADA", "ARCHIVADA"];
 const MAX_IMAGENES_GALERIA = 12;
 const MAX_LARGO_CUERPO = 120000;
-// Las destacadas son el carrusel de la portada pública: entre 3 y 4 de alto
-// impacto (Mi AJB no es un diario; la cobertura diaria vive en ajb.org.ar).
-const MAX_NOTICIAS_DESTACADAS = 4;
+// Las destacadas rotan en el carrusel de la portada pública.
+const MAX_NOTICIAS_DESTACADAS = 5;
 const LOCK_NOTICIAS_DESTACADAS_TIMEOUT_SEGUNDOS = 5;
 const EXPRESION_NOMBRE_LOCK_DESTACADAS = "CONCAT('noticias_destacadas:', DATABASE())";
 
