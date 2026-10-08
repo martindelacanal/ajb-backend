@@ -213,6 +213,7 @@ test("aprobar guarda valores elegidos, código, autor y estado juntos y registra
         assert.ok(historial.some(({ params }) => params[3] === "UPDATE" && params[6] === "Importe autorizado"));
         assert.ok(historial.some(({ params }) => params[3] === "CAMBIO_ESTADO" && params[4] === 4 && params[5] === 7));
         assert.ok(llamadas.some(({ sql }) => /INSERT INTO notificacion/.test(sql)));
+        assert.ok(llamadas.some(({ sql, params }) => /INSERT INTO notificacion/.test(sql) && params[0] === 9 && /Ya podés imprimir la constancia de reintegro.*presentarla ante la Corte/.test(params[3])));
         assert.deepEqual(eventos.filter((evento) => ["begin", "commit", "rollback"].includes(evento)), ["begin", "commit"]);
       });
     }
