@@ -103,8 +103,8 @@ test("Noticias corta la sesion de un administrador actualmente inhabilitado", as
   );
 
   assert.equal(resultado.continuo, false);
-  assert.equal(resultado.status, 403);
-  assert.equal(resultado.body, "Usuario inhabilitado");
+  assert.equal(resultado.status, 401);
+  assert.deepEqual(resultado.body, { mensaje: "Usuario inhabilitado", code: "SESSION_REVOKED" });
   assert.equal(consultas, 1);
 });
 

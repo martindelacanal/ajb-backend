@@ -1,5 +1,7 @@
 "use strict";
 
+const { huellaPassword, igualesSeguros } = require("./auth-crypto");
+
 class ErrorSesionUsuario extends Error {
   constructor(message, statusCode = 403) {
     super(message);
@@ -19,7 +21,7 @@ function parsearCabecera(authData) {
     }
     return { ...cabecera, id: usuarioId };
   } catch (_error) {
-    throw new ErrorSesionUsuario("La sesión no contiene un usuario válido");
+    throw new ErrorSesionUsuario("La sesión no contiene un usuario válido", 401);
   }
 }
 
@@ -62,15 +64,18 @@ function rutaPermitidaFamiliar(req) {
   return /^\/(?:sesion\/permisos|configuracion\/usuario(?:\/\d+)?|usuario|notificaciones(?:\/.*)?|mis-gestiones(?:\/catalogos)?|turismo(?:\/.*)?|reserva(?:\/.*)?|reservas\/aprobaciones-titular|servicios(?:\/.*)?|lugares|recursos|adicionales|regimen|tipo_persona|parentesco|acompaniantes(?:\/\d+)?|tabla\/acompaniantes|familiares(?:\/.*)?|convenios-hoteleros(?:\/.*)?|sorteos(?:\/.*)?|filtros\/para-recursos|descuentos(?:\/.*)?|observaciones\/turismo\/\d+\/lectura|webauthn(?:\/.*)?)\/?$/.test(ruta);
 }
 
-async function actualizarAutorizacionSesion(authData, db) {
+async function actualizarAutorizacionSesion(authData, db, jwtSecret = process.env.JWT_SECRET) {
   const cabecera = parsearCabecera(authData);
   const [usuarios] = await db.query(
     `SELECT
        u.id,
+       u.documento,
        u.rol_id,
        r.nombre AS rol,
        u.departamental_id,
        u.habilitado,
+       u.password,
+       u.auth_revocado_desde,
        u.area_turismo,
        u.area_coseguro,
        u.modulo_turismo,
@@ -86,11 +91,27 @@ async function actualizarAutorizacionSesion(authData, db) {
   );
 
   if (!usuarios.length) {
-    throw new ErrorSesionUsuario("El usuario de la sesión ya no existe");
+    throw new ErrorSesionUsuario("El usuario de la sesión ya no existe", 401);
   }
   if (!usuarioHabilitado(usuarios[0].habilitado)) {
-    throw new ErrorSesionUsuario("Usuario inhabilitado");
+    throw new ErrorSesionUsuario("Usuario inhabilitado", 401);
   }
+
+  const usuario = usuarios[0];
+  if (authData.sid) {
+    if (!igualesSeguros(authData.passwordVersion, huellaPassword(usuario.password, jwtSecret))) {
+      throw new ErrorSesionUsuario("Tu sesión ya no es válida. Volvé a iniciar sesión.", 401);
+    }
+    const [sesiones] = await db.query(`SELECT id FROM auth_sesion WHERE id = ? AND usuario_id = ?
+      AND revocado_en IS NULL AND (vence_en IS NULL OR vence_en > NOW(6))
+      AND (? IS NULL OR creada_en > ?) LIMIT 1`, [authData.sid, cabecera.id, usuario.auth_revocado_desde || null, usuario.auth_revocado_desde || null]);
+    if (!sesiones.length) throw new ErrorSesionUsuario("Tu sesión fue cerrada. Volvé a iniciar sesión.", 401);
+  } else if (usuario.auth_revocado_desde && (!authData.iat || authData.iat * 1000 <= new Date(usuario.auth_revocado_desde).getTime())) {
+    throw new ErrorSesionUsuario("Tu sesión ya no es válida. Volvé a iniciar sesión.", 401);
+  }
+  // Nunca copiar hashes de contraseña ni metadatos internos al contexto público.
+  delete usuario.password;
+  delete usuario.auth_revocado_desde;
 
   const actualizada = { ...cabecera, acceso_familiar_turismo: false, titular_usuario_id: null, ...await resolverAccesoFamiliar(usuarios[0], db) };
   authData.data = JSON.stringify(actualizada);
@@ -107,16 +128,19 @@ function verificarTokenConAutorizacionActual({
   mensajeAuthorization = "No autorizado",
 }) {
   const coincidencia = /^Bearer ([^\s]+)$/.exec(String(req.headers.authorization || ""));
-  if (!coincidencia) return res.status(401).json(mensajeAuthorization);
+  if (!coincidencia) return res.status(401).json({ mensaje: mensajeAuthorization, code: "SESSION_REQUIRED" });
 
   return jwt.verify(coincidencia[1], jwtSecret, async (error, authData) => {
     if (error) {
-      return res.status(403).json(error.name === "TokenExpiredError"
-        ? "Tu sesión venció. Volvé a iniciar sesión."
-        : "Tu sesión no es válida. Volvé a iniciar sesión.");
+      return res.status(401).json({
+        mensaje: error.name === "TokenExpiredError"
+          ? "Tu sesión venció. Volvé a iniciar sesión."
+          : "Tu sesión no es válida. Volvé a iniciar sesión.",
+        code: error.name === "TokenExpiredError" ? "SESSION_EXPIRED" : "SESSION_INVALID",
+      });
     }
     try {
-      const permisos = await actualizarAutorizacionSesion(authData, db);
+      const permisos = await actualizarAutorizacionSesion(authData, db, jwtSecret);
       if (permisos.acceso_familiar_turismo && !rutaPermitidaFamiliar(req)) {
         return res.status(403).json('La cuenta familiar solo tiene acceso a turismo y a sus datos personales');
       }
@@ -124,7 +148,9 @@ function verificarTokenConAutorizacionActual({
       return next();
     } catch (sessionError) {
       if (sessionError instanceof ErrorSesionUsuario) {
-        return res.status(sessionError.statusCode).json(sessionError.message);
+        return res.status(sessionError.statusCode).json(sessionError.statusCode === 401
+          ? { mensaje: sessionError.message, code: "SESSION_REVOKED" }
+          : sessionError.message);
       }
       console.error("No se pudieron refrescar los permisos de la sesion:", sessionError);
       return res.status(500).json("No se pudieron validar los permisos actuales");

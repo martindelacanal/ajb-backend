@@ -5,13 +5,15 @@ const jwt = require("jsonwebtoken");
 function emitirTokenSesion({
   data,
   recordar = false,
+  sid,
+  passwordVersion,
   jwtLib = jwt,
   jwtSecret = process.env.JWT_SECRET,
 }) {
   return new Promise((resolve, reject) => {
-    const expiresIn = recordar ? "7d" : "8h";
+    const expiresIn = recordar ? "15m" : "8h";
     jwtLib.sign(
-      { data: JSON.stringify(data) },
+      { data: JSON.stringify(data), ...(sid ? { sid, passwordVersion } : {}) },
       jwtSecret,
       { expiresIn },
       (error, token) => {

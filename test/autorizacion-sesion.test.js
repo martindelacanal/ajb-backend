@@ -50,7 +50,7 @@ test("rechaza una sesion cuyo usuario fue inhabilitado", async () => {
 
   await assert.rejects(
     actualizarAutorizacionSesion(authData, db),
-    (error) => error instanceof ErrorSesionUsuario && error.statusCode === 403
+    (error) => error instanceof ErrorSesionUsuario && error.statusCode === 401
   );
 });
 
@@ -89,8 +89,8 @@ test("el middleware no consulta la base con un token invalido", () => {
   let consultada = false;
   const req = { headers: { authorization: "Bearer token-invalido" } };
   const res = {
-    status(value) { assert.equal(value, 403); return this; },
-    json(value) { assert.equal(value, "Tu sesión no es válida. Volvé a iniciar sesión."); },
+    status(value) { assert.equal(value, 401); return this; },
+    json(value) { assert.equal(value.code, "SESSION_INVALID"); },
   };
 
   verificarTokenConAutorizacionActual({

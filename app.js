@@ -124,6 +124,7 @@ app.get('/api/healthz', async (_req, res) => {
 // ROUTES
 
 const userRoute = require('./api/routes/user');
+const authRoute = require('./api/routes/auth');
 const coseguroRoute = require('./api/routes/coseguro');
 const olimpiadasRoute = require('./api/routes/olimpiadas');
 const olimpiadasBonosRoute = require('./api/routes/olimpiadas-bonos');
@@ -141,6 +142,7 @@ const publicoRoute = require('./api/routes/publico');
 const turismoPlacasRoute = require('./api/routes/turismo-placas');
 // Portada pública (sin token) y placas de turismo: rutas propias, sin middleware global.
 app.use('/api', publicoRoute);
+app.use('/api', authRoute);
 app.use('/api', turismoPlacasRoute);
 app.use('/api', webauthnRoute);
 app.use('/api', politicaCancelacionRoute);

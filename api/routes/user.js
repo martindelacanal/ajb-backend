@@ -11,7 +11,7 @@ const bcryptjs = require("bcryptjs");
 const { normalizarCredencialesSignin } = require("../security/signin-input");
 const { DNI_MENSAJE, esDniValido } = require("../security/dni");
 const { verificarTokenConAutorizacionActual, resolverAccesoFamiliar, ErrorSesionUsuario } = require("../security/autorizacion-sesion");
-const { emitirTokenSesion } = require("../security/token-sesion");
+const { crearSesion } = require("../security/sesiones-persistentes");
 const { condicionModuloNotificacion } = require("../services/notificaciones-modulos");
 const {
   construirVisibilidadServicioSql,
@@ -727,13 +727,14 @@ router.post("/signin", async (req, res) => {
         if (rows[0].habilitado === "N") {
           res.status(403).json("Usuario inhabilitado");
         } else {
+          const passwordHash = rows[0].password;
           delete rows[0].password;
           let data = rows[0];
 
           try {
             data = await resolverAccesoFamiliar(data, mysqlConnection.promise());
-            const token = await emitirTokenSesion({ data, recordar });
-            res.status(200).json({ token, data });
+            const sesion = await crearSesion({ db: mysqlConnection.promise(), data, recordar, password: passwordHash });
+            res.status(200).json(sesion);
           } catch (tokenError) {
             if (tokenError instanceof ErrorSesionUsuario) return res.status(403).json(tokenError.message);
             console.error("Error al emitir token de acceso:", tokenError);

@@ -11,7 +11,7 @@ const {
   verificarTokenConAutorizacionActual,
 } = require("../security/autorizacion-sesion");
 const { obtenerOrigenesPermitidos } = require("../security/http-config");
-const { emitirTokenSesion } = require("../security/token-sesion");
+const { crearSesion } = require("../security/sesiones-persistentes");
 const {
   ErrorOrigenWebAuthn,
   resolverContextoWebAuthn,
@@ -528,7 +528,7 @@ function crearRouterWebAuthn({
         const [rows] = await connection.query(
           `SELECT c.id AS webauthn_credencial_id, c.credential_id, c.clave_publica,
                   c.contador, c.transportes, c.webauthn_usuario_id,
-                  u.id, u.nombre, u.apellido, u.documento, u.email,
+                  u.id, u.password, u.nombre, u.apellido, u.documento, u.email,
                   u.departamental_id, u.rol_id, r.nombre AS rol, u.habilitado,
                   u.area_turismo, u.area_coseguro,
                   u.modulo_turismo, u.modulo_coseguro, u.modulo_olimpiadas
@@ -593,7 +593,9 @@ function crearRouterWebAuthn({
         );
 
         const data = datosSesionDesdeFila(credencial);
-        const token = await emitirTokenSesion({
+        const sesion = await crearSesion({
+          db: connection,
+          password: credencial.password,
           data,
           recordar: Boolean(desafio.recordar),
           jwtLib,
@@ -602,7 +604,7 @@ function crearRouterWebAuthn({
         await connection.commit();
         connection.release();
         connection = null;
-        res.status(200).json({ token, data });
+        res.status(200).json(sesion);
       } catch (error) {
         if (connection) {
           try {

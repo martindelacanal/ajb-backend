@@ -1588,7 +1588,7 @@ async function actualizarDatosUsuario(connection, {
   }
   try {
     await connection.query(
-      `UPDATE usuario SET ${camposQueCambian.map((campo) => `${campo} = ?`).join(", ")} WHERE id = ?`,
+      `UPDATE usuario SET ${camposQueCambian.map((campo) => `${campo} = ?`).join(", ")}${camposQueCambian.some((campo) => ["password", "habilitado"].includes(campo)) ? ", auth_revocado_desde = NOW(6)" : ""} WHERE id = ?`,
       [...valores, objetivoId]
     );
   } catch (error) {
