@@ -14,6 +14,7 @@
  * 10 Liquidado (pago acreditado; fecha_pago desde el CSV del auditor)
  */
 const { GRUPOS, normalizarCicCodigo } = require("../data/coseguro-catalogo-631");
+const { LIMITES_ARCHIVOS, ADJUNTO_OTROS, completarAdjuntos } = require("../data/coseguro-limites-archivos");
 const express = require("express");
 const router = express.Router();
 const mysqlConnection = require("../connection/connection");
@@ -24,7 +25,7 @@ const multer = require("multer");
 const crypto = require("crypto");
 const moment = require("moment");
 const archiver = require("archiver");
-const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const arca = require("../services/arca");
 const { calcularPhashes, sonMismaImagen, parsearPhash } = require("../services/imagen-hash");
@@ -58,8 +59,8 @@ const s3 = new S3Client({
   region: process.env.BUCKET_REGION,
 });
 const S3_SIGNED_URL_EXPIRES_SECONDS = Number.parseInt(process.env.S3_SIGNED_URL_EXPIRES_SECONDS || "3600", 10);
-const MAX_ARCHIVO_COSEGURO_BYTES = 10 * 1024 * 1024;
-const MAX_TOTAL_COSEGURO_BYTES = 50 * 1024 * 1024;
+const MAX_ARCHIVO_COSEGURO_BYTES = LIMITES_ARCHIVOS.peso_archivo_bytes;
+const MAX_TOTAL_COSEGURO_BYTES = LIMITES_ARCHIVOS.peso_total_bytes;
 const MAX_FIRMA_BYTES = 2 * 1024 * 1024;
 
 const MIME_IMAGEN_PERMITIDO = new Set(["image/jpeg", "image/png", "image/webp", "image/heic"]);
@@ -79,7 +80,7 @@ function detectarMimeArchivo(buffer, { permitePdf = false } = {}) {
 
 function validarContenidoArchivo(file, { permitePdf = false } = {}) {
   if (!file || !Buffer.isBuffer(file.buffer) || file.buffer.length === 0 || file.buffer.length > MAX_ARCHIVO_COSEGURO_BYTES) {
-    return { error: "El archivo está vacío o supera el máximo de 10 MB" };
+    return { error: "El archivo está vacío o supera el máximo de 5 MB" };
   }
   const mimeDetectado = detectarMimeArchivo(file.buffer, { permitePdf });
   const mimeDeclarado = file.mimetype === "image/jpg" ? "image/jpeg" : file.mimetype;
@@ -104,6 +105,10 @@ function decodificarFirmaBase64(firmaBase64) {
 
 async function uploadBufferToS3({ key, buffer, contentType }) {
   await s3.send(new PutObjectCommand({ Bucket: bucketName, Key: key, Body: buffer, ContentType: contentType }));
+}
+
+async function limpiarArchivosSubidos(keys) {
+  await Promise.allSettled(keys.map((Key) => s3.send(new DeleteObjectCommand({ Bucket: bucketName, Key }))));
 }
 
 async function getObjectBufferFromS3(key) {
@@ -165,13 +170,59 @@ function extensionSegura(nombre, mime) {
 const SLOTS_VALIDOS = [
   "RECETA", "TICKET_FISCAL", "TROQUEL", "DETALLE_COMPRA", "PRESCRIPCION", "FACTURA",
   "BONO_FRENTE", "BONO_DORSO", "PARTIDA_NACIMIENTO", "DNI_RECIEN_NACIDO", "COMPROBANTE",
-  "DOCUMENTACION", "EXTRA",
+  "DOCUMENTACION", "EXTRA", ADJUNTO_OTROS.key,
 ];
 
+// Cortar el lote mientras se recibe evita almacenar hasta 100 MB antes de validarlo.
+function almacenamientoCoseguro() {
+  return {
+    _handleFile(req, file, callback) {
+      let chunks = [];
+      let size = 0;
+      let terminado = false;
+      const finalizar = (error, resultado) => {
+        if (terminado) return;
+        terminado = true;
+        if (error) chunks = [];
+        callback(error, resultado);
+      };
+      file.stream.on("data", (chunk) => {
+        if (terminado) return;
+        req.coseguroBytesRecibidos = (req.coseguroBytesRecibidos || 0) + chunk.length;
+        if (req.coseguroBytesRecibidos > MAX_TOTAL_COSEGURO_BYTES) {
+          finalizar(crearErrorHttp("Los archivos superan el máximo total de 50 MB", 400));
+          return;
+        }
+        chunks.push(chunk);
+        size += chunk.length;
+      });
+      file.stream.on("error", (error) => finalizar(error));
+      file.stream.on("end", () => {
+        if (terminado) return;
+        const buffer = Buffer.concat(chunks);
+        chunks = [];
+        finalizar(null, { buffer, size });
+      });
+    },
+    _removeFile(req, file, callback) {
+      delete file.buffer;
+      callback(null);
+    },
+  };
+}
+
 const uploadCoseguro = multer({
-  storage: multer.memoryStorage(),
-  limits: { files: 20, fileSize: MAX_ARCHIVO_COSEGURO_BYTES, fieldSize: Math.ceil(MAX_FIRMA_BYTES / 3) * 4 + 256 },
+  storage: almacenamientoCoseguro(),
+  limits: { files: LIMITES_ARCHIVOS.total, fileSize: MAX_ARCHIVO_COSEGURO_BYTES, fieldSize: Math.ceil(MAX_FIRMA_BYTES / 3) * 4 + 256 },
   fileFilter: (req, file, cb) => {
+    const slot = String(file.fieldname || "").toUpperCase();
+    if (/^\/coseguro\/solicitudes(?:\/\d+)?$/.test(req.path) && !SLOTS_VALIDOS.includes(slot)) {
+      return cb(new Error("Tipo de comprobante no permitido"));
+    }
+    req.coseguroCantidadPorSlot ||= new Map();
+    const cantidad = (req.coseguroCantidadPorSlot.get(slot) || 0) + 1;
+    if (cantidad > LIMITES_ARCHIVOS.por_tipo) return cb(new Error("Podés subir hasta 5 archivos por tipo de comprobante"));
+    req.coseguroCantidadPorSlot.set(slot, cantidad);
     const mime = file.mimetype === "image/jpg" ? "image/jpeg" : file.mimetype;
     const esImagen = MIME_IMAGEN_PERMITIDO.has(mime);
     const esPdf = file.mimetype === "application/pdf";
@@ -196,7 +247,7 @@ function manejarUploadCoseguro(req, res, next) {
     if (error) {
       return res.status(400).json(mensajeErrorMulter(error, "No se pudieron procesar los archivos", {
         tamanio: `Cada archivo puede pesar hasta ${MAX_ARCHIVO_COSEGURO_BYTES / 1024 / 1024} MB`,
-        cantidad: "Podés subir hasta 20 archivos por vez",
+        cantidad: "La solicitud puede tener hasta 20 archivos",
         campo: `La firma puede pesar hasta ${MAX_FIRMA_BYTES / 1024 / 1024} MB`,
       }));
     }
@@ -1095,11 +1146,12 @@ router.get("/coseguro/catalogos", verifyToken, async (req, res) => {
     res.status(200).json({
       estados: estadosSalida,
       grupos: GRUPOS,
-      tipos_reintegro: tipos.map((t) => ({ ...t, adjuntos_config: parseJsonSeguro(t.adjuntos_config) || [] })),
+      tipos_reintegro: tipos.map((t) => ({ ...t, adjuntos_config: completarAdjuntos(parseJsonSeguro(t.adjuntos_config)) })),
       conceptos,
       imputaciones,
       departamentales,
       limite_meses: 6,
+      limites_archivos: LIMITES_ARCHIVOS,
       extraccion_ia_disponible: Boolean(process.env.GEMINI_API_KEY),
     });
   } catch (error) {
@@ -1673,6 +1725,36 @@ function archivosPorSlot(files) {
   return mapa;
 }
 
+function validarLimitesArchivos(files = [], existentes = [], eliminados = []) {
+  const eliminar = new Set(eliminados);
+  const cantidades = new Map();
+  let total = 0;
+  let pesoTotal = 0;
+  const agregar = (slot, bytes) => {
+    const key = String(slot || "").toUpperCase();
+    const cantidad = (cantidades.get(key) || 0) + 1;
+    cantidades.set(key, cantidad);
+    if (cantidad > LIMITES_ARCHIVOS.por_tipo) throw crearErrorHttp("Podés conservar hasta 5 archivos por tipo de comprobante", 400);
+    total += 1;
+    if (total > LIMITES_ARCHIVOS.total) throw crearErrorHttp("La solicitud puede tener hasta 20 archivos", 400);
+    pesoTotal += bytes;
+    if (pesoTotal > LIMITES_ARCHIVOS.peso_total_bytes) throw crearErrorHttp("Los archivos de la solicitud superan el máximo total de 50 MB", 400);
+  };
+  for (const archivo of existentes) {
+    if (!eliminar.has(Number(archivo.id))) agregar(archivo.tipo_adjunto, Number(archivo.tamanio) || MAX_ARCHIVO_COSEGURO_BYTES);
+  }
+  for (const file of files) {
+    const slot = String(file.fieldname || "").toUpperCase();
+    if (!SLOTS_VALIDOS.includes(slot)) throw crearErrorHttp("Tipo de comprobante no permitido", 400);
+    const bytes = file.buffer?.length ?? Number(file.size);
+    if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > MAX_ARCHIVO_COSEGURO_BYTES) {
+      throw crearErrorHttp("Cada archivo debe pesar entre 1 byte y 5 MB", 400);
+    }
+    agregar(slot, bytes);
+  }
+  return { cantidad: total, peso_total_bytes: pesoTotal };
+}
+
 // ---------------------------------------------------------------------------
 // POST /coseguro/solicitudes — crear solicitud
 // ---------------------------------------------------------------------------
@@ -1680,9 +1762,11 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
   let connection;
   let transaccionIniciada = false;
   let bloqueoDuplicadosAdquirido = false;
+  const archivosSubidos = [];
   try {
     const cabecera = getCabecera(req);
     if (!["afiliado", ...ROLES_GESTION].includes(cabecera.rol) || !tieneAreaCoseguro(cabecera)) return res.status(401).json("No autorizado");
+    validarLimitesArchivos(req.files);
     const db = mysqlConnection.promise();
 
     // ¿Para qué afiliado es la solicitud?
@@ -1836,7 +1920,10 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
 
     // Subir firma y archivos a S3
     let firmaArchivo = null;
-    if (firmaBase64) firmaArchivo = await subirFirmaBase64(firmaBase64);
+    if (firmaBase64) {
+      firmaArchivo = await subirFirmaBase64(firmaBase64);
+      archivosSubidos.push(firmaArchivo);
+    }
 
     // Foto de la cobertura vigente: el afiliado ve desde el inicio cuánto se le reintegraría
     const cobertura = calcularReintegroEstimado(validacion.tipo, datos.importe);
@@ -1870,6 +1957,7 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
     for (const [slot, files] of slots.entries()) {
       for (const file of files) {
         const key = await subirArchivoCoseguro(file, `sol${solicitudId}_${slot.toLowerCase()}`);
+        archivosSubidos.push(key);
         await connection.query(
           `INSERT INTO coseguro_archivo (solicitud_id, tipo_adjunto, archivo, nombre_original, mime, tamanio, sha256, phash)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1909,13 +1997,17 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
 
     await connection.commit();
     transaccionIniciada = false;
+    archivosSubidos.length = 0;
 
     // Constatación en ARCA en segundo plano (si la IA leyó el CAE del comprobante)
     void constatarArcaAutomatico(solicitudId);
 
     res.status(201).json({ success: true, id: solicitudId, message: "Solicitud de reintegro enviada correctamente" });
   } catch (error) {
-    if (connection && transaccionIniciada) await connection.rollback();
+    if (connection && transaccionIniciada) {
+      try { await connection.rollback(); } catch (rollbackError) { registrarErrorRuta(rollbackError); }
+    }
+    await limpiarArchivosSubidos(archivosSubidos);
     registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al crear la solicitud de reintegro");
   } finally {
@@ -2194,6 +2286,8 @@ router.get("/coseguro/solicitudes/:id", verifyToken, async (req, res) => {
     const archivosFirmados = await Promise.all(
       archivos.map(async (a) => ({
         ...a,
+        label: a.tipo_adjunto === ADJUNTO_OTROS.key ? ADJUNTO_OTROS.label
+          : (parseJsonSeguro(solicitud.adjuntos_config) || []).find((adjunto) => adjunto.key === a.tipo_adjunto)?.label || a.tipo_adjunto,
         url: await getSignedFileUrlFromS3(a.archivo).catch(() => null),
       }))
     );
@@ -2248,7 +2342,8 @@ router.get("/coseguro/solicitudes/:id", verifyToken, async (req, res) => {
 
     res.status(200).json({
       ...solicitud,
-      adjuntos_config: parseJsonSeguro(solicitud.adjuntos_config) || [],
+      adjuntos_config: completarAdjuntos(parseJsonSeguro(solicitud.adjuntos_config)),
+      limites_archivos: LIMITES_ARCHIVOS,
       extraccion_ia: parseJsonSeguro(solicitud.extraccion_ia_str),
       verificacion: parseJsonSeguro(solicitud.verificacion_str),
       extraccion_ia_str: undefined,
@@ -2400,6 +2495,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
   let connection;
   let transaccionIniciada = false;
   let bloqueoDuplicadosAdquirido = false;
+  const archivosSubidos = [];
   try {
     const cabecera = getCabecera(req);
     const solicitudId = normalizarIdPositivo(req.params.id);
@@ -2425,7 +2521,8 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     if (!Array.isArray(archivosEliminadosRaw)) return res.status(400).json("La lista de archivos eliminados es inválida");
     const eliminarIds = archivosEliminadosRaw.map(normalizarIdPositivo);
     if (eliminarIds.some((id) => !id)) return res.status(400).json("La lista de archivos eliminados contiene IDs inválidos");
-    let [archivosActuales] = await db.query("SELECT id, tipo_adjunto, sha256, archivo FROM coseguro_archivo WHERE solicitud_id = ?", [solicitudId]);
+    let [archivosActuales] = await db.query("SELECT id, tipo_adjunto, sha256, archivo, tamanio FROM coseguro_archivo WHERE solicitud_id = ?", [solicitudId]);
+    validarLimitesArchivos(req.files, archivosActuales, eliminarIds);
     let restantes = archivosActuales.filter((a) => !eliminarIds.includes(a.id));
     const slots = archivosPorSlot(req.files);
     if (validacion.tipo) {
@@ -2506,10 +2603,16 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     datos = validacion.datos;
 
     [archivosActuales] = await connection.query(
-      "SELECT id, tipo_adjunto, sha256, archivo FROM coseguro_archivo WHERE solicitud_id = ? FOR UPDATE",
+      "SELECT id, tipo_adjunto, sha256, archivo, tamanio FROM coseguro_archivo WHERE solicitud_id = ? FOR UPDATE",
       [solicitudId]
     );
     restantes = archivosActuales.filter((archivo) => !eliminarIds.includes(archivo.id));
+    // La fila del trámite y sus archivos están bloqueados: dos ediciones concurrentes
+    // deben cumplir el límite acumulado con los archivos efectivamente vigentes.
+    validarLimitesArchivos(req.files, archivosActuales, eliminarIds);
+    if (restantes.some((archivo) => hashesNuevos.includes(archivo.sha256))) {
+      throw crearErrorHttp("Este comprobante ya está adjunto a la solicitud", 400);
+    }
     if (validacion.tipo) {
       for (const adjunto of validacion.tipo.adjuntos_config) {
         const tieneExistente = restantes.some((archivo) => archivo.tipo_adjunto === adjunto.key);
@@ -2669,6 +2772,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     for (const [slot, files] of slots.entries()) {
       for (const file of files) {
         const key = await subirArchivoCoseguro(file, `sol${solicitudId}_${slot.toLowerCase()}`);
+        archivosSubidos.push(key);
         await connection.query(
           `INSERT INTO coseguro_archivo (solicitud_id, tipo_adjunto, archivo, nombre_original, mime, tamanio, sha256, phash)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -2689,6 +2793,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     // Firma nueva (opcional en edición)
     if (req.body.firma) {
       const firmaArchivo = await subirFirmaBase64(req.body.firma);
+      archivosSubidos.push(firmaArchivo);
       if (firmaArchivo) {
         await connection.query("UPDATE coseguro_solicitud SET firma_archivo = ? WHERE id = ?", [firmaArchivo, solicitudId]);
       }
@@ -2743,13 +2848,17 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
 
     await connection.commit();
     transaccionIniciada = false;
+    archivosSubidos.length = 0;
 
     // Re-constatar en ARCA en segundo plano si cambiaron los datos del comprobante
     if (constatacionDesactualizada) void constatarArcaAutomatico(solicitudId);
 
     res.status(200).json({ success: true, message: aprobarServiciosSociales ? "Solicitud guardada y aprobada por Servicios Sociales" : "Solicitud actualizada correctamente", estado_id: estadoNuevo || solicitud.estado_id });
   } catch (error) {
-    if (connection && transaccionIniciada) await connection.rollback();
+    if (connection && transaccionIniciada) {
+      try { await connection.rollback(); } catch (rollbackError) { registrarErrorRuta(rollbackError); }
+    }
+    await limpiarArchivosSubidos(archivosSubidos);
     registrarErrorRuta(error);
     res.status(error.statusCode || 500).json(error.statusCode ? error.message : "Error al actualizar la solicitud");
   } finally {
@@ -4392,6 +4501,9 @@ router.__test = Object.freeze({
   puedeVerSubsidio,
   tieneAreaCoseguro,
   validarContenidoArchivo,
+  validarLimitesArchivos,
+  manejarUploadCoseguro,
+  almacenamientoCoseguro,
   verifyToken,
 });
 

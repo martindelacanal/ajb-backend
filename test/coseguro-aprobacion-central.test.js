@@ -38,6 +38,16 @@ reemplazarModulo("../api/services/usuarios-datos", {
   async actualizarDatosUsuario() { eventos.push("datos-usuario"); },
   contextoDesdeRequest: () => ({}),
 });
+const sdkS3 = require("@aws-sdk/client-s3");
+reemplazarModulo("@aws-sdk/client-s3", {
+  ...sdkS3,
+  S3Client: class {
+    async send(command) {
+      eventos.push(command instanceof sdkS3.DeleteObjectCommand ? "s3-delete" : "s3-put");
+      return {};
+    }
+  },
+});
 
 const router = require("../api/routes/coseguro");
 const app = express();
@@ -87,10 +97,17 @@ async function consultar(sql, params = []) {
   if (/FROM coseguro_concepto/.test(sql)) return [[{ id: 2, nombre: "Bono bioquímico" }]];
   if (/SELECT concepto_id FROM coseguro_solicitud_concepto/.test(sql)) return [[{ concepto_id: 2 }]];
   if (/(?:DELETE FROM|INSERT INTO) coseguro_solicitud_concepto/.test(sql)) return [{ affectedRows: 1 }];
-  if (/SELECT id, tipo_adjunto, sha256, archivo FROM coseguro_archivo/.test(sql)) {
-    return [[{ id: 3, tipo_adjunto: "FACTURA", sha256: null, archivo: "comprobante.pdf" }]];
+  if (/SELECT id, tipo_adjunto, sha256, archivo, tamanio FROM coseguro_archivo/.test(sql)) {
+    const archivos = /FOR UPDATE/.test(sql) ? escenario.archivosConcurrentes || escenario.archivos : escenario.archivos;
+    return [archivos || [{ id: 3, tipo_adjunto: "FACTURA", sha256: null, archivo: "comprobante.pdf", tamanio: 100 }]];
   }
   if (/FROM coseguro_solicitud s/.test(sql)) return [[]]; // búsqueda de duplicados
+  if (/FROM coseguro_archivo a/.test(sql)) return [[]];
+  if (/INSERT INTO coseguro_archivo/.test(sql)) {
+    if (escenario.fallaArchivo) throw new Error("Archivo no disponible");
+    return [{affectedRows:1}];
+  }
+  if (/DELETE FROM coseguro_archivo/.test(sql)) return [{affectedRows:1}];
   if (/GET_LOCK/.test(sql)) return [[{ adquirido: 1 }]];
   if (/RELEASE_LOCK/.test(sql)) return [[{ liberado: 1 }]];
   if (/FROM coseguro_imputacion/.test(sql)) {
@@ -118,8 +135,8 @@ async function request(body, { editar = false } = {}) {
     const token = jwt.sign({ data: JSON.stringify({ id: 100, rol: escenario.rol }) }, process.env.JWT_SECRET);
     const response = await fetch(`http://127.0.0.1:${server.address().port}/api/coseguro/solicitudes/21${editar ? "" : "/estado"}`, {
       method: "PUT",
-      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-      body: JSON.stringify(body),
+      headers: body instanceof FormData ? { authorization: `Bearer ${token}` } : { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: body instanceof FormData ? body : JSON.stringify(body),
     });
     return { status: response.status, body: await response.json() };
   } finally {
@@ -365,4 +382,49 @@ test("Servicios Sociales rechaza con estado 11 y motivo obligatorio; la departam
   preparar({ rol: 'departamental' });
   const departamental = await request({ estado_id: 11, observacion: 'Prestación no cubierta' });
   assert.equal(departamental.status, 409);
+});
+
+const archivosFactura = (cantidad) => Array.from({length:cantidad},(_,i) => ({id:i+1,tipo_adjunto:"FACTURA",sha256:null,archivo:`factura${i}.pdf`,tamanio:100}));
+function formularioConArchivo(slot = "FACTURA", extra = {}) {
+  const form = new FormData();
+  for (const [key,value] of Object.entries(formulario(extra))) form.append(key,String(value));
+  form.append(slot,new Blob(["%PDF-1.4\ncomprobante de prueba"],{type:"application/pdf"}),"factura.pdf");
+  return form;
+}
+
+test("editar rechaza el sexto comprobante y revalida el acumulado luego de bloquear la solicitud", async () => {
+  preparar({archivos:archivosFactura(5)});
+  const sexto = await request(formularioConArchivo(),{editar:true});
+  assert.equal(sexto.status,400);
+  assert.match(sexto.body,/hasta 5 archivos/);
+  assert.ok(!eventos.includes("begin"));
+  preparar({archivos:archivosFactura(4),archivosConcurrentes:archivosFactura(5)});
+  const concurrente = await request(formularioConArchivo(),{editar:true});
+  assert.equal(concurrente.status,400);
+  assert.ok(eventos.includes("begin") && eventos.includes("rollback"));
+  assert.ok(llamadas.some(({sql}) => /coseguro_archivo WHERE solicitud_id = \? FOR UPDATE/.test(sql)));
+  assert.ok(!eventos.includes("s3-put"));
+  assert.equal(actualizacionConfirmada,null);
+});
+
+test("editar permite reemplazar un comprobante de cinco y acepta OTROS_COMPROBANTES", async () => {
+  preparar({archivos:archivosFactura(5)});
+  const reemplazo = await request(formularioConArchivo("FACTURA",{archivos_eliminados:"[1]"}),{editar:true});
+  assert.equal(reemplazo.status,200,JSON.stringify(reemplazo.body));
+  assert.ok(llamadas.some(({sql,params}) => /DELETE FROM coseguro_archivo/.test(sql) && params[0] === 1 && params[1] === 21));
+  assert.ok(llamadas.some(({sql,params}) => /INSERT INTO coseguro_archivo/.test(sql) && params[1] === "FACTURA"));
+  assert.ok(eventos.includes("commit") && eventos.includes("s3-put") && !eventos.includes("s3-delete"));
+  preparar({archivos:archivosFactura(5)});
+  const otro = await request(formularioConArchivo("OTROS_COMPROBANTES"),{editar:true});
+  assert.equal(otro.status,200,JSON.stringify(otro.body));
+  assert.ok(llamadas.some(({sql,params}) => /INSERT INTO coseguro_archivo/.test(sql) && params[1] === "OTROS_COMPROBANTES"));
+});
+
+test("editar elimina la copia S3 subida si falla su persistencia y revierte la transacción", async () => {
+  preparar({fallaArchivo:true});
+  const response = await request(formularioConArchivo("OTROS_COMPROBANTES"),{editar:true});
+  assert.equal(response.status,500);
+  assert.ok(eventos.includes("rollback"));
+  assert.ok(eventos.indexOf("s3-delete") > eventos.indexOf("s3-put"));
+  assert.equal(actualizacionConfirmada,null);
 });
