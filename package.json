@@ -46,7 +46,8 @@
     "migrate:estado-reserva-cancelada": "node scripts/migrar-estado-reserva-cancelada.js",
     "migrate:estado-reserva-cancelada:check": "node scripts/migrar-estado-reserva-cancelada.js --check",
     "migrate:portada-gestion": "node scripts/migrar-portada-gestion.js",
-    "migrate:noticias-departamentales": "node scripts/migrar-noticias-departamentales.js"
+    "migrate:noticias-departamentales": "node scripts/migrar-noticias-departamentales.js",
+    "migrate:noticias-portada-publica": "node scripts/migrar-noticias-portada-publica.js"
   },
   "keywords": [],
   "author": "",
