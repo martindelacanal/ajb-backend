@@ -1532,6 +1532,29 @@ router.put("/admin/noticias/:id(\\d+)", verifyToken, manejarUploadNoticia, async
       throw crearErrorHttp("Noticia no encontrada", 404);
     }
     const existente = existentes[0];
+    // Editor anterior (pestaña abierta desde antes del deploy): no manda alcance_todas ni
+    // departamentales. A una noticia de 2 o más departamentales la API le devuelve
+    // departamental_id = null y ese select muestra «Provincial» sin que nadie lo haya elegido:
+    // ahí un departamental_id vacío no es una elección y se conserva el alcance guardado.
+    // Con 0 o 1 departamental, o con un id concreto, vale lo pedido.
+    if (
+      !valorPresente(req.body.alcance_todas)
+      && !valorPresente(req.body.departamentales)
+      && !valorPresente(req.body.departamental_id)
+      && !esAlcanceTodas(existente.alcance_todas)
+    ) {
+      // Después del FOR UPDATE: con la noticia bloqueada, nadie cambia sus filas puente en el medio.
+      const [puente] = await connection.query(
+        "SELECT departamental_id FROM noticia_departamental WHERE noticia_id = ?",
+        [noticiaId]
+      );
+      if (puente.length >= 2) {
+        // El UPDATE y el reemplazo de filas puente de abajo reescriben lo mismo.
+        datos.alcanceTodas = 0;
+        datos.departamentales = puente.map((fila) => Number(fila.departamental_id));
+        datos.departamentalId = null;
+      }
+    }
     await validarCupoNoticiasDestacadas(connection, datos.destacada, noticiaId);
 
     // Publicar por primera vez sin fecha explícita equivale a publicar ahora.

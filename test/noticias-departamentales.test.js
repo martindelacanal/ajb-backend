@@ -798,7 +798,8 @@ test("la noticia pública y sus relacionadas cargan las departamentales en una s
 // Escritura: POST / PUT dentro de la transacción
 // ─────────────────────────────────────────────────────────────────────────────
 
-function crearConexion({ noticiaId = 23, insertId = 71, fallarEn = null } = {}) {
+// `noticia` suma campos a la fila guardada (p. ej. su alcance) y `puente`, sus departamentales.
+function crearConexion({ noticiaId = 23, insertId = 71, fallarEn = null, noticia = {}, puente = [] } = {}) {
   const eventos = [];
   const consultas = [];
   return {
@@ -821,7 +822,11 @@ function crearConexion({ noticiaId = 23, insertId = 71, fallarEn = null } = {}) 
       }
       if (/^SELECT \* FROM noticia WHERE id = \?/.test(texto)) {
         eventos.push("select_noticia");
-        return [[{ id: noticiaId, destacada: 0, fecha_publicacion: null, imagen_archivo: null }]];
+        return [[{ id: noticiaId, destacada: 0, fecha_publicacion: null, imagen_archivo: null, ...noticia }]];
+      }
+      if (/^SELECT departamental_id FROM noticia_departamental WHERE noticia_id = \?$/.test(texto)) {
+        eventos.push("select_puente");
+        return [puente.map((departamentalId) => ({ departamental_id: departamentalId }))];
       }
       if (/^INSERT INTO noticia \(/.test(texto)) {
         eventos.push("insert_noticia");
@@ -1015,6 +1020,91 @@ test("PUT del editor anterior (sólo departamental_id) queda con esa única depa
   assert.equal(resultado.statusCode, 200);
   assert.deepEqual(paramsUpdateNoticia(conexionActual).params.slice(4, 6), [0, 9]);
   assert.deepEqual(insertPuente(conexionActual).params, [23, 9]);
+});
+
+// Pestaña abierta desde antes del deploy: con 2 o más departamentales la API le devuelve
+// departamental_id = null y su select muestra «Provincial» sin que nadie lo haya elegido.
+test("PUT del editor anterior sin departamental conserva una noticia de 2 o más departamentales", async () => {
+  for (const body of [{ ...BODY_BASE, departamental_id: "" }, { ...BODY_BASE }]) {
+    const pool = poolSinConsultas();
+    conexionActual = crearConexion({ noticiaId: 20, noticia: { alcance_todas: 0, departamental_id: null }, puente: [1, 8] });
+
+    const resultado = await ejecutar(putNoticia, { cabecera: ADMIN, params: { id: "20" }, body });
+
+    const caso = "departamental_id" in body ? `departamental_id ${JSON.stringify(body.departamental_id)}` : "sin departamental_id";
+    assert.equal(resultado.statusCode, 200, caso);
+    // Las filas puente se leen dentro de la transacción, con la noticia ya bloqueada.
+    assert.deepEqual(conexionActual.eventos, [
+      "get_lock", "begin", "select_noticia", "select_puente", "update_noticia", "delete_puente", "insert_puente",
+      "commit", "release_lock", "release",
+    ], caso);
+    const lecturaPuente = conexionActual.consultas.find((c) => /^SELECT departamental_id FROM noticia_departamental/.test(c.sql));
+    assert.deepEqual(lecturaPuente.params, [20]);
+    assert.deepEqual(paramsUpdateNoticia(conexionActual).params.slice(4, 6), [0, null], caso);
+    assert.deepEqual(insertPuente(conexionActual).params, [20, 1, 20, 8], caso);
+    assert.equal(pool.length, 0);
+  }
+});
+
+test("PUT del editor anterior: con 0 o 1 departamental o con un id elegido se respeta lo pedido", async () => {
+  // Con 0 o 1 fila puente el select viejo mostraba el alcance real: «Provincial» es una elección.
+  for (const puente of [[1], []]) {
+    poolSinConsultas();
+    conexionActual = crearConexion({
+      noticiaId: 20,
+      noticia: { alcance_todas: 0, departamental_id: puente[0] ?? null },
+      puente,
+    });
+    const resultado = await ejecutar(putNoticia, { cabecera: ADMIN, params: { id: "20" }, body: { ...BODY_BASE, departamental_id: "" } });
+    assert.equal(resultado.statusCode, 200);
+    assert.deepEqual(conexionActual.eventos, [
+      "get_lock", "begin", "select_noticia", "select_puente", "update_noticia", "delete_puente",
+      "commit", "release_lock", "release",
+    ], `puente ${JSON.stringify(puente)}`);
+    assert.deepEqual(paramsUpdateNoticia(conexionActual).params.slice(4, 6), [1, null]);
+  }
+
+  // Un id concreto lo eligió el usuario en el select simple: queda sólo esa.
+  poolValidacion([9]);
+  conexionActual = crearConexion({ noticiaId: 20, noticia: { alcance_todas: 0, departamental_id: null }, puente: [1, 8] });
+  const elegida = await ejecutar(putNoticia, { cabecera: ADMIN, params: { id: "20" }, body: { ...BODY_BASE, departamental_id: "9" } });
+  assert.equal(elegida.statusCode, 200);
+  assert.equal(conexionActual.eventos.includes("select_puente"), false);
+  assert.deepEqual(paramsUpdateNoticia(conexionActual).params.slice(4, 6), [0, 9]);
+  assert.deepEqual(insertPuente(conexionActual).params, [20, 9]);
+
+  // Quien manda la lista (aunque sin alcance_todas) ya no es el editor anterior.
+  poolValidacion([3]);
+  conexionActual = crearConexion({ noticiaId: 20, noticia: { alcance_todas: 0, departamental_id: null }, puente: [1, 8] });
+  const lista = await ejecutar(putNoticia, { cabecera: ADMIN, params: { id: "20" }, body: { ...BODY_BASE, departamentales: "[3]" } });
+  assert.equal(lista.statusCode, 200);
+  assert.equal(conexionActual.eventos.includes("select_puente"), false);
+  assert.deepEqual(paramsUpdateNoticia(conexionActual).params.slice(4, 6), [0, 3]);
+  assert.deepEqual(insertPuente(conexionActual).params, [20, 3]);
+
+  // «Todas las departamentales» elegida a propósito vale: el editor nuevo siempre manda
+  // alcance_todas (con la lista vacía) y otro cliente puede mandar sólo alcance_todas.
+  for (const body of [
+    { ...BODY_BASE, alcance_todas: "1", departamentales: "[]", departamental_id: "" },
+    { ...BODY_BASE, alcance_todas: "1" },
+  ]) {
+    poolSinConsultas();
+    conexionActual = crearConexion({ noticiaId: 20, noticia: { alcance_todas: 0, departamental_id: null }, puente: [1, 8] });
+    const todas = await ejecutar(putNoticia, { cabecera: ADMIN, params: { id: "20" }, body });
+    const caso = "departamentales" in body ? "editor nuevo" : "sólo alcance_todas";
+    assert.equal(todas.statusCode, 200, caso);
+    assert.equal(conexionActual.eventos.includes("select_puente"), false, caso);
+    assert.deepEqual(paramsUpdateNoticia(conexionActual).params.slice(4, 6), [1, null], caso);
+    assert.equal(insertPuente(conexionActual), undefined, caso);
+  }
+
+  // Una noticia que ya es de todas ni consulta la tabla puente.
+  poolSinConsultas();
+  conexionActual = crearConexion({ noticiaId: 20, noticia: { alcance_todas: 1, departamental_id: null } });
+  const general = await ejecutar(putNoticia, { cabecera: ADMIN, params: { id: "20" }, body: { ...BODY_BASE, departamental_id: "" } });
+  assert.equal(general.statusCode, 200);
+  assert.equal(conexionActual.eventos.includes("select_puente"), false);
+  assert.deepEqual(paramsUpdateNoticia(conexionActual).params.slice(4, 6), [1, null]);
 });
 
 test("PUT revierte todo si falla el reemplazo de las filas puente", async () => {
