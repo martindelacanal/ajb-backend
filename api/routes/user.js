@@ -13010,8 +13010,8 @@ router.get("/parentesco", verifyToken, async (req, res) => {
 router.get("/departamental", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    // admin-central la necesita para asignar la departamental de un afiliado.
-    if (!["admin", "admin-central"].includes(cabecera.rol)) {
+    // Los roles centrales la necesitan para filtrar e importar afiliados.
+    if (!["admin", "admin-central", "auditor"].includes(cabecera.rol)) {
       return res.status(401).json("No autorizado");
     }
 
@@ -15080,6 +15080,7 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
     if (
       cabecera.rol === "admin" ||
       cabecera.rol === "admin-central" ||
+      cabecera.rol === "auditor" ||
       cabecera.rol === "departamental"
     ) {
       let buscar = req.query.search;
@@ -15102,6 +15103,9 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
         fecha_nacimiento: "u.fecha_nacimiento",
         habilitado: "u.habilitado",
         fecha_creacion: "u.fecha_creacion",
+        primer_ingreso: "u.primer_ingreso",
+        ultimo_ingreso: "u.ultimo_ingreso",
+        estado_email: "COALESCE(cb.estado, 'no_enviado')",
       };
       const orderByKey = Object.prototype.hasOwnProperty.call(columnasOrdenUsuarios, req.query.orderBy)
         ? req.query.orderBy
@@ -15125,6 +15129,23 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
       // Construcción de filtros específicos
       let whereConditions = [];
       let queryParams = [];
+
+      if (filters.estado_ingreso) {
+        if (!["nunca", "ingreso"].includes(filters.estado_ingreso)) {
+          return res.status(400).json("El estado de ingreso es inválido");
+        }
+        whereConditions.push(filters.estado_ingreso === "nunca"
+          ? "u.primer_ingreso IS NULL"
+          : "u.primer_ingreso IS NOT NULL");
+      }
+
+      if (filters.estado_email) {
+        if (!["no_enviado", "pendiente", "enviado", "entregado", "rebotado", "error", "queja"].includes(filters.estado_email)) {
+          return res.status(400).json("El estado del email es inválido");
+        }
+        whereConditions.push("COALESCE(cb.estado, 'no_enviado') = ?");
+        queryParams.push(filters.estado_email);
+      }
 
       // Filtro por rol departamental
       if (cabecera.rol === "departamental") {
@@ -15182,9 +15203,9 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
         queryParams.push(filters.fecha_creacion_maxima);
       }
 
-      // Filtro departamentales_ids (admin y admin-central, que ven todas)
+      // Filtro departamentales_ids para los roles que ven todas.
       if (
-        (cabecera.rol === "admin" || cabecera.rol === "admin-central") &&
+        ["admin", "admin-central", "auditor"].includes(cabecera.rol) &&
         filters.departamentales_ids &&
         Array.isArray(filters.departamentales_ids) &&
         filters.departamentales_ids.length > 0
@@ -15217,6 +15238,11 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
           r.nombre AS rol_codigo,
           u.nombre,
           u.apellido,
+          u.email,
+          u.primer_ingreso,
+          u.ultimo_ingreso,
+          COALESCE(cb.estado, 'no_enviado') AS estado_email,
+          cb.detalle AS email_estado_detalle,
           DATE_FORMAT(u.fecha_nacimiento, '%d/%m/%Y') AS fecha_nacimiento,
           u.documento,
           COALESCE(u.legajo, '') AS legajo,
@@ -15227,6 +15253,7 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
           DATE_FORMAT(u.fecha_creacion, '%d/%m/%Y') AS fecha_creacion
         FROM usuario u
         LEFT JOIN rol r ON u.rol_id = r.id
+        LEFT JOIN correo_bienvenida cb ON cb.usuario_id = u.id
         WHERE 1=1 
           ${queryBuscar}
           ${whereClause}
@@ -15241,6 +15268,7 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
         SELECT COUNT(*) AS count
         FROM usuario u
         LEFT JOIN rol r ON u.rol_id = r.id
+        LEFT JOIN correo_bienvenida cb ON cb.usuario_id = u.id
         WHERE 1=1 
           ${queryBuscar}
           ${whereClause}
@@ -15361,7 +15389,7 @@ router.put("/usuarios/:id/modulo-coseguro", verifyToken, async (req, res) => {
 router.get("/rol", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (cabecera.rol === "admin" || cabecera.rol === "admin-central") {
+    if (["admin", "admin-central", "auditor"].includes(cabecera.rol)) {
       const [rows] = await mysqlConnection
         .promise()
         .query("SELECT id, nombre FROM rol ORDER BY id ASC");

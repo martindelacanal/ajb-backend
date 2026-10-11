@@ -41,6 +41,7 @@ app.use((req, res, next) => {
 });
 
 app.use(cors(corsOptions));
+app.use('/api', require('./api/routes/correo-eventos').crearRouterCorreoEventos({ db: mysqlConnection.promise() }));
 app.use(bodyParser.urlencoded({
   extended: false,
   limit: process.env.REQUEST_FORM_LIMIT || '1mb',
@@ -126,6 +127,7 @@ app.get('/api/healthz', async (_req, res) => {
 const userRoute = require('./api/routes/user');
 const authRoute = require('./api/routes/auth');
 const usuariosAccesoRoute = require('./api/routes/usuarios-acceso');
+const usuariosImportacionRoute = require('./api/routes/usuarios-importacion');
 const coseguroRoute = require('./api/routes/coseguro');
 const olimpiadasRoute = require('./api/routes/olimpiadas');
 const olimpiadasBonosRoute = require('./api/routes/olimpiadas-bonos');
@@ -145,6 +147,7 @@ const turismoPlacasRoute = require('./api/routes/turismo-placas');
 app.use('/api', publicoRoute);
 app.use('/api', authRoute);
 app.use('/api', usuariosAccesoRoute);
+app.use('/api', usuariosImportacionRoute);
 app.use('/api', turismoPlacasRoute);
 app.use('/api', webauthnRoute);
 app.use('/api', politicaCancelacionRoute);

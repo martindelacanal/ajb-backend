@@ -459,6 +459,7 @@ io.on("connection", (socket) => {
 });
 
 server.listen(port);
+require("./api/services/usuarios-bienvenida").iniciarBienvenidas(mysqlConnection.promise());
 iniciarMantenimientoReservas(mysqlConnection.promise());
 iniciarMantenimientoHolds(mysqlConnection.promise(), {
     onExpirados: async (holds) => {

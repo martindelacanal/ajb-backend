@@ -55,6 +55,9 @@ const SESIONES = {
   },
 };
 
+SESIONES.auditor = { ...SESIONES.admin, id: 400, rol_id: 5, rol: "auditor" };
+SESIONES["admin-central"] = { ...SESIONES.admin, id: 500, rol_id: 6, rol: "admin-central" };
+
 function esConsultaAutorizacion(sql) {
   return /u\.modulo_olimpiadas[\s\S]+FROM usuario u[\s\S]+INNER JOIN rol r[\s\S]+WHERE u\.id = \?/i.test(sql);
 }
@@ -341,4 +344,92 @@ test("la tabla de usuarios devuelve rol_codigo y modulo_coseguro", async () => {
   assert.ok(principal);
   assert.match(principal.sql, /r\.nombre AS rol_codigo/);
   assert.match(principal.sql, /u\.modulo_coseguro/);
+});
+
+function responderTabla(sql) {
+  if (/SELECT COUNT\(\*\) AS count/i.test(sql)) return [[{ count: 1 }]];
+  if (/FROM usuario u[\s\S]+LEFT JOIN rol r/i.test(sql)) {
+    return [[{
+      id: 300, rol_codigo: "afiliado", email: "ana@example.org", primer_ingreso: null,
+      ultimo_ingreso: null, estado_email: "rebotado", email_estado_detalle: "Dirección no disponible",
+    }]];
+  }
+  throw new Error(`Consulta inesperada: ${sql}`);
+}
+
+for (const rol of ["admin", "admin-central", "auditor", "departamental"]) {
+  test(`${rol} puede ver seguimiento de ingreso y bienvenida`, async () => {
+    preparar(rol, responderTabla);
+    const response = await request("/api/tabla/usuarios?page=1", { rol, method: "POST", body: {} });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.results[0].estado_email, "rebotado");
+    assert.equal(response.body.results[0].primer_ingreso, null);
+    assert.equal(response.body.results[0].email, "ana@example.org");
+    assert.equal(response.body.results[0].email_estado_detalle, "Dirección no disponible");
+    assert.equal(response.body.totalItems, 1);
+  });
+}
+
+test("los filtros de ingreso y correo conservan el alcance departamental en datos y total", async () => {
+  preparar("departamental", responderTabla);
+  const response = await request("/api/tabla/usuarios?page=1", {
+    rol: "departamental", method: "POST",
+    body: { estado_ingreso: "nunca", estado_email: "rebotado", departamentales_ids: [99] },
+  });
+  assert.equal(response.status, 200);
+  const consultas = databaseCalls.filter(({ sql }) => /LEFT JOIN correo_bienvenida/.test(sql));
+  assert.equal(consultas.length, 2);
+  for (const { sql, params } of consultas) {
+    assert.match(sql, /u\.primer_ingreso IS NULL/);
+    assert.match(sql, /COALESCE\(cb\.estado, 'no_enviado'\) = \?/);
+    assert.match(sql, /u\.departamental_id = \?/);
+    assert.match(sql, /u\.rol_id IN \(2, 4\)/);
+    assert.deepEqual(params, ["rebotado", 7]);
+  }
+});
+
+test("auditor filtra por departamental y personas que ingresaron, incluidos correos no enviados", async () => {
+  preparar("auditor", responderTabla);
+  const response = await request("/api/tabla/usuarios?orderBy=ultimo_ingreso&orderType=asc", {
+    rol: "auditor", method: "POST",
+    body: { estado_ingreso: "ingreso", estado_email: "no_enviado", departamentales_ids: [8, 9] },
+  });
+  assert.equal(response.status, 200);
+  const consultas = databaseCalls.filter(({ sql }) => /LEFT JOIN correo_bienvenida/.test(sql));
+  for (const { sql, params } of consultas) {
+    assert.match(sql, /u\.primer_ingreso IS NOT NULL/);
+    assert.match(sql, /u\.departamental_id IN \(\?,\?\)/);
+    assert.deepEqual(params, ["no_enviado", 8, 9]);
+  }
+  assert.match(consultas[0].sql, /ORDER BY u\.ultimo_ingreso asc/);
+});
+
+for (const body of [{ estado_ingreso: "incorrecto" }, { estado_email: "rebotado' OR 1=1" }]) {
+  test(`rechaza filtros de seguimiento inválidos: ${Object.keys(body)[0]}`, async () => {
+    preparar("admin", responderTabla);
+    const response = await request("/api/tabla/usuarios", { rol: "admin", method: "POST", body });
+    assert.equal(response.status, 400);
+    assert.equal(databaseCalls.some(({ sql }) => /LEFT JOIN correo_bienvenida/.test(sql)), false);
+  });
+}
+
+test("afiliado no obtiene seguimiento de otras cuentas", async () => {
+  preparar("afiliado", responderTabla);
+  const response = await request("/api/tabla/usuarios", { rol: "afiliado", method: "POST", body: {} });
+  assert.equal(response.status, 401);
+  assert.equal(databaseCalls.some(({ sql }) => /LEFT JOIN correo_bienvenida/.test(sql)), false);
+});
+
+test("auditor puede consultar los catálogos de roles y departamentales", async () => {
+  preparar("auditor", async (sql) => {
+    if (/FROM rol ORDER BY/.test(sql)) return [[{ id: 2, nombre: "afiliado" }]];
+    if (/FROM departamental/.test(sql)) return [[{ id: 7, nombre: "La Plata" }]];
+    throw new Error(`Consulta inesperada: ${sql}`);
+  });
+  const roles = await request("/api/rol", { rol: "auditor", method: "GET" });
+  const departamentales = await request("/api/departamental", { rol: "auditor", method: "GET" });
+  assert.equal(roles.status, 200);
+  assert.equal(roles.body[0].codigo, "afiliado");
+  assert.equal(departamentales.status, 200);
+  assert.equal(departamentales.body[0].id, 7);
 });

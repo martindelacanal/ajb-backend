@@ -23,6 +23,7 @@ async function crearSesion({ db, data, password, recordar = false, jwtLib, jwtSe
      VALUES (?, ?, ?, ?, ${recordar ? "NULL" : "DATE_ADD(NOW(6), INTERVAL 8 HOUR)"})`,
     [sid, data.id, refreshToken ? huella(refreshToken, "refresh", jwtSecret) : null, passwordVersion]);
   const token = await emitirTokenSesion({ data, recordar, sid, passwordVersion, jwtLib, jwtSecret });
+  await db.query(`UPDATE usuario SET primer_ingreso=COALESCE(primer_ingreso,NOW(6)), ultimo_ingreso=NOW(6) WHERE id=?`, [data.id]);
   return { token, data, ...(refreshToken ? { refreshToken } : {}) };
 }
 

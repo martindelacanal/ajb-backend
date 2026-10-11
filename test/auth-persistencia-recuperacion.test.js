@@ -13,7 +13,7 @@ test("recordar guarda solo una huella y emite acceso corto revocable; sin record
   for (const recordar of [false, true]) {
     let insert;
     const result = await crearSesion({
-      db: { query: async (sql, params) => { insert = { sql, params }; return [{ affectedRows: 1 }]; } },
+      db: { query: async (sql, params) => { if (/INSERT INTO auth_sesion/.test(sql)) insert = { sql, params }; return [{ affectedRows: 1 }]; } },
       data: { id: 12, rol: "afiliado" }, password: "bcrypt-hash", recordar, jwtSecret: secret,
     });
     const payload = jwt.verify(result.token, secret);

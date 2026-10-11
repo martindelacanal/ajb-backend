@@ -392,6 +392,13 @@ test("authentication/verify bloquea la credencial, actualiza contador y emite el
         eventos.push("session-create");
         return [{ affectedRows: 1 }];
       }
+      if (/UPDATE usuario SET primer_ingreso=/i.test(sql)) {
+        assert.deepEqual(params, [31]);
+        assert.match(sql, /primer_ingreso=COALESCE\(primer_ingreso,NOW\(6\)\)/);
+        assert.match(sql, /ultimo_ingreso=NOW\(6\)/);
+        eventos.push("ingreso-update");
+        return [{ affectedRows: 1 }];
+      }
       throw new Error(`SQL inesperado: ${sql}`);
     },
     async commit() { eventos.push("commit"); },
@@ -467,7 +474,7 @@ test("authentication/verify bloquea la credencial, actualiza contador y emite el
   assert.match(response.body.refreshToken, /^[A-Za-z0-9_-]{43}$/);
   assert.match(firmaJwt.payload.sid, /^[a-f0-9-]{36}$/);
   assert.deepEqual(JSON.parse(firmaJwt.payload.data), response.body.data);
-  assert.deepEqual(eventos, ["begin", "select-for-update", "counter-update", "session-create", "commit", "release"]);
+  assert.deepEqual(eventos, ["begin", "select-for-update", "counter-update", "session-create", "ingreso-update", "commit", "release"]);
 });
 
 test("registration/options exige sesion actual y configura una passkey discoverable", async () => {
