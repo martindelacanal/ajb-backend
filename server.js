@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const app = require('./app');
 const mysqlConnection = require('./api/connection/connection');
 const { actualizarAutorizacionSesion, ErrorSesionUsuario } = require('./api/security/autorizacion-sesion');
+const { exigirOperacionCuenta, ErrorRestriccionCuenta } = require('./api/security/restricciones-cuenta');
 const {
     obtenerOrigenesPermitidos,
     crearValidadorCors,
@@ -229,6 +230,7 @@ io.use(async (socket, next) => {
         }
 
         const usuarios = [await actualizarAutorizacionSesion(tokenVerificado, mysqlConnection.promise())];
+        exigirOperacionCuenta(usuarios[0], { method: 'GET', path: '/socket' });
         socket.data.tokenSesion = token;
 
         socket.data.auth = {
@@ -255,6 +257,7 @@ io.on("connection", (socket) => {
         try {
             const payload = jwt.verify(socket.data.tokenSesion, process.env.JWT_SECRET);
             const usuario = await actualizarAutorizacionSesion(payload, mysqlConnection.promise());
+            exigirOperacionCuenta(usuario, { method: 'GET', path: '/socket' });
             Object.assign(socket.data.auth, {
                 rol: String(usuario.rol || "").trim().toLowerCase(),
                 departamentalId: usuario.departamental_id == null ? null : Number(usuario.departamental_id),
@@ -264,7 +267,7 @@ io.on("connection", (socket) => {
             });
             return true;
         } catch (error) {
-            if (!(error instanceof ErrorSesionUsuario) && !["TokenExpiredError", "JsonWebTokenError", "NotBeforeError"].includes(error?.name)) {
+            if (!(error instanceof ErrorSesionUsuario) && !(error instanceof ErrorRestriccionCuenta) && !["TokenExpiredError", "JsonWebTokenError", "NotBeforeError"].includes(error?.name)) {
                 // Una falla de infraestructura no revoca un dispositivo recordado.
                 // Cerrar el transporte permite que Socket.IO reintente la conexión.
                 socket.conn.close();

@@ -8,6 +8,8 @@
     "test:security": "node --test test/security/authorization.test.js",
     "migrate:auth:check": "node scripts/migrar-auth-v1.js --check --target=develop",
     "migrate:auth:apply": "node scripts/migrar-auth-v1.js --apply --target=develop --confirm=APLICAR_AUTH",
+    "migrate:acceso-usuarios:check": "node scripts/migrar-acceso-usuarios-v1.js --check --target=develop",
+    "migrate:acceso-usuarios:apply": "node scripts/migrar-acceso-usuarios-v1.js --apply --target=develop --confirm=APLICAR_ACCESO_USUARIOS",
     "serve": "nodemon server.js",
     "start": "node server.js",
     "migrate:s3": "node scripts/migrate-images-to-s3.js",
@@ -49,7 +51,8 @@
     "migrate:estado-reserva-cancelada:check": "node scripts/migrar-estado-reserva-cancelada.js --check",
     "migrate:portada-gestion": "node scripts/migrar-portada-gestion.js",
     "migrate:noticias-departamentales": "node scripts/migrar-noticias-departamentales.js",
-    "migrate:noticias-portada-publica": "node scripts/migrar-noticias-portada-publica.js"
+    "migrate:noticias-portada-publica": "node scripts/migrar-noticias-portada-publica.js",
+    "test:acceso:integracion": "node scripts/verificar-acceso-usuarios-integracion.js"
   },
   "keywords": [],
   "author": "",

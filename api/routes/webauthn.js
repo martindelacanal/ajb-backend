@@ -12,6 +12,7 @@ const {
 } = require("../security/autorizacion-sesion");
 const { obtenerOrigenesPermitidos } = require("../security/http-config");
 const { crearSesion } = require("../security/sesiones-persistentes");
+const { datosPublicosAcceso, ErrorRestriccionCuenta, cuerpoRestriccion } = require("../security/restricciones-cuenta");
 const {
   ErrorOrigenWebAuthn,
   resolverContextoWebAuthn,
@@ -78,6 +79,8 @@ function compararBase64UrlSeguro(actual, esperado) {
 
 function datosSesionDesdeFila(row) {
   return {
+    bloqueo: datosPublicosAcceso(row).bloqueo,
+    requiere_cambio_clave: Number(row.requiere_cambio_clave) === 1,
     id: row.id,
     nombre: row.nombre,
     apellido: row.apellido,
@@ -531,7 +534,8 @@ function crearRouterWebAuthn({
                   u.id, u.password, u.nombre, u.apellido, u.documento, u.email,
                   u.departamental_id, u.rol_id, r.nombre AS rol, u.habilitado,
                   u.area_turismo, u.area_coseguro,
-                  u.modulo_turismo, u.modulo_coseguro, u.modulo_olimpiadas
+                  u.modulo_turismo, u.modulo_coseguro, u.modulo_olimpiadas,
+                  u.bloqueo_tipo, u.bloqueo_modulos, u.bloqueo_mensaje, u.requiere_cambio_clave
              FROM webauthn_credencial c
              INNER JOIN usuario u ON u.id = c.usuario_id
              INNER JOIN rol r ON r.id = u.rol_id
@@ -616,6 +620,10 @@ function crearRouterWebAuthn({
         }
         if (error instanceof ErrorWebAuthnEsperado) {
           res.status(error.statusCode).json(error.message);
+          return;
+        }
+        if (error instanceof ErrorRestriccionCuenta) {
+          res.status(error.statusCode).json(cuerpoRestriccion(error));
           return;
         }
         console.error("No se pudo verificar la autenticacion WebAuthn:", error?.code || error?.message);

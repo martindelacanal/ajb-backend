@@ -16,6 +16,7 @@
 const { GRUPOS, normalizarCicCodigo, conGrupoVisual } = require("../data/coseguro-catalogo-631");
 const { LIMITES_ARCHIVOS, ADJUNTO_OTROS, completarAdjuntos } = require("../data/coseguro-limites-archivos");
 const express = require("express");
+const { exigirAltaParaUsuario } = require("../security/restricciones-cuenta");
 const { notificarParticipantesChat } = require("../services/chat-notificaciones");
 const { crearNotificacion } = require("../services/notificaciones");
 const { generarConstanciaReintegro } = require("../services/coseguro-constancia");
@@ -1911,6 +1912,7 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
     if (!usuarioId) return res.status(400).json("Afiliado inválido");
     const [titulares] = await db.query(
       `SELECT u.id, u.departamental_id, u.nombre, u.apellido, u.habilitado,
+              u.bloqueo_tipo, u.bloqueo_modulos, u.bloqueo_mensaje,
               u.usuario_familiar_id, r.nombre AS rol
        FROM usuario u INNER JOIN rol r ON r.id = u.rol_id WHERE u.id = ?`,
       [usuarioId]
@@ -1927,6 +1929,7 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
     const titularOriginal = await obtenerTitularReasignacion(db, cabecera,
       { usuario_id: usuarioId, departamental_id: titular.departamental_id },
       { usuario_id: req.body.usuario_original_id ?? usuarioId });
+    exigirAltaParaUsuario(titular, "coseguro");
 
     let validacion = await validarDatosSolicitud(db, cabecera, req.body, { usuarioId });
 
@@ -2000,13 +2003,15 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
     // La decisión final se toma bajo un bloqueo asesor y la fila del titular se
     // vuelve a validar: así dos altas simultáneas no pueden pasar ambos chequeos.
     const [titularesBloqueados] = await connection.query(
-      `SELECT u.id, u.departamental_id, u.habilitado, u.usuario_familiar_id, r.nombre AS rol
+      `SELECT u.id, u.departamental_id, u.habilitado, u.usuario_familiar_id, r.nombre AS rol,
+              u.bloqueo_tipo, u.bloqueo_modulos, u.bloqueo_mensaje
        FROM usuario u INNER JOIN rol r ON r.id = u.rol_id
        WHERE u.id = ? FOR UPDATE`,
       [usuarioId]
     );
     if (titularesBloqueados.length === 0) throw crearErrorHttp("Afiliado no encontrado", 404);
     const titularBloqueado = titularesBloqueados[0];
+    exigirAltaParaUsuario(titularBloqueado, "coseguro");
     if (titularBloqueado.rol !== "afiliado" || titularBloqueado.habilitado !== "Y" || titularBloqueado.usuario_familiar_id !== null) {
       throw crearErrorHttp("El titular debe ser un afiliado principal habilitado", 422);
     }

@@ -1,6 +1,7 @@
 "use strict";
 
 const { huellaPassword, igualesSeguros } = require("./auth-crypto");
+const { datosPublicosAcceso, exigirAccesoCuenta, exigirOperacionCuenta, ErrorRestriccionCuenta, cuerpoRestriccion } = require("./restricciones-cuenta");
 
 class ErrorSesionUsuario extends Error {
   constructor(message, statusCode = 403) {
@@ -40,13 +41,23 @@ async function resolverAccesoFamiliar(usuario, db) {
     throw new ErrorSesionUsuario('El invitado no tiene un vínculo familiar habilitado');
   }
   const [titulares] = await db.query(
-    `SELECT id, rol_id, habilitado, modulo_turismo, departamental_id, usuario_familiar_id
+    `SELECT id, rol_id, habilitado, modulo_turismo, departamental_id, usuario_familiar_id,
+       bloqueo_tipo, bloqueo_modulos, bloqueo_mensaje
        FROM usuario WHERE id = ? LIMIT 1`, [titularId]);
   const titular = titulares[0];
   if (!titular || Number(titular.rol_id) !== 2 || !usuarioHabilitado(titular.habilitado) || titular.usuario_familiar_id) {
     throw new ErrorSesionUsuario('El titular del grupo familiar no está habilitado');
   }
+  exigirAccesoCuenta(titular);
+  const bloqueoTitular = datosPublicosAcceso(titular).bloqueo;
+  const bloqueoPropio = usuario.bloqueo || datosPublicosAcceso(usuario).bloqueo;
+  // Un familiar no puede comprometer fondos de turismo de un titular bloqueado.
+  const bloqueo = bloqueoPropio?.tipo === 'total' ? bloqueoPropio
+    : bloqueoTitular?.modulos.includes('turismo')
+      ? { tipo: 'modulos', modulos: [...new Set([...(bloqueoPropio?.modulos || []), 'turismo'])], mensaje: bloqueoTitular.mensaje }
+      : bloqueoPropio;
   return { ...usuario, rol: 'afiliado', es_familiar: 'S', acceso_familiar_turismo: true,
+    bloqueo,
     titular_usuario_id: titularId, departamental_id: titular.departamental_id,
     area_turismo: 1, area_coseguro: 0,
     modulo_turismo: (titular.modulo_turismo == null || Number(titular.modulo_turismo) === 1) &&
@@ -59,6 +70,7 @@ function rutaPermitidaFamiliar(req) {
   // la misma normalización evita que esas variantes salteen las exclusiones.
   const ruta = String(req.path || req.url || '').split('?')[0].replace(/\/+$/, '').toLowerCase();
   const metodo = String(req.method || '').toUpperCase();
+  if (metodo === 'POST' && ruta === '/auth/password/cambiar-obligatoria') return true;
   if ((metodo === 'POST' && ruta === '/familiares') || /^\/familiares\/\d+\/vinculo$/.test(ruta)) return false;
   // Los handlers conservan sus controles de propiedad y ámbito de grupo.
   return /^\/(?:sesion\/permisos|configuracion\/usuario(?:\/\d+)?|usuario|notificaciones(?:\/.*)?|mis-gestiones(?:\/catalogos)?|turismo(?:\/.*)?|reserva(?:\/.*)?|reservas\/aprobaciones-titular|servicios(?:\/.*)?|lugares|recursos|adicionales|regimen|tipo_persona|parentesco|acompaniantes(?:\/\d+)?|tabla\/acompaniantes|familiares(?:\/.*)?|convenios-hoteleros(?:\/.*)?|sorteos(?:\/.*)?|filtros\/para-recursos|descuentos(?:\/.*)?|observaciones\/turismo\/\d+\/lectura|webauthn(?:\/.*)?)\/?$/.test(ruta);
@@ -81,6 +93,10 @@ async function actualizarAutorizacionSesion(authData, db, jwtSecret = process.en
        u.modulo_turismo,
        u.modulo_coseguro,
        u.modulo_olimpiadas,
+       u.bloqueo_tipo,
+       u.bloqueo_modulos,
+       u.bloqueo_mensaje,
+       u.requiere_cambio_clave,
        u.es_familiar,
        u.usuario_familiar_id
      FROM usuario u
@@ -98,6 +114,7 @@ async function actualizarAutorizacionSesion(authData, db, jwtSecret = process.en
   }
 
   const usuario = usuarios[0];
+  exigirAccesoCuenta(usuario);
   if (authData.sid) {
     if (!igualesSeguros(authData.passwordVersion, huellaPassword(usuario.password, jwtSecret))) {
       throw new ErrorSesionUsuario("Tu sesión ya no es válida. Volvé a iniciar sesión.", 401);
@@ -113,7 +130,7 @@ async function actualizarAutorizacionSesion(authData, db, jwtSecret = process.en
   delete usuario.password;
   delete usuario.auth_revocado_desde;
 
-  const actualizada = { ...cabecera, acceso_familiar_turismo: false, titular_usuario_id: null, ...await resolverAccesoFamiliar(usuarios[0], db) };
+  const actualizada = { ...cabecera, acceso_familiar_turismo: false, titular_usuario_id: null, ...await resolverAccesoFamiliar(datosPublicosAcceso(usuario), db) };
   authData.data = JSON.stringify(actualizada);
   return actualizada;
 }
@@ -141,12 +158,14 @@ function verificarTokenConAutorizacionActual({
     }
     try {
       const permisos = await actualizarAutorizacionSesion(authData, db, jwtSecret);
+      exigirOperacionCuenta(permisos, req);
       if (permisos.acceso_familiar_turismo && !rutaPermitidaFamiliar(req)) {
         return res.status(403).json('La cuenta familiar solo tiene acceso a turismo y a sus datos personales');
       }
       req.data = authData;
       return next();
     } catch (sessionError) {
+      if (sessionError instanceof ErrorRestriccionCuenta) return res.status(sessionError.statusCode).json(cuerpoRestriccion(sessionError));
       if (sessionError instanceof ErrorSesionUsuario) {
         return res.status(sessionError.statusCode).json(sessionError.statusCode === 401
           ? { mensaje: sessionError.message, code: "SESSION_REVOKED" }

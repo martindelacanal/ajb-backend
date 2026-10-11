@@ -155,7 +155,7 @@ function crearServicioRecuperacion({ db, jwtSecret = process.env.JWT_SECRET, env
       if (!row || !usuario || !usuarioHabilitado(usuario.habilitado)
         || !igualesSeguros(row.password_version, huellaPassword(usuario.password, jwtSecret))
         || !igualesSeguros(row.correo_hash, huella(usuario.email.trim().toLowerCase(), "reset-email", jwtSecret))) throw new ErrorRecuperacion(MENSAJE_CODIGO);
-      await connection.query("UPDATE usuario SET password = ?, auth_revocado_desde = NOW(6) WHERE id = ?", [passwordHash, usuario.id]);
+      await connection.query("UPDATE usuario SET password = ?, requiere_cambio_clave = 0, auth_revocado_desde = NOW(6) WHERE id = ?", [passwordHash, usuario.id]);
       await connection.query("UPDATE auth_recuperacion SET consumido_en = NOW(6), reset_hash = NULL, codigo_hash = NULL WHERE usuario_id = ?", [usuario.id]);
       await connection.query("UPDATE auth_sesion SET revocado_en = NOW(6) WHERE usuario_id = ? AND revocado_en IS NULL", [usuario.id]);
       // Las claves de acceso también permiten entrar: quitar las anteriores tras recuperar una cuenta.

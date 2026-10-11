@@ -54,7 +54,7 @@ test("recupera una renovación cuya respuesta se perdió tras quedar offline y d
         const coincide = [row.refresh_hash, row.refresh_anterior_hash].includes(params[0]);
         return [coincide ? [{ usuario_id: 12 }] : []];
       }
-      if (/SELECT id FROM usuario/.test(sql)) return [[{ id: 12 }]];
+      if (/SELECT id, bloqueo_tipo, bloqueo_modulos, bloqueo_mensaje FROM usuario/.test(sql)) return [[{ id: 12 }]];
       if (/SELECT s.id AS sesion_id/.test(sql)) return [[{ ...row }]];
       if (/UPDATE auth_sesion SET refresh_anterior_hash/.test(sql)) {
         row.refresh_anterior_hash = row.refresh_hash;

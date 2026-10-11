@@ -12,6 +12,7 @@ const { normalizarCredencialesSignin } = require("../security/signin-input");
 const { DNI_MENSAJE, esDniValido } = require("../security/dni");
 const { verificarTokenConAutorizacionActual, resolverAccesoFamiliar, ErrorSesionUsuario } = require("../security/autorizacion-sesion");
 const { crearSesion } = require("../security/sesiones-persistentes");
+const { datosPublicosAcceso, exigirAccesoCuenta, exigirAltaParaUsuario, ErrorRestriccionCuenta, cuerpoRestriccion } = require("../security/restricciones-cuenta");
 const { condicionModuloNotificacion } = require("../services/notificaciones-modulos");
 const { crearNotificacion, obtenerPreferenciasNotificaciones, guardarPreferenciasNotificaciones } = require("../services/notificaciones");
 const {
@@ -714,7 +715,8 @@ router.post("/signin", async (req, res) => {
   const query = `
     SELECT u.id, u.nombre, u.apellido, u.documento, u.email, u.password, u.departamental_id, rol.nombre AS rol, u.habilitado,
            u.area_turismo, u.area_coseguro,
-           u.modulo_turismo, u.modulo_coseguro, u.modulo_olimpiadas, u.rol_id, u.es_familiar, u.usuario_familiar_id
+           u.modulo_turismo, u.modulo_coseguro, u.modulo_olimpiadas, u.rol_id, u.es_familiar, u.usuario_familiar_id,
+           u.bloqueo_tipo, u.bloqueo_modulos, u.bloqueo_mensaje, u.requiere_cambio_clave
     FROM usuario as u
     INNER JOIN rol ON rol.id = u.rol_id
     WHERE u.documento = ? AND u.password IS NOT NULL
@@ -733,10 +735,12 @@ router.post("/signin", async (req, res) => {
           let data = rows[0];
 
           try {
-            data = await resolverAccesoFamiliar(data, mysqlConnection.promise());
+            exigirAccesoCuenta(data);
+            data = await resolverAccesoFamiliar(datosPublicosAcceso(data), mysqlConnection.promise());
             const sesion = await crearSesion({ db: mysqlConnection.promise(), data, recordar, password: passwordHash });
             res.status(200).json(sesion);
           } catch (tokenError) {
+            if (tokenError instanceof ErrorRestriccionCuenta) return res.status(tokenError.statusCode).json(cuerpoRestriccion(tokenError));
             if (tokenError instanceof ErrorSesionUsuario) return res.status(403).json(tokenError.message);
             console.error("Error al emitir token de acceso:", tokenError);
             res.status(500).json("Error interno");
@@ -771,6 +775,8 @@ router.get("/sesion/permisos", verifyToken, (req, res) => {
       es_familiar: cabecera.es_familiar,
       acceso_familiar_turismo: cabecera.acceso_familiar_turismo,
       titular_usuario_id: cabecera.titular_usuario_id,
+      bloqueo: cabecera.bloqueo,
+      requiere_cambio_clave: cabecera.requiere_cambio_clave,
     });
   } catch (_error) {
     return res.status(403).json("Error en la sesion");
@@ -6314,7 +6320,8 @@ async function resolverTitularReservaAlta(connection, cabecera, usuarioIdRaw, {
 
   const [usuariosTitulares] = await connection.query(
     `SELECT u.id, u.nombre, u.apellido, u.documento, u.usuario_familiar_id, u.departamental_id,
-            u.habilitado, u.cbu, u.email, u.es_familiar, u.parentesco_id, u.modulo_turismo, u.modulo_coseguro, r.nombre AS rol
+            u.habilitado, u.cbu, u.email, u.es_familiar, u.parentesco_id, u.modulo_turismo, u.modulo_coseguro, r.nombre AS rol,
+            u.bloqueo_tipo, u.bloqueo_modulos, u.bloqueo_mensaje
        FROM usuario u
        INNER JOIN rol r ON r.id = u.rol_id
       WHERE u.id = ?
@@ -6365,6 +6372,12 @@ async function resolverTitularReservaAlta(connection, cabecera, usuarioIdRaw, {
   }
 
   const grupoReserva = await obtenerGrupoReserva(connection, usuarioTitular, { forUpdate: true });
+  exigirAltaParaUsuario(usuarioTitular, "turismo");
+  exigirAltaParaUsuario(grupoReserva.titular, "turismo");
+  if (requiereCoseguro) {
+    exigirAltaParaUsuario(usuarioTitular, "coseguro");
+    exigirAltaParaUsuario(grupoReserva.titular, "coseguro");
+  }
   if (validarCbuObligatorio) {
     exigirCbu(grupoReserva);
     await asegurarSinSolicitudTitularPendiente(connection, usuarioReservaId);
@@ -15121,10 +15134,7 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
         whereConditions.push(`u.rol_id IN (2, 4)`);
       }
 
-      // admin-central gestiona afiliados e invitados de todas las departamentales
-      if (cabecera.rol === "admin-central") {
-        whereConditions.push(`u.rol_id IN (2, 4)`);
-      }
+      // Administración central puede gestionar el acceso de todos los roles.
 
       // Filtro por roles
       if (filters.roles && Array.isArray(filters.roles) && filters.roles.length > 0) {
@@ -15212,6 +15222,8 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
           COALESCE(u.legajo, '') AS legajo,
           u.habilitado,
           u.modulo_coseguro,
+          u.departamental_id,
+          u.bloqueo_tipo, u.bloqueo_modulos, u.bloqueo_mensaje, u.requiere_cambio_clave,
           DATE_FORMAT(u.fecha_creacion, '%d/%m/%Y') AS fecha_creacion
         FROM usuario u
         LEFT JOIN rol r ON u.rol_id = r.id
@@ -15240,7 +15252,7 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
       const numOfPages = Math.ceil(numOfResults / resultsPerPage);
 
       res.json({
-        results: rows,
+        results: rows.map(datosPublicosAcceso),
         numOfPages,
         totalItems: numOfResults,
         page: page - 1,
@@ -15349,7 +15361,7 @@ router.put("/usuarios/:id/modulo-coseguro", verifyToken, async (req, res) => {
 router.get("/rol", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
-    if (cabecera.rol === "admin") {
+    if (cabecera.rol === "admin" || cabecera.rol === "admin-central") {
       const [rows] = await mysqlConnection
         .promise()
         .query("SELECT id, nombre FROM rol ORDER BY id ASC");
@@ -15373,7 +15385,7 @@ router.get("/rol", verifyToken, async (req, res) => {
       }));
 
       res.status(200).json(roles);
-    } else if (cabecera.rol === "departamental" || cabecera.rol === "admin-central") {
+    } else if (cabecera.rol === "departamental") {
       // Roles de las personas que gestionan (services/usuarios-datos.js).
       const [rows] = await mysqlConnection
         .promise()

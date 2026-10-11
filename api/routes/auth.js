@@ -6,6 +6,7 @@ const mysqlConnection = require("../connection/connection");
 const { enviarCorreoPlantilla } = require("../services/correo");
 const { crearServicioRecuperacion, ErrorRecuperacion, MENSAJE_SOLICITUD } = require("../security/recuperacion-password");
 const { renovarSesion, cerrarSesion, ErrorAutenticacion } = require("../security/sesiones-persistentes");
+const { ErrorRestriccionCuenta, cuerpoRestriccion } = require("../security/restricciones-cuenta");
 
 async function enviarCodigo({ para, codigo }) {
   return enviarCorreoPlantilla({
@@ -25,6 +26,7 @@ function crearRouterAuth({ db = mysqlConnection.promise(), jwtSecret = process.e
   const router = express.Router();
   const recuperacion = crearServicioRecuperacion({ db, jwtSecret, enviarCodigo: enviar });
   const responderError = (res, error) => {
+    if (error instanceof ErrorRestriccionCuenta) return res.status(error.statusCode).json(cuerpoRestriccion(error));
     if (error instanceof ErrorRecuperacion || error instanceof ErrorAutenticacion) {
       if (error.retryAfter) res.set("Retry-After", String(error.retryAfter));
       return res.status(error.statusCode).json({ mensaje: error.message,

@@ -34,7 +34,7 @@ async function obtenerGrupoReserva(connection, usuario, { forUpdate = false } = 
       const [rows] = await connection.query(
         `SELECT u.id, u.nombre, u.apellido, u.cbu, u.email, u.usuario_familiar_id,
                 u.es_familiar, u.parentesco_id, u.departamental_id, u.habilitado,
-                u.modulo_turismo, r.nombre AS rol
+                u.modulo_turismo, r.nombre AS rol, u.bloqueo_tipo, u.bloqueo_modulos, u.bloqueo_mensaje
            FROM usuario u INNER JOIN rol r ON r.id = u.rol_id
           WHERE u.id = ? LIMIT 1${forUpdate ? " FOR UPDATE" : ""}`, [id]);
       titular = rows[0];

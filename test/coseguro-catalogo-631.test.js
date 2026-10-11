@@ -46,7 +46,9 @@ test('reagrupar tarjetas conserva C.I.C., rubro contable y campos almacenados de
 });
 
 function baseSolicitud(extra) {
-  return { tipo_reintegro_id: 1, fecha_comprobante: new Date().toISOString().slice(0,10), comprobante_numero:'123456', emisor_nombre:'Profesional', importe:'100', cuil_afiliado:'20301112220', cbu:'0140999861000000123452', ...extra };
+  // El comprobante usa la misma fecha civil argentina que la validación.
+  const fecha = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' }).format(new Date());
+  return { tipo_reintegro_id: 1, fecha_comprobante: fecha, comprobante_numero:'123456', emisor_nombre:'Profesional', importe:'100', cuil_afiliado:'20301112220', cbu:'0140999861000000123452', ...extra };
 }
 function dbConceptos(conceptos) {
   return { async query(sql) {

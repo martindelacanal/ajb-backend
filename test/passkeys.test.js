@@ -440,6 +440,8 @@ test("authentication/verify bloquea la credencial, actualiza contador y emite el
   assert.equal(response.status, 200);
   assert.equal(response.body.token, "jwt-passkey");
   assert.deepEqual(response.body.data, {
+    bloqueo: null,
+    requiere_cambio_clave: false,
     id: 31,
     nombre: "Ana",
     apellido: "Prueba",
