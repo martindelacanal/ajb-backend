@@ -358,8 +358,9 @@ function getCabecera(req) {
   return JSON.parse(req.data.data);
 }
 
-const ROLES_STAFF = ["admin", "admin-central", "departamental"];
+const ROLES_STAFF = ["admin", "admin-central", "departamental", "educacion"];
 const ROLES_SUPERIORES = ["admin", "admin-central"];
+const { esRubroEducativo, puedeGestionarEducacion, CONDICION_BENEFICIO_EDUCATIVO } = require("../services/beneficios-educacion");
 
 // ---------------------------------------------------------------------------
 // Estados y permisos
@@ -394,6 +395,7 @@ function esDepartamentalDuenia(cabecera, beneficio) {
 // que la incluyen: las propuestas de otras departamentales son privadas hasta publicarse.
 function puedeVerBeneficio(cabecera, beneficio) {
   if (esSuperior(cabecera)) return true;
+  if (cabecera?.rol === "educacion") return puedeGestionarEducacion(cabecera, beneficio);
   if (cabecera?.rol !== "departamental") return false;
   if (esDepartamentalDuenia(cabecera, beneficio)) return true;
   if (Number(beneficio?.estado_id) !== ESTADO.APROBADO) return false;
@@ -402,24 +404,24 @@ function puedeVerBeneficio(cabecera, beneficio) {
 
 // Acceso completo (datos internos, chat, historial, convenio): superiores y la dueña
 function puedeVerDatosInternos(cabecera, beneficio) {
-  return esSuperior(cabecera) || esDepartamentalDuenia(cabecera, beneficio);
+  return esSuperior(cabecera) || puedeGestionarEducacion(cabecera, beneficio) || esDepartamentalDuenia(cabecera, beneficio);
 }
 
 function puedeEditarBeneficio(cabecera, beneficio) {
-  if (esSuperior(cabecera)) return true;
+  if (esSuperior(cabecera) || puedeGestionarEducacion(cabecera, beneficio)) return true;
   return esDepartamentalDuenia(cabecera, beneficio)
     && [ESTADO.PENDIENTE, ESTADO.OBSERVADO].includes(Number(beneficio?.estado_id));
 }
 
 function puedeEliminarBeneficio(cabecera, beneficio) {
-  if (esSuperior(cabecera)) return true;
+  if (esSuperior(cabecera) || puedeGestionarEducacion(cabecera, beneficio)) return true;
   return esDepartamentalDuenia(cabecera, beneficio)
     && [ESTADO.PENDIENTE, ESTADO.OBSERVADO, ESTADO.RECHAZADO].includes(Number(beneficio?.estado_id));
 }
 
 // El chat del flujo de aprobación es entre administración y la departamental dueña
 function puedeObservarBeneficio(cabecera, beneficio) {
-  return esSuperior(cabecera) || esDepartamentalDuenia(cabecera, beneficio);
+  return esSuperior(cabecera) || puedeGestionarEducacion(cabecera, beneficio) || esDepartamentalDuenia(cabecera, beneficio);
 }
 
 function transicionesDisponibles(cabecera, estadoId, esPropia) {
@@ -427,6 +429,7 @@ function transicionesDisponibles(cabecera, estadoId, esPropia) {
   switch (cabecera?.rol) {
     case "admin":
     case "admin-central":
+    case "educacion":
       return ({
         [ESTADO.PENDIENTE]: [ESTADO.APROBADO, ESTADO.OBSERVADO, ESTADO.RECHAZADO],
         [ESTADO.OBSERVADO]: [ESTADO.APROBADO, ESTADO.RECHAZADO],
@@ -1358,7 +1361,8 @@ function departamentalDeCabecera(cabecera) {
 async function obtenerBeneficioStaff(connection, beneficioId, cabecera, { forUpdate = false } = {}) {
   const departamentalId = cabecera.rol === "departamental" ? departamentalDeCabecera(cabecera) : 0;
   const [rows] = await connection.query(
-    `SELECT b.*, ${SELECT_INCLUYE_DEPARTAMENTAL} AS incluye_departamental
+    `SELECT b.*, (SELECT nombre FROM beneficio_rubro WHERE id = b.rubro_id) AS rubro_nombre,
+            ${SELECT_INCLUYE_DEPARTAMENTAL} AS incluye_departamental
      FROM beneficio b WHERE b.id = ? AND b.eliminado = 0${forUpdate ? " FOR UPDATE" : ""}`,
     [departamentalId, beneficioId]
   );
@@ -1424,7 +1428,8 @@ router.get("/beneficios/catalogos", verifyToken, async (req, res) => {
     const [departamentales] = await db.query(
       "SELECT id, nombre FROM departamental WHERE habilitado = 'Y' ORDER BY nombre"
     );
-    res.status(200).json({ estados, estados_inscripcion: estadosInscripcion, rubros, departamentales });
+    const rubrosPermitidos = getCabecera(req).rol === "educacion" ? rubros.filter((r) => esRubroEducativo(r.nombre)) : rubros;
+    res.status(200).json({ estados, estados_inscripcion: estadosInscripcion, rubros: rubrosPermitidos, departamentales });
   } catch (error) {
     registrarErrorRuta(error);
     res.status(500).json("Error al obtener los catálogos de beneficios");
@@ -1438,6 +1443,7 @@ router.post("/beneficios/rubros", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     if (!ROLES_STAFF.includes(cabecera.rol)) return res.status(401).json("No autorizado");
+    if (cabecera.rol === "educacion") return res.status(403).json("Este rol utiliza los rubros Capacitación y Convenios educativos");
     const nombre = normalizarTexto(req.body?.nombre);
     if (!nombre || nombre.length < 2) return res.status(400).json("El nombre del rubro es obligatorio (mínimo 2 caracteres)");
     if (nombre.length > 80) return res.status(400).json("El nombre del rubro es demasiado largo (máximo 80 caracteres)");
@@ -1483,6 +1489,7 @@ router.get("/beneficios/inscripciones", verifyToken, async (req, res) => {
     // Condiciones base (scope + filtros) separadas del filtro de aviso para el resumen
     const condiciones = ["bi.eliminado = 0", "b.eliminado = 0"];
     const params = [];
+    if (cabecera.rol === "educacion") condiciones.push(CONDICION_BENEFICIO_EDUCATIVO);
     if (cabecera.rol === "departamental") {
       const propia = departamentalDeCabecera(cabecera);
       if (!propia) return res.status(401).json("No autorizado");
@@ -1591,6 +1598,7 @@ async function obtenerInscripcionStaff(db, inscripcionId, cabecera) {
   const [rows] = await db.query(
     `SELECT bi.id, bi.beneficio_id, bi.usuario_id, bi.aviso_entidad_estado, bi.aviso_entidad_error,
             b.nombre AS beneficio_nombre, b.email_aviso_inscripcion, b.departamental_id AS beneficio_departamental_id,
+            (SELECT nombre FROM beneficio_rubro WHERE id = b.rubro_id) AS rubro_nombre,
             u.departamental_id AS afiliado_departamental_id
      FROM beneficio_inscripcion bi
      INNER JOIN beneficio b ON b.id = bi.beneficio_id
@@ -1600,6 +1608,9 @@ async function obtenerInscripcionStaff(db, inscripcionId, cabecera) {
   );
   if (rows.length === 0) return { error: crearErrorHttp("Inscripción no encontrada", 404) };
   const inscripcion = rows[0];
+  if (cabecera.rol === "educacion" && !puedeGestionarEducacion(cabecera, inscripcion)) {
+    return { error: crearErrorHttp("No autorizado", 403) };
+  }
   if (cabecera.rol === "departamental") {
     const propia = departamentalDeCabecera(cabecera);
     if (!propia
@@ -2108,6 +2119,7 @@ router.get("/beneficios", verifyToken, async (req, res) => {
     // Condiciones base (scope + filtros) y, aparte, el filtro de estados (el resumen no lo usa)
     const condiciones = ["b.eliminado = 0"];
     const params = [];
+    if (cabecera.rol === "educacion") condiciones.push(CONDICION_BENEFICIO_EDUCATIVO);
     if (cabecera.rol === "departamental") {
       const propia = departamentalDeCabecera(cabecera);
       if (!propia) return res.status(401).json("No autorizado");
@@ -2285,6 +2297,9 @@ router.post("/beneficios", verifyToken, manejarUploadBeneficio, async (req, res)
     const { errores, datos } = await validarDatosBeneficio(db, req.body, {
       cantidadPines: (archivos.pines_imagenes || []).length,
     });
+    if (cabecera.rol === "educacion" && !esRubroEducativo(datos.rubro_nombre)) {
+      return res.status(403).json("Sólo podés cargar Capacitación y Convenios educativos");
+    }
     let departamentalId = null;
     if (cabecera.rol === "departamental") {
       departamentalId = departamentalDeCabecera(cabecera);
@@ -2552,6 +2567,9 @@ router.put("/beneficios/:id(\\d+)", verifyToken, manejarUploadBeneficio, async (
     const { errores, datos } = await validarDatosBeneficio(db, req.body, {
       cantidadPines: (archivos.pines_imagenes || []).length,
     });
+    if (cabecera.rol === "educacion" && !esRubroEducativo(datos.rubro_nombre)) {
+      return res.status(403).json("Sólo podés cargar Capacitación y Convenios educativos");
+    }
     let imagenesExistentes = null;
     if (valorInformado(req.body.imagenes_existentes)) {
       imagenesExistentes = normalizarListaIds(req.body.imagenes_existentes, { maximoItems: MAX_IMAGENES_GALERIA });
@@ -2592,7 +2610,7 @@ router.put("/beneficios/:id(\\d+)", verifyToken, manejarUploadBeneficio, async (
 
     // Departamental dueña: solo la cambian los superiores y solo si la mandan explícitamente
     let departamentalId = beneficio.departamental_id;
-    if (esSuperior(cabecera) && Object.prototype.hasOwnProperty.call(req.body, "departamental_id")) {
+    if ((esSuperior(cabecera) || puedeGestionarEducacion(cabecera, beneficio)) && Object.prototype.hasOwnProperty.call(req.body, "departamental_id")) {
       departamentalId = datos.departamental_id;
     }
 

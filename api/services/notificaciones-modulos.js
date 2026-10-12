@@ -13,7 +13,7 @@ const MODULOS_NOTIFICACION = {
   },
   traslados: { prefijos: ["TRASLADO"] },
   olimpiadas: { prefijos: ["OLIMPIADA"] },
-  beneficios: { prefijos: ["BENEFICIO"] },
+  beneficios: { prefijos: ["BENEFICIO", "KIT_"] },
   // Cambios de datos de familiares pedidos por el afiliado (FAMILIAR_CAMBIO_*).
   familiares: { prefijos: ["FAMILIAR"] },
 };

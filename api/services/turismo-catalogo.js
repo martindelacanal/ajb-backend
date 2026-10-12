@@ -317,6 +317,23 @@ function audienciaParaActor(servicio, cabecera) {
   return actor && actor === propietaria ? "PROPIA" : "OTRAS";
 }
 
+/** Separa la ubicación en el portal sin alterar los permisos de reserva. */
+function construirCatalogoServicioSql(cabecera, { departamental = false, origen = "", alias = "s" } = {}) {
+  const visibilidad = construirVisibilidadServicioSql(cabecera, alias);
+  const condiciones = [visibilidad.sql, `${alias}.propietario_departamental_id IS ${departamental ? "NOT " : ""}NULL`];
+  const params = [...visibilidad.params];
+  if (departamental && ["propia", "otras"].includes(origen)) {
+    const propia = normalizarIdPositivo(cabecera?.departamental_id);
+    if (propia) {
+      condiciones.push(`${alias}.propietario_departamental_id ${origen === "propia" ? "=" : "<>"} ?`);
+      params.push(propia);
+    } else if (origen === "propia") {
+      condiciones.push("1 = 0");
+    }
+  }
+  return { sql: condiciones.join(" AND "), params };
+}
+
 function normalizarValorFiltro(definicion, payload = {}) {
   const tipo = normalizarEnum(definicion?.tipo_valor, TIPOS_FILTRO);
   if (!tipo) return { error: "El tipo de característica no es válido" };
@@ -375,6 +392,7 @@ module.exports = {
   asegurarPropiedadServicio,
   audienciaParaActor,
   construirVisibilidadServicioSql,
+  construirCatalogoServicioSql,
   crearErrorCatalogo,
   cumpleFiltroTipado,
   esAdministradorTurismo,

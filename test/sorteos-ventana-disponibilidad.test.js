@@ -25,7 +25,7 @@ function assertVentanaInscripcionCompleta(sqlContract) {
 
 test("GET /servicios publica sorteos solo dentro de la ventana de inscripcion", () => {
   const contract = extraerContrato(
-    'router.get("/servicios",',
+    'router.get(["/servicios", "/departamental/servicios"],',
     'router.get("/turismo/propuestas",'
   );
 

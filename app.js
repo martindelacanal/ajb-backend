@@ -138,6 +138,7 @@ const dashboardRoute = require('./api/routes/dashboard');
 const webauthnRoute = require('./api/routes/webauthn');
 const turismoGestionRoute = require('./api/routes/turismo-gestion');
 const beneficiosRoute = require('./api/routes/beneficios');
+const kitsRoute = require('./api/routes/kits');
 const descuentosRoute = require('./api/routes/descuentos');
 const familiaresCambiosRoute = require('./api/routes/familiares-cambios');
 const politicaCancelacionRoute = require('./api/routes/politica-cancelacion');
@@ -163,6 +164,7 @@ app.use('/api',trasladosRoute);
 app.use('/api',noticiasRoute);
 app.use('/api',dashboardRoute);
 app.use('/api',beneficiosRoute);
+app.use('/api', kitsRoute);
 // Sin esto, una ruta /api que no existe cae en el finalhandler de Express, que
 // responde una página HTML en inglés ("Cannot GET /api/…") y el front la mostraría.
 app.use('/api', (_req, res) => {

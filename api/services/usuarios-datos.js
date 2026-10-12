@@ -50,6 +50,7 @@ const ROL_NOMBRE_POR_ID = Object.freeze({
   5: "admin-central",
   6: "auditor",
   7: "prensa",
+  8: "educacion",
 });
 
 // Roles de las personas que el staff (admin-central / departamental) puede gestionar.

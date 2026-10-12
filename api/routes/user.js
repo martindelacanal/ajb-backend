@@ -17,6 +17,7 @@ const { condicionModuloNotificacion } = require("../services/notificaciones-modu
 const { crearNotificacion, obtenerPreferenciasNotificaciones, guardarPreferenciasNotificaciones } = require("../services/notificaciones");
 const {
   construirVisibilidadServicioSql,
+  construirCatalogoServicioSql,
   cumpleFiltroTipado,
   servicioVisibleParaActor,
 } = require("../services/turismo-catalogo");
@@ -972,7 +973,7 @@ router.get("/lugares", verifyToken, async (req, res) => {
     ) {
       let rows;
       try {
-        const visibilidad = construirVisibilidadServicioSql(cabecera, "s");
+        const visibilidad = construirCatalogoServicioSql(cabecera);
         [rows] = await mysqlConnection
           .promise()
           .query(`
@@ -995,7 +996,7 @@ router.get("/lugares", verifyToken, async (req, res) => {
         }
         [rows] = await mysqlConnection
           .promise()
-          .query("SELECT lugar FROM servicio WHERE activo = 1 AND estado_aprobacion = 'APROBADO' GROUP BY lugar ORDER BY lugar ASC");
+          .query("SELECT lugar FROM servicio WHERE activo = 1 AND estado_aprobacion = 'APROBADO' AND propietario_departamental_id IS NULL GROUP BY lugar ORDER BY lugar ASC");
       }
       const lugares = rows.map(row => row.lugar);
       res.status(200).json(lugares);
@@ -1008,7 +1009,7 @@ router.get("/lugares", verifyToken, async (req, res) => {
   }
 });
 
-router.get("/servicios", verifyToken, async (req, res) => {
+router.get(["/servicios", "/departamental/servicios"], verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (
@@ -1017,7 +1018,7 @@ router.get("/servicios", verifyToken, async (req, res) => {
         cabecera.rol === "afiliado" ||
         cabecera.rol === "departamental" ||
         cabecera.rol === "admin-central"
-      ) && tieneAreaTurismo(cabecera)
+      ) && (tieneAreaTurismo(cabecera) || (req.path === "/departamental/servicios" && cabecera.rol === "afiliado"))
     ) {
       const db = mysqlConnection.promise();
       const holdIdExcluir = await resolverHoldIdExcluir(db, cabecera, req.query.hold_token);
@@ -1043,18 +1044,25 @@ router.get("/servicios", verifyToken, async (req, res) => {
         criteriosDisponibilidad = parseo.value;
       }
 
-      const visibilidad = construirVisibilidadServicioSql(cabecera, "s");
+      const esCatalogoDepartamental = req.path === "/departamental/servicios";
+      const visibilidad = construirCatalogoServicioSql(cabecera, {
+        departamental: esCatalogoDepartamental,
+        origen: req.query.origen,
+      });
       let query = `SELECT s.id, s.nombre, s.lugar, s.rating, s.codigo, s.descripcion,
                           s.modelo_tarifa, s.unidad_cobro, s.permite_acompanantes,
                           s.max_personas_reserva, s.etiqueta_identificador,
                           s.propietario_departamental_id,
+                          (SELECT d.nombre FROM departamental d WHERE d.id = s.propietario_departamental_id) AS propietario_nombre,
+                          s.alcance_departamental,
+                          (SELECT ch.id FROM convenio_hotel ch WHERE ch.servicio_id = s.id AND ch.activo = 1 LIMIT 1) AS convenio_hotel_id,
                           ts.codigo AS tipo_codigo,
                           (SELECT rp.id FROM recurso rp
                             WHERE rp.servicio_id = s.id AND rp.activo = 1
                             ORDER BY rp.es_recurso_principal DESC, rp.orden ASC, rp.id ASC
                             LIMIT 1) AS recurso_principal_id
                      FROM servicio s INNER JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id
-                    WHERE ${visibilidad.sql} AND ts.activo = 1 AND ts.codigo <> 'CONVENIO_HOTELERO'`;
+                    WHERE ${visibilidad.sql} AND ts.activo = 1${esCatalogoDepartamental ? '' : " AND ts.codigo <> 'CONVENIO_HOTELERO'"}`;
       let params = [...visibilidad.params];
       if (lugar) {
         query += " AND s.lugar = ?";
@@ -2271,7 +2279,7 @@ router.get("/convenios-hoteleros", verifyToken, async (req, res) => {
     }
 
     const ciudad = normalizarTexto(req.query.ciudad || req.query.lugar);
-    const visibilidad = construirVisibilidadServicioSql(cabecera, "s");
+    const visibilidad = construirCatalogoServicioSql(cabecera);
     const params = [...visibilidad.params];
     let filtroCiudad = "";
     if (ciudad) {
@@ -13853,6 +13861,7 @@ router.get("/mis-gestiones/catalogos", verifyToken, async (req, res) => {
       estados_coseguro: estadosCoseguro,
       estados_traslados: [],
       estados_beneficios: estadosBeneficios,
+      estados_kits: require("../services/kits").ESTADOS.map(({ id, nombre, color, color_texto }) => ({ id, nombre, color, color_texto })),
     });
   } catch (error) {
     registrarErrorRuta(error);
@@ -14013,6 +14022,33 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         INNER JOIN beneficio_inscripcion_estado be ON be.id = bi.estado_id
         LEFT JOIN beneficio_rubro br ON br.id = b.rubro_id
       WHERE bi.usuario_id = ? AND bi.eliminado = 0 AND ? = 1
+      UNION ALL
+      SELECT
+        ki.id,
+        'kit' AS tipo,
+        CONCAT('K-', ki.id) AS codigo,
+        CASE ki.estado WHEN 'PENDIENTE' THEN 1 WHEN 'APROBADA' THEN 2 WHEN 'LISTA_RETIRO' THEN 3 WHEN 'ENTREGADA' THEN 4 WHEN 'RECHAZADA' THEN 5 ELSE 6 END AS estado_id,
+        CASE ki.estado WHEN 'PENDIENTE' THEN 'En revisión' WHEN 'APROBADA' THEN 'Aprobada' WHEN 'LISTA_RETIRO' THEN 'Lista para retirar' WHEN 'ENTREGADA' THEN 'Entregada' WHEN 'RECHAZADA' THEN 'Rechazada' ELSE 'Cancelada' END AS estado,
+        CASE ki.estado WHEN 'RECHAZADA' THEN '#fde8e8' WHEN 'PENDIENTE' THEN '#fff4d6' WHEN 'APROBADA' THEN '#e2f1ff' WHEN 'CANCELADA' THEN '#edf0f4' ELSE '#e2f5ec' END AS estado_color,
+        CASE ki.estado WHEN 'RECHAZADA' THEN '#a12727' WHEN 'PENDIENTE' THEN '#755500' WHEN 'APROBADA' THEN '#175c91' WHEN 'CANCELADA' THEN '#526075' ELSE '#176344' END AS estado_color_texto,
+        kc.titulo AS titulo,
+        ko.nombre AS subtitulo,
+        CAST(kc.id AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_0900_ai_ci AS modalidad,
+        DATE_FORMAT(kc.entrega_desde, '%d/%m/%Y') AS fecha_inicio,
+        DATE_FORMAT(kc.entrega_hasta, '%d/%m/%Y') AS fecha_fin,
+        NULL AS importe,
+        NULL AS comprobante,
+        ki.nombre_beneficiario AS beneficiario,
+        kd.nombre AS proveedor,
+        'school' AS tipo_icono,
+        0 AS es_por_salud,
+        NULL AS salud_estado,
+        ki.fecha_creacion
+      FROM kit_inscripcion ki
+        INNER JOIN kit_campania kc ON kc.id = ki.campania_id
+        INNER JOIN kit_opcion ko ON ko.id = ki.opcion_id
+        INNER JOIN departamental kd ON kd.id = kc.departamental_id
+      WHERE ki.usuario_id = ?
     `;
     const unionParams = [
       cabecera.id,
@@ -14022,6 +14058,7 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
       cabecera.id,
       cabecera.id,
       1, // Beneficios no tiene flag de módulo por usuario: siempre visible
+      cabecera.id,
     ];
 
     // Filtros comunes (el tipo se aplica aparte para poder devolver los
@@ -14050,10 +14087,11 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
     const estadosCoseguro = tokens.filter((t) => /^C\d+$/.test(t)).map((t) => Number(t.slice(1)));
     const estadosTraslados = tokens.filter((t) => /^R\d+$/.test(t)).map((t) => Number(t.slice(1)));
     const estadosBeneficios = tokens.filter((t) => /^B\d+$/.test(t)).map((t) => Number(t.slice(1)));
+    const estadosKits = tokens.filter((t) => /^K\d+$/.test(t)).map((t) => Number(t.slice(1)));
     if (estadosCoseguro.includes(COSEGURO_ESTADO_PENDIENTE_ACREDITACION) && !estadosCoseguro.includes(COSEGURO_ESTADO_EXPORTADO)) {
       estadosCoseguro.push(COSEGURO_ESTADO_EXPORTADO);
     }
-    if (estadosTurismo.length > 0 || estadosCoseguro.length > 0 || estadosTraslados.length > 0 || estadosBeneficios.length > 0) {
+    if (estadosTurismo.length > 0 || estadosCoseguro.length > 0 || estadosTraslados.length > 0 || estadosBeneficios.length > 0 || estadosKits.length > 0) {
       const ramas = [];
       if (estadosTurismo.length > 0) {
         ramas.push(`(g.tipo = 'turismo' AND g.estado_id IN (${estadosTurismo.map(() => "?").join(",")}))`);
@@ -14070,6 +14108,10 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
       if (estadosBeneficios.length > 0) {
         ramas.push(`(g.tipo = 'beneficio' AND g.estado_id IN (${estadosBeneficios.map(() => "?").join(",")}))`);
         params.push(...estadosBeneficios);
+      }
+      if (estadosKits.length > 0) {
+        ramas.push(`(g.tipo = 'kit' AND g.estado_id IN (${estadosKits.map(() => "?").join(",")}))`);
+        params.push(...estadosKits);
       }
       condiciones.push(`(${ramas.join(" OR ")})`);
     }
@@ -14091,11 +14133,11 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
       `SELECT g.tipo, COUNT(*) AS total FROM (${unionSql}) g ${whereComun} GROUP BY g.tipo`,
       [...unionParams, ...params]
     );
-    const conteos = { turismo: 0, coseguro: 0, traslado: 0, beneficio: 0 };
+    const conteos = { turismo: 0, coseguro: 0, traslado: 0, beneficio: 0, kit: 0 };
     conteoRows.forEach((row) => (conteos[row.tipo] = Number(row.total)));
 
-    const tipo = ["turismo", "coseguro", "traslado", "beneficio"].includes(req.query.tipo) ? req.query.tipo : null;
-    const totalItems = tipo ? conteos[tipo] : conteos.turismo + conteos.coseguro + conteos.traslado + conteos.beneficio;
+    const tipo = ["turismo", "coseguro", "traslado", "beneficio", "kit"].includes(req.query.tipo) ? req.query.tipo : null;
+    const totalItems = tipo ? conteos[tipo] : conteos.turismo + conteos.coseguro + conteos.traslado + conteos.beneficio + conteos.kit;
 
     const condicionesFinal = tipo ? [...condiciones, "g.tipo = ?"] : condiciones;
     const paramsFinal = tipo ? [...params, tipo] : params;
@@ -15233,6 +15275,7 @@ router.post("/tabla/usuarios", verifyToken, async (req, res) => {
             WHEN r.nombre = 'invitado' THEN 'Invitado'
             WHEN r.nombre = 'auditor' THEN 'Auditor'
             WHEN r.nombre = 'prensa' THEN 'Prensa'
+            WHEN r.nombre = 'educacion' THEN 'Capacitación y convenios educativos'
             ELSE r.nombre
           END AS rol,
           r.nombre AS rol_codigo,
@@ -15403,7 +15446,8 @@ router.get("/rol", verifyToken, async (req, res) => {
         departamental: "Departamental",
         invitado: "Invitado",
         auditor: "Auditor",
-        prensa: "Prensa"
+        prensa: "Prensa",
+        educacion: "Capacitación y convenios educativos"
       };
 
       const roles = rows.map(r => ({

@@ -14,7 +14,8 @@ const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const mysqlConnection = require("../connection/connection");
 const { registrarErrorRuta } = require("../services/errores");
-const { construirVisibilidadServicioSql, normalizarIdPositivo } = require("../services/turismo-catalogo");
+const { CONDICION_BENEFICIO_EDUCATIVO } = require("../services/beneficios-educacion");
+const { construirCatalogoServicioSql, normalizarIdPositivo } = require("../services/turismo-catalogo");
 const {
   CABECERA_PUBLICA,
   CONDICION_BENEFICIO_PUBLICO,
@@ -88,7 +89,7 @@ function marcadores(lista) {
 
 /** Alojamientos visibles con descuento por salud habilitado (reservables por el sistema). */
 async function obtenerAlojamientoSalud(db) {
-  const visibilidad = construirVisibilidadServicioSql(CABECERA_PUBLICA, "s");
+  const visibilidad = construirCatalogoServicioSql(CABECERA_PUBLICA);
   const [filas] = await db.query(
     `SELECT s.id, s.nombre, s.lugar
        FROM servicio s
@@ -123,7 +124,7 @@ async function obtenerTiposReintegro(db, { soloSubsidios = false } = {}) {
 router.get("/publico/turismo", async (_req, res) => {
   try {
     const db = mysqlConnection.promise();
-    const visibilidad = construirVisibilidadServicioSql(CABECERA_PUBLICA, "s");
+    const visibilidad = construirCatalogoServicioSql(CABECERA_PUBLICA);
 
     const [servicios] = await db.query(
       `SELECT s.id, s.nombre, s.lugar, s.descripcion, ts.codigo AS tipo_codigo
@@ -273,6 +274,10 @@ router.get("/publico/beneficios", async (req, res) => {
   try {
     const condiciones = [CONDICION_BENEFICIO_PUBLICO];
     const params = [];
+    if (req.query.categoria !== undefined) {
+      if (req.query.categoria !== "educacion") return res.status(400).json("La categoría no es válida");
+      condiciones.push(CONDICION_BENEFICIO_EDUCATIVO);
+    }
 
     const busqueda = normalizarBusqueda(req.query.q);
     if (busqueda === undefined) return res.status(400).json("La búsqueda no es válida o es demasiado larga");
@@ -359,7 +364,7 @@ router.get("/publico/beneficios", async (req, res) => {
       `SELECT r.id, r.nombre, COUNT(*) AS cantidad
          FROM beneficio b
          INNER JOIN beneficio_rubro r ON r.id = b.rubro_id
-        WHERE ${CONDICION_BENEFICIO_PUBLICO}
+        WHERE ${CONDICION_BENEFICIO_PUBLICO}${req.query.categoria === "educacion" ? ` AND ${CONDICION_BENEFICIO_EDUCATIVO}` : ""}
         GROUP BY r.id, r.nombre
         ORDER BY r.nombre COLLATE utf8mb4_es_0900_ai_ci`
     );

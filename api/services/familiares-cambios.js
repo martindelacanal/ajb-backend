@@ -120,6 +120,7 @@ const ROL_NOMBRE_POR_ID = Object.freeze({
   5: "admin-central",
   6: "auditor",
   7: "prensa",
+  8: "educacion",
 });
 
 // ---------------------------------------------------------------------------

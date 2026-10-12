@@ -76,6 +76,13 @@ function rutaPermitidaFamiliar(req) {
   return /^\/(?:sesion\/permisos|configuracion\/usuario(?:\/\d+)?|usuario|notificaciones(?:\/.*)?|mis-gestiones(?:\/catalogos)?|turismo(?:\/.*)?|reserva(?:\/.*)?|reservas\/aprobaciones-titular|servicios(?:\/.*)?|lugares|recursos|adicionales|regimen|tipo_persona|parentesco|acompaniantes(?:\/\d+)?|tabla\/acompaniantes|familiares(?:\/.*)?|convenios-hoteleros(?:\/.*)?|sorteos(?:\/.*)?|filtros\/para-recursos|descuentos(?:\/.*)?|observaciones\/turismo\/\d+\/lectura|webauthn(?:\/.*)?)\/?$/.test(ruta);
 }
 
+// Defensa adicional para el rol de Educación: ningún handler legado puede
+// concederle acceso a otros módulos por omitir un control de rol local.
+function rutaPermitidaEducacion(req) {
+  const ruta = String(req.path || req.url || '').split('?')[0].replace(/\/+$/, '').toLowerCase();
+  return /^\/(?:beneficios(?:\/.*)?|sesion\/permisos|auth\/password\/cambiar-obligatoria|webauthn(?:\/.*)?)$/.test(ruta);
+}
+
 async function actualizarAutorizacionSesion(authData, db, jwtSecret = process.env.JWT_SECRET) {
   const cabecera = parsearCabecera(authData);
   const [usuarios] = await db.query(
@@ -162,6 +169,9 @@ function verificarTokenConAutorizacionActual({
       if (permisos.acceso_familiar_turismo && !rutaPermitidaFamiliar(req)) {
         return res.status(403).json('La cuenta familiar solo tiene acceso a turismo y a sus datos personales');
       }
+      if (permisos.rol === 'educacion' && !rutaPermitidaEducacion(req)) {
+        return res.status(403).json('Este rol sólo administra Capacitación y Convenios educativos');
+      }
       req.data = authData;
       return next();
     } catch (sessionError) {
@@ -180,6 +190,7 @@ function verificarTokenConAutorizacionActual({
 module.exports = {
   resolverAccesoFamiliar,
   rutaPermitidaFamiliar,
+  rutaPermitidaEducacion,
   ErrorSesionUsuario,
   actualizarAutorizacionSesion,
   parsearCabecera,
