@@ -28,7 +28,7 @@ Las cancelaciones previas conservan sus datos originales. No se rellenan importe
 
 El reintegro es **estimado sobre el total neto de la reserva** (`reserva.precio_total`), que ya incluye adicionales y descuentos. No acredita dinero abonado ni inicia un pago. Usa centavos enteros y porcentajes con dos decimales, con redondeo al centavo más cercano (medio centavo hacia arriba). Base e importe resultante quedan congelados al confirmar la cancelación.
 
-Se usan días calendario de Argentina, con rangos iniciales 0–6 días: 0%; 7–14: 50%; 15 o más: 100%. Las reservas anteriores sin aceptación registrada consultan la política vigente de su servicio y registran `origen_politica: "VIGENTE_RESERVA_ANTERIOR"`; no se atribuye un consentimiento inexistente.
+Se usan días calendario de Argentina, con rangos iniciales 0–6 días: 0%; 7–14: 50%; 15 o más: 100%. Las reservas anteriores sin aceptación registrada conservan la última política del servicio publicada antes de su fecha de creación en BD y registran `origen_politica: "HISTORICA_RESERVA_ANTERIOR"`; no se atribuye un consentimiento inexistente. Si la reserva precede todas las políticas, se aplica la primera registrada para el servicio. A igualdad de segundo entre reserva y publicación se prefiere la política anterior; publicaciones con la misma fecha desempatan por la menor versión e id. Si falta el historial o la fecha de creación de la reserva, la cotización se bloquea para revisión, sin aplicar una política nueva. Los snapshots aceptados y las cancelaciones registradas permanecen inmutables.
 
 Permisos SQL mínimos del usuario de ejecución (además de los existentes):
 

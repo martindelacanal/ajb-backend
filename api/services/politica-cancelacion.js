@@ -265,17 +265,30 @@ async function cotizarCancelacion(connection, { reserva, ahora, bloquear = false
     const snapshot = typeof rows[0].snapshot_json === "string" ? JSON.parse(rows[0].snapshot_json) : rows[0].snapshot_json;
     return calcularCotizacion({ reserva, politica: snapshot, ahora });
   }
-  let servicioId = normalizarIdPositivo(reserva.servicio_id);
-  if (!servicioId) {
-    const [servicios] = await connection.query(
-      `SELECT COALESCE(r.servicio_id, rec.servicio_id, ch.servicio_id) AS servicio_id
-         FROM reserva r LEFT JOIN recurso rec ON rec.id = r.recurso_id
-         LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id WHERE r.id = ?`, [reserva.id]
-    );
-    servicioId = normalizarIdPositivo(servicios[0]?.servicio_id);
+  // Las reservas anteriores al registro de aceptación conservan la política
+  // histórica de su servicio. La fecha y el servicio se leen de BD: nunca se
+  // aceptan datos del cliente para elegir una versión más favorable.
+  // DATETIME guarda segundos; si publicación y reserva coinciden, se prefiere
+  // la política anterior. Versiones con la misma fecha desempatan por la menor
+  // versión/id. Si la reserva precede el registro, se usa la primera política.
+  const [historicas] = await connection.query(
+    `SELECT p.*, ps.servicio_id FROM politica_cancelacion p
+       INNER JOIN politica_cancelacion_servicio ps ON ps.politica_id = p.id
+       INNER JOIN reserva r ON r.id = ?
+       LEFT JOIN recurso rec ON rec.id = r.recurso_id
+       LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
+       WHERE ps.servicio_id = COALESCE(r.servicio_id, rec.servicio_id, ch.servicio_id)
+         AND r.fecha_creacion IS NOT NULL
+       ORDER BY CASE WHEN p.creada_en < r.fecha_creacion THEN 0 ELSE 1 END,
+         CASE WHEN p.creada_en < r.fecha_creacion THEN p.creada_en END DESC,
+         p.creada_en ASC, p.version ASC, p.id ASC
+       LIMIT 1${bloquear ? " LOCK IN SHARE MODE" : ""}`, [reserva.id]
+  );
+  if (!historicas.length) {
+    throw errorPolitica("No se pudo determinar la política histórica de esta reserva", 503, "POLITICA_HISTORICA_NO_CONFIGURADA");
   }
-  const politica = await obtenerPoliticaVigente(connection, { servicioId, bloquear });
-  return calcularCotizacion({ reserva, politica, ahora, origenPolitica: "VIGENTE_RESERVA_ANTERIOR" });
+  const politica = { ...mapearPolitica(historicas[0]), servicio_id: Number(historicas[0].servicio_id) };
+  return calcularCotizacion({ reserva, politica, ahora, origenPolitica: "HISTORICA_RESERVA_ANTERIOR" });
 }
 
 // Llamar después de autorizar la transición y bloquear reserva FOR UPDATE,

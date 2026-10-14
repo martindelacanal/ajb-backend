@@ -78,11 +78,67 @@ test("una política aceptada conserva sus porcentajes aunque admin publique otra
   assert.equal(consultas.length, 1);
 });
 
-test("reservas anteriores consultan política vigente y dejan explícito que no tenían aceptación registrada", async () => {
-  const db = { query: async (sql) => [sql.includes("FROM reserva_politica_cancelacion") ? [] : [fila]] };
-  const cotizacion = await cotizarCancelacion(db, { reserva, ahora });
-  assert.equal(cotizacion.origen_politica, "VIGENTE_RESERVA_ANTERIOR");
+test("reserva sin aceptación conserva la política histórica aunque el servicio ahora no tenga devoluciones", async () => {
+  const consultas = [];
+  const db = { query: async (sql, params) => {
+    consultas.push(sql);
+    if (sql.includes("FROM reserva_politica_cancelacion")) return [[]];
+    assert.ok(!sql.includes("politica_cancelacion_servicio_vigente"), "La política nueva no reemplaza condiciones históricas");
+    assert.match(sql, /INNER JOIN reserva r ON r.id = \?/);
+    assert.match(sql, /ps.servicio_id = COALESCE\(r.servicio_id, rec.servicio_id, ch.servicio_id\)/);
+    assert.deepEqual(params, [reserva.id], "Servicio y fecha sólo pueden provenir de BD");
+    return [[{ ...fila, servicio_id: 7 }]];
+  } };
+  const cotizacion = await cotizarCancelacion(db, { reserva: { ...reserva, servicio_id: 999, fecha_creacion: "2099-01-01" }, ahora });
+  assert.equal(cotizacion.origen_politica, "HISTORICA_RESERVA_ANTERIOR");
+  assert.equal(cotizacion.politica.version, 2);
+  assert.equal(cotizacion.politica.servicio_id, 7);
   assert.equal(cotizacion.porcentaje_reintegro, 100);
+  assert.equal(consultas.length, 2);
+});
+
+test("historial elige publicaciones anteriores; reservas previas al esquema conservan la primera", async () => {
+  const db = { query: async (sql) => {
+    if (sql.includes("FROM reserva_politica_cancelacion")) return [[]];
+    assert.match(sql, /CASE WHEN p.creada_en < r.fecha_creacion THEN 0 ELSE 1 END/);
+    assert.match(sql, /CASE WHEN p.creada_en < r.fecha_creacion THEN p.creada_en END DESC/);
+    assert.match(sql, /p.creada_en ASC, p.version ASC, p.id ASC/);
+    assert.ok(!sql.includes("p.creada_en <="), "Un mismo segundo no prueba que la publicación preceda a la reserva");
+    return [[{ ...fila, id: 1, version: 1, servicio_id: 7 }]];
+  } };
+  const cotizacion = await cotizarCancelacion(db, { reserva, ahora });
+  assert.equal(cotizacion.politica.version, 1);
+  assert.equal(cotizacion.porcentaje_reintegro, 100);
+  assert.equal(cotizacion.origen_politica, "HISTORICA_RESERVA_ANTERIOR");
+});
+
+test("sin historial o fecha de creación no presume política vigente ni aceptación", async () => {
+  const db = { query: async (sql) => {
+    if (!sql.includes("FROM reserva_politica_cancelacion")) assert.match(sql, /r.fecha_creacion IS NOT NULL/);
+    assert.ok(!sql.includes("politica_cancelacion_servicio_vigente"));
+    assert.match(sql.trim(), /^SELECT/);
+    return [[]];
+  } };
+  await assert.rejects(cotizarCancelacion(db, { reserva, ahora }), { statusCode: 503, codigo: "POLITICA_HISTORICA_NO_CONFIGURADA" });
+});
+
+test("confirmación de una reserva anterior bloquea su política histórica y registra el origen sin inventar aceptación", async () => {
+  const escrituras = [];
+  const db = { query: async (sql, params) => {
+    if (sql.includes("FROM reserva_politica_cancelacion")) return [[]];
+    if (sql.includes("FROM politica_cancelacion p")) {
+      assert.match(sql, /LIMIT 1 LOCK IN SHARE MODE$/);
+      return [[{ ...fila, servicio_id: 7 }]];
+    }
+    escrituras.push({ sql, params });
+    return [{ affectedRows: 1 }];
+  } };
+  const cotizacion = calcularCotizacion({ reserva, politica: { ...politica, servicio_id: 7 }, ahora, origenPolitica: "HISTORICA_RESERVA_ANTERIOR" });
+  await confirmarCancelacionPolitica(db, { reserva, usuarioId: 20, confirmada: true, cotizacion: cotizacion.cotizacion, ahora });
+  assert.equal(escrituras.length, 2);
+  assert.match(escrituras[0].sql, /INSERT INTO reserva_cancelacion_politica/);
+  assert.equal(JSON.parse(escrituras[0].params[7]).origen_politica, "HISTORICA_RESERVA_ANTERIOR");
+  assert.ok(!escrituras.some(({ sql }) => /INSERT INTO reserva_politica_cancelacion/.test(sql)));
 });
 
 test("cancelación rechaza cotización vieja o sin consentimiento sin escribir auditoría", async () => {

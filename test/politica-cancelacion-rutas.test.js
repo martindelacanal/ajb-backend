@@ -13,7 +13,7 @@ let consultas = [];
 let reservaActual;
 let lecturaConsistente;
 let aislamientoRepetible;
-const politica = { id: 1, version: 1, titulo: "Hospedaje", reglas_json: REGLAS_INICIALES, motivo: "Motivo interno", creada_por: 9 };
+const politica = { id: 1, version: 1, servicio_id: 7, titulo: "Hospedaje", reglas_json: REGLAS_INICIALES, motivo: "Motivo interno", creada_por: 9 };
 const db = {
   async query(sql, params) {
     consultas.push({ sql, params });
@@ -113,6 +113,7 @@ test("cotización permite dueño y bloquea ajenos, otras departamentales y reser
   assert.equal(propia.body.porcentaje_reintegro, 100);
   assert.equal(propia.body.monto_base, 100.50);
   assert.equal(propia.body.monto_reintegro, 101);
+  assert.equal(propia.body.origen_politica, "HISTORICA_RESERVA_ANTERIOR");
   assert.match(propia.body.cotizacion, /^[a-f0-9]{64}$/);
   assert.equal(propia.body.politica.motivo, undefined);
   usuarioActual.id = 21;
