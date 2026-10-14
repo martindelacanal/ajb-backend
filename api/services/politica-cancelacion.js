@@ -257,7 +257,7 @@ function calcularCotizacion({ reserva, politica, origenPolitica = "ACEPTADA", ah
   return resultado;
 }
 
-async function cotizarCancelacion(connection, { reserva, ahora, bloquear = false }) {
+async function cotizarCancelacion(connection, { reserva, ahora }) {
   const [rows] = await connection.query(
     "SELECT snapshot_json FROM reserva_politica_cancelacion WHERE reserva_id = ?", [reserva.id]
   );
@@ -271,6 +271,9 @@ async function cotizarCancelacion(connection, { reserva, ahora, bloquear = false
   // DATETIME guarda segundos; si publicación y reserva coinciden, se prefiere
   // la política anterior. Versiones con la misma fecha desempatan por la menor
   // versión/id. Si la reserva precede el registro, se usa la primera política.
+  // El historial es inmutable y sólo necesita SELECT. Al confirmar, el caller
+  // ya bloqueó la reserva; no se requieren privilegios de escritura/locking
+  // sobre las políticas para conservar sus condiciones históricas.
   const [historicas] = await connection.query(
     `SELECT p.*, ps.servicio_id FROM politica_cancelacion p
        INNER JOIN politica_cancelacion_servicio ps ON ps.politica_id = p.id
@@ -282,7 +285,7 @@ async function cotizarCancelacion(connection, { reserva, ahora, bloquear = false
        ORDER BY CASE WHEN p.creada_en < r.fecha_creacion THEN 0 ELSE 1 END,
          CASE WHEN p.creada_en < r.fecha_creacion THEN p.creada_en END DESC,
          p.creada_en ASC, p.version ASC, p.id ASC
-       LIMIT 1${bloquear ? " LOCK IN SHARE MODE" : ""}`, [reserva.id]
+       LIMIT 1`, [reserva.id]
   );
   if (!historicas.length) {
     throw errorPolitica("No se pudo determinar la política histórica de esta reserva", 503, "POLITICA_HISTORICA_NO_CONFIGURADA");

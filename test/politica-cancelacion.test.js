@@ -122,12 +122,13 @@ test("sin historial o fecha de creación no presume política vigente ni aceptac
   await assert.rejects(cotizarCancelacion(db, { reserva, ahora }), { statusCode: 503, codigo: "POLITICA_HISTORICA_NO_CONFIGURADA" });
 });
 
-test("confirmación de una reserva anterior bloquea su política histórica y registra el origen sin inventar aceptación", async () => {
+test("confirmación de una reserva anterior sólo lee el historial inmutable y registra el origen sin inventar aceptación", async () => {
   const escrituras = [];
   const db = { query: async (sql, params) => {
     if (sql.includes("FROM reserva_politica_cancelacion")) return [[]];
     if (sql.includes("FROM politica_cancelacion p")) {
-      assert.match(sql, /LIMIT 1 LOCK IN SHARE MODE$/);
+      assert.match(sql, /LIMIT 1$/);
+      assert.ok(!/LOCK IN SHARE MODE|FOR UPDATE/.test(sql), "El historial debe poder leerse con privilegios SELECT");
       return [[{ ...fila, servicio_id: 7 }]];
     }
     escrituras.push({ sql, params });
