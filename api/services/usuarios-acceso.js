@@ -3,7 +3,7 @@
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const { enviarCorreoPlantilla } = require("./correo");
-const { validarPassword } = require("../security/recuperacion-password");
+const { validarPassword } = require("../security/password-policy");
 const { MODULOS, MODULOS_ECONOMICOS, MENSAJE_DEUDA, obtenerBloqueo } = require("../security/restricciones-cuenta");
 
 function errorAcceso(mensaje, statusCode = 400) { return Object.assign(new Error(mensaje), { statusCode }); }
@@ -113,17 +113,17 @@ function crearServicioAccesoUsuarios({ db, enviar = enviarClaveTemporal }) {
   }
 
   async function cambiarObligatoria({ usuarioId, passwordActual, password }) {
-    validarPassword(password);
     if (typeof passwordActual !== "string" || Buffer.byteLength(passwordActual) > 72) throw errorAcceso("Ingresá tu contraseña actual.");
     const connection = await db.getConnection();
     try {
       await connection.beginTransaction();
-      const [usuarios] = await connection.query("SELECT id, password, requiere_cambio_clave, bloqueo_tipo, habilitado FROM usuario WHERE id = ? FOR UPDATE", [usuarioId]);
+      const [usuarios] = await connection.query("SELECT id, password, requiere_cambio_clave, bloqueo_tipo, habilitado, rol_id, documento FROM usuario WHERE id = ? FOR UPDATE", [usuarioId]);
       const usuario = usuarios[0];
       if (!usuario || usuario.bloqueo_tipo === "total" || usuario.habilitado === "N") throw errorAcceso("Usuario inhabilitado.", 403);
       if (Number(usuario.requiere_cambio_clave) !== 1) throw errorAcceso("No hay un cambio obligatorio de contraseña pendiente.", 409);
       if (!await bcrypt.compare(passwordActual, usuario.password)) throw errorAcceso("La contraseña actual no es correcta.");
-      if (await bcrypt.compare(password, usuario.password)) throw errorAcceso("Elegí una contraseña distinta de la temporal.");
+      if (typeof password === "string" && await bcrypt.compare(password, usuario.password)) throw errorAcceso("Elegí una contraseña distinta de la temporal.");
+      validarPassword(password, usuario);
       const hash = await bcrypt.hash(password, 12);
       await connection.query("UPDATE usuario SET password = ?, requiere_cambio_clave = 0, auth_revocado_desde = NOW(6) WHERE id = ?", [hash, usuarioId]);
       await revocarCredenciales(connection, usuarioId);

@@ -731,13 +731,14 @@ test("GET /acompaniantes/:id y POST /tabla/acompaniantes informan el pedido en r
     fecha_modificacion: "2026-09-24 10:05:00",
   };
   preparar([
-    [/^SELECT u\.id, u\.nombre, u\.apellido, u\.documento, u\.fecha_nacimiento, u\.telefono, u\.parentesco_id, u\.tipo_persona_id, TIMESTAMPDIFF/, [[{
-      id: 8, nombre: "Carla", apellido: "Ortega", documento: 40756125, telefono: "2213649350",
+    [/^SELECT u\.id, u\.nombre, u\.apellido, u\.documento, u\.rol_id, u\.fecha_nacimiento, u\.telefono, u\.parentesco_id, u\.tipo_persona_id, TIMESTAMPDIFF/, [[{
+      id: 8, nombre: "Carla", apellido: "Ortega", documento: 40756125, rol_id: 4, telefono: "2213649350",
     }]]],
     [/FROM familiar_cambio_solicitud WHERE pendiente_persona IN \(\?\)/, [[pendiente]]],
   ]);
   const detalle = await pedir("/api/acompaniantes/8", { usuario: 2 });
   assert.equal(detalle.status, 200);
+  assert.equal(detalle.body.rol_id, 4, "el formulario usa el rol de la persona para mostrar su política de contraseña");
   assert.equal(detalle.body.cambio_pendiente.id, 7);
   assert.equal(detalle.body.cambio_pendiente.codigo, "FC-7");
   assert.deepEqual(detalle.body.cambio_pendiente.datos_propuestos, { telefono: "2215550000" });

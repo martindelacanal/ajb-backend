@@ -194,6 +194,29 @@ test("departamental edita su perfil, pero no su DNI", async () => {
   assert.deepEqual(resultado.cambios.map(({ campo }) => campo), ["telefono"]);
 });
 
+test("la edición de contraseña exige la política del objetivo y rechaza cambiar el rol propio para eludirla", async () => {
+  const propio = titular({ id: 3, rol_id: 3, rol_nombre: "departamental" });
+  const conexion = crearConexion([[CARGA_OBJETIVO, [[propio]]]]);
+  await rechazaCon(actualizarDatosUsuario(conexion, {
+    actor: DEPARTAMENTAL_1, usuarioId: 3, cambios: { password: "montaña7" },
+  }), { statusCode: 400, codigo: "DATO_INVALIDO", campo: "password" });
+  await rechazaCon(actualizarDatosUsuario(conexion, {
+    actor: DEPARTAMENTAL_1, usuarioId: 3, cambios: { password: "montaña7", rol_id: 2 },
+  }), { statusCode: 403, codigo: "CAMPO_NO_PERMITIDO", campo: "rol_id" });
+  assert.equal(consultas(conexion, /^UPDATE usuario/).length, 0);
+});
+
+test("la edición de contraseña usa el rol final autorizado al promover una cuenta de afiliado a personal", async () => {
+  const conexion = crearConexion([
+    [CARGA_OBJETIVO, [[titular()]]],
+    [/^SELECT id, nombre FROM rol/, [[{ id: 6, nombre: "auditor" }]]],
+  ]);
+  await rechazaCon(actualizarDatosUsuario(conexion, {
+    actor: ADMIN, usuarioId: 2, cambios: { rol_id: 6, password: "montaña7" },
+  }), { statusCode: 400, codigo: "DATO_INVALIDO", campo: "password" });
+  assert.equal(consultas(conexion, /^UPDATE usuario/).length, 0);
+});
+
 test("admin-central edita afiliados de cualquier departamental con historial a su nombre", async () => {
   const conexion = crearConexion([
     [CARGA_OBJETIVO, [[titular({ departamental_id: 9 })]]],

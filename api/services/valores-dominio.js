@@ -160,6 +160,14 @@ function centavosANumero(centavos) {
   return decimal === null ? null : Number(decimal);
 }
 
+// Turismo liquida el total final en pesos: 50 centavos o más suben al peso
+// siguiente. Se aplica una vez, después de adicionales y descuentos.
+function redondearCentavosAPesos(centavos) {
+  if (!Number.isSafeInteger(centavos) || centavos < 0 || centavos > MAX_DINERO_CENTAVOS) return null;
+  const resultado = Math.floor((centavos + 50) / 100) * 100;
+  return resultado <= MAX_DINERO_CENTAVOS ? resultado : null;
+}
+
 function decimalAPuntosBase(valor, { minimo = 0, maximo = 100 } = {}) {
   const puntosBase = decimalACentavos(valor, { permiteCero: true, permiteNegativo: minimo < 0 });
   if (puntosBase === null || puntosBase < minimo * 100 || puntosBase > maximo * 100) return null;
@@ -249,6 +257,7 @@ module.exports = {
   normalizarFechaCivil,
   obtenerFechaCivilArgentina,
   obtenerNochesReserva,
+  redondearCentavosAPesos,
   revertirDescuentoEnPuntosBase,
   sumarCentavos,
   sumarDiasFechaCivil,

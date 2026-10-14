@@ -26,6 +26,7 @@ function crearRouterAuth({ db = mysqlConnection.promise(), jwtSecret = process.e
   const router = express.Router();
   const recuperacion = crearServicioRecuperacion({ db, jwtSecret, enviarCodigo: enviar });
   const responderError = (res, error) => {
+    if (error.code === "PASSWORD_POLICY") return res.status(400).json({ mensaje: error.message, code: error.code, politicaPassword: error.politicaPassword });
     if (error instanceof ErrorRestriccionCuenta) return res.status(error.statusCode).json(cuerpoRestriccion(error));
     if (error instanceof ErrorRecuperacion || error instanceof ErrorAutenticacion) {
       if (error.retryAfter) res.set("Retry-After", String(error.retryAfter));

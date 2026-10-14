@@ -103,10 +103,10 @@ test("identificadores admiten documento o email único, sin objetos ni destinata
 });
 
 test("la política de contraseña respeta caracteres Unicode y el límite efectivo de bcrypt", () => {
-  assert.doesNotThrow(() => validarPassword("una frase muy segura"));
-  assert.doesNotThrow(() => validarPassword("😀".repeat(18)));
-  assert.throws(() => validarPassword("😀".repeat(19)));
-  assert.throws(() => validarPassword("😀".repeat(6)), /12 caracteres/);
+  assert.doesNotThrow(() => validarPassword("Una frase muy segura 7!", "admin"));
+  assert.doesNotThrow(() => validarPassword("Árbol7!" + "😀".repeat(16), "admin"));
+  assert.throws(() => validarPassword("Árbol7!" + "😀".repeat(17), "admin"), /larga/);
+  assert.throws(() => validarPassword("Árbol7!", "admin"), /12 caracteres/);
   assert.throws(() => validarPassword(" ".repeat(12)));
   assert.throws(() => validarPassword("x".repeat(73)));
   assert.throws(() => validarPassword({ password: "texto" }));

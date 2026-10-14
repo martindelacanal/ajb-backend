@@ -117,6 +117,7 @@ test("reset entrega una clave copiable, solo guarda hash, revoca accesos y sobre
   const servicio = crearServicioAccesoUsuarios({ db: fixture.db, enviar: async (datos) => { envio = datos; throw new Error("SMTP caído"); } });
   const result = await servicio.resetear({ actorId: 1, usuarioId: 2 });
   assert.equal(result.emailEnviado, false);
+  assert.equal(envio.para, fixture.objetivo.email);
   assert.equal(result.passwordTemporal, envio.passwordTemporal);
   assert.match(result.passwordTemporal, /^AJB-[A-Za-z0-9_-]{16}$/);
   assert.equal(await bcrypt.compare(result.passwordTemporal, fixture.objetivo.password), true);
@@ -126,11 +127,34 @@ test("reset entrega una clave copiable, solo guarda hash, revoca accesos y sobre
   assert.ok(fixture.consultas.some((q) => /UPDATE auth_sesion/.test(q.sql)));
   assert.ok(!JSON.stringify(fixture.consultas).includes(result.passwordTemporal), "ninguna consulta ni auditoría incluye la clave en claro");
   await assert.rejects(servicio.cambiarObligatoria({ usuarioId: 2, passwordActual: result.passwordTemporal, password: result.passwordTemporal }), /distinta/);
-  await assert.rejects(servicio.cambiarObligatoria({ usuarioId: 2, passwordActual: "incorrecta", password: "una clave nueva segura" }), /no es correcta/);
-  await servicio.cambiarObligatoria({ usuarioId: 2, passwordActual: result.passwordTemporal, password: "una clave nueva segura" });
+  await assert.rejects(servicio.cambiarObligatoria({ usuarioId: 2, passwordActual: "incorrecta", password: "una clave nueva segura 7" }), /no es correcta/);
+  await servicio.cambiarObligatoria({ usuarioId: 2, passwordActual: result.passwordTemporal, password: "una clave nueva segura 7" });
   assert.equal(fixture.objetivo.requiere_cambio_clave, 0);
-  assert.equal(await bcrypt.compare("una clave nueva segura", fixture.objetivo.password), true);
+  assert.equal(await bcrypt.compare("una clave nueva segura 7", fixture.objetivo.password), true);
   assert.equal(await bcrypt.compare(result.passwordTemporal, fixture.objetivo.password), false);
+});
+
+test("blanqueo envía la clave temporal al correo del usuario afectado y confirma la entrega SMTP", async () => {
+  const fixture = dbServicio();
+  const envios = [];
+  const servicio = crearServicioAccesoUsuarios({ db: fixture.db, enviar: async (datos) => { envios.push(datos); return { enviado: true }; } });
+  const resultado = await servicio.resetear({ actorId: 1, usuarioId: 2 });
+  assert.equal(resultado.emailEnviado, true);
+  assert.deepEqual(envios, [{ para: "afiliado@example.test", nombre: "Afiliado", passwordTemporal: resultado.passwordTemporal }]);
+  assert.match(resultado.mensaje, /enviada por correo/);
+});
+
+test("cambio obligatorio toma el rol persistido del personal y rechaza la clave sencilla", async () => {
+  const fixture = dbServicio();
+  fixture.objetivo.rol = "admin";
+  fixture.objetivo.rol_id = 1;
+  fixture.objetivo.requiere_cambio_clave = 1;
+  fixture.objetivo.password = await bcrypt.hash("Temporal-7", 4);
+  const servicio = crearServicioAccesoUsuarios({ db: fixture.db });
+  await assert.rejects(servicio.cambiarObligatoria({ usuarioId: 2, passwordActual: "Temporal-7", password: "montaña7", rol: "afiliado" }), { code: "PASSWORD_POLICY" });
+  assert.equal(fixture.connection.commits, 0);
+  await servicio.cambiarObligatoria({ usuarioId: 2, passwordActual: "Temporal-7", password: "Mi montaña segura 7!" });
+  assert.equal(fixture.objetivo.requiere_cambio_clave, 0);
 });
 
 test("migración idempotente agrega columnas sin alterar el acceso existente", async () => {

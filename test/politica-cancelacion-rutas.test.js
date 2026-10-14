@@ -112,7 +112,7 @@ test("cotización permite dueño y bloquea ajenos, otras departamentales y reser
   assert.equal(propia.status, 200);
   assert.equal(propia.body.porcentaje_reintegro, 100);
   assert.equal(propia.body.monto_base, 100.50);
-  assert.equal(propia.body.monto_reintegro, 100.50);
+  assert.equal(propia.body.monto_reintegro, 101);
   assert.match(propia.body.cotizacion, /^[a-f0-9]{64}$/);
   assert.equal(propia.body.politica.motivo, undefined);
   usuarioActual.id = 21;

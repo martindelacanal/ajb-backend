@@ -219,7 +219,10 @@ function calcularCotizacion({ reserva, politica, origenPolitica = "ACEPTADA", ah
   const baseCentavos = decimalACentavos(reserva.precio_total);
   if (baseCentavos === null) throw errorPolitica("No se pudo determinar el total de la reserva", 409, "TOTAL_RESERVA_INVALIDO");
   const puntosBase = Math.round(regla.porcentaje_reintegro * 100);
-  const reintegroCentavos = Number((BigInt(baseCentavos) * BigInt(puntosBase) + 5000n) / 10000n);
+  // Redondear directamente el porcentaje al peso, sin redondeo intermedio a
+  // centavos (por ejemplo, $5,499 debe quedar en $5 y $5,50 en $6).
+  const reintegroCentavos = Number((BigInt(baseCentavos) * BigInt(puntosBase) + 500000n) / 1000000n) * 100;
+  if (centavosANumero(reintegroCentavos) === null) throw errorPolitica("El reintegro redondeado excede el máximo permitido", 409, "TOTAL_RESERVA_INVALIDO");
   const resultado = {
     reserva_id: Number(reserva.id),
     fecha_actual: fechaActual,

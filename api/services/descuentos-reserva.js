@@ -27,6 +27,7 @@ const {
   decimalACentavos,
   decimalAPuntosBase,
   obtenerFechaCivilArgentina,
+  redondearCentavosAPesos,
   sumarCentavos,
 } = require("./valores-dominio");
 
@@ -253,6 +254,10 @@ function calcularDescuentos({ personas = [], adicionalesCentavos = 0, reglas = [
     totalDescuentoCentavos = sumarCentavos(totalDescuentoCentavos, item.descuento_centavos);
   }
 
+  const totalRedondeadoCentavos = redondearCentavosAPesos(totalFinalCentavos - totalDescuentoCentavos);
+  if (totalRedondeadoCentavos === null) {
+    throw crearError("El total redondeado excede el máximo permitido", 409, "DESCUENTO_CALCULO_INVALIDO");
+  }
   return {
     items,
     aplicados: aplicados.filter((item) => item.descuento_centavos > 0),
@@ -260,8 +265,8 @@ function calcularDescuentos({ personas = [], adicionalesCentavos = 0, reglas = [
     total_descuento: centavosANumero(totalDescuentoCentavos),
     total_antes_centavos: totalFinalCentavos,
     total_antes: centavosANumero(totalFinalCentavos),
-    total_final_centavos: totalFinalCentavos - totalDescuentoCentavos,
-    total_final: centavosANumero(totalFinalCentavos - totalDescuentoCentavos),
+    total_final_centavos: totalRedondeadoCentavos,
+    total_final: centavosANumero(totalRedondeadoCentavos),
   };
 }
 

@@ -12,6 +12,7 @@ const {
   obtenerFechaCivilArgentina,
   obtenerNochesReserva,
   MAX_DINERO_CENTAVOS,
+  redondearCentavosAPesos,
   revertirDescuentoEnPuntosBase,
   sumarCentavos,
   sumarDiasFechaCivil,
@@ -19,6 +20,16 @@ const {
   validarCuitCuil,
   validarRangoReservaTemporal,
 } = require("../api/services/valores-dominio");
+
+test("totales turismo redondean al peso después de sumar: 49 baja y 50 sube", () => {
+  for (const [centavos, esperado] of [[0, 0], [1, 0], [49, 0], [50, 100], [99, 100], [1049, 1000], [1050, 1100], [1051, 1100], [1100, 1100]]) {
+    assert.equal(redondearCentavosAPesos(centavos), esperado);
+  }
+  assert.equal(redondearCentavosAPesos(sumarCentavos(1049, 1049)), 2100);
+  for (const invalido of [-1, 1.5, null, NaN, Infinity, MAX_DINERO_CENTAVOS]) {
+    assert.equal(redondearCentavosAPesos(invalido), null);
+  }
+});
 
 test("las fechas civiles son estrictas y no dependen de la zona horaria", () => {
   assert.equal(normalizarFechaCivil("2024-02-29"), "2024-02-29");

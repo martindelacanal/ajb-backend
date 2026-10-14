@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
   REGLAS_INICIALES, validarReglas, calcularCotizacion, validarAceptacionPolitica,
-  cotizarCancelacion, confirmarCancelacionPolitica, crearVersionPolitica, obtenerPoliticaVigente, obtenerCancelacionRegistrada,
+  cotizarCancelacion, confirmarCancelacionPolitica, crearVersionPolitica, obtenerPoliticaVigente, obtenerCancelacionRegistrada, guardarAceptacionPolitica,
 } = require("../api/services/politica-cancelacion");
 const { parsearArgumentos, validarDestino, ejecutarMigracion } = require("../scripts/migrar-politicas-cancelacion");
 
@@ -162,12 +162,15 @@ test("selección de servicios duplicada, vacía o sin versiones se rechaza antes
   ]) await assert.rejects(crearVersionPolitica(db, seleccion), { statusCode: 400 });
 });
 
-test("reintegro estimado usa sólo total neto, redondea a centavos y la huella detecta cambios de importe", async () => {
+test("reintegro estimado usa sólo total neto, redondea al peso y la huella detecta cambios de importe", async () => {
   const media = { ...politica, reglas: [{ dias_desde: 0, dias_hasta: null, porcentaje_reintegro: 50 }] };
   const r = { ...reserva, precio_total: "10.01", monto_adicionales: "100", monto_descuentos: "2" };
   const estimado = calcularCotizacion({ reserva: r, politica: media, ahora });
   assert.equal(estimado.monto_base, 10.01);
-  assert.equal(estimado.monto_reintegro, 5.01);
+  assert.equal(estimado.monto_reintegro, 5);
+  for (const [precio, esperado] of [["10.98", 5], ["10.99", 5], ["11.00", 6], ["11.02", 6]]) {
+    assert.equal(calcularCotizacion({ reserva: { ...r, precio_total: precio }, politica: media, ahora }).monto_reintegro, esperado);
+  }
   assert.equal(estimado.tipo_base, "TOTAL_RESERVA");
   assert.equal(estimado.moneda, "ARS");
   assert.equal(estimado.es_estimado, true);
@@ -216,4 +219,35 @@ test("migración por defecto es sólo check y nunca escribe; producción requier
   const resultado = await ejecutarMigracion({ query: async (sql) => { consultas.push(sql); return [[]]; } }, { log: () => {} });
   assert.equal(resultado.faltantes.length, 4);
   assert.ok(consultas.every((sql) => sql.trim().startsWith("SELECT")));
+});
+
+test("servicio sin devoluciones conserva 0% en la aceptación y al cancelar con cualquier anticipación", async () => {
+  const sinDevoluciones = [{ dias_desde: 0, dias_hasta: null, porcentaje_reintegro: 0 }];
+  assert.deepEqual(validarReglas(sinDevoluciones), sinDevoluciones);
+  const filaSinDevoluciones = { ...fila, titulo: "Convenio sin devoluciones", reglas_json: JSON.stringify(sinDevoluciones) };
+  let snapshot;
+  const escrituras = [];
+  const db = { query: async (sql, params) => {
+    if (sql.includes("INNER JOIN politica_cancelacion_servicio_vigente")) {
+      assert.deepEqual(params, [7]);
+      return [[filaSinDevoluciones]];
+    }
+    if (sql.includes("INSERT INTO reserva_politica_cancelacion")) snapshot = params[3];
+    else if (sql.includes("SELECT snapshot_json")) return [[{ snapshot_json: snapshot }]];
+    else escrituras.push({ sql, params });
+    return [{ affectedRows: 1 }];
+  } };
+  const aceptada = await validarAceptacionPolitica(db, { servicioId: 7, aceptada: true, politicaId: 3, version: 2 });
+  await guardarAceptacionPolitica(db, { reservaId: reserva.id, usuarioId: 20, politica: aceptada });
+  assert.deepEqual(JSON.parse(snapshot).reglas, sinDevoluciones);
+  for (const fecha of ["2026-10-07", "2026-10-14", "2026-10-22", "2027-10-07"]) {
+    const cotizacion = await cotizarCancelacion(db, { reserva: { ...reserva, fecha_inicio: fecha }, ahora });
+    assert.equal(cotizacion.porcentaje_reintegro, 0, fecha);
+    assert.equal(cotizacion.monto_reintegro, 0, fecha);
+    assert.equal(cotizacion.origen_politica, "ACEPTADA");
+  }
+  const cotizacion = await cotizarCancelacion(db, { reserva, ahora });
+  await confirmarCancelacionPolitica(db, { reserva, usuarioId: 20, confirmada: true, cotizacion: cotizacion.cotizacion, ahora });
+  assert.equal(escrituras[0].params[3], 0);
+  assert.equal(escrituras[0].params[10], 0);
 });

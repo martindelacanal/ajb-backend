@@ -5,6 +5,7 @@ const bcrypt = require("bcryptjs");
 const { huella, huellaPassword, igualesSeguros, secretoAleatorio } = require("./auth-crypto");
 const { usuarioHabilitado } = require("./autorizacion-sesion");
 const { esCorreoValido } = require("../services/correo/config");
+const { validarPassword, politicaPassword } = require("./password-policy");
 
 const MENSAJE_SOLICITUD = "Si los datos corresponden a una cuenta habilitada, te enviaremos un código a su correo electrónico.";
 const MENSAJE_CODIGO = "El código no es válido o venció. Revisalo o solicitá uno nuevo.";
@@ -18,12 +19,6 @@ function normalizarIdentificador(valor) {
   if (/^\d{1,10}$/.test(texto)) return { tipo: "documento", valor: String(Number(texto)) };
   if (esCorreoValido(texto) && !/[,;\r\n]/.test(texto)) return { tipo: "email", valor: texto };
   return null;
-}
-
-function validarPassword(password) {
-  if (typeof password !== "string" || [...password].length < 12 || Buffer.byteLength(password, "utf8") > 72 || !password.trim()) {
-    throw new ErrorRecuperacion("Usá al menos 12 caracteres y como máximo 72 bytes para tu contraseña.");
-  }
 }
 
 async function limitar(db, clave, maximo, segundos, jwtSecret) {
@@ -129,25 +124,23 @@ function crearServicioRecuperacion({ db, jwtSecret = process.env.JWT_SECRET, env
         reset_vence_en = DATE_ADD(NOW(6), INTERVAL 10 MINUTE) WHERE usuario_id = ?`,
         [huella(resetToken, "reset-ticket", jwtSecret), usuario.id]);
       await connection.commit();
-      return { resetToken, venceEn: 600 };
+      return { resetToken, venceEn: 600, politicaPassword: politicaPassword(usuario) };
     } catch (error) { await connection.rollback(); throw error; }
     finally { connection.release(); }
   }
 
   async function restablecer({ resetToken, password, ip }) {
     await limitar(db, `restablecer:ip:${ip}`, 20, 900, jwtSecret);
-    validarPassword(password);
     if (typeof resetToken !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(resetToken)) throw new ErrorRecuperacion(MENSAJE_CODIGO);
     const tokenHash = huella(resetToken, "reset-ticket", jwtSecret);
     // Evitar bcrypt costoso si el ticket no existe. Se vuelve a validar con bloqueo al consumirlo.
     const [candidatos] = await db.query("SELECT usuario_id FROM auth_recuperacion WHERE reset_hash = ? AND consumido_en IS NULL AND reset_vence_en > NOW(6)", [tokenHash]);
     if (!candidatos.length) throw new ErrorRecuperacion(MENSAJE_CODIGO);
-    const passwordHash = await bcrypt.hash(password, 12);
     const connection = await db.getConnection();
     try {
       await connection.beginTransaction();
       // Siempre usuario antes de recuperación: mismo orden que solicitar/verificar.
-      const [usuarios] = await connection.query("SELECT id, password, email, habilitado FROM usuario WHERE id = ? FOR UPDATE", [candidatos[0].usuario_id]);
+      const [usuarios] = await connection.query("SELECT id, password, email, habilitado, rol_id, documento FROM usuario WHERE id = ? FOR UPDATE", [candidatos[0].usuario_id]);
       const usuario = usuarios[0];
       const [rows] = await connection.query(`SELECT * FROM auth_recuperacion WHERE usuario_id = ? AND reset_hash = ?
         AND consumido_en IS NULL AND reset_vence_en > NOW(6) FOR UPDATE`, [candidatos[0].usuario_id, tokenHash]);
@@ -155,6 +148,8 @@ function crearServicioRecuperacion({ db, jwtSecret = process.env.JWT_SECRET, env
       if (!row || !usuario || !usuarioHabilitado(usuario.habilitado)
         || !igualesSeguros(row.password_version, huellaPassword(usuario.password, jwtSecret))
         || !igualesSeguros(row.correo_hash, huella(usuario.email.trim().toLowerCase(), "reset-email", jwtSecret))) throw new ErrorRecuperacion(MENSAJE_CODIGO);
+      validarPassword(password, usuario);
+      const passwordHash = await bcrypt.hash(password, 12);
       await connection.query("UPDATE usuario SET password = ?, requiere_cambio_clave = 0, auth_revocado_desde = NOW(6) WHERE id = ?", [passwordHash, usuario.id]);
       await connection.query("UPDATE auth_recuperacion SET consumido_en = NOW(6), reset_hash = NULL, codigo_hash = NULL WHERE usuario_id = ?", [usuario.id]);
       await connection.query("UPDATE auth_sesion SET revocado_en = NOW(6) WHERE usuario_id = ? AND revocado_en IS NULL", [usuario.id]);

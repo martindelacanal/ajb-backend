@@ -9,6 +9,7 @@ const jwt = require("jsonwebtoken");
 const bcryptjs = require("bcryptjs");
 
 const { normalizarCredencialesSignin } = require("../security/signin-input");
+const { validarPassword } = require("../security/password-policy");
 const { DNI_MENSAJE, esDniValido } = require("../security/dni");
 const { verificarTokenConAutorizacionActual, resolverAccesoFamiliar, ErrorSesionUsuario } = require("../security/autorizacion-sesion");
 const { crearSesion } = require("../security/sesiones-persistentes");
@@ -51,6 +52,7 @@ const {
   normalizarFechaCivil,
   obtenerFechaCivilArgentina,
   obtenerNochesReserva,
+  redondearCentavosAPesos,
   revertirDescuentoEnPuntosBase,
   sumarCentavos,
   sumarDiasFechaCivil,
@@ -8676,7 +8678,8 @@ async function cotizarBloqueComun(connection, { bloque, regimenId, personas, adi
       decimalACentavos(tarifaBase.total),
       decimalACentavos(adicionalesProcesados.total)
     );
-    if (totalCentavos === null) {
+    const totalRedondeadoCentavos = redondearCentavosAPesos(totalCentavos);
+    if (totalRedondeadoCentavos === null) {
       throw crearErrorNegocio("El total calculado del bloque no es valido", 409, "TARIFA_INVALIDA");
     }
 
@@ -8684,12 +8687,13 @@ async function cotizarBloqueComun(connection, { bloque, regimenId, personas, adi
       recurso,
       tarifaBase,
       adicionalesProcesados,
-      total: centavosANumero(totalCentavos)
+      totalSinRedondearCentavos: totalCentavos,
+      total: centavosANumero(totalRedondeadoCentavos)
     });
   }
 
-  const totalReferencia = Math.round(cotizaciones[0].total * 100);
-  const recursoConDiferencia = cotizaciones.find((cotizacion) => Math.round(cotizacion.total * 100) !== totalReferencia);
+  const totalReferencia = cotizaciones[0].totalSinRedondearCentavos;
+  const recursoConDiferencia = cotizaciones.find((cotizacion) => cotizacion.totalSinRedondearCentavos !== totalReferencia);
 
   if (recursoConDiferencia) {
     throw crearErrorNegocio(
@@ -9935,7 +9939,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
         );
         const precioTotalCentavos = precioBrutoCentavos === null
           ? null
-          : precioBrutoCentavos - resultadoDescuentos.total_descuento_centavos;
+          : redondearCentavosAPesos(precioBrutoCentavos - resultadoDescuentos.total_descuento_centavos);
         if (precioTotalCentavos === null || precioTotalCentavos < 0) {
           throw crearErrorNegocio("El total calculado de la reserva no es valido", 409, "TARIFA_INVALIDA");
         }
@@ -10673,7 +10677,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
         );
         const precioTotalCentavos = precioBrutoCentavos === null
           ? null
-          : precioBrutoCentavos - resultadoDescuentos.total_descuento_centavos;
+          : redondearCentavosAPesos(precioBrutoCentavos - resultadoDescuentos.total_descuento_centavos);
         if (precioTotalCentavos === null || precioTotalCentavos < 0) {
           throw crearErrorNegocio("El total calculado de la reserva no es valido", 409, "TARIFA_INVALIDA");
         }
@@ -11803,7 +11807,11 @@ router.put("/reserva/:id/convenio/propuesta", verifyToken, async (req, res) => {
         [centavosANumero(precioCentavos), familiarId, reservaId]
       );
     }
-    const precioTotal = centavosANumero(precioTotalCentavos);
+    const totalRedondeadoCentavos = redondearCentavosAPesos(precioTotalCentavos);
+    if (totalRedondeadoCentavos === null) {
+      throw crearErrorNegocio("El total de la propuesta excede el máximo permitido", 422);
+    }
+    const precioTotal = centavosANumero(totalRedondeadoCentavos);
 
     const estadoPropuestaId = await obtenerEstadoReservaId(
       connection,
@@ -12309,6 +12317,7 @@ router.get("/acompaniantes/:id?", verifyToken, async (req, res) => {
               u.nombre,
               u.apellido,
               u.documento,
+              u.rol_id,
               u.fecha_nacimiento,
               u.telefono,
               u.parentesco_id,
@@ -18657,6 +18666,7 @@ router.post("/configuracion/usuario", verifyToken, manejarUploadFotoPerfil, asyn
 
       // Procesar password (si viene, sino generar una por defecto o dejarla opcional)
       if (camposPermitidos.includes('password')) {
+        validarPassword(passwordTexto, rolEfectivo, documentoValor);
         const passwordHash = await bcryptjs.hash(passwordTexto, 8);
         insertFields.push('password');
         insertPlaceholders.push('?');

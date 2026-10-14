@@ -30,6 +30,7 @@
 // ============================================================================
 
 const bcryptjs = require("bcryptjs");
+const { validarPassword } = require("../security/password-policy");
 const { DNI_MENSAJE, esDniValido } = require("../security/dni");
 const {
   calcularEdadEnFecha,
@@ -1527,9 +1528,6 @@ async function actualizarDatosUsuario(connection, {
     if (campo === "password") {
       if (typeof valorCrudo !== "string" || valorCrudo.trim() === "") continue; // vacía = no se cambia
       if (!permitidos.has("password")) throw errorCampoNoPermitido("password");
-      if (valorCrudo.length < 8 || valorCrudo.length > 128) {
-        throw errorDatoInvalido("password", "La contraseña debe tener entre 8 y 128 caracteres");
-      }
       nuevos.password = valorCrudo;
       continue;
     }
@@ -1579,6 +1577,10 @@ async function actualizarDatosUsuario(connection, {
     if (campo !== "password") final[campo] = nuevos[campo];
   }
   final.rol_nombre = rolFinalNombre;
+  if (nuevos.password !== undefined) {
+    try { validarPassword(nuevos.password, final); }
+    catch (error) { throw errorDatoInvalido("password", error.message); }
+  }
   validarReglas({ objetivo, nuevos, final, rolFinalNombre, hoy });
   await validarUnicidad(connection, { actor, objetivoId, nuevos });
 

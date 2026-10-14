@@ -33,6 +33,19 @@ const personas = [
   { tipo_persona_id: 3, edad: 30, final_centavos: 9_000_000, lista_centavos: 9_000_000 },
 ];
 
+test("redondea sólo el neto con adicionales y descuentos, conservando el detalle", () => {
+  const viajeros = [{ tipo_persona_id: 1, edad: 40, final_centavos: 1000, lista_centavos: 1000 }];
+  for (const [adicionalesCentavos, esperado] of [[49, 10], [50, 11], [51, 11]]) {
+    const resultado = calcularDescuentos({ personas: viajeros, adicionalesCentavos, reglas: [] });
+    assert.equal(resultado.total_final, esperado);
+    assert.equal(resultado.total_final_centavos, esperado * 100);
+    assert.equal(resultado.total_antes_centavos, 1000 + adicionalesCentavos);
+  }
+  const rebaja = calcularDescuentos({ personas: viajeros, adicionalesCentavos: 49, reglas: [reglaBase({ porcentaje: 5 })] });
+  assert.equal(rebaja.total_descuento, 0.5);
+  assert.equal(rebaja.total_final, 10);
+});
+
 test("normaliza hashtags con o sin numeral, espacios y minúsculas", () => {
   assert.equal(normalizarCodigoCupon("#jubilado"), "JUBILADO");
   assert.equal(normalizarCodigoCupon("  ##Ajb 2026 "), "AJB_2026");
