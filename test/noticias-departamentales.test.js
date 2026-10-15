@@ -479,6 +479,7 @@ test("el listado del portal arma la respuesta con departamental, marcas, conteos
   assert.equal(resultado.headers["cache-control"], "private, no-store");
   const cuerpo = resultado.respuesta;
   assert.deepEqual(cuerpo.departamental, {
+    logo_url: null,
     id: 1,
     nombre: "La Plata",
     direccion: "Calle 55 Nº 910 e/ 13 y 14",
@@ -561,6 +562,7 @@ test("la sede sin coordenadas (o en 0,0) sale con lat/lng nulos", async () => {
   poolCon(reglasPortal({ departamental: { id: 3, nombre: "Provincia", direccion: "Calle 49 entre 4 y 5", localidad: "La Plata", lat: null, lng: null } }));
   const sinCoordenadas = await ejecutar(getPortal, { cabecera: { ...AFILIADO_LA_PLATA, departamental_id: 3 } });
   assert.deepEqual(sinCoordenadas.respuesta.departamental, {
+    logo_url: null,
     id: 3, nombre: "Provincia", direccion: "Calle 49 entre 4 y 5", localidad: "La Plata", lat: null, lng: null,
   });
 

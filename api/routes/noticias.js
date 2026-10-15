@@ -546,7 +546,7 @@ function coordenadaOpcional(valor) {
 async function obtenerDepartamentalPortal(db, departamentalId) {
   if (!departamentalId) return null;
   const [filas] = await db.query(
-    `SELECT d.id, d.nombre, d.direccion, d.localidad,
+    `SELECT d.id, d.nombre, d.direccion, d.localidad, d.logo_archivo,
             ST_Y(d.coordenadas) AS lat, ST_X(d.coordenadas) AS lng
      FROM departamental d
      WHERE d.id = ?
@@ -567,6 +567,7 @@ async function obtenerDepartamentalPortal(db, departamentalId) {
     nombre: fila.nombre || null,
     direccion: fila.direccion || null,
     localidad: fila.localidad || null,
+    logo_url: fila.logo_archivo ? await getSignedFileUrlFromS3(fila.logo_archivo).catch(() => null) : null,
     lat,
     lng,
   };

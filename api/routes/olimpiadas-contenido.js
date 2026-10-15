@@ -12,6 +12,8 @@ const mysqlConnection = require("../connection/connection");
 const { registrarErrorRuta } = require("../services/errores");
 const { normalizarFechaCivil } = require("../services/valores-dominio");
 const { SECCIONES_INICIALES } = require("../data/olimpiadas-plantillas");
+const { verificarAccesoCompeticion, exigirDisciplinaVoluntario, exigirEdicionVoluntario, esVoluntario } = require('../security/olimpiadas-voluntarios');
+const { CAMPOS_PARTIDO_EXTRA, calcularPosiciones, listarTorneos, filtroId } = require('../services/olimpiadas-competicion');
 const {
   verifyToken,
   getCabecera,
@@ -167,6 +169,7 @@ async function historial(connection, cabecera, datos) {
     usuario_id: cabecera.id,
     usuario_rol: cabecera.rol,
     ...datos,
+    observacion: [esVoluntario(cabecera) ? `Voluntario #${cabecera.voluntario_id}: ${cabecera.nombre || cabecera.usuario || ''}` : null, datos.observacion].filter(Boolean).join(' · ') || null,
     valor_anterior: recortar(datos.valor_anterior),
     valor_nuevo: recortar(datos.valor_nuevo),
   });
@@ -1628,10 +1631,20 @@ const SELECT_PARTIDO = `
   SELECT p.id, p.olimpiada_id, p.disciplina_id, d.nombre AS disciplina_nombre, p.fecha, p.hora_inicio, p.hora_fin,
          p.etiqueta, p.fase, p.participante1, p.participante2, p.departamental1_id, p.departamental2_id,
          p.resultado1, p.resultado2, p.ganador, p.estado, p.sede_id, s.nombre AS sede_nombre,
-         p.observacion, p.orden, p.fecha_modificacion
+         p.observacion, p.orden, p.fecha_modificacion, p.torneo_id, t.nombre AS torneo_nombre,
+         p.instancia_id, inst.nombre AS instancia_nombre, ti.orden AS instancia_orden,
+         p.lugar_id, l.nombre AS lugar_nombre, l.predio AS lugar_predio, l.direccion AS lugar_direccion, l.url_mapa AS lugar_url_mapa,
+         p.inscripcion1_id, p.inscripcion2_id, p.mostrar_nombres_publico, p.partido_origen1_id, p.partido_origen2_id,
+         dep1.nombre AS departamental1_nombre, dep2.nombre AS departamental2_nombre
   FROM olimpiada_partido p
   INNER JOIN olimpiada_disciplina d ON d.id = p.disciplina_id
-  LEFT JOIN olimpiada_sede s ON s.id = p.sede_id AND s.eliminado = 0`;
+  LEFT JOIN olimpiada_sede s ON s.id = p.sede_id AND s.eliminado = 0
+  LEFT JOIN olimpiada_torneo t ON t.id = p.torneo_id
+  LEFT JOIN olimpiada_instancia inst ON inst.id = p.instancia_id
+  LEFT JOIN olimpiada_torneo_instancia ti ON ti.torneo_id = p.torneo_id AND ti.instancia_id = p.instancia_id
+  LEFT JOIN olimpiada_lugar l ON l.id = p.lugar_id
+  LEFT JOIN departamental dep1 ON dep1.id = p.departamental1_id
+  LEFT JOIN departamental dep2 ON dep2.id = p.departamental2_id`;
 const ORDEN_PARTIDOS = "p.fecha IS NULL, p.fecha, p.hora_inicio IS NULL, p.hora_inicio, p.orden, p.id";
 
 async function consultarPartidos(conexion, { condiciones, params, orden = ORDEN_PARTIDOS, limite = null }) {
@@ -1679,24 +1692,33 @@ async function listarDisciplinasFixture(conexion, olimpiadaId) {
   );
 }
 
-router.get("/olimpiadas/:id(\\d+)/fixture", verifyToken, async (req, res) => {
+router.get("/olimpiadas/:id(\\d+)/fixture", verificarAccesoCompeticion, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     const olimpiadaId = idDeRuta(req.params.id);
-    await cargarOlimpiada(db, olimpiadaId, cabecera);
+    const olimpiada = await cargarOlimpiada(db, olimpiadaId, cabecera);
+    const asignadas = await exigirEdicionVoluntario({ db, cabecera, olimpiadaId });
     const condiciones = ["p.olimpiada_id = ?"];
     const params = [olimpiadaId];
+    if (asignadas) { condiciones.push('p.disciplina_id IN (?)'); params.push(asignadas.length ? asignadas : [0]); }
     if (req.query.disciplina_id !== undefined && req.query.disciplina_id !== "") {
       const disciplinaId = normalizarIdPositivo(req.query.disciplina_id);
       if (!disciplinaId) return res.status(400).json("La disciplina es inválida");
       condiciones.push("p.disciplina_id = ?");
       params.push(disciplinaId);
+      await exigirDisciplinaVoluntario({ db, cabecera, olimpiadaId, disciplinaId });
     }
-    const [disciplinas, partidos] = await Promise.all([
+    for (const campo of ['torneo_id', 'lugar_id']) { const id = filtroId(req.query, campo); if (id) { condiciones.push(`p.${campo} = ?`); params.push(id); } }
+    const [disciplinas, partidos, torneos] = await Promise.all([
       listarDisciplinasFixture(db, olimpiadaId),
       consultarPartidos(db, { condiciones, params }),
+      listarTorneos(db, olimpiadaId, asignadas),
     ]);
-    res.status(200).json({ disciplinas, partidos });
+    const hoy = fechaHoyBuenosAires();
+    const puedeEditar = esSuperior(cabecera) || (esVoluntario(cabecera) && normalizarFechaCivil(olimpiada.fecha_inicio) <= hoy && hoy <= normalizarFechaCivil(olimpiada.fecha_fin));
+    res.set('Cache-Control', 'no-store');
+    res.status(200).json({ olimpiada: { id: olimpiada.id, nombre: olimpiada.nombre, fecha_inicio: olimpiada.fecha_inicio, fecha_fin: olimpiada.fecha_fin }, puede_editar: puedeEditar,
+      disciplinas: asignadas ? disciplinas.filter(d => asignadas.includes(Number(d.id))) : disciplinas, partidos, torneos, posiciones: calcularPosiciones(partidos) });
   } catch (error) {
     responderError(res, error, "No se pudo cargar el fixture");
   }
@@ -1745,15 +1767,24 @@ function leerPartido(body, base, { completo = false } = {}) {
     hora_fin: leerHora(body, "hora_fin", base, { etiqueta: "la hora de fin" }),
     etiqueta: leerTexto(body, "etiqueta", base, { maximo: 40, etiqueta: "la etiqueta" }),
     fase: leerTexto(body, "fase", base, { maximo: 60, etiqueta: "la fase" }),
-    participante1: leerTexto(body, "participante1", base, { maximo: 120, requerido: true, etiqueta: "el participante 1" }),
-    participante2: leerTexto(body, "participante2", base, { maximo: 120, requerido: true, etiqueta: "el participante 2" }),
+    participante1: leerTexto(body, "participante1", base, { maximo: 120, etiqueta: "el participante 1" }),
+    participante2: leerTexto(body, "participante2", base, { maximo: 120, etiqueta: "el participante 2" }),
     departamental1_id: leerIdOpcional(body, "departamental1_id", base, { etiqueta: "la departamental del participante 1" }),
     departamental2_id: leerIdOpcional(body, "departamental2_id", base, { etiqueta: "la departamental del participante 2" }),
     sede_id: leerIdOpcional(body, "sede_id", base, { etiqueta: "la sede" }),
     observacion: leerTexto(body, "observacion", base, { maximo: 300, etiqueta: "la observación" }),
     orden: leerEntero(body, "orden", base, { etiqueta: "el orden" }),
+    torneo_id: leerIdOpcional(body, 'torneo_id', base),
+    instancia_id: leerIdOpcional(body, 'instancia_id', base),
+    lugar_id: leerIdOpcional(body, 'lugar_id', base),
+    inscripcion1_id: leerIdOpcional(body, 'inscripcion1_id', base),
+    inscripcion2_id: leerIdOpcional(body, 'inscripcion2_id', base),
+    partido_origen1_id: leerIdOpcional(body, 'partido_origen1_id', base),
+    partido_origen2_id: leerIdOpcional(body, 'partido_origen2_id', base),
+    mostrar_nombres_publico: leerFlag(body, 'mostrar_nombres_publico', base, 0),
   };
   if (!datos.disciplina_id) throw crearErrorHttp("Indicá la disciplina del partido");
+  if (datos.hora_inicio && datos.hora_fin && datos.hora_fin <= datos.hora_inicio) throw crearErrorHttp('La hora de fin debe ser posterior al inicio');
   if (completo) {
     datos.estado = leerEnum(body, "estado", base, ESTADOS_PARTIDO, { porDefecto: "PROGRAMADO", etiqueta: "el estado" });
     datos.resultado1 = leerTexto(body, "resultado1", base, { maximo: 20, etiqueta: "el resultado 1" });
@@ -1767,8 +1798,64 @@ function leerPartido(body, base, { completo = false } = {}) {
 async function validarReferenciasPartido(conexion, olimpiadaId, datos) {
   await validarDisciplinaDeOlimpiada(conexion, olimpiadaId, datos.disciplina_id);
   await validarSedeDeOlimpiada(conexion, olimpiadaId, datos.sede_id);
-  await validarDepartamentalOpcional(conexion, datos.departamental1_id, "la departamental del participante 1");
-  await validarDepartamentalOpcional(conexion, datos.departamental2_id, "la departamental del participante 2");
+  if (datos.torneo_id) {
+    const [[torneo]] = await conexion.query('SELECT id FROM olimpiada_torneo WHERE id = ? AND olimpiada_id = ? AND disciplina_id = ? AND eliminado = 0', [datos.torneo_id, olimpiadaId, datos.disciplina_id]);
+    if (!torneo) throw crearErrorHttp('El torneo no pertenece a esta edición y disciplina');
+  }
+  if (datos.instancia_id) {
+    if (!datos.torneo_id) throw crearErrorHttp('Elegí un torneo para seleccionar su instancia');
+    const [[instancia]] = await conexion.query('SELECT i.nombre FROM olimpiada_torneo_instancia ti INNER JOIN olimpiada_instancia i ON i.id = ti.instancia_id WHERE ti.torneo_id = ? AND ti.instancia_id = ?', [datos.torneo_id, datos.instancia_id]);
+    if (!instancia) throw crearErrorHttp('La instancia no pertenece al torneo');
+    datos.fase = instancia.nombre;
+  }
+  if (datos.lugar_id) {
+    const [[lugar]] = await conexion.query('SELECT id FROM olimpiada_lugar WHERE id = ? AND eliminado = 0', [datos.lugar_id]);
+    if (!lugar) throw crearErrorHttp('El lugar elegido no existe');
+  }
+  for (const lado of [1, 2]) {
+    if (datos[`inscripcion${lado}_id`]) {
+      const [[inscripcion]] = await conexion.query(`SELECT i.id, i.departamental_id, u.nombre, u.apellido FROM olimpiada_inscripcion i
+        INNER JOIN usuario u ON u.id = i.usuario_id
+        INNER JOIN olimpiada_inscripcion_disciplina d ON d.inscripcion_id = i.id AND d.disciplina_id = ?
+        WHERE i.id = ? AND i.olimpiada_id = ? AND i.estado = 'VALIDADO' AND i.eliminado = 0`, [datos.disciplina_id, datos[`inscripcion${lado}_id`], olimpiadaId]);
+      if (!inscripcion) throw crearErrorHttp(`El participante ${lado} debe tener inscripción aprobada en esta disciplina`);
+      datos[`participante${lado}`] = `${inscripcion.apellido || ''} ${inscripcion.nombre || ''}`.trim();
+      datos[`departamental${lado}_id`] = inscripcion.departamental_id;
+    } else if (datos[`departamental${lado}_id`]) {
+      const departamental = await validarDepartamentalOpcional(conexion, datos[`departamental${lado}_id`], `la departamental ${lado}`);
+      datos[`participante${lado}`] = departamental.nombre;
+    }
+    if (datos[`partido_origen${lado}_id`]) {
+      const [[origen]] = await conexion.query('SELECT id, torneo_id FROM olimpiada_partido WHERE id = ? AND olimpiada_id = ? AND disciplina_id = ? AND eliminado = 0', [datos[`partido_origen${lado}_id`], olimpiadaId, datos.disciplina_id]);
+      if (!origen || Number(origen.torneo_id) !== Number(datos.torneo_id)) throw crearErrorHttp('El partido de origen debe pertenecer al mismo torneo y disciplina');
+      datos[`participante${lado}`] ||= `Ganador del partido ${origen.id}`;
+    }
+    if (!datos[`participante${lado}`]) throw crearErrorHttp(`Elegí la departamental o el afiliado del participante ${lado}`);
+  }
+  if (datos.inscripcion1_id && datos.inscripcion1_id === datos.inscripcion2_id) throw crearErrorHttp('Un afiliado no puede enfrentarse consigo mismo');
+}
+
+async function autorizarPartido(cabecera, olimpiadaId, disciplinaId, datos = null, actual = null) {
+  if (!esSuperior(cabecera) && !esVoluntario(cabecera)) throw crearErrorHttp('No autorizado', 403);
+  await exigirDisciplinaVoluntario({ db, cabecera, olimpiadaId, disciplinaId, escritura: true });
+  if (esVoluntario(cabecera) && datos && Number(datos.mostrar_nombres_publico) !== Number(actual?.mostrar_nombres_publico || 0)) throw crearErrorHttp('La publicación de nombres la decide la administración', 403);
+}
+
+async function guardarExtrasPartido(connection, partidoId, datos) {
+  if ([datos.partido_origen1_id, datos.partido_origen2_id].some(id => id && Number(id) >= Number(partidoId))) throw crearErrorHttp('Los partidos de origen deben haberse creado antes que el partido siguiente');
+  await connection.query(`UPDATE olimpiada_partido SET ${CAMPOS_PARTIDO_EXTRA.map(c => `${c} = ?`).join(', ')} WHERE id = ?`, [...CAMPOS_PARTIDO_EXTRA.map(c => datos[c] ?? null), partidoId]);
+}
+
+// Prevent a concurrent edit (including a discipline reassignment) from silently
+// replacing the row that was authorized and used as the audit's previous value.
+async function bloquearSinCambios(connection, tabla, anterior) {
+  if (!['olimpiada_partido', 'olimpiada_torneo'].includes(tabla)) throw new Error('Tabla de competición inválida');
+  const [[actual]] = await connection.query(`SELECT * FROM ${tabla} WHERE id = ? AND eliminado = 0 FOR UPDATE`, [anterior.id]);
+  if (!actual) throw crearErrorHttp('El registro ya no existe', 404);
+  if (Object.keys(anterior).some(campo => textoComparable(actual[campo]) !== textoComparable(anterior[campo]))) {
+    throw crearErrorHttp('Otra persona actualizó este registro. Recargá los datos antes de guardar.', 409);
+  }
+  return actual;
 }
 
 function describirPartido(partido) {
@@ -1776,13 +1863,13 @@ function describirPartido(partido) {
   return `${fecha}${partido.participante1} vs ${partido.participante2}${partido.etiqueta ? ` (${partido.etiqueta})` : ""}`;
 }
 
-router.post("/olimpiadas/:id(\\d+)/partidos", verifyToken, async (req, res) => {
-  const cabecera = exigirSuperior(req, res);
-  if (!cabecera) return;
+router.post("/olimpiadas/:id(\\d+)/partidos", verificarAccesoCompeticion, async (req, res) => {
+  const cabecera = getCabecera(req);
   try {
     const olimpiadaId = idDeRuta(req.params.id);
     await cargarOlimpiada(db, olimpiadaId, cabecera);
     const datos = leerPartido(req.body || {}, {});
+    await autorizarPartido(cabecera, olimpiadaId, datos.disciplina_id, datos);
     await validarReferenciasPartido(db, olimpiadaId, datos);
     const partidoId = await enTransaccion(async (connection) => {
       const [insert] = await connection.query(
@@ -1796,6 +1883,7 @@ router.post("/olimpiadas/:id(\\d+)/partidos", verifyToken, async (req, res) => {
           datos.observacion, datos.orden,
         ]
       );
+      await guardarExtrasPartido(connection, insert.insertId, datos);
       await historial(connection, cabecera, {
         entidad: "PARTIDO",
         entidad_id: insert.insertId,
@@ -1811,15 +1899,15 @@ router.post("/olimpiadas/:id(\\d+)/partidos", verifyToken, async (req, res) => {
   }
 });
 
-router.post("/olimpiadas/:id(\\d+)/partidos/importar", verifyToken, async (req, res) => {
-  const cabecera = exigirSuperior(req, res);
-  if (!cabecera) return;
+router.post("/olimpiadas/:id(\\d+)/partidos/importar", verificarAccesoCompeticion, async (req, res) => {
+  const cabecera = getCabecera(req);
   try {
     const olimpiadaId = idDeRuta(req.params.id);
     await cargarOlimpiada(db, olimpiadaId, cabecera);
     const body = req.body || {};
     const disciplinaId = normalizarIdPositivo(body.disciplina_id);
     if (!disciplinaId) return res.status(400).json("Elegí la disciplina a la que pertenecen los partidos");
+    await autorizarPartido(cabecera, olimpiadaId, disciplinaId);
     const disciplina = await validarDisciplinaDeOlimpiada(db, olimpiadaId, disciplinaId);
     const texto = typeof body.texto === "string" ? body.texto : "";
     if (!texto.trim()) return res.status(400).json("Pegá los partidos en el cuadro de texto");
@@ -1863,14 +1951,16 @@ router.post("/olimpiadas/:id(\\d+)/partidos/importar", verifyToken, async (req, 
   }
 });
 
-router.put("/olimpiadas/partidos/:partidoId(\\d+)", verifyToken, async (req, res) => {
-  const cabecera = exigirSuperior(req, res);
-  if (!cabecera) return;
+router.put("/olimpiadas/partidos/:partidoId(\\d+)", verificarAccesoCompeticion, async (req, res) => {
+  const cabecera = getCabecera(req);
   try {
     const partidoId = idDeRuta(req.params.partidoId);
     const actual = await exigirFila(db, "olimpiada_partido", partidoId, "El partido no existe");
     const body = req.body || {};
     const datos = leerPartido(body, actual, { completo: true });
+    await autorizarPartido(cabecera, actual.olimpiada_id, actual.disciplina_id, datos, actual);
+    await autorizarPartido(cabecera, actual.olimpiada_id, datos.disciplina_id, datos, actual);
+    if ((body.resultado1 !== undefined || body.resultado2 !== undefined) && body.ganador === undefined) datos.ganador = null;
     // Finalizado sin ganador definido y con marcador numérico → se calcula (igual que /resultado).
     if (datos.estado === "FINALIZADO" && datos.ganador === null) {
       datos.ganador = calcularGanadorPartido(datos.resultado1, datos.resultado2);
@@ -1878,6 +1968,7 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)", verifyToken, async (req, res
     if (datos.estado !== "FINALIZADO") datos.ganador = null;
     await validarReferenciasPartido(db, actual.olimpiada_id, datos);
     await enTransaccion(async (connection) => {
+      await bloquearSinCambios(connection, 'olimpiada_partido', actual);
       await connection.query(
         `UPDATE olimpiada_partido
          SET disciplina_id = ?, fecha = ?, hora_inicio = ?, hora_fin = ?, etiqueta = ?, fase = ?, participante1 = ?, participante2 = ?,
@@ -1890,6 +1981,7 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)", verifyToken, async (req, res
           datos.estado, datos.resultado1, datos.resultado2, datos.ganador, partidoId,
         ]
       );
+      await guardarExtrasPartido(connection, partidoId, datos);
       await historialCambios(
         connection,
         cabecera,
@@ -1899,6 +1991,7 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)", verifyToken, async (req, res
         [
           "disciplina_id", "fecha", "hora_inicio", "hora_fin", "etiqueta", "fase", "participante1", "participante2",
           "departamental1_id", "departamental2_id", "sede_id", "observacion", "orden", "estado", "resultado1", "resultado2", "ganador",
+          ...CAMPOS_PARTIDO_EXTRA,
         ]
       );
     });
@@ -1915,12 +2008,12 @@ const MENSAJE_RESULTADO = {
   SUSPENDIDO: "Partido suspendido",
 };
 
-router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verifyToken, async (req, res) => {
-  const cabecera = exigirSuperior(req, res);
-  if (!cabecera) return;
+router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCompeticion, async (req, res) => {
+  const cabecera = getCabecera(req);
   try {
     const partidoId = idDeRuta(req.params.partidoId);
     const actual = await exigirFila(db, "olimpiada_partido", partidoId, "El partido no existe");
+    await autorizarPartido(cabecera, actual.olimpiada_id, actual.disciplina_id);
     const body = req.body || {};
     if (body.estado === undefined) return res.status(400).json("Indicá el estado del partido");
     const estado = leerEnum(body, "estado", {}, ESTADOS_PARTIDO, { etiqueta: "el estado" });
@@ -1930,8 +2023,10 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verifyToken, async
     if (ganador === undefined || ganador === null) {
       ganador = estado === "FINALIZADO" ? calcularGanadorPartido(resultado1, resultado2) : null;
     }
+    if (estado !== 'FINALIZADO') ganador = null;
     const nuevo = { estado, resultado1, resultado2, ganador };
     await enTransaccion(async (connection) => {
+      await bloquearSinCambios(connection, 'olimpiada_partido', actual);
       await connection.query(
         "UPDATE olimpiada_partido SET estado = ?, resultado1 = ?, resultado2 = ?, ganador = ? WHERE id = ?",
         [estado, resultado1, resultado2, ganador, partidoId]
@@ -1962,13 +2057,16 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verifyToken, async
   }
 });
 
-router.delete("/olimpiadas/partidos/:partidoId(\\d+)", verifyToken, async (req, res) => {
-  const cabecera = exigirSuperior(req, res);
-  if (!cabecera) return;
+router.delete("/olimpiadas/partidos/:partidoId(\\d+)", verificarAccesoCompeticion, async (req, res) => {
+  const cabecera = getCabecera(req);
   try {
     const partidoId = idDeRuta(req.params.partidoId);
     const actual = await exigirFila(db, "olimpiada_partido", partidoId, "El partido no existe");
+    await autorizarPartido(cabecera, actual.olimpiada_id, actual.disciplina_id);
+    const [[referencias]] = await db.query('SELECT COUNT(*) AS cantidad FROM olimpiada_partido WHERE eliminado = 0 AND (partido_origen1_id = ? OR partido_origen2_id = ?)', [partidoId, partidoId]);
+    if (Number(referencias.cantidad)) throw crearErrorHttp('Primero quitá este partido como origen de los partidos siguientes');
     await enTransaccion(async (connection) => {
+      await bloquearSinCambios(connection, 'olimpiada_partido', actual);
       await connection.query("UPDATE olimpiada_partido SET eliminado = 1 WHERE id = ?", [partidoId]);
       await historial(connection, cabecera, {
         entidad: "PARTIDO",
@@ -1987,21 +2085,25 @@ router.delete("/olimpiadas/partidos/:partidoId(\\d+)", verifyToken, async (req, 
 // ---------------------------------------------------------------------------
 // En vivo
 // ---------------------------------------------------------------------------
-router.get("/olimpiadas/:id(\\d+)/en-vivo", verifyToken, async (req, res) => {
+router.get("/olimpiadas/:id(\\d+)/en-vivo", verificarAccesoCompeticion, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     const olimpiadaId = idDeRuta(req.params.id);
     await cargarOlimpiada(db, olimpiadaId, cabecera);
+    const asignadas = await exigirEdicionVoluntario({ db, cabecera, olimpiadaId });
+    const consultarEnVivo = (conexion, opciones) => consultarPartidos(conexion, asignadas ? {
+      ...opciones, condiciones: [...opciones.condiciones, 'p.disciplina_id IN (?)'], params: [...opciones.params, asignadas.length ? asignadas : [0]],
+    } : opciones);
     const hoy = fechaHoyBuenosAires();
     const [enJuego, recientes, proximos] = await Promise.all([
-      consultarPartidos(db, { condiciones: ["p.olimpiada_id = ?", "p.estado = 'EN_JUEGO'"], params: [olimpiadaId] }),
-      consultarPartidos(db, {
+      consultarEnVivo(db, { condiciones: ["p.olimpiada_id = ?", "p.estado = 'EN_JUEGO'"], params: [olimpiadaId] }),
+      consultarEnVivo(db, {
         condiciones: ["p.olimpiada_id = ?", "p.estado = 'FINALIZADO'"],
         params: [olimpiadaId],
         orden: "p.fecha_modificacion DESC, p.id DESC",
         limite: 20,
       }),
-      consultarPartidos(db, {
+      consultarEnVivo(db, {
         condiciones: ["p.olimpiada_id = ?", "p.estado = 'PROGRAMADO'", "p.fecha >= ?"],
         params: [olimpiadaId, hoy],
         orden: "p.fecha, p.hora_inicio IS NULL, p.hora_inicio, p.orden, p.id",
@@ -2472,6 +2574,10 @@ router.delete("/olimpiadas/fotos/:fotoId(\\d+)", verifyToken, async (req, res) =
 });
 
 // ---------------------------------------------------------------------------
+require('./olimpiadas-torneos')(router, { db, cargarOlimpiada, enTransaccion, historial, historialCambios, leerTexto, leerIdOpcional, leerEnum, leerEntero, leerUrl, validarDisciplinaDeOlimpiada, consultarPartidos, bloquearSinCambios });
+
+router.lecturasPublicas = Object.freeze({ estadoEdicion, consultarPartidos, listarDisciplinasFixture, listarSedes, armarMedallero, serializarNovedad, serializarEvento, serializarFoto, SELECT_EVENTO, SELECT_FOTO });
+
 router.__test = Object.freeze({
   TIPOS_SEDE,
   TIPOS_EVENTO,
@@ -2506,6 +2612,9 @@ router.__test = Object.freeze({
   leerSeccion,
   leerEnlace,
   leerPartido,
+  validarReferenciasPartido,
+  guardarExtrasPartido,
+  bloquearSinCambios,
   leerCamposFoto,
   procesarLoteFotos,
 });

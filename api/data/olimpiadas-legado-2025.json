@@ -1,0 +1,30 @@
+{
+  "fuente": "https://dasvalley.com/olimpiadas/administrador/home.php",
+  "consultado": "2026-10-14",
+  "logos": [
+    ["Avellaneda-Lanús", "Avellaneda-Lanus_20251113_210702.jpg"],
+    ["Azul", "1732806525_IMG-20241128-WA0062.jpg"],
+    ["Bahía Blanca", "Bah-a-Blanca_20251030_223601.png"],
+    ["Dolores", "1729126955_Dolores-1.png"],
+    ["Junín", "1729126965_Junin.png"],
+    ["La Matanza", "1729126429_logo-la-matanza.png"],
+    ["La Plata", "La-Plata_20251030_223317.png"],
+    ["Lomas de Zamora", "1729126944_Lomas-2023.png"],
+    ["Mar del Plata", "1729126479_MARDEL-2024.png"],
+    ["Mercedes", "1731983978_Mercedes.jpg"],
+    ["Morón", "1729127029_Moron-1.jpg"],
+    ["Moreno-Gral. Rodríguez", "1729127044_Moreno.png"],
+    ["Necochea", "1729126974_Necochea.jpg"],
+    ["Pergamino", "1729126548_Pergamino-2.jpg"],
+    ["Quilmes", "1729126557_QUilmes-1.jpg"],
+    ["San Isidro", "1729126456_San-Isidro-2023.png"],
+    ["Gral. San Martín", "1729126510_San-Martin-1.jpg"],
+    ["San Nicolás", "1729126499_San-Nicolas-1.jpg"],
+    ["Trenque Lauquen", "1729127020_Trenque-Lauquen.jpg"],
+    ["Zárate-Campana", "1729127003_ZarateCampana.png"]
+  ],
+  "filas_no_departamentales": ["Bahía/MDQ/San Isidro", "La Matanza/Zárate-Campana", "Lomas de Zamora/Avellaneda-Lanús", "Mercedes/Azul", "Todas las Departamentales"],
+  "lugares": ["Camping", "Camping (Comedor)", "Camping (Confitería)", "Camping (Deck Confitería)", "Camping Adm. Invierno", "Camping Cancha 1", "Camping Cancha 2", "Camping Cancha 3", "Club Atlético Defensores de Miramar (Calle 5 y 54)", "Club San Ignacio", "Defensores (Av. 23 esquina 44)", "La Azucena (Calle 50 e/ 21 y 23)", "La Red (A. 37 e/ 16 y 18) Cancha 1", "La Red (A. 37 e/ 16 y 18) Cancha 2", "Miramar Paddle (Calle 26 e/ 31 y 33)", "Muelles de Pescadores (Costanera y Av. 37)", "Natatorio Municipal de Gral. Otamendi", "Playa", "Polideportivo Néstor Kirschner (Ruta 11 Entrada a Miramar)"],
+  "disciplinas": ["Ajedrez", "Basquet Masculino", "Burako", "Fútbol 11 Masculino", "Fútbol 5 Femenino", "Fútbol 5 Masculino", "Fútbol 5 Senior Masculino +40 años", "Fútbol 5 Super Senior Masculino + 50 años", "Fútbol Tenis", "Hándbol Femenino", "Maratón", "Metegol", "Natación", "Padle Dobles Femenino", "Padle Dobles Masculino", "Padle Dobles Mixto", "Pelota Paleta", "Pesca", "Ping Pong Single Femenino", "Ping Pong Single Masculino", "Poker", "Pool", "Tejo", "Tenis Single Femenino", "Tenis Single Masculino", "Truco", "Voley Femenino", "Voley Masculino", "Voley playa Mixto"],
+  "notas": ["Se mapearon variantes ortográficas a los nombres del sistema nuevo (paddle/padle, handball/hándbol, básquet, senior, fútbol 11).", "Pesca aparece dos veces en origen; se conserva una sola disciplina.", "MEDALLERO y TABLA OLIMPIADAS JUDICIALES son vistas, no disciplinas.", "Tejo genérico se conserva separado de Tejo dobles y Tejo Dobles Mixto.", "Provincia no tiene logo propio en la tabla de origen."]
+}

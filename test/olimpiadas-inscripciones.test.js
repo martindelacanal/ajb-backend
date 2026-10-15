@@ -22,7 +22,7 @@ test("estado inicial: el afiliado nace PENDIENTE si la edición exige aprobació
   assert.equal(estadoInicialInscripcion({ rol: "afiliado", olimpiada: { requiere_aprobacion: 1, exigir_bonos_para_validar: 0 } }), "PENDIENTE");
   assert.equal(estadoInicialInscripcion({ rol: "afiliado", olimpiada: { requiere_aprobacion: 0, exigir_bonos_para_validar: 1 } }), "PENDIENTE");
   assert.equal(estadoInicialInscripcion({ rol: "afiliado", olimpiada: { requiere_aprobacion: "1", exigir_bonos_para_validar: "1" } }), "PENDIENTE");
-  assert.equal(estadoInicialInscripcion({ rol: "afiliado", olimpiada: { requiere_aprobacion: 0, exigir_bonos_para_validar: 0 } }), "VALIDADO");
+  assert.equal(estadoInicialInscripcion({ rol: "afiliado", olimpiada: { requiere_aprobacion: 0, exigir_bonos_para_validar: 0 } }), "PENDIENTE");
 });
 
 test("estado inicial: el staff nace PENDIENTE sólo si la edición exige bonos para validar", () => {
@@ -34,7 +34,7 @@ test("estado inicial: el staff nace PENDIENTE sólo si la edición exige bonos p
 });
 
 test("estado inicial: sin olimpiada o con banderas ausentes se trata como no exigido", () => {
-  assert.equal(estadoInicialInscripcion({ rol: "afiliado", olimpiada: null }), "VALIDADO");
+  assert.equal(estadoInicialInscripcion({ rol: "afiliado", olimpiada: null }), "PENDIENTE");
   assert.equal(estadoInicialInscripcion({ rol: "departamental", olimpiada: {} }), "VALIDADO");
 });
 

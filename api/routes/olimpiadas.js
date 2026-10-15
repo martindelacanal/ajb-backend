@@ -87,13 +87,12 @@ function valorInformado(valor) {
 
 /**
  * Estado con el que nace una inscripción.
- *  - Afiliado: PENDIENTE si la edición exige aprobación o exige bonos para validar; si no, VALIDADO.
+ *  - Afiliado: siempre PENDIENTE hasta la revisión del equipo responsable.
  *  - Staff: PENDIENTE sólo si la edición exige bonos para validar (los asigna después); si no, VALIDADO.
  */
 function estadoInicialInscripcion({ rol, olimpiada }) {
   const exigeBonos = Number(olimpiada?.exigir_bonos_para_validar) === 1;
-  const requiereAprobacion = Number(olimpiada?.requiere_aprobacion) === 1;
-  if (rol === "afiliado") return requiereAprobacion || exigeBonos ? "PENDIENTE" : "VALIDADO";
+  if (rol === "afiliado") return "PENDIENTE";
   return exigeBonos ? "PENDIENTE" : "VALIDADO";
 }
 
@@ -950,7 +949,7 @@ router.get("/olimpiadas", verifyToken, async (req, res) => {
               o.fecha_inicio, o.fecha_fin, o.fecha_inicio_inscripcion, o.fecha_fin_inscripcion,
               o.texto_licencia, o.habilitado, o.fecha_creacion,
               o.valor_bono, o.bonos_afiliado, o.requiere_aprobacion, o.exigir_bonos_para_validar,
-              o.fecha_sorteo, o.sorteo_publicado,
+              o.fecha_sorteo, o.sorteo_publicado, o.publicada_publico,
               (SELECT COUNT(*) FROM olimpiada_inscripcion i
                WHERE i.olimpiada_id = o.id AND i.eliminado = 0
                  AND (? IS NULL OR i.departamental_id = ?)) AS inscriptos,
@@ -1019,12 +1018,14 @@ function normalizarOpcionalesOlimpiada(body) {
     if (bonos === null || bonos > MAX_BONOS_MANUAL) return { error: `Los bonos por afiliado deben ser un entero entre 0 y ${MAX_BONOS_MANUAL}` };
     opcionales.bonos_afiliado = bonos;
   }
-  for (const campo of ["requiere_aprobacion", "exigir_bonos_para_validar"]) {
+  for (const campo of ["requiere_aprobacion", "exigir_bonos_para_validar", "publicada_publico"]) {
     if (!valorInformado(body[campo])) continue;
     const bandera = normalizarBooleano01(body[campo]);
     if (bandera === null) return { error: `El campo ${campo} debe ser 1 o 0` };
     opcionales[campo] = bandera;
   }
+  // La aprobación de solicitudes de afiliados es obligatoria en todas las ediciones.
+  opcionales.requiere_aprobacion = 1;
   return { value: opcionales };
 }
 
@@ -1993,6 +1994,13 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
         valor_anterior: textoResumenAcompaniantes(resumenAnterior),
         valor_nuevo: textoResumenAcompaniantes(resumenAcompaniantesNuevo),
       });
+    }
+
+    // Los cambios del afiliado necesitan una nueva revisión antes de acreditar.
+    if (cabecera.rol === "afiliado" && inscripcion.estado === "VALIDADO" &&
+        (cambios.length > 0 || resumenAcompaniantesNuevo || req.body.datos_sanitarios !== undefined)) {
+      await connection.query("UPDATE olimpiada_inscripcion SET estado='PENDIENTE', validado_por_usuario_id=NULL, fecha_validacion=NULL WHERE id=?", [inscripcionId]);
+      cambios.push({ campo: "estado", anterior: "VALIDADO", nuevo: "PENDIENTE" });
     }
 
     for (const cambio of cambios) {
