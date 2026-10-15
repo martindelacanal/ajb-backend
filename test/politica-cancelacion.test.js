@@ -97,6 +97,19 @@ test("reserva sin aceptación conserva la política histórica aunque el servici
   assert.equal(consultas.length, 2);
 });
 
+test("condiciones históricas congeladas conservan reintegro sin atribuir aceptación", async () => {
+  const db = { query: async (sql, params) => {
+    assert.match(sql, /reserva_politica_cancelacion_historica/);
+    assert.match(sql, /NOT EXISTS \(SELECT 1 FROM reserva_politica_cancelacion/);
+    assert.deepEqual(params, [reserva.id, reserva.id, reserva.id]);
+    return [[{ snapshot_json: JSON.stringify(politica), origen_politica: "HISTORICA_RESERVA_ANTERIOR" }]];
+  } };
+  const cotizacion = await cotizarCancelacion(db, { reserva, ahora });
+  assert.equal(cotizacion.porcentaje_reintegro, 100);
+  assert.equal(cotizacion.politica.id, politica.id);
+  assert.equal(cotizacion.origen_politica, "HISTORICA_RESERVA_ANTERIOR");
+});
+
 test("historial elige publicaciones anteriores; reservas previas al esquema conservan la primera", async () => {
   const db = { query: async (sql) => {
     if (sql.includes("FROM reserva_politica_cancelacion")) return [[]];
@@ -274,7 +287,7 @@ test("migración por defecto es sólo check y nunca escribe; producción requier
   assert.throws(() => validarDestino({ checkOnly: false }, { DB_HOST: "remoto", DB_USER: "u", DB_PASSWORD: "p", DB_DATABASE: "d" }));
   const consultas = [];
   const resultado = await ejecutarMigracion({ query: async (sql) => { consultas.push(sql); return [[]]; } }, { log: () => {} });
-  assert.equal(resultado.faltantes.length, 4);
+  assert.equal(resultado.faltantes.length, 5);
   assert.ok(consultas.every((sql) => sql.trim().startsWith("SELECT")));
 });
 

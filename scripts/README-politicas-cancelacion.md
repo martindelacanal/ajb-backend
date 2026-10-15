@@ -38,8 +38,23 @@ Permisos SQL mínimos del usuario de ejecución (además de los existentes):
 - `politica_cancelacion_servicio_vigente`: SELECT, INSERT, UPDATE.
 - `politica_cancelacion_autoria_auditoria`: SELECT; runtime no escribe correcciones.
 - `reserva_politica_cancelacion` y `reserva_cancelacion_politica`: SELECT, INSERT.
+- `reserva_politica_cancelacion_historica`: SELECT; sólo la migración congela condiciones históricas, sin registrar una aceptación.
 - `politica_cancelacion_migracion`: sin permisos runtime.
 
 La cuenta de migración necesita CREATE, ALTER, SELECT, INSERT y UPDATE para las tablas involucradas. Las nuevas columnas de importes no requieren grants adicionales cuando los permisos existentes se concedieron por tabla.
 
 Pruebas focales: `node --test test/politica-cancelacion.test.js test/politica-cancelacion-rutas.test.js test/politica-cancelacion-migracion.test.js test/reservas-autorizacion-rutas.test.js`.
+
+## Reinicio administrativo del historial (2026-10-15)
+
+`node scripts/reiniciar-historial-politicas-cancelacion.js --check` inspecciona sin escribir. Para aplicar, usar `--apply --backup=RUTA_ABSOLUTA_NUEVA` y, si corresponde, `--allow-production`. El CLI usa exclusivamente las variables activas de `.env`. También se puede importar `ejecutarReinicio(connection, { checkOnly, backupPath, log })` con una conexión explícita a develop o producción; el módulo no carga `.env` al importarlo y toma/libera su propio advisory lock.
+
+El reinicio conserva todas las políticas vigentes por servicio, sus IDs, reglas, título, motivo, autor y fecha. Cada política conservada pasa a versión 1: hospedajes y convenios pueden tener distintas condiciones iniciales con ese mismo número. Se reemplaza el índice único global de versión por un índice normal `(version, id)`. Las publicaciones posteriores siguen serializadas por el puntero global y usan `MAX(version) + 1`.
+
+Se quitan las asignaciones que ya no están vigentes, las políticas sin servicios vigentes y las correcciones administrativas de autoría, con copia previa de las tablas involucradas y del índice de políticas. No se crean aceptaciones ficticias ni se modifican snapshots, versiones aceptadas o cancelaciones registradas. Si esos registros referencian una política que se eliminaría, el reinicio se detiene.
+
+Para las reservas sin aceptación, compara las reglas que resuelve el historial actual con las del historial reducido. Cuando cambian, congela la política histórica y su servicio en `reserva_politica_cancelacion_historica`, siempre que el ID original se conserve; de lo contrario aborta para evitar romper una futura cancelación. Esa tabla tiene `reserva_id`, `snapshot_json` y `registrada_en`; no lleva usuario ni fecha de aceptación. El runtime consulta primero la aceptación y luego este snapshot, conservando el origen `HISTORICA_RESERVA_ANTERIOR`. Los snapshots históricos ya existentes se incluyen en el backup y se conservan. Los servicios que ya no tenían política y las reservas sin fecha conservan su situación.
+
+Ejecutar con el backend detenido brevemente y una cuenta administrativa con SELECT, DELETE, UPDATE, INSERT, CREATE y ALTER sobre las tablas correspondientes. Otorgar SELECT al runtime sobre la nueva tabla histórica antes de reiniciar el backend. Mantener el backup fuera del repositorio y con acceso restringido. MySQL confirma DDL implícitamente; por eso la copia y validación preceden al cambio de índice y a la creación de la tabla histórica si falta. Los snapshots históricos nuevos, la eliminación y la renumeración ocurren en una transacción posterior. Esa segunda transacción vuelve a bloquear e inspeccionar los datos: si detecta actividad durante DDL, revierte los datos y exige un nuevo backup para reintentar. El esquema puede haber quedado migrado; ese estado intermedio es reanudable. La marca en `politica_cancelacion_migracion` impide repetir un reinicio completado y protege publicaciones futuras.
+
+Después de aplicar, verificar que sólo queden políticas versión 1 y asignaciones vigentes, que sus reglas y metadatos coincidan con el backup y que aceptaciones/cancelaciones no hayan cambiado. Pruebas del reinicio: `node --test test/politica-cancelacion-reinicio.test.js`.

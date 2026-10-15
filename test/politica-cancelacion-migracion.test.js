@@ -24,7 +24,7 @@ test("check de esquema nuevo no escribe ni inicia transacción; informa también
   const resultado = await ejecutarMigracion(db, { log() {} });
   assert.equal(resultado.tablasFaltantes.length, 4);
   assert.equal(resultado.columnasFaltantes.length, 3);
-  assert.equal(resultado.tablasBaseFaltantes.length, 4);
+  assert.equal(resultado.tablasBaseFaltantes.length, 5);
   assert.equal(resultado.aplicada, false);
   assert.equal(resultado.nahuelId, 1);
   assert.ok(consultas.every(sql => sql.trim().startsWith("SELECT")));

@@ -89,7 +89,7 @@ async function listarPoliticas(connection) {
   const [rows] = await connection.query(
     `SELECT p.*, CONCAT(COALESCE(u.nombre, ''), ' ', COALESCE(u.apellido, '')) AS autor_nombre
        FROM politica_cancelacion p LEFT JOIN usuario u ON u.id = p.creada_por
-       ORDER BY p.version DESC`
+       ORDER BY p.version DESC, p.id DESC`
   );
   const [servicios] = await connection.query(
     `SELECT s.id, s.nombre, s.activo, v.politica_id, p.version AS politica_version
@@ -169,7 +169,7 @@ async function crearVersionPolitica(connection, { serviciosIds, versionesActuale
       throw errorPolitica("Cambió la política de un servicio seleccionado. Volvé a cargarla antes de publicar", 409, "POLITICA_ACTUALIZADA");
     }
   }
-  const [ultima] = await connection.query("SELECT version FROM politica_cancelacion ORDER BY version DESC LIMIT 1 LOCK IN SHARE MODE");
+  const [ultima] = await connection.query("SELECT version FROM politica_cancelacion ORDER BY version DESC, id DESC LIMIT 1 LOCK IN SHARE MODE");
   const [insert] = await connection.query(
     `INSERT INTO politica_cancelacion (version, titulo, reglas_json, motivo, creada_por)
      VALUES (?, ?, ?, ?, ?)`,
@@ -259,11 +259,16 @@ function calcularCotizacion({ reserva, politica, origenPolitica = "ACEPTADA", ah
 
 async function cotizarCancelacion(connection, { reserva, ahora }) {
   const [rows] = await connection.query(
-    "SELECT snapshot_json FROM reserva_politica_cancelacion WHERE reserva_id = ?", [reserva.id]
+    `SELECT snapshot_json, 'ACEPTADA' AS origen_politica FROM reserva_politica_cancelacion WHERE reserva_id = ?
+       UNION ALL
+     SELECT snapshot_json, 'HISTORICA_RESERVA_ANTERIOR' AS origen_politica
+       FROM reserva_politica_cancelacion_historica WHERE reserva_id = ?
+       AND NOT EXISTS (SELECT 1 FROM reserva_politica_cancelacion WHERE reserva_id = ?)
+       LIMIT 1`, [reserva.id, reserva.id, reserva.id]
   );
   if (rows[0]) {
     const snapshot = typeof rows[0].snapshot_json === "string" ? JSON.parse(rows[0].snapshot_json) : rows[0].snapshot_json;
-    return calcularCotizacion({ reserva, politica: snapshot, ahora });
+    return calcularCotizacion({ reserva, politica: snapshot, ahora, origenPolitica: rows[0].origen_politica || "ACEPTADA" });
   }
   // Las reservas anteriores al registro de aceptación conservan la política
   // histórica de su servicio. La fecha y el servicio se leen de BD: nunca se

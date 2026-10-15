@@ -17,7 +17,7 @@ const TABLAS = {
     motivo TEXT NOT NULL,
     creada_por BIGINT UNSIGNED NULL,
     creada_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE KEY uq_politica_cancelacion_version (version)
+    KEY idx_politica_cancelacion_version (version, id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
   politica_cancelacion_vigente: `CREATE TABLE IF NOT EXISTS politica_cancelacion_vigente (
     id TINYINT UNSIGNED NOT NULL PRIMARY KEY,
@@ -45,6 +45,11 @@ const TABLAS = {
     cancelada_por BIGINT UNSIGNED NOT NULL,
     cancelada_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_cancelacion_politica FOREIGN KEY (politica_id) REFERENCES politica_cancelacion (id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+  reserva_politica_cancelacion_historica: `CREATE TABLE IF NOT EXISTS reserva_politica_cancelacion_historica (
+    reserva_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+    snapshot_json JSON NOT NULL,
+    registrada_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 };
 
