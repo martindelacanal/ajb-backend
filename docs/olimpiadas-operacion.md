@@ -32,11 +32,19 @@ El medallero sigue siendo independiente: la administración asigna puestos por d
 
 ## Colaboradores
 
-Las cuentas se guardan en `olimpiada_voluntario`, separadas de los usuarios generales, y se reutilizan en futuras ediciones mediante asignaciones de edición y disciplina. La administración crea nombre, usuario, correo y contraseña, decide las disciplinas y puede deshabilitar la cuenta o cambiar la clave.
+Las cuentas externas se guardan en `olimpiada_voluntario`, separadas de los usuarios generales, y se reutilizan en futuras ediciones mediante asignaciones de edición y disciplina. La administración crea nombre, usuario, correo y contraseña, decide las disciplinas y puede deshabilitar el acceso de colaboración o cambiar la clave.
 
-El envío de bienvenida es una acción explícita, individual o por selección de cuentas. **Cada envío exitoso genera una nueva contraseña, la comunica por correo y revoca las sesiones previas de esa cuenta.** Nunca se recupera ni se envía la contraseña anterior: sólo se conserva su hash. El correo incluye la edición, disciplinas asignadas y acceso. Un envío fallido no reemplaza la contraseña. El resultado del lote distingue enviados y fallidos, sin mostrar contraseñas en la respuesta.
+También puede buscar una cuenta habilitada de Mi AJB y vincularla mediante `usuario_sistema_id`. La vinculación conserva su rol y contraseña habituales: se crea un acceso limitado a sus disciplinas, sin ampliar los permisos de la cuenta general. La búsqueda admite nombre, documento y correo. Las cuentas vinculadas ingresan con documento/correo y su contraseña habitual. Sus datos personales se administran desde la configuración general de Mi AJB; desde Olimpiadas sólo se administran sus asignaciones y la habilitación de colaboración.
+
+El envío de bienvenida es una acción explícita, individual o por selección de cuentas. **Para cuentas externas, cada envío exitoso genera una nueva contraseña, la comunica por correo y revoca las sesiones previas de esa cuenta.** Nunca se recupera ni se envía la contraseña anterior: sólo se conserva su hash. El correo incluye la edición, disciplinas asignadas y acceso. Un envío fallido no reemplaza la contraseña. Para cuentas vinculadas, la bienvenida indica que se utilicen las credenciales habituales; no cambia su contraseña. El resultado del lote distingue enviados y fallidos, sin mostrar contraseñas en la respuesta.
 
 Los tokens de colaboración usan una firma y audiencia separadas de la sesión general. No dan acceso al resto del sistema. Cada lectura o escritura de competición comprueba la cuenta y sus asignaciones persistidas. La escritura se habilita únicamente entre las fechas de inicio y fin inclusive, con fecha civil de Buenos Aires. Antes del inicio y al terminar, la cuenta conserva **sólo lectura de las disciplinas asignadas**. La administración conserva la posibilidad de corregir información histórica con auditoría; las ediciones pasadas no son inmutables para administradores.
+
+El acceso en `/olimpiadas-colaboradores/ingresar` reutiliza el módulo de login con textos específicos. Se puede mantener la sesión, recuperar la contraseña por código de correo y registrar claves de acceso para Olimpiadas (huella, rostro o PIN según el dispositivo). Los códigos y renovaciones se guardan como hashes; el cierre de sesión revoca el acceso en el servidor. Los bloqueos y cambios de contraseña de la cuenta Mi AJB vinculada se comprueban también en sus accesos de colaboración.
+
+Las cuentas vinculadas pueden usar las claves de acceso que ya tengan registradas en Mi AJB. Esa autenticación emite únicamente una sesión de Olimpiadas y exige una asignación vigente en el sistema; no concede permisos generales. Las claves habituales se administran desde Mi AJB, mientras que las creadas específicamente para Olimpiadas se administran desde la configuración del colaborador.
+
+`/olimpiadas-colaboradores/configuracion` muestra los datos mínimos: nombre, usuario, correo, contraseña y claves de acceso. Para cuentas externas, cambiar el correo o la contraseña exige la clave actual, cierra las sesiones y elimina las claves de acceso anteriores. La recuperación de contraseña también revoca los accesos anteriores. Las claves de acceso de Olimpiadas se registran desde esa pantalla, después del primer ingreso con contraseña.
 
 El historial registra actor, fecha, campo y valores anteriores/nuevos de partidos y torneos. Para colaboradores incluye nombre y número de cuenta en la observación; no guarda contraseñas. El historial de competición admite filtro por disciplina y páginas de 50 registros.
 
@@ -54,7 +62,11 @@ Todas las rutas siguientes están bajo `/api`.
 | Partidos | `POST /olimpiadas/:id/partidos`, `POST /olimpiadas/:id/partidos/importar`, `PUT/DELETE /olimpiadas/partidos/:partidoId`, `PUT /olimpiadas/partidos/:partidoId/resultado` |
 | Catálogos, sólo administración | `GET/POST /olimpiadas/competicion/{lugares,instancias}`, `PUT /olimpiadas/competicion/{lugares,instancias}/:catalogoId` |
 | Acceso de colaboración | `POST /olimpiadas/voluntarios/login`, `GET /olimpiadas/voluntarios/me` |
+| Sesión de colaboración | `POST /olimpiadas/voluntarios/sesion/{renovar,cerrar}` |
+| Cuenta y recuperación | `PUT /olimpiadas/voluntarios/perfil`, `POST /olimpiadas/voluntarios/recuperacion/{solicitar,verificar,restablecer}` |
+| Claves de acceso | `GET /olimpiadas/voluntarios/passkeys`, `DELETE /olimpiadas/voluntarios/passkeys/:id`, `POST /olimpiadas/voluntarios/passkeys/{registration,authentication}/{options,verify}` |
 | Administración de colaboradores | `GET/POST /olimpiadas/:id/voluntarios`, `PUT /olimpiadas/:id/voluntarios/:voluntarioId`, `POST /olimpiadas/:id/voluntarios/enviar-bienvenida` |
+| Vinculación de cuentas existentes | `GET /olimpiadas/:id/usuarios-disponibles?q=`, `POST /olimpiadas/:id/voluntarios/vincular` |
 | Gafetes autorizados | `GET /olimpiadas/inscripciones/:id/gafete.pdf`, `GET /olimpiadas/:id/gafetes.pdf` |
 
 Los listados de competición admiten `disciplina_id`; fixture y posiciones admiten `torneo_id`, y fixture también `lugar_id`. Los listados públicos de fotos admiten `page`, `pageSize` (máximo 60), `disciplina_id`, `fecha` y `etiqueta`. Los campos publicados se proyectan explícitamente, sin exponer las filas completas de inscripción.
@@ -73,6 +85,14 @@ node scripts/migrar-olimpiadas-operacion.js --apply --target=production --allow-
 `--target=all` recorre ambos entornos y requiere `--allow-production`. Sin `--apply`, la operación es de consulta. La conexión de producción utiliza la configuración TLS y CA definida para ese entorno. El informe identifica logos sin correspondencia, departamentales sin logo en el origen, disciplinas duplicadas ya existentes, disciplinas/lugares agregados y filas del sitio anterior que no representan departamentales. No fusiona duplicados ni elimina datos.
 
 Después de aplicar, repetir `--check`, ejecutar las pruebas y verificar la API con la cuenta de ejecución. Confirmar que una edición no publicada devuelve 404 por su URL pública, que el índice público sólo contiene ediciones publicadas y que un colaborador no puede leer otra disciplina ni escribir fuera de fechas. Publicar una edición se hace después de revisar contenido y privacidad, desde su configuración; no es una consecuencia del despliegue.
+
+La ampliación de acceso requiere además `migrar-olimpiadas-acceso-v2.js`, que agrega la vinculación con usuarios y las tablas de sesiones, recuperación, claves de acceso y desafíos. Aplicarla con una cuenta administrativa antes de desplegar el código y conceder permisos DML de esas tablas a `miajb_runtime`; luego verificar con la cuenta de ejecución. El ajuste del ícono de Tejo reutiliza la referencia S3 de Tejo dobles.
+
+```powershell
+node scripts/migrar-olimpiadas-acceso-v2.js --apply --target=develop --confirm=APLICAR_OLIMPIADAS_ACCESO_V2
+node scripts/migrar-olimpiadas-acceso-v2.js --apply --target=production --allow-production --confirm=APLICAR_OLIMPIADAS_ACCESO_V2
+node scripts/ajustar-icono-tejo.js --apply --target=all --allow-production
+```
 
 ```powershell
 node --test test/olimpiadas-competicion.test.js test/olimpiadas-contenido.test.js test/olimpiadas-voluntarios.test.js test/olimpiadas-inscripciones.test.js test/olimpiadas-gafetes-autorizacion.test.js

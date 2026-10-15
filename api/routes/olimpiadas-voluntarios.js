@@ -8,17 +8,16 @@ const { enviarCorreoPlantilla, urlAplicacion } = require("../services/correo");
 const { esCorreoValido } = require("../services/correo/config");
 const { validarPassword } = require("../security/password-policy");
 const { limitar } = require("../security/recuperacion-password");
+const { registrarAccesoVoluntarios } = require("./olimpiadas-acceso");
+const { usuarioHabilitado } = require("../security/autorizacion-sesion");
+const { exigirAccesoCuenta } = require("../security/restricciones-cuenta");
 const {
   verifyToken, getCabecera, esSuperior, crearErrorHttp, normalizarIds,
   normalizarIdPositivo, normalizarBooleano01, registrarHistorial,
 } = require("../services/olimpiadas-comun");
 const {
-  autenticarVoluntario, crearTokenVoluntario, puedeEditarEdicion,
+  autenticarVoluntario, cargarCuentaVoluntario, puedeEditarEdicion,
 } = require("../security/olimpiadas-voluntarios");
-
-// Compara también cuentas inexistentes con bcrypt para evitar diferencias obvias
-// de coste. Este hash es ficticio y nunca permite autenticar a una persona.
-const HASH_FICTICIO = "$2a$12$5WoEYBFTIUBIirQmH.M9BuQ3csYvrZlCZZh3uT7ld3vPvVYpBpD1O";
 
 function normalizarCuenta(body, actual = null) {
   const nombre = String(body.nombre ?? actual?.nombre ?? "").trim();
@@ -80,7 +79,8 @@ async function asignacionesDe(db, voluntarioId) {
   return [...ediciones.values()];
 }
 
-function cuentaPublica(v) { return { id: Number(v.id ?? v.voluntario_id), nombre: v.nombre, usuario: v.usuario, email: v.email }; }
+function cuentaPublica(v) { return { id: Number(v.id ?? v.voluntario_id), nombre: v.nombre, usuario: v.usuario, email: v.email,
+  usuario_sistema_id: v.usuario_sistema_id ? Number(v.usuario_sistema_id) : null, cuenta_sistema: Boolean(v.usuario_sistema_id) }; }
 
 async function transaccion(db, trabajo) {
   const connection = await db.getConnection();
@@ -115,9 +115,9 @@ async function enviarBienvenida({ db, voluntarioId, olimpiada, cabecera, enviar 
   const password = `AJB!${crypto.randomBytes(15).toString("base64url")}9a`;
   const passwordHash = await bcrypt.hash(password, 12);
   return transaccion(db, async (connection) => {
-    const [rows] = await connection.query("SELECT id, nombre, usuario, email, habilitado FROM olimpiada_voluntario WHERE id = ? FOR UPDATE", [voluntarioId]);
-    const v = rows[0];
+    const v = await cargarCuentaVoluntario(connection, voluntarioId, true);
     if (!v || Number(v.habilitado) !== 1) throw crearErrorHttp("La cuenta no existe o está deshabilitada", 400);
+    if (!esCorreoValido(v.email || "") || /[,;\r\n]/.test(v.email)) throw crearErrorHttp("La cuenta necesita un correo válido para enviar la invitación. Actualizalo desde Usuarios.", 400);
     const ediciones = await asignacionesDe(connection, voluntarioId);
     const asignacion = ediciones.find((e) => e.olimpiada_id === Number(olimpiada.id));
     if (!asignacion) throw crearErrorHttp("El colaborador no tiene disciplinas asignadas en esta olimpiada", 400);
@@ -129,33 +129,35 @@ async function enviarBienvenida({ db, voluntarioId, olimpiada, cabecera, enviar 
       parrafos: [
         `Te damos la bienvenida al equipo de colaboración de ${olimpiada.nombre}.`,
         "Podés consultar los partidos de tus disciplinas. Durante las fechas del evento también podés crear partidos y actualizar resultados. Al finalizar, tu acceso continúa en modo lectura.",
-        "Esta es tu nueva contraseña de acceso; reemplaza cualquier contraseña anterior. Guardala en un lugar seguro.",
+        v.usuario_sistema_id ? "Ingresá con el documento y la contraseña que ya usás en Mi AJB. Tu cuenta habitual conserva sus datos, permisos y contraseña." : "Esta es tu nueva contraseña de acceso; reemplaza cualquier contraseña anterior. Guardala en un lugar seguro.",
       ],
       datos: [
         { etiqueta: "Usuario", valor: v.usuario }, { etiqueta: "Correo", valor: v.email },
-        { etiqueta: "Nueva contraseña", valor: password },
+        ...(v.usuario_sistema_id ? [] : [{ etiqueta: "Nueva contraseña", valor: password }]),
         { etiqueta: "Disciplinas asignadas", valor: asignacion.disciplinas.map((d) => d.nombre).join(", ") },
         { etiqueta: "Fechas del evento", valor: `${String(olimpiada.fecha_inicio).slice(0, 10)} al ${String(olimpiada.fecha_fin).slice(0, 10)}` },
       ],
       boton: { texto: "Ingresar como colaborador", url: urlAplicacion("/olimpiadas-colaboradores") },
     });
     if (!respuesta?.enviado) throw crearErrorHttp("No se pudo enviar el correo. La contraseña anterior sigue vigente.", 503);
-    await connection.query("UPDATE olimpiada_voluntario SET password_hash = ?, sesion_version = sesion_version + 1, ultimo_correo_en = NOW() WHERE id = ?", [passwordHash, voluntarioId]);
+    if (v.usuario_sistema_id) await connection.query("UPDATE olimpiada_voluntario SET ultimo_correo_en=NOW() WHERE id=?", [voluntarioId]);
+    else await connection.query("UPDATE olimpiada_voluntario SET password_hash = ?, sesion_version = sesion_version + 1, ultimo_correo_en = NOW() WHERE id = ?", [passwordHash, voluntarioId]);
     await registrarCambio(connection, {
       cabecera, id: voluntarioId, olimpiadaId: olimpiada.id, operacion: "UPDATE",
-      observacion: `Bienvenida enviada a ${v.email}; nueva contraseña generada y sesiones anteriores cerradas.`,
+      observacion: v.usuario_sistema_id ? `Invitación enviada a ${v.email}; conserva su contraseña habitual de Mi AJB.` : `Bienvenida enviada a ${v.email}; nueva contraseña generada y sesiones anteriores cerradas.`,
     });
-    return { id: voluntarioId, enviado: true, mensaje: "Bienvenida enviada con una nueva contraseña" };
+    return { id: voluntarioId, enviado: true, mensaje: v.usuario_sistema_id ? "Invitación enviada; usa su contraseña habitual" : "Bienvenida enviada con una nueva contraseña" };
   });
 }
 
 function crearRouterVoluntarios({ db = mysqlConnection.promise(), jwtSecret = process.env.JWT_SECRET,
-  verificarAdmin = verifyToken, enviar = enviarCorreoPlantilla, limitador = limitar } = {}) {
+  verificarAdmin = verifyToken, enviar = enviarCorreoPlantilla, limitador = limitar, webauthnLib, origenesPermitidos } = {}) {
   const router = express.Router();
   const manejar = (fn) => async (req, res) => {
     try { await fn(req, res); }
     catch (error) {
       if (error.retryAfter) res.set("Retry-After", String(error.retryAfter));
+      if (error.code === "PASSWORD_POLICY") return res.status(400).json({ mensaje:error.message,code:error.code,politicaPassword:error.politicaPassword });
       if (error.code === "ER_DUP_ENTRY") return res.status(409).json("Ya existe un colaborador con ese usuario o correo. Buscalo para reutilizarlo.");
       if (!error.statusCode) console.error("[olimpiadas-voluntarios] Operación fallida:", error.code || "error_interno");
       res.status(error.statusCode || 500).json(error.statusCode ? error.message : "No pudimos completar la operación de colaboradores");
@@ -166,22 +168,7 @@ function crearRouterVoluntarios({ db = mysqlConnection.promise(), jwtSecret = pr
     next();
   };
 
-  router.post("/olimpiadas/voluntarios/login", manejar(async (req, res) => {
-    const identificador = typeof req.body?.identificador === "string" ? req.body.identificador.trim().toLowerCase() : "";
-    await limitador(db, `voluntarios:login:ip:${req.ip}`, 60, 900, jwtSecret);
-    await limitador(db, `voluntarios:login:cuenta:${identificador.slice(0, 254)}`, 15, 900, jwtSecret);
-    if (!identificador || identificador.length > 254 || typeof req.body?.password !== "string" || Buffer.byteLength(req.body.password) > 72) {
-      throw crearErrorHttp("Usuario o contraseña incorrectos", 401);
-    }
-    const [rows] = await db.query("SELECT id, nombre, usuario, email, password_hash, habilitado, sesion_version FROM olimpiada_voluntario WHERE usuario = ? OR email = ? LIMIT 2", [identificador, identificador]);
-    const v = rows.length === 1 ? rows[0] : null;
-    const valido = await bcrypt.compare(req.body.password, v?.password_hash || HASH_FICTICIO);
-    if (!v || !valido || Number(v.habilitado) !== 1) throw crearErrorHttp("Usuario o contraseña incorrectos", 401);
-    const asignaciones = await asignacionesDe(db, v.id);
-    if (!asignaciones.length) throw crearErrorHttp("No tenés disciplinas asignadas. Contactá a la organización de las Olimpiadas.", 403);
-    res.set("Cache-Control", "no-store");
-    res.json({ token: crearTokenVoluntario(v, jwtSecret), voluntario: cuentaPublica(v), asignaciones });
-  }));
+  registrarAccesoVoluntarios({ router, db, jwtSecret, enviar, manejar, limitador, cuentaPublica, asignacionesDe, webauthnLib, origenesPermitidos });
 
   router.get("/olimpiadas/voluntarios/me", manejar(async (req, res) => {
     const bearer = /^Bearer ([^\s]+)$/.exec(String(req.headers.authorization || ""));
@@ -194,10 +181,13 @@ function crearRouterVoluntarios({ db = mysqlConnection.promise(), jwtSecret = pr
   router.get("/olimpiadas/:id/voluntarios", verificarAdmin, admin, manejar(async (req, res) => {
     const olimpiada = await obtenerEdicion(db, req.params.id);
     const q = String(req.query.q || "").trim().slice(0, 160);
-    const [cuentas] = await db.query(`SELECT id, nombre, usuario, email, habilitado, ultimo_correo_en,
-      fecha_creacion FROM olimpiada_voluntario
-      WHERE (? = '' OR nombre LIKE ? OR usuario LIKE ? OR email LIKE ?)
-      ORDER BY nombre, id LIMIT 500`, [q, `%${q}%`, `%${q}%`, `%${q}%`]);
+    const [cuentas] = await db.query(`SELECT v.id, CASE WHEN u.id IS NULL THEN v.nombre ELSE CONCAT_WS(' ',u.nombre,u.apellido) END AS nombre,
+      CASE WHEN u.id IS NULL THEN v.usuario ELSE CAST(u.documento AS CHAR) END AS usuario,
+      CASE WHEN u.id IS NULL THEN v.email ELSE u.email END AS email,
+      v.habilitado, v.ultimo_correo_en, v.fecha_creacion, v.usuario_sistema_id
+      FROM olimpiada_voluntario v LEFT JOIN usuario u ON u.id=v.usuario_sistema_id
+      WHERE (? = '' OR v.nombre LIKE ? OR v.usuario LIKE ? OR v.email LIKE ? OR CONCAT_WS(' ',u.nombre,u.apellido,u.documento,u.email) LIKE ?)
+      ORDER BY nombre, v.id LIMIT 500`, [q, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`]);
     const [asignaciones] = await db.query(`SELECT a.voluntario_id, a.disciplina_id, d.nombre
       FROM olimpiada_voluntario_disciplina a INNER JOIN olimpiada_disciplina d ON d.id = a.disciplina_id
       INNER JOIN olimpiada_disciplina_config c ON c.olimpiada_id = a.olimpiada_id AND c.disciplina_id = a.disciplina_id
@@ -205,7 +195,7 @@ function crearRouterVoluntarios({ db = mysqlConnection.promise(), jwtSecret = pr
     res.set("Cache-Control", "no-store");
     res.json(cuentas.map((v) => {
       const disciplinas = asignaciones.filter((a) => Number(a.voluntario_id) === Number(v.id)).map((a) => ({ id: Number(a.disciplina_id), nombre: a.nombre }));
-      return { ...v, disciplinas, asignado: disciplinas.length > 0 };
+      return { ...v, cuenta_sistema: Boolean(v.usuario_sistema_id), disciplinas, asignado: disciplinas.length > 0 };
     }));
   }));
 
@@ -226,6 +216,50 @@ function crearRouterVoluntarios({ db = mysqlConnection.promise(), jwtSecret = pr
     res.status(201).json({ success: true, id, message: "Colaborador creado y disciplinas asignadas" });
   }));
 
+  router.get("/olimpiadas/:id/usuarios-disponibles", verificarAdmin, admin, manejar(async (req, res) => {
+    await obtenerEdicion(db, req.params.id);
+    const q = String(req.query.q || "").trim().slice(0,160);
+    if (q.length<2) return res.json([]);
+    const [rows] = await db.query(`SELECT u.id,u.nombre,u.apellido,u.documento,u.email,r.nombre AS rol,v.id AS voluntario_id
+      FROM usuario u INNER JOIN rol r ON r.id=u.rol_id LEFT JOIN olimpiada_voluntario v ON v.usuario_sistema_id=u.id
+      WHERE u.rol_id<>4 AND LOWER(r.nombre)<>'invitado' AND UPPER(COALESCE(u.habilitado,'S')) NOT IN ('N','NO','0','FALSE')
+      AND COALESCE(u.bloqueo_tipo,'')<>'total' AND u.password IS NOT NULL
+      AND CONCAT_WS(' ',u.nombre,u.apellido,u.documento,u.email) LIKE ? ORDER BY u.apellido,u.nombre LIMIT 50`, [`%${q}%`]);
+    res.set("Cache-Control","no-store"); res.json(rows);
+  }));
+
+  router.post("/olimpiadas/:id/voluntarios/vincular", verificarAdmin, admin, manejar(async (req,res) => {
+    const olimpiada = await obtenerEdicion(db,req.params.id);
+    const usuarioId = normalizarIdPositivo(req.body?.usuario_sistema_id);
+    if (!usuarioId) throw crearErrorHttp("Seleccioná una cuenta del sistema");
+    const ids = leerIds(req.body?.disciplina_ids,"las disciplinas",{permiteVacio:true});
+    const id = await transaccion(db,async(cx) => {
+      const [usuarios] = await cx.query(`SELECT u.id,u.nombre,u.apellido,u.email,u.documento,u.habilitado,u.rol_id,u.password,
+        u.bloqueo_tipo,u.bloqueo_modulos,u.bloqueo_mensaje,r.nombre AS rol FROM usuario u INNER JOIN rol r ON r.id=u.rol_id
+        WHERE u.id=? LIMIT 1 FOR UPDATE`,[usuarioId]);
+      const u=usuarios[0];
+      if(!u || !usuarioHabilitado(u.habilitado) || Number(u.rol_id)===4 || String(u.rol).toLowerCase()==="invitado" || !u.password) throw crearErrorHttp("La cuenta no está habilitada para colaborar",400);
+      exigirAccesoCuenta(u);
+      await validarDisciplinas(cx,olimpiada.id,ids);
+      const [existentes] = await cx.query("SELECT id FROM olimpiada_voluntario WHERE usuario_sistema_id=? FOR UPDATE",[usuarioId]);
+      let voluntarioId=existentes[0]?.id;
+      if(!voluntarioId) {
+        // Este hash aleatorio no se utiliza: la autenticación siempre verifica la cuenta original.
+        // La dirección interna tampoco se envía: el correo se lee de usuario.
+        // Así una familia/equipo con correo compartido puede usar su DNI individual.
+        const hash=await bcrypt.hash(crypto.randomBytes(32).toString("base64url"),12);
+        const [r]=await cx.query("INSERT INTO olimpiada_voluntario (nombre,usuario,email,password_hash,habilitado,creado_por_usuario_id,usuario_sistema_id) VALUES (?,?,?,?,1,?,?)",
+          [`${u.nombre||""} ${u.apellido||""}`.trim(),`miajb-${u.id}`,`miajb-${u.id}@cuentas.internas.invalid`,hash,getCabecera(req).id,u.id]);
+        voluntarioId=r.insertId;
+      } else await cx.query("UPDATE olimpiada_voluntario SET habilitado=1,sesion_version=sesion_version+1 WHERE id=?",[voluntarioId]);
+      await reemplazarAsignaciones(cx,voluntarioId,olimpiada.id,ids);
+      await registrarCambio(cx,{cabecera:getCabecera(req),id:voluntarioId,olimpiadaId:olimpiada.id,operacion:existentes.length?"UPDATE":"CREATE",
+        nuevo:{usuario_sistema_id:u.id,disciplina_ids:ids},observacion:"Cuenta de Mi AJB vinculada a colaboración; conserva su contraseña y rol habituales."});
+      return voluntarioId;
+    });
+    res.status(201).json({success:true,id,message:"Cuenta vinculada y disciplinas asignadas"});
+  }));
+
   router.put("/olimpiadas/:id/voluntarios/:voluntarioId", verificarAdmin, admin, manejar(async (req, res) => {
     const olimpiada = await obtenerEdicion(db, req.params.id);
     const voluntarioId = normalizarIdPositivo(req.params.voluntarioId);
@@ -235,8 +269,9 @@ function crearRouterVoluntarios({ db = mysqlConnection.promise(), jwtSecret = pr
     if (cambiaPassword) validarPassword(req.body.password, "personal");
     const hash = cambiaPassword ? await bcrypt.hash(req.body.password, 12) : null;
     await transaccion(db, async (connection) => {
-      const [rows] = await connection.query("SELECT id, nombre, usuario, email, habilitado FROM olimpiada_voluntario WHERE id = ? FOR UPDATE", [voluntarioId]);
+      const [rows] = await connection.query("SELECT id, nombre, usuario, email, habilitado, usuario_sistema_id FROM olimpiada_voluntario WHERE id = ? FOR UPDATE", [voluntarioId]);
       if (!rows[0]) throw crearErrorHttp("No encontramos ese colaborador", 404);
+      if (rows[0].usuario_sistema_id && ["nombre","usuario","email","password"].some(c=>req.body?.[c]!==undefined)) throw crearErrorHttp("Esta cuenta conserva los datos y contraseña del sistema. Editá sólo su habilitación y disciplinas.",400);
       const cuenta = normalizarCuenta(req.body || {}, rows[0]);
       await validarDisciplinas(connection, olimpiada.id, ids);
       const [anteriores] = await connection.query("SELECT disciplina_id FROM olimpiada_voluntario_disciplina WHERE voluntario_id = ? AND olimpiada_id = ?", [voluntarioId, olimpiada.id]);

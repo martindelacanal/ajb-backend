@@ -148,6 +148,7 @@ test("login y perfil exponen sólo la cuenta y disciplinas asignadas, nunca hash
   const hash = await bcrypt.hash(password, 4);
   const db = { query: async (sql) => /FROM olimpiada_voluntario_disciplina/.test(sql)
     ? [[{ ...edicion, olimpiada_id: 7, olimpiada_titulo: edicion.nombre, disciplina_id: 4, disciplina_nombre: "Vóley" }]]
+    : /FROM olimpiada_voluntario_sesion/.test(sql) ? [[{ id: "sesion", password_version: require("../api/security/auth-crypto").huellaPassword(hash, secret) }]]
     : [[{ ...v, password_hash: hash }]] };
   const base = await conServidor(t, { db, jwtSecret: secret, limitador: async () => {} });
   const response = await fetch(`${base}/olimpiadas/voluntarios/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ identificador: v.usuario, password }) });
