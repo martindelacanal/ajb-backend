@@ -16,7 +16,7 @@
  */
 const fs = require("fs");
 const path = require("path");
-const forge = require("node-forge");
+const { firmarCms } = require("./arca-cms");
 const moment = require("moment");
 const {
   centavosADecimal,
@@ -68,27 +68,6 @@ function generarTra() {
 </loginTicketRequest>`;
 }
 
-function firmarCms(traXml, certPem, keyPem) {
-  const p7 = forge.pkcs7.createSignedData();
-  p7.content = forge.util.createBuffer(traXml, "utf8");
-  const certificado = forge.pki.certificateFromPem(certPem);
-  const clave = forge.pki.privateKeyFromPem(keyPem);
-  p7.addCertificate(certificado);
-  p7.addSigner({
-    key: clave,
-    certificate: certificado,
-    digestAlgorithm: forge.pki.oids.sha256,
-    authenticatedAttributes: [
-      { type: forge.pki.oids.contentType, value: forge.pki.oids.data },
-      { type: forge.pki.oids.messageDigest },
-      { type: forge.pki.oids.signingTime, value: new Date() },
-    ],
-  });
-  p7.sign();
-  const der = forge.asn1.toDer(p7.toAsn1()).getBytes();
-  return forge.util.encode64(der);
-}
-
 function desescaparXml(texto) {
   return String(texto || "")
     .replace(/&lt;/g, "<")
@@ -124,7 +103,7 @@ async function obtenerTicketAcceso(forzar = false) {
 
   const certPem = fs.readFileSync(config.certPath, "utf8");
   const keyPem = fs.readFileSync(config.keyPath, "utf8");
-  const cms = firmarCms(generarTra(), certPem, keyPem);
+  const cms = await firmarCms(generarTra(), certPem, keyPem);
 
   const soap = `<?xml version="1.0" encoding="UTF-8"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:wsaa="http://wsaa.view.sua.dvadac.desein.afip.gov">

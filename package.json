@@ -10,7 +10,7 @@
     "migrate:auth:apply": "node scripts/migrar-auth-v1.js --apply --target=develop --confirm=APLICAR_AUTH",
     "migrate:acceso-usuarios:check": "node scripts/migrar-acceso-usuarios-v1.js --check --target=develop",
     "migrate:acceso-usuarios:apply": "node scripts/migrar-acceso-usuarios-v1.js --apply --target=develop --confirm=APLICAR_ACCESO_USUARIOS",
-    "serve": "nodemon server.js",
+    "serve": "node --watch server.js",
     "start": "node server.js",
     "migrate:s3": "node scripts/migrate-images-to-s3.js",
     "migrate:coseguro": "node scripts/migrar-coseguro.js",
@@ -65,32 +65,30 @@
     "@aws-sdk/s3-request-presigner": "^3.193.0",
     "@simplewebauthn/server": "^13.3.3",
     "archiver": "^7.0.1",
+    "asn1js": "^3.0.6",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "csv-parser": "^3.0.0",
     "csv-writer": "^1.6.0",
     "dotenv": "^16.0.2",
     "exceljs": "4.4.0",
-    "express": "^4.17.1",
+    "express": "^4.22.3",
     "fast-csv": "^5.0.0",
     "jimp": "^1.6.1",
     "jsonwebtoken": "^9.0.0",
-    "moment": "^2.29.4",
+    "moment": "^2.31.0",
     "multer": "^1.4.5-lts.1",
     "mysql": "^2.18.1",
     "mysql2": "^3.3.3",
-    "node-forge": "^1.4.0",
-    "nodemailer": "^9.0.5",
+    "nodemailer": "^10.1.2",
     "pdfkit": "^0.20.2",
-    "sharp": "^0.35.3",
+    "pkijs": "^3.4.1",
+    "sharp": "^0.35.5",
     "socket.io": "^4.5.1"
   },
   "overrides": {
     "exceljs": {
       "uuid": "11.1.1"
     }
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.14"
   }
 }
