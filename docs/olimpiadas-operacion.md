@@ -2,7 +2,9 @@
 
 ## Publicación y privacidad
 
-Una edición aparece sin iniciar sesión sólo si `eliminado = 0`, `habilitado = 'Y'` y `publicada_publico = 1`. El último indicador es una decisión explícita de la administración y su valor inicial es **0**, también en ediciones existentes. La edición de demostración «Olimpiadas 2026 / Demo» debe conservarse sin publicación hasta que se reemplace su contenido y la administración decida publicarla. La migración no la publica.
+Una edición aparece sin iniciar sesión cuando `eliminado = 0`, `habilitado = 'Y'` y `publicada_publico = 1`. Las nuevas ediciones quedan publicadas **por defecto** (`publicada_publico = 1`) para promocionar las Olimpiadas. La administración puede ocultar una edición expresamente desde su configuración; editar otros campos no cambia esa decisión. El vencimiento de las fechas no retira una edición del portal público ni invalida su enlace compartido.
+
+La migración `migrar-olimpiadas-publicacion.js` cambia el valor por defecto y publica, una sola vez, las ediciones existentes habilitadas y no eliminadas, incluida «Olimpiadas 2026». El texto de edición «Demo» no condiciona su visibilidad. La migración respalda los valores anteriores y registra cada publicación en el historial. Su marca persistente evita que una nueva ejecución vuelva a publicar una edición ocultada posteriormente por la administración.
 
 El portal público permite consultar ediciones anteriores, cronograma, sedes, actividades, secciones visibles, noticias publicadas cuya fecha de publicación ya llegó, enlaces, fotos, reglamentos, fixture, partidos en vivo, posiciones y medallero. La publicación del sorteo se controla además con `sorteo_publicado`.
 
@@ -84,7 +86,19 @@ node scripts/migrar-olimpiadas-operacion.js --apply --target=production --allow-
 
 `--target=all` recorre ambos entornos y requiere `--allow-production`. Sin `--apply`, la operación es de consulta. La conexión de producción utiliza la configuración TLS y CA definida para ese entorno. El informe identifica logos sin correspondencia, departamentales sin logo en el origen, disciplinas duplicadas ya existentes, disciplinas/lugares agregados y filas del sitio anterior que no representan departamentales. No fusiona duplicados ni elimina datos.
 
-Después de aplicar, repetir `--check`, ejecutar las pruebas y verificar la API con la cuenta de ejecución. Confirmar que una edición no publicada devuelve 404 por su URL pública, que el índice público sólo contiene ediciones publicadas y que un colaborador no puede leer otra disciplina ni escribir fuera de fechas. Publicar una edición se hace después de revisar contenido y privacidad, desde su configuración; no es una consecuencia del despliegue.
+Después de aplicar, repetir `--check`, ejecutar las pruebas y verificar la API con la cuenta de ejecución. Confirmar que una edición expresamente oculta devuelve 404 por su URL pública, que el índice público incluye las ediciones pasadas publicadas y que un colaborador no puede leer otra disciplina ni escribir fuera de fechas.
+
+Para adoptar la publicación por defecto, ejecutar con la cuenta administrativa:
+
+```powershell
+node scripts/migrar-olimpiadas-publicacion.js --check --target=develop
+node scripts/migrar-olimpiadas-publicacion.js --apply --target=develop --confirm=APLICAR_OLIMPIADAS_PUBLICACION
+node scripts/migrar-olimpiadas-publicacion.js --check --target=production --allow-production
+node scripts/migrar-olimpiadas-publicacion.js --apply --target=production --allow-production --confirm=APLICAR_OLIMPIADAS_PUBLICACION
+node scripts/migrar-olimpiadas-publicacion.js --check --target=production --allow-production
+```
+
+Producción requiere `DB_SSL_MODE=verify-full` y `DB_SSL_CA_PATH` válido. El respaldo se guarda en `output/olimpiadas-publicacion`; no contiene inscripciones ni datos médicos. La publicación y su auditoría se confirman juntas en una transacción. El cambio del valor por defecto usa DDL fuera de esa transacción: ante un fallo se puede volver a ejecutar sin duplicar la publicación. La marca de `ajb_schema_migration` impide alterar ocultamientos posteriores. Para retirar una edición publicada se usa la configuración administrativa habitual; no se elimina esa marca.
 
 La ampliación de acceso requiere además `migrar-olimpiadas-acceso-v2.js`, que agrega la vinculación con usuarios y las tablas de sesiones, recuperación, claves de acceso y desafíos. Aplicarla con una cuenta administrativa antes de desplegar el código y conceder permisos DML de esas tablas a `miajb_runtime`; luego verificar con la cuenta de ejecución. El ajuste del ícono de Tejo reutiliza la referencia S3 de Tejo dobles.
 

@@ -27,7 +27,14 @@ async function servidor(t, opciones = {}) {
     contexto.consultas.push({ sql, params });
     if (/FROM olimpiada_voluntario WHERE/.test(sql)) return [[contexto.cuenta]];
     if (/FROM olimpiada_voluntario_disciplina a/.test(sql)) return [Number(params[1]) === 7 ? contexto.asignadas.map((disciplina_id) => ({ ...contexto.edicion, disciplina_id })) : []];
-    if (/FROM olimpiada WHERE/.test(sql)) return [[{ ...contexto.edicion, id: Number(params[0]) }]];
+    if (/FROM olimpiada WHERE/.test(sql)) return [contexto.edicion.eliminado ? [] : [{ ...contexto.edicion, id: Number(params[0]) }]];
+    if (/FROM olimpiada o WHERE/.test(sql)) {
+      assert.match(sql, /o\.eliminado = 0 AND o\.habilitado = 'Y' AND o\.publicada_publico = 1/);
+      assert.doesNotMatch(sql.slice(sql.indexOf("FROM olimpiada o WHERE")), /(?:fecha_fin|fecha_inicio)\s*[<>=]/);
+      return [!contexto.edicion.eliminado && contexto.edicion.habilitado === "Y" && contexto.edicion.publicada_publico === 1 ? [contexto.edicion] : []];
+    }
+    if (/SELECT \(SELECT COUNT/.test(sql)) return [[{}]];
+    if (/FROM olimpiada_enlace WHERE/.test(sql)) return [[]];
     if (/SELECT \* FROM olimpiada_partido WHERE/.test(sql)) return [[{ ...partido, id: Number(params[0]), disciplina_id: Number(params[0]) === 55 ? 5 : 4 }]];
     if (/SELECT \* FROM olimpiada_torneo WHERE/.test(sql)) return [[{ id: Number(params[0]), olimpiada_id: 7, disciplina_id: Number(params[0]) === 55 ? 5 : 4, nombre: "Torneo", formato: "LIGA" }]];
     if (/FROM olimpiada_partido p/.test(sql) && /SELECT p\.id/.test(sql)) {
@@ -157,4 +164,46 @@ test("público: habilitar nombres sólo expone los nombres del partido autorizad
   assert.equal(body.partidos[1].participante1, partido.participante1);
   assert.equal(body.partidos[1].inscripcion1_id, undefined);
   assert.equal(body.partidos[1].observacion, undefined);
+});
+
+test("público: las ediciones pasadas figuran en el índice y se abren sin sesión ni datos privados", async (t) => {
+  const { pedir } = await servidor(t, { edicion: {
+    fecha_inicio: "2020-09-23", fecha_fin: "2020-09-26", edicion: "Demo",
+    dni: "documento privado", certificado_archivo: "certificado privado", contacto_emergencia: "teléfono privado",
+  } });
+  const listado = await pedir("/olimpiadas/publico/ediciones", { anonimo: true });
+  assert.equal(listado.status, 200);
+  const ediciones = await listado.json();
+  assert.deepEqual(ediciones.map(e => e.id), [7]);
+  assert.equal(ediciones[0].estado, "FINALIZADA");
+  for (const ruta of ["portal", "fixture"]) {
+    const response = await pedir(`/olimpiadas/publico/7/${ruta}`, { anonimo: true });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    const body = await response.json();
+    assert.equal(body.olimpiada.estado, "FINALIZADA");
+    assert.doesNotMatch(JSON.stringify(body), /documento privado|certificado privado|teléfono privado|Nombre privado|Dato privado|No publicar/);
+    assert.equal(body.olimpiada.dni, undefined);
+    assert.equal(body.olimpiada.certificado_archivo, undefined);
+    if (ruta === "portal") {
+      assert.equal(body.mi_inscripcion, null);
+      assert.deepEqual(body.hoteles_mi_departamental, []);
+      assert.equal(body.departamental_id, null);
+    }
+  }
+  assert.doesNotMatch(JSON.stringify(ediciones), /documento privado|certificado privado|teléfono privado/);
+});
+
+test("público: ocultar, deshabilitar o eliminar una edición pasada bloquea índice y enlace compartido", async (t) => {
+  const { pedir, contexto } = await servidor(t, { edicion: { fecha_inicio: "2020-09-23", fecha_fin: "2020-09-26" } });
+  for (const estado of [
+    { publicada_publico: 0, habilitado: "Y", eliminado: 0 },
+    { publicada_publico: 1, habilitado: "N", eliminado: 0 },
+    { publicada_publico: 1, habilitado: "Y", eliminado: 1 },
+  ]) {
+    Object.assign(contexto.edicion, estado);
+    assert.deepEqual(await (await pedir("/olimpiadas/publico/ediciones", { anonimo: true })).json(), []);
+    assert.equal((await pedir("/olimpiadas/publico/7/portal", { anonimo: true })).status, 404);
+    assert.equal((await pedir("/olimpiadas/publico/7/fixture", { anonimo: true })).status, 404);
+  }
 });

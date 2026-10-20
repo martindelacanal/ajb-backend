@@ -51,6 +51,15 @@ test("olimpiadas exige cupos enteros y disciplinas únicas", () => {
   assert.match(validarDatosOlimpiada(datosOlimpiada({ disciplinas: [{ disciplina_id: 1 }, { disciplina_id: "1" }] })).error, /repetir/);
 });
 
+test("olimpiadas publica nuevas ediciones por defecto y respeta la decisión de ocultarlas", () => {
+  assert.equal(validarDatosOlimpiada(datosOlimpiada(), { nueva: true }).value.opcionales.publicada_publico, 1);
+  assert.equal(validarDatosOlimpiada(datosOlimpiada({ publicada_publico: 0 }), { nueva: true }).value.opcionales.publicada_publico, 0);
+  assert.equal(validarDatosOlimpiada(datosOlimpiada({ publicada_publico: 1 }), { nueva: true }).value.opcionales.publicada_publico, 1);
+  assert.equal(validarDatosOlimpiada(datosOlimpiada()).value.opcionales.publicada_publico, undefined);
+  assert.equal(validarDatosOlimpiada(datosOlimpiada({ publicada_publico: 0 })).value.opcionales.publicada_publico, 0);
+  assert.match(validarDatosOlimpiada(datosOlimpiada({ publicada_publico: 2 }), { nueva: true }).error, /1 o 0/);
+});
+
 test("olimpiadas normaliza listas de IDs sin aceptar decimales ni notación exponencial", () => {
   assert.deepEqual(normalizarIds(["1", 2, "1"]), [1, 2]);
   assert.equal(normalizarIds([1.5]), null);

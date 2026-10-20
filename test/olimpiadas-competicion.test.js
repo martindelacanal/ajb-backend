@@ -98,7 +98,7 @@ test('competición: detecta cambios concurrentes antes de sobrescribir resultado
   await assert.rejects(bloquearSinCambios(conexion({ ...anterior, resultado1: '2' }), 'olimpiada_partido', anterior), e => e.statusCode === 409);
   await assert.rejects(bloquearSinCambios(conexion({ ...anterior, disciplina_id: 4 }), 'olimpiada_partido', anterior), e => e.statusCode === 409);
 });
-test('portal público: una edición demo/no publicada o deshabilitada no ejecuta la lectura del contenido', async () => {
+test('portal público: una edición no publicada o deshabilitada no ejecuta la lectura del contenido', async () => {
   for (const edicion of [null, { habilitado: 'Y', publicada_publico: 0 }, { habilitado: 'N', publicada_publico: 1 }]) {
     const res = respuesta();
     await endpoint(() => assert.fail('No debe leer contenido privado'), async () => edicion)({ params: { id: '1' } }, res);

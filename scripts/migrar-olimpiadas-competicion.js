@@ -44,7 +44,7 @@ const instancias = ['Fase de grupos', 'Dieciseisavos de final', 'Octavos de fina
 async function migrar(connection, aplicar = false) {
   const pendientes = [];
   const [publicacion] = await connection.query("SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'olimpiada' AND column_name = 'publicada_publico'");
-  if (!publicacion.length) { pendientes.push('Agregar olimpiada.publicada_publico'); if (aplicar) await connection.query('ALTER TABLE olimpiada ADD COLUMN publicada_publico TINYINT(1) NOT NULL DEFAULT 0'); }
+  if (!publicacion.length) { pendientes.push('Agregar olimpiada.publicada_publico'); if (aplicar) await connection.query('ALTER TABLE olimpiada ADD COLUMN publicada_publico TINYINT(1) NOT NULL DEFAULT 1'); }
   for (const [tabla, ddl] of Object.entries(tablas)) {
     const [rows] = await connection.query('SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?', [tabla]);
     if (!rows.length) { pendientes.push(`Crear ${tabla}`); if (aplicar) await connection.query(ddl); }

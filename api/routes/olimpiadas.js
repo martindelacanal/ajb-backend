@@ -1029,7 +1029,7 @@ function normalizarOpcionalesOlimpiada(body) {
   return { value: opcionales };
 }
 
-function validarDatosOlimpiada(body) {
+function validarDatosOlimpiada(body, { nueva = false } = {}) {
   const nombre = normalizarTexto(body.nombre, 160);
   const fechaInicio = normalizarFechaCivil(body.fecha_inicio);
   const fechaFin = normalizarFechaCivil(body.fecha_fin);
@@ -1058,6 +1058,9 @@ function validarDatosOlimpiada(body) {
   }
   const opcionales = normalizarOpcionalesOlimpiada(body);
   if (opcionales.error) return { error: opcionales.error };
+  // Las nuevas ediciones se promocionan públicamente. Una edición que la
+  // administración ocultó conserva esa decisión al editar otros campos.
+  if (nueva && opcionales.value.publicada_publico === undefined) opcionales.value.publicada_publico = 1;
   return {
     value: {
       nombre,
@@ -1080,7 +1083,7 @@ router.post("/olimpiadas", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     if (!esSuperior(cabecera)) return res.status(401).json("No autorizado");
-    const parseo = validarDatosOlimpiada(req.body);
+    const parseo = validarDatosOlimpiada(req.body, { nueva: true });
     if (parseo.error) return res.status(400).json(parseo.error);
     const datos = parseo.value;
 
