@@ -8,6 +8,7 @@ const path = require("path");
 const crypto = require("crypto");
 const mysql = require("mysql2/promise");
 const { parsearBloquesEnv, crearOpcionesConexion, validarConfiguracion } = require("./migrar-catalogo-turismo-v1");
+const { asegurarSinTarifasDadasDeBaja } = require("./guardia-baja-logica-tarifas");
 
 const MIGRATION_ID = "20261007_temporadas_edades_0_1_2_17_18";
 const CONFIRMACION = "APLICAR_EDADES_TEMPORADAS";
@@ -304,6 +305,7 @@ async function main(argv = process.argv.slice(2)) {
   let lock = false;
   try {
     await connection.query("SET SESSION time_zone = '-03:00'");
+    await asegurarSinTarifasDadasDeBaja(connection, "migrar-temporadas-edades.js");
     if (opciones.apply) {
       const [[fila]] = await connection.query("SELECT GET_LOCK(?, 10) adquirido", [MIGRATION_ID]);
       if (Number(fila.adquirido) !== 1) throw new Error("Otra migracion de edades esta en curso");

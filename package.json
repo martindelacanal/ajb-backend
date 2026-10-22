@@ -52,6 +52,9 @@
     "migrate:portada-gestion": "node scripts/migrar-portada-gestion.js",
     "migrate:noticias-departamentales": "node scripts/migrar-noticias-departamentales.js",
     "migrate:noticias-portada-publica": "node scripts/migrar-noticias-portada-publica.js",
+    "migrate:temporadas-baja-logica": "node scripts/migrar-temporadas-baja-logica.js",
+    "migrate:temporadas-baja-logica:check": "node scripts/migrar-temporadas-baja-logica.js --check",
+    "tarifas:rehabilitar": "node scripts/rehabilitar-tarifas-temporada.js",
     "test:acceso:integracion": "node scripts/verificar-acceso-usuarios-integracion.js"
   },
   "keywords": [],

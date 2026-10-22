@@ -50,6 +50,7 @@ const {
   contextoDesdeRequest,
 } = require("../services/usuarios-datos");
 const { obtenerCambiosPendientesPorPersona, solicitarCambioFamiliar } = require("../services/familiares-cambios");
+const { leerCodigoBuscado } = require("../services/busqueda-codigos");
 
 // ---------------------------------------------------------------------------
 // S3
@@ -2188,6 +2189,27 @@ const COLUMNAS_ORDEN = {
   estado: "e.orden",
 };
 
+// Búsqueda libre de reintegros: la misma condición en el listado y en la
+// exportación CSV, así el archivo trae exactamente lo que se ve en la tabla.
+// Las dos consultas unen los mismos alias (s, u, fam, d, t, c, e).
+// El código de la solicitud ("C-22", "C22" o "#22", que es como lo manda el
+// front) trae esa solicitud y nada más; cualquier otro texto busca amplio.
+function condicionBusquedaSolicitudes(search) {
+  const codigo = leerCodigoBuscado(search, "C");
+  if (codigo) return { sql: "s.id = ?", params: [codigo.id] };
+  return {
+    sql: `(CONCAT('#', s.id) LIKE ? OR DATE_FORMAT(s.fecha_creacion, '%d/%m/%Y') LIKE ?
+      OR u.nombre LIKE ? OR u.apellido LIKE ? OR CAST(u.documento AS CHAR) LIKE ?
+      OR CONCAT(u.apellido, ', ', u.nombre) LIKE ? OR fam.nombre LIKE ? OR fam.apellido LIKE ?
+      OR CONCAT(fam.apellido, ', ', fam.nombre) LIKE ? OR d.nombre LIKE ? OR t.nombre LIKE ? OR c.nombre LIKE ?
+      OR CONCAT_WS('-', s.comprobante_pto_venta, s.comprobante_numero) LIKE ? OR s.comprobante_numero LIKE ?
+      OR s.emisor_nombre LIKE ? OR s.emisor_cuit LIKE ? OR CAST(s.importe AS CHAR) LIKE ?
+      OR CAST(s.importe_autorizado AS CHAR) LIKE ? OR CAST(s.importe_estimado AS CHAR) LIKE ?
+      OR e.nombre LIKE ? OR e.nombre_afiliado LIKE ?)`,
+    params: Array(21).fill(`%${search}%`),
+  };
+}
+
 router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
@@ -2300,16 +2322,9 @@ router.get("/coseguro/solicitudes", verifyToken, async (req, res) => {
     }
     const search = normalizarTexto(req.query.search);
     if (search) {
-      condiciones.push(`(CONCAT('#', s.id) LIKE ? OR DATE_FORMAT(s.fecha_creacion, '%d/%m/%Y') LIKE ?
-        OR u.nombre LIKE ? OR u.apellido LIKE ? OR CAST(u.documento AS CHAR) LIKE ?
-        OR CONCAT(u.apellido, ', ', u.nombre) LIKE ? OR fam.nombre LIKE ? OR fam.apellido LIKE ?
-        OR CONCAT(fam.apellido, ', ', fam.nombre) LIKE ? OR d.nombre LIKE ? OR t.nombre LIKE ? OR c.nombre LIKE ?
-        OR CONCAT_WS('-', s.comprobante_pto_venta, s.comprobante_numero) LIKE ? OR s.comprobante_numero LIKE ?
-        OR s.emisor_nombre LIKE ? OR s.emisor_cuit LIKE ? OR CAST(s.importe AS CHAR) LIKE ?
-        OR CAST(s.importe_autorizado AS CHAR) LIKE ? OR CAST(s.importe_estimado AS CHAR) LIKE ?
-        OR e.nombre LIKE ? OR e.nombre_afiliado LIKE ?)`);
-      const like = `%${search}%`;
-      params.push(...Array(21).fill(like));
+      const busqueda = condicionBusquedaSolicitudes(search);
+      condiciones.push(busqueda.sql);
+      params.push(...busqueda.params);
     }
 
     // Marca de posibles duplicados (mismo comprobante o mismo archivo en otra solicitud activa).
@@ -3567,12 +3582,13 @@ async function consultarSolicitudesParaExportar(db, cabecera, filtros) {
     condiciones.push("s.usuario_id = ?");
     params.push(usuarioFiltroId);
   }
+  // Misma búsqueda que el listado (antes la exportación comparaba 7 columnas y
+  // no entendía el "#22" que manda el front: el CSV salía vacío con la tabla llena)
   const search = normalizarTexto(filtros.search);
   if (search) {
-    condiciones.push(`(CAST(s.id AS CHAR) LIKE ? OR u.nombre LIKE ? OR u.apellido LIKE ? OR CAST(u.documento AS CHAR) LIKE ?
-      OR s.comprobante_numero LIKE ? OR s.emisor_nombre LIKE ? OR s.emisor_cuit LIKE ?)`);
-    const like = `%${search}%`;
-    params.push(like, like, like, like, like, like, like);
+    const busqueda = condicionBusquedaSolicitudes(search);
+    condiciones.push(busqueda.sql);
+    params.push(...busqueda.params);
   }
   if (cicFiltro) { condiciones.push("s.cic_codigo = ?"); params.push(cicFiltro); }
   if (tipoReintegroFiltroId) {
@@ -4330,18 +4346,14 @@ router.get("/coseguro/estadisticas/export", verifyToken, async (req, res) => {
 // La separación de áreas aplica igual que en los reintegros: solo staff con
 // área coseguro puede tocar estos endpoints.
 // ===========================================================================
+// Códigos del estado (reserva_salud.estado). Los nombres que ve la gente viven
+// en el frontend (coseguro.model.ts › SUBSIDIO_SALUD_ESTADOS), fuente única de
+// todo el sistema: el backend sólo maneja los códigos.
 const SUBSIDIO_ESTADO = {
   PENDIENTE: "PENDIENTE",
   APROBADA_DEPARTAMENTAL: "APROBADA_DEPARTAMENTAL",
   APROBADA: "APROBADA",
   RECHAZADA: "RECHAZADA",
-};
-
-const SUBSIDIO_ESTADO_NOMBRE = {
-  PENDIENTE: "En validación de Servicios Sociales",
-  APROBADA_DEPARTAMENTAL: "Aprobado por departamental",
-  APROBADA: "Subsidio aprobado (100%)",
-  RECHAZADA: "Subsidio rechazado",
 };
 
 function transicionesSubsidioSalud(cabecera, estado) {
@@ -4402,11 +4414,7 @@ const SQL_SUBSIDIO_BASE = `
   LEFT JOIN coseguro_imputacion imp ON imp.id = rs.imputacion_id`;
 
 function mapearSubsidio(cabecera, row) {
-  return {
-    ...row,
-    estado_nombre: SUBSIDIO_ESTADO_NOMBRE[row.estado] || row.estado,
-    transiciones: transicionesSubsidioSalud(cabecera, row.estado),
-  };
+  return { ...row, transiciones: transicionesSubsidioSalud(cabecera, row.estado) };
 }
 
 // ---------------------------------------------------------------------------
@@ -4435,14 +4443,24 @@ router.get("/coseguro/subsidios-salud", verifyToken, async (req, res) => {
       params.push(...estados);
     }
     const search = normalizarTexto(req.query.search);
-    if (search) {
+    if (search && search.length > 200) return res.status(400).json("La búsqueda es demasiado larga");
+    const codigo = search ? leerCodigoBuscado(search, "T") : null;
+    if (codigo) {
+      // "T-120" es el código del expediente (id de la reserva): trae ese y nada más
+      condiciones.push("rs.reserva_id = ?");
+      params.push(codigo.id);
+    } else if (search) {
+      // Sin el estado: el buscador comparaba códigos internos que nadie ve (para eso
+      // están los botones de estado). El DNI se muestra con puntos ("40.759.125"):
+      // escrito así, se busca sin ellos.
+      const like = `%${search}%`;
+      const likeDocumento = /^\d{1,3}(\.\d{3})+$/.test(search) ? `%${search.replace(/\./g, "")}%` : like;
       condiciones.push(`(CAST(rs.reserva_id AS CHAR) LIKE ? OR u.nombre LIKE ? OR u.apellido LIKE ?
         OR CONCAT(u.apellido, ', ', u.nombre) LIKE ? OR CAST(u.documento AS CHAR) LIKE ?
-        OR COALESCE(sv.nombre, ch.nombre) LIKE ? OR d.nombre LIKE ? OR rs.estado LIKE ?
+        OR COALESCE(sv.nombre, ch.nombre) LIKE ? OR d.nombre LIKE ?
         OR DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') LIKE ? OR DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') LIKE ?
         OR CAST(r.precio_total AS CHAR) LIKE ? OR rs.motivo LIKE ? OR rs.centro_medico LIKE ?)`);
-      const like = `%${search}%`;
-      params.push(...Array(13).fill(like));
+      params.push(like, like, like, like, likeDocumento, ...Array(7).fill(like));
     }
 
     const [rows] = await db.query(
@@ -4661,7 +4679,7 @@ router.put("/coseguro/subsidios-salud/:id/estado", verifyToken, async (req, res)
     }
 
     // Notificaciones: siempre al afiliado; al aprobar la departamental, a Servicios Sociales
-    const titulo = `Subsidio por salud de tu reserva #${subsidio.reserva_id}`;
+    const titulo = `Subsidio por salud de tu reserva T-${subsidio.reserva_id}`;
     let mensaje;
     if (estadoNuevo === SUBSIDIO_ESTADO.APROBADA_DEPARTAMENTAL) {
       mensaje = "Tu departamental validó los certificados. Falta la aprobación final de Servicios Sociales.";
@@ -4677,7 +4695,7 @@ router.put("/coseguro/subsidios-salud/:id/estado", verifyToken, async (req, res)
     });
     if (estadoNuevo === SUBSIDIO_ESTADO.APROBADA_DEPARTAMENTAL) {
       await notificarStaffCoseguroPorRol(connection, "admin-central", "RESERVA_SALUD_PARA_CONTROL",
-        `Subsidio por salud de la reserva #${subsidio.reserva_id} para aprobar`,
+        `Subsidio por salud de la reserva T-${subsidio.reserva_id} para aprobar`,
         `${subsidio.afiliado_apellido}, ${subsidio.afiliado_nombre}: la departamental validó los certificados médicos. Falta la aprobación final de Servicios Sociales.`,
         { reserva_id: subsidio.reserva_id, reserva_salud_id: subsidioId, estado: estadoNuevo });
     }
@@ -4711,6 +4729,7 @@ router.__test = Object.freeze({
   adquirirBloqueoDuplicados,
   buscarDuplicadosComprobante,
   calcularReintegroEstimado,
+  condicionBusquedaSolicitudes,
   consultarSolicitudesParaExportar,
   decodificarFirmaBase64,
   detectarMimeArchivo,

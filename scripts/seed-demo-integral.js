@@ -13,6 +13,7 @@ const {
   sha256,
   stableJson,
 } = require("./integridad-financiera-common");
+const { asegurarSinTarifasDadasDeBaja } = require("./guardia-baja-logica-tarifas");
 const {
   aplicarDescuentoEnPuntosBase,
   calcularEdadEnFecha,
@@ -1607,6 +1608,7 @@ async function main(argv = process.argv.slice(2)) {
   const connection = await createConnection();
   let transactionOpen = false;
   try {
+    await asegurarSinTarifasDadasDeBaja(connection, "seed-demo-integral.js");
     await acquireLock(connection);
     if (!mode.apply) {
       await connection.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");

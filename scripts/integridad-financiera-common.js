@@ -680,6 +680,12 @@ async function runDataPreflight(connection) {
     );
   }
 
+  // Las tarifas dadas de baja al editar una temporada (tarifa.eliminado = 1) ya no
+  // cotizan: no cuentan como inconsistentes ni como solapadas. Antes de correr
+  // migrar-temporadas-baja-logica.js la columna no existe y se miran todas. Con los
+  // adicionales, el mismo criterio con activo = 1 (su baja de siempre).
+  const tarifaConBajaLogica = Boolean(await columnInfo(connection, "tarifa", "eliminado"));
+  const soloTarifasVigentes = (alias) => (tarifaConBajaLogica ? ` AND ${alias}.eliminado = 0` : "");
   report.metrics.relational_consistency = await queryOne(
     connection,
     `SELECT
@@ -691,8 +697,8 @@ async function runDataPreflight(connection) {
           LEFT JOIN temporada_tarifa tt ON tt.id = t.temporada_tarifa_id
           LEFT JOIN servicio_regimen sr
             ON sr.servicio_id = r.servicio_id AND sr.regimen_id = t.regimen_id
-         WHERE r.id IS NULL OR tp.id IS NULL OR reg.id IS NULL OR tt.id IS NULL
-            OR sr.servicio_id IS NULL) AS tarifa_regimen_fuera_servicio,
+         WHERE (r.id IS NULL OR tp.id IS NULL OR reg.id IS NULL OR tt.id IS NULL
+            OR sr.servicio_id IS NULL)${soloTarifasVigentes("t")}) AS tarifa_regimen_fuera_servicio,
        (SELECT COUNT(*)
           FROM tarifa_adicional ta
           LEFT JOIN recurso r ON r.id = ta.recurso_id
@@ -701,12 +707,12 @@ async function runDataPreflight(connection) {
           LEFT JOIN temporada_tarifa tt ON tt.id = ta.temporada_tarifa_id
           LEFT JOIN servicio_regimen sr
             ON sr.servicio_id = r.servicio_id AND sr.regimen_id = ta.regimen_id
-         WHERE r.id IS NULL OR ad.id IS NULL OR reg.id IS NULL OR tt.id IS NULL
-            OR sr.servicio_id IS NULL) AS adicional_regimen_fuera_servicio,
+         WHERE (r.id IS NULL OR ad.id IS NULL OR reg.id IS NULL OR tt.id IS NULL
+            OR sr.servicio_id IS NULL) AND ta.activo = 1) AS adicional_regimen_fuera_servicio,
        (SELECT COUNT(*)
           FROM tarifa a
           INNER JOIN tarifa b
-            ON a.id < b.id
+            ON a.id < b.id${soloTarifasVigentes("a")}${soloTarifasVigentes("b")}
            AND a.recurso_id <=> b.recurso_id
            AND a.regimen_id <=> b.regimen_id
            AND a.tipo_persona_id <=> b.tipo_persona_id

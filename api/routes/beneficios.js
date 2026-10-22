@@ -32,6 +32,7 @@ const sharp = require("sharp");
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, CopyObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const { normalizarFechaCivil } = require("../services/valores-dominio");
+const { leerCodigoBuscado } = require("../services/busqueda-codigos");
 const { esDniValido, DNI_MENSAJE } = require("../security/dni");
 const { esCorreoValido } = require("../services/correo/config");
 const {
@@ -1533,7 +1534,13 @@ router.get("/beneficios/inscripciones", verifyToken, async (req, res) => {
     }
     const search = normalizarTexto(req.query.search);
     if (search && search.length > 200) return res.status(400).json("La búsqueda es demasiado larga");
-    if (search) {
+    const codigo = search ? leerCodigoBuscado(search, "B") : null;
+    if (codigo) {
+      // "B-12", "B12", "B 12" o "#12": la inscripción B-12 o las del beneficio B-12 (los dos
+      // códigos se ven en esta bandeja). Código exacto: "B-1" no trae B-10.
+      condiciones.push("(bi.id = ? OR b.id = ?)");
+      params.push(codigo.id, codigo.id);
+    } else if (search) {
       condiciones.push(`(CONCAT('B-', bi.id) LIKE ? OR CONCAT('B-', b.id) LIKE ? OR b.nombre LIKE ?
         OR u.nombre LIKE ? OR u.apellido LIKE ? OR CONCAT(u.apellido, ', ', u.nombre) LIKE ?
         OR CAST(u.documento AS CHAR) LIKE ? OR u.email LIKE ?)`);
@@ -2155,7 +2162,12 @@ router.get("/beneficios", verifyToken, async (req, res) => {
     }
     const search = normalizarTexto(req.query.search);
     if (search && search.length > 200) return res.status(400).json("La búsqueda es demasiado larga");
-    if (search) {
+    const codigo = search ? leerCodigoBuscado(search, "B") : null;
+    if (codigo) {
+      // "B-12", "B12", "B 12" o "#12": ese beneficio y nada más
+      condiciones.push("b.id = ?");
+      params.push(codigo.id);
+    } else if (search) {
       condiciones.push(`(CONCAT('B-', b.id) LIKE ? OR b.nombre LIKE ? OR b.razon_social LIKE ? OR b.descripcion_corta LIKE ?
         OR r.nombre LIKE ? OR d.nombre LIKE ? OR e.nombre LIKE ?)`);
       params.push(...Array(7).fill(`%${search}%`));

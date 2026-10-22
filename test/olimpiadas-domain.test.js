@@ -8,8 +8,11 @@ const {
   decodificarFirmaBase64,
   estaVentanaInscripcionAbierta,
   idsPositivosIguales,
+  nombreDepartamental,
   normalizarCupo,
   normalizarIds,
+  obtenerDisciplinasOlimpiada,
+  resolverAfiliadoDestino,
   validarCapacidadDisciplinas,
   validarConfiguracionContraInscripciones,
   validarContenidoArchivo,
@@ -103,6 +106,7 @@ test("olimpiadas rechaza reactivación o edición cuando el cupo quedó completo
         return [[{ disciplina_id: 7, max_por_departamental: 2, nombre: "Vóley" }]];
       }
       if (sql.includes("COUNT(*) AS total")) return [[{ total: 2 }]];
+      if (sql.includes("SELECT nombre FROM departamental")) return [[{ nombre: "Azul" }]];
       throw new Error(`Consulta inesperada: ${sql}`);
     },
   };
@@ -113,26 +117,132 @@ test("olimpiadas rechaza reactivación o edición cuando el cupo quedó completo
       disciplinaIds: [7],
       excluirInscripcionId: 11,
     }),
-    (error) => error.statusCode === 409 && /Vóley/.test(error.message)
+    (error) => error.statusCode === 409 && error.message === 'Ya no quedan lugares de "Vóley" en el cupo de Azul'
   );
   assert.deepEqual(consultas[1].params, [7, 3, 9, 11]);
+  assert.deepEqual(consultas[2].params, [9]);
+});
+
+test("olimpiadas nombra el cupo de las inscripciones viejas sin departamental sin consultar nombres", async () => {
+  const connection = {
+    async query(sql) {
+      if (sql.includes("FROM olimpiada_disciplina_config")) return [[{ disciplina_id: 7, max_por_departamental: 1, nombre: "Vóley" }]];
+      if (sql.includes("COUNT(*) AS total")) return [[{ total: 1 }]];
+      throw new Error(`Consulta inesperada: ${sql}`);
+    },
+  };
+  await assert.rejects(
+    () => validarCapacidadDisciplinas(connection, { olimpiadaId: 3, departamentalId: null, disciplinaIds: [7] }),
+    (error) => error.statusCode === 409 && /en el cupo de afiliados sin departamental$/.test(error.message)
+  );
 });
 
 test("olimpiadas impide quitar disciplinas usadas o bajar cupos bajo la ocupación", async () => {
   const usada = {
     async query() {
-      return [[{ disciplina_id: 4, departamental_id: 2, inscripciones: 3, activas: 2 }]];
+      return [[{ disciplina_id: 4, departamental_id: 2, disciplina_nombre: "Vóley", departamental_nombre: "Azul", inscripciones: 3, activas: 2 }]];
     },
   };
   await assert.rejects(
     () => validarConfiguracionContraInscripciones(usada, 1, []),
-    (error) => error.statusCode === 409 && /quitar/.test(error.message)
+    (error) => error.statusCode === 409 && error.message === 'No se puede quitar "Vóley": tiene inscripciones asociadas'
   );
   await assert.rejects(
     () => validarConfiguracionContraInscripciones(usada, 1, [{ disciplina_id: 4, max_por_departamental: 1 }]),
-    (error) => error.statusCode === 409 && /no puede bajar/.test(error.message)
+    (error) => error.statusCode === 409
+      // «En revisión», como el staff ve el estado PENDIENTE (no «pendientes»)
+      && error.message === 'El cupo de "Vóley" no puede bajar de 2: ya hay 2 inscripciones en revisión o aprobadas en el cupo de Azul'
   );
   await validarConfiguracionContraInscripciones(usada, 1, [{ disciplina_id: 4, max_por_departamental: 2 }]);
+
+  const sinDepartamental = {
+    async query(sql) {
+      assert.match(sql, /LEFT JOIN departamental dep ON dep\.id = i\.departamental_id/);
+      assert.match(sql, /GROUP BY idp\.disciplina_id, i\.departamental_id/);
+      return [[{ disciplina_id: 4, departamental_id: null, disciplina_nombre: "Vóley", departamental_nombre: null, inscripciones: 3, activas: 3 }]];
+    },
+  };
+  await assert.rejects(
+    () => validarConfiguracionContraInscripciones(sinDepartamental, 1, [{ disciplina_id: 4, max_por_departamental: 2 }]),
+    (error) => /no puede bajar de 3: .* en el cupo de afiliados sin departamental$/.test(error.message)
+  );
+});
+
+test("olimpiadas muestra la ocupación con la misma regla con la que valida el cupo", async () => {
+  const consultas = [];
+  const db = {
+    async query(sql, params) {
+      consultas.push({ sql, params });
+      return [[
+        { id: 7, nombre: "Vóley", tipo_id: 1, tipo_nombre: "Atleta", icono_archivo: null, max_por_departamental: 10, inscriptos_departamental: 3 },
+        { id: 8, nombre: "Truco", tipo_id: 1, tipo_nombre: "Atleta", icono_archivo: null, max_por_departamental: 2, inscriptos_departamental: 5 },
+        { id: 9, nombre: "Ajedrez", tipo_id: 1, tipo_nombre: "Atleta", icono_archivo: null, max_por_departamental: null, inscriptos_departamental: 4 },
+      ]];
+    },
+  };
+  const disciplinas = await obtenerDisciplinasOlimpiada(db, 3, { departamentalId: null, excluirInscripcionId: 11 });
+  assert.match(consultas[0].sql, /i\.departamental_id <=> \?/);
+  assert.match(consultas[0].sql, /\? IS NULL OR i\.id <> \?/);
+  assert.match(consultas[0].sql, /i\.estado IN \('PENDIENTE','VALIDADO'\)/);
+  assert.doesNotMatch(consultas[0].sql, /\? IS NULL OR i\.departamental_id = \?/);
+  assert.deepEqual(consultas[0].params, [null, 11, 11, 3]);
+  assert.deepEqual(disciplinas.map((d) => [d.id, d.inscriptos_departamental, d.cupo_disponible]), [[7, 3, 7], [8, 5, 0], [9, 4, null]]);
+  assert.equal(disciplinas[0].icono_url, null);
+
+  await obtenerDisciplinasOlimpiada(db, 3, { departamentalId: 5 });
+  assert.deepEqual(consultas[1].params, [5, null, null, 3]);
+});
+
+test("olimpiadas sin ocupación devuelve sólo los topes (administración provincial)", async () => {
+  const consultas = [];
+  const db = {
+    async query(sql, params) {
+      consultas.push({ sql, params });
+      return [[{ id: 7, nombre: "Vóley", tipo_id: 1, tipo_nombre: "Atleta", icono_archivo: null, max_por_departamental: 10 }]];
+    },
+  };
+  const [voley] = await obtenerDisciplinasOlimpiada(db, 3, { conOcupacion: false });
+  assert.doesNotMatch(consultas[0].sql, /inscriptos_departamental/);
+  assert.deepEqual(consultas[0].params, [3]);
+  assert.equal(voley.max_por_departamental, 10);
+  assert.equal("inscriptos_departamental" in voley, false);
+  assert.equal("cupo_disponible" in voley, false);
+});
+
+test("olimpiadas no inscribe a personas sin departamental y lo explica según quién carga", async () => {
+  const afiliado = {
+    id: 20, nombre: "Ana", apellido: "Pérez", rol_nombre: "afiliado", habilitado: "Y",
+    usuario_familiar_id: null, es_familiar: "N", modulo_olimpiadas: 1, departamental_id: null,
+  };
+  const db = (fila) => ({ async query() { return [[fila]]; } });
+  await assert.rejects(
+    () => resolverAfiliadoDestino(db(afiliado), 20, { rol: "afiliado", id: 20 }),
+    (error) => error.statusCode === 422
+      && error.message === "Tu usuario no tiene una departamental asignada. Comunicate con la AJB para que te la asignen y después inscribite."
+  );
+  for (const rol of ["admin", "admin-central"]) {
+    await assert.rejects(
+      () => resolverAfiliadoDestino(db(afiliado), 20, { rol, id: 1, departamental_id: 1 }),
+      (error) => error.statusCode === 422
+        && error.message === "Pérez, Ana no tiene una departamental asignada. Asignásela desde Usuarios y después cargá la inscripción.",
+      rol
+    );
+  }
+  // La departamental sigue recibiendo el 403 de siempre (sólo inscribe a los suyos)
+  await assert.rejects(
+    () => resolverAfiliadoDestino(db(afiliado), 20, { rol: "departamental", id: 3, departamental_id: 1 }),
+    (error) => error.statusCode === 403
+  );
+  assert.equal((await resolverAfiliadoDestino(db({ ...afiliado, departamental_id: 5 }), 20, { rol: "admin", id: 1 })).departamental_id, 5);
+});
+
+test("olimpiadas nombra la departamental del cupo y no consulta si no hay departamental", async () => {
+  const consultas = [];
+  const db = (filas) => ({ async query(sql, params) { consultas.push(params); return [filas]; } });
+  assert.equal(await nombreDepartamental(db([{ nombre: "La Plata" }]), 1), "La Plata");
+  assert.equal(await nombreDepartamental(db([]), 4), "departamental #4");
+  assert.equal(await nombreDepartamental(db([]), null), null);
+  assert.deepEqual(consultas, [[1], [4]]);
 });
 
 test("olimpiadas requiere esquema Bearer estricto", () => {

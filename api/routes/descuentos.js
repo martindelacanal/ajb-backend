@@ -29,6 +29,7 @@ const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const mysqlConnection = require("../connection/connection");
 const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
 const { registrarErrorRuta } = require("../services/errores");
+const { leerCodigoBuscado } = require("../services/busqueda-codigos");
 const { decimalACentavos, normalizarFechaCivil } = require("../services/valores-dominio");
 const { puedeAprobarTurismo, tieneAreaTurismo } = require("../services/turismo-catalogo");
 const {
@@ -1148,11 +1149,19 @@ function construirFiltrosUsos(query) {
     condiciones.push("rd.requiere_comprobante = 1 AND NOT EXISTS (SELECT 1 FROM reserva_descuento_archivo a WHERE a.reserva_descuento_id = rd.id)");
   }
   const search = normalizarTexto(query.search, { maximo: 120 });
-  if (search) {
+  const codigo = search ? leerCodigoBuscado(search, "T") : null;
+  if (codigo) {
+    // "T-120" (como se ve en la tabla) es el código de la reserva: sus usos y nada más.
+    // Un cupón puede llamarse igual ("T10", "#2026"): también se lo busca, por código exacto.
+    condiciones.push("(rd.reserva_id = ? OR rd.codigo = ?)");
+    params.push(codigo.id, search.replace(/^#+/, ""));
+  } else if (search) {
     const like = `%${search}%`;
+    // El cupón se ve como hashtag ("#JUBILADO") y se guarda sin el "#"
+    const likeCodigo = `%${search.replace(/^#+/, "") || search}%`;
     condiciones.push(`(CAST(rd.reserva_id AS CHAR) LIKE ? OR rd.codigo LIKE ? OR rd.nombre LIKE ? OR u.nombre LIKE ? OR u.apellido LIKE ?
       OR CAST(u.documento AS CHAR) LIKE ? OR d.nombre LIKE ? OR s.nombre LIKE ? OR er.nombre LIKE ?)`);
-    params.push(like, like, like, like, like, like, like, like, like);
+    params.push(like, likeCodigo, like, like, like, like, like, like, like);
   }
   return { where: condiciones.join(" AND "), params };
 }
@@ -1359,10 +1368,17 @@ router.get("/descuentos/admin/historial", verifyToken, async (req, res) => {
     const hasta = req.query.hasta ? normalizarFechaCivil(String(req.query.hasta).slice(0, 10)) : null;
     if (hasta) { condiciones.push("h.fecha_creacion <= ?"); params.push(`${hasta} 23:59:59`); }
     const search = normalizarTexto(req.query.search, { maximo: 120 });
-    if (search) {
+    const codigo = search ? leerCodigoBuscado(search, "T") : null;
+    if (codigo) {
+      // "T-120" (o "#120", como lo dicen los resúmenes): los movimientos de esa reserva y
+      // los del descuento que se llame exactamente así (un cupón "T10" o "#2026").
+      condiciones.push("(h.reserva_id = ? OR r.codigo = ?)");
+      params.push(codigo.id, search.replace(/^#+/, ""));
+    } else if (search) {
       const like = `%${search}%`;
+      const likeCodigo = `%${search.replace(/^#+/, "") || search}%`; // el cupón se guarda sin el "#"
       condiciones.push("(h.resumen LIKE ? OR CONCAT(u.nombre, ' ', u.apellido) LIKE ? OR r.nombre LIKE ? OR r.codigo LIKE ? OR CAST(h.reserva_id AS CHAR) LIKE ?)");
-      params.push(like, like, like, like, like);
+      params.push(like, like, like, likeCodigo, like);
     }
     const where = condiciones.join(" AND ");
     const [rows] = await db.query(

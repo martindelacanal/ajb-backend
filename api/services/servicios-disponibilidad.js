@@ -318,6 +318,7 @@ async function cargarContextoNoCamping(connection, {
         SELECT recurso_id, edad_minima, edad_maxima, fecha_inicio, fecha_fin
         FROM tarifa
         WHERE recurso_id IN (${placeholders})
+          AND eliminado = 0
           AND turismo_tarifa_regla_id IS NULL
           AND COALESCE(audiencia_departamental, 'TODAS') IN ('TODAS', ?)
           AND fecha_inicio <= ?
@@ -488,6 +489,7 @@ async function cargarContextoCamping(connection, {
         AND fecha_inicio <= ?
         AND fecha_fin >= ?
         AND parcelas_disponibles IS NOT NULL
+        AND eliminado = 0
     `,
     [recursoCampingId, ultimaNoche, fechaDesde]
   );

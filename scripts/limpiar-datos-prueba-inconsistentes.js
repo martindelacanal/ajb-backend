@@ -18,6 +18,7 @@ const {
   cerrarGuardiaArchivoReserva,
   limpiarTokenGuardiaArchivoReserva,
 } = require("../api/services/reserva-version-archivo");
+const { asegurarSinTarifasDadasDeBaja } = require("./guardia-baja-logica-tarifas");
 
 const CLEANUP_ID = "20260809_limpieza_datos_prueba_inconsistentes";
 const MANIFEST_VERSION = 1;
@@ -1460,6 +1461,7 @@ async function main() {
   const connection = await createConnection();
   let lockAcquired = false;
   try {
+    await asegurarSinTarifasDadasDeBaja(connection, "limpiar-datos-prueba-inconsistentes.js");
     await ensurePrerequisites(connection, options.production);
     if (!options.apply) {
       const result = await dryRun(connection);

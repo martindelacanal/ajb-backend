@@ -102,6 +102,7 @@ async function obtenerMejorDescuentoAdicionalesDia(connection, {
          AND (edad_maxima IS NULL OR edad_maxima >= ?)
          AND fecha_inicio <= ?
          AND fecha_fin >= ?
+         AND eliminado = 0
          ${filtroTemporada}
        ORDER BY fecha_inicio ASC`,
       [

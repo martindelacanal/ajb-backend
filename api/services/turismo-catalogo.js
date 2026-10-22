@@ -235,7 +235,7 @@ function construirVisibilidadServicioSql(cabecera, alias = "s") {
                SELECT 1 FROM tarifa tv
                  INNER JOIN recurso rtv ON rtv.id = tv.recurso_id
                 WHERE rtv.servicio_id = ${alias}.id AND rtv.activo = 1
-                  AND tv.fecha_fin >= CURDATE()
+                  AND tv.fecha_fin >= CURDATE() AND tv.eliminado = 0
              )
            )
            AND (

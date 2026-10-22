@@ -28,6 +28,7 @@ const {
   // archivos / S3
   firmarSeguro,
   getObjectBufferFromS3,
+  eliminarObjetosS3Seguro,
   subirArchivoOlimpiadas,
   subirFirmaBase64,
   manejarUploadOlimpiadas,
@@ -204,6 +205,99 @@ function textoResumenAcompaniantes({ cantidad, bonos }) {
   return `${n} acompañante${n === 1 ? "" : "s"} (${Number(bonos) || 0} bonos)`;
 }
 
+function resumenDeAcompaniantes(filas) {
+  return {
+    cantidad: (filas || []).length,
+    bonos: (filas || []).reduce((total, a) => total + (Number(a.bonos) || 0), 0),
+  };
+}
+
+// ¿Cambió de verdad el set de acompañantes? El formulario siempre reenvía la lista completa aunque nadie
+// la haya tocado: se comparan las personas con sus datos y bonos, sin importar el orden.
+function firmaAcompaniante(a) {
+  return JSON.stringify([
+    a.nombre ?? "", a.apellido ?? "", a.documento ?? "", normalizarFechaCivil(a.fecha_nacimiento) ?? "",
+    a.vinculo ?? "", Number(a.es_afiliado) === 1 ? 1 : 0, Number(a.bonos) || 0,
+    Number(a.bonos_manual) === 1 ? 1 : 0, a.observacion ?? "",
+  ]);
+}
+
+function mismosAcompaniantes(anteriores, nuevos) {
+  const antes = (anteriores || []).map(firmaAcompaniante).sort();
+  const ahora = (nuevos || []).map(firmaAcompaniante).sort();
+  return antes.length === ahora.length && antes.every((firma, indice) => firma === ahora[indice]);
+}
+
+// Cupo de una departamental en los mensajes («el cupo de La Plata»). Sin nombre = inscripciones viejas sin
+// departamental, que siguen ocupando un cupo propio (departamental_id <=> NULL).
+function textoCupo(nombreDepartamental) {
+  return nombreDepartamental ? `el cupo de ${nombreDepartamental}` : "el cupo de afiliados sin departamental";
+}
+
+// Respuesta del alta: al staff le confirma de qué cupo se descontaron los lugares.
+function mensajeAltaInscripcion({ actorEsStaff, estado, nombreDepartamental }) {
+  if (!actorEsStaff) {
+    return estado === "PENDIENTE"
+      ? "¡Inscripción enviada! Queda pendiente de aprobación de tu departamental"
+      : "¡Inscripción enviada! Nos vemos en las olimpiadas";
+  }
+  return estado === "PENDIENTE"
+    ? `Inscripción cargada en ${textoCupo(nombreDepartamental)}. Asigná los bonos para aprobarla`
+    : `Inscripción cargada y aprobada en ${textoCupo(nombreDepartamental)}`;
+}
+
+// Aviso al afiliado cuando el staff carga su inscripción: dice quién la cargó (la administración provincial
+// no es «tu departamental»).
+function avisoAltaPorStaff({ rol, olimpiadaNombre, estado }) {
+  const quien = rol === "departamental" ? "Tu departamental" : "La AJB";
+  return {
+    titulo: `Te inscribimos a ${olimpiadaNombre}`,
+    mensaje: estado === "VALIDADO"
+      ? `${quien} cargó tu inscripción a ${olimpiadaNombre} y ya está aprobada. Revisá el detalle y escribinos por el chat si tenés dudas.`
+      : `${quien} cargó tu inscripción a ${olimpiadaNombre}. Queda en revisión hasta que se cubran los bonos contribución.`,
+  };
+}
+
+// La foto va en el gafete (sharp) y se ve en el navegador: una HEIC no se puede mostrar ni imprimir, así
+// que en la foto no se acepta (en el certificado sí, porque se descarga). Se controla antes de subir nada.
+const MIME_FOTO_INSCRIPCION = ["image/jpeg", "image/png", "image/webp"];
+const MENSAJE_FORMATO_FOTO = "La foto tiene que ser JPG, PNG o WebP. Si es una foto de iPhone (HEIC), guardala como JPG y volvé a subirla.";
+
+function formatoFotoValido(archivo) {
+  return MIME_FOTO_INSCRIPCION.includes(archivo?.mimetype);
+}
+
+// multer 1.4.5-lts entrega el nombre del archivo decodificado como latin1: «apto_médico.pdf» llega como
+// «apto_mÃ©dico.pdf». Se repara si se puede (un nombre que ya venía bien da caracteres inválidos al
+// repararlo y se deja como está), se quitan los caracteres de control y se acota a 255 caracteres
+// (la columna es varchar(260)).
+const CARACTER_INVALIDO_UTF8 = String.fromCharCode(0xfffd); // lo que deja Buffer#toString con bytes inválidos
+
+function nombreArchivoOriginal(nombre) {
+  let texto = String(nombre ?? "").replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  if (!texto) return null;
+  if (/^[\x00-\xff]*$/.test(texto)) {
+    const reparado = Buffer.from(texto, "latin1").toString("utf8");
+    if (!reparado.includes(CARACTER_INVALIDO_UTF8)) texto = reparado;
+  }
+  return Array.from(texto).slice(0, 255).join("");
+}
+
+// Texto del historial al cargar o reemplazar la foto o el certificado. La key de S3 sigue en
+// valor_anterior / valor_nuevo para auditoría; el staff lee esta observación.
+function observacionCambioAdjunto({ campo, habia, nombreAnterior = null, nombreNuevo = null }) {
+  if (campo === "foto_archivo") {
+    return habia ? "Se reemplazó la foto del afiliado. La anterior queda guardada." : "Se cargó la foto del afiliado.";
+  }
+  if (campo === "certificado_archivo") {
+    const nuevo = nombreNuevo ? ` «${nombreNuevo}»` : "";
+    if (!habia) return `Se adjuntó el certificado médico${nuevo}.`;
+    const anterior = nombreAnterior ? ` «${nombreAnterior}»` : "";
+    return `Se reemplazó el certificado médico${anterior} por${nuevo || " uno nuevo"}. El anterior queda guardado.`;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers con BD
 // ---------------------------------------------------------------------------
@@ -222,28 +316,46 @@ async function firmarIconosDisciplinas(disciplinas) {
   return Promise.all(disciplinas.map(async (d) => ({ ...d, icono_url: await firmarSeguro(d.icono_archivo) })));
 }
 
-// Disciplinas de una olimpiada con cupo y ocupación por departamental (ocupan cupo PENDIENTE y VALIDADO)
-async function obtenerDisciplinasOlimpiada(db, olimpiadaId, departamentalId) {
-  const [disciplinas] = await db.query(
-    `SELECT c.disciplina_id AS id, d.nombre, d.tipo_id, t.nombre AS tipo_nombre, d.icono_archivo,
-            c.max_por_departamental, c.sede_id, c.veedor,
+/**
+ * Disciplinas de una olimpiada con su tope y la ocupación del cupo de UNA departamental. Es la misma
+ * regla que validarCapacidadDisciplinas: ocupan las PENDIENTE y VALIDADO no eliminadas con
+ * departamental_id <=> ? (NULL = el cupo de las inscripciones viejas sin departamental).
+ *  - excluirInscripcionId: al editar, la inscripción no se cuenta a sí misma.
+ *  - conOcupacion = false: sólo el tope, sin inscriptos_departamental ni cupo_disponible (la
+ *    administración provincial no tiene una departamental propia: pide la ocupación a /cupos).
+ */
+async function obtenerDisciplinasOlimpiada(db, olimpiadaId, { departamentalId = null, excluirInscripcionId = null, conOcupacion = true } = {}) {
+  const columnaOcupacion = conOcupacion
+    ? `,
             (SELECT COUNT(*)
              FROM olimpiada_inscripcion_disciplina idp
              INNER JOIN olimpiada_inscripcion i ON i.id = idp.inscripcion_id
              WHERE idp.disciplina_id = c.disciplina_id AND i.olimpiada_id = c.olimpiada_id
                AND i.eliminado = 0 AND i.estado IN ${SQL_ESTADOS_ACTIVOS}
-               AND (? IS NULL OR i.departamental_id = ?)) AS inscriptos_departamental
+               AND i.departamental_id <=> ? AND (? IS NULL OR i.id <> ?)) AS inscriptos_departamental`
+    : "";
+  const params = conOcupacion
+    ? [departamentalId ?? null, excluirInscripcionId ?? null, excluirInscripcionId ?? null, olimpiadaId]
+    : [olimpiadaId];
+  const [disciplinas] = await db.query(
+    `SELECT c.disciplina_id AS id, d.nombre, d.tipo_id, t.nombre AS tipo_nombre, d.icono_archivo,
+            c.max_por_departamental, c.sede_id, c.veedor${columnaOcupacion}
      FROM olimpiada_disciplina_config c
      INNER JOIN olimpiada_disciplina d ON d.id = c.disciplina_id
      INNER JOIN olimpiada_disciplina_tipo t ON t.id = d.tipo_id
      WHERE c.olimpiada_id = ? AND d.habilitado = 'Y'
      ORDER BY t.nombre ASC, d.nombre ASC`,
-    [departamentalId ?? null, departamentalId ?? null, olimpiadaId]
+    params
   );
-  return firmarIconosDisciplinas(disciplinas.map((d) => ({
-    ...d,
-    cupo_disponible: d.max_por_departamental === null ? null : Math.max(0, d.max_por_departamental - d.inscriptos_departamental),
-  })));
+  return firmarIconosDisciplinas(disciplinas.map((d) => {
+    if (!conOcupacion) return d;
+    const inscriptos = Number(d.inscriptos_departamental) || 0;
+    return {
+      ...d,
+      inscriptos_departamental: inscriptos,
+      cupo_disponible: d.max_por_departamental === null ? null : Math.max(0, Number(d.max_por_departamental) - inscriptos),
+    };
+  }));
 }
 
 async function obtenerTramos(db, olimpiadaId) {
@@ -278,12 +390,15 @@ async function validarDisciplinasCategoria(db, disciplinaIds, categoria) {
 }
 
 // Reemplaza el set de acompañantes de una inscripción calculando los bonos de cada uno.
+// Devuelve el resumen y las filas tal como quedaron guardadas (para compararlas con las anteriores).
 async function guardarAcompaniantes(connection, inscripcionId, acompaniantes, { tramos, bonosAfiliado, fechaReferencia }) {
   await connection.query("DELETE FROM olimpiada_inscripcion_acompaniante WHERE inscripcion_id = ?", [inscripcionId]);
   let totalBonos = 0;
+  const filas = [];
   for (const a of acompaniantes) {
     const bonos = calcularBonosAcompaniante(a, { tramos, bonosAfiliado, fechaReferencia });
     totalBonos += bonos;
+    filas.push({ ...a, bonos });
     await connection.query(
       `INSERT INTO olimpiada_inscripcion_acompaniante
          (inscripcion_id, nombre, apellido, documento, fecha_nacimiento, vinculo, es_afiliado, bonos, bonos_manual, observacion)
@@ -291,15 +406,36 @@ async function guardarAcompaniantes(connection, inscripcionId, acompaniantes, { 
       [inscripcionId, a.nombre, a.apellido, a.documento, a.fecha_nacimiento, a.vinculo, a.es_afiliado, bonos, a.bonos_manual, a.observacion]
     );
   }
-  return { cantidad: acompaniantes.length, bonos: totalBonos };
+  return { cantidad: acompaniantes.length, bonos: totalBonos, filas };
 }
 
-async function resumenAcompaniantesActual(db, inscripcionId) {
-  const [[fila]] = await db.query(
-    "SELECT COUNT(*) AS cantidad, COALESCE(SUM(bonos), 0) AS bonos FROM olimpiada_inscripcion_acompaniante WHERE inscripcion_id = ?",
+async function acompaniantesGuardados(db, inscripcionId) {
+  const [filas] = await db.query(
+    `SELECT nombre, apellido, documento, fecha_nacimiento, vinculo, es_afiliado, bonos, bonos_manual, observacion
+     FROM olimpiada_inscripcion_acompaniante WHERE inscripcion_id = ? ORDER BY id`,
     [inscripcionId]
   );
-  return { cantidad: Number(fila.cantidad) || 0, bonos: Number(fila.bonos) || 0 };
+  return filas;
+}
+
+// Datos sanitarios de una inscripción como texto (para comparar y para el historial). null = ninguno.
+async function listaDatosSanitarios(db, inscripcionId) {
+  const [[fila]] = await db.query(
+    `SELECT GROUP_CONCAT(ds.nombre ORDER BY ds.nombre SEPARATOR ', ') AS lista
+     FROM olimpiada_inscripcion_dato_sanitario ids
+     INNER JOIN olimpiada_dato_sanitario ds ON ds.id = ids.dato_sanitario_id
+     WHERE ids.inscripcion_id = ?`,
+    [inscripcionId]
+  );
+  return fila?.lista || null;
+}
+
+// Nombre de la departamental para los mensajes del cupo. null = sin departamental.
+async function nombreDepartamental(db, departamentalId) {
+  const id = normalizarIdPositivo(departamentalId);
+  if (!id) return null;
+  const [rows] = await db.query("SELECT nombre FROM departamental WHERE id = ?", [id]);
+  return rows[0]?.nombre || `departamental #${id}`;
 }
 
 async function bloquearOlimpiada(connection, olimpiadaId, { requiereHabilitada = false } = {}) {
@@ -327,12 +463,16 @@ async function validarDisciplinasCatalogo(connection, disciplinas) {
 // No se puede quitar una disciplina con inscripciones ni bajar el cupo por debajo de las activas.
 async function validarConfiguracionContraInscripciones(connection, olimpiadaId, disciplinas) {
   const configuracion = new Map(disciplinas.map((disciplina) => [disciplina.disciplina_id, disciplina]));
+  // Los nombres van con MAX(): son únicos por grupo y así la consulta vale con ONLY_FULL_GROUP_BY.
   const [usos] = await connection.query(
     `SELECT idp.disciplina_id, i.departamental_id,
+            MAX(d.nombre) AS disciplina_nombre, MAX(dep.nombre) AS departamental_nombre,
             COUNT(*) AS inscripciones,
             SUM(CASE WHEN i.estado IN ${SQL_ESTADOS_ACTIVOS} THEN 1 ELSE 0 END) AS activas
      FROM olimpiada_inscripcion_disciplina idp
      INNER JOIN olimpiada_inscripcion i ON i.id = idp.inscripcion_id
+     LEFT JOIN olimpiada_disciplina d ON d.id = idp.disciplina_id
+     LEFT JOIN departamental dep ON dep.id = i.departamental_id
      WHERE i.olimpiada_id = ? AND i.eliminado = 0
      GROUP BY idp.disciplina_id, i.departamental_id`,
     [olimpiadaId]
@@ -340,15 +480,19 @@ async function validarConfiguracionContraInscripciones(connection, olimpiadaId, 
 
   for (const uso of usos) {
     const disciplinaId = Number(uso.disciplina_id);
+    const disciplina = uso.disciplina_nombre ? `"${uso.disciplina_nombre}"` : `la disciplina #${disciplinaId}`;
     const nuevaConfiguracion = configuracion.get(disciplinaId);
     if (!nuevaConfiguracion) {
-      throw crearErrorHttp(`No se puede quitar la disciplina #${disciplinaId}: tiene inscripciones asociadas`, 409);
+      throw crearErrorHttp(`No se puede quitar ${disciplina}: tiene inscripciones asociadas`, 409);
     }
     const cupo = nuevaConfiguracion.max_por_departamental;
-    if (cupo !== null && Number(uso.activas) > cupo) {
-      const sede = uso.departamental_id === null ? "sin departamental" : `departamental #${uso.departamental_id}`;
+    const activas = Number(uso.activas) || 0;
+    if (cupo !== null && activas > cupo) {
+      const departamentalId = normalizarIdPositivo(uso.departamental_id);
+      const nombre = departamentalId ? (uso.departamental_nombre || `departamental #${departamentalId}`) : null;
+      // «En revisión» es como el staff ve el estado PENDIENTE en sus pantallas
       throw crearErrorHttp(
-        `El cupo de la disciplina #${disciplinaId} no puede bajar de ${uso.activas} para ${sede}`,
+        `El cupo de ${disciplina} no puede bajar de ${activas}: ya hay ${activas} inscripciones en revisión o aprobadas en ${textoCupo(nombre)}`,
         409
       );
     }
@@ -389,7 +533,9 @@ async function validarCapacidadDisciplinas(connection, {
       params
     );
     if (Number(ocupacion.total) >= Number(config.max_por_departamental)) {
-      throw crearErrorHttp(`No quedan cupos de "${config.nombre}" para la departamental`, 409);
+      // Sirve igual para el alta, la edición y la reactivación: nombra el cupo que se llenó.
+      const nombre = await nombreDepartamental(connection, departamentalId);
+      throw crearErrorHttp(`Ya no quedan lugares de "${config.nombre}" en ${textoCupo(nombre)}`, 409);
     }
   }
 }
@@ -412,8 +558,11 @@ async function validarReferenciasSanitarias(connection, grupoSanguineoId, datosS
 }
 
 /**
- * Afiliado destinatario de una inscripción: titular real, habilitado, con módulo de olimpiadas.
+ * Afiliado destinatario de una inscripción: titular real, habilitado, con módulo de olimpiadas y con
+ * departamental asignada (la inscripción ocupa lugar en el cupo de esa departamental).
  * Una departamental sólo puede inscribir afiliados de su propia departamental.
+ * Lo usan el alta y GET /cupos: la edición y la reactivación de inscripciones viejas sin departamental
+ * no pasan por acá y siguen en su cupo «sin departamental».
  */
 async function resolverAfiliadoDestino(db, usuarioId, cabecera, { forUpdate = false } = {}) {
   const [usuarios] = await db.query(
@@ -432,6 +581,11 @@ async function resolverAfiliadoDestino(db, usuarioId, cabecera, { forUpdate = fa
   }
   if (cabecera.rol === "departamental" && !idsPositivosIguales(afiliado.departamental_id, cabecera.departamental_id)) {
     throw crearErrorHttp("Sólo podés inscribir afiliados de tu departamental", 403);
+  }
+  if (!normalizarIdPositivo(afiliado.departamental_id)) {
+    throw crearErrorHttp(cabecera.rol === "afiliado"
+      ? "Tu usuario no tiene una departamental asignada. Comunicate con la AJB para que te la asignen y después inscribite."
+      : `${afiliado.apellido}, ${afiliado.nombre} no tiene una departamental asignada. Asignásela desde Usuarios y después cargá la inscripción.`, 422);
   }
   return afiliado;
 }
@@ -903,7 +1057,8 @@ router.get("/olimpiadas/actual", verifyToken, async (req, res) => {
     let reglasBonos = null;
     const referencia = olimpiada || proxima;
     if (referencia) {
-      disciplinas = await obtenerDisciplinasOlimpiada(db, referencia.id, cabecera.departamental_id ?? null);
+      // El cupo de la departamental del afiliado: el mismo contra el que se valida su inscripción
+      disciplinas = await obtenerDisciplinasOlimpiada(db, referencia.id, { departamentalId: cabecera.departamental_id ?? null });
       const [inscripciones] = await db.query(
         `SELECT i.id, i.estado, i.fecha_creacion, i.categoria_tipo_id,
                 (SELECT COUNT(*) FROM olimpiada_inscripcion_observacion o WHERE o.inscripcion_id = i.id) AS mensajes
@@ -928,6 +1083,9 @@ router.get("/olimpiadas/actual", verifyToken, async (req, res) => {
       disciplinas,
       inscripcion,
       inscripcion_abierta: !!olimpiada,
+      // Sin departamental no hay cupo del que descontar: el alta responde 422 (resolverAfiliadoDestino).
+      // El formulario lo avisa al entrar, no después de completarlo todo.
+      sin_departamental: cabecera.rol === "afiliado" && !normalizarIdPositivo(cabecera.departamental_id),
       categorias: await obtenerCategorias(db),
       reglas_bonos: reglasBonos,
     });
@@ -990,8 +1148,11 @@ router.get("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
     const db = mysqlConnection.promise();
     const olimpiada = await obtenerOlimpiada(db, olimpiadaId);
     if (!olimpiada) return res.status(404).json("Olimpiada no encontrada");
+    // La departamental ve la ocupación de su cupo. La administración provincial recibe sólo los topes:
+    // el cupo es por departamental y depende de la persona, así que lo pide a /cupos al elegirla.
     const disciplinas = await obtenerDisciplinasOlimpiada(
-      db, olimpiadaId, cabecera.rol === "departamental" ? cabecera.departamental_id : null
+      db, olimpiadaId,
+      cabecera.rol === "departamental" ? { departamentalId: departamentalDe(cabecera) } : { conOcupacion: false }
     );
     res.status(200).json({
       ...olimpiada,
@@ -1002,6 +1163,61 @@ router.get("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
   } catch (error) {
     registrarErrorRuta(error);
     res.status(500).json("Error al obtener la olimpiada");
+  }
+});
+
+/**
+ * Cupos para el formulario de inscripción. La departamental la decide el servidor:
+ *  - usuario_id (sólo staff, alta): la del afiliado a inscribir, con las mismas reglas y errores que el alta.
+ *  - inscripcion_id (staff que puede verla o el afiliado dueño, edición): la guardada en la inscripción,
+ *    sin contarse a sí misma (si no, al desmarcar una disciplina llena ya no se podría volver a marcar).
+ * Responde { departamental: { id, nombre }, disciplinas: [{ id, max_por_departamental,
+ * inscriptos_departamental, cupo_disponible }] } (cupo_disponible null = sin límite).
+ */
+router.get("/olimpiadas/:id(\\d+)/cupos", verifyToken, async (req, res) => {
+  try {
+    const cabecera = getCabecera(req);
+    if (cabecera.rol !== "afiliado" && !esStaff(cabecera)) return res.status(401).json("No autorizado");
+    const olimpiadaId = normalizarIdPositivo(req.params.id);
+    if (!olimpiadaId) return res.status(400).json("ID de olimpiada inválido");
+    const db = mysqlConnection.promise();
+    if (!(await obtenerOlimpiada(db, olimpiadaId))) return res.status(404).json("Olimpiada no encontrada");
+
+    let departamentalId = null;
+    let excluirInscripcionId = null;
+    if (valorInformado(req.query.inscripcion_id)) {
+      const inscripcionId = normalizarIdPositivo(req.query.inscripcion_id);
+      if (!inscripcionId) return res.status(400).json("La inscripción indicada no es válida");
+      const [rows] = await db.query(
+        "SELECT id, usuario_id, departamental_id FROM olimpiada_inscripcion WHERE id = ? AND olimpiada_id = ? AND eliminado = 0",
+        [inscripcionId, olimpiadaId]
+      );
+      if (rows.length === 0) return res.status(404).json("Inscripción no encontrada");
+      if (!puedeVerInscripcion(cabecera, rows[0])) return res.status(401).json("No autorizado");
+      departamentalId = rows[0].departamental_id ?? null;
+      excluirInscripcionId = inscripcionId;
+    } else if (valorInformado(req.query.usuario_id)) {
+      if (!esStaff(cabecera)) return res.status(401).json("No autorizado");
+      const usuarioId = normalizarIdPositivo(req.query.usuario_id);
+      if (!usuarioId) return res.status(400).json("El afiliado indicado no es válido");
+      const afiliado = await resolverAfiliadoDestino(db, usuarioId, cabecera);
+      departamentalId = afiliado.departamental_id ?? null;
+    } else {
+      return res.status(400).json("Elegí al afiliado para ver los cupos de su departamental");
+    }
+
+    const disciplinas = await obtenerDisciplinasOlimpiada(db, olimpiadaId, { departamentalId, excluirInscripcionId });
+    res.status(200).json({
+      departamental: { id: normalizarIdPositivo(departamentalId), nombre: await nombreDepartamental(db, departamentalId) },
+      disciplinas: disciplinas.map((d) => ({
+        id: d.id,
+        max_por_departamental: d.max_por_departamental,
+        inscriptos_departamental: d.inscriptos_departamental,
+        cupo_disponible: d.cupo_disponible,
+      })),
+    });
+  } catch (error) {
+    responderError(res, error, "Error al obtener los cupos");
   }
 });
 
@@ -1352,6 +1568,9 @@ router.post("/olimpiadas/:id(\\d+)/mensajes", verifyToken, async (req, res) => {
 // Alta (afiliado para sí mismo; staff en nombre de un afiliado: departamental sólo los suyos)
 router.post("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, manejarUploadOlimpiadas, async (req, res) => {
   let connection;
+  // Lo que se sube a S3 en este intento: si la transacción no se confirma, se borra (no quedan huérfanos)
+  const objetosSubidos = [];
+  let transaccionConfirmada = false;
   try {
     const cabecera = getCabecera(req);
     const olimpiadaId = normalizarIdPositivo(req.params.id);
@@ -1402,7 +1621,7 @@ router.post("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, manejarUploadOli
       if (!archivoCertificado) return res.status(400).json("Adjuntá el certificado médico");
       if (!archivoFoto) return res.status(400).json("Adjuntá una foto del afiliado");
     }
-    if (archivoFoto && !archivoFoto.mimetype?.startsWith("image/")) return res.status(400).json("La foto debe ser una imagen");
+    if (archivoFoto && !formatoFotoValido(archivoFoto)) return res.status(400).json(MENSAJE_FORMATO_FOTO);
 
     // Cupos por departamental (dentro de la transacción para evitar sobrecupo)
     connection = await db.getConnection();
@@ -1444,9 +1663,18 @@ router.post("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, manejarUploadOli
     let firmaArchivo = null;
     let certificadoArchivo = null;
     let fotoArchivo = null;
-    if (firmaBase64) firmaArchivo = await subirFirmaBase64(firmaBase64, "inscripciones/firma");
-    if (archivoCertificado) certificadoArchivo = await subirArchivoOlimpiadas(archivoCertificado, "inscripciones/certificado");
-    if (archivoFoto) fotoArchivo = await subirArchivoOlimpiadas(archivoFoto, "inscripciones/foto");
+    if (firmaBase64) {
+      firmaArchivo = await subirFirmaBase64(firmaBase64, "inscripciones/firma");
+      objetosSubidos.push(firmaArchivo);
+    }
+    if (archivoCertificado) {
+      certificadoArchivo = await subirArchivoOlimpiadas(archivoCertificado, "inscripciones/certificado");
+      objetosSubidos.push(certificadoArchivo);
+    }
+    if (archivoFoto) {
+      fotoArchivo = await subirArchivoOlimpiadas(archivoFoto, "inscripciones/foto");
+      objetosSubidos.push(fotoArchivo);
+    }
 
     const validadaAlCrear = estadoInicial === "VALIDADO";
     const [resultado] = await connection.query(
@@ -1462,7 +1690,7 @@ router.post("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, manejarUploadOli
         normalizarTexto(req.body.detalle_medico), normalizarTexto(req.body.detalle_alimentario),
         normalizarTexto(req.body.observaciones), normalizarTexto(req.body.lugar_trabajo, 120),
         firmaArchivo, certificadoArchivo,
-        archivoCertificado ? archivoCertificado.originalname || null : null,
+        archivoCertificado ? nombreArchivoOriginal(archivoCertificado.originalname) : null,
         archivoCertificado ? archivoCertificado.mimetype || null : null,
         fotoArchivo,
         validadaAlCrear && actorEsStaff ? cabecera.id : null,
@@ -1506,11 +1734,8 @@ router.post("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, manejarUploadOli
     }
 
     if (actorEsStaff) {
-      await insertarNotificacion(connection, usuarioId, "OLIMPIADA_ESTADO",
-        `Te inscribimos a ${olimpiada.nombre}`,
-        estadoInicial === "VALIDADO"
-          ? `Tu departamental cargó tu inscripción a ${olimpiada.nombre} y ya está aprobada. Revisá el detalle y escribinos por el chat si tenés dudas.`
-          : `Tu departamental cargó tu inscripción a ${olimpiada.nombre}. Queda en revisión hasta que se cubran los bonos contribución.`,
+      const aviso = avisoAltaPorStaff({ rol: cabecera.rol, olimpiadaNombre: olimpiada.nombre, estado: estadoInicial });
+      await insertarNotificacion(connection, usuarioId, "OLIMPIADA_ESTADO", aviso.titulo, aviso.mensaje,
         { inscripcion_id: inscripcionId, olimpiada_id: olimpiadaId, estado: estadoInicial });
     } else {
       await notificarStaffOlimpiadas(connection, afiliado.departamental_id, "OLIMPIADA_NUEVA",
@@ -1519,18 +1744,20 @@ router.post("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, manejarUploadOli
         { inscripcion_id: inscripcionId, olimpiada_id: olimpiadaId, estado: estadoInicial });
     }
 
+    // Los lugares se descontaron del cupo de la departamental de la persona inscripta
+    const nombreDep = await nombreDepartamental(connection, afiliado.departamental_id);
     await connection.commit();
-    let message;
-    if (estadoInicial === "PENDIENTE") {
-      message = actorEsStaff
-        ? "Inscripción cargada. Asigná los bonos para validarla"
-        : "¡Inscripción enviada! Queda pendiente de aprobación de tu departamental";
-    } else {
-      message = actorEsStaff ? "Inscripción cargada y validada" : "¡Inscripción enviada! Nos vemos en las olimpiadas";
-    }
-    res.status(201).json({ success: true, id: inscripcionId, message, estado: estadoInicial });
+    transaccionConfirmada = true;
+    res.status(201).json({
+      success: true,
+      id: inscripcionId,
+      message: mensajeAltaInscripcion({ actorEsStaff, estado: estadoInicial, nombreDepartamental: nombreDep }),
+      estado: estadoInicial,
+      departamental: { id: normalizarIdPositivo(afiliado.departamental_id), nombre: nombreDep },
+    });
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection && !transaccionConfirmada) await connection.rollback();
+    if (!transaccionConfirmada) await eliminarObjetosS3Seguro(objetosSubidos);
     responderError(res, error, "Error al enviar la inscripción");
   } finally {
     if (connection) connection.release();
@@ -1784,6 +2011,9 @@ router.get("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, async (req, res) 
 // Edición (staff siempre; el afiliado mientras la ventana esté abierta y no esté cancelada)
 router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlimpiadas, async (req, res) => {
   let connection;
+  // Lo que se sube a S3 en este intento: si la transacción no se confirma, se borra (no quedan huérfanos)
+  const objetosSubidos = [];
+  let transaccionConfirmada = false;
   try {
     const cabecera = getCabecera(req);
     const inscripcionId = normalizarIdPositivo(req.params.id);
@@ -1809,6 +2039,10 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
     const acompaniantesParseo = normalizarAcompaniantes(req.body.acompaniantes, { permitirManual: actorEsStaff });
     if (acompaniantesParseo.error) return res.status(400).json(acompaniantesParseo.error);
     const acompaniantes = acompaniantesParseo.value;
+    const archivos = req.files || [];
+    const archivoCertificado = archivos.find((f) => f.fieldname === "CERTIFICADO");
+    const archivoFoto = archivos.find((f) => f.fieldname === "FOTO");
+    if (archivoFoto && !formatoFotoValido(archivoFoto)) return res.status(400).json(MENSAJE_FORMATO_FOTO);
 
     connection = await db.getConnection();
     await connection.beginTransaction();
@@ -1871,10 +2105,8 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
       }
     }
 
-    // Archivos nuevos (opcionales)
-    const archivos = req.files || [];
-    const archivoCertificado = archivos.find((f) => f.fieldname === "CERTIFICADO");
-    const archivoFoto = archivos.find((f) => f.fieldname === "FOTO");
+    // Archivos nuevos (opcionales). El anterior NO se borra de S3: es documentación personal (como la
+    // foto de perfil en user.js) y su key queda en olimpiada_historial.valor_anterior para auditoría.
     let certificadoArchivo = inscripcion.certificado_archivo;
     let certificadoNombre = inscripcion.certificado_nombre_original;
     let certificadoMime = inscripcion.certificado_mime;
@@ -1882,18 +2114,32 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
     let firmaArchivo = inscripcion.firma_archivo;
     if (archivoCertificado) {
       certificadoArchivo = await subirArchivoOlimpiadas(archivoCertificado, "inscripciones/certificado");
-      certificadoNombre = archivoCertificado.originalname || null;
+      objetosSubidos.push(certificadoArchivo);
+      certificadoNombre = nombreArchivoOriginal(archivoCertificado.originalname);
       certificadoMime = archivoCertificado.mimetype || null;
-      cambios.push({ campo: "certificado_archivo", anterior: inscripcion.certificado_archivo, nuevo: certificadoArchivo });
+      cambios.push({
+        campo: "certificado_archivo", anterior: inscripcion.certificado_archivo, nuevo: certificadoArchivo,
+        observacion: observacionCambioAdjunto({
+          campo: "certificado_archivo",
+          habia: Boolean(inscripcion.certificado_archivo),
+          // Tal cual: ya se guardó reparado. Repararlo otra vez rompe nombres válidos («NÓº1.pdf» → «NӺ1.pdf»).
+          nombreAnterior: inscripcion.certificado_nombre_original,
+          nombreNuevo: certificadoNombre,
+        }),
+      });
     }
     if (archivoFoto) {
-      if (!archivoFoto.mimetype?.startsWith("image/")) throw crearErrorHttp("La foto debe ser una imagen", 400);
       fotoArchivo = await subirArchivoOlimpiadas(archivoFoto, "inscripciones/foto");
-      cambios.push({ campo: "foto_archivo", anterior: inscripcion.foto_archivo, nuevo: fotoArchivo });
+      objetosSubidos.push(fotoArchivo);
+      cambios.push({
+        campo: "foto_archivo", anterior: inscripcion.foto_archivo, nuevo: fotoArchivo,
+        observacion: observacionCambioAdjunto({ campo: "foto_archivo", habia: Boolean(inscripcion.foto_archivo) }),
+      });
     }
     const firmaBase64 = normalizarTexto(req.body.firma);
     if (firmaBase64) {
       const nuevaFirma = await subirFirmaBase64(firmaBase64, "inscripciones/firma");
+      objetosSubidos.push(nuevaFirma);
       firmaArchivo = nuevaFirma;
       cambios.push({ campo: "firma_archivo", anterior: inscripcion.firma_archivo, nuevo: nuevaFirma });
     }
@@ -1966,10 +2212,13 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
       }
       await validarDisciplinasCategoria(connection, disciplinasFinales, categoria);
     }
+    // El formulario siempre reenvía los datos sanitarios: el cambio cuenta (historial y aviso) sólo si
+    // la lista quedó distinta.
     if (req.body.datos_sanitarios !== undefined) {
       const datoIds = normalizarIds(req.body.datos_sanitarios);
       if (!datoIds) throw crearErrorHttp("La lista de datos sanitarios contiene IDs inválidos", 400);
       await validarReferenciasSanitarias(connection, campos.grupo_sanguineo_id, datoIds);
+      const sanitariosAnteriores = await listaDatosSanitarios(connection, inscripcionId);
       await connection.query("DELETE FROM olimpiada_inscripcion_dato_sanitario WHERE inscripcion_id = ?", [inscripcionId]);
       for (const datoId of datoIds) {
         await connection.query(
@@ -1977,31 +2226,43 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
           [inscripcionId, datoId]
         );
       }
+      const sanitariosNuevos = await listaDatosSanitarios(connection, inscripcionId);
+      if ((sanitariosAnteriores || "") !== (sanitariosNuevos || "")) {
+        cambios.push({ campo: "datos_sanitarios", anterior: sanitariosAnteriores, nuevo: sanitariosNuevos });
+      }
     }
 
-    // Acompañantes (si vienen, se reemplaza el set completo y se recalculan los bonos)
-    let resumenAcompaniantesNuevo = null;
-    if (acompaniantes !== undefined) {
-      const resumenAnterior = await resumenAcompaniantesActual(connection, inscripcionId);
+    // Acompañantes (si vienen, se reemplaza el set completo y se recalculan los bonos). El formulario
+    // siempre los reenvía: el historial y el aviso cuentan sólo si el set cambió de verdad.
+    const acompaniantesRecibidos = acompaniantes !== undefined;
+    let acompaniantesCambiaron = false;
+    if (acompaniantesRecibidos) {
+      const anteriores = await acompaniantesGuardados(connection, inscripcionId);
       const tramos = await obtenerTramos(connection, inscripcion.olimpiada_id);
-      resumenAcompaniantesNuevo = await guardarAcompaniantes(connection, inscripcionId, acompaniantes, {
+      const resumenNuevo = await guardarAcompaniantes(connection, inscripcionId, acompaniantes, {
         tramos,
         bonosAfiliado: olimpiada.bonos_afiliado,
         fechaReferencia: olimpiada.fecha_inicio,
       });
-      await registrarHistorial(connection, {
-        entidad: "ACOMPANIANTE", entidad_id: inscripcionId,
-        olimpiada_id: inscripcion.olimpiada_id, inscripcion_id: inscripcionId,
-        usuario_id: cabecera.id, usuario_rol: cabecera.rol,
-        tipo_operacion: "UPDATE", campo_modificado: "acompaniantes",
-        valor_anterior: textoResumenAcompaniantes(resumenAnterior),
-        valor_nuevo: textoResumenAcompaniantes(resumenAcompaniantesNuevo),
-      });
+      acompaniantesCambiaron = !mismosAcompaniantes(anteriores, resumenNuevo.filas);
+      if (acompaniantesCambiaron) {
+        const textoAnterior = textoResumenAcompaniantes(resumenDeAcompaniantes(anteriores));
+        const textoNuevo = textoResumenAcompaniantes(resumenNuevo);
+        await registrarHistorial(connection, {
+          entidad: "ACOMPANIANTE", entidad_id: inscripcionId,
+          olimpiada_id: inscripcion.olimpiada_id, inscripcion_id: inscripcionId,
+          usuario_id: cabecera.id, usuario_rol: cabecera.rol,
+          tipo_operacion: "UPDATE", campo_modificado: "acompaniantes",
+          valor_anterior: textoAnterior,
+          valor_nuevo: textoNuevo,
+          observacion: textoAnterior === textoNuevo ? "Cambiaron los datos de algún acompañante." : null,
+        });
+      }
     }
 
     // Los cambios del afiliado necesitan una nueva revisión antes de acreditar.
     if (cabecera.rol === "afiliado" && inscripcion.estado === "VALIDADO" &&
-        (cambios.length > 0 || resumenAcompaniantesNuevo || req.body.datos_sanitarios !== undefined)) {
+        (cambios.length > 0 || acompaniantesRecibidos || req.body.datos_sanitarios !== undefined)) {
       await connection.query("UPDATE olimpiada_inscripcion SET estado='PENDIENTE', validado_por_usuario_id=NULL, fecha_validacion=NULL WHERE id=?", [inscripcionId]);
       cambios.push({ campo: "estado", anterior: "VALIDADO", nuevo: "PENDIENTE" });
     }
@@ -2013,11 +2274,12 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
         usuario_id: cabecera.id, usuario_rol: cabecera.rol,
         tipo_operacion: "UPDATE", campo_modificado: cambio.campo,
         valor_anterior: cambio.anterior, valor_nuevo: cambio.nuevo,
+        observacion: cambio.observacion,
       });
     }
 
-    // Avisar a la otra parte si hubo cambios
-    if (cambios.length > 0 || resumenAcompaniantesNuevo) {
+    // Avisar a la otra parte sólo si algo cambió de verdad
+    if (cambios.length > 0 || acompaniantesCambiaron) {
       if (cabecera.rol === "afiliado") {
         await notificarStaffOlimpiadas(connection, inscripcion.departamental_id, "OLIMPIADA_ACTUALIZADA",
           `Inscripción #${inscripcionId} actualizada`,
@@ -2032,9 +2294,11 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
     }
 
     await connection.commit();
+    transaccionConfirmada = true;
     res.status(200).json({ success: true, message: "Inscripción actualizada" });
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection && !transaccionConfirmada) await connection.rollback();
+    if (!transaccionConfirmada) await eliminarObjetosS3Seguro(objetosSubidos);
     responderError(res, error, "Error al actualizar la inscripción");
   } finally {
     if (connection) connection.release();
@@ -2480,6 +2744,8 @@ router.get("/olimpiadas/historial", verifyToken, async (req, res) => {
 
 router.__test = Object.freeze({
   ESTADOS_EDICION,
+  MENSAJE_FORMATO_FOTO,
+  avisoAltaPorStaff,
   calcularEstadoEdicion,
   decodificarFirmaBase64,
   detectarMimeArchivo,
@@ -2487,12 +2753,21 @@ router.__test = Object.freeze({
   estaVentanaInscripcionAbierta,
   estadoInicialInscripcion,
   fechaHoyBuenosAires,
+  formatoFotoValido,
   idsPositivosIguales,
+  mensajeAltaInscripcion,
+  mismosAcompaniantes,
+  nombreArchivoOriginal,
+  nombreDepartamental,
   normalizarAcompaniantes,
   normalizarCupo,
   normalizarIdPositivo,
   normalizarIds,
+  obtenerDisciplinasOlimpiada,
+  observacionCambioAdjunto,
   permisosInscripcion,
+  resolverAfiliadoDestino,
+  textoCupo,
   textoResumenAcompaniantes,
   transicionPermitida,
   validarCapacidadDisciplinas,

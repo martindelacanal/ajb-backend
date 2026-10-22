@@ -22,6 +22,7 @@ const crypto = require("crypto");
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const { normalizarFechaCivil } = require("../services/valores-dominio");
+const { leerCodigoBuscado } = require("../services/busqueda-codigos");
 
 // ---------------------------------------------------------------------------
 // S3
@@ -1039,7 +1040,13 @@ router.get("/traslados/solicitudes", verifyToken, async (req, res) => {
     }
     const search = normalizarTexto(req.query.search);
     if (search && search.length > 200) return res.status(400).json("La búsqueda es demasiado larga");
-    if (search) {
+    // El código de la solicitud ("TR-12", "TR12" o "#12"; el front ya manda "TR-12")
+    // trae esa solicitud y nada más: "TR-12" no trae TR-120. El resto busca amplio.
+    const codigo = search ? leerCodigoBuscado(search, "TR") : null;
+    if (codigo) {
+      condiciones.push("s.id = ?");
+      params.push(codigo.id);
+    } else if (search) {
       condiciones.push(`(CONCAT('TR-', s.id) LIKE ? OR dor.nombre LIKE ? OR des.nombre LIKE ?
         OR u.nombre LIKE ? OR u.apellido LIKE ? OR CONCAT(u.apellido, ', ', u.nombre) LIKE ?
         OR CAST(u.documento AS CHAR) LIKE ? OR DATE_FORMAT(s.fecha_creacion, '%d/%m/%Y') LIKE ?
