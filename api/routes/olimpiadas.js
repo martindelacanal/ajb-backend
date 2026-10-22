@@ -205,6 +205,17 @@ function textoResumenAcompaniantes({ cantidad, bonos }) {
   return `${n} acompañante${n === 1 ? "" : "s"} (${Number(bonos) || 0} bonos)`;
 }
 
+// Nombre de pantalla de cada estado de una inscripción (como en la ficha y en Inscriptos)
+const NOMBRES_ESTADO_INSCRIPCION = { PENDIENTE: "En revisión", VALIDADO: "Aprobada", CANCELADO: "Cancelada" };
+
+// Lo que el historial guarda al crear una inscripción. Lo lee el staff tal cual:
+// «Inscripción de Pérez, Ana · Atleta · 1 disciplina · En revisión» (no «1 disciplinas · PENDIENTE»).
+function resumenAltaInscripcion({ apellido, nombre, categoria, cantidadDisciplinas, estado }) {
+  const n = Number(cantidadDisciplinas) || 0;
+  const disciplinas = `${n} disciplina${n === 1 ? "" : "s"}`;
+  return `Inscripción de ${apellido}, ${nombre} · ${categoria} · ${disciplinas} · ${NOMBRES_ESTADO_INSCRIPCION[estado] || estado}`;
+}
+
 function resumenDeAcompaniantes(filas) {
   return {
     cantidad: (filas || []).length,
@@ -1721,7 +1732,10 @@ router.post("/olimpiadas/:id(\\d+)/inscripciones", verifyToken, manejarUploadOli
       olimpiada_id: olimpiadaId, inscripcion_id: inscripcionId,
       usuario_id: cabecera.id, usuario_rol: cabecera.rol,
       tipo_operacion: "CREATE",
-      valor_nuevo: `Inscripción de ${afiliado.apellido}, ${afiliado.nombre} · ${categoria.nombre} · ${disciplinaIds.length} disciplinas · ${estadoInicial}`,
+      valor_nuevo: resumenAltaInscripcion({
+        apellido: afiliado.apellido, nombre: afiliado.nombre, categoria: categoria.nombre,
+        cantidadDisciplinas: disciplinaIds.length, estado: estadoInicial,
+      }),
     });
     if (resumenAcompaniantes.cantidad > 0) {
       await registrarHistorial(connection, {
@@ -2767,6 +2781,7 @@ router.__test = Object.freeze({
   observacionCambioAdjunto,
   permisosInscripcion,
   resolverAfiliadoDestino,
+  resumenAltaInscripcion,
   textoCupo,
   textoResumenAcompaniantes,
   transicionPermitida,

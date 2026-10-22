@@ -18,6 +18,7 @@ const {
   normalizarAcompaniantes,
   observacionCambioAdjunto,
   permisosInscripcion,
+  resumenAltaInscripcion,
   textoCupo,
   textoResumenAcompaniantes,
   transicionPermitida,
@@ -132,6 +133,27 @@ test("acompañantes: resumen legible en singular y plural", () => {
   assert.equal(textoResumenAcompaniantes({ cantidad: 1, bonos: 6 }), "1 acompañante (6 bonos)");
   assert.equal(textoResumenAcompaniantes({ cantidad: 3, bonos: 17 }), "3 acompañantes (17 bonos)");
   assert.equal(textoResumenAcompaniantes({ cantidad: 0, bonos: 0 }), "0 acompañantes (0 bonos)");
+});
+
+// El historial muestra este texto tal cual («Ahora» de «Se creó la inscripción»)
+test("alta: el resumen del historial va con el plural correcto y el estado como se ve en pantalla", () => {
+  const datos = { apellido: "Staffa", nombre: "Nahuel", categoria: "Atleta" };
+  assert.equal(
+    resumenAltaInscripcion({ ...datos, cantidadDisciplinas: 1, estado: "PENDIENTE" }),
+    "Inscripción de Staffa, Nahuel · Atleta · 1 disciplina · En revisión"
+  );
+  assert.equal(
+    resumenAltaInscripcion({ ...datos, cantidadDisciplinas: 3, estado: "VALIDADO" }),
+    "Inscripción de Staffa, Nahuel · Atleta · 3 disciplinas · Aprobada"
+  );
+  assert.equal(
+    resumenAltaInscripcion({ ...datos, cantidadDisciplinas: 2, estado: "CANCELADO" }),
+    "Inscripción de Staffa, Nahuel · Atleta · 2 disciplinas · Cancelada"
+  );
+  // Ningún código de estado crudo, en ninguno de los estados con que puede nacer
+  for (const estado of ["PENDIENTE", "VALIDADO"]) {
+    assert.doesNotMatch(resumenAltaInscripcion({ ...datos, cantidadDisciplinas: 1, estado }), /PENDIENTE|VALIDADO|1 disciplinas/);
+  }
 });
 
 // ---------------------------------------------------------------------------
