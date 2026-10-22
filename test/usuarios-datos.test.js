@@ -724,7 +724,8 @@ test("cambiar el parentesco recalcula es_familiar y corrige la etiqueta en reser
   const resultado = await actualizarDatosUsuario(conexion, { actor: DEPARTAMENTAL_1, usuarioId: 22, cambios: { parentesco_id: 2 } });
   assert.deepEqual(resultado.cambios.map(({ campo, valorNuevo }) => [campo, valorNuevo]), [["parentesco_id", 2], ["es_familiar", "S"]]);
   const [consultaReservas] = consultas(conexion, /FROM reserva_familiar rf INNER JOIN reserva r/);
-  assert.deepEqual(consultaReservas.params[1], [1, 2, 3, 6, 7, 9, 10, 11]);
+  // Incluye «Pendiente de firma» (15): la persona firma con sus datos al día.
+  assert.deepEqual(consultaReservas.params[1], [1, 2, 3, 6, 7, 9, 10, 11, 15]);
   assert.match(consultaReservas.sql, /FOR UPDATE OF rf$/);
   assert.match(consultaReservas.sql, /NOT EXISTS \(SELECT 1 FROM reserva_aprobacion_titular a WHERE a.reserva_id = r.id\)/);
   assert.deepEqual(consultas(conexion, /^UPDATE reserva_familiar/)[0].params, [2, 90]);

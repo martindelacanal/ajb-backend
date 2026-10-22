@@ -19,6 +19,7 @@
  * Los helpers compartidos (auth, normalización, S3, historial, notificaciones, reglas de bonos)
  * están en services/olimpiadas-comun.js.
  */
+const crypto = require("crypto");
 const express = require("express");
 const router = express.Router();
 const mysqlConnection = require("../connection/connection");
@@ -88,7 +89,8 @@ function valorInformado(valor) {
 
 /**
  * Estado con el que nace una inscripción.
- *  - Afiliado: siempre PENDIENTE hasta la revisión del equipo responsable.
+ *  - Afiliado: siempre PENDIENTE hasta la revisión del equipo responsable. La aprobación del afiliado es
+ *    obligatoria en todas las ediciones (`olimpiada.requiere_aprobacion` ya no se consulta).
  *  - Staff: PENDIENTE sólo si la edición exige bonos para validar (los asigna después); si no, VALIDADO.
  */
 function estadoInicialInscripcion({ rol, olimpiada }) {
@@ -223,20 +225,143 @@ function resumenDeAcompaniantes(filas) {
   };
 }
 
-// ¿Cambió de verdad el set de acompañantes? El formulario siempre reenvía la lista completa aunque nadie
-// la haya tocado: se comparan las personas con sus datos y bonos, sin importar el orden.
-function firmaAcompaniante(a) {
+// ---------------------------------------------------------------------------
+// «Guardar cambios»: qué cambió de verdad. El formulario reenvía todos los campos aunque nadie los toque,
+// así que cada uno se compara con lo guardado y sólo cuenta (historial, aviso, vuelta a revisión) lo que
+// quedó distinto. Lo que no cambió no se reescribe.
+// ---------------------------------------------------------------------------
+
+// Texto para comparar: sin espacios en los extremos y con los saltos de línea unificados (el navegador manda
+// CRLF por FormData y lo cargado por otra vía puede tener LF). null y "" son lo mismo.
+function textoComparable(valor) {
+  return String(valor ?? "").replace(/\r\n?/g, "\n").trim();
+}
+
+// Mismo conjunto de ids sin importar el orden (disciplinas y antecedentes: no se repiten por inscripción).
+function mismosIds(anteriores, nuevos) {
+  const antes = [...new Set((anteriores || []).map(Number))].sort((a, b) => a - b);
+  const ahora = [...new Set((nuevos || []).map(Number))].sort((a, b) => a - b);
+  return antes.length === ahora.length && antes.every((id, indice) => id === ahora[indice]);
+}
+
+// Datos que carga la persona de cada acompañante. El documento se compara sólo con dígitos (el formulario lo
+// manda así y hay guardados con puntos) y el vínculo vacío es «Otro» (así lo muestra y lo reenvía el formulario).
+function firmaDatosAcompaniante(a) {
   return JSON.stringify([
-    a.nombre ?? "", a.apellido ?? "", a.documento ?? "", normalizarFechaCivil(a.fecha_nacimiento) ?? "",
-    a.vinculo ?? "", Number(a.es_afiliado) === 1 ? 1 : 0, Number(a.bonos) || 0,
-    Number(a.bonos_manual) === 1 ? 1 : 0, a.observacion ?? "",
+    textoComparable(a.nombre), textoComparable(a.apellido), String(a.documento ?? "").replace(/\D/g, ""),
+    normalizarFechaCivil(a.fecha_nacimiento) ?? "", textoComparable(a.vinculo) || "Otro",
+    Number(a.es_afiliado) === 1 ? 1 : 0, textoComparable(a.observacion),
   ]);
 }
 
+// Los bonos calculados por edad no cuentan (dependen de las reglas vigentes y se recalculan al leer);
+// los que el staff fijó a mano sí.
+function firmaAcompaniante(a) {
+  const manual = Number(a.bonos_manual) === 1;
+  return JSON.stringify([firmaDatosAcompaniante(a), manual ? 1 : 0, manual ? Number(a.bonos) || 0 : null]);
+}
+
+// ¿Cambió de verdad el set de acompañantes? Se comparan las personas con sus datos, sin importar el orden.
 function mismosAcompaniantes(anteriores, nuevos) {
   const antes = (anteriores || []).map(firmaAcompaniante).sort();
   const ahora = (nuevos || []).map(firmaAcompaniante).sort();
   return antes.length === ahora.length && antes.every((firma, indice) => firma === ahora[indice]);
+}
+
+// El afiliado no ve ni puede tocar los bonos que el staff fijó a mano: si reenvía a la misma persona con los
+// mismos datos, se conservan. Si le cambió algún dato, vuelve al cálculo por edad (y la inscripción, a revisión).
+function conservarBonosManuales(anteriores, nuevos) {
+  const manuales = (anteriores || []).filter((a) => Number(a.bonos_manual) === 1);
+  return (nuevos || []).map((nuevo) => {
+    const firma = firmaDatosAcompaniante(nuevo);
+    const indice = manuales.findIndex((a) => firmaDatosAcompaniante(a) === firma);
+    if (indice === -1) return nuevo;
+    const [anterior] = manuales.splice(indice, 1);
+    return { ...nuevo, bonos_manual: 1, bonos: Number(anterior.bonos) || 0 };
+  });
+}
+
+// Versión de una inscripción: el estado y todo lo que el formulario carga y reenvía (datos, archivos, categoría,
+// disciplinas, antecedentes y acompañantes con los bonos fijados a mano). Viaja en el detalle y el formulario la
+// devuelve al guardar: si ya no coincide, alguien la cambió mientras estaba abierto (el staff corrigió un dato, la
+// aprobaron…) y guardar pisaría ese cambio o la devolvería a revisión sin preguntar. Hash corto como
+// versionSolicitud (familiares-cambios): fecha_modificacion no alcanza, las tablas hijas no la mueven.
+const CAMPOS_TEXTO_VERSION_INSCRIPCION = [
+  "tension_arterial", "detalle_medico", "detalle_alimentario", "observaciones", "lugar_trabajo",
+  "foto_archivo", "certificado_archivo", "firma_archivo",
+];
+function versionInscripcion(inscripcion, { disciplinaIds, datoSanitarioIds, acompaniantes }) {
+  const canonico = [
+    inscripcion.estado ?? null,
+    Number(inscripcion.categoria_tipo_id) || null,
+    Number(inscripcion.grupo_sanguineo_id) || null,
+    CAMPOS_TEXTO_VERSION_INSCRIPCION.map((campo) => inscripcion[campo] ?? null),
+    [...new Set((disciplinaIds || []).map(Number))].sort((a, b) => a - b),
+    [...new Set((datoSanitarioIds || []).map(Number))].sort((a, b) => a - b),
+    (acompaniantes || []).map(firmaAcompaniante).sort(),
+  ];
+  return crypto.createHash("sha256").update(JSON.stringify(canonico)).digest("hex").slice(0, 16);
+}
+
+// Cómo se nombra cada campo en los avisos y en el historial, en el orden del formulario y con sus rótulos
+// («Presión arterial habitual», «¿Tiene alguno de estos antecedentes?»…). «estado» no se nombra: es la
+// consecuencia, no un dato que cargó la persona.
+const NOMBRES_CAMPOS_INSCRIPCION = [
+  ["categoria_tipo_id", "la categoría"],
+  ["disciplinas", "las disciplinas"],
+  ["acompaniantes", "los acompañantes"],
+  ["tension_arterial", "la presión arterial"],
+  ["grupo_sanguineo_id", "el grupo sanguíneo"],
+  ["lugar_trabajo", "el lugar de trabajo"],
+  ["datos_sanitarios", "los antecedentes de salud"],
+  ["detalle_medico", "el detalle médico"],
+  ["detalle_alimentario", "el detalle alimentario"],
+  ["observaciones", "las observaciones"],
+  ["foto_archivo", "la foto"],
+  ["certificado_archivo", "el certificado médico"],
+  ["firma_archivo", "la firma"],
+];
+
+// «la presión arterial», «las disciplinas y la foto», «la categoría, las disciplinas y la foto». "" si no hay.
+function textoCamposCambiados(campos) {
+  const elegidos = new Set(campos || []);
+  const nombres = NOMBRES_CAMPOS_INSCRIPCION.filter(([campo]) => elegidos.has(campo)).map(([, nombre]) => nombre);
+  if (nombres.length <= 1) return nombres[0] || "";
+  return `${nombres.slice(0, -1).join(", ")} y ${nombres[nombres.length - 1]}`;
+}
+
+// Aviso al staff cuando el afiliado cambia su inscripción: quién, qué cambió y si volvió a revisión (se puede
+// reaprobar desde la lista sin abrirla, por eso nombra los cambios).
+function avisoEdicionAfiliado({ inscripcionId, persona, campos, volvioARevision }) {
+  const quien = persona || "El afiliado";
+  const que = textoCamposCambiados(campos) || "algunos datos";
+  if (volvioARevision) {
+    return {
+      titulo: `Inscripción #${inscripcionId} actualizada y de vuelta en revisión`,
+      mensaje: `${quien} cambió ${que} de su inscripción aprobada. Volvió a «En revisión»: revisá los cambios y aprobala de nuevo para que pueda descargar el gafete.`,
+    };
+  }
+  return {
+    titulo: `Inscripción #${inscripcionId} actualizada`,
+    mensaje: `${quien} cambió ${que} de su inscripción.`,
+  };
+}
+
+// Respuesta de «Guardar cambios» (se ve en el aviso de abajo de la pantalla).
+function mensajeEdicionInscripcion({ actorEsStaff, huboCambios, volvioARevision, estado }) {
+  if (actorEsStaff) return huboCambios ? "Inscripción actualizada" : "No había cambios para guardar.";
+  if (!huboCambios) {
+    if (estado === "VALIDADO") return "No había cambios para guardar: tu inscripción sigue aprobada.";
+    if (estado === "PENDIENTE") return "No había cambios para guardar: tu inscripción sigue en revisión.";
+    return "No había cambios para guardar.";
+  }
+  if (volvioARevision) {
+    return "Guardamos los cambios. Tu inscripción volvió a «En revisión»: vas a poder descargar el gafete cuando tu departamental la apruebe de nuevo.";
+  }
+  if (estado === "PENDIENTE") {
+    return "Guardamos los cambios. Tu inscripción sigue en revisión: te avisamos cuando tu departamental la apruebe.";
+  }
+  return "Guardamos los cambios.";
 }
 
 // Cupo de una departamental en los mensajes («el cupo de La Plata»). Sin nombre = inscripciones viejas sin
@@ -400,8 +525,8 @@ async function validarDisciplinasCategoria(db, disciplinaIds, categoria) {
   }
 }
 
-// Reemplaza el set de acompañantes de una inscripción calculando los bonos de cada uno.
-// Devuelve el resumen y las filas tal como quedaron guardadas (para compararlas con las anteriores).
+// Reemplaza el set de acompañantes de una inscripción calculando los bonos de cada uno (los manuales se
+// respetan). Devuelve el resumen (cantidad y bonos) y las filas tal como quedaron guardadas.
 async function guardarAcompaniantes(connection, inscripcionId, acompaniantes, { tramos, bonosAfiliado, fechaReferencia }) {
   await connection.query("DELETE FROM olimpiada_inscripcion_acompaniante WHERE inscripcion_id = ?", [inscripcionId]);
   let totalBonos = 0;
@@ -429,7 +554,7 @@ async function acompaniantesGuardados(db, inscripcionId) {
   return filas;
 }
 
-// Datos sanitarios de una inscripción como texto (para comparar y para el historial). null = ninguno.
+// Datos sanitarios de una inscripción como texto (para el historial). null = ninguno.
 async function listaDatosSanitarios(db, inscripcionId) {
   const [[fila]] = await db.query(
     `SELECT GROUP_CONCAT(ds.nombre ORDER BY ds.nombre SEPARATOR ', ') AS lista
@@ -439,6 +564,40 @@ async function listaDatosSanitarios(db, inscripcionId) {
     [inscripcionId]
   );
   return fila?.lista || null;
+}
+
+// Disciplinas de una inscripción como texto (para el historial). null = ninguna.
+async function listaDisciplinas(db, inscripcionId) {
+  const [[fila]] = await db.query(
+    `SELECT GROUP_CONCAT(d.nombre ORDER BY d.nombre SEPARATOR ', ') AS lista
+     FROM olimpiada_inscripcion_disciplina idp
+     INNER JOIN olimpiada_disciplina d ON d.id = idp.disciplina_id
+     WHERE idp.inscripcion_id = ?`,
+    [inscripcionId]
+  );
+  return fila?.lista || null;
+}
+
+// Ids guardados de las disciplinas y de los antecedentes de salud (para saber si el formulario los cambió)
+async function idsDisciplinasGuardadas(db, inscripcionId) {
+  const [filas] = await db.query("SELECT disciplina_id FROM olimpiada_inscripcion_disciplina WHERE inscripcion_id = ?", [inscripcionId]);
+  return filas.map((fila) => Number(fila.disciplina_id));
+}
+
+async function idsDatosSanitariosGuardados(db, inscripcionId) {
+  const [filas] = await db.query(
+    "SELECT dato_sanitario_id FROM olimpiada_inscripcion_dato_sanitario WHERE inscripcion_id = ?",
+    [inscripcionId]
+  );
+  return filas.map((fila) => Number(fila.dato_sanitario_id));
+}
+
+// «Pérez, Ana» para los avisos al staff. null si no se encuentra (el aviso dice «El afiliado»).
+async function nombrePersona(db, usuarioId) {
+  const [filas] = await db.query("SELECT apellido, nombre FROM usuario WHERE id = ?", [usuarioId]);
+  const persona = filas[0];
+  if (!persona) return null;
+  return [persona.apellido, persona.nombre].map((parte) => textoComparable(parte)).filter(Boolean).join(", ") || null;
 }
 
 // Nombre de la departamental para los mensajes del cupo. null = sin departamental.
@@ -1082,15 +1241,19 @@ router.get("/olimpiadas/actual", verifyToken, async (req, res) => {
       reglasBonos = {
         valor_bono: Number(referencia.valor_bono) || 0,
         bonos_afiliado: Number(referencia.bonos_afiliado) || 0,
-        requiere_aprobacion: Number(referencia.requiere_aprobacion) === 1 ? 1 : 0,
+        // Fijo: la aprobación del afiliado es obligatoria (se sigue mandando para los fronts viejos en caché)
+        requiere_aprobacion: 1,
         exigir_bonos_para_validar: Number(referencia.exigir_bonos_para_validar) === 1 ? 1 : 0,
         tramos: await obtenerTramos(db, referencia.id),
       };
     }
 
+    // requiere_aprobacion va fijo en 1, como en las demás respuestas: una edición que haya quedado en 0 (se podía
+    // apagar en Bonos › Reglas) no lo muestra hasta que se la guarde
+    const conAprobacionFija = (fila) => (fila ? { ...fila, requiere_aprobacion: 1 } : null);
     res.status(200).json({
-      olimpiada,
-      proxima,
+      olimpiada: conAprobacionFija(olimpiada),
+      proxima: conAprobacionFija(proxima),
       disciplinas,
       inscripcion,
       inscripcion_abierta: !!olimpiada,
@@ -1117,7 +1280,7 @@ router.get("/olimpiadas", verifyToken, async (req, res) => {
       `SELECT o.id, o.nombre, o.edicion, o.localidad, o.descripcion,
               o.fecha_inicio, o.fecha_fin, o.fecha_inicio_inscripcion, o.fecha_fin_inscripcion,
               o.texto_licencia, o.habilitado, o.fecha_creacion,
-              o.valor_bono, o.bonos_afiliado, o.requiere_aprobacion, o.exigir_bonos_para_validar,
+              o.valor_bono, o.bonos_afiliado, o.exigir_bonos_para_validar,
               o.fecha_sorteo, o.sorteo_publicado, o.publicada_publico,
               (SELECT COUNT(*) FROM olimpiada_inscripcion i
                WHERE i.olimpiada_id = o.id AND i.eliminado = 0
@@ -1143,7 +1306,8 @@ router.get("/olimpiadas", verifyToken, async (req, res) => {
       ]
     );
     const hoy = fechaHoyBuenosAires();
-    res.status(200).json(olimpiadas.map((o) => ({ ...o, estado_edicion: calcularEstadoEdicion(o, hoy) })));
+    // requiere_aprobacion va fijo en 1: la aprobación del afiliado es obligatoria en todas las ediciones
+    res.status(200).json(olimpiadas.map((o) => ({ ...o, requiere_aprobacion: 1, estado_edicion: calcularEstadoEdicion(o, hoy) })));
   } catch (error) {
     registrarErrorRuta(error);
     res.status(500).json("Error al obtener las olimpiadas");
@@ -1167,6 +1331,7 @@ router.get("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
     );
     res.status(200).json({
       ...olimpiada,
+      requiere_aprobacion: 1, // fijo: la aprobación del afiliado es obligatoria (la columna ya no se lee)
       estado_edicion: calcularEstadoEdicion(olimpiada),
       disciplinas,
       tramos: await obtenerTramos(db, olimpiadaId),
@@ -1245,13 +1410,15 @@ function normalizarOpcionalesOlimpiada(body) {
     if (bonos === null || bonos > MAX_BONOS_MANUAL) return { error: `Los bonos por afiliado deben ser un entero entre 0 y ${MAX_BONOS_MANUAL}` };
     opcionales.bonos_afiliado = bonos;
   }
-  for (const campo of ["requiere_aprobacion", "exigir_bonos_para_validar", "publicada_publico"]) {
+  // requiere_aprobacion no se lee del body (si llega de un front viejo en caché, se ignora aunque sea inválido)
+  for (const campo of ["exigir_bonos_para_validar", "publicada_publico"]) {
     if (!valorInformado(body[campo])) continue;
     const bandera = normalizarBooleano01(body[campo]);
     if (bandera === null) return { error: `El campo ${campo} debe ser 1 o 0` };
     opcionales[campo] = bandera;
   }
-  // La aprobación de solicitudes de afiliados es obligatoria en todas las ediciones.
+  // La aprobación de solicitudes de afiliados es obligatoria en todas las ediciones: se escribe siempre 1
+  // (la columna se conserva por historial; el PUT corrige una edición que haya quedado en 0).
   opcionales.requiere_aprobacion = 1;
   return { value: opcionales };
 }
@@ -1910,7 +2077,6 @@ router.get("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, async (req, res) 
               o.fecha_inicio_inscripcion AS olimpiada_fecha_inicio_inscripcion,
               o.fecha_fin_inscripcion AS olimpiada_fecha_fin_inscripcion,
               o.valor_bono AS olimpiada_valor_bono, o.bonos_afiliado AS olimpiada_bonos_afiliado,
-              o.requiere_aprobacion AS olimpiada_requiere_aprobacion,
               o.exigir_bonos_para_validar AS olimpiada_exigir_bonos,
               o.bono_numero_hasta AS olimpiada_bono_numero_hasta,
               dep.nombre AS departamental_nombre,
@@ -2000,7 +2166,7 @@ router.get("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, async (req, res) 
     res.status(200).json({
       ...inscripcion,
       planilla_descuento: Number(inscripcion.planilla_descuento) === 1 ? 1 : 0,
-      olimpiada_requiere_aprobacion: Number(inscripcion.olimpiada_requiere_aprobacion) === 1 ? 1 : 0,
+      olimpiada_requiere_aprobacion: 1, // fijo: la aprobación del afiliado es obligatoria (fronts viejos en caché)
       olimpiada_exigir_bonos: Number(inscripcion.olimpiada_exigir_bonos) === 1 ? 1 : 0,
       inscripcion_abierta: estaVentanaInscripcionAbierta(olimpiada),
       disciplinas: await firmarIconosDisciplinas(disciplinas),
@@ -2015,6 +2181,12 @@ router.get("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, async (req, res) 
       certificado_url: await firmarSeguro(inscripcion.certificado_archivo),
       foto_url: await firmarSeguro(inscripcion.foto_archivo),
       permisos: permisosInscripcion({ cabecera, inscripcion, olimpiada }),
+      // El formulario la devuelve al guardar: así el PUT sabe si alguien la cambió mientras estaba abierto
+      version: versionInscripcion(inscripcion, {
+        disciplinaIds: disciplinas.map((disciplina) => disciplina.id),
+        datoSanitarioIds: datosSanitarios.map((dato) => dato.id),
+        acompaniantes: resumen.acompaniantes,
+      }),
     });
   } catch (error) {
     registrarErrorRuta(error);
@@ -2053,6 +2225,11 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
     const acompaniantesParseo = normalizarAcompaniantes(req.body.acompaniantes, { permitirManual: actorEsStaff });
     if (acompaniantesParseo.error) return res.status(400).json(acompaniantesParseo.error);
     const acompaniantes = acompaniantesParseo.value;
+    // La presión es obligatoria, como en el alta: si llega en blanco (o sólo con espacios) no se conserva la
+    // anterior en silencio diciendo que no había cambios. Si no llega, queda la guardada.
+    if (req.body.tension_arterial !== undefined && !normalizarTexto(req.body.tension_arterial, 20)) {
+      return res.status(400).json(actorEsStaff ? "Indicá la presión arterial habitual del afiliado" : "Indicá tu presión arterial habitual");
+    }
     const archivos = req.files || [];
     const archivoCertificado = archivos.find((f) => f.fieldname === "CERTIFICADO");
     const archivoFoto = archivos.find((f) => f.fieldname === "FOTO");
@@ -2077,6 +2254,20 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
         throw crearErrorHttp("La inscripción ya cerró: pedí los cambios por el chat", 409);
       }
       if (inscripcion.estado === "CANCELADO") throw crearErrorHttp("La inscripción está cancelada", 409);
+    }
+    // El formulario manda la versión que cargó (versionInscripcion): si alguien cambió la inscripción mientras
+    // estaba abierto, guardar pisaría ese cambio o, si la aprobaron, la devolvería a revisión sin preguntar.
+    // Se pide recargar. Sin versión (un formulario anterior) se guarda como siempre.
+    const versionVista = normalizarTexto(req.body.version, 64);
+    if (versionVista) {
+      const versionActual = versionInscripcion(inscripcion, {
+        disciplinaIds: await idsDisciplinasGuardadas(connection, inscripcionId),
+        datoSanitarioIds: await idsDatosSanitariosGuardados(connection, inscripcionId),
+        acompaniantes: await acompaniantesGuardados(connection, inscripcionId),
+      });
+      if (versionActual !== versionVista) {
+        throw crearErrorHttp("La inscripción cambió mientras se editaba. Recargá e intentá nuevamente.", 409);
+      }
     }
 
     const cambios = [];
@@ -2114,7 +2305,10 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
     await validarReferenciasSanitarias(connection, campos.grupo_sanguineo_id, []);
     for (const [campo, valorNuevo] of Object.entries(campos)) {
       const valorAnterior = inscripcion[campo];
-      if ((valorAnterior ?? "") !== (valorNuevo ?? "")) {
+      if (textoComparable(valorAnterior) === textoComparable(valorNuevo)) {
+        // Sin cambio real (a lo sumo otros saltos de línea o espacios en los extremos): queda como estaba
+        campos[campo] = valorAnterior ?? null;
+      } else {
         cambios.push({ campo, anterior: valorAnterior, nuevo: valorNuevo });
       }
     }
@@ -2158,109 +2352,100 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
       cambios.push({ campo: "firma_archivo", anterior: inscripcion.firma_archivo, nuevo: nuevaFirma });
     }
 
-    const [actualizacionInscripcion] = await connection.query(
-      `UPDATE olimpiada_inscripcion
-       SET tension_arterial = ?, grupo_sanguineo_id = ?, detalle_medico = ?, detalle_alimentario = ?,
-           observaciones = ?, lugar_trabajo = ?, firma_archivo = ?,
-           certificado_archivo = ?, certificado_nombre_original = ?, certificado_mime = ?, foto_archivo = ?,
-           categoria_tipo_id = ?
-       WHERE id = ? AND estado = ? AND eliminado = 0`,
-      [
-        campos.tension_arterial, campos.grupo_sanguineo_id, campos.detalle_medico, campos.detalle_alimentario,
-        campos.observaciones, campos.lugar_trabajo, firmaArchivo,
-        certificadoArchivo, certificadoNombre, certificadoMime, fotoArchivo,
-        categoriaTipoId,
-        inscripcionId, inscripcion.estado,
-      ]
-    );
-    if (actualizacionInscripcion.affectedRows !== 1) {
-      throw crearErrorHttp("La inscripción cambió mientras se editaba. Recargá e intentá nuevamente.", 409);
+    // La fila se reescribe sólo si cambió algo de ella (datos, categoría o archivos). La transacción ya la
+    // bloqueó (FOR UPDATE); el estado en el WHERE es el resguardo de siempre.
+    if (cambios.length > 0) {
+      const [actualizacionInscripcion] = await connection.query(
+        `UPDATE olimpiada_inscripcion
+         SET tension_arterial = ?, grupo_sanguineo_id = ?, detalle_medico = ?, detalle_alimentario = ?,
+             observaciones = ?, lugar_trabajo = ?, firma_archivo = ?,
+             certificado_archivo = ?, certificado_nombre_original = ?, certificado_mime = ?, foto_archivo = ?,
+             categoria_tipo_id = ?
+         WHERE id = ? AND estado = ? AND eliminado = 0`,
+        [
+          campos.tension_arterial, campos.grupo_sanguineo_id, campos.detalle_medico, campos.detalle_alimentario,
+          campos.observaciones, campos.lugar_trabajo, firmaArchivo,
+          certificadoArchivo, certificadoNombre, certificadoMime, fotoArchivo,
+          categoriaTipoId,
+          inscripcionId, inscripcion.estado,
+        ]
+      );
+      if (actualizacionInscripcion.affectedRows !== 1) {
+        throw crearErrorHttp("La inscripción cambió mientras se editaba. Recargá e intentá nuevamente.", 409);
+      }
     }
 
-    // Disciplinas y datos sanitarios (si vienen, se reemplazan)
+    // Disciplinas: el formulario siempre las reenvía. Si quedan las mismas no se tocan (ya ocupan su lugar en
+    // el cupo); si cambian, se controla el cupo y se reemplazan.
     let disciplinasFinales = null;
     if (req.body.disciplinas !== undefined) {
       const disciplinaIds = normalizarIds(req.body.disciplinas);
       if (!disciplinaIds || disciplinaIds.length === 0) throw crearErrorHttp("Elegí al menos una disciplina con IDs válidos", 400);
-      await validarCapacidadDisciplinas(connection, {
-        olimpiadaId: inscripcion.olimpiada_id,
-        departamentalId: inscripcion.departamental_id,
-        disciplinaIds,
-        excluirInscripcionId: inscripcionId,
-        controlarCapacidad: ESTADOS_ACTIVOS.includes(inscripcion.estado),
-      });
-      const [anteriores] = await connection.query(
-        `SELECT GROUP_CONCAT(d.nombre ORDER BY d.nombre SEPARATOR ', ') AS lista
-         FROM olimpiada_inscripcion_disciplina idp
-         INNER JOIN olimpiada_disciplina d ON d.id = idp.disciplina_id
-         WHERE idp.inscripcion_id = ?`,
-        [inscripcionId]
-      );
-      await connection.query("DELETE FROM olimpiada_inscripcion_disciplina WHERE inscripcion_id = ?", [inscripcionId]);
-      for (const disciplinaId of disciplinaIds) {
-        await connection.query(
-          "INSERT INTO olimpiada_inscripcion_disciplina (inscripcion_id, disciplina_id) VALUES (?, ?)",
-          [inscripcionId, disciplinaId]
-        );
+      if (!mismosIds(await idsDisciplinasGuardadas(connection, inscripcionId), disciplinaIds)) {
+        await validarCapacidadDisciplinas(connection, {
+          olimpiadaId: inscripcion.olimpiada_id,
+          departamentalId: inscripcion.departamental_id,
+          disciplinaIds,
+          excluirInscripcionId: inscripcionId,
+          controlarCapacidad: ESTADOS_ACTIVOS.includes(inscripcion.estado),
+        });
+        const disciplinasAnteriores = await listaDisciplinas(connection, inscripcionId);
+        await connection.query("DELETE FROM olimpiada_inscripcion_disciplina WHERE inscripcion_id = ?", [inscripcionId]);
+        for (const disciplinaId of disciplinaIds) {
+          await connection.query(
+            "INSERT INTO olimpiada_inscripcion_disciplina (inscripcion_id, disciplina_id) VALUES (?, ?)",
+            [inscripcionId, disciplinaId]
+          );
+        }
+        const disciplinasNuevas = await listaDisciplinas(connection, inscripcionId);
+        cambios.push({ campo: "disciplinas", anterior: disciplinasAnteriores, nuevo: disciplinasNuevas });
+        disciplinasFinales = disciplinaIds;
       }
-      const [nuevas] = await connection.query(
-        `SELECT GROUP_CONCAT(d.nombre ORDER BY d.nombre SEPARATOR ', ') AS lista
-         FROM olimpiada_inscripcion_disciplina idp
-         INNER JOIN olimpiada_disciplina d ON d.id = idp.disciplina_id
-         WHERE idp.inscripcion_id = ?`,
-        [inscripcionId]
-      );
-      if ((anteriores[0].lista || "") !== (nuevas[0].lista || "")) {
-        cambios.push({ campo: "disciplinas", anterior: anteriores[0].lista, nuevo: nuevas[0].lista });
-      }
-      disciplinasFinales = disciplinaIds;
     }
     // Coherencia disciplinas ↔ categoría cuando cambia alguna de las dos
     if (categoria && (categoriaCambio || disciplinasFinales)) {
-      if (!disciplinasFinales) {
-        const [actuales] = await connection.query(
-          "SELECT disciplina_id FROM olimpiada_inscripcion_disciplina WHERE inscripcion_id = ?",
-          [inscripcionId]
-        );
-        disciplinasFinales = actuales.map((d) => Number(d.disciplina_id));
-      }
+      if (!disciplinasFinales) disciplinasFinales = await idsDisciplinasGuardadas(connection, inscripcionId);
       await validarDisciplinasCategoria(connection, disciplinasFinales, categoria);
     }
-    // El formulario siempre reenvía los datos sanitarios: el cambio cuenta (historial y aviso) sólo si
-    // la lista quedó distinta.
+    // Antecedentes de salud: el formulario siempre los reenvía; se reemplazan sólo si la lista cambió.
     if (req.body.datos_sanitarios !== undefined) {
       const datoIds = normalizarIds(req.body.datos_sanitarios);
       if (!datoIds) throw crearErrorHttp("La lista de datos sanitarios contiene IDs inválidos", 400);
       await validarReferenciasSanitarias(connection, campos.grupo_sanguineo_id, datoIds);
-      const sanitariosAnteriores = await listaDatosSanitarios(connection, inscripcionId);
-      await connection.query("DELETE FROM olimpiada_inscripcion_dato_sanitario WHERE inscripcion_id = ?", [inscripcionId]);
-      for (const datoId of datoIds) {
-        await connection.query(
-          "INSERT INTO olimpiada_inscripcion_dato_sanitario (inscripcion_id, dato_sanitario_id) VALUES (?, ?)",
-          [inscripcionId, datoId]
-        );
-      }
-      const sanitariosNuevos = await listaDatosSanitarios(connection, inscripcionId);
-      if ((sanitariosAnteriores || "") !== (sanitariosNuevos || "")) {
+      if (!mismosIds(await idsDatosSanitariosGuardados(connection, inscripcionId), datoIds)) {
+        const sanitariosAnteriores = await listaDatosSanitarios(connection, inscripcionId);
+        await connection.query("DELETE FROM olimpiada_inscripcion_dato_sanitario WHERE inscripcion_id = ?", [inscripcionId]);
+        for (const datoId of datoIds) {
+          await connection.query(
+            "INSERT INTO olimpiada_inscripcion_dato_sanitario (inscripcion_id, dato_sanitario_id) VALUES (?, ?)",
+            [inscripcionId, datoId]
+          );
+        }
+        const sanitariosNuevos = await listaDatosSanitarios(connection, inscripcionId);
         cambios.push({ campo: "datos_sanitarios", anterior: sanitariosAnteriores, nuevo: sanitariosNuevos });
       }
     }
 
-    // Acompañantes (si vienen, se reemplaza el set completo y se recalculan los bonos). El formulario
-    // siempre los reenvía: el historial y el aviso cuentan sólo si el set cambió de verdad.
+    // Acompañantes: el formulario siempre reenvía la lista completa. Se compara antes de escribir y sólo un
+    // set distinto se reemplaza (con los bonos recalculados); si no, quedan intactos (ids, bonos manuales y
+    // vínculos vacíos viejos incluidos).
     const acompaniantesRecibidos = acompaniantes !== undefined;
     let acompaniantesCambiaron = false;
     if (acompaniantesRecibidos) {
       const anteriores = await acompaniantesGuardados(connection, inscripcionId);
-      const tramos = await obtenerTramos(connection, inscripcion.olimpiada_id);
-      const resumenNuevo = await guardarAcompaniantes(connection, inscripcionId, acompaniantes, {
-        tramos,
-        bonosAfiliado: olimpiada.bonos_afiliado,
-        fechaReferencia: olimpiada.fecha_inicio,
-      });
-      acompaniantesCambiaron = !mismosAcompaniantes(anteriores, resumenNuevo.filas);
+      const nuevos = actorEsStaff ? acompaniantes : conservarBonosManuales(anteriores, acompaniantes);
+      acompaniantesCambiaron = !mismosAcompaniantes(anteriores, nuevos);
       if (acompaniantesCambiaron) {
-        const textoAnterior = textoResumenAcompaniantes(resumenDeAcompaniantes(anteriores));
+        const reglasBonos = {
+          tramos: await obtenerTramos(connection, inscripcion.olimpiada_id),
+          bonosAfiliado: olimpiada.bonos_afiliado,
+          fechaReferencia: olimpiada.fecha_inicio,
+        };
+        const resumenNuevo = await guardarAcompaniantes(connection, inscripcionId, nuevos, reglasBonos);
+        // El «antes» con las reglas vigentes, como lo mostraban las pantallas: compara lo mismo que el «después»
+        const textoAnterior = textoResumenAcompaniantes(resumenDeAcompaniantes(
+          anteriores.map((a) => ({ ...a, bonos: calcularBonosAcompaniante(a, reglasBonos) }))
+        ));
         const textoNuevo = textoResumenAcompaniantes(resumenNuevo);
         await registrarHistorial(connection, {
           entidad: "ACOMPANIANTE", entidad_id: inscripcionId,
@@ -2274,11 +2459,18 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
       }
     }
 
-    // Los cambios del afiliado necesitan una nueva revisión antes de acreditar.
-    if (cabecera.rol === "afiliado" && inscripcion.estado === "VALIDADO" &&
-        (cambios.length > 0 || acompaniantesRecibidos || req.body.datos_sanitarios !== undefined)) {
+    // Sólo un cambio real del afiliado en una inscripción aprobada pide otra revisión (la foto y el certificado
+    // van al gafete; disciplinas y acompañantes cambian cupo y bonos). Guardar sin cambiar nada la deja como
+    // estaba. Las ediciones del staff no cambian el estado.
+    const camposCambiados = [...cambios.map((cambio) => cambio.campo), ...(acompaniantesCambiaron ? ["acompaniantes"] : [])];
+    const huboCambios = camposCambiados.length > 0;
+    const volvioARevision = cabecera.rol === "afiliado" && inscripcion.estado === "VALIDADO" && huboCambios;
+    if (volvioARevision) {
       await connection.query("UPDATE olimpiada_inscripcion SET estado='PENDIENTE', validado_por_usuario_id=NULL, fecha_validacion=NULL WHERE id=?", [inscripcionId]);
-      cambios.push({ campo: "estado", anterior: "VALIDADO", nuevo: "PENDIENTE" });
+      cambios.push({
+        campo: "estado", anterior: "VALIDADO", nuevo: "PENDIENTE",
+        observacion: `Volvió a revisión porque el afiliado cambió ${textoCamposCambiados(camposCambiados)}.`,
+      });
     }
 
     for (const cambio of cambios) {
@@ -2292,13 +2484,18 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
       });
     }
 
-    // Avisar a la otra parte sólo si algo cambió de verdad
-    if (cambios.length > 0 || acompaniantesCambiaron) {
+    // Avisar a la otra parte sólo si algo cambió de verdad. Al staff: quién, qué cambió y si volvió a revisión.
+    if (huboCambios) {
       if (cabecera.rol === "afiliado") {
+        const aviso = avisoEdicionAfiliado({
+          inscripcionId,
+          persona: await nombrePersona(connection, inscripcion.usuario_id),
+          campos: camposCambiados,
+          volvioARevision,
+        });
         await notificarStaffOlimpiadas(connection, inscripcion.departamental_id, "OLIMPIADA_ACTUALIZADA",
-          `Inscripción #${inscripcionId} actualizada`,
-          `El afiliado actualizó su formulario de inscripción a las olimpiadas.`,
-          { inscripcion_id: inscripcionId, olimpiada_id: inscripcion.olimpiada_id });
+          aviso.titulo, aviso.mensaje,
+          { inscripcion_id: inscripcionId, olimpiada_id: inscripcion.olimpiada_id, ...(volvioARevision ? { estado: "PENDIENTE" } : {}) });
       } else {
         await insertarNotificacion(connection, inscripcion.usuario_id, "OLIMPIADA_ACTUALIZADA",
           `Actualizamos tu inscripción a las olimpiadas`,
@@ -2309,7 +2506,14 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)", verifyToken, manejarUploadOlim
 
     await connection.commit();
     transaccionConfirmada = true;
-    res.status(200).json({ success: true, message: "Inscripción actualizada" });
+    const estadoFinal = volvioARevision ? "PENDIENTE" : inscripcion.estado;
+    res.status(200).json({
+      success: true,
+      message: mensajeEdicionInscripcion({ actorEsStaff, huboCambios, volvioARevision, estado: estadoFinal }),
+      hubo_cambios: huboCambios,
+      volvio_a_revision: volvioARevision,
+      estado: estadoFinal,
+    });
   } catch (error) {
     if (connection && !transaccionConfirmada) await connection.rollback();
     if (!transaccionConfirmada) await eliminarObjetosS3Seguro(objetosSubidos);
@@ -2759,8 +2963,11 @@ router.get("/olimpiadas/historial", verifyToken, async (req, res) => {
 router.__test = Object.freeze({
   ESTADOS_EDICION,
   MENSAJE_FORMATO_FOTO,
+  NOMBRES_CAMPOS_INSCRIPCION,
   avisoAltaPorStaff,
+  avisoEdicionAfiliado,
   calcularEstadoEdicion,
+  conservarBonosManuales,
   decodificarFirmaBase64,
   detectarMimeArchivo,
   documentacionCompleta,
@@ -2770,7 +2977,9 @@ router.__test = Object.freeze({
   formatoFotoValido,
   idsPositivosIguales,
   mensajeAltaInscripcion,
+  mensajeEdicionInscripcion,
   mismosAcompaniantes,
+  mismosIds,
   nombreArchivoOriginal,
   nombreDepartamental,
   normalizarAcompaniantes,
@@ -2782,6 +2991,8 @@ router.__test = Object.freeze({
   permisosInscripcion,
   resolverAfiliadoDestino,
   resumenAltaInscripcion,
+  textoCamposCambiados,
+  textoComparable,
   textoCupo,
   textoResumenAcompaniantes,
   transicionPermitida,
@@ -2790,6 +3001,7 @@ router.__test = Object.freeze({
   validarContenidoArchivo,
   validarDatosOlimpiada,
   verifyToken,
+  versionInscripcion,
 });
 
 module.exports = router;

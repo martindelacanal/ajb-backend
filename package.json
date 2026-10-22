@@ -54,6 +54,8 @@
     "migrate:noticias-portada-publica": "node scripts/migrar-noticias-portada-publica.js",
     "migrate:temporadas-baja-logica": "node scripts/migrar-temporadas-baja-logica.js",
     "migrate:temporadas-baja-logica:check": "node scripts/migrar-temporadas-baja-logica.js --check",
+    "migrate:firma-condiciones": "node scripts/migrar-firma-condiciones-reserva.js",
+    "migrate:firma-condiciones:check": "node scripts/migrar-firma-condiciones-reserva.js --check",
     "tarifas:rehabilitar": "node scripts/rehabilitar-tarifas-temporada.js",
     "test:acceso:integracion": "node scripts/verificar-acceso-usuarios-integracion.js"
   },

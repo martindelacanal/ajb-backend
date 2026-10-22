@@ -152,6 +152,10 @@ app.use('/api', usuariosImportacionRoute);
 app.use('/api', turismoPlacasRoute);
 app.use('/api', webauthnRoute);
 app.use('/api', politicaCancelacionRoute);
+// Constancia de condiciones de cancelación (PDF y constancia firmada): antes de userRoute.
+app.use('/api', require('./api/routes/reserva-condiciones'));
+// «Pendiente de firma»: la persona afiliada firma lo que le cargó el staff (antes de userRoute).
+app.use('/api', require('./api/routes/reservas-firma'));
 app.use('/api', turismoGestionRoute);
 app.use('/api', descuentosRoute);
 app.use('/api', familiaresCambiosRoute);

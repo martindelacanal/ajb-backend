@@ -7,27 +7,36 @@ const router = require("../api/routes/olimpiadas");
 const {
   ESTADOS_EDICION,
   MENSAJE_FORMATO_FOTO,
+  NOMBRES_CAMPOS_INSCRIPCION,
   avisoAltaPorStaff,
+  avisoEdicionAfiliado,
   calcularEstadoEdicion,
+  conservarBonosManuales,
   documentacionCompleta,
   estadoInicialInscripcion,
   formatoFotoValido,
   mensajeAltaInscripcion,
+  mensajeEdicionInscripcion,
   mismosAcompaniantes,
+  mismosIds,
   nombreArchivoOriginal,
   normalizarAcompaniantes,
   observacionCambioAdjunto,
   permisosInscripcion,
   resumenAltaInscripcion,
+  textoCamposCambiados,
+  textoComparable,
   textoCupo,
   textoResumenAcompaniantes,
   transicionPermitida,
+  validarDatosOlimpiada,
+  versionInscripcion,
 } = router.__test;
 
 // ---------------------------------------------------------------------------
 // Estado inicial de la inscripción (§1.3 del contrato)
 // ---------------------------------------------------------------------------
-test("estado inicial: el afiliado nace PENDIENTE si la edición exige aprobación o bonos", () => {
+test("estado inicial: el afiliado siempre nace PENDIENTE: la aprobación es obligatoria", () => {
   assert.equal(estadoInicialInscripcion({ rol: "afiliado", olimpiada: { requiere_aprobacion: 1, exigir_bonos_para_validar: 0 } }), "PENDIENTE");
   assert.equal(estadoInicialInscripcion({ rol: "afiliado", olimpiada: { requiere_aprobacion: 0, exigir_bonos_para_validar: 1 } }), "PENDIENTE");
   assert.equal(estadoInicialInscripcion({ rol: "afiliado", olimpiada: { requiere_aprobacion: "1", exigir_bonos_para_validar: "1" } }), "PENDIENTE");
@@ -45,6 +54,26 @@ test("estado inicial: el staff nace PENDIENTE sólo si la edición exige bonos p
 test("estado inicial: sin olimpiada o con banderas ausentes se trata como no exigido", () => {
   assert.equal(estadoInicialInscripcion({ rol: "afiliado", olimpiada: null }), "PENDIENTE");
   assert.equal(estadoInicialInscripcion({ rol: "departamental", olimpiada: {} }), "VALIDADO");
+});
+
+// La aprobación del afiliado es obligatoria en todas las ediciones (Solución A): el interruptor viejo
+// requiere_aprobacion no se lee del body y la edición siempre lo guarda en 1.
+test("edición de la olimpiada: requiere_aprobacion no se lee del body y se guarda siempre en 1", () => {
+  const datos = {
+    nombre: "Olimpiadas 2027", fecha_inicio: "2027-10-10", fecha_fin: "2027-10-12",
+    fecha_inicio_inscripcion: "2027-08-01", fecha_fin_inscripcion: "2027-10-09",
+    disciplinas: [{ disciplina_id: 1, max_por_departamental: 10 }],
+  };
+  for (const valor of [undefined, 0, "0", 1, "1", "x", false]) {
+    for (const nueva of [true, false]) {
+      const resultado = validarDatosOlimpiada({ ...datos, requiere_aprobacion: valor }, { nueva });
+      assert.equal(resultado.error, undefined, `${valor} (${nueva ? "alta" : "edición"})`);
+      assert.equal(resultado.value.opcionales.requiere_aprobacion, 1, `${valor} (${nueva ? "alta" : "edición"})`);
+    }
+  }
+  // Las otras banderas se siguen validando
+  assert.match(validarDatosOlimpiada({ ...datos, exigir_bonos_para_validar: "x" }).error, /exigir_bonos_para_validar debe ser 1 o 0/);
+  assert.equal(validarDatosOlimpiada({ ...datos, exigir_bonos_para_validar: 0 }).value.opcionales.exigir_bonos_para_validar, 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -324,4 +353,166 @@ test("acompañantes: sólo cuenta como cambio si cambió alguna persona, sus dat
   assert.equal(mismosAcompaniantes(guardados, [{ ...mismos[0], fecha_nacimiento: "2015-05-06" }, mismos[1]]), false);
   assert.equal(mismosAcompaniantes(guardados, [{ ...mismos[0], bonos: 4, bonos_manual: 1 }, mismos[1]]), false);
   assert.equal(mismosAcompaniantes(guardados, [mismos[0], { ...mismos[1], observacion: "DT" }]), false);
+});
+
+// ---------------------------------------------------------------------------
+// «Guardar cambios»: qué es un cambio real
+// ---------------------------------------------------------------------------
+test("acompañantes: los bonos calculados, el documento con puntos y el vínculo vacío no son un cambio", () => {
+  const guardado = {
+    nombre: "Ana", apellido: "Staffa", documento: "40.123.456", fecha_nacimiento: "2015-05-05",
+    vinculo: null, es_afiliado: 0, bonos: 4, bonos_manual: 0, observacion: null,
+  };
+  // Como lo reenvía el formulario: documento sólo con dígitos, vínculo «Otro» y sin bonos (los calcula el servidor)
+  const reenviado = { ...guardado, documento: "40123456", vinculo: "Otro", bonos: null };
+  assert.equal(mismosAcompaniantes([guardado], [reenviado]), true);
+  assert.equal(mismosAcompaniantes([guardado], [{ ...reenviado, bonos: 6 }]), true); // los tramos cambiaron después
+  assert.equal(mismosAcompaniantes([guardado], [{ ...reenviado, vinculo: "" }]), true);
+  assert.equal(mismosAcompaniantes([{ ...guardado, nombre: " Ana " }], [reenviado]), true); // espacios en los extremos
+  assert.equal(mismosAcompaniantes([{ ...guardado, observacion: "Celíaca\nSin TACC" }], [{ ...reenviado, observacion: "Celíaca\r\nSin TACC" }]), true);
+  // Los cambios de verdad siguen contando
+  assert.equal(mismosAcompaniantes([guardado], [{ ...reenviado, documento: "40123457" }]), false);
+  assert.equal(mismosAcompaniantes([guardado], [{ ...reenviado, vinculo: "Hijo/a" }]), false);
+  assert.equal(mismosAcompaniantes([guardado], [{ ...reenviado, nombre: "ana" }]), false);
+  assert.equal(mismosAcompaniantes([guardado], [{ ...reenviado, es_afiliado: 1 }]), false);
+  // Bonos fijados a mano: cuentan la marca y el valor
+  const manual = { ...guardado, bonos: 3, bonos_manual: 1 };
+  assert.equal(mismosAcompaniantes([manual], [{ ...reenviado, bonos: 3, bonos_manual: 1 }]), true);
+  assert.equal(mismosAcompaniantes([manual], [{ ...reenviado, bonos: 5, bonos_manual: 1 }]), false);
+  assert.equal(mismosAcompaniantes([manual], [reenviado]), false); // sin el ajuste: vuelve al cálculo por edad
+});
+
+test("acompañantes: el afiliado conserva los bonos que el staff fijó a mano mientras no cambie esos datos", () => {
+  const guardados = [
+    { nombre: "Ana", apellido: "Staffa", documento: "40.123.456", fecha_nacimiento: "2015-05-05", vinculo: null, es_afiliado: 0, bonos: 3, bonos_manual: 1, observacion: null },
+    { nombre: "Luis", apellido: "Gómez", documento: null, fecha_nacimiento: null, vinculo: "Esposo/a", es_afiliado: 0, bonos: 6, bonos_manual: 0, observacion: null },
+  ];
+  // Lo que llega del afiliado (normalizarAcompaniantes sin permitirManual): nunca trae bonos
+  const ana = { nombre: "Ana", apellido: "Staffa", documento: "40123456", fecha_nacimiento: "2015-05-05", vinculo: "Otro", es_afiliado: 0, bonos: null, bonos_manual: 0, observacion: null };
+  const luis = { nombre: "Luis", apellido: "Gómez", documento: null, fecha_nacimiento: null, vinculo: "Esposo/a", es_afiliado: 0, bonos: null, bonos_manual: 0, observacion: null };
+
+  const conservados = conservarBonosManuales(guardados, [luis, ana]);
+  assert.deepEqual(conservados, [luis, { ...ana, bonos: 3, bonos_manual: 1 }]);
+  assert.equal(mismosAcompaniantes(guardados, conservados), true);
+  assert.equal(ana.bonos_manual, 0); // no modifica lo recibido
+
+  // Con un dato cambiado, el ajuste no se aplica y la lista cuenta como cambio
+  const cambiada = conservarBonosManuales(guardados, [{ ...ana, fecha_nacimiento: "2015-06-05" }, luis]);
+  assert.equal(cambiada[0].bonos_manual, 0);
+  assert.equal(mismosAcompaniantes(guardados, cambiada), false);
+
+  // Cada ajuste se usa una sola vez: si se repite la persona, sólo una lo hereda
+  assert.deepEqual(conservarBonosManuales(guardados, [ana, ana]).map((a) => a.bonos_manual), [1, 0]);
+  assert.deepEqual(conservarBonosManuales([], [ana]), [ana]);
+  assert.deepEqual(conservarBonosManuales(guardados, []), []);
+  assert.deepEqual(conservarBonosManuales(null, null), []);
+});
+
+test("ids: disciplinas y antecedentes son el mismo conjunto sin importar el orden", () => {
+  assert.equal(mismosIds([1, 2], [2, 1]), true);
+  assert.equal(mismosIds(["4"], [4]), true);
+  assert.equal(mismosIds([], []), true);
+  assert.equal(mismosIds(null, []), true);
+  assert.equal(mismosIds([1], [1, 2]), false);
+  assert.equal(mismosIds([1, 2], [1, 3]), false);
+  assert.equal(mismosIds([1, 2], []), false);
+});
+
+test("textos: los saltos de línea y los espacios de los extremos no son un cambio", () => {
+  assert.equal(textoComparable("Llego el sábado\r\nSin auto"), textoComparable("Llego el sábado\nSin auto"));
+  assert.equal(textoComparable("a\rb"), "a\nb");
+  assert.equal(textoComparable("  12/8 "), "12/8");
+  assert.equal(textoComparable(null), "");
+  assert.equal(textoComparable(undefined), "");
+  assert.equal(textoComparable(""), "");
+  assert.equal(textoComparable(2), "2"); // grupo sanguíneo
+  assert.notEqual(textoComparable("Llego el sábado"), textoComparable("Llego el domingo"));
+  assert.notEqual(textoComparable("Sin\nauto"), textoComparable("Sin auto"));
+});
+
+test("cambios: se nombran como en el formulario y en su orden, sin el estado", () => {
+  assert.equal(textoCamposCambiados(["foto_archivo"]), "la foto");
+  assert.equal(textoCamposCambiados(["foto_archivo", "disciplinas"]), "las disciplinas y la foto");
+  assert.equal(
+    textoCamposCambiados(["certificado_archivo", "categoria_tipo_id", "acompaniantes"]),
+    "la categoría, los acompañantes y el certificado médico"
+  );
+  assert.equal(textoCamposCambiados(["tension_arterial", "estado"]), "la presión arterial");
+  assert.equal(textoCamposCambiados(["datos_sanitarios", "datos_sanitarios"]), "los antecedentes de salud");
+  assert.equal(textoCamposCambiados(["estado"]), "");
+  assert.equal(textoCamposCambiados([]), "");
+  assert.equal(textoCamposCambiados(undefined), "");
+  // Cada campo que puede cambiar «Guardar cambios» tiene nombre, y ninguno es un código
+  const campos = [
+    "categoria_tipo_id", "disciplinas", "acompaniantes", "tension_arterial", "grupo_sanguineo_id", "lugar_trabajo",
+    "datos_sanitarios", "detalle_medico", "detalle_alimentario", "observaciones", "foto_archivo", "certificado_archivo", "firma_archivo",
+  ];
+  assert.deepEqual(NOMBRES_CAMPOS_INSCRIPCION.map(([campo]) => campo), campos);
+  for (const campo of campos) assert.doesNotMatch(textoCamposCambiados([campo]), /^$|_/, campo);
+});
+
+test("aviso al staff: quién, qué cambió y si la inscripción volvió a revisión", () => {
+  assert.deepEqual(avisoEdicionAfiliado({ inscripcionId: 11, persona: "Pérez, Ana", campos: ["foto_archivo", "disciplinas"], volvioARevision: true }), {
+    titulo: "Inscripción #11 actualizada y de vuelta en revisión",
+    mensaje: "Pérez, Ana cambió las disciplinas y la foto de su inscripción aprobada. Volvió a «En revisión»: revisá los cambios y aprobala de nuevo para que pueda descargar el gafete.",
+  });
+  assert.deepEqual(avisoEdicionAfiliado({ inscripcionId: 11, persona: "Pérez, Ana", campos: ["tension_arterial"], volvioARevision: false }), {
+    titulo: "Inscripción #11 actualizada",
+    mensaje: "Pérez, Ana cambió la presión arterial de su inscripción.",
+  });
+  // Sin nombre (no debería pasar) o sin campos con nombre
+  assert.match(
+    avisoEdicionAfiliado({ inscripcionId: 11, persona: null, campos: ["tension_arterial"], volvioARevision: true }).mensaje,
+    /^El afiliado cambió la presión arterial de su inscripción aprobada\./
+  );
+  assert.equal(
+    avisoEdicionAfiliado({ inscripcionId: 11, persona: "Pérez, Ana", campos: [], volvioARevision: false }).mensaje,
+    "Pérez, Ana cambió algunos datos de su inscripción."
+  );
+});
+
+test("respuesta de «Guardar cambios»: dice si había cambios y cómo queda la inscripción", () => {
+  const casos = [
+    [{ actorEsStaff: false, huboCambios: false, volvioARevision: false, estado: "VALIDADO" }, "No había cambios para guardar: tu inscripción sigue aprobada."],
+    [{ actorEsStaff: false, huboCambios: false, volvioARevision: false, estado: "PENDIENTE" }, "No había cambios para guardar: tu inscripción sigue en revisión."],
+    [{ actorEsStaff: false, huboCambios: true, volvioARevision: false, estado: "PENDIENTE" }, "Guardamos los cambios. Tu inscripción sigue en revisión: te avisamos cuando tu departamental la apruebe."],
+    [{ actorEsStaff: false, huboCambios: true, volvioARevision: true, estado: "PENDIENTE" }, "Guardamos los cambios. Tu inscripción volvió a «En revisión»: vas a poder descargar el gafete cuando tu departamental la apruebe de nuevo."],
+    [{ actorEsStaff: true, huboCambios: true, volvioARevision: false, estado: "VALIDADO" }, "Inscripción actualizada"],
+    [{ actorEsStaff: true, huboCambios: false, volvioARevision: false, estado: "VALIDADO" }, "No había cambios para guardar."],
+  ];
+  for (const [datos, texto] of casos) assert.equal(mensajeEdicionInscripcion(datos), texto, JSON.stringify(datos));
+});
+
+test("versión: cambia con el estado o con algo del formulario; los bonos calculados y la forma de leerla, no", () => {
+  const fila = {
+    estado: "VALIDADO", categoria_tipo_id: 1, grupo_sanguineo_id: 2, tension_arterial: "12/8", detalle_medico: null,
+    detalle_alimentario: null, observaciones: "Llego el sábado", lugar_trabajo: null,
+    foto_archivo: "olimpiadas/inscripciones/foto_1.png", certificado_archivo: null, firma_archivo: null,
+  };
+  const ana = { nombre: "Ana", apellido: "Staffa", documento: "40123456", fecha_nacimiento: "2015-05-05", vinculo: "Hijo/a", es_afiliado: 0, bonos: 4, bonos_manual: 0, observacion: null };
+  const luis = { nombre: "Luis", apellido: "Gómez", documento: null, fecha_nacimiento: null, vinculo: null, es_afiliado: 0, bonos: 3, bonos_manual: 1, observacion: null };
+  const guardada = { disciplinaIds: [4, 5], datoSanitarioIds: [1], acompaniantes: [ana, luis] };
+  const version = versionInscripcion(fila, guardada);
+  assert.match(version, /^[0-9a-f]{16}$/);
+  // Como la arma el detalle (GET): con columnas de más, los bonos recalculados con las reglas vigentes y otro orden.
+  // Tiene que dar lo mismo que en el PUT, que lee las filas guardadas.
+  assert.equal(versionInscripcion(
+    { ...fila, olimpiada_nombre: "Olimpiadas 2027", afiliado_apellido: "Pérez", categoria_tipo_id: "1" },
+    { disciplinaIds: [5, 4], datoSanitarioIds: [1], acompaniantes: [{ ...luis, id: 9, edad: 40 }, { ...ana, id: 8, edad: 11, bonos: 6 }] }
+  ), version);
+  // Lo que otra persona puede cambiar mientras el formulario está abierto la cambia
+  const distintas = [
+    versionInscripcion({ ...fila, estado: "PENDIENTE" }, guardada), // la aprobaron o la devolvieron a revisión
+    versionInscripcion({ ...fila, tension_arterial: "13/8" }, guardada),
+    versionInscripcion({ ...fila, grupo_sanguineo_id: 3 }, guardada),
+    versionInscripcion({ ...fila, categoria_tipo_id: 2 }, guardada),
+    versionInscripcion({ ...fila, observaciones: null }, guardada),
+    versionInscripcion({ ...fila, certificado_archivo: "olimpiadas/inscripciones/certificado_2.pdf" }, guardada),
+    versionInscripcion(fila, { ...guardada, disciplinaIds: [4] }),
+    versionInscripcion(fila, { ...guardada, datoSanitarioIds: [] }),
+    versionInscripcion(fila, { ...guardada, acompaniantes: [ana] }),
+    versionInscripcion(fila, { ...guardada, acompaniantes: [{ ...ana, vinculo: "Pareja" }, luis] }),
+    versionInscripcion(fila, { ...guardada, acompaniantes: [ana, { ...luis, bonos: 5 }] }), // bonos fijados a mano
+  ];
+  for (const [indice, otra] of distintas.entries()) assert.notEqual(otra, version, `caso ${indice}`);
 });

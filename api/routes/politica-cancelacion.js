@@ -5,11 +5,12 @@ const jwt = require("jsonwebtoken");
 const mysqlConnection = require("../connection/connection");
 const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
 const { esAdministradorTurismo, tieneAreaTurismo, normalizarIdPositivo } = require("../services/turismo-catalogo");
-const { validarTransicionTurismo } = require("../services/reservas-turismo");
+const { REGLA_CANCELACION_SIN_FIRMA, validarTransicionTurismo } = require("../services/reservas-turismo");
 const { obtenerFechaCivilArgentina, normalizarFechaCivil } = require("../services/valores-dominio");
 const { registrarErrorRuta } = require("../services/errores");
 const {
   ZONA_HORARIA, errorPolitica, obtenerPoliticaVigente, listarPoliticas, crearVersionPolitica, cotizarCancelacion,
+  resumenPoliticaTexto,
 } = require("../services/politica-cancelacion");
 
 const router = express.Router();
@@ -39,7 +40,11 @@ router.get("/turismo/politica-cancelacion", verifyToken, async (req, res) => {
     const politica = await obtenerPoliticaVigente(mysqlConnection.promise(), { servicioId: req.query.servicio_id });
     // El motivo de los cambios y la identidad de sus autores son de auditoría.
     const { motivo, creada_por, autor_nombre, ...publica } = politica;
-    return res.json({ politica: publica, fecha_actual: obtenerFechaCivilArgentina(), zona_horaria: ZONA_HORARIA });
+    // `resumen`: las condiciones en una oración (el guion del staff para leerlas por teléfono).
+    return res.json({
+      politica: publica, resumen: resumenPoliticaTexto(publica),
+      fecha_actual: obtenerFechaCivilArgentina(), zona_horaria: ZONA_HORARIA,
+    });
   } catch (error) { return responderError(res, error); }
 });
 
@@ -102,12 +107,17 @@ router.get("/reserva/:id(\\d+)/cancelacion-cotizacion", verifyToken, async (req,
       || normalizarIdPositivo(actor.departamental_id) !== normalizarIdPositivo(reserva.usuario_departamental_id))) {
       throw errorPolitica("No puedes gestionar reservas de otra departamental", 403, "RESERVA_OTRA_DEPARTAMENTAL");
     }
+    // El staff (admin o departamental de la jurisdicción) cotiza para cancelar a
+    // pedido de la persona afiliada: el mismo cálculo que vería ella en la app.
     const transicion = validarTransicionTurismo({
       rol: actor.rol, usuarioId: actor.id, propietarioId: reserva.usuario_id,
       estadoActual: reserva.estado_nombre, estadoSolicitado: "Cancelada", modalidad: reserva.modalidad,
+      aPedidoAfiliado: actor.rol !== "afiliado",
     });
     if (!transicion.valido) throw errorPolitica(transicion.mensaje, transicion.statusCode, transicion.codigo);
-    if (normalizarFechaCivil(reserva.fecha_inicio) < obtenerFechaCivilArgentina()) {
+    // Sin firma no hay nada que cobrar: se da de baja aunque haya pasado el ingreso.
+    if (transicion.regla !== REGLA_CANCELACION_SIN_FIRMA
+      && normalizarFechaCivil(reserva.fecha_inicio) < obtenerFechaCivilArgentina()) {
       throw errorPolitica("No se puede cancelar una reserva cuya fecha de ingreso ya pasó", 409, "RESERVA_FECHA_VENCIDA");
     }
     const cotizacion = await cotizarCancelacion(db, { reserva });
