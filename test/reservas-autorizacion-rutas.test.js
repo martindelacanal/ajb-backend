@@ -988,16 +988,35 @@ test("el alta departamental revierte Iniciada y Verificada si falla el segundo h
     throw new Error(`Consulta inesperada: ${sql}`);
   });
 
-  const response = await request("/api/reserva", {
-    method: "POST",
-    token: tokenFor({ id: 100, rol: "departamental", departamental_id: 7 }),
-    body: bodyEdicion({
-      usuario_id: 200,
-      politica_cancelacion_aceptada: true, politica_cancelacion_id: 1, politica_cancelacion_version: 1,
-      personas: [{ id: 200, dni: "12345678" }],
-    }),
-  });
+  // La carga del staff dice quién firma; la firma va a S3 (simulado).
+  const { S3Client } = require("@aws-sdk/client-s3");
+  const enviarOriginal = S3Client.prototype.send;
+  const comandosS3 = [];
+  S3Client.prototype.send = async (comando) => {
+    comandosS3.push([comando.constructor.name, comando.input?.Key]);
+    return {};
+  };
+  let response;
+  try {
+    response = await request("/api/reserva", {
+      method: "POST",
+      token: tokenFor({ id: 100, rol: "departamental", departamental_id: 7 }),
+      body: bodyEdicion({
+        usuario_id: 200,
+        politica_cancelacion_aceptada: true, politica_cancelacion_id: 1, politica_cancelacion_version: 1,
+        politica_cancelacion_canal: "PRESENCIAL", firma_por: "AFILIADO",
+        firma: `data:image/png;base64,${Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]).toString("base64")}`,
+        personas: [{ id: 200, dni: "12345678" }],
+      }),
+    });
+  } finally {
+    S3Client.prototype.send = enviarOriginal;
+  }
 
+  // La firma se subió dentro de la transacción revertida: no quedó en ninguna reserva y se borra.
+  assert.deepEqual(comandosS3.map(([comando]) => comando), ["PutObjectCommand", "DeleteObjectCommand"]);
+  assert.match(comandosS3[0][1], /^firma_\d+_[a-z0-9]+\.png$/);
+  assert.equal(comandosS3[1][1], comandosS3[0][1]);
   assert.equal(response.status, 500);
   assert.equal(response.body, "Error al procesar la reserva");
   assert.equal(insercionesHistorial, 2);
@@ -1038,6 +1057,18 @@ function responderResumenConSaludOculta(propietarioId, tieneAprobacionTitular = 
     if (/FROM reserva_cancelacion_politica/i.test(sql)) return [cancelacion ? [cancelacion] : []];
     // Cupones / tipos de viaje aplicados a la reserva (módulo Descuentos)
     if (/FROM reserva_descuento rd/i.test(sql)) return [[]];
+    // Condiciones de cancelación: la cargó la persona afiliada, sin
+    // aceptación registrada ni solicitud de firma ni constancia en papel; la
+    // política es la histórica del servicio.
+    if (/SELECT r\.creado_por_usuario_id/i.test(sql)) return [[{ creado_por_usuario_id: null }]];
+    if (/FROM reserva_politica_cancelacion rpc/i.test(sql)) return [[]];
+    if (/FROM reserva_firma_afiliado f/i.test(sql)) return [[]];
+    if (/FROM reserva_politica_cancelacion_historica/i.test(sql)) return [[]];
+    if (/FROM politica_cancelacion p/i.test(sql)) {
+      return [[{ id: 1, version: 1, titulo: "Inicial", servicio_id: 1, creada_por: 1, motivo: "interno",
+        reglas_json: [{ dias_desde: 0, dias_hasta: null, porcentaje_reintegro: 50 }] }]];
+    }
+    if (/FROM reserva_constancia_archivo a/i.test(sql)) return [[]];
     if (/\b(?:FROM|JOIN)\s+reserva_salud(?:_archivo)?\b/i.test(sql)) {
       throw new Error(`No debió consultar datos médicos: ${sql}`);
     }
@@ -1053,6 +1084,11 @@ test("el resumen oculta la acción de edición cuando el titular ya aprobó el c
   assert.equal(response.status, 200);
   assert.equal(response.body.puede_editar, false);
   assert.equal(response.body.puede_cancelar, true);
+  // La persona afiliada dueña ve las condiciones, sin el botón del staff.
+  assert.equal(response.body.es_propietario, true);
+  assert.equal(response.body.puede_cancelar_a_pedido, false);
+  assert.equal(response.body.condiciones_cancelacion.origen, "HISTORICA_RESERVA_ANTERIOR");
+  assert.equal(response.body.condiciones_cancelacion.politica.motivo, undefined);
 });
 
 test("detalle de reserva cancelada muestra cálculo histórico al dueño y al personal autorizado", async () => {
@@ -1070,6 +1106,10 @@ test("detalle de reserva cancelada muestra cálculo histórico al dueño y al pe
     assert.equal(response.body.cancelacion.politica.creada_por, undefined);
     assert.equal(response.body.puede_cancelar, false);
     assert.ok(!databaseCalls.some(({ sql }) => /FROM politica_cancelacion p/.test(sql)));
+    // Las condiciones de una reserva cancelada salen de la política que se aplicó al cancelar.
+    assert.equal(response.body.condiciones_cancelacion.politica.version, 1);
+    assert.equal(response.body.condiciones_cancelacion.tramos.some((tramo) => tramo.es_hoy), false);
+    assert.equal(response.body.puede_cancelar_a_pedido, false, claims.rol);
   }
 });
 

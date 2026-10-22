@@ -72,7 +72,10 @@ async function guardarPreferenciasNotificaciones(connection, usuarioId, valor) {
   }
 }
 
-async function crearNotificacion(connection, { usuarioId, tipo, titulo, mensaje, payload = {}, categoria }) {
+// `obligatoria: true` se guarda y se entrega aunque la persona haya silenciado esa
+// categoría: es para avisos que traen las condiciones de su propia reserva o le piden una
+// acción con plazo (por ejemplo, firmar una reserva que le cargó su departamental).
+async function crearNotificacion(connection, { usuarioId, tipo, titulo, mensaje, payload = {}, categoria, obligatoria = false }) {
   const id = Number(usuarioId);
   if (!Number.isSafeInteger(id) || id <= 0) return { insertId: null, affectedRows: 0 };
   const categoriaEntrega = categoria || categoriaNotificacion(tipo);
@@ -81,6 +84,12 @@ async function crearNotificacion(connection, { usuarioId, tipo, titulo, mensaje,
   const valores = [id, tipo, textoTitulo.length > 180 ? `${textoTitulo.slice(0, 179)}…` : textoTitulo,
     mensaje, typeof payload === "string" ? payload : JSON.stringify(payload || {})];
   let resultado;
+  if (obligatoria === true) {
+    [resultado] = await connection.query(
+      "INSERT INTO notificacion (usuario_id, tipo, titulo, mensaje, payload) VALUES (?, ?, ?, ?, ?)", valores
+    );
+    return { ...resultado, insertId: resultado.insertId || null };
+  }
   try {
     // INSERT ... SELECT comprueba la preferencia en la misma sentencia; no
     // necesita caché ni otra conexión y participa de la transacción del trámite.

@@ -58,8 +58,9 @@ const ROL_NOMBRE_POR_ID = Object.freeze({
 const ROLES_OBJETIVO_STAFF = Object.freeze(["afiliado", "invitado"]);
 
 // Reservas "abiertas": todo lo que no es Rechazada (4), Utilizada (5),
-// No adjudicada (8) ni Convenio rechazado (12).
-const ESTADOS_RESERVA_ABIERTA = Object.freeze([1, 2, 3, 6, 7, 9, 10, 11]);
+// No adjudicada (8) ni Convenio rechazado (12). Incluye «Pendiente de firma» (15):
+// la persona tiene que firmar con sus datos al día.
+const ESTADOS_RESERVA_ABIERTA = Object.freeze([1, 2, 3, 6, 7, 9, 10, 11, 15]);
 // Coseguro: al cambiar la departamental sólo se mueven las solicitudes que
 // todavía están en manos de la departamental.
 const ESTADOS_COSEGURO_MOVER_DEPARTAMENTAL = Object.freeze([1, 2, 3]);

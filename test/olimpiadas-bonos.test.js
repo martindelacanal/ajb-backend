@@ -152,6 +152,10 @@ test("bonos: armarReglas y mapearBonoVendido devuelven el shape del contrato", (
   ]);
   assert.equal(reglas.digitos, 4);
   assert.deepEqual(reglas.tramos[0], { id: 1, edad_desde: 18, edad_hasta: null, bonos: 11, etiqueta: "Invitado", orden: 1 });
+  // requiere_aprobacion va fijo en 1 (fronts viejos en caché): la aprobación del afiliado es obligatoria
+  assert.equal(reglas.requiere_aprobacion, 1);
+  assert.equal(armarReglas({ ...OLIMPIADA, requiere_aprobacion: 0 }, []).requiere_aprobacion, 1);
+  assert.equal(armarReglas(OLIMPIADA, []).requiere_aprobacion, 1);
 
   const fila = mapearBonoVendido({ id: 3, numero: 460, comprador_nombre: "Coop", a_nombre_departamental: 1, inscripcion_id: null, departamental_id: 1, fecha_venta: "2026-09-02" }, OLIMPIADA);
   assert.equal(fila.numero_texto, "0460");
@@ -203,17 +207,20 @@ test("bonos: normalizarReglasEntrada valida montos, numeración, flags, fecha y 
     sorteo_detalle: " Quiniela nocturna ",
     tramos: [{ edad_desde: 0, edad_hasta: 17, bonos: 5 }, { edad_desde: 18, edad_hasta: null, bonos: 11 }],
   });
+  // requiere_aprobacion ya no es una regla editable: si llega (front viejo en caché), se ignora
   assert.deepEqual(ok.value.cambios, {
     valor_bono: 40000.5,
     bonos_afiliado: 8,
     bono_numero_hasta: 9999,
-    requiere_aprobacion: 1,
     exigir_bonos_para_validar: 0,
     fecha_sorteo: "2026-09-25",
     sorteo_detalle: "Quiniela nocturna",
   });
   assert.equal(ok.value.tramos.length, 2);
   assert.equal(ok.value.tramos[1].orden, 2);
+  assert.deepEqual(normalizarReglasEntrada({ requiere_aprobacion: 0 }).value, { cambios: {}, tramos: null });
+  assert.equal(normalizarReglasEntrada({ requiere_aprobacion: "x" }).error, undefined);
+  assert.match(normalizarReglasEntrada({ exigir_bonos_para_validar: "x" }).error, /exigir_bonos_para_validar debe ser 0 o 1/);
 
   assert.match(normalizarReglasEntrada({ valor_bono: "abc" }).error, /importe/);
   assert.match(normalizarReglasEntrada({ bonos_afiliado: -1 }).error, /entre 0 y/);

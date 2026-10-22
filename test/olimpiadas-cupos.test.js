@@ -37,8 +37,11 @@ const DISCIPLINAS = [
   { id: 4, nombre: "Vóley", tipo_id: 1, tipo_nombre: "Atleta", icono_archivo: null, max_por_departamental: 10, sede_id: null, veedor: null },
   { id: 6, nombre: "Truco", tipo_id: 2, tipo_nombre: "Cultura", icono_archivo: null, max_por_departamental: null, sede_id: null, veedor: null },
 ];
+// requiere_aprobacion en 0: entre el 14/10 y el 21/10 se podía apagar en Bonos › Reglas y la columna queda así
+// hasta que se guarde la edición (las respuestas lo mandan fijo en 1)
 const OLIMPIADA = { id: 7, nombre: "Olimpiadas 2027", fecha_inicio: "2027-10-10", fecha_fin: "2027-10-12",
-  fecha_inicio_inscripcion: "2027-08-01", fecha_fin_inscripcion: "2027-10-09", valor_bono: 1000, bonos_afiliado: 6 };
+  fecha_inicio_inscripcion: "2027-08-01", fecha_fin_inscripcion: "2027-10-09", valor_bono: 1000, bonos_afiliado: 6,
+  requiere_aprobacion: 0 };
 
 async function servidor(t, actor) {
   contexto = {
@@ -53,7 +56,9 @@ async function servidor(t, actor) {
     if (/u\.\*, r\.nombre AS rol_nombre/.test(sql)) return [AFILIADOS[params[0]] ? [{ ...AFILIADOS[params[0]] }] : []];
     if (/FROM usuario u[\s\S]+INNER JOIN rol r/.test(sql)) return [[{ ...contexto.actor }]];
     if (/SELECT \* FROM olimpiada WHERE id = \?/.test(sql)) return [Number(params[0]) === 7 ? [{ ...OLIMPIADA }] : []];
-    if (/FROM olimpiada o\s+WHERE o\.eliminado = 0 AND o\.habilitado = 'Y'\s+AND CURDATE\(\) BETWEEN/.test(sql)) return [[{ ...OLIMPIADA }]];
+    if (/FROM olimpiada o\s+WHERE o\.eliminado = 0 AND o\.habilitado = 'Y'\s+AND CURDATE\(\) BETWEEN/.test(sql)) return [contexto.sinVigente ? [] : [{ ...OLIMPIADA }]];
+    // Sin edición con la inscripción abierta, /actual muestra la próxima
+    if (/FROM olimpiada\s+WHERE eliminado = 0 AND habilitado = 'Y' AND fecha_inicio_inscripcion > CURDATE\(\)/.test(sql)) return [[{ ...OLIMPIADA }]];
     if (/SELECT id, usuario_id, departamental_id FROM olimpiada_inscripcion WHERE id = \? AND olimpiada_id = \?/.test(sql)) {
       const inscripcion = INSCRIPCIONES[params[0]];
       return [inscripcion && inscripcion.olimpiada_id === Number(params[1]) ? [{ ...inscripcion }] : []];
@@ -195,4 +200,18 @@ test("portal del afiliado: sin departamental se le avisa al entrar, no al enviar
   // El staff no se inscribe desde el portal: nunca se lo marca
   const admin = await servidor(t, { id: 1, rol: "admin" });
   assert.equal((await admin.pedir("/olimpiadas/actual")).body.sin_departamental, false);
+});
+
+test("requiere_aprobacion va fijo en 1 aunque la edición haya quedado en 0: /actual (vigente y próxima) y el detalle", async (t) => {
+  const afiliado = await servidor(t, { id: 20, rol: "afiliado", departamental_id: 5 });
+  const vigente = await afiliado.pedir("/olimpiadas/actual");
+  assert.equal(vigente.status, 200);
+  assert.equal(vigente.body.olimpiada.requiere_aprobacion, 1);
+  assert.equal(vigente.body.reglas_bonos.requiere_aprobacion, 1);
+  afiliado.contexto.sinVigente = true;
+  const proxima = await afiliado.pedir("/olimpiadas/actual");
+  assert.equal(proxima.body.olimpiada, null);
+  assert.equal(proxima.body.proxima.requiere_aprobacion, 1);
+  const admin = await servidor(t, { id: 1, rol: "admin" });
+  assert.equal((await admin.pedir("/olimpiadas/7")).body.requiere_aprobacion, 1);
 });

@@ -73,7 +73,7 @@ function rutaPermitidaFamiliar(req) {
   if (metodo === 'POST' && ruta === '/auth/password/cambiar-obligatoria') return true;
   if ((metodo === 'POST' && ruta === '/familiares') || /^\/familiares\/\d+\/vinculo$/.test(ruta)) return false;
   // Los handlers conservan sus controles de propiedad y ámbito de grupo.
-  return /^\/(?:sesion\/permisos|configuracion\/usuario(?:\/\d+)?|usuario|notificaciones(?:\/.*)?|mis-gestiones(?:\/catalogos)?|turismo(?:\/.*)?|reserva(?:\/.*)?|reservas\/aprobaciones-titular|servicios(?:\/.*)?|lugares|recursos|adicionales|regimen|tipo_persona|parentesco|acompaniantes(?:\/\d+)?|tabla\/acompaniantes|familiares(?:\/.*)?|convenios-hoteleros(?:\/.*)?|sorteos(?:\/.*)?|filtros\/para-recursos|descuentos(?:\/.*)?|observaciones\/turismo\/\d+\/lectura|webauthn(?:\/.*)?)\/?$/.test(ruta);
+  return /^\/(?:sesion\/permisos|configuracion\/usuario(?:\/\d+)?|usuario|notificaciones(?:\/.*)?|mis-gestiones(?:\/catalogos)?|turismo(?:\/.*)?|reserva(?:\/.*)?|reservas\/aprobaciones-titular|reservas\/firmas-pendientes|servicios(?:\/.*)?|lugares|recursos|adicionales|regimen|tipo_persona|parentesco|acompaniantes(?:\/\d+)?|tabla\/acompaniantes|familiares(?:\/.*)?|convenios-hoteleros(?:\/.*)?|sorteos(?:\/.*)?|filtros\/para-recursos|descuentos(?:\/.*)?|observaciones\/turismo\/\d+\/lectura|webauthn(?:\/.*)?)\/?$/.test(ruta);
 }
 
 // Defensa adicional para el rol de Educación: ningún handler legado puede

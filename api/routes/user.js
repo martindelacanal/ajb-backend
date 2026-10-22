@@ -114,9 +114,19 @@ const {
   validarAdultoResponsable, registrarSolicitudTitular,
   asegurarSinSolicitudTitularPendiente, decidirSolicitudTitular,
 } = require("../services/reservas-familiares");
+// «¿Quién firma?» en la carga del staff y el envío a firmar («Pendiente de firma»).
+// Se usa con el prefijo para no chocar con nombres de otros módulos en este archivo.
+const reservasFirma = require("../services/reservas-firma");
 const {
   validarAceptacionPolitica, guardarAceptacionPolitica, confirmarCancelacionPolitica, obtenerCancelacionRegistrada,
 } = require("../services/politica-cancelacion");
+// «Cancelar a pedido de la persona afiliada» y las condiciones del detalle.
+const {
+  CANALES_PEDIDO_CANCELACION, ORIGEN_CANCELACION_STAFF_A_PEDIDO, REGLA_CANCELACION_SIN_FIRMA,
+  esCargaPropiaDepartamental, puedeCancelarAPedido,
+} = require("../services/reservas-turismo");
+const { obtenerCargaReserva, obtenerCondicionesReserva } = require("../services/politica-cancelacion");
+const { avisarCancelacionAPedido, textoAvisoCancelacionAfiliadoStaff } = require("../services/reservas-cancelacion-avisos");
 const { obtenerMejorDescuentoAdicionalesDia } = require("../services/descuento-adicionales");
 const { validarRangosEdadTemporada } = require("../services/temporadas-edades");
 const {
@@ -399,6 +409,17 @@ async function deleteFileFromS3(key) {
       Key: key,
     })
   );
+}
+
+// La firma de un alta se sube dentro de la transacción: si después se revierte, no quedó en
+// ninguna reserva y se borra de S3. Si el borrado falla, queda en el log y sigue el error del alta.
+async function borrarFirmaDeAltaRevertida(key) {
+  if (!key) return;
+  try {
+    await deleteFileFromS3(key);
+  } catch (error) {
+    console.error("No se pudo borrar la firma de un alta revertida", error?.name || error?.code);
+  }
 }
 // S3 FIN
 
@@ -4334,6 +4355,7 @@ router.post("/sorteos/:id/cotizacion", verifyToken, async (req, res) => {
 
 router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
   let connection;
+  let firmaNuevaSubida = null;
   try {
     const cabecera = JSON.parse(req.data.data);
     if (!["admin", "afiliado", "departamental"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
@@ -4350,7 +4372,12 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
 
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
-    const { usuarioReservaId, grupoReserva, requiereAprobacionTitular } = await resolverTitularReservaAlta(connection, cabecera, req.body.usuario_id);
+    const { esRolCargaAdministrativa, usuarioReservaId, grupoReserva, requiereAprobacionTitular } = await resolverTitularReservaAlta(connection, cabecera, req.body.usuario_id);
+    // «¿Quién firma?» si lo manda el staff (no hay pantalla del staff para sorteos): el
+    // envío a firmar no está disponible para inscripciones.
+    const cargaFirma = reservasFirma.resolverFirmaCarga({
+      rol: cabecera.rol, body: req.body, permiteEnvio: false, canalObligatorio: false,
+    });
     await ejecutarMantenimientoBloquesAlta(connection);
 
     const bloque = await obtenerBloqueConRecursos(connection, bloqueFechaId, { forUpdate: true });
@@ -4401,6 +4428,7 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
         defaultContentType: "image/png",
       });
       firmaArchivo = firmaFileName;
+      firmaNuevaSubida = firmaFileName;
     }
 
     const estadoSolicitudId = await obtenerEstadoReservaId(connection, "Solicitud sorteo", ESTADO_RESERVA_INICIADA_ID);
@@ -4409,8 +4437,8 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
       `INSERT INTO reserva (
         estado_reserva_id, modalidad, sorteo_id, bloque_fecha_id, servicio_id,
         regimen_id, recurso_id, usuario_id, firma_archivo, precio_total,
-        fecha_inicio, fecha_fin, observaciones, monto_adicionales
-      ) VALUES (?, 'SORTEO', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`,
+        fecha_inicio, fecha_fin, observaciones, monto_adicionales, creado_por_usuario_id
+      ) VALUES (?, 'SORTEO', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         estadoSolicitudId,
         sorteoId,
@@ -4423,12 +4451,16 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
         cotizacion.fecha_inicio,
         cotizacion.fecha_fin,
         req.body.observaciones || null,
-        cotizacion.monto_adicionales
+        cotizacion.monto_adicionales,
+        cabecera.id
       ]
     );
 
     const reservaId = reservaResult.insertId;
-    await guardarAceptacionPolitica(connection, { reservaId, usuarioId: cabecera.id, politica: politicaAceptada });
+    await guardarAceptacionPolitica(connection, {
+      reservaId, usuarioId: cabecera.id, politica: politicaAceptada,
+      modo: cargaFirma.modo, canal: cargaFirma.canal, firmaPor: cargaFirma.firmaPor, firmaArchivo,
+    });
     if (cotizacion.adicionales.length > 0) {
       await guardarAdicionalesReserva(connection, reservaId, cotizacion.adicionales);
     }
@@ -4469,11 +4501,29 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
       `Inscripcion al sorteo ${sorteoId}, bloque ${bloqueFechaId}`
     );
 
+    // Hasta ahora la persona no se enteraba de la inscripción que le cargaba el staff:
+    // aviso obligatorio con las condiciones que se aplican si sale sorteada.
+    if (esRolCargaAdministrativa) {
+      await reservasFirma.avisarAfiliadoCargaStaff(connection, {
+        reservaId,
+        afiliadoId: usuarioReservaId,
+        rolSolicitante: cabecera.rol,
+        canal: cargaFirma.canal,
+        estado: "Solicitud sorteo",
+        politica: politicaAceptada,
+        tipo: "RESERVA_SORTEO_CREADA_POR_TURISMO",
+        titulo: `Te anotaron en un sorteo (T-${reservaId})`,
+        tipoAlta: "SORTEO",
+        sorteoNombre: bloque.sorteo_nombre,
+      });
+    }
+
     if (requiereAprobacionTitular) {
       await registrarSolicitudTitular(connection, { reservaId, solicitanteId: usuarioReservaId,
         titularId: grupoReserva.titular.id, estadoDestino: "Solicitud sorteo" });
     }
     await connection.commit();
+    firmaNuevaSubida = null;
     res.status(201).json({
       id: reservaId,
       numero_reserva: `${reservaId}`,
@@ -4489,6 +4539,7 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
     if (connection) {
       await connection.rollback();
     }
+    await borrarFirmaDeAltaRevertida(firmaNuevaSubida);
     registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
@@ -9732,6 +9783,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
       let holdReservaValidado = null;
 
       let connection;
+      let firmaNuevaSubida = null;
       try {
         // Iniciar transacción
         connection = await mysqlConnection.promise().getConnection();
@@ -9768,28 +9820,50 @@ router.post("/reserva", verifyToken, async (req, res) => {
           throw crearErrorNegocio(errorReglasCamping, 422, "CAPACIDAD_SERVICIO_EXCEDIDA");
         }
 
+        // «¿Quién firma?» (sólo la carga del staff): la persona en la oficina, el
+        // administrativo por teléfono o enviársela para que firme desde Mi AJB. Va
+        // después del titular: el 422 de CBU sale primero.
+        const cargaFirma = reservasFirma.resolverFirmaCarga({ rol: cabecera.rol, body: req.body });
+        let venceFirma = null;
+        if (cargaFirma.esEnvio) {
+          venceFirma = reservasFirma.calcularVencimientoFirma({ fechaInicio: fechaInicioReserva });
+          await reservasFirma.asegurarSinFirmaPendiente(connection, {
+            usuarioId: usuarioReservaId,
+            nombre: [usuarioTitular.nombre, usuarioTitular.apellido].filter(Boolean).join(" "),
+          });
+        }
+        // Con el envío, el staff no acepta: fija la versión que se le presenta a la persona.
         const politicaAceptada = await validarAceptacionPolitica(connection, {
           servicioId: servicioIdReserva,
           aceptada: req.body.politica_cancelacion_aceptada,
           politicaId: req.body.politica_cancelacion_id, version: req.body.politica_cancelacion_version,
+          exigirAceptacion: !cargaFirma.esEnvio,
         });
         // Se controla antes de consultar disponibilidad para que, si la unica
         // reserva iniciada ya vencio, quede rechazada y libere el recurso en
         // esta misma transaccion. Tambien cubre altas hechas por admin para un
-        // afiliado, que igualmente deben respetar la unicidad.
+        // afiliado, que igualmente deben respetar la unicidad. Una reserva que
+        // espera la firma y al firmarse queda Iniciada cuenta como su Iniciada.
         const altaQuedaIniciada = obtenerEstadoAltaTurismo(cabecera.rol) === ESTADO_INICIADA;
         if (altaQuedaIniciada) {
           const reservaIniciada = await asegurarSinReservaIniciadaAfiliado(
             connection,
             usuarioReservaId
           );
-          if (reservaIniciada) {
+          const firmaPendienteIniciada = reservaIniciada
+            ? null
+            : await reservasFirma.buscarFirmaPendienteIniciada(connection, usuarioReservaId);
+          if (reservaIniciada || firmaPendienteIniciada) {
             const error = crearErrorNegocio(
-              "Ya tenes una reserva de turismo iniciada. Podes verla y continuarla antes de crear otra.",
+              reservaIniciada
+                ? "Ya tenes una reserva de turismo iniciada. Podes verla y continuarla antes de crear otra."
+                : esRolCargaAdministrativa
+                  ? `${[usuarioTitular.nombre, usuarioTitular.apellido].filter(Boolean).join(" ") || "La persona afiliada"} ya tiene la reserva T-${firmaPendienteIniciada.id} esperando su firma. Esperá que la firme o dala de baja antes de cargar otra.`
+                  : `Ya tenés la reserva T-${firmaPendienteIniciada.id} esperando tu firma. Firmala o, si no la querés, presioná «No la quiero» en esa reserva antes de crear otra.`,
               409,
               "RESERVA_INICIADA_EXISTENTE"
             );
-            error.detalles = { reserva: reservaIniciada };
+            error.detalles = { reserva: reservaIniciada || firmaPendienteIniciada };
             throw error;
           }
         }
@@ -9949,9 +10023,10 @@ router.post("/reserva", verifyToken, async (req, res) => {
         const adicionalesProcesados = resultadoAdicionales.items;
         const precioTotalReserva = centavosANumero(precioTotalCentavos);
 
-        // Procesar firma si existe
+        // Procesar firma si existe. Con el envío a firmar nadie firma ahora: la
+        // firma llega cuando la persona la firme desde Mi AJB.
         let firmaArchivo = null;
-        if (firma) {
+        if (firma && !cargaFirma.esEnvio) {
           const firmaFileName = `firma_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.png`;
           await uploadBase64ToS3({
             key: firmaFileName,
@@ -9959,6 +10034,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
             defaultContentType: "image/png",
           });
           firmaArchivo = firmaFileName;
+          firmaNuevaSubida = firmaFileName;
         }
 
         const usuariosIds = personasCalculadas;
@@ -9968,8 +10044,8 @@ router.post("/reserva", verifyToken, async (req, res) => {
             estado_reserva_id, modalidad, sorteo_id, bloque_fecha_id, servicio_id,
             regimen_id, recurso_id, usuario_id,
             firma_archivo, precio_total, fecha_inicio, fecha_fin, observaciones, monto_adicionales,
-            monto_descuentos
-          ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            monto_descuentos, creado_por_usuario_id
+          ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             ESTADO_RESERVA_INICIADA_ID,
             modalidadReserva,
@@ -9984,12 +10060,20 @@ router.post("/reserva", verifyToken, async (req, res) => {
             fechaFinReserva,
             observaciones || null,
             montoAdicionales,
-            montoDescuentos
+            montoDescuentos,
+            cabecera.id
           ]
         );
 
         const reservaId = reservaResult.insertId;
-        await guardarAceptacionPolitica(connection, { reservaId, usuarioId: cabecera.id, politica: politicaAceptada });
+        // Cómo se aceptaron las condiciones y la copia de la firma tomada con ellas.
+        // Con el envío a firmar no hay aceptación todavía: se guarda al firmar.
+        if (!cargaFirma.esEnvio) {
+          await guardarAceptacionPolitica(connection, {
+            reservaId, usuarioId: cabecera.id, politica: politicaAceptada,
+            modo: cargaFirma.modo, canal: cargaFirma.canal, firmaPor: cargaFirma.firmaPor, firmaArchivo,
+          });
+        }
         let estadoRespuesta = ESTADO_INICIADA;
         const esAltaDepartamental = obtenerEstadoAltaTurismo(cabecera.rol) === ESTADO_VERIFICADA;
         const registrarHitoAlta = esAltaDepartamental
@@ -10008,8 +10092,9 @@ router.post("/reserva", verifyToken, async (req, res) => {
 
         // Una reserva cargada por la departamental ya fue revisada por ese
         // equipo. Se conserva el paso Iniciada en el historial y se avanza en
-        // la misma transaccion a Verificada.
-        if (esAltaDepartamental) {
+        // la misma transaccion a Verificada. Si se envía a firmar, el pase a
+        // Verificada y el aviso a administración se hacen recién al firmar.
+        if (esAltaDepartamental && !cargaFirma.esEnvio) {
           const estadoVerificadaId = await obtenerEstadoReservaId(connection, ESTADO_VERIFICADA, 2);
           await connection.query(
             "UPDATE reserva SET estado_reserva_id = ?, fecha_modificacion = NOW() WHERE id = ?",
@@ -10038,17 +10123,20 @@ router.post("/reserva", verifyToken, async (req, res) => {
           );
           estadoRespuesta = ESTADO_VERIFICADA;
         }
-        if (esRolCargaAdministrativa) {
-          await insertarNotificacion(
-            connection,
-            usuarioReservaId,
-            "RESERVA_CREADA_POR_TURISMO",
-            `Nueva reserva de turismo #${reservaId}`,
-            estadoRespuesta === ESTADO_VERIFICADA
-              ? "Tu departamental creó y verificó una reserva de turismo a tu nombre."
-              : "El equipo de Turismo creó una reserva a tu nombre. La departamental tiene 72 horas para verificarla.",
-            { reserva_id: reservaId, estado: estadoRespuesta }
-          );
+        // Aviso a la persona con las condiciones que se le leyeron o que firmó:
+        // obligatorio (llega aunque haya silenciado avisos). Con el envío a firmar,
+        // el aviso es el de la firma pendiente (registrarSolicitudFirma, más abajo).
+        if (esRolCargaAdministrativa && !cargaFirma.esEnvio) {
+          await reservasFirma.avisarAfiliadoCargaStaff(connection, {
+            reservaId,
+            afiliadoId: usuarioReservaId,
+            rolSolicitante: cabecera.rol,
+            canal: cargaFirma.canal,
+            estado: estadoRespuesta,
+            politica: politicaAceptada,
+            tipo: "RESERVA_CREADA_POR_TURISMO",
+            titulo: `Nueva reserva de turismo #${reservaId}`,
+          });
         }
         let numeroParcelaAsignada = null;
 
@@ -10153,7 +10241,25 @@ router.post("/reserva", verifyToken, async (req, res) => {
             titularId: grupoReserva.titular.id, estadoDestino: ESTADO_INICIADA });
           estadoRespuesta = ESTADO_PENDIENTE_TITULAR;
         }
+        // Enviada a firmar: con el lugar ya tomado (hold consumido, bloque reclamado),
+        // pasa a «Pendiente de firma» en esta misma transacción. Al firmar queda
+        // Iniciada (carga de administración) o Verificada (carga departamental).
+        let solicitudFirma = null;
+        if (cargaFirma.esEnvio) {
+          solicitudFirma = await reservasFirma.registrarSolicitudFirma(connection, {
+            reservaId,
+            afiliadoId: usuarioReservaId,
+            solicitante: { id: cabecera.id, rol: cabecera.rol },
+            estadoAnteriorId: ESTADO_RESERVA_INICIADA_ID,
+            estadoDestino: obtenerEstadoAltaTurismo(cabecera.rol),
+            politica: politicaAceptada,
+            venceEn: venceFirma,
+            contexto: { ip: req.ip, userAgent: req.get("User-Agent") },
+          });
+          estadoRespuesta = solicitudFirma.estado;
+        }
         await connection.commit();
+        firmaNuevaSubida = null;
         emitirInvalidacionDisponibilidad(
           req,
           holdReservaValidado?.hold || {
@@ -10181,13 +10287,20 @@ router.post("/reserva", verifyToken, async (req, res) => {
           monto_adicionales: montoAdicionales,
           monto_descuentos: montoDescuentos,
           descuentos: descuentosGuardados,
-          reserva_salud_id: reservaSaludId
+          reserva_salud_id: reservaSaludId,
+          // Cómo se informaron las condiciones; con el envío, hasta cuándo puede firmar
+          // y en qué estado queda cuando firme.
+          canal: cargaFirma.canal,
+          requiere_firma_afiliado: Boolean(solicitudFirma),
+          firma_vence_en: solicitudFirma ? solicitudFirma.vence_en.toISOString() : null,
+          firma_estado_destino: solicitudFirma ? solicitudFirma.estado_destino : null,
         });
 
       } catch (transactionError) {
         if (connection) {
           await connection.rollback();
         }
+        await borrarFirmaDeAltaRevertida(firmaNuevaSubida);
         throw transactionError;
       } finally {
         if (connection) {
@@ -10216,6 +10329,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
 
 router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) => {
   let connection;
+  let firmaNuevaSubida = null;
   try {
     const cabecera = JSON.parse(req.data.data);
     if (!["admin", "departamental", "afiliado"].includes(cabecera.rol) || !tieneAreaTurismo(cabecera)) {
@@ -10231,7 +10345,7 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
       observaciones,
     } = req.body;
 
-    if (!hotelId || !fecha_inicio || !fecha_fin || !Array.isArray(personas) || personas.length === 0 || !firma) {
+    if (!hotelId || !fecha_inicio || !fecha_fin || !Array.isArray(personas) || personas.length === 0) {
       return res.status(400).json("Faltan campos requeridos");
     }
     const fechaInicioReserva = formatearFechaSQL(fecha_inicio);
@@ -10253,6 +10367,16 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
       requiereCoseguro: Boolean(porSalud),
     });
 
+    // «¿Quién firma?» si lo manda el staff (no hay pantalla del staff para convenios),
+    // después del titular como en las otras altas: el 422 de CBU sale primero. La firma
+    // es obligatoria acá, así que el envío a firmar no está disponible.
+    const cargaFirma = reservasFirma.resolverFirmaCarga({
+      rol: cabecera.rol, body: req.body, permiteEnvio: false, canalObligatorio: false,
+    });
+    if (!firma) {
+      await connection.rollback();
+      return res.status(400).json("Faltan campos requeridos");
+    }
 
     const [hoteles] = await connection.query(
       "SELECT id, nombre, servicio_id FROM convenio_hotel WHERE id = ? AND activo = 1 LIMIT 1",
@@ -10291,6 +10415,7 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
       value: firma,
       defaultContentType: "image/png",
     });
+    firmaNuevaSubida = firmaFileName;
 
     const { usuarioFamiliarPrincipalId, departamentalId } = await obtenerUsuarioPrincipalFamilia(
       connection,
@@ -10327,8 +10452,9 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
           fecha_inicio,
           fecha_fin,
           observaciones,
-          monto_adicionales
-        ) VALUES (?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, ?, ?, ?, 0)
+          monto_adicionales,
+          creado_por_usuario_id
+        ) VALUES (?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, ?, ?, ?, 0, ?)
       `,
       [
         estadoSolicitudConvenioId,
@@ -10339,11 +10465,15 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
         fechaInicioReserva,
         fechaFinReserva,
         observaciones || null,
+        cabecera.id,
       ]
     );
 
     const reservaId = reservaResult.insertId;
-    await guardarAceptacionPolitica(connection, { reservaId, usuarioId: cabecera.id, politica: politicaAceptada });
+    await guardarAceptacionPolitica(connection, {
+      reservaId, usuarioId: cabecera.id, politica: politicaAceptada,
+      modo: cargaFirma.modo, canal: cargaFirma.canal, firmaPor: cargaFirma.firmaPor, firmaArchivo: firmaFileName,
+    });
     for (const persona of usuariosIds) {
       await connection.query(
         `
@@ -10377,14 +10507,18 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
     );
 
     if (esRolCargaAdministrativa) {
-      await insertarNotificacion(
-        connection,
-        usuarioReservaId,
-        "CONVENIO_CREADO_POR_TURISMO",
-        `Nueva solicitud de convenio #${reservaId}`,
-        "El equipo de Turismo creó una solicitud de convenio hotelero a tu nombre.",
-        { reserva_id: reservaId, estado: "Solicitud convenio" }
-      );
+      // Con las condiciones de cancelación y obligatorio, como en las demás cargas del staff.
+      await reservasFirma.avisarAfiliadoCargaStaff(connection, {
+        reservaId,
+        afiliadoId: usuarioReservaId,
+        rolSolicitante: cabecera.rol,
+        canal: cargaFirma.canal,
+        estado: "Solicitud convenio",
+        politica: politicaAceptada,
+        tipo: "CONVENIO_CREADO_POR_TURISMO",
+        titulo: `Nueva solicitud de convenio #${reservaId}`,
+        tipoAlta: "CONVENIO",
+      });
     }
 
     // Viaje por motivos de salud: crea el trámite de subsidio para Servicios Sociales
@@ -10404,6 +10538,7 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
         titularId: grupoReserva.titular.id, estadoDestino: "Solicitud convenio" });
     }
     await connection.commit();
+    firmaNuevaSubida = null;
 
     res.status(201).json({
       id: reservaId,
@@ -10418,6 +10553,7 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
     if (connection) {
       await connection.rollback();
     }
+    await borrarFirmaDeAltaRevertida(firmaNuevaSubida);
     registrarErrorRuta(error);
     if (error?.statusCode) {
       return res.status(error.statusCode).json({
@@ -10588,9 +10724,12 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           ? Number(numeroParcelaAnteriorRaw)
           : null;
 
-        // Procesar firma si existe
+        // Procesar firma si existe. Sólo la persona dueña de la reserva puede volver a
+        // firmar al editarla: la edición del staff no pide firma y, si un front viejo
+        // la manda igual, se ignora para no pisar la firma de la persona afiliada.
         let firmaArchivo = null;
-        if (firma_base64) {
+        const firmaDelDuenio = cabecera.rol === "afiliado" && Number(reservaActual.usuario_id) === Number(cabecera.id);
+        if (firma_base64 && firmaDelDuenio) {
           const firmaFileName = `firma_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.png`;
           await uploadBase64ToS3({
             key: firmaFileName,
@@ -10949,7 +11088,8 @@ router.get("/reserva/:id/edicion", verifyToken, async (req, res) => {
             r.fecha_fin,
             r.observaciones,
             r.fecha_creacion,
-            DATE_ADD(COALESCE((SELECT a.fecha_respuesta FROM reserva_aprobacion_titular a WHERE a.reserva_id = r.id AND a.decision = 'APROBADA'), r.fecha_creacion), INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR) AS fecha_vencimiento_respuesta,
+            -- Las 72 horas corren desde la aprobación del titular o la firma de la persona afiliada, si las hubo.
+            DATE_ADD(${reservasFirma.sqlInicioPlazoVerificacion("r")}, INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR) AS fecha_vencimiento_respuesta,
             COALESCE(r.modalidad, 'FECHA_LIBRE') as modalidad,
             r.sorteo_id,
             r.bloque_fecha_id,
@@ -11212,7 +11352,8 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
             r.fecha_fin,
             r.observaciones,
             r.fecha_creacion,
-            DATE_ADD(COALESCE((SELECT a.fecha_respuesta FROM reserva_aprobacion_titular a WHERE a.reserva_id = r.id AND a.decision = 'APROBADA'), r.fecha_creacion), INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR) AS fecha_vencimiento_respuesta,
+            -- Las 72 horas corren desde la aprobación del titular o la firma de la persona afiliada, si las hubo.
+            DATE_ADD(${reservasFirma.sqlInicioPlazoVerificacion("r")}, INTERVAL ${PLAZO_RESPUESTA_HORAS} HOUR) AS fecha_vencimiento_respuesta,
             r.firma_archivo,
             r.usuario_id,
             EXISTS(SELECT 1 FROM reserva_aprobacion_titular at WHERE at.reserva_id = r.id) AS tiene_aprobacion_titular,
@@ -11595,7 +11736,42 @@ router.get("/reserva/:id/resumen", verifyToken, async (req, res) => {
           && [ESTADO_INICIADA, ESTADO_VERIFICADA, ESTADO_APROBADA, ESTADO_PENDIENTE_TITULAR].includes(reserva.estado)
           && [MODALIDAD_FECHA_LIBRE, MODALIDAD_BLOQUE].includes(reserva.modalidad)
           && formatearFechaSQL(reserva.fecha_inicio) >= obtenerFechaCivilHoyArgentina();
-        respuesta.cancelacion = await obtenerCancelacionRegistrada(connection, { reservaId: reserva.id });
+        // Cancelación y condiciones: los nombres de quien cargó, aceptó o canceló sólo van al staff.
+        const esStaffResumen = ["admin", "admin-central", "departamental"].includes(cabecera.rol);
+        respuesta.cancelacion = await obtenerCancelacionRegistrada(connection, {
+          reservaId: reserva.id, incluirAutor: esStaffResumen,
+        });
+        respuesta.es_propietario = Number(reserva.usuario_id) === Number(cabecera.id);
+        const cargaReserva = await obtenerCargaReserva(connection, reserva.id);
+        respuesta.condiciones_cancelacion = await obtenerCondicionesReserva(connection, {
+          reserva,
+          carga: cargaReserva,
+          cancelacion: respuesta.cancelacion,
+          rol: cabecera.rol,
+          usuarioId: cabecera.id,
+          firmarArchivo: getSignedFileUrlFromS3,
+        });
+        // «Cancelar a pedido de la persona afiliada» y «Rechazar» con la misma
+        // regla que PUT /reserva/:id/estado (la jurisdicción ya se controló arriba).
+        respuesta.puede_cancelar_a_pedido = ["admin", "departamental"].includes(cabecera.rol)
+          && puedeCancelarAPedido({
+            rol: cabecera.rol,
+            estado: reserva.estado,
+            modalidad: reserva.modalidad,
+            fechaInicio: reserva.fecha_inicio,
+            hoy: obtenerFechaCivilHoyArgentina(),
+          });
+        respuesta.puede_rechazar = ["admin", "departamental"].includes(cabecera.rol)
+          && validarTransicionTurismo({
+            rol: cabecera.rol,
+            estadoActual: reserva.estado,
+            estadoSolicitado: ESTADO_RECHAZADA,
+            modalidad: reserva.modalidad,
+            cargaPropiaDepartamental: cabecera.rol === "departamental" && esCargaPropiaDepartamental({
+              creador: cargaReserva,
+              departamentalActorId: cabecera.departamental_id,
+            }),
+          }).valido;
         respuesta.puede_aprobar_titular = esTitularAutorizado && aprobacionesTitular[0].decision === "PENDIENTE" && reserva.estado === ESTADO_PENDIENTE_TITULAR;
         respuesta.convenio_hotel = convenioHotel;
         respuesta.convenio_propuesta = convenioPropuesta;
@@ -12101,6 +12277,30 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
       return res.status(400).json({ success: false, message: "Las observaciones son demasiado extensas" });
     }
 
+    // «Cancelar a pedido de la persona afiliada»: el staff sólo cancela a su
+    // pedido y dice cómo se lo pidió. La persona afiliada cancela desde la app
+    // (si manda un canal, se ignora: queda APP).
+    const esCancelacionAPedido = estado === ESTADO_CANCELADA && cabecera.rol !== "afiliado";
+    let canalPedidoCancelacion = null;
+    if (esCancelacionAPedido) {
+      const canal = typeof req.body?.cancelacion_canal === "string" ? req.body.cancelacion_canal.trim().toUpperCase() : "";
+      if (!canal) {
+        return res.status(400).json({
+          success: false,
+          codigo: "CANCELACION_CANAL_REQUERIDO",
+          message: "Indicá cómo te pidió la cancelación la persona afiliada: en persona, por teléfono o por escrito.",
+        });
+      }
+      if (!CANALES_PEDIDO_CANCELACION.includes(canal)) {
+        return res.status(400).json({
+          success: false,
+          codigo: "CANCELACION_CANAL_INVALIDO",
+          message: "Elegí cómo te pidió la cancelación: en persona, por teléfono o por escrito.",
+        });
+      }
+      canalPedidoCancelacion = canal;
+    }
+
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
 
@@ -12119,12 +12319,13 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
     }
 
     const reservaActual = reservas[0];
+    let departamentalEditorId = null;
     if (cabecera.rol === "departamental") {
       const [editores] = await connection.query(
         "SELECT departamental_id FROM usuario WHERE id = ? LIMIT 1",
         [cabecera.id]
       );
-      const departamentalEditorId = normalizarIdPositivo(editores[0]?.departamental_id);
+      departamentalEditorId = normalizarIdPositivo(editores[0]?.departamental_id);
       const departamentalReservaId = normalizarIdPositivo(reservaActual.usuario_departamental_id);
       if (!departamentalEditorId || departamentalEditorId !== departamentalReservaId) {
         throw crearErrorNegocio(
@@ -12135,6 +12336,24 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
       }
     }
 
+    // La departamental también rechaza sus propias cargas ya verificadas: un
+    // error de carga se rechaza, no se cancela «a pedido».
+    let cargaPropiaDepartamental = false;
+    if (cabecera.rol === "departamental" && estado === ESTADO_RECHAZADA
+      && reservaActual.estado_nombre === ESTADO_VERIFICADA
+      && normalizarIdPositivo(reservaActual.creado_por_usuario_id)) {
+      const [creadores] = await connection.query(
+        `SELECT u.departamental_id, ro.nombre AS rol
+           FROM usuario u INNER JOIN rol ro ON ro.id = u.rol_id
+          WHERE u.id = ? LIMIT 1`,
+        [reservaActual.creado_por_usuario_id]
+      );
+      cargaPropiaDepartamental = esCargaPropiaDepartamental({
+        creador: creadores[0],
+        departamentalActorId: departamentalEditorId,
+      });
+    }
+
     const transicion = validarTransicionTurismo({
       rol: cabecera.rol,
       usuarioId: cabecera.id,
@@ -12142,6 +12361,8 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
       estadoActual: reservaActual.estado_nombre,
       estadoSolicitado: estado,
       modalidad: reservaActual.modalidad,
+      aPedidoAfiliado: esCancelacionAPedido,
+      cargaPropiaDepartamental,
     });
     if (!transicion.valido) {
       throw crearErrorNegocio(transicion.mensaje, transicion.statusCode, transicion.codigo);
@@ -12149,12 +12370,17 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
 
     let cancelacion = null;
     if (transicion.estadoDestino === ESTADO_CANCELADA) {
-      if (formatearFechaSQL(reservaActual.fecha_inicio) < obtenerFechaCivilHoyArgentina()) {
+      // Sin firma no hay nada que cobrar: se da de baja aunque haya pasado el ingreso.
+      if (transicion.regla !== REGLA_CANCELACION_SIN_FIRMA
+        && formatearFechaSQL(reservaActual.fecha_inicio) < obtenerFechaCivilHoyArgentina()) {
         throw crearErrorNegocio("La fecha de ingreso ya pasó", 409, "RESERVA_FECHA_VENCIDA");
       }
+      // Mismo cálculo que si la persona afiliada cancelara desde la app; se
+      // guarda quién lo cargó, cómo lo pidió y el motivo.
       cancelacion = await confirmarCancelacionPolitica(connection, {
         reserva: reservaActual, usuarioId: cabecera.id,
         confirmada: req.body.cancelacion_confirmada, cotizacion: req.body.cancelacion_cotizacion,
+        origen: transicion.origen, canal: canalPedidoCancelacion, rol: cabecera.rol, motivo: observacionesNormalizadas,
       });
     }
     const fallbackEstadoId = {
@@ -12169,19 +12395,22 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
       fallbackEstadoId
     );
 
+    // El motivo de una cancelación queda guardado con ella
+    // (reserva_cancelacion_politica): no pisa las observaciones de la reserva.
+    const observacionesReserva = transicion.estadoDestino === ESTADO_CANCELADA ? null : observacionesNormalizadas;
     const cambios = [{
       campo: "estado_reserva_id",
       valorAnterior: reservaActual.estado_reserva_id,
       valorNuevo: estadoId,
     }];
     if (
-      observacionesNormalizadas !== null &&
-      String(reservaActual.observaciones || "") !== observacionesNormalizadas
+      observacionesReserva !== null &&
+      String(reservaActual.observaciones || "") !== observacionesReserva
     ) {
       cambios.push({
         campo: "observaciones",
         valorAnterior: reservaActual.observaciones || "",
-        valorNuevo: observacionesNormalizadas,
+        valorNuevo: observacionesReserva,
       });
     }
 
@@ -12191,7 +12420,7 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
               observaciones = COALESCE(?, observaciones),
               fecha_modificacion = NOW()
         WHERE id = ? AND estado_reserva_id = ?`,
-      [estadoId, observacionesNormalizadas, reservaId, reservaActual.estado_reserva_id]
+      [estadoId, observacionesReserva, reservaId, reservaActual.estado_reserva_id]
     );
     if (actualizacion.affectedRows !== 1) {
       throw crearErrorNegocio("La reserva cambió de estado. Volvé a cargarla.", 409, "RESERVA_MODIFICADA");
@@ -12216,6 +12445,30 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
           WHERE reserva_id = ? AND estado = 'PENDIENTE'`,
         [reservaId]
       );
+      if (reservaActual.estado_nombre === ESTADO_PENDIENTE_TITULAR) {
+        // El titular ya no tiene nada que aprobar.
+        await connection.query(
+          `UPDATE notificacion SET leida = 1, fecha_lectura = COALESCE(fecha_lectura, NOW())
+            WHERE tipo = 'RESERVA_APROBACION_TITULAR'
+              AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.reserva_id')) = ?`,
+          [String(reservaId)]
+        );
+      }
+      if (transicion.regla === REGLA_CANCELACION_SIN_FIRMA) {
+        // Ya no espera la firma: la solicitud queda cancelada y su aviso, leído.
+        await connection.query(
+          `UPDATE reserva_firma_afiliado
+              SET decision = 'CANCELADA', fecha_respuesta = NOW(), respondida_por_usuario_id = ?
+            WHERE reserva_id = ? AND decision = 'PENDIENTE'`,
+          [cabecera.id, reservaId]
+        );
+        await connection.query(
+          `UPDATE notificacion SET leida = 1, fecha_lectura = COALESCE(fecha_lectura, NOW())
+            WHERE tipo = 'RESERVA_FIRMA_PENDIENTE' AND usuario_id = ?
+              AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.reserva_id')) = ?`,
+          [reservaActual.usuario_id, String(reservaId)]
+        );
+      }
     }
 
     const mensajes = {
@@ -12224,26 +12477,36 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
       [ESTADO_RECHAZADA]: observacionesNormalizadas
         ? `Tu reserva fue rechazada. Motivo: ${observacionesNormalizadas}`
         : "Tu reserva fue rechazada.",
-      [ESTADO_CANCELADA]: observacionesNormalizadas
-        ? `Tu reserva fue cancelada. Motivo: ${observacionesNormalizadas}`
-        : "Tu reserva fue cancelada.",
     };
-    if (Number(reservaActual.usuario_id) !== Number(cabecera.id)) {
-      await insertarNotificacion(
-        connection,
-        reservaActual.usuario_id,
-        `RESERVA_${transicion.accion}`,
-        `Reserva #${reservaId}: ${transicion.estadoDestino}`,
-        mensajes[transicion.estadoDestino],
-        { reserva_id: reservaId, estado: transicion.estadoDestino }
-      );
+    if (transicion.origen === ORIGEN_CANCELACION_STAFF_A_PEDIDO) {
+      // A la persona afiliada (y a su titular) con el reintegro, y a Turismo sin el autor.
+      await avisarCancelacionAPedido(connection, {
+        reservaId,
+        actorId: cabecera.id,
+        rolActor: cabecera.rol,
+        canal: canalPedidoCancelacion,
+        cancelacion,
+        notificarStaff: (tipo, titulo, mensaje, payload) => notificarStaffTurismo(
+          connection, reservaActual.usuario_departamental_id, tipo, titulo, mensaje, payload, cabecera.id
+        ),
+      });
+    } else if (Number(reservaActual.usuario_id) !== Number(cabecera.id)) {
+      // Los cambios de estado van en «estados» aunque el tipo use un infinitivo.
+      await crearNotificacion(connection, {
+        usuarioId: reservaActual.usuario_id,
+        tipo: `RESERVA_${transicion.accion}`,
+        titulo: `Reserva #${reservaId}: ${transicion.estadoDestino}`,
+        mensaje: mensajes[transicion.estadoDestino],
+        payload: { reserva_id: reservaId, estado: transicion.estadoDestino },
+        categoria: "estados",
+      });
     } else if (cabecera.rol === "afiliado") {
       await notificarStaffTurismo(
         connection,
         reservaActual.usuario_departamental_id,
         "RESERVA_CANCELADA_AFILIADO",
         `Reserva #${reservaId} cancelada por el afiliado`,
-        observacionesNormalizadas || "El afiliado canceló la reserva iniciada.",
+        textoAvisoCancelacionAfiliadoStaff(cancelacion),
         { reserva_id: reservaId, estado: transicion.estadoDestino },
         cabecera.id
       );
@@ -12260,9 +12523,12 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
     }
 
     await connection.commit();
+    // El motivo interno de la política y su autor son de auditoría.
+    const { motivo: _motivoPolitica, creada_por: _creadaPor, autor_nombre: _autorPolitica, ...politicaCancelacion } =
+      cancelacion?.politica || {};
     return res.status(200).json({
       success: true,
-      cancelacion,
+      cancelacion: cancelacion ? { ...cancelacion, politica: politicaCancelacion } : null,
       message: `Reserva ${transicion.estadoDestino.toLowerCase()} exitosamente`,
       reserva: {
         id: reservaId,
@@ -12279,6 +12545,16 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
         success: false,
         message: error.message,
         codigo: error.codigo || null,
+      });
+    }
+    // Esta ruta bloquea reserva → persona; la firma y el alta, persona → reserva. Si una
+    // operación sobre la misma persona se cruza, InnoDB revierte una (deadlock) sin dejar
+    // nada a medias: se pide volver a intentar en vez de un error genérico.
+    if (error?.code === "ER_LOCK_DEADLOCK" || error?.errno === 1213) {
+      return res.status(409).json({
+        success: false,
+        codigo: "RESERVA_MODIFICADA",
+        message: "La reserva cambió mientras se guardaba. Volvé a cargarla e intentalo de nuevo.",
       });
     }
     return res.status(500).json({
@@ -13713,7 +13989,10 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       COALESCE(r.observaciones, '') AS observaciones,
       DATE_FORMAT(r.fecha_creacion, '%d/%m/%Y') AS fecha_creacion,
       r.precio_total AS importe,
-      (SELECT COUNT(*) FROM reserva_observacion ro WHERE ro.reserva_id = r.id) AS mensajes
+      (SELECT COUNT(*) FROM reserva_observacion ro WHERE ro.reserva_id = r.id) AS mensajes,
+      -- «Pendiente de firma»: hasta cuándo puede firmar la persona afiliada (NULL en los demás).
+      (SELECT f.vence_en FROM reserva_firma_afiliado f
+        WHERE f.reserva_id = r.id AND f.decision = 'PENDIENTE') AS firma_vence_en
     FROM reserva r
     INNER JOIN estado_reserva er ON r.estado_reserva_id = er.id
     LEFT JOIN recurso rec ON r.recurso_id = rec.id
@@ -13812,6 +14091,8 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
 // Colores pastel para los estados de reserva (misma estética que coseguro_estado)
 const COLORES_ESTADO_RESERVA = {
   "Pendiente_Aprobacion_Titular": { color: "#FEF3C7", color_texto: "#92400E" },
+  // Pide una acción de la persona afiliada (como la propuesta de convenio).
+  "Pendiente de firma": { color: "#FFF1DB", color_texto: "#B45309" },
   "Iniciada": { color: "#E3F2FD", color_texto: "#1565C0" },
   "Verificada": { color: "#FEF9C3", color_texto: "#A16207" },
   "Aprobada": { color: "#D1FAE5", color_texto: "#047857" },

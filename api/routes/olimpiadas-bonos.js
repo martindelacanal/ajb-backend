@@ -459,7 +459,9 @@ function normalizarReglasEntrada(body) {
     if (valor === null || valor > MAX_NUMERO_BONO) return { error: `La numeración debe ser un entero entre 0 y ${MAX_NUMERO_BONO}` };
     cambios[campo] = valor;
   }
-  for (const campo of ["requiere_aprobacion", "exigir_bonos_para_validar", "sorteo_publicado"]) {
+  // requiere_aprobacion ya no es una regla editable (la aprobación del afiliado es obligatoria en todas las
+  // ediciones): si llega de un front viejo en caché, se ignora.
+  for (const campo of ["exigir_bonos_para_validar", "sorteo_publicado"]) {
     if (b[campo] === undefined) continue;
     const valor = normalizarBooleano01(b[campo]);
     if (valor === null) return { error: `El campo ${campo} debe ser 0 o 1` };
@@ -521,7 +523,7 @@ function armarReglas(olimpiada, tramos) {
     bono_numero_desde: Number(olimpiada.bono_numero_desde) || 0,
     bono_numero_hasta: Number(olimpiada.bono_numero_hasta) || 0,
     digitos: digitosBono(olimpiada),
-    requiere_aprobacion: Number(olimpiada.requiere_aprobacion) === 1 ? 1 : 0,
+    requiere_aprobacion: 1, // compatibilidad: la aprobación del afiliado es obligatoria (la columna ya no se lee)
     exigir_bonos_para_validar: Number(olimpiada.exigir_bonos_para_validar) === 1 ? 1 : 0,
     fecha_sorteo: olimpiada.fecha_sorteo || null,
     sorteo_detalle: olimpiada.sorteo_detalle || null,
