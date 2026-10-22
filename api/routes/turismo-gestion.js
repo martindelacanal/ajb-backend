@@ -588,7 +588,8 @@ async function evaluarConfiguracionServicio(connection, servicio) {
        (SELECT COUNT(*) FROM tarifa t
           INNER JOIN recurso r ON r.id = t.recurso_id
          WHERE r.servicio_id = ? AND r.activo = 1
-           AND t.turismo_tarifa_regla_id IS NULL AND t.fecha_fin >= CURDATE()) AS tarifas_legacy_vigentes,
+           AND t.turismo_tarifa_regla_id IS NULL AND t.fecha_fin >= CURDATE()
+           AND t.eliminado = 0) AS tarifas_legacy_vigentes,
        (SELECT COUNT(*) FROM servicio_departamental_visible sdv
          WHERE sdv.servicio_id = ?) AS departamentales_visibles`,
     Array(7).fill(servicio.id)
@@ -874,7 +875,7 @@ router.get("/gestion/turismo/servicios/:id", verifyToken, async (req, res) => {
                     AND ta.recurso_id IN (SELECT rr.id FROM recurso rr WHERE rr.servicio_id = ?)) AS adicionales,
                 (SELECT bf.id FROM bloque_fecha bf WHERE bf.temporada_tarifa_id = tt.id LIMIT 1) AS bloque_fecha_id
            FROM temporada_tarifa tt
-           INNER JOIN tarifa t ON t.temporada_tarifa_id = tt.id
+           INNER JOIN tarifa t ON t.temporada_tarifa_id = tt.id AND t.eliminado = 0
            INNER JOIN recurso r ON r.id = t.recurso_id
           WHERE r.servicio_id = ? AND tt.fecha_fin >= CURDATE()
           GROUP BY tt.id

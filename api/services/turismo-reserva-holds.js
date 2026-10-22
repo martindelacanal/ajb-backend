@@ -587,7 +587,8 @@ async function obtenerParcelasCamping(connection, datos, configuracion, holdIdEx
         WHERE recurso_id = ?
           AND fecha_inicio <= ?
           AND fecha_fin >= ?
-          AND parcelas_disponibles IS NOT NULL`,
+          AND parcelas_disponibles IS NOT NULL
+          AND eliminado = 0`,
       [datos.recursoId, fecha, fecha]
     );
     if (!Number.isInteger(parcelas) || parcelas <= 0) parcelas = Number(rows[0]?.parcelas);

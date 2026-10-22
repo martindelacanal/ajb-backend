@@ -1230,7 +1230,7 @@ test("Mis gestiones devuelve icono y proveedor de Coseguro y permite buscarlo", 
     assert.match(sql, /cs.emisor_nombre AS proveedor/);
     assert.match(sql, /t.icono AS tipo_icono/);
     assert.match(sql, /g.proveedor LIKE \?/);
-    assert.equal(params.filter(p => p === "%Farmacia de prueba%").length, 15);
+    assert.equal(params.filter(p => p === "%Farmacia de prueba%").length, 14);
     if (/SELECT g.tipo, COUNT\(\*\)/i.test(sql)) return [[{ tipo: "coseguro", total: 1 }]];
     if (/SELECT g.\* FROM/i.test(sql)) {
       return [[{ id: 5, tipo: "coseguro", codigo: "C-5", proveedor: "Farmacia de prueba", tipo_icono: "medication" }]];

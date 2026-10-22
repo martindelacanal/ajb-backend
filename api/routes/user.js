@@ -16,6 +16,7 @@ const { crearSesion } = require("../security/sesiones-persistentes");
 const { datosPublicosAcceso, exigirAccesoCuenta, exigirAltaParaUsuario, ErrorRestriccionCuenta, cuerpoRestriccion } = require("../security/restricciones-cuenta");
 const { condicionModuloNotificacion } = require("../services/notificaciones-modulos");
 const { crearNotificacion, obtenerPreferenciasNotificaciones, guardarPreferenciasNotificaciones } = require("../services/notificaciones");
+const { leerCodigoBuscado } = require("../services/busqueda-codigos");
 const {
   construirVisibilidadServicioSql,
   construirCatalogoServicioSql,
@@ -1272,6 +1273,7 @@ router.get(["/servicios", "/departamental/servicios"], verifyToken, async (req, 
         AND (t.edad_maxima IS NULL OR t.edad_maxima >= 18)
         AND t.fecha_inicio <= ?
         AND t.fecha_fin >= ?
+        AND t.eliminado = 0
     `, [servicio.id, fechaString, fechaString]);
 
               estimacionCompleta = acumularRangoTarifa(tarifasAdultos, adultos) && estimacionCompleta;
@@ -1288,6 +1290,7 @@ router.get(["/servicios", "/departamental/servicios"], verifyToken, async (req, 
         AND (t.edad_maxima IS NULL OR t.edad_maxima >= 2)
         AND t.fecha_inicio <= ?
         AND t.fecha_fin >= ?
+        AND t.eliminado = 0
     `, [servicio.id, fechaString, fechaString]);
 
               estimacionCompleta = acumularRangoTarifa(tarifasninos, ninos) && estimacionCompleta;
@@ -1303,6 +1306,7 @@ router.get(["/servicios", "/departamental/servicios"], verifyToken, async (req, 
                   AND (t.edad_maxima IS NULL OR t.edad_maxima < 2)
                   AND t.fecha_inicio <= ?
                   AND t.fecha_fin >= ?
+                  AND t.eliminado = 0
               `, [servicio.id, fechaString, fechaString]);
 
               estimacionCompleta = acumularRangoTarifa(tarifasBebes, bebes) && estimacionCompleta;
@@ -3961,10 +3965,25 @@ router.put("/admin/bloques/:id", verifyToken, async (req, res) => {
       temporadaTarifaId = temporada.temporadaId;
 
       if (temporadaAnteriorId) {
-        const tieneHistoria = await temporadaTieneReferenciasHistoricas(connection, temporadaAnteriorId);
-        if (!tieneHistoria) {
-          await connection.query("DELETE FROM temporada_tarifa WHERE id = ?", [temporadaAnteriorId]);
-        }
+        // La temporada anterior ya no se borra (el borrado arrastraba su historial): sus
+        // tarifas y adicionales quedan dados de baja como REEMPLAZADO, con lote, y la fila de
+        // temporada_tarifa queda sin precios vigentes.
+        const baja = await darDeBajaTarifasTemporada(connection, {
+          temporadaId: temporadaAnteriorId,
+          usuarioId: cabecera.id,
+        });
+        await guardarHistorialTemporada(
+          connection,
+          temporadaAnteriorId,
+          cabecera.id,
+          "DELETE",
+          "tarifas",
+          JSON.stringify(resumenHistorialBajaTarifas(baja, {
+            adicionales: baja.adicionales,
+            reemplazada_por: temporadaTarifaId,
+          })),
+          null
+        );
       }
     }
 
@@ -4900,6 +4919,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
               AND (tarifa.edad_maxima IS NULL OR tarifa.edad_maxima >= ?)
               AND tarifa.fecha_inicio <= ?
               AND tarifa.fecha_fin >= ?
+              AND tarifa.eliminado = 0
               ${filtroTemporada}
           `, [
             servicioIdSolicitud,
@@ -5453,6 +5473,7 @@ router.post("/filtros/para-recursos", verifyToken, async (req, res) => {
               AND (tarifa.edad_maxima IS NULL OR tarifa.edad_maxima >= ?)
               AND tarifa.fecha_inicio <= ?
               AND tarifa.fecha_fin >= ?
+              AND tarifa.eliminado = 0
               ${filtroTemporada}
           `, [
             servicioIdSolicitud,
@@ -7569,6 +7590,7 @@ async function validarSolapamientoTarifasExistentes(connection, {
       WHERE t.recurso_id IN (${placeholdersRecursos})
         AND t.fecha_inicio <= ?
         AND t.fecha_fin >= ?
+        AND t.eliminado = 0
         AND (
           COALESCE(tt.origen, 'GENERAL') <> 'BLOQUE'
           OR EXISTS (
@@ -8254,6 +8276,7 @@ async function calcularTarifaBaseReserva(connection, {
           AND (edad_maxima IS NULL OR edad_maxima >= ?)
           AND fecha_inicio <= ?
           AND fecha_fin >= ?
+          AND eliminado = 0
           ${filtroTemporada}
         ORDER BY fecha_inicio ASC
       `,
@@ -8391,31 +8414,6 @@ async function insertarTarifasFamiliaresCalculadas(connection, reservasFamiliare
   }
 }
 
-async function temporadaTieneReferenciasHistoricas(connection, temporadaTarifaId) {
-  const [rows] = await connection.query(
-    `
-      SELECT EXISTS (
-        SELECT 1
-        FROM tarifa t
-        INNER JOIN reserva_familiar_tarifa rft ON rft.tarifa_id = t.id
-        WHERE t.temporada_tarifa_id = ?
-        UNION ALL
-        SELECT 1
-        FROM tarifa t
-        INNER JOIN reserva_adicional_detalle rad ON rad.tarifa_id = t.id
-        WHERE t.temporada_tarifa_id = ?
-        UNION ALL
-        SELECT 1
-        FROM tarifa_adicional ta
-        INNER JOIN reserva_adicional_detalle rad ON rad.tarifa_adicional_id = ta.id
-        WHERE ta.temporada_tarifa_id = ?
-      ) AS tiene_referencias
-    `,
-    [temporadaTarifaId, temporadaTarifaId, temporadaTarifaId]
-  );
-  return Number(rows[0]?.tiene_referencias) === 1;
-}
-
 async function insertarTarifasFamiliaresReserva(connection, reservasFamiliaresIds, recursoId, regimenId, fechaInicio, fechaFin, temporadaTarifaId = null) {
   const noches = obtenerNochesReserva(formatearFechaSQL(fechaInicio), formatearFechaSQL(fechaFin));
   if (noches.length === 0) {
@@ -8436,6 +8434,7 @@ async function insertarTarifasFamiliaresReserva(connection, reservasFamiliaresId
            AND (edad_maxima IS NULL OR edad_maxima >= ?)
            AND fecha_inicio <= ?
            AND fecha_fin >= ?
+           AND eliminado = 0
            ${filtroTemporada}
          ORDER BY fecha_inicio ASC`,
         [
@@ -9092,7 +9091,8 @@ async function obtenerMinimoParcelasDisponiblesCamping(connection, recursoId, no
        WHERE t.recurso_id = ?
          AND t.fecha_inicio <= ?
          AND t.fecha_fin >= ?
-         AND t.parcelas_disponibles IS NOT NULL`,
+         AND t.parcelas_disponibles IS NOT NULL
+         AND t.eliminado = 0`,
       [recursoId, fecha, fecha]
     );
 
@@ -9581,8 +9581,8 @@ async function crearReservaSalud(connection, {
     await crearNotificacion(connection, {
       usuarioId: u.id,
       tipo: "RESERVA_SALUD_NUEVA",
-      titulo: `Nueva reserva por salud #${reservaId}`,
-      mensaje: `${usuarioNombre} solicitó el subsidio de alojamiento por salud. Revisá los certificados médicos en Servicios Sociales.`,
+      titulo: `Nueva reserva por salud T-${reservaId}`,
+      mensaje: `${usuarioNombre} pidió el subsidio de alojamiento por salud. Sus certificados médicos están por validar en Coseguro médico › Subsidios por salud.`,
       payload: { reserva_id: reservaId, reserva_salud_id: reservaSaludId, estado: "PENDIENTE" },
     });
   }
@@ -13677,7 +13677,13 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
   const queryOrderBy = `${orderBy} ${orderType}`;
 
   const querySearchParams = [];
-  if (buscar) {
+  // El código de la reserva con o sin guion ("T-41", "T41") o el "#41" del staff
+  // trae esa reserva y nada más; el número solo y el texto libre buscan amplio.
+  const codigo = buscar ? leerCodigoBuscado(buscar, "T") : null;
+  if (codigo) {
+    queryBuscar = "AND r.id = ?";
+    querySearchParams.push(codigo.id);
+  } else if (buscar) {
     const like = `%${buscar}%`;
     queryBuscar = `AND (CAST(r.id AS CHAR) LIKE ? OR er.nombre LIKE ? OR r.modalidad LIKE ?
       OR s.nombre LIKE ? OR rec.nombre LIKE ? OR ch.nombre LIKE ? OR ch.ciudad LIKE ? OR ch.provincia LIKE ?
@@ -14076,15 +14082,25 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
     const params = [];
 
     const search = String(req.query.search || "").trim();
-    if (search) {
+    // El código como se ve en pantalla, con o sin guion ("T-120", "T120", "tr 12"),
+    // trae esa gestión y nada más; "#120", las de ese número en cualquier módulo.
+    const codigo = search ? leerCodigoBuscado(search, ["T", "C", "TR", "B", "K"]) : null;
+    if (codigo?.prefijo) {
+      condiciones.push("g.codigo = ?");
+      params.push(`${codigo.prefijo}-${codigo.id}`);
+    } else if (codigo) {
+      condiciones.push("g.id = ?");
+      params.push(codigo.id);
+    } else if (search) {
+      // Sin el estado del subsidio: es un código interno; su nombre lo pone el front
       condiciones.push(`(g.codigo LIKE ? OR g.tipo LIKE ? OR g.titulo LIKE ? OR g.subtitulo LIKE ? OR g.estado LIKE ?
         OR g.comprobante LIKE ? OR g.beneficiario LIKE ? OR g.fecha_inicio LIKE ? OR g.fecha_fin LIKE ?
         OR REPLACE(g.modalidad, '_', ' ') LIKE ? OR CAST(g.importe AS CHAR) LIKE ?
         OR DATE_FORMAT(g.fecha_creacion, '%d/%m/%Y %H:%i') LIKE ?
-        OR (CASE WHEN g.es_por_salud = 1 THEN 'Por salud' ELSE '' END) LIKE ? OR g.salud_estado LIKE ?
+        OR (CASE WHEN g.es_por_salud = 1 THEN 'Por salud' ELSE '' END) LIKE ?
         OR g.proveedor LIKE ?)`);
       const like = `%${search}%`;
-      params.push(...Array(15).fill(like));
+      params.push(...Array(14).fill(like));
     }
 
     // estados=T1,T3,C7 → cada token filtra dentro de su propio módulo
@@ -15548,6 +15564,180 @@ async function guardarHistorialTemporada(connection, temporadaId, usuarioId, ope
   }
 }
 
+// --- Baja lógica de tarifas de temporada ----------------------------------------
+// Al guardar una temporada (PUT /temporada/:id) o reemplazar la de un bloque de
+// temporada alta, sus tarifas y adicionales vigentes NO se borran: quedan con
+// eliminado = 1 (tarifa) o activo = 0 (tarifa_adicional), fecha, usuario, motivo y
+// un lote (UUID) por guardado. Toda consulta que cotiza, ofrece o edita lee sólo
+// eliminado = 0 (lo controla test/tarifa-baja-logica-consultas.test.js). Lo dado de
+// baja se audita o rehabilita con scripts/rehabilitar-tarifas-temporada.js.
+
+const MENSAJE_TEMPORADA_CON_HISTORIAL =
+  "La temporada ya se usó en reservas y sus precios no se pueden reemplazar. Para precios nuevos, creá otra temporada.";
+// historial_temporada.valor_anterior es TEXT (64 KB): resumen por par, nunca filas completas.
+const MAXIMO_PARES_HISTORIAL_TEMPORADA = 500;
+
+// ¿Alguna reserva usó tarifas de la temporada (vigentes o dadas de baja)? Con
+// reservas sus precios no se reemplazan (409 TEMPORADA_CON_HISTORIAL) y
+// GET /temporada/:id lo avisa en tiene_reservas.
+// reserva_familiar_tarifa no tiene índice por tarifa_id: MySQL la recorre entera
+// (como ya lo hacía el PUT antes de la baja lógica). Con este volumen alcanza; si
+// crece, el arreglo es ese índice en una migración NUEVA (la de baja lógica ya quedó
+// registrada con su checksum).
+async function temporadaUsadaEnReservas(connection, temporadaId) {
+  const [rows] = await connection.query(
+    `SELECT EXISTS (
+       SELECT 1
+         FROM reserva_familiar_tarifa rft
+         INNER JOIN tarifa t ON t.id = rft.tarifa_id
+        WHERE t.temporada_tarifa_id = ?
+     ) AS usada`,
+    [temporadaId]
+  );
+  return Number(rows[0]?.usada) === 1;
+}
+
+// Pares "recurso:régimen" que siguen en la configuración que mandó el editor.
+function paresRecursoRegimenConfiguracion(configuracionServicios) {
+  return Array.from(new Set(
+    extraerSegmentosTarifasConfiguracion(configuracionServicios)
+      .filter((segmento) => segmento.recursoId && segmento.regimenId)
+      .map((segmento) => `${segmento.recursoId}:${segmento.regimenId}`)
+  ));
+}
+
+// Filas dadas de baja agrupadas por servicio, régimen y recurso (para el historial).
+function resumirTarifasPorPar(tarifas) {
+  const pares = new Map();
+  for (const tarifa of tarifas) {
+    const clave = `${tarifa.recurso_id}:${tarifa.regimen_id}`;
+    if (!pares.has(clave)) {
+      pares.set(clave, {
+        servicio_id: normalizarIdPositivo(tarifa.servicio_id),
+        regimen_id: normalizarIdPositivo(tarifa.regimen_id),
+        recurso_id: normalizarIdPositivo(tarifa.recurso_id),
+        filas: 0,
+      });
+    }
+    pares.get(clave).filas += 1;
+  }
+  return Array.from(pares.values());
+}
+
+/**
+ * Da de baja (nunca borra) las tarifas y adicionales vigentes de una temporada.
+ * paresConservados: pares "recurso:régimen" que siguen en la temporada; sus filas
+ * se reemplazan por las que se insertan después (motivo REEMPLAZADO) y las del
+ * resto quedan QUITADO. Sin pares (null) todo queda REEMPLAZADO: es la temporada
+ * anterior de un bloque, reemplazada entera por otra.
+ */
+async function darDeBajaTarifasTemporada(connection, { temporadaId, usuarioId, paresConservados = null }) {
+  const lote = crypto.randomUUID();
+  const conservados = Array.isArray(paresConservados) ? new Set(paresConservados.map(String)) : null;
+  let motivoSql = "'REEMPLAZADO'";
+  const motivoParams = [];
+  if (conservados && conservados.size > 0) {
+    motivoSql = "IF(CONCAT(recurso_id, ':', regimen_id) IN (?), 'REEMPLAZADO', 'QUITADO')";
+    motivoParams.push(Array.from(conservados));
+  } else if (conservados) {
+    motivoSql = "'QUITADO'";
+  }
+
+  const [tarifas] = await connection.query(
+    `SELECT t.id, t.recurso_id, t.regimen_id, r.servicio_id
+       FROM tarifa t
+       LEFT JOIN recurso r ON r.id = t.recurso_id
+      WHERE t.temporada_tarifa_id = ? AND t.eliminado = 0
+      FOR UPDATE OF t`,
+    [temporadaId]
+  );
+  if (tarifas.length > 0) {
+    await connection.query(
+      `UPDATE tarifa
+          SET eliminado = 1, fecha_eliminacion = NOW(), eliminado_usuario_id = ?,
+              eliminado_lote = ?, eliminado_motivo = ${motivoSql}
+        WHERE temporada_tarifa_id = ? AND eliminado = 0`,
+      [usuarioId, lote, ...motivoParams, temporadaId]
+    );
+  }
+  const [resultadoAdicionales] = await connection.query(
+    `UPDATE tarifa_adicional
+        SET activo = 0, fecha_eliminacion = NOW(), eliminado_usuario_id = ?,
+            eliminado_lote = ?, eliminado_motivo = ${motivoSql}
+      WHERE temporada_tarifa_id = ? AND activo = 1`,
+    [usuarioId, lote, ...motivoParams, temporadaId]
+  );
+
+  const quitadas = conservados
+    ? tarifas.filter((tarifa) => !conservados.has(`${tarifa.recurso_id}:${tarifa.regimen_id}`))
+    : [];
+  return {
+    lote,
+    tarifas: tarifas.length,
+    reemplazadas: tarifas.length - quitadas.length,
+    quitadas: resumirTarifasPorPar(quitadas),
+    adicionales: Number(resultadoAdicionales?.affectedRows || 0),
+  };
+}
+
+// valor_anterior del historial para una baja: lote, cantidades y pares quitados.
+function resumenHistorialBajaTarifas(baja, extra = {}) {
+  const quitadas = baja.quitadas.slice(0, MAXIMO_PARES_HISTORIAL_TEMPORADA);
+  return {
+    baja_logica: true,
+    lote: baja.lote,
+    cantidad: baja.tarifas,
+    reemplazadas: baja.reemplazadas,
+    quitadas,
+    ...(baja.quitadas.length > quitadas.length ? { pares_omitidos: baja.quitadas.length - quitadas.length } : {}),
+    ...extra,
+  };
+}
+
+// Los adicionales vuelven con un upsert sobre uniq_tarifa_adic (temporada, recurso,
+// régimen, adicional y fechas): si la clave ya existía, dada de baja en este guardado
+// o antes, la fila se reactiva con el precio nuevo. Como el precio anterior no queda en
+// ninguna fila (a diferencia de las tarifas, que quedan REEMPLAZADO), va al historial.
+// Cada cambio ocupa ~170 bytes: 250 entran holgados en el TEXT (64 KB) del historial.
+const MAXIMO_ADICIONALES_HISTORIAL_TEMPORADA = 250;
+
+function claveTarifaAdicional({ recursoId, regimenId, adicionalId, fechaInicio, fechaFin }) {
+  return [
+    normalizarIdPositivo(recursoId),
+    normalizarIdPositivo(regimenId),
+    normalizarIdPositivo(adicionalId),
+    formatearFechaSQL(fechaInicio),
+    formatearFechaSQL(fechaFin),
+  ].join("|");
+}
+
+// Adicionales de la temporada (vigentes o no) por clave, con su precio actual.
+async function adicionalesTemporadaPorClave(connection, temporadaId) {
+  const [filas] = await connection.query(
+    `SELECT id, recurso_id, regimen_id, adicional_id, fecha_inicio, fecha_fin, precio
+       FROM tarifa_adicional
+      WHERE temporada_tarifa_id = ?`,
+    [temporadaId]
+  );
+  return new Map(filas.map((fila) => [claveTarifaAdicional({
+    recursoId: fila.recurso_id,
+    regimenId: fila.regimen_id,
+    adicionalId: fila.adicional_id,
+    fechaInicio: fila.fecha_inicio,
+    fechaFin: fila.fecha_fin,
+  }), fila]));
+}
+
+// valor_anterior del historial: los adicionales cuyo precio pisó el upsert.
+function resumenHistorialPreciosAdicionales(lote, cambios) {
+  const incluidos = cambios.slice(0, MAXIMO_ADICIONALES_HISTORIAL_TEMPORADA);
+  return {
+    lote,
+    adicionales: incluidos,
+    ...(cambios.length > incluidos.length ? { adicionales_omitidos: cambios.length - incluidos.length } : {}),
+  };
+}
+
 function normalizarBanderaPorcentaje(valor) {
   if (valor === undefined || valor === null) {
     return false;
@@ -16651,6 +16841,7 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
           JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id
           JOIN regimen reg ON t.regimen_id = reg.id
           WHERE t.temporada_tarifa_id = ?
+            AND t.eliminado = 0
           ORDER BY s.id, reg.id, r.id, t.fecha_inicio`,
           [id]
         );
@@ -16821,13 +17012,17 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
           };
         });
 
+        // Con reservas sus precios no se pueden reemplazar: el editor lo avisa al abrirla.
+        const tieneReservas = await temporadaUsadaEnReservas(connection, id);
+
         // 4. Construir respuesta final
         const response = {
           nombre_campania: temporada.nombre,
           fecha_inicio: temporada.fecha_inicio,
           fecha_fin: temporada.fecha_fin,
           configuracion_servicios: Array.from(serviciosMap.values()),
-          porcentajes_tipo_persona: porcentajesTipoPersona
+          porcentajes_tipo_persona: porcentajesTipoPersona,
+          tiene_reservas: tieneReservas
         };
 
         connection.release();
@@ -16926,67 +17121,46 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
           );
         }
 
-        // 3. Eliminar todas las tarifas existentes de esta temporada
-        const [tarifasAnteriores] = await connection.query(
-          "SELECT id FROM tarifa WHERE temporada_tarifa_id = ?",
-          [id]
-        );
+        // 3. Dar de baja (no borrar) las tarifas y adicionales vigentes: abajo se insertan
+        //    los nuevos. Lo que ya no viene (servicio, régimen o recurso quitado) queda
+        //    QUITADO; lo que sigue, REEMPLAZADO. Todo con el mismo lote.
+        if (await temporadaUsadaEnReservas(connection, id)) {
+          throw crearErrorNegocio(MENSAJE_TEMPORADA_CON_HISTORIAL, 409, "TEMPORADA_CON_HISTORIAL");
+        }
+        const baja = await darDeBajaTarifasTemporada(connection, {
+          temporadaId: id,
+          usuarioId: cabecera.id,
+          paresConservados: paresRecursoRegimenConfiguracion(configuracion_servicios),
+        });
 
-        if (tarifasAnteriores.length > 0) {
-          const [referenciasTarifas] = await connection.query(
-            `SELECT COUNT(*) AS cantidad
-             FROM reserva_familiar_tarifa rft
-             INNER JOIN tarifa t ON t.id = rft.tarifa_id
-             WHERE t.temporada_tarifa_id = ?`,
-            [id]
-          );
-          if (Number(referenciasTarifas[0]?.cantidad || 0) > 0) {
-            throw crearErrorNegocio(
-              "La temporada ya fue utilizada por reservas y no puede reemplazar sus tarifas históricas; crea una nueva temporada",
-              409,
-              "TEMPORADA_CON_HISTORIAL"
-            );
-          }
-          await connection.query(
-            "DELETE FROM tarifa WHERE temporada_tarifa_id = ?",
-            [id]
-          );
-
-          // Guardar historial de eliminación
+        if (baja.tarifas > 0) {
           await guardarHistorialTemporada(
             connection,
             id,
             cabecera.id,
             'DELETE',
             'tarifas',
-            JSON.stringify({ cantidad: tarifasAnteriores.length }),
+            JSON.stringify(resumenHistorialBajaTarifas(baja)),
             null
           );
         }
 
-        // Soft delete: marcar como inactivas las tarifas adicionales existentes
-        // en lugar de eliminarlas (para preservar referencias de reservas existentes)
-        const [adicionalesAnteriores] = await connection.query(
-          "SELECT id FROM tarifa_adicional WHERE temporada_tarifa_id = ? AND activo = 1",
-          [id]
-        );
-
-        if (adicionalesAnteriores.length > 0) {
-          await connection.query(
-            "UPDATE tarifa_adicional SET activo = 0 WHERE temporada_tarifa_id = ?",
-            [id]
-          );
-
+        if (baja.adicionales > 0) {
           await guardarHistorialTemporada(
             connection,
             id,
             cabecera.id,
             'UPDATE',
             'tarifa_adicional',
-            JSON.stringify({ cantidad: adicionalesAnteriores.length, accion: 'desactivar' }),
+            JSON.stringify({ baja_logica: true, lote: baja.lote, cantidad: baja.adicionales, accion: 'desactivar' }),
             null
           );
         }
+
+        // El upsert de abajo pisa el precio de un adicional con la misma clave: el
+        // anterior se lee ahora para dejarlo en el historial.
+        const adicionalesAnteriores = await adicionalesTemporadaPorClave(connection, id);
+        const adicionalesConOtroPrecio = [];
 
         const [porcentajesAnteriores] = await connection.query(
           "SELECT tipo_persona_id, porcentaje FROM temporada_tipo_persona_porcentaje WHERE temporada_tarifa_id = ?",
@@ -17069,7 +17243,9 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
                           INSERT INTO tarifa_adicional
                             (temporada_tarifa_id, recurso_id, regimen_id, adicional_id, fecha_inicio, fecha_fin, precio, activo)
                           VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-                          ON DUPLICATE KEY UPDATE precio = VALUES(precio), activo = 1
+                          ON DUPLICATE KEY UPDATE precio = VALUES(precio), activo = 1,
+                            fecha_eliminacion = NULL, eliminado_usuario_id = NULL,
+                            eliminado_motivo = NULL, eliminado_lote = NULL
                         `,
                         [
                           id,
@@ -17089,6 +17265,27 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
                         fecha_inicio: fecha.fecha_inicio,
                         fecha_fin: fecha.fecha_fin
                       });
+
+                      const anterior = adicionalesAnteriores.get(claveTarifaAdicional({
+                        recursoId: recurso.id,
+                        regimenId: regimen.id,
+                        adicionalId: adicional.adicionalId,
+                        fechaInicio: fecha.fecha_inicio,
+                        fechaFin: fecha.fecha_fin,
+                      }));
+                      // En centavos: precio es DECIMAL(12,2)
+                      if (anterior && Math.round(Number(anterior.precio) * 100) !== Math.round(Number(adicional.precio) * 100)) {
+                        adicionalesConOtroPrecio.push({
+                          id: anterior.id,
+                          adicional_id: anterior.adicional_id,
+                          recurso_id: anterior.recurso_id,
+                          regimen_id: anterior.regimen_id,
+                          fecha_inicio: formatearFechaSQL(anterior.fecha_inicio),
+                          fecha_fin: formatearFechaSQL(anterior.fecha_fin),
+                          precio_anterior: Number(anterior.precio),
+                          precio_nuevo: Number(adicional.precio),
+                        });
+                      }
                     }
                   }
 
@@ -17205,6 +17402,18 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
             'tarifa_adicional',
             null,
             JSON.stringify({ registros: adicionalesPorTemporada.length })
+          );
+        }
+
+        if (adicionalesConOtroPrecio.length > 0) {
+          await guardarHistorialTemporada(
+            connection,
+            id,
+            cabecera.id,
+            'UPDATE',
+            'tarifa_adicional_precio',
+            JSON.stringify(resumenHistorialPreciosAdicionales(baja.lote, adicionalesConOtroPrecio)),
+            null
           );
         }
 
@@ -18784,5 +18993,9 @@ function verifyToken(req, res, next) {
     mensajeAuthorization: "No autorizado",
   });
 }
+
+router.__test = Object.freeze({
+  darDeBajaTarifasTemporada,
+});
 
 module.exports = router;

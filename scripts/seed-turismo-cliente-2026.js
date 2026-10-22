@@ -20,6 +20,7 @@
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
+const { asegurarSinTarifasDadasDeBaja } = require("./guardia-baja-logica-tarifas");
 
 const MARCADOR = "[AJB-CLIENTE-2026]";
 const CONFIRMACION = "APLICAR_SEED_TURISMO_2026";
@@ -230,6 +231,7 @@ async function main() {
 
   const resumen = { temporadas: 0, tarifas: 0, adicionales: 0, tarifasAdicionales: 0, cupos: 0, sorteos: 0, bloques: 0, omitidos: [] };
   try {
+    await asegurarSinTarifasDadasDeBaja(connection, "seed-turismo-cliente-2026.js");
     await connection.beginTransaction();
 
     // Catálogo
