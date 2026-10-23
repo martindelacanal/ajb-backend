@@ -480,12 +480,23 @@ test("ningún alta ni hold inicia hospedaje sin CBU y no se exponen datos bancar
     assert.equal(response.body.codigo, "CBU_REQUERIDO", endpoint);
     assert.equal(databaseCalls.some(({ sql }) => /INSERT INTO reserva|INSERT INTO turismo_reserva_hold/.test(sql)), false);
   }
-  setDatabaseHandler(responderTitularParaAlta({ cbu: "2850590940090418135201" }));
-  const elegibilidad = await request("/api/turismo/reserva-elegibilidad?usuario_id=200", { token: tokenFor({ rol: "admin" }) });
-  assert.equal(elegibilidad.status, 200);
-  assert.equal(elegibilidad.body.cbu_completo, true);
-  assert.equal(elegibilidad.body.puede_reservar, true);
-  assert.equal(JSON.stringify(elegibilidad.body).includes("2850590940090418135201"), false);
+  // El staff también sabe si la persona entró alguna vez a Mi AJB (para «Se la envío…»).
+  const titularValido = responderTitularParaAlta({ cbu: "2850590940090418135201" });
+  for (const ingreso of [0, 1]) {
+    setDatabaseHandler(async (sql, params) => {
+      if (/primer_ingreso IS NOT NULL OR ultimo_ingreso IS NOT NULL/.test(sql)) {
+        assert.deepEqual(params, [200]);
+        return [[{ ingreso }]];
+      }
+      return titularValido(sql, params);
+    });
+    const elegibilidad = await request("/api/turismo/reserva-elegibilidad?usuario_id=200", { token: tokenFor({ rol: "admin" }) });
+    assert.equal(elegibilidad.status, 200);
+    assert.equal(elegibilidad.body.cbu_completo, true);
+    assert.equal(elegibilidad.body.puede_reservar, true);
+    assert.equal(elegibilidad.body.ingreso_mi_ajb, ingreso === 1);
+    assert.equal(JSON.stringify(elegibilidad.body).includes("2850590940090418135201"), false);
+  }
 });
 
 test("elegibilidad familiar usa su titular y descarta un usuario_id manipulado", async () => {
@@ -501,6 +512,7 @@ test("elegibilidad familiar usa su titular y descarta un usuario_id manipulado",
   assert.equal(response.status, 200);
   assert.equal(response.body.requiere_aprobacion_titular, true);
   assert.equal(response.body.titular_usuario_id, 200);
+  assert.equal("ingreso_mi_ajb" in response.body, false);
   assert.equal(databaseCalls.some(({ params }) => params.includes(999)), false);
 });
 
@@ -1482,4 +1494,65 @@ test("departamental solo Turismo busca titulares habilitados de su jurisdiccion"
     departamental_nombre: "Departamental 7",
     modulo_coseguro: 0,
   }]);
+});
+
+test("el titular ve a los pasajeros de cada solicitud de su familia", async () => {
+  setDatabaseHandler(async (sql, params) => {
+    if (/FROM reserva_aprobacion_titular a INNER JOIN reserva r/.test(sql)) {
+      assert.equal(params[0], 200);
+      return [[{ id: 7, estado: "Pendiente_Aprobacion_Titular", solicitante_nombre: "Juan", solicitante_apellido: "Gómez",
+        servicio: "Hotel Solís", recurso: "Habitación doble", fecha_inicio: "2099-01-10", fecha_fin: "2099-01-17",
+        precio_total: 480000, modalidad: "FECHA_LIBRE" }]];
+    }
+    if (/FROM reserva_familiar rf/.test(sql)) {
+      assert.deepEqual(params, [[7]]);
+      return [[{ reserva_id: 7, nombre: "Juan", apellido: "Gómez", edad: 40 }, { reserva_id: 7, nombre: "Sofía", apellido: "Gómez", edad: 9 }]];
+    }
+    throw new Error(`Consulta no prevista: ${sql}`);
+  });
+  const response = await request("/api/reservas/aprobaciones-titular", { token: tokenFor({ id: 200, rol: "afiliado" }) });
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body.reservas[0].personas, [
+    { nombre: "Juan", apellido: "Gómez", edad: 40 }, { nombre: "Sofía", apellido: "Gómez", edad: 9 },
+  ]);
+  assert.equal(response.body.reservas[0].puede_aprobar_titular, true);
+});
+
+test("cerrar el sorteo no deja pendiente la aprobación del titular de una inscripción que esperaba", async () => {
+  setDatabaseHandler(async (sql, params) => {
+    if (/SELECT id, estado FROM sorteo/.test(sql)) return [[{ id: 5, estado: "ACTIVO" }]];
+    if (/SELECT id, estado_reserva_id\s+FROM reserva/.test(sql)) return [[{ id: 30, estado_reserva_id: 14 }, { id: 31, estado_reserva_id: 9 }]];
+    if (/SELECT id FROM estado_reserva WHERE nombre = \?/.test(sql)) return [[{ id: 12 }]];
+    if (/FROM reserva_aprobacion_titular a INNER JOIN reserva r/.test(sql)) {
+      assert.deepEqual(params, [[30, 31]]);
+      return [[{ reserva_id: 30, usuario_id: 20 }]];
+    }
+    if (/^\s*(UPDATE|INSERT)/i.test(sql)) return [{ affectedRows: 1, insertId: 1 }];
+    return [[]];
+  });
+  const response = await request("/api/admin/sorteos/5/cerrar", { method: "PUT", token: tokenFor({ rol: "admin" }) });
+  assert.equal(response.status, 200);
+  const cierre = databaseCalls.find(({ sql }) => /UPDATE reserva_aprobacion_titular SET decision = 'CANCELADA'/.test(sql));
+  assert.deepEqual(cierre.params, [[30]]);
+  assert.ok(databaseCalls.some(({ sql, params }) => /INSERT INTO notificacion/.test(sql) && params.includes("Reserva #30: No adjudicada")));
+  assert.ok(databaseCalls.some(({ sql }) => /UPDATE sorteo SET estado = 'CERRADO'/.test(sql)));
+});
+
+test("cancelar el sorteo tampoco deja pendiente la aprobación del titular", async () => {
+  setDatabaseHandler(async (sql, params) => {
+    if (/SELECT id, estado FROM sorteo/.test(sql)) return [[{ id: 5, estado: "ACTIVO" }]];
+    if (/SELECT r\.id, r\.estado_reserva_id\s+FROM reserva r/.test(sql)) return [[{ id: 30, estado_reserva_id: 14 }]];
+    if (/SELECT id FROM estado_reserva WHERE nombre IN/.test(sql)) return [[{ id: 13 }]];
+    if (/FROM reserva_aprobacion_titular a INNER JOIN reserva r/.test(sql)) {
+      assert.deepEqual(params, [[30]]);
+      return [[{ reserva_id: 30, usuario_id: 20 }]];
+    }
+    if (/^\s*(UPDATE|INSERT)/i.test(sql)) return [{ affectedRows: 1, insertId: 1 }];
+    return [[]];
+  });
+  const response = await request("/api/admin/sorteos/5", { method: "DELETE", token: tokenFor({ rol: "admin" }) });
+  assert.equal(response.status, 200);
+  const cierre = databaseCalls.find(({ sql }) => /UPDATE reserva_aprobacion_titular SET decision = 'CANCELADA'/.test(sql));
+  assert.deepEqual(cierre.params, [[30]]);
+  assert.ok(databaseCalls.some(({ sql, params }) => /INSERT INTO notificacion/.test(sql) && params.includes("Reserva #30: Cancelada")));
 });

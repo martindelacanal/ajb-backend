@@ -1238,6 +1238,22 @@ async function responderFirma(connection, { reservaId, actor, accion, body = {},
   return reenviarAviso(connection, { fila, actor, contexto });
 }
 
+/**
+ * ¿La persona entró alguna vez a Mi AJB? Si nunca entró, no va a ver el aviso de «Firmá tu
+ * reserva»: el staff lo ve antes de elegir «Se la envío…». null = no se sabe (sin el dato).
+ */
+async function consultarIngresoMiAjb(connection, usuarioId) {
+  try {
+    const [filas] = await connection.query(
+      "SELECT (primer_ingreso IS NOT NULL OR ultimo_ingreso IS NOT NULL) AS ingreso FROM usuario WHERE id = ? LIMIT 1",
+      [usuarioId]);
+    return filas.length ? Number(filas[0].ingreso) === 1 : null;
+  } catch (error) {
+    if (error?.code === "ER_BAD_FIELD_ERROR") return null;
+    throw error;
+  }
+}
+
 module.exports = {
   CANALES_CARGA_STAFF,
   ESTADO_PENDIENTE_FIRMA,
@@ -1256,6 +1272,7 @@ module.exports = {
   avisarAfiliadoCargaStaff,
   buscarFirmaPendienteIniciada,
   calcularVencimientoFirma,
+  consultarIngresoMiAjb,
   datosAvisoReserva,
   decodificarFirmaPng,
   errorFirma,
