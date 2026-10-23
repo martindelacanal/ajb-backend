@@ -112,7 +112,8 @@ const {
 const {
   ESTADO_PENDIENTE_TITULAR, MENSAJE_CBU, esFamiliar, obtenerGrupoReserva, exigirCbu,
   validarAdultoResponsable, registrarSolicitudTitular,
-  asegurarSinSolicitudTitularPendiente, decidirSolicitudTitular,
+  asegurarSinSolicitudTitularPendiente, decidirSolicitudTitular, cerrarSolicitudesTitularDelSorteo,
+  obtenerPersonasSolicitudes,
 } = require("../services/reservas-familiares");
 // «¿Quién firma?» en la carga del staff y el envío a firmar («Pendiente de firma»).
 // Se usa con el prefijo para no chocar con nombres de otros módulos en este archivo.
@@ -1478,12 +1479,17 @@ router.get("/turismo/reserva-elegibilidad", verifyToken, async (req, res) => {
     if (!puedeUsarHoldsTurismo(cabecera)) return res.status(403).json({ message: "No autorizado" });
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
-    const { grupoReserva, requiereAprobacionTitular } = await resolverTitularReservaAlta(
+    const { esRolCargaAdministrativa, usuarioReservaId, grupoReserva, requiereAprobacionTitular } = await resolverTitularReservaAlta(
       connection, cabecera, req.query.usuario_id, { validarCbuObligatorio: false });
+    // Sólo para el staff que carga: si nunca entró a Mi AJB, no va a ver el aviso para firmar.
+    const ingresoMiAjb = esRolCargaAdministrativa
+      ? await reservasFirma.consultarIngresoMiAjb(connection, usuarioReservaId)
+      : undefined;
     await connection.commit();
     return res.json({ puede_reservar: grupoReserva.cbuCompleto, cbu_completo: grupoReserva.cbuCompleto,
       requiere_aprobacion_titular: requiereAprobacionTitular, titular_usuario_id: Number(grupoReserva.titular.id),
-      mensaje: grupoReserva.cbuCompleto ? null : MENSAJE_CBU });
+      mensaje: grupoReserva.cbuCompleto ? null : MENSAJE_CBU,
+      ...(ingresoMiAjb === undefined ? {} : { ingreso_mi_ajb: ingresoMiAjb }) });
   } catch (error) {
     if (connection) await connection.rollback();
     registrarErrorRuta(error);
@@ -1510,7 +1516,11 @@ router.get("/reservas/aprobaciones-titular", verifyToken, async (req, res) => {
          LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
         WHERE a.titular_usuario_id = ? AND a.decision = 'PENDIENTE' AND er.nombre = ?
         ORDER BY a.fecha_solicitud DESC LIMIT 100`, [cabecera.id, ESTADO_PENDIENTE_TITULAR]);
-    return res.json({ reservas: reservas.map((reserva) => ({ ...reserva, puede_aprobar_titular: true })) });
+    // La tarjeta muestra quiénes viajan: el aviso le pide al titular que los revise.
+    const personas = await obtenerPersonasSolicitudes(db, reservas.map((reserva) => reserva.id));
+    return res.json({ reservas: reservas.map((reserva) => ({
+      ...reserva, personas: personas.get(Number(reserva.id)) || [], puede_aprobar_titular: true,
+    })) });
   } catch (error) {
     registrarErrorRuta(error);
     return res.status(500).json({ message: "No se pudieron cargar las solicitudes de tus familiares" });
@@ -3698,6 +3708,8 @@ router.delete("/admin/sorteos/:id", verifyToken, async (req, res) => {
         "UPDATE reserva SET estado_reserva_id = ?, fecha_modificacion = NOW() WHERE id IN (?)",
         [estadoCancelacionId, reservasCancelables]
       );
+      // Las que esperaban al titular: su solicitud no puede quedar pendiente para siempre.
+      await cerrarSolicitudesTitularDelSorteo(connection, { reservaIds: reservasCancelables, cierre: "CANCELADO" });
     }
     await connection.query(
       `UPDATE bloque_fecha_recurso bfr
@@ -4807,6 +4819,11 @@ router.put("/admin/sorteos/:id/cerrar", verifyToken, async (req, res) => {
       "UPDATE reserva SET estado_reserva_id = ? WHERE sorteo_id = ? AND modalidad = 'SORTEO' AND recurso_id IS NULL AND COALESCE(estado_reserva_id, ?) NOT IN (?)",
       [estadoNoAdjudicadaId, sorteoId, ESTADO_RESERVA_INICIADA_ID, ESTADOS_RESERVA_BAJA_IDS]
     );
+    // Las que esperaban al titular quedaron «No adjudicada»: su solicitud no puede quedar
+    // pendiente para siempre.
+    await cerrarSolicitudesTitularDelSorteo(connection, {
+      reservaIds: inscripcionesNoAdjudicadas.map((inscripcion) => inscripcion.id), cierre: "CERRADO",
+    });
 
     await connection.query(
       `UPDATE bloque_fecha_recurso bfr

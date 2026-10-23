@@ -167,6 +167,63 @@ async function decidirSolicitudTitular(connection, { reservaId, actorId, accion 
   return { ...reserva, estado: destino };
 }
 
+const CIERRES_SORTEO = {
+  CERRADO: { destino: "No adjudicada", mensaje: "El sorteo cerró antes de que el titular aprobara tu solicitud, así que no participó." },
+  CANCELADO: { destino: "Cancelada", mensaje: "Se canceló el sorteo, así que tu solicitud ya no necesita la aprobación del titular." },
+};
+
+/**
+ * El sorteo se cerró o se canceló con inscripciones que esperaban al titular: sus
+ * solicitudes quedan CANCELADA (si no, siguen PENDIENTE para siempre), el aviso del
+ * titular se marca leído (ya no hay nada que aprobar) y se le avisa al familiar.
+ * Recibe todas las reservas que cambian de estado; sólo toca las que esperaban.
+ */
+async function cerrarSolicitudesTitularDelSorteo(connection, { reservaIds, cierre }) {
+  const datos = CIERRES_SORTEO[cierre];
+  const ids = [...new Set((reservaIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  if (!datos || !ids.length) return 0;
+  const [pendientes] = await connection.query(
+    `SELECT a.reserva_id, r.usuario_id FROM reserva_aprobacion_titular a INNER JOIN reserva r ON r.id = a.reserva_id
+      WHERE a.reserva_id IN (?) AND a.decision = 'PENDIENTE' FOR UPDATE`, [ids]);
+  if (!pendientes.length) return 0;
+  const cerradas = pendientes.map((fila) => Number(fila.reserva_id));
+  await connection.query(
+    "UPDATE reserva_aprobacion_titular SET decision = 'CANCELADA', fecha_respuesta = NOW() WHERE reserva_id IN (?) AND decision = 'PENDIENTE'",
+    [cerradas]);
+  await connection.query(
+    `UPDATE notificacion SET leida = 1, fecha_lectura = COALESCE(fecha_lectura, NOW())
+      WHERE tipo = 'RESERVA_APROBACION_TITULAR' AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.reserva_id')) IN (?)`,
+    [cerradas.map(String)]);
+  for (const fila of pendientes) {
+    await crearNotificacion(connection, {
+      usuarioId: fila.usuario_id,
+      tipo: "RESERVA_RESPUESTA_TITULAR",
+      titulo: `Reserva #${fila.reserva_id}: ${datos.destino}`,
+      mensaje: datos.mensaje,
+      payload: { reserva_id: Number(fila.reserva_id), estado: datos.destino, url: "/mis-gestiones" },
+    });
+  }
+  return cerradas.length;
+}
+
+/** Pasajeros de cada solicitud que ve el titular (edad al ingreso, como se guardó). */
+async function obtenerPersonasSolicitudes(connection, reservaIds) {
+  const ids = [...new Set((reservaIds || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  const porReserva = new Map(ids.map((id) => [id, []]));
+  if (!ids.length) return porReserva;
+  const [personas] = await connection.query(
+    `SELECT rf.reserva_id, u.nombre, u.apellido, rf.edad FROM reserva_familiar rf
+       INNER JOIN usuario u ON u.id = rf.usuario_id
+      WHERE rf.reserva_id IN (?) ORDER BY rf.reserva_id, rf.parentesco_id, rf.id`, [ids]);
+  for (const persona of personas) {
+    porReserva.get(Number(persona.reserva_id))?.push({
+      nombre: persona.nombre, apellido: persona.apellido, edad: persona.edad === null ? null : Number(persona.edad),
+    });
+  }
+  return porReserva;
+}
+
 module.exports = { ESTADO_PENDIENTE_TITULAR, MENSAJE_CBU, MENSAJE_ADULTO, esFamiliar,
   obtenerGrupoReserva, exigirCbu, validarAdultoResponsable, registrarSolicitudTitular,
-  asegurarSinSolicitudTitularPendiente, decidirSolicitudTitular };
+  asegurarSinSolicitudTitularPendiente, decidirSolicitudTitular, cerrarSolicitudesTitularDelSorteo,
+  obtenerPersonasSolicitudes };

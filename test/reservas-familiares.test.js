@@ -129,3 +129,60 @@ test("la migración puede chequearse sin escrituras y reaplicarse sin duplicar e
   assert.deepEqual(await migrar(db), { estado: true, tabla: true });
   assert.equal(altasEstado, 1);
 });
+
+test("cerrar o cancelar el sorteo cierra las solicitudes que esperaban al titular y avisa al familiar", async () => {
+  const { cerrarSolicitudesTitularDelSorteo } = require("../api/services/reservas-familiares");
+  const consultas = [];
+  const conn = { async query(sql, params = []) {
+    consultas.push({ sql, params });
+    if (/FROM reserva_aprobacion_titular a INNER JOIN reserva r/.test(sql)) {
+      return [[{ reserva_id: 31, usuario_id: 20 }]];
+    }
+    return [{ affectedRows: 1, insertId: 1 }];
+  } };
+  // Recibe todas las inscripciones que cambian de estado; sólo cierra las que esperaban.
+  assert.equal(await cerrarSolicitudesTitularDelSorteo(conn, { reservaIds: [30, 31, 31, "x"], cierre: "CERRADO" }), 1);
+  assert.deepEqual(consultas[0].params, [[30, 31]]);
+  const cierre = consultas.find(({ sql }) => /UPDATE reserva_aprobacion_titular SET decision = 'CANCELADA'/.test(sql));
+  assert.deepEqual(cierre.params, [[31]]);
+  const leidos = consultas.find(({ sql }) => /UPDATE notificacion SET leida = 1/.test(sql));
+  assert.match(leidos.sql, /RESERVA_APROBACION_TITULAR/);
+  assert.deepEqual(leidos.params, [["31"]]);
+  const aviso = consultas.find(({ sql }) => /INSERT INTO notificacion/.test(sql));
+  assert.equal(aviso.params[0], 20);
+  assert.equal(aviso.params[1], "RESERVA_RESPUESTA_TITULAR");
+  assert.equal(aviso.params[2], "Reserva #31: No adjudicada");
+  assert.match(aviso.params[3], /El sorteo cerró antes de que el titular aprobara tu solicitud/);
+  assert.equal(JSON.parse(aviso.params[4]).url, "/mis-gestiones");
+
+  consultas.length = 0;
+  await cerrarSolicitudesTitularDelSorteo(conn, { reservaIds: [31], cierre: "CANCELADO" });
+  const avisoCancelado = consultas.find(({ sql }) => /INSERT INTO notificacion/.test(sql));
+  assert.equal(avisoCancelado.params[2], "Reserva #31: Cancelada");
+  assert.match(avisoCancelado.params[3], /Se canceló el sorteo/);
+
+  // Sin inscripciones, o sin ninguna que esperara al titular, no toca nada más.
+  consultas.length = 0;
+  assert.equal(await cerrarSolicitudesTitularDelSorteo(conn, { reservaIds: [], cierre: "CERRADO" }), 0);
+  assert.equal(consultas.length, 0);
+  const sinPendientes = { query: async (sql) => { assert.match(sql, /SELECT a.reserva_id/); return [[]]; } };
+  assert.equal(await cerrarSolicitudesTitularDelSorteo(sinPendientes, { reservaIds: [30], cierre: "CERRADO" }), 0);
+});
+
+test("las solicitudes que ve el titular traen a los pasajeros con su edad al ingreso", async () => {
+  const { obtenerPersonasSolicitudes } = require("../api/services/reservas-familiares");
+  const conn = { async query(sql, params) {
+    assert.match(sql, /FROM reserva_familiar rf/);
+    assert.deepEqual(params, [[7, 8]]);
+    return [[
+      { reserva_id: 7, nombre: "Marta", apellido: "Gómez", edad: 74 },
+      { reserva_id: 7, nombre: "Juan", apellido: "Gómez", edad: "12" },
+    ]];
+  } };
+  const personas = await obtenerPersonasSolicitudes(conn, [7, 8, 7]);
+  assert.deepEqual(personas.get(7), [
+    { nombre: "Marta", apellido: "Gómez", edad: 74 }, { nombre: "Juan", apellido: "Gómez", edad: 12 },
+  ]);
+  assert.deepEqual(personas.get(8), []);
+  assert.equal((await obtenerPersonasSolicitudes({ query() { throw new Error("no debe consultar"); } }, [])).size, 0);
+});
