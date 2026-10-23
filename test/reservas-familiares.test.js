@@ -151,14 +151,14 @@ test("cerrar o cancelar el sorteo cierra las solicitudes que esperaban al titula
   const aviso = consultas.find(({ sql }) => /INSERT INTO notificacion/.test(sql));
   assert.equal(aviso.params[0], 20);
   assert.equal(aviso.params[1], "RESERVA_RESPUESTA_TITULAR");
-  assert.equal(aviso.params[2], "Reserva #31: No adjudicada");
+  assert.equal(aviso.params[2], "Reserva T-31: No adjudicada");
   assert.match(aviso.params[3], /El sorteo cerró antes de que el titular aprobara tu solicitud/);
   assert.equal(JSON.parse(aviso.params[4]).url, "/mis-gestiones");
 
   consultas.length = 0;
   await cerrarSolicitudesTitularDelSorteo(conn, { reservaIds: [31], cierre: "CANCELADO" });
   const avisoCancelado = consultas.find(({ sql }) => /INSERT INTO notificacion/.test(sql));
-  assert.equal(avisoCancelado.params[2], "Reserva #31: Cancelada");
+  assert.equal(avisoCancelado.params[2], "Reserva T-31: Cancelada");
   assert.match(avisoCancelado.params[3], /Se canceló el sorteo/);
 
   // Sin inscripciones, o sin ninguna que esperara al titular, no toca nada más.

@@ -9,6 +9,7 @@ const path = require("node:path");
 // la firma (no desde la creación) en el alta, el mantenimiento y el detalle.
 
 const firmaService = require("../api/services/reservas-firma");
+const familiaresService = require("../api/services/reservas-familiares");
 const {
   PLAZO_RESPUESTA_HORAS,
   asegurarSinReservaIniciadaAfiliado,
@@ -40,6 +41,7 @@ test("el mantenimiento también da de baja las firmas vencidas, en un bloque apa
     llamadas.push(db);
     return { ejecutado: true, firmas: 2, eventos: [] };
   });
+  t.mock.method(familiaresService, "expirarSolicitudesTitularVencidas", async () => ({ ejecutado: true, solicitudes: 0 }));
   const { logs, errores } = silenciarConsola(t);
   // El vencimiento de 72 horas falla (sin conexión): igual corre el de las firmas.
   const db = {
@@ -58,12 +60,58 @@ test("el mantenimiento también da de baja las firmas vencidas, en un bloque apa
   assert.deepEqual(logs, ["Mantenimiento de reservas: 2 reservas sin firmar dadas de baja"]);
 });
 
+test("el mantenimiento da de baja las solicitudes que el titular no respondió, en un bloque aparte", async (t) => {
+  // Las de 72 horas y las firmas fallan: igual corre el bloque del titular, y su error no frena el de las firmas.
+  t.mock.method(firmaService, "expirarFirmasVencidas", async () => {
+    throw Object.assign(new Error("Lock wait timeout"), { code: "ER_LOCK_WAIT_TIMEOUT" });
+  });
+  let llamadas = 0;
+  t.mock.method(familiaresService, "expirarSolicitudesTitularVencidas", async (db) => {
+    llamadas += 1;
+    assert.ok(db);
+    return { ejecutado: true, solicitudes: 1 };
+  });
+  const { logs, errores } = silenciarConsola(t);
+  const db = {
+    async getConnection() {
+      throw Object.assign(new Error("sin conexión"), { code: "ECONNREFUSED" });
+    },
+  };
+  const detener = iniciarMantenimientoReservas(db, { demoraInicialMs: 0, intervaloMs: 60000 });
+  try {
+    await esperar(() => errores.length === 2);
+  } finally {
+    detener();
+  }
+  assert.equal(llamadas, 1);
+  assert.deepEqual(logs, ["Mantenimiento de reservas: 1 solicitud sin respuesta del titular dada de baja"]);
+  assert.deepEqual(errores, [
+    "Error en mantenimiento de reservas de 72 horas: ECONNREFUSED",
+    "Error en mantenimiento de firmas pendientes: ER_LOCK_WAIT_TIMEOUT",
+  ]);
+
+  // Un error propio se registra aparte (y no impide el de las firmas).
+  t.mock.method(familiaresService, "expirarSolicitudesTitularVencidas", async () => {
+    throw Object.assign(new Error("Lock wait timeout"), { code: "ER_LOCK_WAIT_TIMEOUT" });
+  });
+  errores.length = 0;
+  const detener2 = iniciarMantenimientoReservas(db, { demoraInicialMs: 0, intervaloMs: 60000 });
+  try {
+    await esperar(() => errores.length === 3);
+  } finally {
+    detener2();
+  }
+  assert.ok(errores.includes("Error en mantenimiento de solicitudes del titular: ER_LOCK_WAIT_TIMEOUT"));
+  assert.ok(errores.includes("Error en mantenimiento de firmas pendientes: ER_LOCK_WAIT_TIMEOUT"));
+});
+
 test("un error en las firmas vencidas se registra y no frena las corridas siguientes", async (t) => {
   let llamadas = 0;
   t.mock.method(firmaService, "expirarFirmasVencidas", async () => {
     llamadas += 1;
     throw Object.assign(new Error("Lock wait timeout"), { code: "ER_LOCK_WAIT_TIMEOUT" });
   });
+  t.mock.method(familiaresService, "expirarSolicitudesTitularVencidas", async () => ({ ejecutado: true, solicitudes: 0 }));
   const { logs, errores } = silenciarConsola(t);
   const db = {
     async getConnection() {
@@ -86,6 +134,7 @@ test("un error en las firmas vencidas se registra y no frena las corridas siguie
 
 test("sin la migración, el mantenimiento deja a la vista que no vence las firmas (con el código del error)", async (t) => {
   // La base real sin la tabla: expirarFirmasVencidas la omite y el mantenimiento lo avisa.
+  t.mock.method(familiaresService, "expirarSolicitudesTitularVencidas", async () => ({ ejecutado: true, solicitudes: 0 }));
   const avisos = [];
   t.mock.method(console, "warn", (...args) => avisos.push(args.join(" ")));
   const { logs } = silenciarConsola(t);

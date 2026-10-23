@@ -1033,7 +1033,7 @@ async function propagarDepartamental(connection, ctx) {
         if (error?.code !== "ER_DUP_ENTRY") throw error;
         resultado.advertencias.push({
           codigo: "COSEGURO_NO_MOVIDA",
-          mensaje: `La solicitud de reintegro #${solicitud.id} no se pudo pasar a ${nombreNueva} porque su comprobante choca con otra solicitud. Revisala desde Coseguro.`,
+          mensaje: `La solicitud de reintegro C-${solicitud.id} no se pudo pasar a ${nombreNueva} porque su comprobante choca con otra solicitud. Revisala desde Coseguro.`,
         });
         continue;
       }
@@ -1053,7 +1053,7 @@ async function propagarDepartamental(connection, ctx) {
         campo: "departamental_id",
         valorAnterior: idPositivo(solicitud.departamental_id),
         valorNuevo: nuevaId,
-        descripcion: `La solicitud de reintegro #${solicitud.id} pasa a la departamental ${nombreNueva}`,
+        descripcion: `La solicitud de reintegro C-${solicitud.id} pasa a la departamental ${nombreNueva}`,
       });
     }
   }
@@ -1155,7 +1155,7 @@ async function propagarDatosBancarios(connection, ctx) {
       if (error?.code !== "ER_DUP_ENTRY") throw error;
       resultado.advertencias.push({
         codigo: "COSEGURO_NO_ACTUALIZADA",
-        mensaje: `La solicitud de reintegro #${solicitud.id} no se pudo actualizar porque su comprobante choca con otra solicitud. Revisala desde Coseguro.`,
+        mensaje: `La solicitud de reintegro C-${solicitud.id} no se pudo actualizar porque su comprobante choca con otra solicitud. Revisala desde Coseguro.`,
       });
       continue;
     }
@@ -1176,7 +1176,7 @@ async function propagarDatosBancarios(connection, ctx) {
         campo: columna,
         valorAnterior: solicitud[columna] ?? null,
         valorNuevo: final[campo],
-        descripcion: `La solicitud de reintegro #${solicitud.id} toma el ${etiqueta} nuevo`,
+        descripcion: `La solicitud de reintegro C-${solicitud.id} toma el ${etiqueta} nuevo`,
       });
     }
   }
@@ -1211,7 +1211,7 @@ function advertenciaDatoBancarioNoPropagado(actor, noPropagadas) {
   const datos = etiquetas.length === 1 ? `El ${etiquetas[0]} nuevo no se copió` : `El ${etiquetas.join(" y el ")} nuevos no se copiaron`;
   const solicitudes = noPropagadas.map(({ solicitud }) => {
     const estado = NOMBRE_ESTADO_COSEGURO[Number(solicitud.estado_id)];
-    return `#${solicitud.id}${estado ? ` (${estado})` : ""}`;
+    return `C-${solicitud.id}${estado ? ` (${estado})` : ""}`;
   });
   const una = solicitudes.length === 1;
   // El motivo real puede ser el módulo/área, la sede o la etapa del trámite.
@@ -1271,7 +1271,7 @@ async function propagarParentesco(connection, ctx) {
       campo: "parentesco_id",
       valorAnterior: idPositivo(fila.parentesco_id),
       valorNuevo: nuevoId,
-      descripcion: `En la reserva #${fila.reserva_id} ${nombreCompleto(final)} figura ahora como ${nombreDe(nuevoId)}`,
+      descripcion: `En la reserva T-${fila.reserva_id} ${nombreCompleto(final)} figura ahora como ${nombreDe(nuevoId)}`,
     });
   }
 }
@@ -1441,7 +1441,7 @@ async function propagarIdentidadOlimpiadas(connection, ctx) {
         campo: cambio.columna,
         valorAnterior: cambio.anterior,
         valorNuevo: cambio.nuevo,
-        descripcion: `El acompañante de la inscripción #${acompaniante.inscripcion_id} toma los datos nuevos de ${nombreCompleto(final)}`,
+        descripcion: `El acompañante de la inscripción Nº ${String(acompaniante.inscripcion_id).padStart(3, "0")} toma los datos nuevos de ${nombreCompleto(final)}`,
       });
     }
   }

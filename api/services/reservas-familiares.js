@@ -62,31 +62,174 @@ function validarAdultoResponsable(personas, fechaIngreso) {
   return edades;
 }
 
+const PLAZO_RESPUESTA_TITULAR_HORAS = 48;
+const ESTADO_RECHAZADA = "Rechazada";
+const LOCK_VENCIMIENTO_TITULAR = "ajb:reservas:titular-vencidas:v1";
+
+/** Fin del día civil (hora de Argentina) como instante. */
+function finDelDiaArgentina(fecha) {
+  const civil = fecha ? normalizarFechaCivil(typeof fecha === "string" ? fecha.slice(0, 10) : fecha) : null;
+  return civil ? new Date(`${civil}T23:59:59-03:00`) : null;
+}
+
+/**
+ * Hasta cuándo puede responder el titular: 48 horas desde la solicitud, sin pasar del día
+ * del ingreso (después ya no se puede aprobar) ni, en un sorteo, del último día de
+ * inscripción. Devuelve un Date sin milisegundos.
+ */
+function calcularVencimientoTitular({ fechaInicio, finInscripcion = null, ahora = new Date() }) {
+  const topes = [
+    ahora.getTime() + PLAZO_RESPUESTA_TITULAR_HORAS * 3600 * 1000,
+    finDelDiaArgentina(fechaInicio)?.getTime(),
+    finDelDiaArgentina(finInscripcion)?.getTime(),
+  ].filter((valor) => Number.isFinite(valor));
+  return new Date(Math.floor(Math.min(...topes) / 1000) * 1000);
+}
+
+function fechaHoraTexto(valor) {
+  // Diferido: reservas-firma ya requiere este módulo.
+  return require("./reservas-firma").fechaHoraTexto(valor);
+}
+
 async function registrarSolicitudTitular(connection, { reservaId, solicitanteId, titularId, estadoDestino }) {
   const [estados] = await connection.query("SELECT id FROM estado_reserva WHERE nombre = ?", [ESTADO_PENDIENTE_TITULAR]);
   if (!estados.length) throw errorReserva("Falta aplicar la migración de aprobación del titular", 503, "APROBACION_TITULAR_NO_MIGRADA");
+  const [datos] = await connection.query(
+    `SELECT r.fecha_inicio, s.fecha_fin_inscripcion FROM reserva r
+       LEFT JOIN sorteo s ON s.id = r.sorteo_id WHERE r.id = ?`, [reservaId]);
+  const venceEn = calcularVencimientoTitular({
+    fechaInicio: datos[0]?.fecha_inicio,
+    finInscripcion: estadoDestino === "Solicitud sorteo" ? datos[0]?.fecha_fin_inscripcion : null,
+  });
   await connection.query("UPDATE reserva SET estado_reserva_id = ? WHERE id = ?", [estados[0].id, reservaId]);
   await connection.query(
-    `INSERT INTO reserva_aprobacion_titular (reserva_id, solicitante_usuario_id, titular_usuario_id, estado_destino)
-     VALUES (?, ?, ?, ?)`, [reservaId, solicitanteId, titularId, estadoDestino]);
+    `INSERT INTO reserva_aprobacion_titular (reserva_id, solicitante_usuario_id, titular_usuario_id, estado_destino, vence_en)
+     VALUES (?, ?, ?, ?, ?)`, [reservaId, solicitanteId, titularId, estadoDestino, venceEn]);
   await crearNotificacion(connection, {
     usuarioId: titularId,
     tipo: "RESERVA_APROBACION_TITULAR",
-    titulo: `Reserva #${reservaId} pendiente de tu aprobación`,
-    mensaje: "Un familiar solicitó una reserva. Revisá los pasajeros, las fechas y el importe para aprobarla o rechazarla.",
+    titulo: `Reserva T-${reservaId} pendiente de tu aprobación`,
+    mensaje: "Un familiar solicitó una reserva. Revisá los pasajeros, las fechas y el importe para aprobarla o rechazarla "
+      + `antes del ${fechaHoraTexto(venceEn)}: si no respondés, se da de baja sola.`,
     payload: { reserva_id: reservaId, estado: ESTADO_PENDIENTE_TITULAR, url: `/mis-gestiones?aprobacion_reserva=${reservaId}` },
   });
   await connection.query(
     `INSERT INTO historial_reserva (reserva_id, tipo_operacion, campo_modificado, valor_anterior,
        valor_nuevo, usuario_modificador_id, observaciones) VALUES (?, 'UPDATE', 'estado_reserva_id', NULL, ?, ?, ?)`,
-    [reservaId, estados[0].id, solicitanteId, "Solicitud del familiar pendiente de aprobación del titular"]);
+    [reservaId, estados[0].id, solicitanteId,
+      `Solicitud del familiar pendiente de aprobación del titular (vence el ${fechaHoraTexto(venceEn)})`]);
+  return { vence_en: venceEn };
+}
+
+/**
+ * Da de baja una solicitud que el titular no respondió a tiempo: Rechazada, decisión
+ * VENCIDA, lugar liberado, historial automático y avisos al familiar y al titular.
+ * Devuelve false si otra transacción ya la resolvió.
+ */
+async function expirarSolicitudTitularEnTransaccion(connection, { reserva_id: reservaId }) {
+  const [estados] = await connection.query(
+    "SELECT id, nombre FROM estado_reserva WHERE nombre IN (?, ?)", [ESTADO_PENDIENTE_TITULAR, ESTADO_RECHAZADA]);
+  const pendienteId = estados.find((estado) => estado.nombre === ESTADO_PENDIENTE_TITULAR)?.id;
+  const rechazadaId = estados.find((estado) => estado.nombre === ESTADO_RECHAZADA)?.id;
+  if (!pendienteId || !rechazadaId) throw errorReserva("Faltan estados de reserva", 503, "ESTADO_RESERVA_FALTANTE");
+  const [cambio] = await connection.query(
+    "UPDATE reserva SET estado_reserva_id = ?, fecha_modificacion = NOW() WHERE id = ? AND estado_reserva_id = ?",
+    [rechazadaId, reservaId, pendienteId]);
+  if (Number(cambio?.affectedRows) !== 1) return false;
+  const [solicitudes] = await connection.query(
+    `SELECT a.titular_usuario_id, a.vence_en, r.usuario_id, u.nombre, u.apellido
+       FROM reserva_aprobacion_titular a INNER JOIN reserva r ON r.id = a.reserva_id
+       LEFT JOIN usuario u ON u.id = r.usuario_id WHERE a.reserva_id = ?`, [reservaId]);
+  const solicitud = solicitudes[0] || {};
+  await connection.query(
+    "UPDATE reserva_aprobacion_titular SET decision = 'VENCIDA', fecha_respuesta = NOW() WHERE reserva_id = ? AND decision = 'PENDIENTE'",
+    [reservaId]);
+  const { liberarRecursoBloque } = require("./reservas-turismo");
+  await liberarRecursoBloque(connection, reservaId);
+  await connection.query(
+    `INSERT INTO historial_reserva (reserva_id, tipo_operacion, campo_modificado, valor_anterior,
+       valor_nuevo, usuario_modificador_id, observaciones) VALUES (?, 'UPDATE', 'estado_reserva_id', ?, ?, NULL, ?)`,
+    [reservaId, pendienteId, rechazadaId,
+      `Se dio de baja sola: el titular no respondió a tiempo (vencía el ${fechaHoraTexto(solicitud.vence_en)}). Se liberó el lugar.`]);
+  await connection.query(
+    `UPDATE notificacion SET leida = 1, fecha_lectura = COALESCE(fecha_lectura, NOW())
+      WHERE tipo = 'RESERVA_APROBACION_TITULAR' AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.reserva_id')) = ?`,
+    [String(reservaId)]);
+  const familiar = [solicitud.nombre, solicitud.apellido].filter(Boolean).join(" ") || "tu familiar";
+  await crearNotificacion(connection, {
+    usuarioId: solicitud.usuario_id,
+    tipo: "RESERVA_RESPUESTA_TITULAR",
+    titulo: `Reserva T-${reservaId} dada de baja`,
+    mensaje: "Tu titular no respondió la solicitud a tiempo, así que se dio de baja y se liberó el lugar. "
+      + "Si todavía querés viajar, volvé a reservar.",
+    payload: { reserva_id: reservaId, estado: ESTADO_RECHAZADA, motivo: "TITULAR_SIN_RESPUESTA", url: "/mis-gestiones" },
+    categoria: "estados",
+  });
+  await crearNotificacion(connection, {
+    usuarioId: solicitud.titular_usuario_id,
+    tipo: "RESERVA_APROBACION_TITULAR_VENCIDA",
+    titulo: `Reserva T-${reservaId}: venció el plazo para responder`,
+    mensaje: `No respondiste a tiempo la solicitud de ${familiar}, así que se dio de baja y se liberó el lugar.`,
+    payload: { reserva_id: reservaId, estado: ESTADO_RECHAZADA, motivo: "TITULAR_SIN_RESPUESTA", url: "/mis-gestiones" },
+    categoria: "estados",
+  });
+  return { reservaId };
 }
 
 async function asegurarSinSolicitudTitularPendiente(connection, usuarioId) {
   const [rows] = await connection.query(
-    `SELECT r.id FROM reserva r INNER JOIN estado_reserva er ON er.id = r.estado_reserva_id
+    `SELECT r.id, (a.vence_en IS NOT NULL AND a.vence_en <= NOW()) AS vencida
+       FROM reserva r INNER JOIN estado_reserva er ON er.id = r.estado_reserva_id
+       LEFT JOIN reserva_aprobacion_titular a ON a.reserva_id = r.id AND a.decision = 'PENDIENTE'
       WHERE r.usuario_id = ? AND er.nombre = ? LIMIT 1 FOR UPDATE`, [usuarioId, ESTADO_PENDIENTE_TITULAR]);
-  if (rows.length) throw errorReserva("Ya tenés una reserva pendiente de aprobación del titular", 409, "RESERVA_PENDIENTE_TITULAR_EXISTENTE");
+  for (const fila of rows) {
+    // La que ya venció (y el mantenimiento todavía no dio de baja) no frena una nueva.
+    if (Number(fila.vencida) === 1 && await expirarSolicitudTitularEnTransaccion(connection, { reserva_id: fila.id })) continue;
+    throw errorReserva("Ya tenés una reserva pendiente de aprobación del titular", 409, "RESERVA_PENDIENTE_TITULAR_EXISTENTE");
+  }
+}
+
+/**
+ * Mantenimiento (cada 5 minutos, junto con los demás vencimientos): da de baja las
+ * solicitudes que el titular no respondió a tiempo. Conexión, lock y transacción propios.
+ * Sin la columna vence_en (falta la migración) no hace nada.
+ */
+async function expirarSolicitudesTitularVencidas(db, { limite = 100 } = {}) {
+  const limiteSeguro = Number.isInteger(Number(limite)) ? Math.max(1, Math.min(500, Number(limite))) : 100;
+  const connection = await db.getConnection();
+  let lockTomado = false;
+  try {
+    const [locks] = await connection.query("SELECT GET_LOCK(?, 0) AS adquirido", [LOCK_VENCIMIENTO_TITULAR]);
+    lockTomado = Number(locks[0]?.adquirido) === 1;
+    if (!lockTomado) return { ejecutado: false, solicitudes: 0 };
+    await connection.beginTransaction();
+    const [filas] = await connection.query(
+      `SELECT a.reserva_id
+         FROM reserva_aprobacion_titular a
+         STRAIGHT_JOIN reserva r ON r.id = a.reserva_id
+         INNER JOIN estado_reserva er ON er.id = r.estado_reserva_id
+        WHERE a.decision = 'PENDIENTE' AND a.vence_en <= NOW() AND er.nombre = ?
+        ORDER BY a.vence_en ASC, a.reserva_id ASC
+        LIMIT ${limiteSeguro}
+        FOR UPDATE SKIP LOCKED`, [ESTADO_PENDIENTE_TITULAR]);
+    let vencidas = 0;
+    for (const fila of filas) {
+      if (await expirarSolicitudTitularEnTransaccion(connection, fila)) vencidas += 1;
+    }
+    await connection.commit();
+    return { ejecutado: true, solicitudes: vencidas };
+  } catch (error) {
+    try { await connection.rollback(); } catch (_) { /* conexión cerrada tras el error */ }
+    if (error?.code === "ER_BAD_FIELD_ERROR" && /vence_en/.test(String(error?.message))) {
+      return { ejecutado: false, solicitudes: 0, omitido: "SIN_MIGRACION" };
+    }
+    throw error;
+  } finally {
+    if (lockTomado) {
+      try { await connection.query("SELECT RELEASE_LOCK(?)", [LOCK_VENCIMIENTO_TITULAR]); } catch (_) { /* se libera al cerrar */ }
+    }
+    connection.release();
+  }
 }
 
 async function decidirSolicitudTitular(connection, { reservaId, actorId, accion }) {
@@ -109,13 +252,20 @@ async function decidirSolicitudTitular(connection, { reservaId, actorId, accion 
   const grupo = await obtenerGrupoReserva(connection, solicitante, { forUpdate: true });
   if (Number(grupo.titular.id) !== Number(actorId)) throw errorReserva("El titular del grupo familiar cambió", 403, "APROBACION_TITULAR_NO_AUTORIZADA");
   const [rows] = await connection.query(
-    `SELECT r.*, er.nombre AS estado_nombre, a.decision, a.estado_destino
+    `SELECT r.*, er.nombre AS estado_nombre, a.decision, a.estado_destino,
+            (a.vence_en IS NOT NULL AND a.vence_en <= NOW()) AS vencida
        FROM reserva r INNER JOIN reserva_aprobacion_titular a ON a.reserva_id = r.id
        INNER JOIN estado_reserva er ON er.id = r.estado_reserva_id
       WHERE r.id = ? AND a.titular_usuario_id = ? FOR UPDATE`, [reservaId, actorId]);
   const reserva = rows[0];
   if (!reserva || reserva.decision !== "PENDIENTE" || reserva.estado_nombre !== ESTADO_PENDIENTE_TITULAR) {
     throw errorReserva("Esta solicitud ya fue resuelta o cancelada", 409, "APROBACION_TITULAR_RESUELTA");
+  }
+  // Pasó el plazo y el mantenimiento todavía no la dio de baja: se da de baja ahora (la ruta
+  // confirma la baja y responde 409).
+  if (Number(reserva.vencida) === 1) {
+    await expirarSolicitudTitularEnTransaccion(connection, { reserva_id: reservaId });
+    return { ...reserva, estado: ESTADO_RECHAZADA, vencida: true };
   }
   if (accion === "APROBAR") {
     exigirCbu(grupo);
@@ -160,7 +310,7 @@ async function decidirSolicitudTitular(connection, { reservaId, actorId, accion 
   await crearNotificacion(connection, {
     usuarioId: reserva.usuario_id,
     tipo: "RESERVA_RESPUESTA_TITULAR",
-    titulo: `Reserva #${reservaId}: ${destino}`,
+    titulo: `Reserva T-${reservaId}: ${destino}`,
     mensaje: `El titular ${accion === "APROBAR" ? "aprobó" : "rechazó"} tu solicitud.`,
     payload: { reserva_id: reservaId, estado: destino, url: "/mis-gestiones" },
   });
@@ -198,7 +348,7 @@ async function cerrarSolicitudesTitularDelSorteo(connection, { reservaIds, cierr
     await crearNotificacion(connection, {
       usuarioId: fila.usuario_id,
       tipo: "RESERVA_RESPUESTA_TITULAR",
-      titulo: `Reserva #${fila.reserva_id}: ${datos.destino}`,
+      titulo: `Reserva T-${fila.reserva_id}: ${datos.destino}`,
       mensaje: datos.mensaje,
       payload: { reserva_id: Number(fila.reserva_id), estado: datos.destino, url: "/mis-gestiones" },
     });
@@ -226,4 +376,5 @@ async function obtenerPersonasSolicitudes(connection, reservaIds) {
 module.exports = { ESTADO_PENDIENTE_TITULAR, MENSAJE_CBU, MENSAJE_ADULTO, esFamiliar,
   obtenerGrupoReserva, exigirCbu, validarAdultoResponsable, registrarSolicitudTitular,
   asegurarSinSolicitudTitularPendiente, decidirSolicitudTitular, cerrarSolicitudesTitularDelSorteo,
-  obtenerPersonasSolicitudes };
+  obtenerPersonasSolicitudes, PLAZO_RESPUESTA_TITULAR_HORAS, calcularVencimientoTitular,
+  expirarSolicitudTitularEnTransaccion, expirarSolicitudesTitularVencidas };

@@ -291,7 +291,7 @@ function armarCsvBonos(filas, olimpiada) {
         fila.comprador_telefono,
         fila.departamental_nombre,
         Number(fila.a_nombre_departamental) === 1 ? "Sí" : "No",
-        fila.inscripcion_id ? `#${fila.inscripcion_id}` : "",
+        fila.inscripcion_id ? `Nº ${String(fila.inscripcion_id).padStart(3, "0")}` : "",
         fila.afiliado_apellido ? `${fila.afiliado_apellido}, ${fila.afiliado_nombre || ""}`.trim() : "",
         formatearFechaHora(fila.fecha_venta),
         fila.observacion,
@@ -1465,7 +1465,7 @@ router.post("/olimpiadas/:id(\\d+)/bonos", verifyToken, async (req, res) => {
         usuario_rol: cabecera.rol,
         tipo_operacion: "CREATE",
         campo_modificado: "venta",
-        valor_nuevo: `${describirNumeros(numerosCreados, olimpiada)} → ${resumenComprador}${inscripcion ? ` / inscripción #${inscripcion.id}` : ""}`,
+        valor_nuevo: `${describirNumeros(numerosCreados, olimpiada)} → ${resumenComprador}${inscripcion ? ` / inscripción Nº ${String(inscripcion.id).padStart(3, "0")}` : ""}`,
         observacion: datos.observacion,
       });
 
@@ -1492,7 +1492,7 @@ router.post("/olimpiadas/:id(\\d+)/bonos", verifyToken, async (req, res) => {
       : `Se registraron ${cantidad} bonos (${describirNumeros(resultado.creados.map((c) => c.numero), resultado.olimpiada)})`;
     return res.status(201).json({
       success: true,
-      message: resultado.inscripcion ? `${mensaje} para la inscripción #${resultado.inscripcion.id}` : mensaje,
+      message: resultado.inscripcion ? `${mensaje} para la inscripción Nº ${String(resultado.inscripcion.id).padStart(3, "0")}` : mensaje,
       bonos: resultado.creados,
       resumen_inscripcion: resumenInscripcion,
     });

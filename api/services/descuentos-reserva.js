@@ -792,8 +792,8 @@ async function guardarReservaDescuentos(connection, {
           reglaId: item.regla_id, reservaId, servicioId, entidadTipo: "USO", entidadId: existente.id,
           operacion: "UPDATE",
           resumen: cambioDeRegla
-            ? `Reserva #${reservaId}: ${etiquetaTipo(item.tipo)} cambiado de ${existente.nombre} a ${item.nombre} (${item.porcentaje}% → $${item.importe_descuento})`
-            : `Reserva #${reservaId}: ${etiquetaTipo(item.tipo)} ${item.nombre} recalculado (${item.porcentaje}% → $${item.importe_descuento})`,
+            ? `Reserva T-${reservaId}: ${etiquetaTipo(item.tipo)} cambiado de ${existente.nombre} a ${item.nombre} (${item.porcentaje}% → $${item.importe_descuento})`
+            : `Reserva T-${reservaId}: ${etiquetaTipo(item.tipo)} ${item.nombre} recalculado (${item.porcentaje}% → $${item.importe_descuento})`,
           anterior: snapshotUso(existente), nuevo: snapshotUso({ ...item, id: existente.id }), usuarioId: actorId, req,
         });
         if (registrarHistorialReserva) {
@@ -821,7 +821,7 @@ async function guardarReservaDescuentos(connection, {
       await registrarHistorialDescuento(connection, {
         reglaId: item.regla_id, reservaId, servicioId, entidadTipo: "USO", entidadId: insercion.insertId,
         operacion: "CREATE",
-        resumen: `Reserva #${reservaId}: ${etiquetaTipo(item.tipo)} ${item.nombre} aplicado (${item.porcentaje}% sobre ${item.base_calculo === "PRECIO_LISTA" ? "precio de lista" : "precio final"} → $${item.importe_descuento})`,
+        resumen: `Reserva T-${reservaId}: ${etiquetaTipo(item.tipo)} ${item.nombre} aplicado (${item.porcentaje}% sobre ${item.base_calculo === "PRECIO_LISTA" ? "precio de lista" : "precio final"} → $${item.importe_descuento})`,
         nuevo: snapshotUso({ ...item, id: insercion.insertId }), usuarioId: actorId, req,
       });
       if (registrarHistorialReserva) {
@@ -856,7 +856,7 @@ async function guardarReservaDescuentos(connection, {
     await registrarHistorialDescuento(connection, {
       reglaId: existente.regla_id, reservaId, servicioId, entidadTipo: "USO", entidadId: existente.id,
       operacion: "DELETE",
-      resumen: `Reserva #${reservaId}: se quitó ${etiquetaTipo(existente.tipo)} ${existente.nombre}`,
+      resumen: `Reserva T-${reservaId}: se quitó ${etiquetaTipo(existente.tipo)} ${existente.nombre}`,
       anterior: snapshotUso(existente), usuarioId: actorId, req,
     });
     if (registrarHistorialReserva) {

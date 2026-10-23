@@ -842,7 +842,7 @@ router.post("/traslados/solicitudes", verifyToken, manejarUploadTraslados, async
     );
     if (activas.length > 0) {
       await connection.rollback();
-      return res.status(409).json(`El afiliado ya tiene una solicitud de traslado en curso (#${activas[0].id}). Cancelala o concretala antes de iniciar otra.`);
+      return res.status(409).json(`El afiliado ya tiene una solicitud de traslado en curso (TR-${activas[0].id}). Cancelala o concretala antes de iniciar otra.`);
     }
 
     const { errores, datos } = await validarDatosSolicitud(connection, req.body, usuarioId);
@@ -910,8 +910,8 @@ router.post("/traslados/solicitudes", verifyToken, manejarUploadTraslados, async
     };
     await notificarInvolucrados(
       connection, solicitudNueva, cabecera, "TRASLADO_NUEVA",
-      `Nueva solicitud de traslado #${solicitudId}`,
-      `Tu solicitud de traslado #${solicitudId} fue registrada`,
+      `Nueva solicitud de traslado TR-${solicitudId}`,
+      `Tu solicitud de traslado TR-${solicitudId} fue registrada`,
       `${titular.apellido}, ${titular.nombre} solicita traslado de departamental. Revisá los datos y las posibles coincidencias.`
     );
 
@@ -1485,8 +1485,8 @@ router.put("/traslados/solicitudes/:id", verifyToken, manejarUploadTraslados, as
       // el aviso tiene que llegar a la nueva (la anterior deja de estar involucrada)
       await notificarInvolucrados(
         connection, { ...solicitud, departamental_destino_id: datos.departamental_destino_id }, cabecera, "TRASLADO_ACTUALIZADA",
-        `Solicitud de traslado #${solicitudId} actualizada`,
-        `Tu solicitud de traslado #${solicitudId} fue actualizada`,
+        `Solicitud de traslado TR-${solicitudId} actualizada`,
+        `Tu solicitud de traslado TR-${solicitudId} fue actualizada`,
         cabecera.rol === "afiliado"
           ? "El afiliado actualizó los datos de su solicitud de traslado."
           : "Se actualizaron datos de la solicitud de traslado."
@@ -1551,7 +1551,7 @@ router.put("/traslados/solicitudes/:id/estado", verifyToken, async (req, res) =>
       );
       if (otrasActivas.length > 0) {
         await connection.rollback();
-        return res.status(409).json(`No se puede reabrir: el afiliado ya tiene otra solicitud de traslado en curso (#${otrasActivas[0].id}).`);
+        return res.status(409).json(`No se puede reabrir: el afiliado ya tiene otra solicitud de traslado en curso (TR-${otrasActivas[0].id}).`);
       }
     }
 
@@ -1585,8 +1585,8 @@ router.put("/traslados/solicitudes/:id/estado", verifyToken, async (req, res) =>
     const nombreEstado = estados.length > 0 ? estados[0].nombre : "";
     await notificarInvolucrados(
       connection, { ...solicitud, estado_id: estadoNuevo }, cabecera, "TRASLADO_ESTADO",
-      `La solicitud de traslado #${solicitudId} pasó a "${nombreEstado}"`,
-      `Tu solicitud de traslado #${solicitudId} pasó a "${nombreEstado}"`,
+      `La solicitud de traslado TR-${solicitudId} pasó a "${nombreEstado}"`,
+      `Tu solicitud de traslado TR-${solicitudId} pasó a "${nombreEstado}"`,
       `Nueva situación: ${nombreEstado}.${observacion ? " Observación: " + observacion : ""}`
     );
 
@@ -1646,8 +1646,8 @@ router.post("/traslados/solicitudes/:id/observaciones", verifyToken, async (req,
 
     await notificarInvolucrados(
       connection, solicitud, cabecera, "TRASLADO_OBSERVACION",
-      `Nuevo mensaje en la solicitud de traslado #${solicitudId}`,
-      `Nuevo mensaje en tu solicitud de traslado #${solicitudId}`,
+      `Nuevo mensaje en la solicitud de traslado TR-${solicitudId}`,
+      `Nuevo mensaje en tu solicitud de traslado TR-${solicitudId}`,
       `${cabecera.rol === "afiliado" ? "El afiliado" : "El equipo de la AJB"} escribió: ${mensaje}`
     );
 

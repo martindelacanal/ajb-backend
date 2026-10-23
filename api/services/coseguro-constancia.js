@@ -73,7 +73,7 @@ function generarConstanciaReintegro(solicitud) {
       size: "A4",
       margin: MARGEN,
       info: {
-        Title: `Constancia de reintegro #${solicitud.id}`,
+        Title: `Constancia de reintegro C-${solicitud.id}`,
         Author: "Asociación Judicial Bonaerense",
       },
     });

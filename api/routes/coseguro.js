@@ -734,8 +734,8 @@ async function validarSolicitudParaAprobacionDepartamental(db, cabecera, solicit
 async function notificarAprobacionDepartamental(connection, solicitud, estadoAnterior = ESTADO.INICIADA) {
   await notificarCambioEstadoAfiliado(connection, solicitud, estadoAnterior, ESTADO.APROBADA_DEPTO, null);
   await notificarUsuariosPorRol(connection, "admin-central", "COSEGURO_PARA_CONTROL",
-    `Solicitud #${solicitud.id} aprobada por departamental`,
-    `La solicitud de reintegro #${solicitud.id} quedó lista para el control de Servicios Sociales.`,
+    `Solicitud C-${solicitud.id} aprobada por departamental`,
+    `La solicitud de reintegro C-${solicitud.id} quedó lista para el control de Servicios Sociales.`,
     { solicitud_id: solicitud.id, estado_id: ESTADO.APROBADA_DEPTO });
 }
 
@@ -823,10 +823,10 @@ async function registrarReasignacion(connection, cabecera, solicitud, usuarioNue
     observacion: `Solicitud reasignada. Afiliado original: #${originalId}` });
   const destinatarios = new Set([Number(originalId), Number(solicitud.usuario_id), Number(usuarioNuevoId)]);
   for (const usuarioId of destinatarios) {
-    await insertarNotificacion(connection, usuarioId, "COSEGURO_REASIGNADA", `Solicitud de reintegro #${solicitud.id} reasignada`,
+    await insertarNotificacion(connection, usuarioId, "COSEGURO_REASIGNADA", `Solicitud de reintegro C-${solicitud.id} reasignada`,
       usuarioId === Number(usuarioNuevoId)
-        ? `La solicitud de reintegro #${solicitud.id} fue asignada a tu grupo familiar.`
-        : `La solicitud de reintegro #${solicitud.id} fue reasignada a otro afiliado para corregir quién recibió la prestación.`,
+        ? `La solicitud de reintegro C-${solicitud.id} fue asignada a tu grupo familiar.`
+        : `La solicitud de reintegro C-${solicitud.id} fue reasignada a otro afiliado para corregir quién recibió la prestación.`,
       { solicitud_id: solicitud.id, estado_id: solicitud.estado_id, usuario_anterior_id: solicitud.usuario_id, usuario_nuevo_id: usuarioNuevoId, usuario_original_id: originalId,
         reasignacion: usuarioId === Number(usuarioNuevoId) ? "entrante" : "saliente" });
   }
@@ -862,7 +862,7 @@ async function notificarCambioEstadoAfiliado(connection, solicitud, estadoAnteri
   const nombreNuevo = await nombreEstadoAfiliado(connection, estadoNuevoId);
   const nombreAnterior = estadoAnteriorId ? await nombreEstadoAfiliado(connection, estadoAnteriorId) : null;
   if (!nombreNuevo || nombreNuevo === nombreAnterior) return; // p.ej. 8 -> 9: el afiliado ve lo mismo
-  const titulo = `Tu solicitud de reintegro #${solicitud.id} cambió de estado`;
+  const titulo = `Tu solicitud de reintegro C-${solicitud.id} cambió de estado`;
   let mensaje = `Nueva situación: ${nombreNuevo}.`;
   if (estadoNuevoId === ESTADO.APROBADA_CENTRAL) mensaje += " Ya podés imprimir la constancia de reintegro desde el detalle de tu trámite y presentarla ante la Corte.";
   if (observacion) mensaje += ` Observación: ${observacion}`;
@@ -1963,7 +1963,7 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
     });
     if (duplicadosComprobante.length > 0 && !forzarDuplicado) {
       return res.status(409).json(
-        `Ya existe una solicitud con ese número de comprobante (solicitud #${duplicadosComprobante[0].id} de ${duplicadosComprobante[0].afiliado}, estado: ${duplicadosComprobante[0].estado}). No se puede cargar dos veces el mismo comprobante.`
+        `Ya existe una solicitud con ese número de comprobante (solicitud C-${duplicadosComprobante[0].id} de ${duplicadosComprobante[0].afiliado}, estado: ${duplicadosComprobante[0].estado}). No se puede cargar dos veces el mismo comprobante.`
       );
     }
 
@@ -1981,7 +1981,7 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
       const dup = duplicadosArchivo[0];
       const detalle = dup.coincidencia === "imagen" ? " (la imagen coincide aunque esté rotada, espejada o recomprimida)" : "";
       return res.status(409).json(
-        `Uno de los archivos adjuntos ya fue presentado en la solicitud #${dup.solicitud_id} (${dup.afiliado})${detalle}. No se puede subir el mismo comprobante dos veces.`
+        `Uno de los archivos adjuntos ya fue presentado en la solicitud C-${dup.solicitud_id} (${dup.afiliado})${detalle}. No se puede subir el mismo comprobante dos veces.`
       );
     }
 
@@ -2047,14 +2047,14 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
     if (duplicadosComprobanteFinales.length > 0 && !forzarDuplicado) {
       const duplicado = duplicadosComprobanteFinales[0];
       throw crearErrorHttp(
-        `Ya existe una solicitud con ese número de comprobante (solicitud #${duplicado.id}, estado: ${duplicado.estado}).`,
+        `Ya existe una solicitud con ese número de comprobante (solicitud C-${duplicado.id}, estado: ${duplicado.estado}).`,
         409
       );
     }
     const duplicadosArchivoFinales = await buscarDuplicadosArchivo(connection, hashes, null, phashSets);
     if (duplicadosArchivoFinales.length > 0 && !forzarDuplicado) {
       throw crearErrorHttp(
-        `Uno de los archivos adjuntos ya fue presentado en la solicitud #${duplicadosArchivoFinales[0].solicitud_id}.`,
+        `Uno de los archivos adjuntos ya fue presentado en la solicitud C-${duplicadosArchivoFinales[0].solicitud_id}.`,
         409
       );
     }
@@ -2126,7 +2126,7 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
       cambios: { cuil: datos.cuil_afiliado, cbu: datos.cbu },
       contexto: {
         origen: "coseguro",
-        observaciones: `CUIL/CBU tomados de la solicitud de reintegro #${solicitudId}`,
+        observaciones: `CUIL/CBU tomados de la solicitud de reintegro C-${solicitudId}`,
         ...contextoDesdeRequest(req),
       },
       opciones: { propagar: false, autorizacionPrevia: true },
@@ -2146,7 +2146,7 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
         tipo_operacion: "CAMBIO_ESTADO", estado_anterior_id: ESTADO.INICIADA, estado_nuevo_id: estadoInicial });
       await notificarAprobacionDepartamental(connection, { id: solicitudId, usuario_id: usuarioId });
     } else await notificarUsuariosDepartamental(connection, departamentalId, "COSEGURO_NUEVA",
-      `Nueva solicitud de reintegro #${solicitudId}`,
+      `Nueva solicitud de reintegro C-${solicitudId}`,
       `${titular.apellido}, ${titular.nombre} cargó una solicitud de reintegro para revisar.`,
       { solicitud_id: solicitudId, estado_id: ESTADO.INICIADA });
     if (!idsPositivosIguales(titularOriginal.id, usuarioId)) await registrarReasignacion(connection, cabecera,
@@ -2780,7 +2780,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     });
     if (duplicadosComprobante.length > 0 && !forzarDuplicado) {
       return res.status(409).json(
-        `Ya existe otra solicitud con ese número de comprobante (solicitud #${duplicadosComprobante[0].id}, estado: ${duplicadosComprobante[0].estado}).`
+        `Ya existe otra solicitud con ese número de comprobante (solicitud C-${duplicadosComprobante[0].id}, estado: ${duplicadosComprobante[0].estado}).`
       );
     }
     const preparacion = await prepararHashesArchivos(req.files);
@@ -2796,7 +2796,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
       const dup = duplicadosArchivo[0];
       const detalle = dup.coincidencia === "imagen" ? " (la imagen coincide aunque esté rotada, espejada o recomprimida)" : "";
       return res.status(409).json(
-        `Uno de los archivos adjuntos ya fue presentado en la solicitud #${dup.solicitud_id}${detalle}.`
+        `Uno de los archivos adjuntos ya fue presentado en la solicitud C-${dup.solicitud_id}${detalle}.`
       );
     }
 
@@ -2868,7 +2868,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     });
     if (duplicadosComprobanteFinales.length > 0 && !forzarDuplicado) {
       throw crearErrorHttp(
-        `Ya existe otra solicitud con ese número de comprobante (solicitud #${duplicadosComprobanteFinales[0].id}).`,
+        `Ya existe otra solicitud con ese número de comprobante (solicitud C-${duplicadosComprobanteFinales[0].id}).`,
         409
       );
     }
@@ -2880,7 +2880,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     );
     if (duplicadosArchivoFinales.length > 0 && !forzarDuplicado) {
       throw crearErrorHttp(
-        `Uno de los archivos adjuntos ya fue presentado en la solicitud #${duplicadosArchivoFinales[0].solicitud_id}.`,
+        `Uno de los archivos adjuntos ya fue presentado en la solicitud C-${duplicadosArchivoFinales[0].solicitud_id}.`,
         409
       );
     }
@@ -3057,7 +3057,7 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
       cambios: { cuil: datos.cuil_afiliado, cbu: datos.cbu },
       contexto: {
         origen: "coseguro",
-        observaciones: `CUIL/CBU corregidos en la solicitud de reintegro #${solicitudId}`,
+        observaciones: `CUIL/CBU corregidos en la solicitud de reintegro C-${solicitudId}`,
         ...contextoDesdeRequest(req),
       },
       opciones: { propagar: false, autorizacionPrevia: true },
@@ -3094,8 +3094,8 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
         );
       }
       await notificarUsuariosDepartamental(connection, solicitud.departamental_id, "COSEGURO_REVISADA",
-        `Solicitud de reintegro #${solicitudId} revisada`,
-        `El afiliado corrigió y reenvió la solicitud #${solicitudId}.${mensajeRevision ? " Mensaje: " + mensajeRevision : ""}`,
+        `Solicitud de reintegro C-${solicitudId} revisada`,
+        `El afiliado corrigió y reenvió la solicitud C-${solicitudId}.${mensajeRevision ? " Mensaje: " + mensajeRevision : ""}`,
         { solicitud_id: solicitudId, estado_id: estadoNuevo });
     }
 
@@ -3272,16 +3272,16 @@ router.put("/coseguro/solicitudes/:id/estado", verifyToken, async (req, res) => 
     // Notificaciones
     if (cabecera.rol === "afiliado" && estadoNuevo === ESTADO.CANCELADA) {
       await notificarUsuariosDepartamental(connection, solicitud.departamental_id, "COSEGURO_CANCELADA",
-        `Solicitud de reintegro #${solicitudId} cancelada`,
-        `El afiliado canceló la solicitud #${solicitudId}.${observacion ? " Motivo: " + observacion : ""}`,
+        `Solicitud de reintegro C-${solicitudId} cancelada`,
+        `El afiliado canceló la solicitud C-${solicitudId}.${observacion ? " Motivo: " + observacion : ""}`,
         { solicitud_id: solicitudId, estado_id: estadoNuevo });
     } else {
       await notificarCambioEstadoAfiliado(connection, solicitud, solicitud.estado_id, estadoNuevo, observacion);
     }
     if (estadoNuevo === ESTADO.APROBADA_DEPTO) {
       await notificarUsuariosPorRol(connection, "admin-central", "COSEGURO_PARA_CONTROL",
-        `Solicitud #${solicitudId} aprobada por departamental`,
-        `La solicitud de reintegro #${solicitudId} quedó lista para el control de Servicios Sociales.`,
+        `Solicitud C-${solicitudId} aprobada por departamental`,
+        `La solicitud de reintegro C-${solicitudId} quedó lista para el control de Servicios Sociales.`,
         { solicitud_id: solicitudId, estado_id: estadoNuevo });
     }
 
@@ -3349,7 +3349,7 @@ router.post("/coseguro/solicitudes/:id/observaciones", verifyToken, async (req, 
     await notificarParticipantesChat(connection, {
       modulo: "coseguro", entidadId: solicitudId,
       entidad: { ...solicitud, estado_id: estadoNuevo || solicitud.estado_id }, autorId: cabecera.id,
-      tipo: "COSEGURO_OBSERVACION", titulo: `Nuevo mensaje en la solicitud #${solicitudId}`,
+      tipo: "COSEGURO_OBSERVACION", titulo: `Nuevo mensaje en la solicitud C-${solicitudId}`,
       mensaje, payload: { solicitud_id: solicitudId, estado_id: estadoNuevo || solicitud.estado_id },
     });
 
@@ -3996,7 +3996,7 @@ router.post("/coseguro/liquidacion/confirmar", verifyToken, async (req, res) => 
         observacion: `Acreditación bancaria confirmada el ${moment(item.fecha_pago).format("DD/MM/YYYY HH:mm")}`,
       });
       await insertarNotificacion(connection, solicitud.usuario_id, "COSEGURO_ESTADO",
-        `Tu reintegro #${item.id} fue liquidado`,
+        `Tu reintegro C-${item.id} fue liquidado`,
         `El pago ya fue acreditado en tu cuenta el ${moment(item.fecha_pago).format("DD/MM/YYYY HH:mm")}.`,
         { solicitud_id: item.id, estado_id: ESTADO.LIQUIDADO, estado_nombre: "Liquidado" });
       aplicadas += 1;

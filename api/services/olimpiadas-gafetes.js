@@ -65,7 +65,7 @@ async function generarGafetes(registros, { cargarFoto = async () => null } = {})
     textoAjustado(doc, (r.disciplinas || []).join(' · ') || 'Sin disciplinas asignadas', x + 13, y + 214, ANCHO - 26, 70, 11);
     doc.font('Helvetica').fontSize(8).fillColor('#526477');
     textoAjustado(doc, [r.olimpiada_localidad, r.fecha_inicio, r.fecha_fin && r.fecha_fin !== r.fecha_inicio ? `al ${r.fecha_fin}` : ''].filter(Boolean).join(' · '), x + 13, y + 292, ANCHO - 26, 22, 8);
-    doc.font('Helvetica-Bold').fillColor(AZUL).fontSize(9).text(`INSCRIPCIÓN APROBADA · #${r.id}`, x + 13, y + ALTO - 23, { width: ANCHO - 26 });
+    doc.font('Helvetica-Bold').fillColor(AZUL).fontSize(9).text(`INSCRIPCIÓN APROBADA · Nº ${String(r.id).padStart(3, '0')}`, x + 13, y + ALTO - 23, { width: ANCHO - 26 });
     doc.restore();
   }
   doc.end();

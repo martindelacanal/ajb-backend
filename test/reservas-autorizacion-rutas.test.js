@@ -1534,7 +1534,7 @@ test("cerrar el sorteo no deja pendiente la aprobación del titular de una inscr
   assert.equal(response.status, 200);
   const cierre = databaseCalls.find(({ sql }) => /UPDATE reserva_aprobacion_titular SET decision = 'CANCELADA'/.test(sql));
   assert.deepEqual(cierre.params, [[30]]);
-  assert.ok(databaseCalls.some(({ sql, params }) => /INSERT INTO notificacion/.test(sql) && params.includes("Reserva #30: No adjudicada")));
+  assert.ok(databaseCalls.some(({ sql, params }) => /INSERT INTO notificacion/.test(sql) && params.includes("Reserva T-30: No adjudicada")));
   assert.ok(databaseCalls.some(({ sql }) => /UPDATE sorteo SET estado = 'CERRADO'/.test(sql)));
 });
 
@@ -1554,5 +1554,5 @@ test("cancelar el sorteo tampoco deja pendiente la aprobación del titular", asy
   assert.equal(response.status, 200);
   const cierre = databaseCalls.find(({ sql }) => /UPDATE reserva_aprobacion_titular SET decision = 'CANCELADA'/.test(sql));
   assert.deepEqual(cierre.params, [[30]]);
-  assert.ok(databaseCalls.some(({ sql, params }) => /INSERT INTO notificacion/.test(sql) && params.includes("Reserva #30: Cancelada")));
+  assert.ok(databaseCalls.some(({ sql, params }) => /INSERT INTO notificacion/.test(sql) && params.includes("Reserva T-30: Cancelada")));
 });

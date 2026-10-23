@@ -382,7 +382,7 @@ async function expirarReservaTurismoEnTransaccion(connection, reserva, estadoRec
     connection,
     reserva.usuario_id,
     "RESERVA_RECHAZADA_SIN_RESPUESTA",
-    `Reserva #${reserva.id} rechazada por falta de respuesta`,
+    `Reserva T-${reserva.id} rechazada por falta de respuesta`,
     "Tu reserva fue rechazada porque no recibio respuesta de la departamental dentro de las 72 horas. El recurso ya fue liberado y podes iniciar una nueva reserva.",
     { reserva_id: Number(reserva.id), estado: ESTADO_RECHAZADA, motivo: "SIN_RESPUESTA_72H" }
   );
@@ -614,6 +614,18 @@ function iniciarMantenimientoReservas(db, {
       }
     } catch (error) {
       console.error("Error en mantenimiento de reservas de 72 horas:", error?.code || error?.message);
+    }
+    // Solicitudes de un familiar que el titular no respondió en 48 horas: bloque aparte.
+    try {
+      const { expirarSolicitudesTitularVencidas } = require("./reservas-familiares");
+      const resultado = await expirarSolicitudesTitularVencidas(db);
+      if (resultado.solicitudes) {
+        const una = resultado.solicitudes === 1;
+        console.log(`Mantenimiento de reservas: ${resultado.solicitudes} ${una ? "solicitud" : "solicitudes"} sin respuesta del titular ${una ? "dada" : "dadas"} de baja`);
+      }
+      if (resultado.omitido) console.warn(`Vencimiento de solicitudes del titular omitido: ${resultado.omitido}`);
+    } catch (error) {
+      console.error("Error en mantenimiento de solicitudes del titular:", error?.code || error?.message);
     }
     // «Pendiente de firma» vencidas: bloque aparte, así un error de uno no frena
     // el otro. Sin la migración este bloque no hace nada (omitido: 'SIN_MIGRACION').

@@ -453,11 +453,11 @@ test("cambios: se nombran como en el formulario y en su orden, sin el estado", (
 
 test("aviso al staff: quién, qué cambió y si la inscripción volvió a revisión", () => {
   assert.deepEqual(avisoEdicionAfiliado({ inscripcionId: 11, persona: "Pérez, Ana", campos: ["foto_archivo", "disciplinas"], volvioARevision: true }), {
-    titulo: "Inscripción #11 actualizada y de vuelta en revisión",
+    titulo: "Inscripción Nº 011 actualizada y de vuelta en revisión",
     mensaje: "Pérez, Ana cambió las disciplinas y la foto de su inscripción aprobada. Volvió a «En revisión»: revisá los cambios y aprobala de nuevo para que pueda descargar el gafete.",
   });
   assert.deepEqual(avisoEdicionAfiliado({ inscripcionId: 11, persona: "Pérez, Ana", campos: ["tension_arterial"], volvioARevision: false }), {
-    titulo: "Inscripción #11 actualizada",
+    titulo: "Inscripción Nº 011 actualizada",
     mensaje: "Pérez, Ana cambió la presión arterial de su inscripción.",
   });
   // Sin nombre (no debería pasar) o sin campos con nombre
