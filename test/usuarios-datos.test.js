@@ -645,7 +645,7 @@ test("el afiliado que cambia su CBU no lo pasa a solicitudes ya aprobadas: se av
   const aviso = resultado.advertencias.find(({ codigo }) => codigo === "COSEGURO_DATO_BANCARIO_NO_PROPAGADO");
   assert.ok(aviso, JSON.stringify(resultado.advertencias));
   assert.deepEqual(aviso.solicitudes, [5, 6, 8]);
-  assert.match(aviso.mensaje, /El CBU nuevo no se copió a las solicitudes de reintegro #5 \(revisada\), #6 \(aprobada por la departamental\) y #8 \(aprobada por Servicios Sociales\)/);
+  assert.match(aviso.mensaje, /El CBU nuevo no se copió a las solicitudes de reintegro C-5 \(revisada\), C-6 \(aprobada por la departamental\) y C-8 \(aprobada por Servicios Sociales\)/);
   assert.match(aviso.mensaje, /avisale a tu departamental/);
   assert.deepEqual(resultado.propagaciones.map(({ id }) => id), [4, 7]);
 });

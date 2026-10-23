@@ -413,7 +413,7 @@ test("edición: el afiliado que cambia la presión de su inscripción aprobada l
   // Aviso a la administración y a la departamental de la inscripción, con quién y qué cambió
   assert.deepEqual(contexto.notificaciones.map((n) => n.usuario), [1, 3]);
   for (const aviso of contexto.notificaciones) {
-    assert.equal(aviso.titulo, "Inscripción #11 actualizada y de vuelta en revisión");
+    assert.equal(aviso.titulo, "Inscripción Nº 011 actualizada y de vuelta en revisión");
     assert.equal(aviso.mensaje, "Pérez, Ana cambió la presión arterial de su inscripción aprobada. Volvió a «En revisión»: revisá los cambios y aprobala de nuevo para que pueda descargar el gafete.");
     assert.deepEqual(aviso.payload, { inscripcion_id: 11, olimpiada_id: 7, estado: "PENDIENTE" });
   }
@@ -517,7 +517,7 @@ test("edición: con la inscripción en revisión, un cambio del afiliado la deja
   });
   assert.deepEqual(contexto.escrituras, ["UPDATE inscripción"]);
   assert.deepEqual(contexto.historial.map((h) => [h.campo, h.anterior, h.nuevo]), [["detalle_medico", null, "Asma leve"]]);
-  assert.equal(contexto.notificaciones[0].titulo, "Inscripción #11 actualizada");
+  assert.equal(contexto.notificaciones[0].titulo, "Inscripción Nº 011 actualizada");
   assert.equal(contexto.notificaciones[0].mensaje, "Pérez, Ana cambió el detalle médico de su inscripción.");
   assert.deepEqual(contexto.notificaciones[0].payload, { inscripcion_id: 11, olimpiada_id: 7 });
 });

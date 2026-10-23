@@ -44,6 +44,12 @@ const connection = {
     if (/FROM usuario u INNER JOIN rol/.test(sql)) return [[titular]];
     if (/SELECT r.\*, er.nombre AS estado_nombre/.test(sql)) return [[{ ...estado.reserva }]];
     if (/SELECT id FROM usuario/.test(sql)) return [[{ id: 20 }]];
+    if (/SELECT id, nombre FROM estado_reserva WHERE nombre IN/.test(sql) && params[0] === ESTADO_PENDIENTE_TITULAR) {
+      return [[{ id: 14, nombre: ESTADO_PENDIENTE_TITULAR }, { id: 4, nombre: "Rechazada" }]];
+    }
+    if (/SELECT a\.titular_usuario_id, a\.vence_en/.test(sql)) {
+      return [[{ titular_usuario_id: 10, vence_en: new Date("2026-10-25T13:00:00Z"), usuario_id: 20, nombre: "Juan", apellido: "Pérez" }]];
+    }
     if (/SELECT id, nombre FROM estado_reserva/.test(sql)) return [[{ id: 1, nombre: "Iniciada" }, { id: 4, nombre: "Rechazada" }]];
     if (/FROM reserva r/.test(sql)) return [[]];
     if (/SELECT id FROM estado_reserva/.test(sql)) return [[{ id: { Iniciada: 1, Rechazada: 4, [ESTADO_PENDIENTE_TITULAR]: 14 }[params[0]] }]];
@@ -110,7 +116,13 @@ test("cada modalidad guarda la solicitud y notifica internamente al titular sin 
     assert.deepEqual(JSON.parse(notificacion.params[4]), {
       reserva_id: 7, estado: ESTADO_PENDIENTE_TITULAR, url: "/mis-gestiones?aprobacion_reserva=7",
     });
-    assert.deepEqual(estado.solicitud, [7, 20, 10, estadoDestino]);
+    assert.deepEqual(estado.solicitud.slice(0, 4), [7, 20, 10, estadoDestino]);
+    // Hasta cuándo puede responder el titular: 48 horas (sin fecha de ingreso en esta base simulada).
+    const venceEn = estado.solicitud[4];
+    assert.ok(venceEn instanceof Date);
+    assert.ok(Math.abs(venceEn.getTime() - (Date.now() + 48 * 3600 * 1000)) < 5000);
+    assert.match(notificacion.params[2], /^Reserva T-7 pendiente de tu aprobación$/);
+    assert.match(notificacion.params[3], /antes del \d{2}\/\d{2}\/\d{4} a las \d{2}:\d{2}: si no respondés, se da de baja sola\.$/);
   }
   assert.equal(estado.historial.length, 3);
   comprobarSinCorreo();
@@ -152,6 +164,29 @@ for (const [accion, destino] of [["APROBAR", "Iniciada"], ["RECHAZAR", "Rechazad
     assert.equal(respuesta.params[0], 20);
     assert.equal(JSON.parse(respuesta.params[4]).estado, destino);
     assert.equal(estado.historial.length, 1);
+    comprobarSinCorreo();
+  });
+}
+
+for (const accion of ["APROBAR", "RECHAZAR"]) {
+  test(`PUT aprobación titular ${accion} con el plazo vencido: la baja queda firme y responde 409`, async () => {
+    estado.reserva.vencida = 1;
+    const response = await responderSolicitud(accion);
+    assert.equal(response.status, 409);
+    assert.equal(response.body.codigo, "APROBACION_TITULAR_VENCIDA");
+    assert.match(response.body.message, /Venció el plazo para responder/);
+    // Se confirma (no se revierte): la solicitud vencida no vuelve a quedar pendiente.
+    assert.deepEqual(transacciones, ["begin", "commit"]);
+    assert.equal(estado.reserva.estado_nombre, "Rechazada");
+    assert.ok(consultas.some(({ sql }) => /SET decision = 'VENCIDA'/.test(sql)));
+    assert.deepEqual(estado.notificaciones.map(({ params }) => [params[0], params[1], params[2]]), [
+      [20, "RESERVA_RESPUESTA_TITULAR", "Reserva T-7 dada de baja"],
+      [10, "RESERVA_APROBACION_TITULAR_VENCIDA", "Reserva T-7: venció el plazo para responder"],
+    ]);
+    assert.match(estado.notificaciones[1].params[3], /No respondiste a tiempo la solicitud de Juan Pérez/);
+    // Historial automático (sin usuario) con la fecha en que vencía.
+    assert.equal(estado.historial.length, 1);
+    assert.match(estado.historial[0][3], /^Se dio de baja sola: el titular no respondió a tiempo \(vencía el 25\/10\/2026 a las 10:00\)/);
     comprobarSinCorreo();
   });
 }

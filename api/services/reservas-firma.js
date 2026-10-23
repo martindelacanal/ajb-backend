@@ -459,7 +459,7 @@ async function avisarAdministradoresParaAprobar(connection, { reservaId, excluir
     await crearNotificacion(connection, {
       usuarioId: admin.id,
       tipo: "RESERVA_PARA_APROBAR",
-      titulo: `Reserva #${reservaId} verificada`,
+      titulo: `Reserva T-${reservaId} verificada`,
       mensaje,
       payload: { reserva_id: reservaId, estado: ESTADO_VERIFICADA },
     });

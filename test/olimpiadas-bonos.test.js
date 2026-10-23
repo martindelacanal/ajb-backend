@@ -299,7 +299,7 @@ test("bonos: armarCsvBonos arranca con BOM, usa ; y las columnas del contrato", 
   const lineas = csv.slice(1).split("\r\n");
   assert.equal(lineas[0], COLUMNAS_CSV.join(";"));
   assert.equal(lineas[0], "Número;Comprador;DNI;Email;Teléfono;Departamental;A nombre de la departamental;Inscripción;Afiliado;Fecha de venta;Observación");
-  assert.equal(lineas[1], `0460;'=malicioso();20123456;a@b.com;;La Plata;Sí;#12;Pérez, Juan;02/09/2026 18:05;"ok; listo"`);
+  assert.equal(lineas[1], `0460;'=malicioso();20123456;a@b.com;;La Plata;Sí;Nº 012;Pérez, Juan;02/09/2026 18:05;"ok; listo"`);
   assert.equal(lineas[2], "0007;Cooperadora;;;;Mercedes;No;;;;");
   assert.equal(lineas[3], "");
 });

@@ -535,7 +535,7 @@ router.post("/reserva/:id/descuentos/:descuentoId/comprobantes", verifyToken, pr
     await registrarHistorialDescuento(db, {
       reglaId: descuento.regla_id, reservaId, servicioId: descuento.servicio_id,
       entidadTipo: "COMPROBANTE", entidadId: descuentoId, operacion: "UPLOAD",
-      resumen: `Reserva #${reservaId}: ${files.length} comprobante${files.length === 1 ? "" : "s"} de ${descuento.nombre} cargado${files.length === 1 ? "" : "s"} por ${cabecera.rol}`,
+      resumen: `Reserva T-${reservaId}: ${files.length} comprobante${files.length === 1 ? "" : "s"} de ${descuento.nombre} cargado${files.length === 1 ? "" : "s"} por ${cabecera.rol}`,
       nuevo: { archivos: guardados.map((archivo) => ({ id: archivo.id, nombre: archivo.nombre_original })) },
       usuarioId: cabecera.id, req,
     });
@@ -582,7 +582,7 @@ router.delete("/reserva/:id/descuentos/comprobantes/:archivoId", verifyToken, as
     await registrarHistorialDescuento(db, {
       reglaId: descuento.regla_id, reservaId, servicioId: descuento.servicio_id,
       entidadTipo: "COMPROBANTE", entidadId: descuento.id, operacion: "DELETE",
-      resumen: `Reserva #${reservaId}: se quitó el comprobante "${archivo.nombre_original || archivoId}" de ${descuento.nombre}`,
+      resumen: `Reserva T-${reservaId}: se quitó el comprobante "${archivo.nombre_original || archivoId}" de ${descuento.nombre}`,
       anterior: { id: archivoId, nombre: archivo.nombre_original }, usuarioId: cabecera.id, req,
     });
     return res.status(200).json({ success: true });

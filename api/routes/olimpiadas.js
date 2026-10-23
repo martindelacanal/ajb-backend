@@ -209,6 +209,8 @@ function textoResumenAcompaniantes({ cantidad, bonos }) {
 
 // Nombre de pantalla de cada estado de una inscripción (como en la ficha y en Inscriptos)
 const NOMBRES_ESTADO_INSCRIPCION = { PENDIENTE: "En revisión", VALIDADO: "Aprobada", CANCELADO: "Cancelada" };
+/** «012»: el número de inscripción como lo muestran las pantallas («Nº 012»). */
+const numeroInscripcion = (id) => String(id).padStart(3, "0");
 
 // Lo que el historial guarda al crear una inscripción. Lo lee el staff tal cual:
 // «Inscripción de Pérez, Ana · Atleta · 1 disciplina · En revisión» (no «1 disciplinas · PENDIENTE»).
@@ -337,12 +339,12 @@ function avisoEdicionAfiliado({ inscripcionId, persona, campos, volvioARevision 
   const que = textoCamposCambiados(campos) || "algunos datos";
   if (volvioARevision) {
     return {
-      titulo: `Inscripción #${inscripcionId} actualizada y de vuelta en revisión`,
+      titulo: `Inscripción Nº ${numeroInscripcion(inscripcionId)} actualizada y de vuelta en revisión`,
       mensaje: `${quien} cambió ${que} de su inscripción aprobada. Volvió a «En revisión»: revisá los cambios y aprobala de nuevo para que pueda descargar el gafete.`,
     };
   }
   return {
-    titulo: `Inscripción #${inscripcionId} actualizada`,
+    titulo: `Inscripción Nº ${numeroInscripcion(inscripcionId)} actualizada`,
     mensaje: `${quien} cambió ${que} de su inscripción.`,
   };
 }
@@ -2624,7 +2626,7 @@ router.put("/olimpiadas/inscripciones/:id(\\d+)/estado", verifyToken, async (req
 
     if (cabecera.rol === "afiliado") {
       await notificarStaffOlimpiadas(connection, inscripcion.departamental_id, "OLIMPIADA_ESTADO",
-        `Inscripción #${inscripcionId} cancelada`,
+        `Inscripción Nº ${numeroInscripcion(inscripcionId)} cancelada`,
         `El afiliado canceló su inscripción a ${inscripcion.olimpiada_nombre}.${motivo ? ` Motivo: ${motivo}` : ""}`,
         { inscripcion_id: inscripcionId, olimpiada_id: inscripcion.olimpiada_id, estado: estadoNuevo });
     } else {
@@ -2894,7 +2896,7 @@ router.post("/olimpiadas/inscripciones/:id(\\d+)/observaciones", verifyToken, as
     });
 
     await notificarStaffOlimpiadas(connection, inscripcion.departamental_id, "OLIMPIADA_OBSERVACION",
-      `Nuevo mensaje en la inscripción #${inscripcionId}`, mensaje,
+      `Nuevo mensaje en la inscripción Nº ${numeroInscripcion(inscripcionId)}`, mensaje,
       { inscripcion_id: inscripcionId, olimpiada_id: inscripcion.olimpiada_id }, cabecera.id);
     if (Number(inscripcion.usuario_id) !== Number(cabecera.id)) {
       await insertarNotificacion(connection, inscripcion.usuario_id, "OLIMPIADA_OBSERVACION",

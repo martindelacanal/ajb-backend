@@ -1632,7 +1632,7 @@ async function advertenciasSolicitud(db, { actor, solicitud, persona, anteriores
     advertencias.push({
       codigo: "COSEGURO_EN_CURSO",
       solicitudes: coseguro.map((fila) => Number(fila.id)),
-      mensaje: `${nombrePersona} tiene ${coseguro.length} solicitud(es) de reintegro en curso (${coseguro.map((fila) => `#${fila.id}`).join(", ")}); van a tomar los datos nuevos.`,
+      mensaje: `${nombrePersona} tiene ${coseguro.length} solicitud(es) de reintegro en curso (${coseguro.map((fila) => `C-${fila.id}`).join(", ")}); van a tomar los datos nuevos.`,
     });
   }
 

@@ -56,6 +56,10 @@
     "migrate:temporadas-baja-logica:check": "node scripts/migrar-temporadas-baja-logica.js --check",
     "migrate:firma-condiciones": "node scripts/migrar-firma-condiciones-reserva.js",
     "migrate:firma-condiciones:check": "node scripts/migrar-firma-condiciones-reserva.js --check",
+    "migrate:aprobacion-titular-vencimiento": "node scripts/migrar-aprobacion-titular-vencimiento.js",
+    "migrate:aprobacion-titular-vencimiento:check": "node scripts/migrar-aprobacion-titular-vencimiento.js --check",
+    "avisos:unificar-codigos": "node scripts/unificar-codigos-avisos.js",
+    "avisos:unificar-codigos:check": "node scripts/unificar-codigos-avisos.js --check",
     "tarifas:rehabilitar": "node scripts/rehabilitar-tarifas-temporada.js",
     "test:acceso:integracion": "node scripts/verificar-acceso-usuarios-integracion.js"
   },

@@ -1507,7 +1507,7 @@ router.get("/reservas/aprobaciones-titular", verifyToken, async (req, res) => {
               COALESCE(s.nombre, 'Convenio hotelero') AS servicio, COALESCE(rec.nombre, ch.nombre) AS recurso,
               DATE_FORMAT(r.fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
               DATE_FORMAT(r.fecha_fin, '%Y-%m-%d') AS fecha_fin, r.precio_total, r.modalidad,
-              a.fecha_solicitud, a.correo_enviado_en
+              a.fecha_solicitud, a.vence_en, a.correo_enviado_en
          FROM reserva_aprobacion_titular a INNER JOIN reserva r ON r.id = a.reserva_id
          INNER JOIN estado_reserva er ON er.id = r.estado_reserva_id
          INNER JOIN usuario u ON u.id = a.solicitante_usuario_id
@@ -1515,6 +1515,7 @@ router.get("/reservas/aprobaciones-titular", verifyToken, async (req, res) => {
          LEFT JOIN servicio s ON s.id = COALESCE(r.servicio_id, rec.servicio_id)
          LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
         WHERE a.titular_usuario_id = ? AND a.decision = 'PENDIENTE' AND er.nombre = ?
+          AND (a.vence_en IS NULL OR a.vence_en > NOW())
         ORDER BY a.fecha_solicitud DESC LIMIT 100`, [cabecera.id, ESTADO_PENDIENTE_TITULAR]);
     // La tarjeta muestra quiénes viajan: el aviso le pide al titular que los revise.
     const personas = await obtenerPersonasSolicitudes(db, reservas.map((reserva) => reserva.id));
@@ -1537,9 +1538,18 @@ router.put("/reserva/:id/aprobacion-titular", verifyToken, async (req, res) => {
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
     const reserva = await decidirSolicitudTitular(connection, { reservaId, actorId: cabecera.id, accion: req.body.accion });
+    if (reserva.vencida) {
+      // Venció el plazo: la baja queda firme y se le explica al titular.
+      await connection.commit();
+      emitirInvalidacionDisponibilidad(req, reserva, "RESERVA_RESPUESTA_TITULAR");
+      return res.status(409).json({
+        message: "Venció el plazo para responder: la solicitud se dio de baja y se liberó el lugar.",
+        codigo: "APROBACION_TITULAR_VENCIDA",
+      });
+    }
     if (req.body.accion === "APROBAR") {
       await notificarStaffTurismo(connection, cabecera.departamental_id, "RESERVA_TITULAR_APROBADA",
-        `Reserva #${reservaId} aprobada por el titular`, "El titular aprobó la solicitud de su familiar. Ya está disponible para gestión administrativa.",
+        `Reserva T-${reservaId} aprobada por el titular`, "El titular aprobó la solicitud de su familiar. Ya está disponible para gestión administrativa.",
         { reserva_id: reservaId, estado: reserva.estado }, cabecera.id);
     }
     await connection.commit();
@@ -10133,7 +10143,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
           await notificarAdministradoresTurismo(
             connection,
             "RESERVA_PARA_APROBAR",
-            `Reserva #${reservaId} verificada`,
+            `Reserva T-${reservaId} verificada`,
             "La departamental creó y verificó la reserva. Ya está disponible para aprobación administrativa.",
             { reserva_id: reservaId, estado: ESTADO_VERIFICADA },
             cabecera.id
@@ -10152,7 +10162,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
             estado: estadoRespuesta,
             politica: politicaAceptada,
             tipo: "RESERVA_CREADA_POR_TURISMO",
-            titulo: `Nueva reserva de turismo #${reservaId}`,
+            titulo: `Nueva reserva de turismo T-${reservaId}`,
           });
         }
         let numeroParcelaAsignada = null;
@@ -10533,7 +10543,7 @@ router.post("/convenios-hoteleros/:id/reservas", verifyToken, async (req, res) =
         estado: "Solicitud convenio",
         politica: politicaAceptada,
         tipo: "CONVENIO_CREADO_POR_TURISMO",
-        titulo: `Nueva solicitud de convenio #${reservaId}`,
+        titulo: `Nueva solicitud de convenio T-${reservaId}`,
         tipoAlta: "CONVENIO",
       });
     }
@@ -11874,7 +11884,7 @@ router.post("/reserva/:id/observaciones", verifyToken, async (req, res) => {
         connection,
         reserva.usuario_id,
         "RESERVA_OBSERVACION",
-        `Nuevo mensaje en tu reserva #${reservaId}`,
+        `Nuevo mensaje en tu reserva T-${reservaId}`,
         resumenMensaje,
         payload
       );
@@ -11883,7 +11893,7 @@ router.post("/reserva/:id/observaciones", verifyToken, async (req, res) => {
       connection,
       reserva.usuario_departamental_id,
       "RESERVA_OBSERVACION",
-      `Nuevo mensaje en la reserva #${reservaId}`,
+      `Nuevo mensaje en la reserva T-${reservaId}`,
       resumenMensaje,
       payload,
       cabecera.id
@@ -12512,7 +12522,7 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
       await crearNotificacion(connection, {
         usuarioId: reservaActual.usuario_id,
         tipo: `RESERVA_${transicion.accion}`,
-        titulo: `Reserva #${reservaId}: ${transicion.estadoDestino}`,
+        titulo: `Reserva T-${reservaId}: ${transicion.estadoDestino}`,
         mensaje: mensajes[transicion.estadoDestino],
         payload: { reserva_id: reservaId, estado: transicion.estadoDestino },
         categoria: "estados",
@@ -12522,7 +12532,7 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
         connection,
         reservaActual.usuario_departamental_id,
         "RESERVA_CANCELADA_AFILIADO",
-        `Reserva #${reservaId} cancelada por el afiliado`,
+        `Reserva T-${reservaId} cancelada por el afiliado`,
         textoAvisoCancelacionAfiliadoStaff(cancelacion),
         { reserva_id: reservaId, estado: transicion.estadoDestino },
         cabecera.id
@@ -12532,7 +12542,7 @@ router.put("/reserva/:id/estado", verifyToken, async (req, res) => {
       await notificarAdministradoresTurismo(
         connection,
         "RESERVA_PARA_APROBAR",
-        `Reserva #${reservaId} verificada`,
+        `Reserva T-${reservaId} verificada`,
         "Turismo verificó la reserva. Ya está disponible para aprobación administrativa.",
         { reserva_id: reservaId, estado: ESTADO_VERIFICADA },
         cabecera.id
