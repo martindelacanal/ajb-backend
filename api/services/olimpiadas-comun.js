@@ -9,7 +9,7 @@
 const jwt = require("jsonwebtoken");
 const { crearNotificacion } = require("./notificaciones");
 const crypto = require("crypto");
-const multer = require("multer");
+const multer = require("../security/multipart");
 const sharp = require("sharp");
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");

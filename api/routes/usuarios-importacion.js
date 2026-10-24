@@ -1,7 +1,7 @@
 "use strict";
 
 const express = require("express");
-const multer = require("multer");
+const multer = require("../security/multipart");
 const jwt = require("jsonwebtoken");
 const mysqlConnection = require("../connection/connection");
 const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");

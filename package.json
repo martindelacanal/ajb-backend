@@ -67,15 +67,28 @@
   "author": "",
   "license": "ISC",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.23.4 <23"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.193.0",
     "@aws-sdk/s3-request-presigner": "^3.193.0",
+    "@jimp/core": "1.6.1",
+    "@jimp/js-bmp": "1.6.1",
+    "@jimp/js-gif": "1.6.1",
+    "@jimp/js-jpeg": "1.6.1",
+    "@jimp/js-png": "1.6.1",
+    "@jimp/js-tiff": "1.6.1",
+    "@jimp/plugin-blur": "1.6.1",
+    "@jimp/plugin-color": "1.6.1",
+    "@jimp/plugin-flip": "1.6.1",
+    "@jimp/plugin-resize": "1.6.1",
+    "@jimp/plugin-rotate": "1.6.1",
+    "@jimp/utils": "1.6.1",
     "@simplewebauthn/server": "^13.3.3",
     "archiver": "^7.0.1",
     "asn1js": "^3.0.6",
     "bcryptjs": "^2.4.3",
+    "body-parser": "^1.20.9",
     "cors": "^2.8.5",
     "csv-parser": "^3.0.0",
     "csv-writer": "^1.6.0",
@@ -83,13 +96,12 @@
     "exceljs": "4.4.0",
     "express": "^4.22.3",
     "fast-csv": "^5.0.0",
-    "jimp": "^1.6.1",
     "jsonwebtoken": "^9.0.0",
     "moment": "^2.31.0",
-    "multer": "^1.4.5-lts.1",
+    "multer": "^2.5.0",
     "mysql": "^2.18.1",
     "mysql2": "^3.3.3",
-    "nodemailer": "^10.1.2",
+    "nodemailer": "^10.2.1",
     "pdfkit": "^0.20.2",
     "pkijs": "^3.4.1",
     "sharp": "^0.35.5",
@@ -98,6 +110,24 @@
   "overrides": {
     "exceljs": {
       "uuid": "11.1.1"
+    },
+    "@jimp/types": {
+      "zod": "4.6.7"
+    },
+    "@jimp/plugin-color": {
+      "zod": "4.6.7"
+    },
+    "@jimp/plugin-flip": {
+      "zod": "4.6.7"
+    },
+    "@jimp/plugin-resize": {
+      "zod": "4.6.7"
+    },
+    "@jimp/plugin-rotate": {
+      "zod": "4.6.7"
+    },
+    "@jimp/plugin-crop": {
+      "zod": "4.6.7"
     }
   }
 }

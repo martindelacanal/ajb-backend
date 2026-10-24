@@ -14,7 +14,7 @@
  * comparar contra las 8 orientaciones hace la detección inmune a rotaciones y espejos
  * sin depender de una canonización inestable.
  */
-const { Jimp, ResizeStrategy, intToRGBA } = require("jimp");
+const { Jimp, ResizeStrategy, intToRGBA } = require("./jimp-hash");
 
 const TAMANIO_NORMALIZADO = 128; // miniatura cuadrada de trabajo
 const GRILLA = 16; // 16x16 comparaciones -> 256 bits -> 64 caracteres hex

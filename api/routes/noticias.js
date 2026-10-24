@@ -3,7 +3,7 @@ const router = express.Router();
 const mysqlConnection = require("../connection/connection");
 const jwt = require("jsonwebtoken");
 const { verificarTokenConAutorizacionActual } = require("../security/autorizacion-sesion");
-const multer = require("multer");
+const multer = require("../security/multipart");
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const {

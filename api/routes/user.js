@@ -24,7 +24,7 @@ const {
   servicioVisibleParaActor,
 } = require("../services/turismo-catalogo");
 
-const multer = require("multer");
+const multer = require("../security/multipart");
 
 const moment = require("moment"); // para formatear fechas
 const {

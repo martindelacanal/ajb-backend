@@ -17,7 +17,7 @@
 const crypto = require("crypto");
 const express = require("express");
 const jwt = require("jsonwebtoken");
-const multer = require("multer");
+const multer = require("../security/multipart");
 const {
   S3Client,
   PutObjectCommand,
