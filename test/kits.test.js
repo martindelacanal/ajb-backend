@@ -147,6 +147,26 @@ test("estados: afiliado no aprueba ni entrega; rechazo requiere explicación; en
   assert.throws(() => kits.validarTransicion(staff, "ENTREGADA", "PENDIENTE", null), { statusCode: 409 });
 });
 
+test("el aviso de cambio de estado lleva a la inscripción K-… y lo dice con su código", async () => {
+  const row = { id: 61, usuario_id: 19, departamental_id: 4, estado: "PENDIENTE", campania_titulo: "Kits 2027", nombre_beneficiario: "Sofía Pérez" };
+  const db = dbCon([[row], {}, {}, { affectedRows: 1, insertId: 7 }]);
+  assert.deepEqual(await kits.cambiarEstado(db, staff, 61, { estado: "APROBADA" }), { id: 61, estado: "APROBADA" });
+  const aviso = db.calls.find((c) => /^\s*INSERT INTO notificacion/.test(c.sql));
+  assert.ok(aviso, "Debe crear la notificación");
+  const [usuarioId, tipo, titulo, mensaje, payload] = aviso.params;
+  assert.equal(usuarioId, 19);
+  assert.equal(tipo, "KIT_ESTADO");
+  assert.equal(titulo, "Tu kit K-61: Aprobada");
+  assert.equal(mensaje, "Kits 2027 (Sofía Pérez). Tocá este aviso para ver tu inscripción.");
+  assert.doesNotMatch(mensaje, /Mis gestiones/);
+  assert.deepEqual(JSON.parse(payload), { inscripcion_id: 61, url: "/departamental/kits/inscripcion/61" });
+
+  // Con la observación de la departamental, va la observación (sin duplicar el punto).
+  assert.equal(kits.textosAvisoEstadoKit(row, "RECHAZADA", "Falta la constancia.").mensaje, "Kits 2027 (Sofía Pérez). Falta la constancia.");
+  assert.equal(kits.textosAvisoEstadoKit(row, "RECHAZADA", "Falta la constancia").mensaje, "Kits 2027 (Sofía Pérez). Falta la constancia.");
+  assert.equal(kits.textosAvisoEstadoKit(row, "RECHAZADA", "¿Podés traerla?").mensaje, "Kits 2027 (Sofía Pérez). ¿Podés traerla?");
+});
+
 test("migración check no escribe; apply usa CREATE IF NOT EXISTS y grants precisos", async () => {
   const names = ["kit_campania", "kit_opcion", "kit_inscripcion", "kit_inscripcion_historial"].map((nombre) => ({ nombre }));
   const check = dbCon([names]);

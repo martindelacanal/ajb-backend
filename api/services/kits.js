@@ -233,16 +233,28 @@ function validarTransicion(actor, actual, siguiente, observacion) {
   if (actor.rol === "afiliado" && (siguiente !== "CANCELADA" || !["PENDIENTE", "APROBADA"].includes(actual))) throw error("Solo podés cancelar una inscripción pendiente o aprobada", 403);
   if (siguiente === "RECHAZADA" && !observacion) throw error("Indicá el motivo del rechazo para que el afiliado pueda consultarlo");
 }
+/** Título y mensaje del aviso al afiliado cuando la departamental cambia el estado de su kit. */
+function textosAvisoEstadoKit(row, estado, observacion) {
+  const codigo = `K-${row.id}`;
+  const nombre = ESTADOS.find((e) => e.codigo === estado)?.nombre || estado;
+  const nota = String(observacion || "").trim();
+  const cierre = nota ? (/[.!?…]$/.test(nota) ? nota : `${nota}.`) : "Tocá este aviso para ver tu inscripción.";
+  return {
+    titulo: `Tu kit ${codigo}: ${nombre}`,
+    mensaje: `${row.campania_titulo}${row.nombre_beneficiario ? ` (${row.nombre_beneficiario})` : ""}. ${cierre}`,
+  };
+}
 async function cambiarEstado(db, actor, id, body) {
   const row = await buscarInscripcion(db, actor, id, true);
   const observacion = texto(body.observacion_estado, 3000);
   validarTransicion(actor, row.estado, body.estado, observacion);
   await db.query("UPDATE kit_inscripcion SET estado = ?, observacion_estado = ?, resuelto_por = ? WHERE id = ?", [body.estado, observacion, actor.id, row.id]);
   await db.query("INSERT INTO kit_inscripcion_historial (inscripcion_id, estado, observacion, usuario_id) VALUES (?, ?, ?, ?)", [row.id, body.estado, observacion, actor.id]);
-  if (actor.rol !== "afiliado") await crearNotificacion(db, { usuarioId: row.usuario_id, tipo: "KIT_ESTADO", titulo: `Tu kit: ${ESTADOS.find((e) => e.codigo === body.estado).nombre}`,
-    mensaje: `${row.campania_titulo}. ${observacion || "Podés consultar el detalle en Mis gestiones."}`, payload: { inscripcion_id: row.id, url: "/mis-gestiones?tipo=kit" } });
+  // El aviso lleva a la inscripción K-… (su ficha de seguimiento), no a la lista de Mis gestiones.
+  if (actor.rol !== "afiliado") await crearNotificacion(db, { usuarioId: row.usuario_id, tipo: "KIT_ESTADO", ...textosAvisoEstadoKit(row, body.estado, observacion),
+    payload: { inscripcion_id: row.id, url: `/departamental/kits/inscripcion/${row.id}` } });
   return { id: row.id, estado: body.estado };
 }
 module.exports = { ESTADOS, TRANSICIONES, STAFF, error, fecha, hoyArgentina, periodoCampania, exigirStaff, exigirPropietario, exigirAfiliado,
   normalizarCampania, validarArchivo, normalizarInscripcion, validarTransicion, listarCampanias, detalleCampania, guardarCampania,
-  inscribir, listarInscripciones, buscarInscripcion, detalleInscripcion, cambiarEstado };
+  inscribir, listarInscripciones, buscarInscripcion, detalleInscripcion, cambiarEstado, textosAvisoEstadoKit };

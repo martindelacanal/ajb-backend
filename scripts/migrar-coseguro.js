@@ -29,7 +29,8 @@ const ESTADOS = [
   [7, "Aprobado por servicios sociales", null, "#D1FAE5", "#047857", 7],
   [8, "Exportado para liquidar", "Pendiente de acreditación", "#F3F4F6", "#4B5563", 8],
   [9, "Pendiente de acreditación", null, "#E2E8F0", "#475569", 9],
-  [10, "Liquidado", null, "#E5E7EB", "#374151", 10],
+  // Verde: es el final feliz (antes gris; ver scripts/colorear-coseguro-liquidado.js)
+  [10, "Liquidado", null, "#D1FAE5", "#047857", 10],
 ];
 
 // Plan de cuentas 631 (Excel del cliente). tipo: RUBRO (agrupador), CUENTA (código imputable = C.I.C.),

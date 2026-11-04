@@ -72,6 +72,7 @@ const {
   obtenerEstadoRecursoTrasLiberacion,
   obtenerEstadoRecursoTrasRechazo,
   validarAdjudicacionSorteo,
+  validarBajaInscripcionSorteo,
   validarRespuestaAdjudicacion,
 } = require("../services/sorteos-vigencia");
 const {
@@ -846,6 +847,21 @@ router.get("/new/token", verifyToken, async (req, res) => {
   }
 });
 
+// Foto de la credencial como data URI (base64 desde S3): la usan el carnet y la
+// página pública de verificación. Sin foto o si S3 falla, null (se ve la genérica).
+async function fotoCredencialDataUri(fotoArchivo) {
+  if (!fotoArchivo) return null;
+  try {
+    const fotoObject = await getObjectBufferFromS3(fotoArchivo);
+    return fotoObject?.buffer
+      ? `data:${fotoObject.contentType};base64,${fotoObject.buffer.toString("base64")}`
+      : null;
+  } catch (readError) {
+    console.error("Error leyendo foto desde S3:", readError);
+    return null;
+  }
+}
+
 router.get("/credencial-digital", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
@@ -916,18 +932,7 @@ router.get("/credencial-digital", verifyToken, async (req, res) => {
 
         // Si tiene foto, prepararla para envío (como base64)
         if (usuario.foto_archivo) {
-          try {
-            const fotoObject = await getObjectBufferFromS3(usuario.foto_archivo);
-            if (fotoObject?.buffer) {
-              const fotoBase64 = fotoObject.buffer.toString("base64");
-              usuario.foto_data = `data:${fotoObject.contentType};base64,${fotoBase64}`;
-            } else {
-              usuario.foto_data = null;
-            }
-          } catch (readError) {
-            console.error("Error leyendo foto desde S3:", readError);
-            usuario.foto_data = null;
-          }
+          usuario.foto_data = await fotoCredencialDataUri(usuario.foto_archivo);
         }
 
         res.status(200).json(usuario);
@@ -960,15 +965,21 @@ router.get("/credencial-digital/verificacion/:hash", async (req, res) => {
     const [rows] = await mysqlConnection
       .promise()
       .query(
-        `SELECT 
+        `SELECT
           id,
           hash_credencial,
           DATE(fecha_hash_credencial) AS fecha_validez,
-          CURDATE() AS fecha_actual
-        FROM usuario 
+          CURDATE() AS fecha_actual,
+          nombre,
+          apellido,
+          documento,
+          foto_archivo
+        FROM usuario
         WHERE hash_credencial = ?`,
         [hash]
       );
+    // Con datos personales: que ningún intermediario guarde la respuesta
+    res.set("Cache-Control", "no-store");
 
     // Si no se encuentra el hash
     if (rows.length === 0) {
@@ -989,9 +1000,17 @@ router.get("/credencial-digital/verificacion/:hash", async (req, res) => {
       });
     }
 
+    // Sólo con el código vigente: quien escanea compara el nombre, la foto y el
+    // DNI con la persona que tiene adelante. Expirada o Inexistente nunca los llevan.
     return res.status(200).json({
       estado: "Vigente",
-      descripcion: "Credencial válida en la fecha actual"
+      descripcion: "Credencial válida en la fecha actual",
+      titular: {
+        nombre: usuario.nombre || "",
+        apellido: usuario.apellido || "",
+        dni: usuario.documento != null ? String(usuario.documento) : null,
+        foto_data: await fotoCredencialDataUri(usuario.foto_archivo),
+      },
     });
 
   } catch (error) {
@@ -2881,7 +2900,112 @@ router.get("/sorteos/inscripcion-activa", verifyToken, async (req, res) => {
     if (esErrorTemporadaAltaNoMigrada(error)) {
       return res.status(200).json({ activa: false, inscripcion: null });
     }
-    res.status(500).json("Error al obtener inscripcion activa");
+    res.status(500).json("Error al obtener la inscripción activa");
+  }
+});
+
+// La persona afiliada se da de baja de su inscripción a un sorteo antes de que se
+// sortee (si no, sólo puede tener una y no hay forma de cambiarla). Queda
+// «Cancelada» (id 13), como las demás bajas del afiliado. No libera ninguna unidad:
+// la inscripción no tiene recurso hasta la adjudicación.
+router.put("/sorteos/inscripciones/:id/cancelar", verifyToken, async (req, res) => {
+  let connection;
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (cabecera.rol !== "afiliado" || !tieneAreaTurismo(cabecera)) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const reservaId = normalizarIdPositivo(req.params.id);
+    if (!reservaId) {
+      return res.status(400).json({ message: "La inscripción no es válida", codigo: "ID_INVALIDO" });
+    }
+
+    connection = await mysqlConnection.promise().getConnection();
+    await connection.beginTransaction();
+    // Mismo candado que adjudicar y cerrar el sorteo: o se da de baja o se sortea.
+    const [inscripciones] = await connection.query(
+      `SELECT r.id, r.usuario_id, r.recurso_id, r.estado_reserva_id, er.nombre AS estado_nombre,
+              s.estado AS sorteo_estado, s.nombre AS sorteo_nombre
+         FROM reserva r
+         LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
+         LEFT JOIN sorteo s ON s.id = r.sorteo_id
+        WHERE r.id = ? AND r.modalidad = 'SORTEO'
+        FOR UPDATE`,
+      [reservaId]
+    );
+    if (inscripciones.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ message: "No encontramos la inscripción al sorteo", codigo: "INSCRIPCION_NO_ENCONTRADA" });
+    }
+    const inscripcion = inscripciones[0];
+    const [adjudicaciones] = await connection.query(
+      "SELECT id FROM sorteo_adjudicacion_respuesta WHERE reserva_id = ? LIMIT 1 FOR UPDATE",
+      [reservaId]
+    );
+    const error = validarBajaInscripcionSorteo({
+      esPropietario: Number(inscripcion.usuario_id) === Number(cabecera.id),
+      recursoId: inscripcion.recurso_id,
+      tieneAdjudicacion: adjudicaciones.length > 0,
+      estadoReserva: inscripcion.estado_nombre,
+      estadoSorteo: inscripcion.sorteo_estado,
+    });
+    if (error) {
+      await connection.rollback();
+      const status = error.codigo === "INSCRIPCION_AJENA" ? 403 : 409;
+      return res.status(status).json({ message: error.mensaje, codigo: error.codigo });
+    }
+
+    const [actualizacion] = await connection.query(
+      `UPDATE reserva SET estado_reserva_id = ?, fecha_modificacion = NOW()
+        WHERE id = ? AND estado_reserva_id = ?`,
+      [ESTADO_RESERVA_CANCELADA_ID, reservaId, inscripcion.estado_reserva_id]
+    );
+    if (actualizacion.affectedRows !== 1) {
+      throw crearErrorNegocio("La inscripción cambió de estado. Volvé a cargarla.", 409, "RESERVA_MODIFICADA");
+    }
+    await registrarHistorialReserva(
+      connection,
+      reservaId,
+      "UPDATE",
+      cabecera.id,
+      req,
+      [{ campo: "estado_reserva_id", valorAnterior: inscripcion.estado_reserva_id, valorNuevo: ESTADO_RESERVA_CANCELADA_ID }],
+      "Baja de la inscripción al sorteo pedida por la persona afiliada"
+    );
+    // Si esperaba al titular, ya no tiene nada que aprobar.
+    await connection.query(
+      "UPDATE reserva_aprobacion_titular SET decision = 'CANCELADA', fecha_respuesta = NOW() WHERE reserva_id = ? AND decision = 'PENDIENTE'",
+      [reservaId]
+    );
+    if (inscripcion.estado_nombre === ESTADO_PENDIENTE_TITULAR) {
+      await connection.query(
+        `UPDATE notificacion SET leida = 1, fecha_lectura = COALESCE(fecha_lectura, NOW())
+          WHERE tipo = 'RESERVA_APROBACION_TITULAR'
+            AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.reserva_id')) = ?`,
+        [String(reservaId)]
+      );
+    }
+
+    await connection.commit();
+    res.status(200).json({
+      id: reservaId,
+      estado: ESTADO_CANCELADA,
+      message: `Te diste de baja del sorteo${inscripcion.sorteo_nombre ? ` «${inscripcion.sorteo_nombre}»` : ""}. Ya podés anotarte en otro.`,
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    registrarErrorRuta(error);
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+    }
+    res.status(500).json("Error al dar de baja la inscripción al sorteo");
+  } finally {
+    if (connection) {
+      connection.release();
+    }
   }
 });
 
@@ -3265,7 +3389,7 @@ router.get("/sorteos/adjudicaciones/pendiente", verifyToken, async (req, res) =>
     if (esErrorTemporadaAltaNoMigrada(error)) {
       return res.status(200).json({ pendiente: false, adjudicacion: null });
     }
-    res.status(500).json("Error al obtener adjudicacion pendiente");
+    res.status(500).json("Error al obtener la adjudicación pendiente");
   }
 });
 
@@ -3293,12 +3417,12 @@ router.put("/sorteos/adjudicaciones/:id/aceptar", verifyToken, async (req, res) 
 
     if (!adjudicacion) {
       await connection.rollback();
-      return res.status(404).json("Adjudicacion no encontrada");
+      return res.status(404).json("Adjudicación no encontrada");
     }
 
     if (adjudicacion.estado !== "PENDIENTE") {
       await connection.rollback();
-      return res.status(409).json("La adjudicacion ya fue respondida");
+      return res.status(409).json("La adjudicación ya fue respondida");
     }
 
     const errorVigencia = validarRespuestaAdjudicacion({
@@ -3375,7 +3499,7 @@ router.put("/sorteos/adjudicaciones/:id/rechazar", verifyToken, async (req, res)
     }
 
     if (req.body?.confirmacion !== true) {
-      return res.status(400).json("Debe confirmar el rechazo del premio");
+      return res.status(400).json("Confirmá que querés rechazar el premio");
     }
 
     connection = await mysqlConnection.promise().getConnection();
@@ -3389,12 +3513,12 @@ router.put("/sorteos/adjudicaciones/:id/rechazar", verifyToken, async (req, res)
 
     if (!adjudicacion) {
       await connection.rollback();
-      return res.status(404).json("Adjudicacion no encontrada");
+      return res.status(404).json("Adjudicación no encontrada");
     }
 
     if (adjudicacion.estado !== "PENDIENTE") {
       await connection.rollback();
-      return res.status(409).json("La adjudicacion ya fue respondida");
+      return res.status(409).json("La adjudicación ya fue respondida");
     }
 
     const errorVigencia = validarRespuestaAdjudicacion({
@@ -4525,7 +4649,7 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
     if (inscripcionExistente) {
       await connection.rollback();
       return res.status(409).json({
-        message: "Ya tenes una inscripcion activa a un sorteo. Solo podes tener una a la vez.",
+        message: "Ya tenés una inscripción activa a un sorteo y sólo podés tener una a la vez. Si querés cambiarla, date de baja desde Turismo.",
         codigo: "INSCRIPCION_SORTEO_ACTIVA",
         inscripcion: inscripcionExistente
       });
@@ -4671,7 +4795,7 @@ router.post("/sorteos/:id/inscripciones", verifyToken, async (req, res) => {
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
     }
-    res.status(500).json("Error al crear inscripcion al sorteo");
+    res.status(500).json("Error al crear la inscripción al sorteo");
   } finally {
     if (connection) {
       connection.release();
@@ -8802,13 +8926,13 @@ async function obtenerBloqueConRecursos(connection, bloqueFechaId, { forUpdate =
 
 function validarBloqueInscripcionAbierta(bloque) {
   if (bloque.estado !== "ACTIVO") {
-    throw crearErrorNegocio("El bloque no esta activo", 409);
+    throw crearErrorNegocio("El bloque no está activo", 409);
   }
   if (bloque.modalidad !== MODALIDAD_SORTEO) {
     throw crearErrorNegocio("El bloque indicado no corresponde a un sorteo", 400);
   }
   if (bloque.sorteo_estado !== "ACTIVO") {
-    throw crearErrorNegocio("El sorteo no esta activo", 409);
+    throw crearErrorNegocio("El sorteo no está activo", 409);
   }
 
   const hoy = obtenerFechaCivilHoyArgentina();
@@ -8816,7 +8940,7 @@ function validarBloqueInscripcionAbierta(bloque) {
   const fin = formatearFechaSQL(bloque.fecha_fin_inscripcion);
 
   if (!inicio || !fin || inicio > fin || hoy < inicio || hoy > fin) {
-    throw crearErrorNegocio("El periodo de inscripcion al sorteo no esta vigente", 409);
+    throw crearErrorNegocio("El período de inscripción al sorteo no está vigente", 409);
   }
   if (!validarRangoReservaTemporal(bloque.fecha_inicio, bloque.fecha_fin, { hoy }).valido) {
     throw crearErrorNegocio("El bloque del sorteo ya no admite cotizaciones ni inscripciones", 409);
@@ -14353,6 +14477,8 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         -- Total neto guardado: incluye adicionales y descuentos. NULL indica
         -- falta de cotización; 0 es una reserva bonificada (también por salud).
         r.precio_total AS importe,
+        -- Sólo coseguro tiene importes estimados (columna del UNION en todas las ramas)
+        0 AS importe_es_estimado,
         NULL AS comprobante,
         NULL AS beneficiario,
         NULL AS proveedor,
@@ -14384,6 +14510,9 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         NULL AS fecha_inicio,
         NULL AS fecha_fin,
         COALESCE(cs.importe_autorizado, cs.importe_estimado, cs.importe) AS importe,
+        -- Sin importe autorizado, el que se muestra es el estimado (o el del comprobante):
+        -- el front lo marca con «≈» para que no se lea como un monto firme.
+        CASE WHEN cs.importe_autorizado IS NULL THEN 1 ELSE 0 END AS importe_es_estimado,
         CONCAT(COALESCE(CONCAT(cs.comprobante_pto_venta, '-'), ''), cs.comprobante_numero) AS comprobante,
         CASE WHEN cs.familiar_usuario_id IS NOT NULL THEN CONCAT(fam.nombre, ' ', fam.apellido) ELSE NULL END AS beneficiario,
         cs.emisor_nombre AS proveedor,
@@ -14412,6 +14541,7 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         NULL AS fecha_inicio,
         NULL AS fecha_fin,
         NULL AS importe,
+        0 AS importe_es_estimado,
         NULL AS comprobante,
         NULL AS beneficiario,
         NULL AS proveedor,
@@ -14444,6 +14574,7 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         DATE_FORMAT(b.fecha_vigencia_desde, '%d/%m/%Y') AS fecha_inicio,
         DATE_FORMAT(b.fecha_vigencia_hasta, '%d/%m/%Y') AS fecha_fin,
         NULL AS importe,
+        0 AS importe_es_estimado,
         NULL AS comprobante,
         NULL AS beneficiario,
         NULL AS proveedor,
@@ -14471,6 +14602,7 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         DATE_FORMAT(kc.entrega_desde, '%d/%m/%Y') AS fecha_inicio,
         DATE_FORMAT(kc.entrega_hasta, '%d/%m/%Y') AS fecha_fin,
         NULL AS importe,
+        0 AS importe_es_estimado,
         NULL AS comprobante,
         ki.nombre_beneficiario AS beneficiario,
         kd.nombre AS proveedor,
