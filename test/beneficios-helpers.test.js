@@ -185,3 +185,15 @@ test("normalizarListaIds y flags", () => {
   assert.equal(T.normalizarFlag("0", 1), 0);
   assert.equal(T.normalizarFlag("si", 1), null);
 });
+
+test("debeAvisarCancelacionEntidad: sólo si la entidad se enteró del alta y tiene casilla", () => {
+  const casilla = "entidad@ejemplo.com";
+  assert.equal(T.debeAvisarCancelacionEntidad({ email_aviso_inscripcion: casilla, aviso_entidad_estado: "ENVIADO" }), true);
+  assert.equal(T.debeAvisarCancelacionEntidad({ email_aviso_inscripcion: casilla, aviso_entidad_estado: "RESUELTO" }), true);
+  // Nunca supo del alta (falló el aviso) o el beneficio no avisa a nadie
+  assert.equal(T.debeAvisarCancelacionEntidad({ email_aviso_inscripcion: casilla, aviso_entidad_estado: "ERROR" }), false);
+  assert.equal(T.debeAvisarCancelacionEntidad({ email_aviso_inscripcion: casilla, aviso_entidad_estado: "NO_APLICA" }), false);
+  assert.equal(T.debeAvisarCancelacionEntidad({ email_aviso_inscripcion: "  ", aviso_entidad_estado: "ENVIADO" }), false);
+  assert.equal(T.debeAvisarCancelacionEntidad({ email_aviso_inscripcion: null, aviso_entidad_estado: "ENVIADO" }), false);
+  assert.equal(T.debeAvisarCancelacionEntidad(), false);
+});
