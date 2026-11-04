@@ -45,7 +45,7 @@ function validarAdjudicacionSorteo({
   if (!fechaActual || !finInscripcion || !inicioBloque) {
     return crearResultadoInvalido(
       "FECHAS_SORTEO_INVALIDAS",
-      "Las fechas del sorteo o del bloque no son validas"
+      "Las fechas del sorteo o del bloque no son válidas"
     );
   }
 
@@ -84,17 +84,63 @@ function validarRespuestaAdjudicacion({
   if (!fechaActual || !inicioBloque) {
     return crearResultadoInvalido(
       "FECHAS_SORTEO_INVALIDAS",
-      "Las fechas del sorteo o del bloque no son validas"
+      "Las fechas del sorteo o del bloque no son válidas"
     );
   }
 
   if (fechaActual > inicioBloque) {
     return crearResultadoInvalido(
       "RESPUESTA_ADJUDICACION_VENCIDA",
-      "El plazo para responder la adjudicacion ya vencio"
+      "El plazo para responder la adjudicación ya venció"
     );
   }
 
+  return null;
+}
+
+// Estados de una inscripción que todavía espera el sorteo (sin unidad asignada).
+const ESTADOS_INSCRIPCION_SORTEO_EN_ESPERA = new Set([
+  "solicitud sorteo",
+  "pendiente_aprobacion_titular",
+]);
+
+/**
+ * Baja que pide la persona afiliada de su propia inscripción a un sorteo antes
+ * de que se sortee. La inscripción no ocupa ninguna unidad (recurso_id NULL),
+ * así que darla de baja no libera nada; una vez adjudicada se responde desde el
+ * aviso de adjudicación, y con el sorteo cerrado o cancelado ya no corre.
+ */
+function validarBajaInscripcionSorteo({
+  esPropietario,
+  recursoId,
+  tieneAdjudicacion,
+  estadoReserva,
+  estadoSorteo,
+}) {
+  if (!esPropietario) {
+    return crearResultadoInvalido(
+      "INSCRIPCION_AJENA",
+      "Sólo podés darte de baja de una inscripción tuya"
+    );
+  }
+  if (recursoId || tieneAdjudicacion) {
+    return crearResultadoInvalido(
+      "INSCRIPCION_ADJUDICADA",
+      "Tu inscripción ya salió sorteada: respondé desde el aviso de adjudicación"
+    );
+  }
+  if (!ESTADOS_INSCRIPCION_SORTEO_EN_ESPERA.has(normalizarEstado(estadoReserva))) {
+    return crearResultadoInvalido(
+      "INSCRIPCION_NO_ACTIVA",
+      "La inscripción ya no está activa"
+    );
+  }
+  if (estadoSorteo !== "ACTIVO") {
+    return crearResultadoInvalido(
+      "SORTEO_YA_REALIZADO",
+      "El sorteo ya se realizó o se canceló: la inscripción ya no se puede dar de baja"
+    );
+  }
   return null;
 }
 
@@ -127,5 +173,6 @@ module.exports = {
   obtenerEstadoRecursoTrasLiberacion,
   obtenerEstadoRecursoTrasRechazo,
   validarAdjudicacionSorteo,
+  validarBajaInscripcionSorteo,
   validarRespuestaAdjudicacion,
 };

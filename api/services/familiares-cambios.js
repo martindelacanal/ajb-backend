@@ -26,6 +26,11 @@ const { crearNotificacion } = require("./notificaciones");
 // titular) y actualizarDatosUsuario aplica es_familiar / parentesco (historial
 // estricto y parentesco propagado a las reservas abiertas).
 //
+// La BAJA ("Pedir baja", POST /familiares/:id/baja) también: un pedido con
+// `habilitado: 'N'` sobre alguien que el afiliado cargó en su grupo. Al
+// aprobarlo se aplica la baja lógica del staff (habilitado = 'N' con
+// actualizarDatosUsuario); nunca se borra la fila.
+//
 // Cada pedido tiene una `version` (hash de datos_propuestos): quien resuelve
 // manda la que vio y, si el afiliado reemplazó el pedido mientras tanto, la
 // resolución responde 409 SOLICITUD_MODIFICADA en lugar de aplicar algo que el
@@ -66,8 +71,11 @@ const CAMPOS_SOLICITABLES = Object.freeze([
 ]);
 
 // Todo lo que puede viajar en un pedido: además, el vínculo con el grupo
-// familiar, que sólo llega por solicitarCambioVinculo (tiene reglas propias).
-const CAMPOS_PEDIDO = Object.freeze([...CAMPOS_SOLICITABLES, "es_familiar"]);
+// familiar, que sólo llega por solicitarCambioVinculo (tiene reglas propias), y
+// la baja (`habilitado: 'N'`), que sólo llega por solicitarBajaFamiliar: es la
+// misma baja lógica que hace el staff con «Cuenta habilitada» en la ficha (la
+// persona deja de figurar; no se borra nada).
+const CAMPOS_PEDIDO = Object.freeze([...CAMPOS_SOLICITABLES, "es_familiar", "habilitado"]);
 
 // Etiqueta para títulos de columna ("Antes → Después").
 const ETIQUETAS_CAMPOS = Object.freeze({
@@ -79,11 +87,17 @@ const ETIQUETAS_CAMPOS = Object.freeze({
   tipo_persona_id: "Tipo de persona",
   parentesco_id: "Parentesco",
   es_familiar: "Vínculo",
+  habilitado: "Baja",
 });
 
 const TEXTO_VINCULO = Object.freeze({
   S: "Grupo familiar",
   N: "Acompañante de viaje",
+});
+
+const TEXTO_HABILITADO = Object.freeze({
+  Y: "Activa",
+  N: "Dada de baja",
 });
 
 const ESTADOS_SOLICITUD = Object.freeze(["PENDIENTE", "APROBADA", "RECHAZADA", "CANCELADA"]);
@@ -190,6 +204,17 @@ function vinculoNormalizado(valor) {
   return valor === "S" ? "S" : "N";
 }
 
+// Sólo 'N' es baja: NULL (datos viejos) cuenta como activa, igual que en
+// POST /tabla/acompaniantes (COALESCE(u.habilitado, 'Y') = 'Y').
+function habilitadoNormalizado(valor) {
+  return valor === "N" ? "N" : "Y";
+}
+
+/** El pedido es una baja ("Pedir baja"): propone habilitado = 'N'. */
+function esPedidoBaja(propuestos) {
+  return tieneClave(propuestos, "habilitado") && habilitadoNormalizado(propuestos.habilitado) === "N";
+}
+
 function tieneCuentaPropia(persona) {
   return (persona?.password !== null && persona?.password !== undefined) ||
     Boolean(persona?.email && String(persona.email).trim());
@@ -248,6 +273,8 @@ function valorGuardado(campo, persona) {
       return idPositivo(valor);
     case "es_familiar":
       return vinculoNormalizado(valor);
+    case "habilitado":
+      return habilitadoNormalizado(valor);
     default:
       return textoONull(valor);
   }
@@ -255,6 +282,7 @@ function valorGuardado(campo, persona) {
 
 function mismoValor(campo, a, b) {
   if (campo === "es_familiar") return vinculoNormalizado(a) === vinculoNormalizado(b);
+  if (campo === "habilitado") return habilitadoNormalizado(a) === habilitadoNormalizado(b);
   const aVacio = a === null || a === undefined;
   const bVacio = b === null || b === undefined;
   if (aVacio || bVacio) return aVacio && bVacio;
@@ -456,6 +484,7 @@ function textoValor(campo, valor, catalogos = {}) {
   if (campo === "tipo_persona_id") return catalogos.tipos?.get(Number(valor)) || `#${valor}`;
   if (campo === "parentesco_id") return catalogos.parentescos?.get(Number(valor)) || `#${valor}`;
   if (campo === "es_familiar") return TEXTO_VINCULO[vinculoNormalizado(valor)];
+  if (campo === "habilitado") return TEXTO_HABILITADO[habilitadoNormalizado(valor)];
   return String(valor);
 }
 
@@ -523,6 +552,8 @@ function valorCanonico(campo, valor) {
       return fechaGuardada(valor) || String(valor);
     case "es_familiar":
       return vinculoNormalizado(valor);
+    case "habilitado":
+      return habilitadoNormalizado(valor);
     default:
       return String(valor);
   }
@@ -553,6 +584,8 @@ function presentarPendiente(fila) {
     campos: camposDeSolicitud(propuestos),
     datos_anteriores: filtrarSolicitables(parsearJson(fila.datos_anteriores)),
     datos_propuestos: propuestos,
+    // "Pedir baja" en revisión: la tabla del afiliado lo dice y ofrece retirarlo.
+    baja: esPedidoBaja(propuestos),
     version: versionSolicitud(propuestos),
   };
 }
@@ -806,9 +839,16 @@ function textosAvisoSolicitado({
   departamentalAnteriorNombre = null,
 }) {
   const vinculo = tieneClave(propuestos, "es_familiar") ? vinculoNormalizado(propuestos.es_familiar) : null;
+  const baja = esPedidoBaja(propuestos);
   let titulo;
   if (motivo === "REASIGNADO") {
-    titulo = `Te pasaron el pedido ${codigo}: cambios de ${nombrePersona} (de ${nombreSolicitante})`;
+    titulo = baja
+      ? `Te pasaron el pedido ${codigo}: baja de ${nombrePersona} (de ${nombreSolicitante})`
+      : `Te pasaron el pedido ${codigo}: cambios de ${nombrePersona} (de ${nombreSolicitante})`;
+  } else if (baja) {
+    titulo = motivo === "ACTUALIZADO"
+      ? `${nombreSolicitante} cambió su pedido: ahora pide dar de baja a ${nombrePersona}`
+      : `${nombreSolicitante} pidió dar de baja a ${nombrePersona}`;
   } else if (vinculo === "S") {
     titulo = motivo === "ACTUALIZADO"
       ? `${nombreSolicitante} actualizó su pedido para sumar a ${nombrePersona} a su grupo familiar`
@@ -827,13 +867,18 @@ function textosAvisoSolicitado({
   const otros = vinculo
     ? cambios.filter((cambio) => cambio.campo !== "es_familiar" && !(vinculo === "S" && cambio.campo === "parentesco_id"))
     : cambios;
-  const resumen = [
-    vinculo ? (cambioVinculo?.descripcion || (vinculo === "S" ? "Pasa a integrar el grupo familiar" : "Deja el grupo familiar")) : null,
-    resumenCambiosTexto(otros) || null,
-  ].filter(Boolean).join("; ");
-  const cierre = motivo === "REASIGNADO"
-    ? `El titular cambió de departamental${departamentalAnteriorNombre ? ` (antes ${departamentalAnteriorNombre})` : ""}: ahora lo resolvés vos desde Cambios de familiares.`
-    : "Los datos no cambian hasta que los apruebes o rechaces desde Cambios de familiares.";
+  const resumen = baja
+    ? "Pide la baja: deja de figurar entre sus familiares y acompañantes"
+    : [
+      vinculo ? (cambioVinculo?.descripcion || (vinculo === "S" ? "Pasa a integrar el grupo familiar" : "Deja el grupo familiar")) : null,
+      resumenCambiosTexto(otros) || null,
+    ].filter(Boolean).join("; ");
+  let cierre = "Los datos no cambian hasta que los apruebes o rechaces desde Cambios de familiares.";
+  if (motivo === "REASIGNADO") {
+    cierre = `El titular cambió de departamental${departamentalAnteriorNombre ? ` (antes ${departamentalAnteriorNombre})` : ""}: ahora lo resolvés vos desde Cambios de familiares.`;
+  } else if (baja) {
+    cierre = "Sigue en su lista hasta que lo apruebes o rechaces desde Cambios de familiares.";
+  }
   const mensaje = `${codigo}${resumen ? ` · ${cerrarFrase(resumen)}` : "."} ${cierre}`;
   return { titulo, mensaje };
 }
@@ -1055,7 +1100,22 @@ async function registrarPedido(connection, { actor, actorId, objetivoId, constru
       );
     }
 
-    const previos = pendiente ? filtrarSolicitables(parsearJson(pendiente.datos_propuestos)) : {};
+    const previosGuardados = pendiente ? filtrarSolicitables(parsearJson(pendiente.datos_propuestos)) : {};
+    const pideBaja = esPedidoBaja(normalizados);
+    // Una baja en revisión no se mezcla con correcciones: o se da de baja a la
+    // persona o se corrigen sus datos. Pedir la baja reemplaza lo pedido antes
+    // (corregir a alguien que se da de baja no tiene sentido).
+    if (esPedidoBaja(previosGuardados)) {
+      throw crearErrorUsuario(
+        pideBaja
+          ? `Ya pediste la baja de ${nombreCompleto(persona)}: está en revisión de tu departamental.`
+          : `Pediste la baja de ${nombreCompleto(persona)} y está en revisión: mientras tanto no se pueden pedir otros cambios. Si ya no querés darla de baja, retirá ese pedido.`,
+        409,
+        "BAJA_PENDIENTE",
+        { solicitud_id: Number(pendiente.id) }
+      );
+    }
+    const previos = pideBaja ? {} : previosGuardados;
     ({ anteriores, propuestos, campos } = calcularDiferencias(persona, { ...previos, ...normalizados }));
     if (campos.length === 0) {
       const propio = typeof mensajeSinCambios === "function" ? mensajeSinCambios(persona, pendiente) : null;
@@ -1146,6 +1206,7 @@ async function registrarPedido(connection, { actor, actorId, objetivoId, constru
     datos_propuestos: propuestos,
     cambios,
     cambio_vinculo: cambioVinculo,
+    baja: esPedidoBaja(propuestos),
     version: versionSolicitud(propuestos),
     notificados,
   };
@@ -1227,6 +1288,63 @@ async function solicitarCambioVinculo(connection, { actor, personaId, esFamiliar
         ? `${nombreCompleto(persona)} ya integra tu grupo familiar con ese parentesco: no hay nada para cambiar.`
         : `${nombreCompleto(persona)} ya figura como acompañante de viaje: no hay nada para cambiar.`;
     },
+  });
+}
+
+/**
+ * ¿Se puede dar de baja a esta persona a pedido de `solicitanteId`? null si se
+ * puede; si no, {codigo:'BAJA_INVALIDA', mensaje (para el staff), mensajeAfiliado}.
+ *  - Sólo a quien está atado a su grupo (usuario_familiar_id = el afiliado):
+ *    un acompañante que sólo compartió reservas puede figurar también en las
+ *    listas de otros afiliados, y la baja lo sacaría de todas.
+ *  - Nunca a quien entra a MiAJB con su propia cuenta (password) ni a otro
+ *    afiliado: la baja le cortaría el ingreso. Para que deje el grupo familiar
+ *    está «Quitar del grupo familiar».
+ */
+function problemaBaja(persona, { solicitanteId, nombreSolicitante = "el afiliado" }) {
+  const nombrePersona = nombreCompleto(persona);
+  if (idPositivo(persona?.usuario_familiar_id) !== solicitanteId) {
+    return {
+      codigo: "BAJA_INVALIDA",
+      mensaje: `${nombrePersona} ya no está atada al grupo de ${nombreSolicitante}: la baja pedida no se puede aplicar.`,
+      mensajeAfiliado: `Sólo podés pedir la baja de personas que cargaste en tu grupo. Para ${nombrePersona}, comunicate con tu departamental.`,
+    };
+  }
+  const tieneIngreso = (persona?.password !== null && persona?.password !== undefined) || nombreRol(persona) === "afiliado";
+  if (tieneIngreso) {
+    return {
+      codigo: "BAJA_INVALIDA",
+      mensaje: `${nombrePersona} tiene cuenta propia en MiAJB: la baja le cortaría el ingreso. Si corresponde, gestionala desde su ficha.`,
+      mensajeAfiliado: `${nombrePersona} tiene su propia cuenta en MiAJB, así que no se puede dar de baja desde acá. Si ya no integra tu grupo familiar, entrá a «Editar» y pedí «Quitar del grupo familiar»; para lo demás, comunicate con tu departamental.`,
+    };
+  }
+  return null;
+}
+
+/**
+ * "Pedir baja": el afiliado pide dar de baja a un familiar o acompañante que
+ * cargó él (p. ej. un duplicado cargado por error). Queda como pedido
+ * PENDIENTE con `habilitado: 'N'` que aprueba la departamental; al aprobarse,
+ * actualizarDatosUsuario aplica la misma baja lógica del staff (habilitado =
+ * 'N', con historial): la persona deja de figurar en su lista y como familiar a
+ * cargo del coseguro, pero no se borra (reservas y reintegros conservan sus
+ * datos). Reemplaza cualquier otro pedido suyo en revisión sobre esa persona.
+ * Corre dentro de la transacción del llamador. Misma respuesta que
+ * solicitarCambioFamiliar.
+ */
+async function solicitarBajaFamiliar(connection, { actor, personaId } = {}) {
+  const { actorId, objetivoId } = validarActorAfiliado(actor, personaId);
+  await exigirPersonaEnUniverso(connection, actorId, objetivoId);
+  return registrarPedido(connection, {
+    actor,
+    actorId,
+    objetivoId,
+    construirDatos: (persona) => {
+      const problema = problemaBaja(persona, { solicitanteId: actorId });
+      if (problema) throw crearErrorUsuario(problema.mensajeAfiliado, 403, problema.codigo);
+      return { habilitado: "N" };
+    },
+    mensajeSinCambios: (persona) => `${nombreCompleto(persona)} ya está dada de baja: no hay nada para cambiar.`,
   });
 }
 
@@ -1332,6 +1450,8 @@ function presentarSolicitud(fila, catalogos = {}) {
     cambios: presentarCambios(anteriores, propuestos, catalogos),
     // Frase legible del cambio de vínculo (null si el pedido no lo toca).
     cambio_vinculo: presentarCambioVinculo(propuestos, catalogos, { parentescoActual: fila.persona_parentesco ?? null }),
+    // "Pedir baja": el afiliado pide dar de baja a la persona (habilitado = 'N').
+    baja: esPedidoBaja(propuestos),
     // Se manda al resolver: si el afiliado reemplazó el pedido, 409 SOLICITUD_MODIFICADA.
     version: versionSolicitud(propuestos),
   };
@@ -1502,6 +1622,14 @@ async function advertenciasSolicitud(db, { actor, solicitud, persona, anteriores
   const hoy = obtenerFechaCivilArgentina();
   const campos = camposDeSolicitud(propuestos);
   const nombrePersona = nombreCompleto(persona);
+  const baja = esPedidoBaja(propuestos);
+
+  if (baja) {
+    const solicitanteId = idPositivo(solicitud.solicitante_usuario_id);
+    const nombreSolicitante = nombreCompleto({ id: solicitanteId, nombre: solicitud.solicitante_nombre, apellido: solicitud.solicitante_apellido });
+    const problema = problemaBaja(persona, { solicitanteId, nombreSolicitante });
+    if (problema) advertencias.push({ codigo: problema.codigo, campo: "habilitado", mensaje: problema.mensaje });
+  }
 
   const modificados = camposModificadosDesdePedido(persona, anteriores, campos);
   if (modificados.length) {
@@ -1581,7 +1709,8 @@ async function advertenciasSolicitud(db, { actor, solicitud, persona, anteriores
   }
 
   const tieneCuenta = persona.password !== null && persona.password !== undefined && nombreRol(persona) !== "invitado";
-  if (tieneCuenta) {
+  // En una baja, la cuenta propia ya la avisa BAJA_INVALIDA (no se puede aprobar).
+  if (tieneCuenta && !baja) {
     advertencias.push({
       codigo: "CUENTA_PROPIA",
       mensaje: `${nombrePersona} tiene cuenta propia en MiAJB: el pedido lo hizo otra persona de su grupo.`,
@@ -1607,6 +1736,12 @@ async function advertenciasSolicitud(db, { actor, solicitud, persona, anteriores
   );
   if (reservas.length) {
     const afectaTarifa = tieneClave(distintos, "tipo_persona_id") || tieneClave(distintos, "fecha_nacimiento");
+    let mensajeReservas = afectaTarifa
+      ? `${nombrePersona} viaja en ${reservas.length} reserva(s) abierta(s). Cambiar el tipo de persona o la fecha de nacimiento no recalcula la tarifa ya cotizada: revisalas después de aprobar.`
+      : `${nombrePersona} viaja en ${reservas.length} reserva(s) abierta(s); van a mostrar los datos nuevos.`;
+    if (baja) {
+      mensajeReservas = `${nombrePersona} viaja en ${reservas.length} reserva(s) abierta(s): la baja no la saca de esas reservas. Revisalas con el afiliado antes de aprobar.`;
+    }
     advertencias.push({
       codigo: "RESERVAS_ABIERTAS",
       reservas: reservas.map((fila) => ({
@@ -1615,9 +1750,7 @@ async function advertenciasSolicitud(db, { actor, solicitud, persona, anteriores
         fecha_inicio: fechaGuardada(fila.fecha_inicio),
         fecha_fin: fechaGuardada(fila.fecha_fin),
       })),
-      mensaje: afectaTarifa
-        ? `${nombrePersona} viaja en ${reservas.length} reserva(s) abierta(s). Cambiar el tipo de persona o la fecha de nacimiento no recalcula la tarifa ya cotizada: revisalas después de aprobar.`
-        : `${nombrePersona} viaja en ${reservas.length} reserva(s) abierta(s); van a mostrar los datos nuevos.`,
+      mensaje: mensajeReservas,
     });
   }
 
@@ -1632,7 +1765,9 @@ async function advertenciasSolicitud(db, { actor, solicitud, persona, anteriores
     advertencias.push({
       codigo: "COSEGURO_EN_CURSO",
       solicitudes: coseguro.map((fila) => Number(fila.id)),
-      mensaje: `${nombrePersona} tiene ${coseguro.length} solicitud(es) de reintegro en curso (${coseguro.map((fila) => `C-${fila.id}`).join(", ")}); van a tomar los datos nuevos.`,
+      mensaje: baja
+        ? `${nombrePersona} tiene ${coseguro.length} solicitud(es) de reintegro en curso (${coseguro.map((fila) => `C-${fila.id}`).join(", ")}): siguen su trámite; la baja sólo impide pedir reintegros nuevos a su nombre.`
+        : `${nombrePersona} tiene ${coseguro.length} solicitud(es) de reintegro en curso (${coseguro.map((fila) => `C-${fila.id}`).join(", ")}); van a tomar los datos nuevos.`,
     });
   }
 
@@ -1764,11 +1899,22 @@ async function aplicarVinculoAprobado(connection, {
 }
 
 /** Título y mensaje del aviso al afiliado cuando se resuelve su pedido. */
-function textosAvisoResolucion({ aprobada, quien, codigo, nombrePersona, camposTexto, motivo, cambioVinculo, otrosCampos }) {
+function textosAvisoResolucion({ aprobada, quien, codigo, nombrePersona, camposTexto, motivo, cambioVinculo, otrosCampos, baja = false }) {
   const vinculo = cambioVinculo?.es_familiar || null;
   const tambien = otrosCampos.length
     ? ` También ${aprobada ? "quedó vigente" : "se pedía"} el cambio de ${listaLegible(otrosCampos.map(etiquetaEnFrase))}.`
     : "";
+  if (baja) {
+    return aprobada
+      ? {
+        titulo: `${nombrePersona} ya no figura en tu grupo`,
+        mensaje: `${quien} aprobó tu pedido ${codigo}: dimos de baja a ${nombrePersona}. Ya no aparece en Familiares y acompañantes.`,
+      }
+      : {
+        titulo: `No se aprobó la baja de ${nombrePersona}`,
+        mensaje: `${quien} rechazó el pedido ${codigo}. Motivo: ${cerrarFrase(motivo)} ${nombrePersona} sigue en tu lista.`,
+      };
+  }
   if (aprobada) {
     if (vinculo === "S") {
       return {
@@ -1920,6 +2066,7 @@ async function resolverSolicitud(connection, {
   const staff = await datosUsuario(connection, actorId);
   const nombrePersona = nombreCompleto(persona);
   const codigo = codigoSolicitud(id);
+  const baja = esPedidoBaja(propuestos);
   const camposTexto = listaLegible(campos.map(etiquetaEnFrase)) || "sus datos";
   // Campos que no son el vínculo (ni el parentesco con el que se suma al grupo).
   const otrosCampos = cambioVinculo
@@ -1947,6 +2094,7 @@ async function resolverSolicitud(connection, {
       motivo: motivoTexto,
       cambioVinculo,
       otrosCampos,
+      baja,
     });
     await insertarNotificacion(connection, solicitanteId, TIPOS_NOTIFICACION_FAMILIAR.RECHAZADO, aviso.titulo, aviso.mensaje, payload);
     return {
@@ -1957,6 +2105,7 @@ async function resolverSolicitud(connection, {
       campos,
       cambios: cambiosLegibles,
       cambio_vinculo: cambioVinculo,
+      baja,
       resultado: null,
     };
   }
@@ -1992,6 +2141,12 @@ async function resolverSolicitud(connection, {
       nombreSolicitante: nombreCompleto(solicitante),
     });
     if (problema) throw crearErrorUsuario(problema.mensaje, 409, problema.codigo, { campo: "es_familiar" });
+  }
+  // La baja se revalida con la ficha de hoy: pudo haber sacado cuenta propia o
+  // cambiado de grupo desde que se pidió.
+  if (baja && tieneClave(distintos, "habilitado")) {
+    const problema = problemaBaja(persona, { solicitanteId, nombreSolicitante: nombreCompleto(solicitante) });
+    if (problema) throw crearErrorUsuario(problema.mensaje, 409, problema.codigo, { campo: "habilitado" });
   }
 
   let observaciones = `Solicitado por ${nombreCompleto(solicitante)} (${codigo}), aprobado por ${nombreCompleto(staff)}`;
@@ -2045,6 +2200,7 @@ async function resolverSolicitud(connection, {
     motivo: motivoTexto,
     cambioVinculo,
     otrosCampos,
+    baja,
   });
   await insertarNotificacion(connection, solicitanteId, TIPOS_NOTIFICACION_FAMILIAR.APROBADO, aviso.titulo, aviso.mensaje, payload);
   return {
@@ -2055,6 +2211,7 @@ async function resolverSolicitud(connection, {
     campos,
     cambios: cambiosLegibles,
     cambio_vinculo: cambioVinculo,
+    baja,
     resultado,
   };
 }
@@ -2125,6 +2282,7 @@ module.exports = {
   cuerpoErrorCambio,
   departamentalActualDelTitular,
   detalleSolicitud,
+  esPedidoBaja,
   extraerDatosSolicitados,
   listarSolicitudes,
   listaLegible,
@@ -2136,11 +2294,13 @@ module.exports = {
   personaEnUniversoAfiliado,
   presentarCambioVinculo,
   presentarCambios,
+  problemaBaja,
   problemaVinculo,
   puedeGestionarSolicitud,
   puedeVerSolicitud,
   reasignarSolicitudesPendientesDelTitular,
   resolverSolicitud,
+  solicitarBajaFamiliar,
   solicitarCambioFamiliar,
   solicitarCambioVinculo,
   validarReglasSolicitud,

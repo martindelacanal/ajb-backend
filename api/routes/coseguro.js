@@ -1038,7 +1038,8 @@ async function buscarDuplicadosComprobante(db, { emisor_cuit, comprobante_pto_ve
   }
   const [rows] = await db.query(
     `SELECT s.id, s.usuario_id, s.estado_id, s.fecha_creacion, s.importe,
-            CONCAT(u.apellido, ', ', u.nombre) AS afiliado, e.nombre AS estado
+            CONCAT(u.apellido, ', ', u.nombre) AS afiliado, e.nombre AS estado,
+            COALESCE(e.nombre_afiliado, e.nombre) AS estado_afiliado
      FROM coseguro_solicitud s
      INNER JOIN usuario u ON u.id = s.usuario_id
      INNER JOIN coseguro_estado e ON e.id = s.estado_id
@@ -1064,7 +1065,7 @@ async function buscarDuplicadosArchivo(db, hashes, excluirSolicitudId, phashSets
     }
     const [rows] = await db.query(
       `SELECT a.id AS archivo_id, a.sha256, a.tipo_adjunto, s.id AS solicitud_id, s.usuario_id, e.nombre AS estado,
-              CONCAT(u.apellido, ', ', u.nombre) AS afiliado
+              COALESCE(e.nombre_afiliado, e.nombre) AS estado_afiliado, CONCAT(u.apellido, ', ', u.nombre) AS afiliado
        FROM coseguro_archivo a
        INNER JOIN coseguro_solicitud s ON s.id = a.solicitud_id
        INNER JOIN usuario u ON u.id = s.usuario_id
@@ -1088,7 +1089,7 @@ async function buscarDuplicadosArchivo(db, hashes, excluirSolicitudId, phashSets
     }
     const [rows] = await db.query(
       `SELECT a.id AS archivo_id, a.sha256, a.phash, a.tipo_adjunto, s.id AS solicitud_id, s.usuario_id, e.nombre AS estado,
-              CONCAT(u.apellido, ', ', u.nombre) AS afiliado
+              COALESCE(e.nombre_afiliado, e.nombre) AS estado_afiliado, CONCAT(u.apellido, ', ', u.nombre) AS afiliado
        FROM coseguro_archivo a
        INNER JOIN coseguro_solicitud s ON s.id = a.solicitud_id
        INNER JOIN usuario u ON u.id = s.usuario_id
@@ -1108,6 +1109,32 @@ async function buscarDuplicadosArchivo(db, hashes, excluirSolicitudId, phashSets
   }
 
   return Array.from(resultados.values()).slice(0, 10);
+}
+
+// Lo que ve el AFILIADO de un posible duplicado: que existe y, sólo si la otra
+// solicitud es suya, su código C- y su estado. Nunca el nombre, el importe ni el
+// código de la solicitud de otra persona. El staff sigue recibiendo las filas enteras.
+// Las propias van primero: el formulario muestra la primera.
+function duplicadosVisiblesAfiliado(cabecera, filas, campoId) {
+  const propias = filas
+    .filter((fila) => idsPositivosIguales(fila.usuario_id, cabecera.id))
+    .map((fila) => ({ [campoId]: fila[campoId], estado: fila.estado_afiliado || fila.estado, propia: true }));
+  const hayAjenas = filas.some((fila) => !idsPositivosIguales(fila.usuario_id, cabecera.id));
+  return hayAjenas ? [...propias, { [campoId]: null, estado: null, propia: false }] : propias;
+}
+
+// Mensaje del 409 por comprobante o archivo repetido cuando quien carga es el afiliado.
+function mensajeDuplicadoAfiliado(cabecera, filas, tipo, detalle = "") {
+  const esComprobante = tipo === "comprobante";
+  const [primero] = duplicadosVisiblesAfiliado(cabecera, filas, esComprobante ? "id" : "solicitud_id");
+  if (primero?.propia) {
+    return esComprobante
+      ? `Ya presentaste ese número de comprobante en tu solicitud C-${primero.id} (${primero.estado}). No se puede cargar dos veces el mismo comprobante.`
+      : `Uno de los archivos adjuntos ya lo presentaste en tu solicitud C-${primero.solicitud_id}${detalle}. No se puede subir el mismo comprobante dos veces.`;
+  }
+  return esComprobante
+    ? "Ese número de comprobante ya fue presentado en otra solicitud de reintegro. No se puede cargar dos veces el mismo comprobante: si creés que es un error, comunicate con tu departamental."
+    : `Uno de los archivos adjuntos ya fue presentado en otra solicitud de reintegro${detalle}. No se puede subir el mismo comprobante dos veces: si creés que es un error, comunicate con tu departamental.`;
 }
 
 // Calcula sha256 + hash perceptual de los archivos subidos y detecta si el usuario
@@ -1664,12 +1691,13 @@ router.post("/coseguro/verificar-duplicados", verifyToken, async (req, res) => {
     });
     const hashes = Array.isArray(req.body.hashes) ? req.body.hashes.filter((h) => /^[a-f0-9]{64}$/i.test(String(h))) : [];
     const archivos = await buscarDuplicadosArchivo(db, hashes, excluirId);
+    const esAfiliado = cabecera.rol === "afiliado";
 
     res.status(200).json({
       duplicado_comprobante: comprobantes.length > 0,
       duplicado_archivo: archivos.length > 0,
-      comprobantes,
-      archivos,
+      comprobantes: esAfiliado ? duplicadosVisiblesAfiliado(cabecera, comprobantes, "id") : comprobantes,
+      archivos: esAfiliado ? duplicadosVisiblesAfiliado(cabecera, archivos, "solicitud_id") : archivos,
     });
   } catch (error) {
     registrarErrorRuta(error);
@@ -1696,13 +1724,25 @@ router.post("/coseguro/verificar-archivo", verifyToken, manejarUploadCoseguro, a
     const duplicados = await buscarDuplicadosArchivo(db, [sha], excluirId, phashes ? [phashes] : []);
 
     if (duplicados.length === 0) return res.status(200).json({ duplicado: false });
+    if (cabecera.rol === "afiliado") {
+      // Sin datos de la solicitud de otra persona (ver duplicadosVisiblesAfiliado)
+      const propia = duplicados.find((fila) => idsPositivosIguales(fila.usuario_id, cabecera.id));
+      const visible = propia || duplicados[0];
+      return res.status(200).json({
+        duplicado: true,
+        coincidencia: visible.coincidencia,
+        solicitud_id: propia ? propia.solicitud_id : null,
+        estado: propia ? propia.estado_afiliado || propia.estado : null,
+        mismo_afiliado: Boolean(propia),
+      });
+    }
     const dup = duplicados[0];
     res.status(200).json({
       duplicado: true,
       coincidencia: dup.coincidencia, // 'archivo' (idéntico) | 'imagen' (rotada/espejada/recomprimida)
       solicitud_id: dup.solicitud_id,
       estado: dup.estado,
-      mismo_afiliado: cabecera.rol !== "afiliado" || idsPositivosIguales(dup.usuario_id, cabecera.id),
+      mismo_afiliado: true,
     });
   } catch (error) {
     registrarErrorRuta(error);
@@ -1962,8 +2002,9 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
       usuario_id: usuarioId,
     });
     if (duplicadosComprobante.length > 0 && !forzarDuplicado) {
-      return res.status(409).json(
-        `Ya existe una solicitud con ese número de comprobante (solicitud C-${duplicadosComprobante[0].id} de ${duplicadosComprobante[0].afiliado}, estado: ${duplicadosComprobante[0].estado}). No se puede cargar dos veces el mismo comprobante.`
+      return res.status(409).json(cabecera.rol === "afiliado"
+        ? mensajeDuplicadoAfiliado(cabecera, duplicadosComprobante, "comprobante")
+        : `Ya existe una solicitud con ese número de comprobante (solicitud C-${duplicadosComprobante[0].id} de ${duplicadosComprobante[0].afiliado}, estado: ${duplicadosComprobante[0].estado}). No se puede cargar dos veces el mismo comprobante.`
       );
     }
 
@@ -1980,8 +2021,9 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
     if (duplicadosArchivo.length > 0 && !forzarDuplicado) {
       const dup = duplicadosArchivo[0];
       const detalle = dup.coincidencia === "imagen" ? " (la imagen coincide aunque esté rotada, espejada o recomprimida)" : "";
-      return res.status(409).json(
-        `Uno de los archivos adjuntos ya fue presentado en la solicitud C-${dup.solicitud_id} (${dup.afiliado})${detalle}. No se puede subir el mismo comprobante dos veces.`
+      return res.status(409).json(cabecera.rol === "afiliado"
+        ? mensajeDuplicadoAfiliado(cabecera, duplicadosArchivo, "archivo", detalle)
+        : `Uno de los archivos adjuntos ya fue presentado en la solicitud C-${dup.solicitud_id} (${dup.afiliado})${detalle}. No se puede subir el mismo comprobante dos veces.`
       );
     }
 
@@ -2046,15 +2088,17 @@ router.post("/coseguro/solicitudes", verifyToken, manejarUploadCoseguro, async (
     });
     if (duplicadosComprobanteFinales.length > 0 && !forzarDuplicado) {
       const duplicado = duplicadosComprobanteFinales[0];
-      throw crearErrorHttp(
-        `Ya existe una solicitud con ese número de comprobante (solicitud C-${duplicado.id}, estado: ${duplicado.estado}).`,
+      throw crearErrorHttp(cabecera.rol === "afiliado"
+        ? mensajeDuplicadoAfiliado(cabecera, duplicadosComprobanteFinales, "comprobante")
+        : `Ya existe una solicitud con ese número de comprobante (solicitud C-${duplicado.id}, estado: ${duplicado.estado}).`,
         409
       );
     }
     const duplicadosArchivoFinales = await buscarDuplicadosArchivo(connection, hashes, null, phashSets);
     if (duplicadosArchivoFinales.length > 0 && !forzarDuplicado) {
-      throw crearErrorHttp(
-        `Uno de los archivos adjuntos ya fue presentado en la solicitud C-${duplicadosArchivoFinales[0].solicitud_id}.`,
+      throw crearErrorHttp(cabecera.rol === "afiliado"
+        ? mensajeDuplicadoAfiliado(cabecera, duplicadosArchivoFinales, "archivo")
+        : `Uno de los archivos adjuntos ya fue presentado en la solicitud C-${duplicadosArchivoFinales[0].solicitud_id}.`,
         409
       );
     }
@@ -2779,8 +2823,9 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
       excluirId: solicitudId,
     });
     if (duplicadosComprobante.length > 0 && !forzarDuplicado) {
-      return res.status(409).json(
-        `Ya existe otra solicitud con ese número de comprobante (solicitud C-${duplicadosComprobante[0].id}, estado: ${duplicadosComprobante[0].estado}).`
+      return res.status(409).json(cabecera.rol === "afiliado"
+        ? mensajeDuplicadoAfiliado(cabecera, duplicadosComprobante, "comprobante")
+        : `Ya existe otra solicitud con ese número de comprobante (solicitud C-${duplicadosComprobante[0].id}, estado: ${duplicadosComprobante[0].estado}).`
       );
     }
     const preparacion = await prepararHashesArchivos(req.files);
@@ -2795,8 +2840,9 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
     if (duplicadosArchivo.length > 0 && !forzarDuplicado) {
       const dup = duplicadosArchivo[0];
       const detalle = dup.coincidencia === "imagen" ? " (la imagen coincide aunque esté rotada, espejada o recomprimida)" : "";
-      return res.status(409).json(
-        `Uno de los archivos adjuntos ya fue presentado en la solicitud C-${dup.solicitud_id}${detalle}.`
+      return res.status(409).json(cabecera.rol === "afiliado"
+        ? mensajeDuplicadoAfiliado(cabecera, duplicadosArchivo, "archivo", detalle)
+        : `Uno de los archivos adjuntos ya fue presentado en la solicitud C-${dup.solicitud_id}${detalle}.`
       );
     }
 
@@ -2867,8 +2913,9 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
       excluirId: solicitudId,
     });
     if (duplicadosComprobanteFinales.length > 0 && !forzarDuplicado) {
-      throw crearErrorHttp(
-        `Ya existe otra solicitud con ese número de comprobante (solicitud C-${duplicadosComprobanteFinales[0].id}).`,
+      throw crearErrorHttp(cabecera.rol === "afiliado"
+        ? mensajeDuplicadoAfiliado(cabecera, duplicadosComprobanteFinales, "comprobante")
+        : `Ya existe otra solicitud con ese número de comprobante (solicitud C-${duplicadosComprobanteFinales[0].id}).`,
         409
       );
     }
@@ -2879,8 +2926,9 @@ router.put("/coseguro/solicitudes/:id", verifyToken, manejarUploadCoseguro, asyn
       phashSetsNuevos
     );
     if (duplicadosArchivoFinales.length > 0 && !forzarDuplicado) {
-      throw crearErrorHttp(
-        `Uno de los archivos adjuntos ya fue presentado en la solicitud C-${duplicadosArchivoFinales[0].solicitud_id}.`,
+      throw crearErrorHttp(cabecera.rol === "afiliado"
+        ? mensajeDuplicadoAfiliado(cabecera, duplicadosArchivoFinales, "archivo")
+        : `Uno de los archivos adjuntos ya fue presentado en la solicitud C-${duplicadosArchivoFinales[0].solicitud_id}.`,
         409
       );
     }
@@ -4745,6 +4793,8 @@ router.__test = Object.freeze({
   parsearCamposCentral,
   transicionesDisponibles,
   completarConceptosSolicitudes,
+  duplicadosVisiblesAfiliado,
+  mensajeDuplicadoAfiliado,
   notificarCambioEstadoAfiliado,
   normalizarEnteroSeguro,
   normalizarFecha,

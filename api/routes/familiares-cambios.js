@@ -5,6 +5,7 @@
 //
 // Afiliado:
 //   POST   /familiares/:id/cambios          → crea (o reemplaza) el pedido PENDIENTE. 202 {pendiente:true, solicitud_id}
+//   POST   /familiares/:id/baja             → "Pedir baja": pedido PENDIENTE con habilitado 'N'. 202 {pendiente:true, baja:true}
 //   DELETE /familiares/cambios/:id          → retira su pedido PENDIENTE (→ CANCELADA)
 //   GET    /familiares/cambios/:id          → su pedido (sin advertencias)
 // Staff (admin y admin-central: todo; departamental: su departamental, mientras
@@ -32,6 +33,7 @@ const {
   extraerDatosSolicitados,
   listarSolicitudes,
   resolverSolicitud,
+  solicitarBajaFamiliar,
   solicitarCambioFamiliar,
 } = require("../services/familiares-cambios");
 
@@ -88,6 +90,13 @@ function mensajeSolicitudEnviada(resultado) {
   return `${base} Quedan en revisión hasta que los apruebe; mientras tanto se usan los datos actuales.`;
 }
 
+function mensajeBajaEnviada(resultado) {
+  const base = resultado.reemplazada
+    ? "Reemplazamos tu pedido de cambios por el de baja."
+    : "Le pedimos la baja a tu departamental.";
+  return `${base} Mientras la revisa, la persona sigue en tu lista; si te arrepentís, podés retirar el pedido.`;
+}
+
 // POST /familiares/:id/cambios — el afiliado pide cambiar datos de un familiar
 // o acompañante de su universo (el mismo de POST /tabla/acompaniantes).
 router.post("/familiares/:id(\\d+)/cambios", verifyToken, async (req, res) => {
@@ -109,6 +118,29 @@ router.post("/familiares/:id(\\d+)/cambios", verifyToken, async (req, res) => {
     });
   } catch (error) {
     return responderError(res, error, "No se pudo enviar el pedido de cambio");
+  }
+});
+
+// POST /familiares/:id/baja — el afiliado pide dar de baja a alguien que cargó
+// en su grupo. No se aplica acá: lo aprueba la departamental (Cambios de familiares).
+router.post("/familiares/:id(\\d+)/baja", verifyToken, async (req, res) => {
+  try {
+    const cabecera = cabeceraDe(req);
+    if (cabecera.rol !== "afiliado") {
+      return res.status(403).json({ success: false, message: "Sólo el afiliado puede pedir la baja de alguien de su grupo" });
+    }
+    const resultado = await enTransaccion((connection) => solicitarBajaFamiliar(connection, {
+      actor: cabecera,
+      personaId: req.params.id,
+    }));
+    return res.status(202).json({
+      success: true,
+      pendiente: true,
+      message: mensajeBajaEnviada(resultado),
+      ...resultado,
+    });
+  } catch (error) {
+    return responderError(res, error, "No se pudo enviar el pedido de baja");
   }
 });
 
@@ -149,11 +181,14 @@ router.post("/familiares/cambios/:id(\\d+)/resolucion", verifyToken, async (req,
       contexto: contextoDesdeRequest(req),
     }));
     const aprobada = resultado.estado === "APROBADA";
+    let mensaje = aprobada
+      ? "Cambio aprobado: los datos nuevos ya están vigentes y avisamos al afiliado"
+      : "Pedido rechazado: le avisamos al afiliado con el motivo";
+    if (aprobada && resultado.baja) mensaje = "Baja aprobada: la persona ya no figura en el grupo y avisamos al afiliado";
     return res.status(200).json({
       success: true,
-      message: aprobada
-        ? "Cambio aprobado: los datos nuevos ya están vigentes y avisamos al afiliado"
-        : "Pedido rechazado: le avisamos al afiliado con el motivo",
+      message: mensaje,
+      baja: Boolean(resultado.baja),
       solicitud_id: resultado.solicitud_id,
       codigo: resultado.codigo,
       estado: resultado.estado,
