@@ -1340,6 +1340,73 @@ async function procesarCorreosInscripcion(db, inscripcionId) {
   }
 }
 
+// La entidad se enteró de la inscripción (por correo, o el staff lo resolvió por otro
+// medio): sólo entonces se le avisa la baja. Con NO_APLICA no hay casilla de aviso y
+// con ERROR nunca supo del alta, así que un correo de baja la confundiría.
+const AVISOS_ENTIDAD_ENTERADA = new Set(["ENVIADO", "RESUELTO"]);
+
+function debeAvisarCancelacionEntidad({ email_aviso_inscripcion, aviso_entidad_estado } = {}) {
+  return Boolean(normalizarTexto(email_aviso_inscripcion)) && AVISOS_ENTIDAD_ENTERADA.has(aviso_entidad_estado);
+}
+
+// Correo a la entidad cuando el afiliado cancela: sólo lo necesario para identificarlo.
+function enviarCorreoCancelacionEntidad({ beneficio, afiliado }) {
+  return enviarCorreoPlantilla({
+    para: beneficio.email_aviso_inscripcion,
+    asunto: `Inscripción cancelada al beneficio "${beneficio.nombre}" — Mi AJB`,
+    titulo: "Inscripción cancelada",
+    previsualizacion: `${afiliado.apellido}, ${afiliado.nombre} canceló su inscripción al beneficio "${beneficio.nombre}"`,
+    saludo: "Hola",
+    parrafos: [
+      `Un afiliado / una afiliada de la Asociación Judicial Bonaerense canceló su inscripción al beneficio "${beneficio.nombre}".`,
+      "Ya no hace falta que se contacten por esta inscripción.",
+    ],
+    datos: [
+      { etiqueta: "Nombre", valor: afiliado.nombre || "—" },
+      { etiqueta: "Apellido", valor: afiliado.apellido || "—" },
+      { etiqueta: "DNI", valor: afiliado.documento || "—" },
+    ],
+    aviso: "Este correo se envió automáticamente desde Mi AJB por el convenio vigente con AJB. Ante dudas, respondé a este correo o contactá a la departamental correspondiente.",
+  });
+}
+
+/**
+ * Post-commit de una cancelación: avisa a la entidad (si corresponde) y deja el
+ * resultado en el historial. Si el correo falla, el equipo de la departamental y
+ * los superiores reciben una notificación para avisarle por otro medio. Nunca lanza.
+ */
+async function procesarAvisoCancelacionEntidad(db, inscripcionId) {
+  try {
+    const contexto = await obtenerInscripcionParaCorreo(db, inscripcionId);
+    if (!contexto) return;
+    const { beneficio, inscripcion, afiliado } = contexto;
+    if (!debeAvisarCancelacionEntidad({ ...beneficio, ...inscripcion })) return;
+
+    const resultado = await enviarCorreoCancelacionEntidad({ beneficio, afiliado });
+    const destino = beneficio.email_aviso_inscripcion;
+    const motivo = resultado.enviado ? null : describirMotivoCorreo(resultado).slice(0, 300);
+    await registrarHistorial(db, {
+      beneficio_id: beneficio.id,
+      inscripcion_id: inscripcion.id,
+      usuario_id: afiliado.id,
+      usuario_rol: "afiliado",
+      tipo_operacion: "AVISO",
+      observacion: resultado.enviado
+        ? `Aviso de cancelación enviado a la entidad (${destino}) por la inscripción B-${inscripcion.id}`
+        : `No se pudo avisar a la entidad (${destino}) la cancelación de la inscripción B-${inscripcion.id}: ${motivo}`,
+    });
+    if (!resultado.enviado) {
+      const payload = { beneficio_id: beneficio.id, inscripcion_id: inscripcion.id };
+      const titulo = `Falló el aviso de cancelación del beneficio "${beneficio.nombre}"`;
+      const mensaje = `${afiliado.apellido}, ${afiliado.nombre} canceló la inscripción B-${inscripcion.id}, pero no se pudo avisar a ${destino}: ${motivo}. Avisale a la entidad por otro medio.`;
+      await notificarUsuariosDepartamental(db, beneficio.departamental_id, "BENEFICIO_AVISO_ERROR", titulo, mensaje, payload, afiliado.id);
+      await notificarSuperiores(db, "BENEFICIO_AVISO_ERROR", titulo, mensaje, payload, afiliado.id);
+    }
+  } catch (error) {
+    registrarErrorRuta(error, "beneficios:aviso-cancelacion");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Consultas compartidas
 // ---------------------------------------------------------------------------
@@ -2038,7 +2105,7 @@ router.put("/beneficios/publicados/:id(\\d+)/inscripcion/cancelar", verifyToken,
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
     const [activas] = await connection.query(
-      `SELECT bi.id FROM beneficio_inscripcion bi
+      `SELECT bi.id, bi.aviso_entidad_estado FROM beneficio_inscripcion bi
        WHERE bi.usuario_id = ? AND bi.beneficio_id = ? AND bi.activa = 1 FOR UPDATE`,
       [usuarioId, beneficioId]
     );
@@ -2047,6 +2114,14 @@ router.put("/beneficios/publicados/:id(\\d+)/inscripcion/cancelar", verifyToken,
       return res.status(404).json("No tenés una inscripción activa en este beneficio");
     }
     const inscripcionId = activas[0].id;
+    const [[beneficioAviso = {}]] = await connection.query(
+      "SELECT email_aviso_inscripcion FROM beneficio WHERE id = ?",
+      [beneficioId]
+    );
+    const avisaEntidad = debeAvisarCancelacionEntidad({
+      email_aviso_inscripcion: beneficioAviso.email_aviso_inscripcion,
+      aviso_entidad_estado: activas[0].aviso_entidad_estado,
+    });
     await connection.query(
       "UPDATE beneficio_inscripcion SET estado_id = ? WHERE id = ?",
       [ESTADO_INSCRIPCION.CANCELADA, inscripcionId]
@@ -2060,7 +2135,15 @@ router.put("/beneficios/publicados/:id(\\d+)/inscripcion/cancelar", verifyToken,
       observacion: `Inscripción B-${inscripcionId} cancelada por el afiliado`,
     });
     await connection.commit();
-    res.status(200).json({ success: true, message: "Inscripción cancelada" });
+    connection.release();
+    connection = null;
+    res.status(200).json({
+      success: true,
+      message: avisaEntidad ? "Tu inscripción quedó cancelada. Le avisamos a la institución." : "Inscripción cancelada",
+      aviso_entidad: avisaEntidad,
+    });
+    // Post-respuesta: el afiliado no espera al servidor de correo (nunca lanza).
+    if (avisaEntidad) procesarAvisoCancelacionEntidad(mysqlConnection.promise(), inscripcionId);
   } catch (error) {
     if (connection) await connection.rollback();
     registrarErrorRuta(error);
@@ -3188,6 +3271,8 @@ router.__test = Object.freeze({
   extraerArchivosEditor,
   resumenHtml,
   describirMotivoCorreo,
+  debeAvisarCancelacionEntidad,
+  procesarAvisoCancelacionEntidad,
   esDepartamentalDuenia,
   puedeVerBeneficio,
   puedeVerDatosInternos,

@@ -856,20 +856,38 @@ router.get("/credencial-digital", verifyToken, async (req, res) => {
     ) {
       const userId = cabecera.id;
 
-      // Generar hash aleatorio de 50 caracteres
-      const hashCredencial = crypto.randomBytes(25).toString('hex'); // 25 bytes = 50 caracteres hex
-      const fechaActual = new Date();
-
-      // Actualizar el usuario con el nuevo hash y fecha
-      await mysqlConnection
+      // El código del QR vale por el día: si ya se generó uno hoy se reutiliza,
+      // así la credencial abierta en otro dispositivo (o una captura de hoy)
+      // sigue verificando. Recién al día siguiente se genera uno nuevo.
+      const [actuales] = await mysqlConnection
         .promise()
         .query(
-          `UPDATE usuario SET 
-            hash_credencial = ?, 
-            fecha_hash_credencial = ?
+          `SELECT hash_credencial, DATE(fecha_hash_credencial) = CURDATE() AS es_de_hoy
+          FROM usuario
           WHERE id = ?`,
-          [hashCredencial, fechaActual, userId]
+          [userId]
         );
+      const actual = actuales[0];
+      const reutilizarHash = Boolean(actual)
+        && Number(actual.es_de_hoy) === 1
+        && typeof actual.hash_credencial === 'string'
+        && actual.hash_credencial.length === 50;
+
+      if (!reutilizarHash) {
+        // Generar hash aleatorio de 50 caracteres
+        const hashCredencial = crypto.randomBytes(25).toString('hex'); // 25 bytes = 50 caracteres hex
+        const fechaActual = new Date();
+
+        await mysqlConnection
+          .promise()
+          .query(
+            `UPDATE usuario SET
+              hash_credencial = ?,
+              fecha_hash_credencial = ?
+            WHERE id = ?`,
+            [hashCredencial, fechaActual, userId]
+          );
+      }
 
       // Obtener los datos del usuario actualizados
       const [rows] = await mysqlConnection
@@ -1033,6 +1051,136 @@ router.get("/lugares", verifyToken, async (req, res) => {
     res.status(500).json("Error al obtener los lugares");
   }
 });
+
+// Rango de precio total estimado de un servicio para unas fechas y un grupo
+// (adultos/niños/bebés). Lo usan el catálogo con fechas (/servicios) y las
+// tarjetas de la búsqueda (/servicios/precios). null/null si las tarifas no
+// cubren todas las noches.
+async function estimarRangoPrecioServicio(db, servicio, criterios, cabecera) {
+  let precio_minimo = null;
+  let precio_maximo = null;
+  const { fecha_inicio, fecha_fin, adultos, ninos, bebes } = criterios;
+  const nochesSolicitud = obtenerNochesReserva(fecha_inicio, fecha_fin, 366);
+
+  if (servicio.modelo_tarifa === "PRECIO_UNICO") {
+    const [recursosPrecioUnico] = await db.query(
+      "SELECT id FROM recurso WHERE servicio_id = ? AND activo = 1 ORDER BY orden, id",
+      [servicio.id]
+    );
+    const totales = [];
+    for (const recursoPrecioUnico of recursosPrecioUnico) {
+      try {
+        const cotizacion = await calcularTarifaBaseReserva(db, {
+          recursoId: recursoPrecioUnico.id,
+          regimenId: null,
+          personas: [{ id: cabecera.id, usuario_id: cabecera.id }],
+          fechaInicio: fecha_inicio,
+          fechaFin: fecha_fin,
+          departamentalId: cabecera.departamental_id,
+        });
+        const total = decimalACentavos(cotizacion.total);
+        if (total !== null) totales.push(total);
+      } catch (error) {
+        if (!["TARIFA_INCOMPLETA", "TARIFA_AMBIGUA", "TARIFA_REGLA_INCOMPLETA"].includes(error?.codigo)) {
+          throw error;
+        }
+      }
+    }
+    if (totales.length) {
+      precio_minimo = centavosANumero(Math.min(...totales));
+      precio_maximo = centavosANumero(Math.max(...totales));
+    }
+  } else {
+
+  const preciosMinimosCentavos = [];
+  const preciosMaximosCentavos = [];
+  let estimacionCompleta = nochesSolicitud.length > 0;
+
+  // Procesar cada día del rango
+  for (const fechaString of nochesSolicitud) {
+
+    let precioMinimoDiaCentavos = 0;
+    let precioMaximoDiaCentavos = 0;
+    const acumularRangoTarifa = (filas, cantidad) => {
+      if (cantidad === 0) return true;
+      const minimo = decimalACentavos(filas?.[0]?.precio_min);
+      const maximo = decimalACentavos(filas?.[0]?.precio_max);
+      const subtotalMinimo = minimo === null ? null : minimo * cantidad;
+      const subtotalMaximo = maximo === null ? null : maximo * cantidad;
+      if (!Number.isSafeInteger(subtotalMinimo) || !Number.isSafeInteger(subtotalMaximo)) {
+        return false;
+      }
+      const nuevoMinimo = sumarCentavos(precioMinimoDiaCentavos, subtotalMinimo);
+      const nuevoMaximo = sumarCentavos(precioMaximoDiaCentavos, subtotalMaximo);
+      if (nuevoMinimo === null || nuevoMaximo === null) return false;
+      precioMinimoDiaCentavos = nuevoMinimo;
+      precioMaximoDiaCentavos = nuevoMaximo;
+      return true;
+    };
+
+    // Procesar adultos (18 años o más)
+    if (adultos > 0) {
+      const [tarifasAdultos] = await db.query(`
+SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
+FROM tarifa t
+INNER JOIN recurso r ON t.recurso_id = r.id
+WHERE r.servicio_id = ?
+AND (t.edad_maxima IS NULL OR t.edad_maxima >= 18)
+AND t.fecha_inicio <= ?
+AND t.fecha_fin >= ?
+AND t.eliminado = 0
+  `, [servicio.id, fechaString, fechaString]);
+
+      estimacionCompleta = acumularRangoTarifa(tarifasAdultos, adultos) && estimacionCompleta;
+    }
+
+    // Procesar niños (entre 2 y 5 años inclusivo)
+    if (ninos > 0) {
+      const [tarifasninos] = await db.query(`
+SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
+FROM tarifa t
+INNER JOIN recurso r ON t.recurso_id = r.id
+WHERE r.servicio_id = ?
+AND (t.edad_minima IS NULL OR t.edad_minima <= 17)
+AND (t.edad_maxima IS NULL OR t.edad_maxima >= 2)
+AND t.fecha_inicio <= ?
+AND t.fecha_fin >= ?
+AND t.eliminado = 0
+  `, [servicio.id, fechaString, fechaString]);
+
+      estimacionCompleta = acumularRangoTarifa(tarifasninos, ninos) && estimacionCompleta;
+    }
+
+    // Procesar bebés (menores de 2 años)
+    if (bebes > 0) {
+      const [tarifasBebes] = await db.query(`
+        SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
+        FROM tarifa t
+        INNER JOIN recurso r ON t.recurso_id = r.id
+        WHERE r.servicio_id = ?
+          AND (t.edad_maxima IS NULL OR t.edad_maxima < 2)
+          AND t.fecha_inicio <= ?
+          AND t.fecha_fin >= ?
+          AND t.eliminado = 0
+      `, [servicio.id, fechaString, fechaString]);
+
+      estimacionCompleta = acumularRangoTarifa(tarifasBebes, bebes) && estimacionCompleta;
+    }
+
+    preciosMinimosCentavos.push(precioMinimoDiaCentavos);
+    preciosMaximosCentavos.push(precioMaximoDiaCentavos);
+  }
+
+  // Sumar todos los días
+  const totalMinimoCentavos = sumarCentavos(...preciosMinimosCentavos);
+  const totalMaximoCentavos = sumarCentavos(...preciosMaximosCentavos);
+  if (estimacionCompleta && totalMinimoCentavos !== null && totalMaximoCentavos !== null) {
+    precio_minimo = centavosANumero(totalMinimoCentavos);
+    precio_maximo = centavosANumero(totalMaximoCentavos);
+  }
+  }
+  return { precio_minimo, precio_maximo };
+}
 
 router.get(["/servicios", "/departamental/servicios"], verifyToken, async (req, res) => {
   try {
@@ -1221,132 +1369,10 @@ router.get(["/servicios", "/departamental/servicios"], verifyToken, async (req, 
 
       // Agregar campo imagenes y precios a cada servicio
       const serviciosConImagenes = await Promise.all(servicios.map(async (servicio) => {
-        let precio_minimo = null;
-        let precio_maximo = null;
-
         // Calcular precios solo si se proporcionan las fechas y al menos una persona
-        if (criteriosDisponibilidad) {
-          const { fecha_inicio, fecha_fin, adultos, ninos, bebes } = criteriosDisponibilidad;
-          const nochesSolicitud = obtenerNochesReserva(fecha_inicio, fecha_fin, 366);
-
-          if (servicio.modelo_tarifa === "PRECIO_UNICO") {
-            const [recursosPrecioUnico] = await db.query(
-              "SELECT id FROM recurso WHERE servicio_id = ? AND activo = 1 ORDER BY orden, id",
-              [servicio.id]
-            );
-            const totales = [];
-            for (const recursoPrecioUnico of recursosPrecioUnico) {
-              try {
-                const cotizacion = await calcularTarifaBaseReserva(db, {
-                  recursoId: recursoPrecioUnico.id,
-                  regimenId: null,
-                  personas: [{ id: cabecera.id, usuario_id: cabecera.id }],
-                  fechaInicio: fecha_inicio,
-                  fechaFin: fecha_fin,
-                  departamentalId: cabecera.departamental_id,
-                });
-                const total = decimalACentavos(cotizacion.total);
-                if (total !== null) totales.push(total);
-              } catch (error) {
-                if (!["TARIFA_INCOMPLETA", "TARIFA_AMBIGUA", "TARIFA_REGLA_INCOMPLETA"].includes(error?.codigo)) {
-                  throw error;
-                }
-              }
-            }
-            if (totales.length) {
-              precio_minimo = centavosANumero(Math.min(...totales));
-              precio_maximo = centavosANumero(Math.max(...totales));
-            }
-          } else {
-
-          const preciosMinimosCentavos = [];
-          const preciosMaximosCentavos = [];
-          let estimacionCompleta = nochesSolicitud.length > 0;
-
-          // Procesar cada día del rango
-          for (const fechaString of nochesSolicitud) {
-
-            let precioMinimoDiaCentavos = 0;
-            let precioMaximoDiaCentavos = 0;
-            const acumularRangoTarifa = (filas, cantidad) => {
-              if (cantidad === 0) return true;
-              const minimo = decimalACentavos(filas?.[0]?.precio_min);
-              const maximo = decimalACentavos(filas?.[0]?.precio_max);
-              const subtotalMinimo = minimo === null ? null : minimo * cantidad;
-              const subtotalMaximo = maximo === null ? null : maximo * cantidad;
-              if (!Number.isSafeInteger(subtotalMinimo) || !Number.isSafeInteger(subtotalMaximo)) {
-                return false;
-              }
-              const nuevoMinimo = sumarCentavos(precioMinimoDiaCentavos, subtotalMinimo);
-              const nuevoMaximo = sumarCentavos(precioMaximoDiaCentavos, subtotalMaximo);
-              if (nuevoMinimo === null || nuevoMaximo === null) return false;
-              precioMinimoDiaCentavos = nuevoMinimo;
-              precioMaximoDiaCentavos = nuevoMaximo;
-              return true;
-            };
-
-            // Procesar adultos (18 años o más)
-            if (adultos > 0) {
-              const [tarifasAdultos] = await db.query(`
-      SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
-      FROM tarifa t
-      INNER JOIN recurso r ON t.recurso_id = r.id
-      WHERE r.servicio_id = ?
-        AND (t.edad_maxima IS NULL OR t.edad_maxima >= 18)
-        AND t.fecha_inicio <= ?
-        AND t.fecha_fin >= ?
-        AND t.eliminado = 0
-    `, [servicio.id, fechaString, fechaString]);
-
-              estimacionCompleta = acumularRangoTarifa(tarifasAdultos, adultos) && estimacionCompleta;
-            }
-
-            // Procesar niños (entre 2 y 5 años inclusivo)
-            if (ninos > 0) {
-              const [tarifasninos] = await db.query(`
-      SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
-      FROM tarifa t
-      INNER JOIN recurso r ON t.recurso_id = r.id
-      WHERE r.servicio_id = ?
-        AND (t.edad_minima IS NULL OR t.edad_minima <= 17)
-        AND (t.edad_maxima IS NULL OR t.edad_maxima >= 2)
-        AND t.fecha_inicio <= ?
-        AND t.fecha_fin >= ?
-        AND t.eliminado = 0
-    `, [servicio.id, fechaString, fechaString]);
-
-              estimacionCompleta = acumularRangoTarifa(tarifasninos, ninos) && estimacionCompleta;
-            }
-
-            // Procesar bebés (menores de 2 años)
-            if (bebes > 0) {
-              const [tarifasBebes] = await db.query(`
-                SELECT MIN(t.precio) as precio_min, MAX(t.precio) as precio_max
-                FROM tarifa t
-                INNER JOIN recurso r ON t.recurso_id = r.id
-                WHERE r.servicio_id = ?
-                  AND (t.edad_maxima IS NULL OR t.edad_maxima < 2)
-                  AND t.fecha_inicio <= ?
-                  AND t.fecha_fin >= ?
-                  AND t.eliminado = 0
-              `, [servicio.id, fechaString, fechaString]);
-
-              estimacionCompleta = acumularRangoTarifa(tarifasBebes, bebes) && estimacionCompleta;
-            }
-
-            preciosMinimosCentavos.push(precioMinimoDiaCentavos);
-            preciosMaximosCentavos.push(precioMaximoDiaCentavos);
-          }
-
-          // Sumar todos los días
-          const totalMinimoCentavos = sumarCentavos(...preciosMinimosCentavos);
-          const totalMaximoCentavos = sumarCentavos(...preciosMaximosCentavos);
-          if (estimacionCompleta && totalMinimoCentavos !== null && totalMaximoCentavos !== null) {
-            precio_minimo = centavosANumero(totalMinimoCentavos);
-            precio_maximo = centavosANumero(totalMaximoCentavos);
-          }
-          }
-        }
+        const { precio_minimo, precio_maximo } = criteriosDisponibilidad
+          ? await estimarRangoPrecioServicio(db, servicio, criteriosDisponibilidad, cabecera)
+          : { precio_minimo: null, precio_maximo: null };
 
         const disponibilidadBase = disponibilidadPorServicio.get(Number(servicio.id)) || null;
         let calendario = null;
@@ -1485,10 +1511,32 @@ router.get("/turismo/reserva-elegibilidad", verifyToken, async (req, res) => {
     const ingresoMiAjb = esRolCargaAdministrativa
       ? await reservasFirma.consultarIngresoMiAjb(connection, usuarioReservaId)
       : undefined;
+    // La misma regla que el envío («una sola reserva Iniciada a la vez»), avisada
+    // antes de empezar: si no, la persona la descubría al tocar «Enviar», después
+    // de apartar el lugar, cargar a todos y firmar. Una reserva que espera la firma
+    // y al firmarse queda Iniciada también cuenta.
+    let reservaIniciada = null;
+    if (!esRolCargaAdministrativa && obtenerEstadoAltaTurismo(cabecera.rol) === ESTADO_INICIADA) {
+      const iniciada = await asegurarSinReservaIniciadaAfiliado(connection, usuarioReservaId);
+      const firmaPendiente = iniciada ? null : await reservasFirma.buscarFirmaPendienteIniciada(connection, usuarioReservaId);
+      const existente = iniciada || firmaPendiente;
+      if (existente) {
+        reservaIniciada = {
+          id: Number(existente.id),
+          estado: existente.estado || null,
+          servicio: existente.servicio || null,
+          recurso: existente.recurso || null,
+          fecha_inicio: existente.fecha_inicio || null,
+          fecha_fin: existente.fecha_fin || null,
+          espera_firma: !iniciada,
+        };
+      }
+    }
     await connection.commit();
     return res.json({ puede_reservar: grupoReserva.cbuCompleto, cbu_completo: grupoReserva.cbuCompleto,
       requiere_aprobacion_titular: requiereAprobacionTitular, titular_usuario_id: Number(grupoReserva.titular.id),
       mensaje: grupoReserva.cbuCompleto ? null : MENSAJE_CBU,
+      reserva_iniciada: reservaIniciada,
       ...(ingresoMiAjb === undefined ? {} : { ingreso_mi_ajb: ingresoMiAjb }) });
   } catch (error) {
     if (connection) await connection.rollback();
@@ -2440,6 +2488,63 @@ router.get("/convenios-hoteleros/:id", verifyToken, async (req, res) => {
   } catch (error) {
     registrarErrorRuta(error);
     res.status(500).json("Error al obtener el convenio hotelero");
+  }
+});
+
+// Precio total estimado de las tarjetas de la búsqueda de turismo. El catálogo se
+// pide sin fechas (la disponibilidad va por /servicios/disponibilidad, separada
+// entre servicios grupales y de sólo titular); esto completa el precio con las
+// fechas y el grupo buscados, una sola vez por búsqueda.
+const MAXIMO_SERVICIOS_PRECIOS = 60;
+router.get("/servicios/precios", verifyToken, async (req, res) => {
+  try {
+    const cabecera = JSON.parse(req.data.data);
+    if (
+      !(
+        cabecera.rol === "admin" ||
+        cabecera.rol === "afiliado" ||
+        cabecera.rol === "departamental" ||
+        cabecera.rol === "admin-central"
+      ) || !tieneAreaTurismo(cabecera)
+    ) {
+      return res.status(401).json("No autorizado");
+    }
+
+    const parseo = parsearParametrosBusquedaDisponibilidad(req.query, {
+      requireFechas: true,
+      requirePersonas: true,
+    });
+    if (parseo.error) {
+      return res.status(422).json(parseo.error);
+    }
+
+    const servicioIds = parsearServicioIdsCsv(req.query.servicio_ids).slice(0, MAXIMO_SERVICIOS_PRECIOS);
+    if (!servicioIds.length) return res.status(200).json([]);
+
+    const db = mysqlConnection.promise();
+    const visibilidad = construirVisibilidadServicioSql(cabecera, "s");
+    const [servicios] = await db.query(
+      `SELECT s.id, s.modelo_tarifa FROM servicio s INNER JOIN tipo_servicio ts ON ts.id = s.tipo_servicio_id
+        WHERE ${visibilidad.sql} AND s.id IN (${servicioIds.map(() => "?").join(",")})
+          AND ts.activo = 1 AND ts.codigo <> 'CONVENIO_HOTELERO'`,
+      [...visibilidad.params, ...servicioIds]
+    );
+
+    const precios = [];
+    for (const servicio of servicios) {
+      try {
+        const rango = await estimarRangoPrecioServicio(db, servicio, parseo.value, cabecera);
+        precios.push({ servicio_id: Number(servicio.id), ...rango });
+      } catch (error) {
+        // Un servicio con tarifas rotas no deja a los demás sin precio.
+        registrarErrorRuta(error, "turismo:precio-estimado");
+        precios.push({ servicio_id: Number(servicio.id), precio_minimo: null, precio_maximo: null });
+      }
+    }
+    res.status(200).json(precios);
+  } catch (error) {
+    registrarErrorRuta(error);
+    res.status(500).json("Error al estimar los precios de los servicios");
   }
 });
 
@@ -14125,6 +14230,8 @@ const COLORES_ESTADO_RESERVA = {
   "Aprobada": { color: "#D1FAE5", color_texto: "#047857" },
   "Rechazada": { color: "#FEE2E2", color_texto: "#B91C1C" },
   "Cancelada": { color: "#F1F5F9", color_texto: "#475569" },
+  // Rechazada porque no se firmó a tiempo: no la rechazó nadie, se dio de baja sola.
+  "Vencida": { color: "#F1F5F9", color_texto: "#475569" },
   "Utilizada": { color: "#E5E7EB", color_texto: "#374151" },
   "Solicitud sorteo": { color: "#EDE9FE", color_texto: "#6D28D9" },
   "Adjudicada": { color: "#DCFCE7", color_texto: "#15803D" },
@@ -14231,7 +14338,11 @@ router.get("/mis-gestiones", verifyToken, async (req, res) => {
         'turismo' AS tipo,
         CONCAT('T-', r.id) AS codigo,
         er.id AS estado_id,
-        er.nombre AS estado,
+        -- La firma que vence deja la reserva Rechazada (como si la rechazara la AJB):
+        -- la persona afiliada la lee «Vencida», que es lo que pasó.
+        CASE WHEN er.nombre = 'Rechazada' AND EXISTS (
+          SELECT 1 FROM reserva_firma_afiliado rfa WHERE rfa.reserva_id = r.id AND rfa.decision = 'VENCIDA'
+        ) THEN 'Vencida' ELSE er.nombre END AS estado,
         NULL AS estado_color,
         NULL AS estado_color_texto,
         COALESCE(s.nombre, ch.nombre, 'Convenio hotelero') AS titulo,

@@ -499,11 +499,26 @@ test("ningún alta ni hold inicia hospedaje sin CBU y no se exponen datos bancar
   }
 });
 
+// «Una sola reserva Iniciada a la vez»: la elegibilidad del afiliado la consulta antes
+// de abrir el formulario. Responde las consultas de ese chequeo (sin reservas o con una).
+function responderChequeoIniciada(sql, params, { iniciada = null } = {}) {
+  if (/SELECT id FROM usuario WHERE id = \? FOR UPDATE/.test(sql)) return [[{ id: params[0] }]];
+  if (/SELECT id, nombre FROM estado_reserva WHERE nombre IN/.test(sql)) return [[{ id: 1, nombre: "Iniciada" }, { id: 4, nombre: "Rechazada" }]];
+  if (/SELECT id FROM estado_reserva WHERE nombre = \? LIMIT 1/.test(sql)) return [[{ id: 15 }]];
+  // Antes que la de firmas: el inicio del plazo tiene una subconsulta a reserva_firma_afiliado.
+  if (/AS vencida\s+FROM reserva r/.test(sql)) return [iniciada ? [{ ...iniciada, vencida: 0 }] : []];
+  if (/SELECT f\.reserva_id, f\.estado_destino/.test(sql)) return [[]];
+  if (/SELECT \? AS estado,/.test(sql)) return [[{ estado: "Iniciada", servicio: "Miramar Cabañas", recurso: "Cabaña 2" }]];
+  return undefined;
+}
+
 test("elegibilidad familiar usa su titular y descarta un usuario_id manipulado", async () => {
   setDatabaseHandler(async (sql, params) => {
     if (/SELECT u.id, u.nombre/.test(sql)) return [[params[0] === 100
       ? { id: 100, rol: "invitado", habilitado: "Y", es_familiar: "S", parentesco_id: 3, usuario_familiar_id: 200 }
       : { id: 200, rol: "afiliado", habilitado: "Y", modulo_turismo: 1, cbu: "123", usuario_familiar_id: null }]];
+    const chequeo = responderChequeoIniciada(sql, params);
+    if (chequeo) return chequeo;
     throw new Error(`Consulta no prevista: ${sql}`);
   });
   const response = await request("/api/turismo/reserva-elegibilidad?usuario_id=999", {
@@ -513,7 +528,24 @@ test("elegibilidad familiar usa su titular y descarta un usuario_id manipulado",
   assert.equal(response.body.requiere_aprobacion_titular, true);
   assert.equal(response.body.titular_usuario_id, 200);
   assert.equal("ingreso_mi_ajb" in response.body, false);
+  assert.equal(response.body.reserva_iniciada, null);
   assert.equal(databaseCalls.some(({ params }) => params.includes(999)), false);
+});
+
+test("elegibilidad del afiliado avisa antes de empezar que ya tiene una reserva Iniciada", async () => {
+  const iniciada = { id: 61, usuario_id: 200, estado_reserva_id: 1, modalidad: "FECHA_LIBRE", fecha_inicio: "2026-12-10", fecha_fin: "2026-12-14" };
+  setDatabaseHandler(async (sql, params) => {
+    if (/SELECT u.id, u.nombre/.test(sql)) return [[{ id: 200, rol: "afiliado", habilitado: "Y", modulo_turismo: 1, cbu: "2850590940090418135201", usuario_familiar_id: null }]];
+    const chequeo = responderChequeoIniciada(sql, params, { iniciada });
+    if (chequeo) return chequeo;
+    throw new Error(`Consulta no prevista: ${sql}`);
+  });
+  const response = await request("/api/turismo/reserva-elegibilidad", { token: tokenFor({ id: 200, rol: "afiliado" }) });
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body.reserva_iniciada, {
+    id: 61, estado: "Iniciada", servicio: "Miramar Cabañas", recurso: "Cabaña 2",
+    fecha_inicio: "2026-12-10", fecha_fin: "2026-12-14", espera_firma: false,
+  });
 });
 
 test("la aprobación del titular exige autenticación, titular asociado y excluye al staff", async () => {
