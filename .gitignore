@@ -58,3 +58,7 @@ testem.log
 # System Files
 .DS_Store
 Thumbs.db
+
+# Predios: caché del runtime de Node para el instalador y bases locales de prueba
+/.cache/
+/predios/.local/

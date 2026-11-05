@@ -40,6 +40,11 @@ app.use((req, res, next) => {
   next();
 });
 
+// Predios: la notebook del camping (sin Origin) y la pantalla remota (mismo origen que la API)
+// no pasan por el CORS del front. La administración (/api/predios) sí, más abajo.
+const prediosRoutes = require('./api/routes/predios');
+app.use('/api/predios-sync', prediosRoutes.crearRouterSync());
+app.use('/api/predios-app', prediosRoutes.crearRouterApp());
 app.use(cors(corsOptions));
 app.use('/api', require('./api/routes/correo-eventos').crearRouterCorreoEventos({ db: mysqlConnection.promise() }));
 app.use(bodyParser.urlencoded({
@@ -172,6 +177,7 @@ app.use('/api',noticiasRoute);
 app.use('/api',dashboardRoute);
 app.use('/api',beneficiosRoute);
 app.use('/api', kitsRoute);
+app.use('/api', prediosRoutes.crearRouterAdmin());
 // Sin esto, una ruta /api que no existe cae en el finalhandler de Express, que
 // responde una página HTML en inglés ("Cannot GET /api/…") y el front la mostraría.
 app.use('/api', (_req, res) => {

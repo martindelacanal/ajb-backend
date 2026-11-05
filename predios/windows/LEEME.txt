@@ -1,0 +1,58 @@
+﻿SISTEMA DEL PREDIO (AJB) - INSTALACIÓN EN LA NOTEBOOK SERVIDOR
+==============================================================
+
+QUÉ ES
+------
+Es el sistema de ventas, caja, stock, compras y afiliados del camping. Funciona en la
+red local del camping aunque se corte internet. Cuando hay conexión, se sincroniza
+solo con el sistema general (Mi AJB) y desde ahí la administración ve todo en tiempo
+real y puede hacer cambios a distancia. Las actualizaciones llegan solas.
+
+INSTALAR (una sola vez, en la notebook que queda en el camping)
+----------------------------------------------------------------
+1. Descomprimí este .zip completo en cualquier carpeta (por ejemplo, el Escritorio).
+2. Clic derecho en INSTALAR.bat > "Ejecutar como administrador".
+3. Esperá a que diga "Listo". Se abre el navegador con la pantalla de ingreso.
+   - La primera vez, en la notebook, se crea el administrador del camping
+     (usuario y contraseña). También pueden entrar los administradores del sistema
+     general con su DNI y su contraseña de Mi AJB (la primera vez con internet).
+4. En el escritorio queda "Sistema del Camping - direcciones.txt" con la dirección
+   para las demás PCs (por ejemplo http://192.168.0.10:8080).
+
+El sistema queda instalado en C:\AJB-Predio y arranca solo cada vez que se enciende
+la notebook (no hace falta iniciar sesión en Windows). Si se cae, se levanta solo.
+
+EN CADA PC DE LAS BOCAS (comedor, confitería, proveeduría, etc.)
+-----------------------------------------------------------------
+- Abrí el navegador (Chrome, Edge o Firefox) y entrá a la dirección del punto 4.
+- Recomendado: copiá C:\AJB-Predio\herramientas\crear-acceso-pc-caja.bat a esa PC
+  y ejecutalo. Crea el acceso "Sistema del Camping" en el escritorio que imprime los
+  tickets directo por la tiquetera (que tiene que ser la impresora predeterminada).
+- En Windows 8 o con navegadores viejos: instalá Chrome 109 o Firefox ESR 115
+  (las últimas versiones que soportan Windows 7 y 8). Internet Explorer no sirve.
+
+RECOMENDACIONES PARA LA NOTEBOOK SERVIDOR
+-----------------------------------------
+- Dejala siempre enchufada y conectada al router del camping (mejor por cable).
+- Pedile al router una IP fija para la notebook (reserva DHCP) así la dirección no cambia.
+- En la BIOS activá "encender al conectar la corriente" (Power On AC / AC Recovery),
+  si la notebook lo tiene: así vuelve a prender sola después de un corte largo.
+- El instalador ya desactivó la suspensión y el apagado al cerrar la tapa.
+
+SI ALGO NO ANDA
+---------------
+- C:\AJB-Predio\herramientas\reiniciar-servidor.bat  reinicia el sistema.
+- C:\AJB-Predio\logs\  tiene los registros de cada día.
+- C:\AJB-Predio\datos\respaldos\  tiene una copia de la base por día (30 días).
+- Volver a ejecutar INSTALAR.bat repara la instalación SIN borrar los datos.
+- Desde Mi AJB > Predios la administración puede reiniciar, actualizar o pedir los
+  registros a distancia (sin TeamViewer).
+
+SIN INTERNET EN EL CAMPING
+--------------------------
+- En el sistema del camping: Sistema > "Exportar datos para el sistema general"
+  genera un archivo .ajbpredio. Llevalo en pendrive y subilo en Mi AJB > Predios >
+  "Subir datos del camping".
+- Al revés: en Mi AJB > Predios > "Descargar paquete para el camping" baja un archivo
+  .ajbpaquete (afiliados con reserva, cambios pendientes y, si querés, la última
+  versión del sistema). En el camping: Sistema > "Cargar paquete del sistema general".
