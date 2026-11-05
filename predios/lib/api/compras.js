@@ -10,7 +10,10 @@ const { esAdmin, bocasDe } = require("./comun");
 
 async function puedeComprar(t, ctx, bocaId) {
   if (esAdmin(ctx)) return;
-  if (!bocasDe(ctx).includes(Number(bocaId))) throw U.error("Las compras las carga el almacén o un administrador", 403);
+  const boca = await N.obtener(t, ctx, "predio_boca", bocaId);
+  if (!boca || !Number(boca.es_almacen) || !bocasDe(ctx).includes(Number(bocaId))) {
+    throw U.error("Las compras las carga el almacén o un administrador", 403);
+  }
 }
 
 async function crearCompra(ctx) {
@@ -95,7 +98,8 @@ async function crearCompra(ctx) {
     for (const l of lineas) {
       const p = await N.exigir(t, ctx, "predio_producto", l.producto_id, "Uno de los productos no existe", { bloquear: true });
       const anterior = Number(p.precio_compra || 0);
-      const margen = l.margen === null ? Number(p.margen || 0) : U.redondear(l.margen, 2);
+      // El margen lo define el administrador: un usuario del almacén no lo cambia desde la compra.
+      const margen = l.margen === null || !esAdmin(ctx) ? Number(p.margen || 0) : U.redondear(l.margen, 2);
       const nuevoVenta = precioVenta(l.precio_unitario, margen);
       await N.insertar(t, ctx, "predio_compra_item", {
         compra_id: compraId, producto_id: l.producto_id, cantidad: l.cantidad, precio_unitario: l.precio_unitario,

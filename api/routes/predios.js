@@ -289,7 +289,7 @@ function crearRouterAdmin() {
         datos.codigo = paquete.buffer.toString("base64");
         datos.version = paquete.version;
       }
-      const buffer = zlib.gzipSync(Buffer.from(JSON.stringify(datos)));
+      const buffer = C.paqueteFirmado(datos);
       await C.evento(pool(), p.id, "PAQUETE_DESCARGADO", { comandos: comandos.length, con_codigo: req.query.codigo === "1" }, req.actor.id);
       res.setHeader("Content-Type", "application/octet-stream");
       res.setHeader("Content-Disposition", `attachment; filename="paquete-${p.codigo.toLowerCase()}-${datos.generado.slice(0, 10)}.ajbpaquete"`);
@@ -416,9 +416,12 @@ function crearRouterSync() {
         if (b.vacia || (escrituraPosterior && !Number(b.pendientes))) accion = "DESCARGAR_DATOS";
         else accion = "TOMAR_CONTROL";
       } else if (p.instancia_id && p.instancia_id !== instancia) {
-        if (b.vacia) accion = "DESCARGAR_DATOS";
+        // Notebook nueva que reemplaza a la anterior: si todavía no cargó nada propio,
+        // baja los datos más recientes del sistema general y toma el control.
+        const recienInstalada = String(b.bootstrap || "").startsWith("instalador") && !Number(b.pendientes);
+        if (b.vacia || recienInstalada) accion = "DESCARGAR_DATOS";
         else {
-          conflicto = `Otra instalación (${p.equipo || "otro equipo"}) tiene el control de los datos de este predio. Si esta notebook la reemplaza, reinstalala desde el sistema general.`;
+          conflicto = `Otra instalación (${p.equipo || "otro equipo"}) tiene el control de los datos de este predio. Si esta notebook la reemplaza, reinstalala con un instalador nuevo de Mi AJB y dejala conectarse antes de cargar datos.`;
         }
       } else if (!p.instancia_id) {
         accion = "TOMAR_CONTROL";
@@ -558,12 +561,13 @@ function crearRouterSync() {
 
   router.get("/version", (_req, res) => {
     const p = C.paqueteCodigo();
-    res.json({ version: p.version, sha256: p.sha256, tamano: p.tamano });
+    res.json({ version: p.version, sha256: p.sha256, tamano: p.tamano, firma: p.firma });
   });
 
   router.get("/codigo", (_req, res) => {
     const p = C.paqueteCodigo();
     res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("X-Firma", p.firma);
     res.send(p.buffer);
   });
 

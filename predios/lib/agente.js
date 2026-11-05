@@ -19,6 +19,7 @@ const { TABLAS, NOMBRES_TABLAS, columnasDe } = require("./esquema");
 const { leerMeta, escribirMeta } = require("./db-sqlite");
 const { aplicarMaestros } = require("./maestros");
 const { instalarPaquete, leerPaquete } = require("./paquete");
+const { verificar } = require("./firma");
 
 const LOTE_PUSH = 400;
 
@@ -298,6 +299,9 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
     const buffer = await pedir("GET", "/codigo", { binario: true, timeout: 120000 });
     const sha = crypto.createHash("sha256").update(buffer).digest("hex");
     if (info.sha256 && sha !== info.sha256) throw new Error("El paquete descargado está dañado (no coincide la huella)");
+    if (config.clave_publica && !verificar(buffer, info.firma, config.clave_publica)) {
+      throw new Error("La actualización no tiene una firma válida del sistema general: no se instala");
+    }
     return instalarActualizacion(buffer);
   }
 
@@ -390,8 +394,14 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
   }
 
   async function importarPaquete(buffer) {
-    let datos;
-    try { datos = JSON.parse(zlib.gunzipSync(buffer).toString("utf8")); } catch (_e) { throw U.error("El archivo no se pudo leer: ¿es un paquete del sistema general?"); }
+    let envoltorio;
+    try { envoltorio = JSON.parse(zlib.gunzipSync(buffer).toString("utf8")); } catch (_e) { throw U.error("El archivo no se pudo leer: ¿es un paquete del sistema general?"); }
+    if (envoltorio.tipo !== "predio-paquete-firmado") throw U.error("Ese archivo no es un paquete del sistema general para el predio");
+    if (!config.clave_publica) throw U.error("Esta instalación no tiene la clave para verificar paquetes: reinstalala con un instalador nuevo de Mi AJB");
+    if (!verificar(Buffer.from(String(envoltorio.contenido || "")), envoltorio.firma, config.clave_publica)) {
+      throw U.error("El paquete no tiene una firma válida del sistema general: no se carga", 403);
+    }
+    const datos = JSON.parse(envoltorio.contenido);
     if (datos.tipo !== "predio-paquete") throw U.error("Ese archivo no es un paquete del sistema general para el predio");
     if (Number(datos.predio_id) !== pid) throw U.error("El paquete es de otro predio");
     const resumen = { maestros: null, comandos: 0, errores: 0, actualizacion: null };
