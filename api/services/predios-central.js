@@ -17,6 +17,7 @@ const { armarPaquete } = require("../../predios/lib/paquete");
 const { aplicarMaestros } = require("../../predios/lib/maestros");
 const { sembrarPredio, PREDIOS } = require("../../predios/lib/semilla");
 const firma = require("../../predios/lib/firma");
+const { nuevosAvisos, entregarAvisos } = require("./predios-avisos");
 
 // Estados de reserva que NO cuentan como estadía (rechazada, solicitud de sorteo,
 // no adjudicada, convenio rechazado, cancelada).
@@ -121,6 +122,9 @@ async function upsertFilas(conexion, predioId, tabla, filas) {
 
 // Aplica los cambios que sube la notebook (en orden y en una transacción).
 async function aplicarCambios(conexion, predio, cambios) {
+  // Serializa push y archivos del mismo predio antes de comprobar los avisos
+  // existentes: dos sincronizaciones simultáneas no deben entregarlos dos veces.
+  await conexion.query("SELECT id FROM predio WHERE id = ? FOR UPDATE", [predio.id]);
   const nuevosPermisos = [];
   const porTabla = new Map();
   const borrar = [];
@@ -145,10 +149,12 @@ async function aplicarCambios(conexion, predio, cambios) {
       for (const p of pendientes) if (conocidos.get(Number(p.id)) !== "PENDIENTE") nuevosPermisos.push(p);
     }
   }
+  const avisos = await nuevosAvisos(conexion, predio.id, porTabla.get("predio_aviso") || []);
   for (const [tabla, filas] of porTabla) {
     for (let i = 0; i < filas.length; i += 200) await upsertFilas(conexion, predio.id, tabla, filas.slice(i, i + 200));
   }
   for (const b of borrar) await conexion.query(`DELETE FROM \`${b.tabla}\` WHERE predio_id = ? AND id = ?`, [predio.id, b.id]);
+  await entregarAvisos(conexion, predio, avisos);
   return { aplicados: cambios.length, nuevosPermisos };
 }
 
@@ -178,6 +184,8 @@ async function importarExportacion(pool, predio, datos, { forzar = false, usuari
   const resumen = {};
   try {
     await conexion.beginTransaction();
+    await conexion.query("SELECT id FROM predio WHERE id = ? FOR UPDATE", [predio.id]);
+    const avisos = await nuevosAvisos(conexion, predio.id, Array.isArray(datos.tablas?.predio_aviso) ? datos.tablas.predio_aviso : []);
     for (const tabla of NOMBRES_TABLAS) {
       const filas = Array.isArray(datos.tablas?.[tabla]) ? datos.tablas[tabla] : null;
       if (!filas) continue;
@@ -185,6 +193,7 @@ async function importarExportacion(pool, predio, datos, { forzar = false, usuari
       for (let i = 0; i < filas.length; i += 300) await upsertFilas(conexion, predio.id, tabla, filas.slice(i, i + 300));
       resumen[tabla] = filas.length;
     }
+    await entregarAvisos(conexion, predio, avisos);
     await conexion.query(
       "UPDATE predio SET escritor = 'LOCAL', instancia_id = ?, ultimo_seq = GREATEST(ultimo_seq, ?), ultimo_push = NOW(), version_local = COALESCE(?, version_local) WHERE id = ?",
       [datos.instancia_id || predio.instancia_id, Number(datos.hasta_seq) || 0, datos.version || null, predio.id]);

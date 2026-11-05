@@ -34,6 +34,7 @@
         abrirAlEnfocar: false,
         placeholder: "Escaneá o buscá el producto",
         bocaId: function () { return Number(origen.value); }, mostrarStock: true,
+        alCambiarTexto: function () { elegido = null; disponible.textContent = ""; },
         alElegir: function (o) { elegido = o.dato; mostrarDisponible(); cantidad.focus(); cantidad.select(); },
       });
       function mostrarDisponible() {
@@ -122,6 +123,7 @@
       var disp = h("div.campo-ayuda");
       var combo = P.comboProducto({
         abrirAlEnfocar: false, bocaId: function () { return Number(boca.value); }, mostrarStock: true,
+        alCambiarTexto: function () { elegido = null; disp.textContent = ""; },
         alElegir: function (o) { elegido = o.dato; disp.textContent = "Stock en la boca: " + P.f.numero(o.dato.stock_boca); cantidad.focus(); },
       });
       var cantidad = P.input({ inputmode: "decimal", valor: "1" });

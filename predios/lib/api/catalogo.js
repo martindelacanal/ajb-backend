@@ -6,7 +6,8 @@
 const U = require("../util");
 const N = require("../negocio");
 const { DESTINOS } = require("../listados");
-const { exigirAdmin, esAdmin, bocasDe } = require("./comun");
+const { gtinValido, proximidadCodigo } = require("../codigo-barras");
+const { exigirAdmin, esAdmin, bocasDe, exigirPuesto, exigirBoca } = require("./comun");
 
 const DESTINOS_VALIDOS = DESTINOS.map((d) => d.valor);
 
@@ -84,12 +85,27 @@ async function opciones(ctx) {
 // Búsqueda rápida para los desplegables con escáner: el código exacto va primero.
 async function buscarProductos(ctx) {
   const q = String(ctx.query.q || "").trim().slice(0, 80);
-  const bocaId = Number(ctx.query.boca_id) || null;
+  let bocaId = Number(ctx.query.boca_id) || null;
   const soloVenta = ctx.query.venta === "1";
+  const sinStock = soloVenta && ctx.query.sin_stock === "1";
+  if (soloVenta) {
+    const puesto = exigirPuesto(ctx);
+    if (bocaId && bocaId !== Number(puesto.boca_id)) throw U.error("La búsqueda de ventas corresponde a la boca de tu caja", 403);
+    bocaId = Number(puesto.boca_id);
+    exigirBoca(ctx, bocaId);
+    // El catálogo de excepción sólo se abre mediante una búsqueda concreta.
+    if (sinStock && q.length < 2) return [];
+  } else if (bocaId) exigirBoca(ctx, bocaId);
   const db = ctx.db;
   const params = [bocaId || -1, ctx.pid];
   let where = "p.predio_id = ? AND p.activo = 1";
-  if (soloVenta) where += " AND p.destino <> 'USO_INTERNO'";
+  if (soloVenta) {
+    where += " AND p.destino <> 'USO_INTERNO'";
+    where += sinStock
+      ? " AND p.destino = 'VENTA_DIRECTA' AND COALESCE(s.cantidad, 0) <= 0"
+      : " AND (p.destino <> 'VENTA_DIRECTA' OR COALESCE(s.cantidad, 0) > 0)";
+  }
+  const baseWhere = where;
   let orden = "p.nombre";
   if (q) {
     const palabras = q.split(/\s+/).slice(0, 5);
@@ -106,13 +122,79 @@ async function buscarProductos(ctx) {
     WHERE ${where} ORDER BY ${orden} LIMIT 30`;
   if (q) params.push(q);
   const filas = await db.all(sql, params);
+  // La consulta normal conserva su contrato. Al escanear un código más largo que
+  // el importado, se agregan como máximo ocho sugerencias, nunca coincidencias exactas.
+  if (/^\d{8,60}$/.test(q) && !filas.some((f) => f.codigo === q)) {
+    const candidatos = await db.all(
+      `SELECT p.id, p.nombre, p.codigo, p.precio_venta, p.precio_compra, p.margen, p.destino, p.perecedero, p.fecha_caducidad,
+         COALESCE(s.cantidad, 0) AS stock_boca
+       FROM predio_producto p
+       LEFT JOIN predio_stock s ON s.predio_id = p.predio_id AND s.producto_id = p.id AND s.boca_id = ?
+       WHERE ${baseWhere} AND p.codigo IS NOT NULL AND LENGTH(p.codigo) BETWEEN ? AND ?`,
+      [bocaId || -1, ctx.pid, Math.max(6, q.length - 6), Math.min(60, q.length + 1)]);
+    const ids = new Set(filas.map((f) => Number(f.id)));
+    const cercanos = candidatos.map((f) => ({ fila: f, distancia: proximidadCodigo(f.codigo, q) }))
+      .filter((f) => f.distancia !== null && f.distancia > 0 && !ids.has(Number(f.fila.id)))
+      .sort((a, b) => a.distancia - b.distancia || a.fila.nombre.localeCompare(b.fila.nombre))
+      .slice(0, 8).map((f) => f.fila);
+    filas.push(...cercanos);
+  }
   const costos = await veCostos(db, ctx);
-  return filas.map((f) => ({
+  return filas.slice(0, 30).map((f) => ({
     id: f.id, nombre: f.nombre, codigo: f.codigo, precio_venta: Number(f.precio_venta || 0),
     precio_compra: costos ? Number(f.precio_compra || 0) : undefined, margen: costos ? Number(f.margen || 0) : undefined, destino: f.destino,
     perecedero: !!Number(f.perecedero), fecha_caducidad: f.fecha_caducidad, stock_boca: Number(f.stock_boca || 0),
     exacto: !!q && f.codigo === q,
+    sugerido: !!q && f.codigo !== q && proximidadCodigo(f.codigo, q) !== null,
+    coincidencia: !!q && f.codigo === q ? "EXACTA" : (proximidadCodigo(f.codigo, q) !== null ? "CODIGO_APROXIMADO" : "TEXTO"),
   }));
+}
+
+// Serializa todas las altas/ediciones de códigos del catálogo en los dos motores.
+// No se usa un índice UNIQUE: el catálogo histórico puede contener repetidos inactivos.
+async function bloquearCodigos(t, ctx) {
+  await t.run(`${t.insertIgnore} INTO predio_secuencia (predio_id, tabla, ultimo) VALUES (?, 'codigos_producto', 0)`, [ctx.pid]);
+  await t.get(`SELECT ultimo FROM predio_secuencia WHERE predio_id = ? AND tabla = 'codigos_producto'${t.forUpdate}`, [ctx.pid]);
+}
+
+async function corregirCodigoBarras(ctx) {
+  if (ctx.body.confirmar !== true) throw U.error("Confirmá que cotejaste el producto y su código con el envase");
+  const id = U.id(ctx.params.id);
+  const anterior = U.texto(ctx.body.codigo_anterior, { max: 60, requerido: true, campo: "El código anterior" });
+  const nuevo = U.texto(ctx.body.codigo_nuevo, { max: 60, requerido: true, campo: "El código escaneado" });
+  if (!esAdmin(ctx)) {
+    const puesto = exigirPuesto(ctx);
+    exigirBoca(ctx, puesto.boca_id);
+  }
+  if (!/^\d{8,60}$/.test(nuevo)) throw U.error("Volvé a escanear el código completo del envase");
+  if ([8, 12, 13, 14].includes(nuevo.length) && !gtinValido(nuevo)) {
+    throw U.error("El dígito de control del código escaneado no es válido. Revisá el envase y volvé a escanear.", 400, { codigo: "CODIGO_BARRAS_INVALIDO" });
+  }
+  return ctx.db.tx(async (t) => {
+    await bloquearCodigos(t, ctx);
+    if (!esAdmin(ctx)) {
+      const caja = await N.exigir(t, ctx, "predio_caja", ctx.sesion.caja_id, "La caja ya no existe");
+      const boca = await N.exigir(t, ctx, "predio_boca", ctx.sesion.boca_id, "La boca ya no existe");
+      if (!Number(caja.activo) || !Number(boca.activo) || Number(caja.boca_id) !== Number(boca.id)) {
+        throw U.error("Elegí nuevamente la boca y la caja", 409, { codigo: "SIN_PUESTO" });
+      }
+    }
+    const p = await N.exigir(t, ctx, "predio_producto", id, "No encontramos el producto", { bloquear: true });
+    if (!Number(p.activo)) throw U.error("El producto está dado de baja", 409);
+    if (String(p.codigo || "") !== anterior) throw U.error("El código del producto cambió mientras lo revisabas. Volvé a buscarlo.", 409, { codigo: "CODIGO_MODIFICADO", codigo_actual: p.codigo });
+    if (!esAdmin(ctx) && p.destino === "USO_INTERNO") throw U.error("Este producto se corrige desde Gestión", 403);
+    if (proximidadCodigo(anterior, nuevo) === null) throw U.error("El código no es próximo al guardado. Pedile al administrador que revise la ficha del producto.", 409);
+    const dup = await codigoDuplicado(t, ctx, nuevo, id);
+    if (dup) throw U.error(`Ese código ya pertenece a «${dup.nombre}». No se modificó el producto.`, 409, { codigo: "CODIGO_DUPLICADO" });
+    if (nuevo !== anterior) {
+      await N.actualizar(t, ctx, "predio_producto", id, { codigo: nuevo });
+      await N.auditar(t, ctx, "Corrección de código de barras cotejado con el envase", "producto", id, {
+        producto: p.nombre, codigo: { antes: anterior, despues: nuevo },
+        boca_id: ctx.sesion?.boca_id || null, caja_id: ctx.sesion?.caja_id || null,
+      });
+    }
+    return { id, codigo: nuevo, mensaje: "Código de barras actualizado" };
+  });
 }
 
 async function detalleProducto(ctx) {
@@ -162,6 +244,7 @@ async function crearProducto(ctx) {
     ? U.numero(ctx.body.precio_venta_manual, { min: 0, campo: "El precio de venta" })
     : precioVenta(datos.precio_compra, datos.margen);
   return ctx.db.tx(async (t) => {
+    await bloquearCodigos(t, ctx);
     const dup = await codigoDuplicado(t, ctx, datos.codigo);
     if (dup) throw U.error(`Ese código ya lo tiene «${dup.nombre}». Cada producto necesita un código distinto.`, 409);
     const nombreDup = await t.get("SELECT id FROM predio_producto WHERE predio_id = ? AND LOWER(nombre) = LOWER(?) AND activo = 1", [ctx.pid, datos.nombre]);
@@ -188,7 +271,9 @@ async function editarProducto(ctx) {
   exigirAdmin(ctx);
   const id = U.id(ctx.params.id);
   const datos = validarProducto(ctx.body, { parcial: true });
+  if (ctx.body.activo !== undefined) datos.activo = U.bool(ctx.body.activo);
   return ctx.db.tx(async (t) => {
+    if (datos.codigo !== undefined || datos.activo === 1) await bloquearCodigos(t, ctx);
     const antes = await N.exigir(t, ctx, "predio_producto", id, "No encontramos el producto", { bloquear: true });
     const compra = datos.precio_compra !== undefined ? datos.precio_compra : Number(antes.precio_compra || 0);
     const margen = datos.margen !== undefined ? datos.margen : Number(antes.margen || 0);
@@ -197,9 +282,8 @@ async function editarProducto(ctx) {
     } else if (datos.precio_compra !== undefined || datos.margen !== undefined) {
       datos.precio_venta = precioVenta(compra, margen);
     }
-    if (ctx.body.activo !== undefined) datos.activo = U.bool(ctx.body.activo);
-    if (datos.codigo) {
-      const dup = await codigoDuplicado(t, ctx, datos.codigo, id);
+    if (datos.codigo || datos.activo === 1) {
+      const dup = await codigoDuplicado(t, ctx, datos.codigo === undefined ? antes.codigo : datos.codigo, id);
       if (dup) throw U.error(`Ese código ya lo tiene «${dup.nombre}»`, 409);
     }
     await N.actualizar(t, ctx, "predio_producto", id, datos);
@@ -480,6 +564,7 @@ module.exports = {
   rutas: [
     { m: "GET", p: "/opciones/:fuente", h: opciones },
     { m: "GET", p: "/productos/buscar", h: buscarProductos },
+    { m: "POST", p: "/productos/:id/codigo-barras", h: corregirCodigoBarras, escritura: true },
     { m: "GET", p: "/productos/:id", h: detalleProducto, roles: ["ADMIN"] },
     { m: "POST", p: "/productos", h: crearProducto, escritura: true, roles: ["ADMIN"] },
     { m: "PUT", p: "/productos/:id", h: editarProducto, escritura: true, roles: ["ADMIN"] },

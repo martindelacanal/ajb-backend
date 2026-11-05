@@ -180,8 +180,11 @@ input[type="password"]::-ms-reveal, input[type="password"]::-ms-clear { display:
   box-shadow: var(--sombra-flotante);
   animation: aparecer 140ms ease-out;
 }
-.combo-opcion { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 9px 10px; border-radius: var(--radio-chico); cursor: pointer; }
+.combo-opcion { display: flex; gap: 12px; align-items: center; justify-content: space-between; width: 100%; padding: 9px 10px; border: 0; border-radius: var(--radio-chico); background: transparent; text-align: left; cursor: pointer; }
 .combo-opcion:hover, .combo-opcion[aria-selected="true"] { background: var(--cielo); }
+.combo-opcion:focus-visible { outline: 2px solid var(--azul); outline-offset: -2px; background: var(--cielo); }
+.combo-opcion > div:first-child { min-width: 0; overflow-wrap: anywhere; }
+.combo-ayuda { padding: 9px 10px; color: var(--azul-hondo); background: var(--cielo); border-radius: var(--radio-chico); font-size: 13px; }
 .combo-opcion-principal { font-weight: 700; }
 .combo-opcion-detalle { font-size: 12.5px; color: var(--texto-3); }
 .combo-opcion-lado { text-align: right; font-size: 13px; color: var(--texto-2); white-space: nowrap; }
@@ -500,6 +503,9 @@ table.tabla { width: 100%; border-collapse: separate; border-spacing: 0; font-si
 .vender { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 18px; align-items: start; }
 @media (max-width: 1100px) { .vender { grid-template-columns: minmax(0, 1fr); } }
 .vender-buscador { padding: 16px; }
+.vender-ayuda { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px 12px; margin-top: 8px; }
+.vender-ayuda .btn { white-space: normal; text-align: left; }
+.codigo-comparacion strong { overflow-wrap: anywhere; }
 .vender-buscador .campo-control { min-height: 58px; padding-left: 52px; font-size: 19px; font-weight: 700; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%230097de' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M3 5v14M7 5v14M11 5v14M14 5v14M18 5v14M21 5v14'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: 16px center; background-size: 24px; }
 .items { min-height: 300px; }
 .items td { padding-top: 9px; padding-bottom: 9px; }

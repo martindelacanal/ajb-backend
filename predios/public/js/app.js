@@ -9,6 +9,7 @@
   var temporizadores = [];
   var pagina = null;
   var ultimoPermisoVisto = 0;
+  var ultimoAvisoVisto = 0;
 
   P.alSalir = function (fn) { limpiezas.push(fn); };
   P.intervalo = function (fn, ms) { var t = setInterval(fn, ms); limpiezas.push(function () { clearInterval(t); }); return t; };
@@ -127,6 +128,9 @@
   function panelAvisos(ancla) {
     var a = P.estado.avisos || {};
     var items = [];
+    (a.notificaciones || []).forEach(function (n) {
+      items.push({ texto: n.titulo, icono: "alerta", accion: function () { verNotificacion(n); } });
+    });
     (a.permisos || []).forEach(function (p) {
       items.push({ texto: p.usuario_nombre + " pide autorización (" + (p.boca || "") + ")", icono: "llave", accion: function () { P.resolverPermiso(p); } });
     });
@@ -139,6 +143,32 @@
     if (a.stock_negativo) items.push({ texto: a.stock_negativo + " producto(s) con stock negativo en alguna boca", icono: "alerta", accion: function () { P.cache["tabla:stock"] = { filtros: { estado: "negativo" } }; P.ruta.ir("/gestion/stock"); } });
     if (!items.length) items.push({ texto: "No hay avisos pendientes", icono: "check", accion: function () {} });
     P.menuFlotante(ancla, items);
+  }
+
+  function verNotificacion(n) {
+    var d = n.detalle || {};
+    var m = P.modal({
+      titulo: n.titulo, subtitulo: P.f.fechaHora(n.fecha) + " · Hora de Argentina",
+      contenido: h("div.columna", h("p", n.mensaje),
+        d.intentos_recientes && d.intentos_recientes.length ? h("div.columna",
+          h("strong", "Intentos registrados"),
+          d.intentos_recientes.map(function (x) {
+            return h("p.chico", P.f.fechaHora(x.fecha) + " · " + (x.boca || "Sin boca registrada") + (x.caja ? " · " + x.caja : "") + " · IP " + (x.ip || "sin datos"));
+          })) : null,
+        d.origen_puesto ? h("p.texto-3.chico", d.origen_puesto + (d.puesto_registrado_en ? ": " + P.f.fechaHora(d.puesto_registrado_en) : "") + ". Esta referencia identifica el último puesto usado; no confirma quién intentó ingresar.") : null,
+        d.agente ? h("p.texto-3.chico", "Navegador: " + d.agente) : null),
+      acciones: [
+        P.btn("Cerrar", { onclick: function () { m.cerrar(); } }),
+        P.btn("Marcar como leído", { tipo: "primario", onclick: function (ev) {
+          P.ejecutar(ev.currentTarget, function () {
+            return P.post("/avisos/" + n.id + "/leer", {}).then(function (r) {
+              m.cerrar();
+              if (!r.encolado) consultarAvisos();
+            });
+          });
+        } }),
+      ],
+    });
   }
 
   P.resolverPermiso = function (p) {
@@ -182,7 +212,7 @@
       var viejo = c.querySelector(".campana-numero");
       if (viejo) viejo.remove();
       var a = P.estado.avisos || {};
-      var total = (a.permisos || []).length + (a.aperturas || []).length + (a.solicitudes_despachar || 0) + (a.solicitudes_recibir || 0);
+      var total = (a.notificaciones || []).length + (a.permisos || []).length + (a.aperturas || []).length + (a.solicitudes_despachar || 0) + (a.solicitudes_recibir || 0);
       if (total) c.appendChild(h("span.campana-numero", total > 99 ? "99+" : String(total)));
     }
   }
@@ -193,6 +223,13 @@
       var antes = P.estado.avisos;
       P.estado.avisos = a;
       pintarContadores();
+      if (a.notificaciones && a.notificaciones.length) {
+        var aviso = a.notificaciones[0];
+        if (aviso.id > ultimoAvisoVisto) {
+          P.aviso(aviso.titulo + ". Tocá la campana para ver el detalle.", "cola", 10000);
+          ultimoAvisoVisto = aviso.id;
+        }
+      }
       if (P.esAdmin() && a.permisos && a.permisos.length) {
         var max = Math.max.apply(null, a.permisos.map(function (p) { return p.id; }));
         if (antes && max > ultimoPermisoVisto) {
@@ -306,7 +343,7 @@
         })),
         h("div.espacio"),
         puesto.boca ? h("span.puesto-chip", h("span", puesto.boca + (puesto.caja ? " · " + puesto.caja : "")), P.btn("Cambiar", { tipo: "texto", chico: true, onclick: function () { P.ruta.ir("/puesto"); } })) : null,
-        chipConexion(), botonUsuario()),
+        chipConexion(), campana(), botonUsuario()),
       pagina);
   }
 
@@ -387,7 +424,10 @@
   };
 
   P.alIngresar = function (r) {
+    P.estado.avisos = null;
+    ultimoAvisoVisto = 0;
     P.estado.sesion = r;
+    P.equipo.recordarPuesto(r.puesto);
     var ses = r;
     if (ses.usuario.rol !== "ADMIN" && !ses.puesto) {
       var puestos = ses.puestos || [];

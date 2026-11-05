@@ -62,6 +62,17 @@ const TABLAS = {
     columnas: { usuario_id: "int!", boca_id: "int!" },
     unicos: [["usuario_id", "boca_id"]],
   },
+  predio_aviso: {
+    columnas: {
+      tipo: "str:40!", usuario_id: "int", general_usuario_id: "int", general_documento: "str:20",
+      titulo: "str:180!", mensaje: "text!", fecha: "dt!", detalle: "text",
+    },
+    indices: [["usuario_id", "fecha"], ["tipo", "fecha"]],
+  },
+  predio_aviso_lectura: {
+    columnas: { aviso_id: "int!", usuario_id: "int!", fecha: "dt!" },
+    unicos: [["aviso_id", "usuario_id"]],
+  },
   predio_proveedor: {
     auditoria: true,
     columnas: {

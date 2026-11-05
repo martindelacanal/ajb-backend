@@ -113,6 +113,37 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
   Las PCs entran con `http://nombre:puerto`, que Windows resuelve solo por NetBIOS/LLMNR.
   El nombre nuevo se aplica al reiniciar, y desde la misma pantalla se puede reiniciar la notebook.
 - Las contraseñas de usuarios del camping tienen como mínimo 4 caracteres.
+- Desde el quinto intento de contraseña incorrecta se avisa al dueño de la cuenta,
+  cualquiera sea su rol. Se informa la cantidad, los horarios, la IP, el dispositivo
+  y la última boca/caja registrada. El décimo fallo bloquea la cuenta y la PC durante
+  15 minutos completos; el bloqueo se conserva al reiniciar el servidor.
+- El navegador y el servidor recuerdan el último puesto de cada PC aun después de
+  cerrar sesión. Ese dato identifica el origen de los avisos; no otorga permisos.
+- La campana muestra avisos privados de acceso y, a los administradores, los de stock.
+  Los avisos se guardan sin internet y se replican; las cuentas de Mi AJB reciben los
+  suyos en el sistema general. Marcar un aviso leído no lo borra para los demás.
+
+## Lectores de códigos y stock en ventas
+
+- El lector + Enter carga automáticamente sólo un código exacto y único. Un código
+  próximo se muestra como sugerencia y exige elegir el producto explícitamente.
+  El diálogo permite cotejar nombre, presentación y códigos y elegir «Corregir y usar
+  producto» o «Continuar sin modificar»; cerrarlo cancela la selección.
+- La corrección valida el dígito de control de los GTIN, impide duplicados y rechaza
+  códigos que hayan cambiado mientras se revisaban. Queda auditada y se sincroniza.
+  El mismo selector se usa en compras y movimientos de stock.
+- No se completan códigos sólo por longitud: un código de 12 dígitos puede ser un UPC
+  válido o un EAN truncado, y un código corto puede ser interno. Para reparaciones ya
+  verificadas, la orden de sistema `CORREGIR_CODIGOS_VERIFICADOS` recibe `productos`
+  con `producto_id`, `nombre_esperado`, `codigo_anterior` y `codigo_nuevo`; valida todo
+  antes de aplicar y admite repetición. Primero actualizar la notebook, luego encolar
+  la reparación: las versiones anteriores no conocen esta orden.
+- La lista habitual de ventas ofrece productos con stock positivo en la boca elegida;
+  los servicios, las ventas compuestas y los alquileres conservan su tratamiento sin
+  descuento de unidades. «¿No aparece el producto?» permite buscar una excepción y
+  confirmar el aviso al administrador con producto, boca, caja, operador y horario.
+  El aviso no modifica existencias. La configuración que prohíbe vender sin stock se
+  respeta también en este circuito; las ventas excepcionales autorizadas generan aviso.
 
 ## Reglas de negocio que conviene recordar
 

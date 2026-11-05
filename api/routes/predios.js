@@ -50,7 +50,8 @@ async function ejecutarComoAdminGeneral(res, predio, usuario, { metodo, ruta, cu
   const bocas = (await db.all("SELECT id FROM predio_boca WHERE predio_id = ?", [predio.id])).map((b) => Number(b.id));
   const base = {
     db, pid: predio.id, modo: "central", origen: "REMOTO", ip: null, servicios: {},
-    usuario: { id: null, usuario: `dni${usuario.documento}`, nombre, rol: "ADMIN", bocas, es_admin_general: true },
+    usuario: { id: null, usuario: `dni${usuario.documento}`, nombre, rol: "ADMIN", bocas, es_admin_general: true,
+      general_usuario_id: Number(usuario.id), documento: String(usuario.documento || "") },
     sesion: {}, query: { ...(query || {}) }, body: cuerpo && typeof cuerpo === "object" ? cuerpo : {},
   };
   const encontrada = apiPredio.buscarRuta(metodo, ruta);
@@ -70,6 +71,12 @@ async function ejecutarComoAdminGeneral(res, predio, usuario, { metodo, ruta, cu
   if (ruta === "/afiliados/buscar" || ruta.startsWith("/listados/afiliados") || ruta === "/inicio") {
     if (predio.escritor === "CENTRAL") await C.refrescarMaestrosCentral(pool(), predio).catch(() => {});
   }
+  // Las lecturas usan la identidad local replicada, sin crear usuarios ni escribir
+  // sobre datos de una notebook que sigue siendo la dueña del predio.
+  const usuarioPredio = await db.get(
+    "SELECT id FROM predio_usuario WHERE predio_id = ? AND es_admin_general = 1 AND general_usuario_id = ? LIMIT 1",
+    [predio.id, Number(usuario.id)]);
+  base.usuario.id = usuarioPredio ? Number(usuarioPredio.id) : null;
   const r = await apiPredio.ejecutar(base, metodo, ruta);
   return enviarResultado(res, r);
 }

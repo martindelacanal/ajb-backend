@@ -152,7 +152,7 @@
       error.ocultar();
       if (!usuario.value.trim() || !clave.value) { error.mostrar("Escribí tu usuario y tu contraseña."); (usuario.value.trim() ? clave : usuario).focus(); return; }
       P.ejecutar(boton, function () {
-        return P.post("/login", { usuario: usuario.value.trim(), password: clave.value, recordar: recordar.checked }, { sinRedireccion: true }).then(function (r) {
+        return P.post("/login", Object.assign({ usuario: usuario.value.trim(), password: clave.value, recordar: recordar.checked }, P.equipo.datos()), { sinRedireccion: true }).then(function (r) {
           P.sesion.guardar(r.token, recordar.checked);
           P.alIngresar(r);
         });
@@ -195,8 +195,9 @@
 
   // ------------------------------------------------------------------ elegir boca y caja
   P.elegirPuesto = function (boca_id, caja_id) {
-    return P.post("/sesion/puesto", { boca_id: boca_id, caja_id: caja_id || null }).then(function (r) {
+    return P.post("/sesion/puesto", Object.assign({ boca_id: boca_id, caja_id: caja_id || null }, P.equipo.datos())).then(function (r) {
       P.estado.sesion = Object.assign({}, P.estado.sesion, r);
+      P.equipo.recordarPuesto(r.puesto);
       return r;
     });
   };

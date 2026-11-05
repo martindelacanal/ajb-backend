@@ -5,11 +5,75 @@
 
 const U = require("../util");
 const N = require("../negocio");
+const { emitirAviso } = require("../avisos");
 const { FORMAS_PAGO } = require("../listados");
-const { esAdmin, bocasDe, exigirPuesto, autorizar, disponibleAfiliado } = require("./comun");
+const { esAdmin, bocasDe, exigirPuesto, exigirBoca, autorizar, disponibleAfiliado } = require("./comun");
 
 const FORMAS = FORMAS_PAGO.map((f) => f.valor);
 const MOVEDORES_STOCK = ["VENTA_DIRECTA"];
+
+async function stockParaVenta(t, ctx, bocaId, productoId) {
+  // Una consulta previa puede ver una instantánea vieja en MySQL. Sólo se usa
+  // para evitar altas innecesarias; el saldo válido sale de la lectura bloqueada.
+  const fila = await t.get("SELECT id FROM predio_stock WHERE predio_id = ? AND boca_id = ? AND producto_id = ?", [ctx.pid, bocaId, productoId]);
+  if (!fila) {
+    const id = await N.nuevoId(t, "predio_stock", ctx.pid);
+    // Si otra operación creó la fila mientras esperábamos, se conserva su saldo.
+    await t.run(`${t.insertIgnore} INTO predio_stock (predio_id, id, boca_id, producto_id, cantidad, fecha_modificacion) VALUES (?, ?, ?, ?, 0, ?)`,
+      [ctx.pid, id, bocaId, productoId, U.fechaHora()]);
+  }
+  const actual = await t.get(`SELECT cantidad FROM predio_stock WHERE predio_id = ? AND boca_id = ? AND producto_id = ?${t.forUpdate}`, [ctx.pid, bocaId, productoId]);
+  if (!actual) throw U.error("No pudimos comprobar el stock del producto. Volvé a intentar.", 409);
+  return Number(actual.cantidad);
+}
+
+async function avisarFaltante(t, ctx, { producto, busqueda, cantidad, stock, ventaId = null, faltantes = null }) {
+  const puesto = exigirPuesto(ctx);
+  const caja = await N.exigir(t, ctx, "predio_caja", puesto.caja_id, "La caja ya no existe");
+  if (!Number(caja.activo) || Number(caja.boca_id) !== Number(puesto.boca_id)) throw U.error("Elegí nuevamente la boca y la caja", 409, { codigo: "SIN_PUESTO" });
+  const boca = await N.exigir(t, ctx, "predio_boca", caja.boca_id, "La boca ya no existe");
+  const fecha = U.fechaHora();
+  const detalle = {
+    fecha, boca_id: boca.id, boca: boca.nombre, caja_id: caja.id, caja: caja.nombre,
+    usuario_id: ctx.usuario.id, usuario: N.nombreActor(ctx), producto_id: producto?.id || null,
+    producto: producto?.nombre || null, codigo: producto?.codigo || null,
+    busqueda: busqueda || producto?.codigo || producto?.nombre || null,
+    cantidad: cantidad || null, stock: stock ?? null, venta_id: ventaId, faltantes,
+  };
+  let mensaje = ventaId
+    ? `${N.nombreActor(ctx)} registró la venta N° ${ventaId} con stock insuficiente en ${boca.nombre} · ${caja.nombre}, el ${fecha}. Revisá los movimientos de stock.`
+    : `${N.nombreActor(ctx)} intentó vender «${producto?.nombre || busqueda}» sin stock registrado suficiente en ${boca.nombre} · ${caja.nombre}, el ${fecha}. Revisá los movimientos de stock.`;
+  if (ventaId && faltantes?.length) {
+    mensaje += " Productos: " + faltantes.map((f) => `«${f.producto}»: solicitado ${f.pedido}, stock ${f.disponible}`).join("; ") + ".";
+  }
+  const id = await emitirAviso(t, ctx, {
+    tipo: "VENTA_SIN_STOCK", titulo: ventaId ? "Venta con stock insuficiente" : "Intento de venta sin stock", mensaje, detalle,
+  });
+  await N.auditar(t, ctx, ventaId ? "Aviso de venta con stock insuficiente" : "Intento de venta de producto sin stock", "producto", producto?.id || null, detalle);
+  return id;
+}
+
+async function avisarSinStock(ctx) {
+  const puesto = exigirPuesto(ctx);
+  exigirBoca(ctx, puesto.boca_id);
+  if (ctx.body.confirmar !== true) throw U.error("Aceptá el aviso para informar al administrador");
+  const productoId = ctx.body.producto_id ? U.id(ctx.body.producto_id, "El producto") : null;
+  const busqueda = U.texto(ctx.body.busqueda, { max: 160, requerido: !productoId, campo: "El producto o código buscado" });
+  const cantidad = U.numero(ctx.body.cantidad ?? 1, { min: 0.001, max: 99999, decimales: 3, campo: "La cantidad" });
+  return ctx.db.tx(async (t) => {
+    let producto = null;
+    let stock = null;
+    if (productoId) {
+      producto = await N.exigir(t, ctx, "predio_producto", productoId, "No encontramos el producto");
+      if (!Number(producto.activo) || producto.destino !== "VENTA_DIRECTA") throw U.error("Este producto no corresponde a una venta sin stock", 409);
+      stock = await N.stockActual(t, ctx, puesto.boca_id, productoId);
+      if (stock >= cantidad) throw U.error("El producto ya tiene stock suficiente. Volvé a buscarlo en la lista de ventas.", 409, { codigo: "STOCK_DISPONIBLE" });
+    }
+    const id = await avisarFaltante(t, ctx, { producto, busqueda, cantidad, stock });
+    const config = await N.leerConfig(t, ctx);
+    return { id, puede_vender: !!producto && config.vender_sin_stock !== "0", mensaje: "El aviso quedó registrado para el administrador. Si no hay internet, se enviará al sistema general al sincronizar." };
+  });
+}
 
 async function datosTicket(db, ctx, ventaId) {
   const v = await db.get(
@@ -55,6 +119,7 @@ function puedeVerVenta(ctx, v) {
 
 async function crearVenta(ctx) {
   const puesto = exigirPuesto(ctx);
+  exigirBoca(ctx, puesto.boca_id);
   const b = ctx.body;
   const items = Array.isArray(b.items) ? b.items : [];
   if (!items.length) throw U.error("Agregá al menos un producto a la venta");
@@ -76,17 +141,27 @@ async function crearVenta(ctx) {
   return ctx.db.tx(async (t) => {
     const caja = await N.exigir(t, ctx, "predio_caja", puesto.caja_id, "La caja ya no existe");
     if (!Number(caja.activo)) throw U.error("La caja está deshabilitada", 409);
+    if (Number(caja.boca_id) !== Number(puesto.boca_id)) throw U.error("Elegí nuevamente la boca y la caja", 409, { codigo: "SIN_PUESTO" });
     const config = await N.leerConfig(t, ctx);
     const lineas = [];
     const faltantes = [];
-    for (const [productoId, cantidad] of agrupados) {
+    const productos = new Map();
+    const stocks = new Map();
+    // Todas las cajas bloquean los productos en el mismo orden. Se conserva el
+    // orden del carrito para el ticket y se evitan bloqueos cruzados entre cajas.
+    for (const productoId of [...agrupados.keys()].sort((a, b) => a - b)) {
       const p = await N.exigir(t, ctx, "predio_producto", productoId, "Uno de los productos no existe");
+      productos.set(productoId, p);
+      if (MOVEDORES_STOCK.includes(p.destino)) stocks.set(productoId, await stockParaVenta(t, ctx, caja.boca_id, productoId));
+    }
+    for (const [productoId, cantidad] of agrupados) {
+      const p = productos.get(productoId);
       if (!Number(p.activo)) throw U.error(`«${p.nombre}» está dado de baja`);
       if (p.destino === "USO_INTERNO") throw U.error(`«${p.nombre}» es de uso interno y no se vende`);
       const precio = U.redondear(Number(p.precio_venta || 0), 2);
       if (precio <= 0) throw U.error(`«${p.nombre}» no tiene precio de venta: pedile al administrador que lo cargue`, 409, { codigo: "SIN_PRECIO" });
       if (MOVEDORES_STOCK.includes(p.destino)) {
-        const stock = await N.stockActual(t, ctx, caja.boca_id, productoId);
+        const stock = stocks.get(productoId);
         if (stock < cantidad) faltantes.push({ producto_id: productoId, producto: p.nombre, pedido: cantidad, disponible: stock });
       }
       lineas.push({ producto: p, cantidad, precio, subtotal: U.redondear(precio * cantidad, 2) });
@@ -95,7 +170,7 @@ async function crearVenta(ctx) {
       if (config.vender_sin_stock === "0") {
         throw U.error(`No hay stock suficiente de «${faltantes[0].producto}» en esta boca`, 409, { codigo: "SIN_STOCK", faltantes });
       }
-      if (!b.confirmar_sin_stock) {
+      if (b.confirmar_sin_stock !== true && b.confirmar_sin_stock !== 1) {
         throw U.error("Hay productos que figuran sin stock suficiente en esta boca", 409, { codigo: "STOCK_INSUFICIENTE", faltantes });
       }
     }
@@ -155,6 +230,7 @@ async function crearVenta(ctx) {
     }
     if (faltantes.length) {
       await N.auditar(t, ctx, "Venta sin stock suficiente", "venta", ventaId, { faltantes });
+      await avisarFaltante(t, ctx, { ventaId, faltantes });
     }
     return { id: ventaId, total, vuelto, mensaje: `Venta N° ${ventaId} registrada`, ticket: await datosTicket(t, ctx, ventaId) };
   });
@@ -238,6 +314,7 @@ async function habilitarVerCaja(ctx) {
 module.exports = {
   datosTicket,
   rutas: [
+    { m: "POST", p: "/ventas/avisar-sin-stock", h: avisarSinStock, escritura: true, soloLocal: true },
     { m: "POST", p: "/ventas", h: crearVenta, escritura: true, soloLocal: true },
     { m: "GET", p: "/ventas/:id", h: verVenta },
     { m: "POST", p: "/ventas/:id/impresion", h: registrarImpresion, escritura: true },

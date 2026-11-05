@@ -85,6 +85,19 @@ const TABLAS_LOCALES = [
      general_id INTEGER,
      actualizado TEXT
    )`,
+  `CREATE TABLE IF NOT EXISTS predio_acceso_control (
+     clave TEXT PRIMARY KEY, fallos INTEGER NOT NULL, inicio_ms INTEGER NOT NULL,
+     ultimo_ms INTEGER NOT NULL, bloqueado_hasta_ms INTEGER
+   )`,
+  `CREATE TABLE IF NOT EXISTS predio_acceso_intento (
+     id INTEGER PRIMARY KEY AUTOINCREMENT, cuenta_clave TEXT NOT NULL,
+     fecha_ms INTEGER NOT NULL, detalle TEXT NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS ix_acceso_intento_cuenta ON predio_acceso_intento (cuenta_clave, fecha_ms)`,
+  `CREATE TABLE IF NOT EXISTS predio_dispositivo (
+     id TEXT PRIMARY KEY, boca_id INTEGER, caja_id INTEGER, actualizado TEXT,
+     ip TEXT, agente TEXT
+   )`,
   `CREATE TABLE IF NOT EXISTS predio_comando_ejecutado (
      comando_id INTEGER PRIMARY KEY,
      fecha TEXT,

@@ -166,6 +166,8 @@
     var resultados = [];
     var indice = -1;
     var pedido = 0;
+    var seleccionando = false;
+    var enterPendiente = 0;
     var input = h("input.campo-control", {
       type: "text", placeholder: opciones.placeholder || "Escribí para buscar…", autocomplete: "off", spellcheck: "false",
       role: "combobox", "aria-expanded": "false", "aria-autocomplete": "list", id: opciones.id, autofocus: opciones.autofocus,
@@ -193,8 +195,18 @@
 
     function buscar(texto) {
       var n = ++pedido;
+      input.setAttribute("aria-busy", "true");
       var promesa = opciones.buscar ? opciones.buscar(texto) : opciones.fuente ? P.opciones(opciones.fuente).then(function (ops) { opciones.opciones = ops; delete opciones.fuente; return fuenteLocal(texto); }) : fuenteLocal(texto);
-      return promesa.then(function (r) { if (n === pedido) { resultados = r || []; pintar(texto); } return r; });
+      return promesa.then(function (r) {
+        if (n === pedido && !seleccionando) {
+          input.setAttribute("aria-busy", "false");
+          resultados = r || []; indice = -1; pintar(texto);
+        }
+        return r;
+      }).catch(function (e) {
+        if (n === pedido) { input.setAttribute("aria-busy", "false"); cerrarLista(); }
+        throw e;
+      });
     }
 
     // La lista flota sobre la página (position: fixed, en el body): ninguna ventana ni tabla con
@@ -228,6 +240,9 @@
       else { lista.style.bottom = "auto"; lista.style.top = (r.bottom + 6) + "px"; }
     }
     function cerrarLista() {
+      pedido++;
+      enterPendiente++;
+      input.setAttribute("aria-busy", "false");
       if (lista) {
         lista.remove();
         lista = null;
@@ -241,8 +256,11 @@
       abrir();
       P.vaciar(lista);
       if (!resultados.length) lista.appendChild(h("div.combo-vacio", texto ? "No hay coincidencias para «" + texto + "»" : "No hay opciones"));
+      if (resultados.some(function (o) { return o.requiereEleccion; })) {
+        lista.appendChild(h("div.combo-ayuda", { role: "status" }, "El código completo no coincide. Revisá el envase y elegí el producto de la lista para continuar."));
+      }
       resultados.forEach(function (o, i) {
-        lista.appendChild(h("div.combo-opcion", { role: "option", "aria-selected": String(i === indice), onmousedown: function (ev) { ev.preventDefault(); elegir(o); } },
+        lista.appendChild(h("button.combo-opcion", { type: "button", role: "option", "aria-selected": String(i === indice), onclick: function () { elegir(o); }, onmousedown: function (ev) { ev.preventDefault(); } },
           h("div", h("div.combo-opcion-principal", o.texto), o.detalle ? h("div.combo-opcion-detalle", o.detalle) : null),
           o.lado ? h("div.combo-opcion-lado", o.lado) : null));
       });
@@ -253,7 +271,7 @@
       ubicar();
     }
     function mover(d) {
-      if (!resultados.length) return;
+      if (!lista || !resultados.length) return;
       indice = (indice + d + resultados.length) % resultados.length;
       Array.prototype.forEach.call(lista.querySelectorAll(".combo-opcion"), function (el, i) {
         el.setAttribute("aria-selected", String(i === indice));
@@ -261,45 +279,59 @@
       });
     }
     function elegir(o) {
-      actual = o;
-      input.value = opciones.limpiarAlElegir ? "" : o.texto;
+      if (seleccionando) return;
+      seleccionando = true;
       cerrarLista();
-      if (opciones.alElegir) opciones.alElegir(o);
-      if (opciones.limpiarAlElegir) { actual = null; input.focus(); }
+      Promise.resolve().then(function () { return opciones.antesDeElegir ? opciones.antesDeElegir(o) : true; }).then(function (permitido) {
+        if (permitido === false) return;
+        actual = o;
+        input.value = opciones.limpiarAlElegir ? "" : o.texto;
+        if (opciones.alElegir) opciones.alElegir(o);
+        if (opciones.limpiarAlElegir) { actual = null; input.focus(); }
+      }).catch(P.error).finally(function () { seleccionando = false; });
     }
 
     var temporizador = null;
     input.addEventListener("input", function () {
       actual = null;
+      cerrarLista();
+      resultados = [];
+      enterPendiente++;
       if (opciones.alCambiarTexto) opciones.alCambiarTexto(input.value);
       clearTimeout(temporizador);
-      temporizador = setTimeout(function () { buscar(input.value.trim()); }, opciones.buscar ? 160 : 40);
+      temporizador = setTimeout(function () { if (!seleccionando) buscar(input.value.trim()).catch(P.error); }, opciones.buscar ? 160 : 40);
     });
-    input.addEventListener("focus", function () { if (opciones.abrirAlEnfocar !== false) buscar(actual ? "" : input.value.trim()); });
+    input.addEventListener("focus", function () { if (!seleccionando && opciones.abrirAlEnfocar !== false) buscar(actual ? "" : input.value.trim()).catch(P.error); });
     input.addEventListener("blur", function () {
       setTimeout(function () {
+        if (document.activeElement === input) return;
+        if (lista && lista.contains(document.activeElement)) return;
         cerrarLista();
-        if (!actual && !opciones.textoLibre && !opciones.limpiarAlElegir) input.value = "";
+        if (!seleccionando && !actual && !opciones.textoLibre && !opciones.limpiarAlElegir) input.value = "";
         if (actual) input.value = actual.texto;
       }, 120);
     });
     input.addEventListener("keydown", function (ev) {
-      if (ev.key === "ArrowDown") { ev.preventDefault(); if (!lista) buscar(input.value.trim()); else mover(1); }
+      if (seleccionando) { if (ev.key === "Enter") ev.preventDefault(); return; }
+      if (ev.key === "ArrowDown") { ev.preventDefault(); if (!lista) buscar(input.value.trim()).catch(P.error); else mover(1); }
       else if (ev.key === "ArrowUp") { ev.preventDefault(); mover(-1); }
       else if (ev.key === "Escape") { if (lista) { ev.stopPropagation(); cerrarLista(); } }
       else if (ev.key === "Enter") {
         ev.preventDefault();
         var texto = input.value.trim();
-        if (lista && indice >= 0 && resultados[indice]) { elegir(resultados[indice]); return; }
+        if (lista && indice >= 0 && resultados[indice] && !resultados[indice].requiereEleccion) { elegir(resultados[indice]); return; }
         clearTimeout(temporizador);
+        var intento = ++enterPendiente;
         // Escáner: se resuelve con el texto completo, sin esperar la búsqueda en curso.
         buscar(texto).then(function (r) {
+          if (intento !== enterPendiente || texto !== input.value.trim() || seleccionando) return;
           r = r || [];
-          var exacto = r.filter(function (o) { return o.exacto || (o.codigo && String(o.codigo) === texto); })[0];
-          if (exacto) elegir(exacto);
-          else if (r.length === 1 && texto) elegir(r[0]);
-          else if (opciones.alEnterSinCoincidencia) opciones.alEnterSinCoincidencia(texto);
-        });
+          var exactos = r.filter(function (o) { return !o.requiereEleccion && (o.exacto || (o.codigo && String(o.codigo) === texto)); });
+          if (exactos.length === 1) elegir(exactos[0]);
+          else if (r.length === 1 && texto && opciones.elegirUnico !== false && !r[0].requiereEleccion) elegir(r[0]);
+          else if (r.length && opciones.alEnterConResultados) opciones.alEnterConResultados(texto, r);
+          else if (!r.length && opciones.alEnterSinCoincidencia) opciones.alEnterSinCoincidencia(texto);
+        }).catch(P.error);
       }
     });
 
@@ -309,29 +341,67 @@
       valor: function () { return actual ? actual.valor : null; },
       opcion: function () { return actual; },
       fijar: function (valor, texto, extra) { actual = valor === null || valor === undefined ? null : Object.assign({ valor: valor, texto: texto }, extra || {}); input.value = actual ? texto : ""; },
-      limpiar: function () { actual = null; input.value = ""; },
+      limpiar: function () { actual = null; input.value = ""; cerrarLista(); },
       foco: function () { input.focus(); },
       recargar: function (ops) { opciones.opciones = ops; },
     };
   };
 
+  // Una sugerencia nunca cambia el catálogo hasta que la persona compara ambos códigos.
+  P.confirmarCodigoProducto = function (producto, codigoLeido) {
+    return new Promise(function (resolver) {
+      var correcto = P.btn("Corregir y usar producto", { tipo: "primario", icono: "check", onclick: function () {
+        continuar.disabled = true;
+        P.ejecutar(correcto, function () {
+          return P.post("/productos/" + producto.id + "/codigo-barras", {
+            codigo_anterior: producto.codigo, codigo_nuevo: codigoLeido, confirmar: true,
+          }).then(function (r) {
+            if (!r.encolado) { producto.codigo = r.codigo; P.aviso(r.mensaje || "Código de barras corregido", "ok"); }
+            m.cerrar(true);
+          });
+        }).catch(function () {}).finally(function () { continuar.disabled = false; });
+      } });
+      var continuar = P.btn("Continuar sin modificar", { tipo: "secundario", onclick: function () { m.cerrar(true); } });
+      var m = P.modal({
+        titulo: "Verificá el código de barras",
+        contenido: h("div.columna",
+          P.mensaje("La coincidencia es aproximada. Comprobá que el nombre, la presentación y el envase correspondan al mismo producto antes de corregirlo.", "aviso"),
+          h("div.datos.codigo-comparacion", P.dato("Producto elegido", producto.nombre), P.dato("Código guardado", producto.codigo || "Sin código"), P.dato("Código leído", codigoLeido)),
+          h("p.texto-3.chico", "Si confirmás la corrección, las próximas lecturas de este código encontrarán el producto directamente.")),
+        acciones: [continuar, correcto],
+        alCerrar: function (v) { resolver(v === true); },
+      });
+    });
+  };
+
   // Desplegable de productos (busca en el servidor; acepta código de barras).
   P.comboProducto = function (opciones) {
     opciones = opciones || {};
-    return P.combo(Object.assign({
+    var config = Object.assign({
       placeholder: "Escaneá el código o escribí el nombre del producto",
+      elegirUnico: false,
       buscar: function (texto) {
-        return P.get("/productos/buscar" + P.qs({ q: texto, boca_id: opciones.bocaId ? opciones.bocaId() : null, venta: opciones.venta ? 1 : null })).then(function (r) {
+        return P.get("/productos/buscar" + P.qs({ q: texto, boca_id: opciones.bocaId ? opciones.bocaId() : null, venta: opciones.venta ? 1 : null, sin_stock: opciones.sinStock ? 1 : null })).then(function (r) {
           return r.map(function (p) {
             return {
-              valor: p.id, texto: p.nombre, codigo: p.codigo, exacto: p.exacto, dato: p,
-              detalle: [p.codigo ? "Código " + p.codigo : null, opciones.mostrarStock && opciones.bocaId && opciones.bocaId() ? "Stock en la boca: " + P.f.numero(p.stock_boca) : null].filter(Boolean).join(" · "),
+              valor: p.id, texto: p.nombre, codigo: p.codigo, exacto: p.exacto, dato: p, busqueda: texto,
+              requiereEleccion: !!p.sugerido,
+              detalle: [p.sugerido ? "Código aproximado: revisá el envase" : null, p.codigo ? "Código " + p.codigo : null, opciones.mostrarStock && opciones.bocaId && opciones.bocaId() ? "Stock en la boca: " + P.f.numero(p.stock_boca) : null].filter(Boolean).join(" · "),
               lado: opciones.ladoCompra ? P.f.pesos(p.precio_compra) : P.f.pesos(p.precio_venta),
             };
           });
         });
       },
-    }, opciones));
+    }, opciones);
+    config.antesDeElegir = function (o) {
+      var comprobacion = o.requiereEleccion ? P.confirmarCodigoProducto(o.dato, o.busqueda) : Promise.resolve(true);
+      return comprobacion.then(function (permitido) {
+        if (!permitido) return false;
+        o.codigo = o.dato.codigo;
+        return opciones.antesDeElegir ? opciones.antesDeElegir(o) : true;
+      });
+    };
+    return P.combo(config);
   };
 
   // ------------------------------------------------------------------ tabla de listados

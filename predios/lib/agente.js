@@ -23,6 +23,45 @@ const { verificar } = require("./firma");
 
 const LOTE_PUSH = 400;
 
+// Manifiesto explícito, revisado contra el producto real: nunca completa códigos
+// por longitud ni crea un usuario ficticio para ejecutar la reparación.
+async function corregirCodigosVerificados(db, pid, cuerpo) {
+  const productos = cuerpo?.productos;
+  if (!Array.isArray(productos) || !productos.length || productos.length > 100) throw U.error("La corrección necesita entre 1 y 100 productos verificados");
+  const { gtinValido } = require("./codigo-barras");
+  const ids = new Set();
+  const manifiesto = productos.map((p) => {
+    if (!p || typeof p !== "object" || Array.isArray(p)) throw U.error("El producto del manifiesto no es válido");
+    const id = U.id(p.producto_id, "El producto verificado");
+    if (ids.has(id)) throw U.error("El manifiesto repite un producto");
+    ids.add(id);
+    const anterior = U.texto(p.codigo_anterior, { max: 60, requerido: true, campo: "El código anterior verificado" });
+    const nuevo = U.texto(p.codigo_nuevo, { max: 14, requerido: true, campo: "El GTIN verificado" });
+    if (!gtinValido(nuevo)) throw U.error("El código nuevo del manifiesto no es un GTIN válido");
+    if (typeof p.nombre_esperado !== "string" || !p.nombre_esperado.trim() || p.nombre_esperado.length > 160) throw U.error("Indicá el nombre exacto del producto verificado");
+    return { id, anterior, nuevo, nombre: p.nombre_esperado };
+  });
+  const apiLocal = require("./api");
+  return db.tx(async (t) => {
+    const ctx = {
+      db: t, pid: U.id(pid, "El predio"), modo: "local", origen: "SISTEMA", ip: null, sesion: {}, query: {},
+      usuario: { id: null, nombre: "Corrección verificada del sistema general", rol: "ADMIN", bocas: [] },
+    };
+    const resultados = [];
+    for (const p of manifiesto) {
+      const fila = await t.get(`SELECT nombre, codigo, activo FROM predio_producto WHERE predio_id = ? AND id = ?${t.forUpdate}`, [ctx.pid, p.id]);
+      if (!fila || fila.nombre !== p.nombre || Number(fila.activo) !== 1) throw U.error(`El producto ${p.id} no coincide con la ficha verificada. No se aplicaron las correcciones.`, 409);
+      if (fila.codigo === p.nuevo) {
+        resultados.push({ id: p.id, codigo: p.nuevo, estado: "YA_CORREGIDO" });
+        continue;
+      }
+      const r = await apiLocal.ejecutar({ ...ctx, body: { codigo_anterior: p.anterior, codigo_nuevo: p.nuevo, confirmar: true } }, "POST", `/productos/${p.id}/codigo-barras`);
+      resultados.push({ id: r.id, codigo: r.codigo, estado: "CORREGIDO" });
+    }
+    return { mensaje: "Códigos verificados procesados", productos: resultados };
+  });
+}
+
 function crearAgente({ db, config, base, version, log, api, alActualizar, alReiniciar }) {
   const pid = Number(config.predio_id);
   const estado = {
@@ -233,6 +272,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
 
   async function comandoSistema(c) {
     const accion = c.ruta;
+    if (accion === "CORREGIR_CODIGOS_VERIFICADOS") return corregirCodigosVerificados(db, pid, c.cuerpo);
     if (accion === "SINCRONIZAR_TODO") {
       await reenviarTodo();
       return { mensaje: "Se reenviarán todos los datos" };
@@ -487,4 +527,4 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
   }
 }
 
-module.exports = { crearAgente };
+module.exports = { crearAgente, corregirCodigosVerificados };

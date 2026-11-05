@@ -5,6 +5,7 @@
 
 const U = require("../util");
 const N = require("../negocio");
+const { listarAvisos, leerAviso } = require("../avisos");
 const { TIPOS_PERMISO, textoDe } = require("../listados");
 const { exigirAdmin, esAdmin, bocasDe, validarClave, exigirPuesto } = require("./comun");
 
@@ -73,6 +74,7 @@ async function avisos(ctx) {
   const pid = ctx.pid;
   const hoy = U.hoy();
   const salida = { permisos: [], solicitudes_despachar: 0, solicitudes_recibir: 0, aperturas: [], vencimientos: 0, stock_negativo: 0, mis_permisos: [] };
+  salida.notificaciones = await listarAvisos(ctx);
   if (esAdmin(ctx)) {
     salida.permisos = await db.all(
       `SELECT x.id, x.tipo, x.usuario_nombre, x.detalle, x.fecha_solicitud, b.nombre AS boca, c.nombre AS caja
@@ -113,7 +115,7 @@ async function avisos(ctx) {
         [pid, ctx.sesion.caja_id, hoy]) || null;
     }
   }
-  salida.total = salida.permisos.length + salida.aperturas.length + salida.solicitudes_despachar + salida.solicitudes_recibir;
+  salida.total = salida.notificaciones.length + salida.permisos.length + salida.aperturas.length + salida.solicitudes_despachar + salida.solicitudes_recibir;
   return salida;
 }
 
@@ -219,6 +221,7 @@ module.exports = {
     { m: "POST", p: "/permisos/:id/resolver", h: resolver, escritura: true, roles: ["ADMIN"] },
     { m: "POST", p: "/permisos/probar-clave", h: probarClave, soloLocal: true },
     { m: "GET", p: "/avisos", h: avisos },
+    { m: "POST", p: "/avisos/:id/leer", h: leerAviso, escritura: true },
     { m: "GET", p: "/estadisticas", h: estadisticas, roles: ["ADMIN"] },
     { m: "GET", p: "/inicio", h: inicio },
   ],

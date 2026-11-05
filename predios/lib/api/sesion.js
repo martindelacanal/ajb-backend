@@ -6,25 +6,7 @@
 
 const U = require("../util");
 const N = require("../negocio");
-
-const VENTANA_MS = 15 * 60 * 1000;
-const MAX_FALLOS = 10;
-const intentos = new Map();
-
-function controlarIntentos(ip) {
-  const ahora = Date.now();
-  const e = intentos.get(ip);
-  if (e && ahora - e.inicio < VENTANA_MS && e.fallos >= MAX_FALLOS) {
-    throw U.error("Demasiados intentos fallidos. Esperá unos minutos y volvé a probar.", 429);
-  }
-}
-function registrarFallo(ip) {
-  const ahora = Date.now();
-  const e = intentos.get(ip);
-  if (!e || ahora - e.inicio >= VENTANA_MS) intentos.set(ip, { inicio: ahora, fallos: 1 });
-  else e.fallos++;
-  if (intentos.size > 5000) intentos.delete(intentos.keys().next().value);
-}
+const acceso = require("../acceso");
 
 async function bocasUsuario(db, ctx, usuario) {
   if (usuario.rol === "ADMIN") {
@@ -89,28 +71,35 @@ async function asegurarUsuarioGeneral(ctx, datos) {
 }
 
 async function login(ctx) {
-  const ip = String(ctx.ip || "");
-  controlarIntentos(ip);
+  return acceso.serializarIngreso(ctx, () => ingresar(ctx));
+}
+
+async function ingresar(ctx) {
   const identificador = String(ctx.body.usuario || "").trim().toLowerCase();
   const password = String(ctx.body.password || "");
   const recordar = U.bool(ctx.body.recordar);
   if (!identificador || !password) throw U.error("Escribí tu usuario y tu contraseña");
   let usuario = await ctx.db.get("SELECT * FROM predio_usuario WHERE predio_id = ? AND usuario = ? AND es_admin_general = 0", [ctx.pid, identificador]);
+  const dni = identificador.replace(/[.\s]/g, "");
+  const documento = /^\d{6,9}$/.test(dni) ? String(Number(dni)) : null;
+  const cuenta = usuario || (documento ? await ctx.db.get("SELECT * FROM predio_usuario WHERE predio_id = ? AND es_admin_general = 1 AND documento = ?", [ctx.pid, documento]) : null);
+  const claves = acceso.clavesDe(ctx, documento || identificador, cuenta);
+  await acceso.controlarIntentos(ctx, claves);
   if (usuario && Number(usuario.activo) === 1 && U.verificarPassword(password, usuario.password_hash)) {
     // usuario del predio
   } else {
     usuario = null;
-    const dni = identificador.replace(/[.\s]/g, "");
-    if (/^\d{6,9}$/.test(dni)) {
-      const general = await verificarAdminGeneral(ctx, String(Number(dni)), password);
+    if (documento) {
+      const general = await verificarAdminGeneral(ctx, documento, password);
       if (general) usuario = await asegurarUsuarioGeneral(ctx, general);
     }
   }
   if (!usuario) {
-    registrarFallo(ip);
+    const bloqueo = await acceso.registrarFallo(ctx, claves, documento || identificador, cuenta);
+    if (bloqueo) throw bloqueo;
     throw U.error("Usuario o contraseña incorrectos", 401);
   }
-  intentos.delete(ip);
+  await acceso.registrarExito(ctx, claves);
   const token = await crearSesion(ctx, usuario, recordar);
   return { token, recordar: !!recordar, ...(await armarSesion(ctx, usuario, {})) };
 }
@@ -202,6 +191,7 @@ async function elegirPuesto(ctx) {
   });
   await ctx.db.run("UPDATE predio_sesion SET boca_id = ?, caja_id = ?, turno_id = ? WHERE token_hash = ?",
     [bocaId, cajaId, cajaId ? turnoId : null, sesion.token_hash]);
+  await acceso.registrarPuesto(ctx, bocaId, cajaId);
   return armarSesion(ctx, u, { boca_id: bocaId, caja_id: cajaId, turno_id: cajaId ? turnoId : null });
 }
 

@@ -116,6 +116,7 @@
     var combo = P.comboProducto({
       ladoCompra: true, limpiarAlElegir: false, abrirAlEnfocar: false,
       placeholder: "Escaneá o buscá el producto",
+      alCambiarTexto: function () { elegido = null; ayudaProducto.textContent = ""; },
       alElegir: function (o) {
         elegido = o.dato;
         ayudaProducto.textContent = "Precio anterior: " + P.f.pesos(elegido.precio_compra) + " · Margen: " + P.f.pct(elegido.margen) + " · Venta actual: " + P.f.pesos(elegido.precio_venta);

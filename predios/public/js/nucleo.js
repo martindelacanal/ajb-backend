@@ -198,6 +198,30 @@
 
   // ------------------------------------------------------------------ sesión
   var CLAVE = P.modo === "remoto" ? "predio.remoto." + (P.predioCodigo || "") : "predio.sesion";
+  var CLAVE_EQUIPO = "predio.equipo." + (P.predioCodigo || "local");
+  var equipoMemoria = null;
+  P.equipo = {
+    datos: function () {
+      if (P.modo !== "local") return {};
+      if (!equipoMemoria) {
+        try { equipoMemoria = JSON.parse(localStorage.getItem(CLAVE_EQUIPO) || "null"); } catch (e) { /* almacenamiento restringido */ }
+        if (!equipoMemoria || !/^[a-zA-Z0-9_-]{16,80}$/.test(equipoMemoria.dispositivo_id || "")) {
+          var aleatorio = new Uint8Array(16);
+          if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(aleatorio);
+          else for (var i = 0; i < aleatorio.length; i++) aleatorio[i] = Math.floor(Math.random() * 256);
+          equipoMemoria = { dispositivo_id: Array.prototype.map.call(aleatorio, function (n) { return ("0" + n.toString(16)).slice(-2); }).join("") };
+        }
+        try { localStorage.setItem(CLAVE_EQUIPO, JSON.stringify(equipoMemoria)); } catch (e) { /* se conserva durante esta pestaña */ }
+      }
+      return { dispositivo_id: equipoMemoria.dispositivo_id, ultimo_puesto: equipoMemoria.ultimo_puesto || null };
+    },
+    recordarPuesto: function (puesto) {
+      if (P.modo !== "local" || !puesto || !puesto.boca_id) return;
+      P.equipo.datos();
+      equipoMemoria.ultimo_puesto = { boca_id: puesto.boca_id, caja_id: puesto.caja_id || null, boca: puesto.boca, caja: puesto.caja || null };
+      try { localStorage.setItem(CLAVE_EQUIPO, JSON.stringify(equipoMemoria)); } catch (e) { /* se conserva durante esta pestaña */ }
+    },
+  };
   P.sesion = {
     token: function () {
       try { return sessionStorage.getItem(CLAVE) || localStorage.getItem(CLAVE); } catch (e) { return null; }
