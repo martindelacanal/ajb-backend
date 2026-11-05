@@ -83,7 +83,7 @@
         ancho: "ancha",
         contenido: h("div.columna",
           h("div.grilla.grilla-2", P.campo("Sale de (boca de origen)", origen), P.campo("Llega a (boca de destino)", destino)),
-          h("div.fila", { style: { alignItems: "flex-end" } }, h("div", { style: { flex: "1 1 300px" } }, P.campo("Producto", combo.el), disponible), P.campo("Cantidad", cantidad),
+          h("div.fila-campos", P.campo("Producto", h("div", combo.el, disponible), { clase: "crece" }), P.campo("Cantidad", cantidad),
             h("div.campo", h("span.campo-etiqueta", " "), P.btn("Agregar", { tipo: "celeste", icono: "mas", onclick: agregar }))),
           lista,
           P.esAdmin() ? baja : null,

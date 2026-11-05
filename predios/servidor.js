@@ -11,6 +11,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const zlib = require("node:zlib");
 const os = require("node:os");
+const { execFile } = require("node:child_process");
 const U = require("./lib/util");
 const { crearSqlite, asegurarEsquema, leerMeta, escribirMeta } = require("./lib/db-sqlite");
 const api = require("./lib/api");
@@ -126,6 +127,119 @@ function direccionesLan() {
   return salida;
 }
 
+// ------------------------------------------------------------------ nombre de la notebook en la red
+// Las PCs de la LAN pueden entrar con el nombre del equipo (http://camping:8080) en lugar de la IP:
+// Windows lo anuncia solo (NetBIOS/LLMNR). Cambiarlo es renombrar el equipo: se aplica al reiniciar.
+
+function estadoRed() {
+  const sufijo = config.puerto === 80 ? "" : `:${config.puerto}`;
+  const nombre = os.hostname();
+  const pendiente = leerMeta(db, "nombre_red_pendiente");
+  return {
+    nombre,
+    pendiente: pendiente && pendiente.toUpperCase() !== nombre.toUpperCase() ? pendiente : null,
+    por_nombre: `http://${nombre.toLowerCase()}${sufijo}`,
+    direcciones: direccionesLan(),
+    puede_cambiar: process.platform === "win32",
+  };
+}
+
+function ejecutarPowershell(script) {
+  return new Promise((resolve, reject) => {
+    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+      { timeout: 90000, windowsHide: true }, (e, salida, errores) => {
+        if (e) reject(new Error(String(errores || e.message).trim().split(/\r?\n/).slice(0, 3).join(" ")));
+        else resolve(String(salida || ""));
+      });
+  });
+}
+
+async function cambiarNombreRed(ctx, nombre) {
+  nombre = String(nombre || "").trim();
+  if (!/^[A-Za-z][A-Za-z0-9-]{1,14}$/.test(nombre) || nombre.endsWith("-")) {
+    throw U.error("Usá de 2 a 15 letras, números o guiones, empezando con una letra. Por ejemplo: CAMPING");
+  }
+  if (process.platform !== "win32") throw U.error("El nombre en la red se cambia en la notebook servidor (Windows)", 409);
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `if ($env:COMPUTERNAME -ne '${nombre}') { Rename-Computer -NewName '${nombre}' -Force -WarningAction SilentlyContinue }`,
+    // Que la notebook responda cuando las PCs preguntan por su nombre (NetBIOS, mDNS y LLMNR).
+    "Get-NetFirewallRule -DisplayName 'AJB Predio (nombre en la red)' -ErrorAction SilentlyContinue | Remove-NetFirewallRule",
+    "New-NetFirewallRule -DisplayName 'AJB Predio (nombre en la red)' -Direction Inbound -Protocol UDP -LocalPort 137,5353,5355 -Action Allow -Profile Any | Out-Null",
+  ].join("; ");
+  try {
+    await ejecutarPowershell(script);
+  } catch (e) {
+    throw U.error(`Windows no dejó cambiar el nombre: ${e.message.slice(0, 240)}`, 409);
+  }
+  escribirMeta(db, "nombre_red_pendiente", nombre.toUpperCase());
+  await db.tx((t) => N.auditar(t, ctx, "Cambio del nombre de la notebook en la red", "sistema", null, { antes: os.hostname(), despues: nombre.toUpperCase() }));
+  return { ...estadoRed(), mensaje: `Listo: la notebook se va a llamar ${nombre.toUpperCase()} después de reiniciarla.` };
+}
+
+// ------------------------------------------------------------------ galería del ingreso
+// Las fotos del ingreso son las de la galería del sistema general (Mi AJB). Se bajan cuando hay
+// internet y quedan guardadas en la notebook, así se ven aunque se corte; sin fotos, va el logo.
+
+const DIR_GALERIA = path.join(BASE, "datos", "galeria");
+const TIPOS_GALERIA = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "image/avif": ".avif" };
+let galeriaEnCurso = null;
+
+function leerGaleria() {
+  try { return JSON.parse(fs.readFileSync(path.join(DIR_GALERIA, "indice.json"), "utf8")); } catch (_e) { return { fecha: null, imagenes: [] }; }
+}
+
+function actualizarGaleria() {
+  if (!config.servidor) return Promise.resolve(leerGaleria());
+  if (galeriaEnCurso) return galeriaEnCurso;
+  galeriaEnCurso = (async () => {
+    fs.mkdirSync(DIR_GALERIA, { recursive: true });
+    const r = await fetch(`${config.servidor.replace(/\/+$/, "")}/login/imagenes`, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const lista = await r.json();
+    const previa = leerGaleria();
+    const imagenes = [];
+    for (const img of (Array.isArray(lista) ? lista : []).filter((i) => i && i.imagen_url).slice(0, 10)) {
+      const clave = U.sha256(String(img.archivo || img.id || String(img.imagen_url).split("?")[0])).slice(0, 16);
+      const guardada = previa.imagenes.find((x) => x.clave === clave && fs.existsSync(path.join(DIR_GALERIA, x.archivo)));
+      if (guardada) { imagenes.push(guardada); continue; }
+      try {
+        const d = await fetch(img.imagen_url, { signal: AbortSignal.timeout(30000) });
+        const tipo = String(d.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+        if (!d.ok || !TIPOS_GALERIA[tipo]) continue;
+        const buffer = Buffer.from(await d.arrayBuffer());
+        if (!buffer.length || buffer.length > 8 * 1024 * 1024) continue;
+        const archivo = `${clave}${TIPOS_GALERIA[tipo]}`;
+        fs.writeFileSync(path.join(DIR_GALERIA, archivo), buffer);
+        imagenes.push({ clave, archivo, tipo });
+      } catch (e) {
+        log(`Galería del ingreso: no se pudo bajar una foto (${e.message})`);
+      }
+    }
+    const indice = { fecha: U.fechaHora(), imagenes };
+    fs.writeFileSync(path.join(DIR_GALERIA, "indice.json"), JSON.stringify(indice));
+    for (const f of fs.readdirSync(DIR_GALERIA)) {
+      if (f !== "indice.json" && !imagenes.some((x) => x.archivo === f)) fs.rmSync(path.join(DIR_GALERIA, f), { force: true });
+    }
+    return indice;
+  })().finally(() => { galeriaEnCurso = null; });
+  return galeriaEnCurso;
+}
+
+function rutaGaleria(req, res, rutaApi) {
+  if (rutaApi === "/login/imagenes") {
+    const g = leerGaleria();
+    const vieja = !g.fecha || Date.now() - Date.parse(`${g.fecha.replace(" ", "T")}-03:00`) > 6 * 3600 * 1000;
+    if (vieja) actualizarGaleria().catch(() => { /* sin internet: quedan las guardadas */ });
+    return enviar(req, res, 200, { imagenes: g.imagenes.map((x) => ({ url: `login/imagen/${x.archivo}` })) });
+  }
+  const m = /^\/login\/imagen\/([a-f0-9]{16}\.(jpg|png|webp|gif|avif))$/.exec(rutaApi);
+  const archivo = m && path.join(DIR_GALERIA, m[1]);
+  if (!archivo || !fs.existsSync(archivo)) return enviar(req, res, 404, { mensaje: "No encontrada" });
+  const tipo = Object.keys(TIPOS_GALERIA).find((t) => TIPOS_GALERIA[t] === `.${m[2]}`);
+  return enviar(req, res, 200, fs.readFileSync(archivo), tipo, { "Cache-Control": "public, max-age=86400" });
+}
+
 async function rutaSistema(ctx, metodo, ruta, req, res) {
   if (ctx.usuario?.rol !== "ADMIN") throw U.error("Esta sección es del administrador", 403);
   if (metodo === "GET" && ruta === "/sistema/estado") {
@@ -136,9 +250,23 @@ async function rutaSistema(ctx, metodo, ruta, req, res) {
       sincronizacion: agente.estadoPublico(),
       equipo: { nombre: os.hostname(), sistema: `${os.type()} ${os.release()}`, node: process.version, memoria_libre: os.freemem(), memoria_total: os.totalmem(), encendido_hace: Math.round(os.uptime()) },
       servidor: { puerto: config.puerto, direcciones: direccionesLan(), base: BASE, version: VERSION, iniciado: servidorIniciado },
+      red: estadoRed(),
       base_datos: { archivo: db.archivo, tamano },
       respaldos: respaldos.slice(0, 40),
     };
+  }
+  if (metodo === "GET" && ruta === "/sistema/red") return estadoRed();
+  if (metodo === "POST" && ruta === "/sistema/red") {
+    const cuerpo = await leerCuerpo(req, 10000);
+    return cambiarNombreRed(ctx, cuerpo.nombre);
+  }
+  if (metodo === "POST" && ruta === "/sistema/reiniciar-equipo") {
+    if (process.platform !== "win32") throw U.error("Esto se hace en la notebook servidor (Windows)", 409);
+    await db.tx((t) => N.auditar(t, ctx, "Reinicio de la notebook servidor", "sistema", null, null));
+    execFile("shutdown.exe", ["/r", "/t", "20", "/c", "AJB Predio: reinicio pedido por el administrador"], { windowsHide: true }, (e) => {
+      if (e) log(`No se pudo reiniciar la notebook: ${e.message}`);
+    });
+    return { mensaje: "La notebook se reinicia en 20 segundos. El sistema vuelve solo en uno o dos minutos." };
   }
   if (metodo === "POST" && ruta === "/sistema/sincronizar") {
     const r = await agente.sincronizarAhora();
@@ -181,7 +309,7 @@ async function rutaSistema(ctx, metodo, ruta, req, res) {
 const TIPOS = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
   ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".ico": "image/x-icon", ".json": "application/json",
-  ".woff2": "font/woff2", ".woff": "font/woff", ".txt": "text/plain; charset=utf-8", ".webmanifest": "application/manifest+json",
+  ".woff2": "font/woff2", ".woff": "font/woff", ".webp": "image/webp", ".jpeg": "image/jpeg", ".gif": "image/gif", ".txt": "text/plain; charset=utf-8", ".webmanifest": "application/manifest+json",
 };
 
 function cabecerasSeguridad(res) {
@@ -267,6 +395,7 @@ async function manejar(req, res) {
     const token = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization || "")?.[1];
     const auth = await sesion.autenticar(ctx, token);
     if (auth) Object.assign(ctx, auth);
+    if ((req.method === "GET" || req.method === "HEAD") && rutaApi.startsWith("/login/imagen")) return rutaGaleria(req, res, rutaApi);
     if (rutaApi.startsWith("/sistema/")) {
       if (!ctx.usuario) throw U.error("Iniciá sesión para continuar", 401, { codigo: "SIN_SESION" });
       const r = await rutaSistema(ctx, req.method, rutaApi, req, res);
@@ -335,6 +464,9 @@ servidor.listen(config.puerto, "0.0.0.0", () => {
   agente.iniciar();
   respaldoDiario();
   setInterval(respaldoDiario, 3 * 3600 * 1000).unref();
+  // Fotos del ingreso: al arrancar y cada 6 horas (si no hay internet, quedan las guardadas).
+  setTimeout(() => actualizarGaleria().catch(() => {}), 15000).unref();
+  setInterval(() => actualizarGaleria().catch(() => {}), 6 * 3600 * 1000).unref();
   // Limpieza de sesiones vencidas.
   setInterval(() => {
     db.run("DELETE FROM predio_sesion WHERE vence IS NOT NULL AND vence < ?", [U.fechaHora()]).catch(() => {});

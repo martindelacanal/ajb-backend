@@ -110,6 +110,10 @@
     tag: "M3 3h8l10 10-8 8L3 11z|M7.5 7.5h.01",
     mensaje: "M4 4h16v12H8l-4 4z",
     escudo: "M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z",
+    persona: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z|M4 21a8 8 0 0 1 16 0",
+    "ojo-tachado": "M3 3l18 18|M10.6 5.1A10.4 10.4 0 0 1 12 5c6.5 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.1|M6.6 6.6C3.9 8.4 2 12 2 12s3.5 7 10 7a9.7 9.7 0 0 0 5.4-1.6|M9.9 9.9a3 3 0 0 0 4.2 4.2",
+    flecha: "M5 12h14|M13 6l6 6-6 6",
+    red: "M5 12.5a10 10 0 0 1 14 0|M8.5 16a5 5 0 0 1 7 0|M2 9a15 15 0 0 1 20 0|M12 19.5h.01",
   };
   P.icono = function (nombre, clase) {
     var svg = document.createElementNS(SVG, "svg");
@@ -328,7 +332,11 @@
     var ventana = P.h("div.ventana" + (opciones.ancho ? ".ventana-" + opciones.ancho : ""), { role: "dialog", "aria-modal": "true", "aria-label": opciones.titulo },
       P.h("div.ventana-cabecera",
         P.h("div", P.h("h2", opciones.titulo), opciones.subtitulo ? P.h("p", opciones.subtitulo) : null),
-        opciones.sinCerrar ? null : P.btn("", { tipo: "texto", icono: "cerrar", etiqueta: "Cerrar", onclick: function () { api.cerrar(); } })),
+        opciones.sinCerrar ? null : (function () {
+          var x = P.btn("", { tipo: "texto", icono: "cerrar", etiqueta: "Cerrar", onclick: function () { api.cerrar(); } });
+          x.classList.add("ventana-cerrar");
+          return x;
+        })()),
       cuerpo, pie);
     if (opciones.contenido) P.reemplazar(cuerpo, opciones.contenido);
     (opciones.acciones || []).forEach(function (a) { if (a) pie.appendChild(a instanceof Node ? a : P.btn(a.texto, a)); });
@@ -356,7 +364,7 @@
   document.addEventListener("keydown", function (ev) {
     if (ev.key === "Escape" && abiertas.length) {
       var ultima = abiertas[abiertas.length - 1];
-      if (!ultima.velo.querySelector(".combo-lista")) { ev.preventDefault(); ultima.cerrar(); }
+      if (!document.querySelector(".combo-lista")) { ev.preventDefault(); ultima.cerrar(); }
     }
   });
   P.hayVentana = function () { return abiertas.length > 0; };

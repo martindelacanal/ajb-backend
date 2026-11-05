@@ -159,3 +159,24 @@ test("importa el catálogo y elimina de a uno, varios o por filtro", async () =>
   const auditoria = await ok("GET", "/listados/auditoria?q=Eliminación", { token: admin });
   assert.ok(auditoria.total >= 4);
 });
+
+test("contraseña de 4 caracteres, galería del ingreso y dirección por nombre", async () => {
+  const admin = (await ok("POST", "/login", { cuerpo: { usuario: "admin", password: "secreto1" } })).token;
+  const corta = await api("POST", "/usuarios", { token: admin, cuerpo: { usuario: "corta", nombre: "Clave corta", rol: "ADMIN", password: "123" } });
+  assert.equal(corta.status, 400);
+  assert.match(corta.json.mensaje, /4 caracteres/);
+  await ok("POST", "/usuarios", { token: admin, cuerpo: { usuario: "cuatro", nombre: "Clave de cuatro", rol: "ADMIN", password: "1234" } });
+  await ok("POST", "/login", { cuerpo: { usuario: "cuatro", password: "1234" } });
+
+  // Sin sistema general configurado no hay fotos: el ingreso muestra el logo.
+  const galeria = await ok("GET", "/login/imagenes");
+  assert.deepEqual(galeria.imagenes, []);
+  assert.equal((await api("GET", "/login/imagen/0123456789abcdef.png")).status, 404);
+  assert.equal((await api("GET", "/login/imagen/..%2Fconfig.json")).status, 404);
+
+  // La dirección con el nombre de la notebook aparece en el estado del sistema.
+  const estado = await ok("GET", "/sistema/estado", { token: admin });
+  assert.match(estado.red.por_nombre, /^http:\/\/[a-z0-9-]+:\d+$/);
+  const malNombre = await api("POST", "/sistema/red", { token: admin, cuerpo: { nombre: "camping; shutdown" } });
+  assert.equal(malNombre.status, 400);
+});

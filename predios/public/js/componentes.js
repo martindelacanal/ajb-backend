@@ -24,6 +24,23 @@
     if (opciones.alCambiar) el.addEventListener("input", function () { opciones.alCambiar(el.value); });
     return el;
   };
+  // Contraseña con el botón para verla adentro del recuadro (mismo ancho que los otros campos).
+  // Devuelve el contenedor; el input está en .input.
+  P.inputClave = function (opciones) {
+    var input = P.input(Object.assign({ autocomplete: "new-password" }, opciones || {}, { tipo: "password" }));
+    var ojo = h("button.campo-ojo", { type: "button", "aria-label": "Mostrar contraseña", "aria-pressed": "false" }, P.icono("ojo"));
+    ojo.addEventListener("click", function () {
+      var ver = input.type === "password";
+      input.type = ver ? "text" : "password";
+      ojo.setAttribute("aria-label", ver ? "Ocultar contraseña" : "Mostrar contraseña");
+      ojo.setAttribute("aria-pressed", String(ver));
+      P.reemplazar(ojo, P.icono(ver ? "ojo-tachado" : "ojo"));
+      input.focus();
+    });
+    var cont = h("div.campo-clave", input, ojo);
+    cont.input = input;
+    return cont;
+  };
   P.dinero = function (opciones) {
     var input = P.input(Object.assign({ inputmode: "decimal", placeholder: "0,00" }, opciones || {}));
     input.style.textAlign = "right";
@@ -180,17 +197,43 @@
       return promesa.then(function (r) { if (n === pedido) { resultados = r || []; pintar(texto); } return r; });
     }
 
+    // La lista flota sobre la página (position: fixed, en el body): ninguna ventana ni tabla con
+    // desplazamiento propio la recorta. Se abre hacia arriba si abajo no entra.
     function abrir() {
       if (!lista) {
         lista = h("div.combo-lista", { role: "listbox" });
-        cont.appendChild(lista);
+        document.body.appendChild(lista);
         input.setAttribute("aria-expanded", "true");
-        var r = input.getBoundingClientRect();
-        if (window.innerHeight - r.bottom < 260 && r.top > 300) lista.setAttribute("data-arriba", "");
+        window.addEventListener("scroll", ubicar, true);
+        window.addEventListener("resize", ubicar);
       }
     }
+    function ubicar(ev) {
+      if (!lista) return;
+      if (ev && ev.type === "scroll" && lista.contains(ev.target)) return;
+      var r = input.getBoundingClientRect();
+      // En el celular, con el teclado abierto, sólo cuenta la parte visible de la pantalla.
+      var alto = window.visualViewport ? Math.min(window.innerHeight, window.visualViewport.height + window.visualViewport.offsetTop) : window.innerHeight;
+      if (r.bottom < 0 || r.top > alto || !input.offsetParent) { cerrarLista(); return; }
+      var abajo = alto - r.bottom - 10;
+      var arriba = r.top - 10;
+      var deseado = Math.min(340, lista.scrollHeight + 2);
+      var haciaArriba = abajo < Math.min(deseado, 220) && arriba > abajo;
+      var maximo = Math.max(140, Math.min(340, (haciaArriba ? arriba : abajo) - 6));
+      var ancho = Math.min(Math.max(r.width, 280), window.innerWidth - 16);
+      lista.style.left = Math.max(8, Math.min(r.left, window.innerWidth - ancho - 8)) + "px";
+      lista.style.width = ancho + "px";
+      lista.style.maxHeight = maximo + "px";
+      if (haciaArriba) { lista.style.top = "auto"; lista.style.bottom = (alto - r.top + 6) + "px"; }
+      else { lista.style.bottom = "auto"; lista.style.top = (r.bottom + 6) + "px"; }
+    }
     function cerrarLista() {
-      if (lista) { lista.remove(); lista = null; }
+      if (lista) {
+        lista.remove();
+        lista = null;
+        window.removeEventListener("scroll", ubicar, true);
+        window.removeEventListener("resize", ubicar);
+      }
       input.setAttribute("aria-expanded", "false");
       indice = -1;
     }
@@ -207,6 +250,7 @@
         lista.appendChild(h("button.combo-accion", { type: "button", onmousedown: function (ev) { ev.preventDefault(); cerrarLista(); opciones.accionExtra.onclick(input.value); } },
           P.icono("mas"), opciones.accionExtra.texto));
       }
+      ubicar();
     }
     function mover(d) {
       if (!resultados.length) return;
@@ -317,9 +361,32 @@
     var barra = h("div.tabla-barra");
     var cuerpo = h("div.tabla-desplazable");
     var pie = h("div.tabla-pie");
+    // Barra lateral propia + paginador: flotan abajo de la pantalla mientras se recorre una tabla
+    // alta, así no hay que bajar hasta el final para moverse a los costados o cambiar de página.
+    var desliz = h("div.tabla-desliz", { "aria-hidden": "true" }, h("div.tabla-desliz-ancho"));
+    desliz.hidden = true;
+    var flotante = h("div.tabla-flotante", desliz, pie);
     raiz.appendChild(barra);
     raiz.appendChild(cuerpo);
-    raiz.appendChild(pie);
+    raiz.appendChild(flotante);
+    cuerpo.addEventListener("scroll", function () { if (desliz.scrollLeft !== cuerpo.scrollLeft) desliz.scrollLeft = cuerpo.scrollLeft; });
+    desliz.addEventListener("scroll", function () { if (cuerpo.scrollLeft !== desliz.scrollLeft) cuerpo.scrollLeft = desliz.scrollLeft; });
+    function medirDesliz() {
+      var sobra = cuerpo.scrollWidth > cuerpo.clientWidth + 1;
+      desliz.hidden = !sobra;
+      if (!sobra) return;
+      desliz.firstChild.style.width = cuerpo.scrollWidth + "px";
+      desliz.scrollLeft = cuerpo.scrollLeft;
+    }
+    if (window.ResizeObserver) {
+      new ResizeObserver(function () { medirDesliz(); }).observe(cuerpo);
+    } else {
+      var alRedimensionar = function () {
+        if (!document.body.contains(raiz)) { window.removeEventListener("resize", alRedimensionar); return; }
+        medirDesliz();
+      };
+      window.addEventListener("resize", alRedimensionar);
+    }
     cuerpo.appendChild(P.cargando());
     var pedido = 0;
 
@@ -452,8 +519,11 @@
           var partes = /^(eq|gte|lte):(.*)$/.exec(valor || "") || [null, "gte", ""];
           var op = P.select([{ valor: "gte", texto: "≥" }, { valor: "lte", texto: "≤" }, { valor: "eq", texto: "=" }], partes[1]);
           op.style.width = "64px";
+          op.style.flex = "none";
           var monto = P.input({ inputmode: "decimal", valor: partes[2], placeholder: "Monto" });
           monto.style.width = "110px";
+          monto.style.flex = "1 1 80px";
+          monto.style.minWidth = "0";
           var aplicar = function () { estado.filtros[f.clave] = monto.value.trim() ? op.value + ":" + P.numeroDe(monto.value) : ""; estado.pagina = 1; cargar(); };
           op.addEventListener("change", aplicar);
           var tm = null;
@@ -548,6 +618,7 @@
         P.btn("", { tipo: "texto", chico: true, icono: "volver", etiqueta: "Página anterior", deshabilitado: datos.pagina <= 1, onclick: function () { estado.pagina--; cargar(); } }),
         h("span", "Página " + datos.pagina + " de " + datos.paginas),
         (function () { var b = P.btn("", { tipo: "texto", chico: true, icono: "volver", etiqueta: "Página siguiente", deshabilitado: datos.pagina >= datos.paginas, onclick: function () { estado.pagina++; cargar(); } }); b.firstChild.style.transform = "rotate(180deg)"; return b; })()));
+      medirDesliz();
       if (opciones.alCargar) opciones.alCargar(datos);
     }
 

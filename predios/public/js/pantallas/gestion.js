@@ -402,7 +402,7 @@
       var usuario = P.input({ valor: u.usuario, max: 60, placeholder: "Ej.: maria.comedor" });
       var nombre = P.input({ valor: u.nombre, max: 120 });
       var rol = P.segmentado([{ valor: "CAJERO", texto: "Usuario de boca" }, { valor: "ADMIN", texto: "Administrador" }], u.rol || "CAJERO", function (v) { zonaBocas.hidden = v === "ADMIN"; });
-      var clave = P.input({ tipo: "password", placeholder: editar ? "Dejala vacía para no cambiarla" : "Al menos 6 caracteres" });
+      var clave = P.inputClave({ placeholder: editar ? "Dejala vacía para no cambiarla" : "Al menos 4 caracteres" });
       var checks = bocas.map(function (b) { var ch = P.check(b.texto, asignadas.indexOf(b.valor) >= 0); ch.valor = b.valor; return ch; });
       var zonaBocas = P.campo("Bocas que atiende", h("div.grilla.grilla-2", { style: { gap: "8px" } }, checks), { ayuda: "Al ingresar va directo a su boca. Si tiene varias, elige." });
       zonaBocas.hidden = (u.rol || "CAJERO") === "ADMIN";
@@ -418,7 +418,7 @@
           editar ? h("p.texto-3.chico", "Último ingreso: " + (u.ultimo_ingreso ? P.f.fechaHora(u.ultimo_ingreso) : "nunca")) : null),
         acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn("Guardar", { tipo: "primario", icono: "check", onclick: function (ev) {
           var cuerpo = {
-            usuario: usuario.value, nombre: nombre.value, rol: rol.valor(), password: clave.value || undefined,
+            usuario: usuario.value, nombre: nombre.value, rol: rol.valor(), password: clave.input.value || undefined,
             bocas: checks.filter(function (ch) { return ch.input.checked; }).map(function (ch) { return ch.valor; }),
           };
           if (editar) cuerpo.activo = activo.input.checked;
