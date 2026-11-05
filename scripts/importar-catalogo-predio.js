@@ -31,9 +31,12 @@ async function main() {
     throw new Error(`DB_HOST=${host} no es local. Para correr contra producción agregá --allow-production.`);
   }
   const datos = JSON.parse(fs.readFileSync(path.resolve(archivo), "utf8"));
+  // En producción la RDS exige TLS (DB_SSL_MODE=verify-ca|verify-full + DB_SSL_CA_PATH), igual que la app.
+  const modoTls = String(process.env.DB_SSL_MODE || "disabled").trim().toLowerCase();
   const pool = mysql.createPool({
     host, user: process.env.DB_USER, password: process.env.DB_PASSWORD, database: process.env.DB_DATABASE,
     port: Number(process.env.DB_PORT || 3306), timezone: "-03:00", dateStrings: true, decimalNumbers: true, connectionLimit: 2,
+    ssl: modoTls === "disabled" ? undefined : { ca: fs.readFileSync(process.env.DB_SSL_CA_PATH), rejectUnauthorized: true },
   });
   try {
     const [[predio]] = await pool.query("SELECT id, codigo, nombre, escritor FROM predio WHERE codigo = ?", [codigo]);
