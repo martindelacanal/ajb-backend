@@ -67,6 +67,7 @@
     function agregar(p) {
       if (!p) return;
       if (p.destino === "USO_INTERNO") { P.aviso("«" + p.nombre + "» es de uso interno y no se vende", "error"); return; }
+      if (!(Number(p.precio_venta) > 0)) { P.aviso("«" + p.nombre + "» no tiene precio de venta: pedile al administrador que lo cargue", "error"); combo.foco(); return; }
       var existente = estado.items.filter(function (i) { return i.producto.id === p.id; })[0];
       if (existente) existente.cantidad = P.redondear(existente.cantidad + 1, 3);
       else estado.items.push({ producto: p, cantidad: 1 });

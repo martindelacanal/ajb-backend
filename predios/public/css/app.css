@@ -323,6 +323,14 @@ select.campo-control { appearance: none; -webkit-appearance: none; padding-right
 .tabla-buscar { flex: 1 1 240px; max-width: 360px; }
 .tabla-buscar .campo-control { padding-left: 38px; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%235d7690' stroke-width='2.2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m20 20-3.5-3.5'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: 12px center; background-size: 18px; }
 .tabla-desplazable { overflow-x: auto; }
+.tabla-seleccion { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; padding: 10px 16px; background: var(--cielo); border-bottom: 1px solid var(--borde); }
+.tabla-seleccion[hidden] { display: none; }
+.tabla-seleccion-texto { color: var(--azul); font-weight: 800; }
+.tabla th.col-sel, .tabla td.col-sel { width: 44px; padding: 0 0 0 6px; }
+.sel-celda { display: flex; align-items: center; justify-content: center; width: 38px; min-height: 42px; cursor: pointer; }
+.sel-celda input { width: 18px; height: 18px; margin: 0; accent-color: var(--azul); cursor: pointer; }
+.sel-celda input:disabled { cursor: default; }
+.ventana-pie .izquierda { margin-right: auto; }
 table.tabla { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 14px; }
 .tabla th { position: sticky; top: 0; z-index: 1; padding: 11px 12px; background: var(--papel); border-bottom: 1px solid var(--borde); color: var(--texto-2); font-size: 12px; font-weight: 800; letter-spacing: .03em; text-align: left; text-transform: uppercase; white-space: nowrap; }
 .tabla th.ordenable { cursor: pointer; user-select: none; }
@@ -336,6 +344,7 @@ table.tabla { width: 100%; border-collapse: separate; border-spacing: 0; font-si
 .tabla tbody tr:last-child td { border-bottom: 0; }
 .tabla .der { text-align: right; }
 .tabla td.sin-corte { white-space: nowrap; }
+.tabla .col-ancha { min-width: 230px; }
 .tabla .centro { text-align: center; }
 .tabla td.der, .tabla th.der { font-variant-numeric: tabular-nums; }
 .tabla tfoot td { padding: 11px 12px; background: var(--papel); border-top: 1px solid var(--borde); font-weight: 800; }

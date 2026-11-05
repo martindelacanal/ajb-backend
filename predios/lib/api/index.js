@@ -10,6 +10,7 @@ const N = require("../negocio");
 const modulos = [
   require("./sesion"),
   require("./catalogo"),
+  require("./eliminar"),
   require("./stock"),
   require("./compras"),
   require("./ventas"),

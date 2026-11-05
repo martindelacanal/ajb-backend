@@ -84,6 +84,7 @@ async function crearVenta(ctx) {
       if (!Number(p.activo)) throw U.error(`«${p.nombre}» está dado de baja`);
       if (p.destino === "USO_INTERNO") throw U.error(`«${p.nombre}» es de uso interno y no se vende`);
       const precio = U.redondear(Number(p.precio_venta || 0), 2);
+      if (precio <= 0) throw U.error(`«${p.nombre}» no tiene precio de venta: pedile al administrador que lo cargue`, 409, { codigo: "SIN_PRECIO" });
       if (MOVEDORES_STOCK.includes(p.destino)) {
         const stock = await N.stockActual(t, ctx, caja.boca_id, productoId);
         if (stock < cantidad) faltantes.push({ producto_id: productoId, producto: p.nombre, pedido: cantidad, disponible: stock });

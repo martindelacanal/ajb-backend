@@ -77,6 +77,15 @@ const TIPOS_PERMISO = [
 
 const SI_NO = [{ valor: "1", texto: "Sí" }, { valor: "0", texto: "No" }];
 
+// Autor de lo que vino del sistema anterior (creado_por): permite filtrarlo para revisarlo.
+const IMPORTADOR = "Sistema anterior (importación)";
+// Un producto "se usó" si tiene ventas, compras, solicitudes, bajas o movimientos que no sean
+// la carga inicial o un ajuste manual. Mismo criterio que api/eliminar.js.
+const PRODUCTO_USADO = ["predio_venta_item", "predio_compra_item", "predio_solicitud", "predio_baja"]
+  .map((t) => `EXISTS (SELECT 1 FROM ${t} u WHERE u.predio_id = p.predio_id AND u.producto_id = p.id)`)
+  .concat("EXISTS (SELECT 1 FROM predio_movimiento u WHERE u.predio_id = p.predio_id AND u.producto_id = p.id AND u.tipo NOT IN ('ALTA_INICIAL', 'AJUSTE'))")
+  .join(" OR ");
+
 function textoDe(lista, valor) {
   const item = lista.find((i) => i.valor === valor);
   return item ? item.texto : valor;
@@ -138,6 +147,27 @@ L.productos = {
         { valor: "vencidos", texto: "Vencidos", sql: "p.fecha_caducidad IS NOT NULL AND p.fecha_caducidad < :hoy" },
         { valor: "7", texto: "Vencen en 7 días", sql: "p.fecha_caducidad IS NOT NULL AND p.fecha_caducidad >= :hoy AND p.fecha_caducidad <= :hoy7" },
         { valor: "30", texto: "Vencen en 30 días", sql: "p.fecha_caducidad IS NOT NULL AND p.fecha_caducidad >= :hoy AND p.fecha_caducidad <= :hoy30" },
+      ],
+    },
+    {
+      clave: "precio", titulo: "Precio", tipo: "opciones",
+      opciones: [
+        { valor: "sin", texto: "Sin precio de venta", sql: "COALESCE(p.precio_venta, 0) <= 0" },
+        { valor: "con", texto: "Con precio de venta", sql: "COALESCE(p.precio_venta, 0) > 0" },
+      ],
+    },
+    {
+      clave: "uso", titulo: "Uso", tipo: "opciones",
+      opciones: [
+        { valor: "nunca", texto: "Nunca usados", sql: `NOT (${PRODUCTO_USADO})` },
+        { valor: "usados", texto: "Con ventas, compras o movimientos", sql: PRODUCTO_USADO },
+      ],
+    },
+    {
+      clave: "origen", titulo: "Origen", tipo: "opciones",
+      opciones: [
+        { valor: "importado", texto: "Del sistema anterior", sql: `p.creado_por = '${IMPORTADOR}'` },
+        { valor: "nuevo", texto: "Cargados en este sistema", sql: `COALESCE(p.creado_por, '') <> '${IMPORTADOR}'` },
       ],
     },
     { clave: "activo", titulo: "Estado", tipo: "opciones", expr: "p.activo", opciones: [{ valor: "1", texto: "Activos" }, { valor: "0", texto: "Dados de baja" }], defecto: "1" },
@@ -224,6 +254,20 @@ L.proveedores = {
     { clave: "activo", titulo: "Activo", expr: "pr.activo", tipo: "bool", oculta: true },
   ],
   filtros: [
+    {
+      clave: "uso", titulo: "Compras", tipo: "opciones",
+      opciones: [
+        { valor: "sin", texto: "Sin compras", sql: "COALESCE(c.compras, 0) = 0" },
+        { valor: "con", texto: "Con compras", sql: "COALESCE(c.compras, 0) > 0" },
+      ],
+    },
+    {
+      clave: "origen", titulo: "Origen", tipo: "opciones",
+      opciones: [
+        { valor: "importado", texto: "Del sistema anterior", sql: `pr.creado_por = '${IMPORTADOR}'` },
+        { valor: "nuevo", texto: "Cargados en este sistema", sql: `COALESCE(pr.creado_por, '') <> '${IMPORTADOR}'` },
+      ],
+    },
     { clave: "activo", titulo: "Estado", tipo: "opciones", expr: "pr.activo", opciones: [{ valor: "1", texto: "Activos" }, { valor: "0", texto: "Dados de baja" }], defecto: "1" },
   ],
   orden: { clave: "razon_social", dir: "asc" },
@@ -1253,4 +1297,5 @@ module.exports = {
   construirWhere,
   parametrosBase,
   traducir,
+  IMPORTADOR,
 };
