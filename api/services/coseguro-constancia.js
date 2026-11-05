@@ -3,6 +3,7 @@
 const path = require("node:path");
 const PDFDocument = require("pdfkit");
 const { decimalACentavos, normalizarFechaCivil } = require("./valores-dominio");
+const { nombrePrestacion } = require("./coseguro-nombres");
 
 const LOGO_PATH = path.join(__dirname, "..", "assets", "ajb-logo.png");
 const MARGEN = 42;
@@ -40,14 +41,14 @@ function formatearNumeroComprobante(puntoVenta, numero) {
 
 function datosConstanciaReintegro(solicitud) {
   const conceptos = Array.isArray(solicitud.conceptos)
-    ? solicitud.conceptos.map((concepto) => texto(concepto.nombre)).filter(Boolean)
+    ? solicitud.conceptos.map((concepto) => nombrePrestacion(concepto.nombre)).filter(Boolean)
     : [];
   const domicilio = [solicitud.afiliado_direccion, solicitud.afiliado_dependencia_judicial]
     .map(texto).filter(Boolean).join(" / ");
   return {
     reintegro: [
-      ["Tipo de Reintegro", texto(solicitud.tipo_reintegro) || NO_INFORMADO, true],
-      ["Conceptos", conceptos.join(", ") || texto(solicitud.concepto) || NO_INFORMADO, true],
+      ["Tipo de Reintegro", nombrePrestacion(solicitud.tipo_reintegro) || NO_INFORMADO, true],
+      ["Conceptos", conceptos.join(", ") || nombrePrestacion(solicitud.concepto) || NO_INFORMADO, true],
       ["Fecha de Aprobación", formatearFechaConstancia(solicitud.fecha_aprobacion_central_civil ?? solicitud.fecha_aprobacion_central), true],
       ["Importe", formatearImporteConstancia(solicitud.importe_autorizado), true],
       ["Fecha de Comprobante", formatearFechaConstancia(solicitud.fecha_comprobante_civil ?? solicitud.fecha_comprobante)],
