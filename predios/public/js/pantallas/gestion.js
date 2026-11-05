@@ -31,8 +31,81 @@
 
   P.ruta.registrar(/^\/gestion$/, function () { P.ruta.ir("/gestion/productos"); }, { admin: true });
 
+  // ------------------------------------------------------------------ eliminar
+  // eleccion = { ids: [...] } o { consulta: parametros de la tabla } (todos los que coinciden).
+  var ELIMINABLES = {
+    productos: { ruta: "/productos/eliminar", singular: "producto", plural: "productos" },
+    proveedores: { ruta: "/proveedores/eliminar", singular: "proveedor", plural: "proveedores" },
+  };
+  P.eliminarRegistros = function (clave, eleccion, alTerminar) {
+    var cfg = ELIMINABLES[clave];
+    var cuerpo = eleccion.ids ? { ids: eleccion.ids } : { consulta: eleccion.consulta };
+    P.post(cfg.ruta + "/previa", cuerpo).then(function (pr) {
+      var cuantos = function (n) { return P.f.entero(n) + " " + (n === 1 ? cfg.singular : cfg.plural); };
+      var lista = function (muestra, total) {
+        return h("ul.lista-simple", muestra.map(function (x) {
+          return h("li", h("span", x.nombre), x.usos ? h("span.texto-3.chico", "tiene " + x.usos.join(", ")) : (x.codigo ? h("span.texto-3.chico", x.codigo) : null));
+        }).concat(total > muestra.length ? [h("li.texto-3", "y " + P.f.entero(total - muestra.length) + " más")] : []));
+      };
+      var bloques = [];
+      if (pr.se_borran) {
+        bloques.push(h("div.columna", { style: { gap: "6px" } },
+          h("strong", "Se borran del todo: " + cuantos(pr.se_borran)),
+          h("p.texto-3", { style: { margin: 0 } }, "Nunca se usaron: desaparecen del sistema."),
+          lista(pr.muestra_borrar, pr.se_borran)));
+      }
+      if (pr.se_dan_de_baja) {
+        bloques.push(h("div.columna", { style: { gap: "6px" } },
+          h("strong", "Se dan de baja: " + cuantos(pr.se_dan_de_baja)),
+          h("p.texto-3", { style: { margin: 0 } }, "Ya tienen ventas, compras o movimientos. Para no perder ese historial quedan como «Dados de baja»: no aparecen más para vender ni comprar."),
+          lista(pr.muestra_baja, pr.se_dan_de_baja)));
+      }
+      if (pr.sin_cambios) {
+        bloques.push(P.mensaje(cuantos(pr.sin_cambios) + (pr.sin_cambios === 1 ? " ya estaba dado de baja y tiene" : " ya estaban dados de baja y tienen") + " historial: queda" + (pr.sin_cambios === 1 ? "" : "n") + " como está" + (pr.sin_cambios === 1 ? "" : "n") + ".", "info"));
+      }
+      var accionables = pr.se_borran + pr.se_dan_de_baja;
+      var unico = pr.cantidad === 1 ? (pr.muestra_borrar[0] || pr.muestra_baja[0] || pr.muestra_sin_cambios[0]) : null;
+      var m = P.modal({
+        titulo: unico ? "Eliminar «" + unico.nombre + "»" : "Eliminar " + cuantos(pr.cantidad),
+        subtitulo: pr.se_borran ? "Lo que se borra no se puede recuperar." : null,
+        contenido: h("div.columna", bloques.length ? bloques : [P.mensaje("No hay nada para eliminar.", "info")]),
+        acciones: [
+          P.btn("Cancelar", { onclick: function () { m.cerrar(); } }),
+          accionables ? P.btn(accionables === 1 ? "Eliminar" : "Eliminar " + cuantos(accionables), { tipo: "peligro-lleno", icono: "borrar", onclick: function (ev) {
+            P.ejecutar(ev.currentTarget, function () {
+              return P.post(cfg.ruta, cuerpo).then(function (r) {
+                if (!r.encolado) P.aviso(r.mensaje, "ok");
+                P.olvidarOpciones();
+                m.cerrar();
+                if (alTerminar) alTerminar(r);
+              });
+            }).catch(function () {});
+          } }) : null,
+        ],
+      });
+    }).catch(P.error);
+  };
+  function seleccionEliminar(clave) {
+    var cfg = ELIMINABLES[clave];
+    return {
+      singular: cfg.singular, plural: cfg.plural,
+      acciones: [{ texto: "Eliminar", icono: "borrar", tipo: "peligro", accion: function (eleccion, despues) {
+        P.eliminarRegistros(clave, eleccion, function () { despues(); });
+      } }],
+    };
+  }
+
   // ------------------------------------------------------------------ productos
-  P.formProducto = function (base, alGuardar) {
+  function botonEliminar(clave, id, modal, alEliminar) {
+    var b = P.btn("Eliminar", { tipo: "peligro", icono: "borrar", onclick: function () {
+      modal().cerrar();
+      P.eliminarRegistros(clave, { ids: [id] }, alEliminar);
+    } });
+    b.classList.add("izquierda");
+    return b;
+  }
+
+  P.formProducto = function (base, alGuardar, alEliminar) {
     base = base || {};
     var editar = !!base.id;
     var cargar = editar ? P.get("/productos/" + base.id) : Promise.resolve(null);
@@ -88,7 +161,7 @@
       if (detalle) {
         var stockLista = h("ul.lista-simple", detalle.stock.map(function (s) { return h("li", h("span", s.boca), h("strong.numero", P.f.numero(s.cantidad))); }));
         var precios = h("ul.lista-simple", detalle.precios.map(function (x) {
-          return h("li", h("div", h("strong", P.f.fechaHora(x.fecha)), h("div.texto-3.chico", ({ ALTA: "Alta", EDICION: "Edición", COMPRA: "Compra N° " + x.referencia_id })[x.origen] + " · " + (x.usuario_nombre || ""))),
+          return h("li", h("div", h("strong", P.f.fechaHora(x.fecha)), h("div.texto-3.chico", (({ ALTA: "Alta", EDICION: "Edición", COMPRA: "Compra N° " + x.referencia_id, IMPORTACION: "Último precio en el sistema anterior" })[x.origen] || x.origen) + " · " + (x.usuario_nombre || ""))),
             h("div", { style: { textAlign: "right" } }, h("div", "Compra " + P.f.pesos(x.precio_compra) + " · " + P.f.pct(x.margen)), h("strong", "Venta " + P.f.pesos(x.precio_venta))));
         }));
         var solapa = P.segmentado([{ valor: "datos", texto: "Datos" }, { valor: "stock", texto: "Stock por boca" }, { valor: "precios", texto: "Historial de precios" }], "datos", function (v) {
@@ -102,7 +175,8 @@
       var m = P.modal({
         titulo: editar ? p.nombre : "Nuevo producto", subtitulo: editar ? "ID " + p.id + (p.codigo ? " · Código " + p.codigo : "") : null,
         ancho: "ancha", contenido: contenido,
-        acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn(editar ? "Guardar cambios" : "Crear producto", { tipo: "primario", icono: "check", onclick: function (ev) {
+        acciones: [editar && alEliminar ? botonEliminar("productos", p.id, function () { return m; }, alEliminar) : null,
+          P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn(editar ? "Guardar cambios" : "Crear producto", { tipo: "primario", icono: "check", onclick: function (ev) {
           var cuerpo = {
             nombre: nombre.value, codigo: codigo.value, precio_compra: P.numeroDe(compra.value) || 0, margen: P.numeroDe(margen.value) || 0,
             destino: destino.value, perecedero: perecedero.input.checked, fecha_caducidad: perecedero.input.checked ? vence.value || null : null,
@@ -133,8 +207,9 @@
     P.solapasGestion(c, "/gestion/productos");
     var tabla = P.tabla({
       listado: "productos",
-      alClickFila: function (f) { P.formProducto({ id: f.id }, function () { tabla.recargar(); }); },
+      alClickFila: function (f) { P.formProducto({ id: f.id }, function () { tabla.recargar(); }, function () { tabla.recargar(); }); },
       placeholderBuscar: "Nombre o código",
+      seleccion: seleccionEliminar("productos"),
       celdas: {
         stock: function (v, f) { return h("span.numero" + (Number(v) < 0 ? ".negativo" : ""), P.f.numero(v)); },
         fecha_caducidad: function (v) {
@@ -197,7 +272,7 @@
   }, { admin: true, titulo: "Bajas" });
 
   // ------------------------------------------------------------------ proveedores
-  P.formProveedor = function (base, alGuardar) {
+  P.formProveedor = function (base, alGuardar, alEliminar) {
     base = base || {};
     var editar = !!base.id;
     (editar ? P.get("/proveedores/" + base.id).then(function (r) { return r.proveedor; }) : Promise.resolve(base)).then(function (p) {
@@ -216,7 +291,8 @@
           h("div.grilla.grilla-3", P.campo("Código", codigo), P.campo("Razón social", razon, { requerido: true }), P.campo("CUIT", cuit)),
           h("div.grilla.grilla-3", P.campo("Teléfono", tel), P.campo("Correo", mail), P.campo("Contacto", contacto)),
           P.campo("Dirección", dir), P.campo("Observaciones", obs), editar ? activo : null),
-        acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn(editar ? "Guardar" : "Crear proveedor", { tipo: "primario", icono: "check", onclick: function (ev) {
+        acciones: [editar && alEliminar ? botonEliminar("proveedores", p.id, function () { return m; }, alEliminar) : null,
+          P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn(editar ? "Guardar" : "Crear proveedor", { tipo: "primario", icono: "check", onclick: function (ev) {
           var cuerpo = { codigo: codigo.value, razon_social: razon.value, cuit: cuit.value, telefono: tel.value, email: mail.value, direccion: dir.value, contacto: contacto.value, observaciones: obs.value };
           if (editar) cuerpo.activo = activo.input.checked;
           P.ejecutar(ev.currentTarget, function () {
@@ -234,7 +310,11 @@
 
   P.ruta.registrar(/^\/gestion\/proveedores$/, function (c) {
     P.solapasGestion(c, "/gestion/proveedores");
-    var t = P.tabla({ listado: "proveedores", alClickFila: function (f) { P.formProveedor({ id: f.id }, function () { t.recargar(); }); } });
+    var t = P.tabla({
+      listado: "proveedores",
+      alClickFila: function (f) { P.formProveedor({ id: f.id }, function () { t.recargar(); }, function () { t.recargar(); }); },
+      seleccion: seleccionEliminar("proveedores"),
+    });
     c.appendChild(h("div.fila", { style: { marginBottom: "14px" } }, P.btn("Nuevo proveedor", { tipo: "primario", icono: "mas", onclick: function () { P.formProveedor({}, function () { t.recargar(); }); } }),
       P.btn("Compras por proveedor", { tipo: "texto", icono: "estadisticas", onclick: function () { P.cache["compras:vista"] = "compras"; P.ruta.ir("/compras"); } })));
     c.appendChild(t.el);

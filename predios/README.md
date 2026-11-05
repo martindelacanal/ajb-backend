@@ -77,6 +77,31 @@ La migración es idempotente: crea/completa las tablas, siembra MIRAMAR (14 boca
 otorga DML a `miajb_runtime` en cada host que tenga. Si se agregan columnas a `lib/esquema.js`,
 volver a correrla en las dos bases (la notebook se actualiza sola al arrancar).
 
+## Catálogo del sistema anterior
+
+El catálogo de AJBGestion (Access) se pasa en tres pasos:
+
+```sh
+# 1. Exportar (Windows; se relanza solo en PowerShell de 32 bits por el driver de Access)
+powershell -ExecutionPolicy Bypass -File predios/herramientas/sistema-anterior/exportar-access.ps1 -Mdb "…\Data.mdb" -Clave "…" -Salida C:\temp\access -Desde 2024-12-01
+# 2. Convertir: productos usados desde esa fecha o con precio vigente (nunca los «VIEJO - …»),
+#    proveedores con compras desde esa fecha
+node predios/herramientas/sistema-anterior/convertir.js --entrada C:\temp\access --salida catalogo.json --desde 2024-12-01
+# 3. Importar (sin --aplicar sólo simula). Antes de instalar la notebook, en el sistema general:
+node scripts/importar-catalogo-predio.js --predio MIRAMAR --archivo catalogo.json --aplicar [--allow-production]
+#    Con la notebook instalada, en la notebook:
+node predios/herramientas/importar-catalogo.js --base C:\AJB-Predio --archivo catalogo.json --aplicar
+```
+
+Lo importado queda con `creado_por = "Sistema anterior (importación)"` (filtro «Origen» de las
+tablas de productos y proveedores) y el último precio conocido en el historial de precios. Lo que
+ya existe (mismo nombre, código o CUIT) se saltea, así que se puede volver a correr. Los productos
+sin precio de venta no se pueden vender hasta que el administrador lo cargue.
+
+**Eliminar**: en Gestión se eligen filas (o «todos los que coinciden» con el filtro) y se eliminan;
+también desde la ficha. Lo que nunca se usó se borra del todo; lo que tiene ventas, compras,
+solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib/api/eliminar.js`).
+
 ## Reglas de negocio que conviene recordar
 
 - Solicitud entre bocas: el producto **sale** de la boca de origen (que lo despacha) y **llega** a

@@ -297,6 +297,9 @@
     return P.get("/listados/" + nombre + "/meta").then(function (m) { metas[nombre] = m; return m; });
   };
 
+  // Columnas de nombres largos (productos, proveedores): no se parten en muchos renglones.
+  var COLUMNAS_ANCHAS = ["nombre", "producto", "razon_social", "proveedor"];
+
   P.tabla = function (opciones) {
     var nombre = opciones.listado;
     var claveEstado = "tabla:" + (opciones.claveEstado || nombre);
@@ -319,6 +322,88 @@
     raiz.appendChild(pie);
     cuerpo.appendChild(P.cargando());
     var pedido = 0;
+
+    // Selección de filas (opciones.seleccion = { singular, plural, acciones: [{ texto, icono, tipo, accion(eleccion, despues) }] }).
+    // Se mantiene al cambiar de página u orden; se limpia al cambiar la búsqueda o los filtros.
+    var sel = opciones.seleccion ? { ids: {}, cantidad: 0, todos: false } : null;
+    var barraSel = h("div.tabla-seleccion", { "aria-live": "polite" });
+    barraSel.hidden = true;
+    if (sel) raiz.insertBefore(barraSel, cuerpo);
+    var ultimos = null;
+    var firma = null;
+
+    function firmaConsulta() { return JSON.stringify({ q: estado.q, f: estado.filtros }); }
+    function limpiarSeleccion() {
+      if (!sel) return;
+      sel.ids = {};
+      sel.cantidad = 0;
+      sel.todos = false;
+      pintarSeleccion();
+      marcarFilas();
+    }
+    function alternar(id, si) {
+      if (si && !sel.ids[id]) { sel.ids[id] = true; sel.cantidad++; }
+      else if (!si && sel.ids[id]) { delete sel.ids[id]; sel.cantidad--; }
+    }
+    function marcarFilas() {
+      if (!sel) return;
+      var filas = ultimos ? ultimos.filas : [];
+      Array.prototype.forEach.call(cuerpo.querySelectorAll("input[data-sel]"), function (i) {
+        i.checked = sel.todos || !!sel.ids[i.getAttribute("data-sel")];
+        i.disabled = sel.todos;
+      });
+      var cabecera = cuerpo.querySelector("input[data-sel-todos]");
+      if (cabecera) {
+        var marcadas = filas.filter(function (f) { return sel.ids[f.id]; }).length;
+        cabecera.checked = sel.todos || (filas.length > 0 && marcadas === filas.length);
+        cabecera.indeterminate = !sel.todos && marcadas > 0 && marcadas < filas.length;
+      }
+    }
+    function pintarSeleccion() {
+      if (!sel) return;
+      P.vaciar(barraSel);
+      var total = ultimos ? ultimos.total : 0;
+      var n = sel.todos ? total : sel.cantidad;
+      barraSel.hidden = !n;
+      if (!n) return;
+      var cfg = opciones.seleccion;
+      var singular = cfg.singular || "registro", plural = cfg.plural || "registros";
+      barraSel.appendChild(h("span.tabla-seleccion-texto", sel.todos
+        ? "Elegiste los " + P.f.entero(total) + " " + plural + " que coinciden con la búsqueda y los filtros"
+        : P.f.entero(n) + " " + (n === 1 ? singular + " elegido" : plural + " elegidos")));
+      var filas = ultimos ? ultimos.filas : [];
+      var paginaEntera = filas.length > 0 && filas.every(function (f) { return sel.ids[f.id]; });
+      if (!sel.todos && paginaEntera && total > filas.length) {
+        barraSel.appendChild(P.btn("Elegir los " + P.f.entero(total) + " que coinciden", { tipo: "texto", chico: true, onclick: function () {
+          sel.todos = true; pintarSeleccion(); marcarFilas();
+        } }));
+      }
+      barraSel.appendChild(h("div.espacio"));
+      (cfg.acciones || []).forEach(function (a) {
+        barraSel.appendChild(P.btn(a.texto, { tipo: a.tipo || "secundario", chico: true, icono: a.icono, onclick: function () {
+          var eleccion = sel.todos
+            ? { consulta: parametros(), cantidad: total }
+            : { ids: Object.keys(sel.ids).map(Number), cantidad: sel.cantidad };
+          a.accion(eleccion, function () { limpiarSeleccion(); return recargar(); });
+        } }));
+      });
+      barraSel.appendChild(P.btn("Quitar la selección", { tipo: "texto", chico: true, onclick: limpiarSeleccion }));
+    }
+    function celdaSeleccion(f) {
+      var nombre = f.nombre || f.razon_social || f.descripcion || ("ID " + f.id);
+      var input = h("input", { type: "checkbox", "data-sel": String(f.id), "aria-label": "Elegir " + nombre, onchange: function () {
+        alternar(String(f.id), input.checked); pintarSeleccion(); marcarFilas();
+      } });
+      return h("td.col-sel", h("label.sel-celda", input));
+    }
+    function cabeceraSeleccion(filas) {
+      var input = h("input", { type: "checkbox", "data-sel-todos": "", "aria-label": "Elegir todos los de esta página", onchange: function () {
+        if (sel.todos) { limpiarSeleccion(); return; }
+        filas.forEach(function (f) { alternar(String(f.id), input.checked); });
+        pintarSeleccion(); marcarFilas();
+      } });
+      return h("th.col-sel", { scope: "col" }, h("label.sel-celda", input));
+    }
 
     function guardar() { P.cache[claveEstado] = { q: estado.q, orden: estado.orden, dir: estado.dir, pagina: estado.pagina, tam: estado.tam, filtros: estado.filtros }; }
 
@@ -409,6 +494,7 @@
 
     function pintar(datos) {
       var cols = columnasVisibles();
+      ultimos = datos;
       P.vaciar(cuerpo);
       if (!datos.filas.length) {
         cuerpo.appendChild(P.vacio(opciones.iconoVacio || "lista", opciones.tituloVacio || "No hay registros", estado.q || Object.keys(estado.filtros).some(function (k) { return estado.filtros[k]; }) ? "Probá con otros filtros o borrá la búsqueda." : opciones.textoVacio));
@@ -416,7 +502,7 @@
         var thead = h("thead", h("tr", cols.map(function (c) {
           var ordenado = estado.orden === c.clave || (!estado.orden && meta.orden && meta.orden.clave === c.clave);
           var dir = estado.orden === c.clave ? estado.dir : (meta.orden ? meta.orden.dir : "asc");
-          return h("th.ordenable" + (ALINEA_DERECHA.indexOf(c.tipo) >= 0 ? ".der" : ""), {
+          return h("th.ordenable" + (ALINEA_DERECHA.indexOf(c.tipo) >= 0 ? ".der" : "") + (COLUMNAS_ANCHAS.indexOf(c.clave) >= 0 ? ".col-ancha" : ""), {
             "aria-sort": ordenado ? (dir === "desc" ? "descending" : "ascending") : null, scope: "col",
             onclick: function () {
               if (estado.orden === c.clave) estado.dir = estado.dir === "asc" ? "desc" : "asc";
@@ -425,20 +511,21 @@
             },
           }, c.titulo, h("span.flecha", ordenado ? (dir === "desc" ? "▼" : "▲") : "↕"));
         }).concat(opciones.acciones ? [h("th.der", "")] : [])));
+        if (sel) thead.firstChild.insertBefore(cabeceraSeleccion(datos.filas), thead.firstChild.firstChild);
         var tbody = h("tbody", datos.filas.map(function (f) {
           var tr = h("tr" + (opciones.alClickFila ? ".clicable" : ""), {
-            onclick: opciones.alClickFila ? function (ev) { if (!ev.target.closest("button, a, input")) opciones.alClickFila(f); } : null,
-          }, cols.map(function (c) {
+            onclick: opciones.alClickFila ? function (ev) { if (!ev.target.closest("button, a, input, label")) opciones.alClickFila(f); } : null,
+          }, sel ? celdaSeleccion(f) : null, cols.map(function (c) {
             var especial = opciones.celdas && opciones.celdas[c.clave];
             var contenido = especial ? especial(f[c.clave], f) : P.formatoCelda(c, f[c.clave]);
-            return h("td" + (ALINEA_DERECHA.indexOf(c.tipo) >= 0 ? ".der" : "") + (c.tipo === "opcion" || c.tipo === "dt" || c.tipo === "date" || ALINEA_DERECHA.indexOf(c.tipo) >= 0 ? ".sin-corte" : ""), contenido);
+            return h("td" + (ALINEA_DERECHA.indexOf(c.tipo) >= 0 ? ".der" : "") + (COLUMNAS_ANCHAS.indexOf(c.clave) >= 0 ? ".col-ancha" : "") + (c.tipo === "opcion" || c.tipo === "dt" || c.tipo === "date" || ALINEA_DERECHA.indexOf(c.tipo) >= 0 ? ".sin-corte" : ""), contenido);
           }));
           if (opciones.acciones) tr.appendChild(h("td.acciones", opciones.acciones(f, recargar)));
           return tr;
         }));
         var tabla = h("table.tabla", thead, tbody);
         if (datos.totales) {
-          tabla.appendChild(h("tfoot", h("tr", cols.map(function (c, i) {
+          tabla.appendChild(h("tfoot", h("tr", sel ? h("td") : null, cols.map(function (c, i) {
             if (i === 0) return h("td", "Total (" + P.f.entero(datos.total) + ")");
             if (c.clave in datos.totales) return h("td" + (ALINEA_DERECHA.indexOf(c.tipo) >= 0 ? ".der" : ""), P.formatoCelda(c, datos.totales[c.clave]));
             return h("td");
@@ -446,6 +533,8 @@
         }
         cuerpo.appendChild(tabla);
       }
+      marcarFilas();
+      pintarSeleccion();
       P.vaciar(pie);
       var desde = datos.total ? (datos.pagina - 1) * datos.tam + 1 : 0;
       var hasta = Math.min(datos.total, datos.pagina * datos.tam);
@@ -464,6 +553,11 @@
 
     function cargar() {
       guardar();
+      if (sel) {
+        var nueva = firmaConsulta();
+        if (firma !== null && nueva !== firma) limpiarSeleccion();
+        firma = nueva;
+      }
       var n = ++pedido;
       cuerpo.style.opacity = ".55";
       return P.get("/listados/" + nombre + P.qs(Object.assign(parametros(), { pagina: estado.pagina, tam: estado.tam }))).then(function (datos) {
