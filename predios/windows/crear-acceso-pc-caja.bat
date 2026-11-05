@@ -7,7 +7,7 @@ echo.
 echo  Acceso directo al Sistema del Camping
 echo  -------------------------------------
 echo  Escribi la direccion que figura en la notebook servidor
-echo  (por ejemplo http://192.168.0.10:8080):
+echo  (por ejemplo http://camping:8080 o http://192.168.0.10:8080):
 echo.
 set /p URL=  Direccion: 
 if "%URL%"=="" (

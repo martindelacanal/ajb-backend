@@ -1,4 +1,6 @@
-/* Ingreso: inicio de sesión, configuración inicial y elección de boca y caja. */
+/* Ingreso: inicio de sesión, configuración inicial y elección de boca y caja.
+   Misma cara que el ingreso de Mi AJB: cabecera blanca, cielo celeste con olas, el formulario en
+   una tarjeta y al lado la galería de fotos del sistema general (o el logo si no hay fotos). */
 (function () {
   "use strict";
   if (window.__SIN_SOPORTE) return;
@@ -6,144 +8,187 @@
   var h = P.h;
   var NS = "http://www.w3.org/2000/svg";
 
-  function s(tag, attrs, hijos) {
-    var e = document.createElementNS(NS, tag);
-    Object.keys(attrs || {}).forEach(function (k) { e.setAttribute(k, attrs[k]); });
-    (hijos || []).forEach(function (c) { e.appendChild(c); });
-    return e;
-  }
-
-  // Bosque de pinos (el vivero de Miramar) como silueta: triángulos escalonados.
-  function bosque(y, alto, semilla, ancho) {
-    var d = "M0 900 L0 " + y;
-    var x = 0;
-    var r = semilla;
-    function azar() { r = (r * 9301 + 49297) % 233280; return r / 233280; }
-    while (x < ancho) {
-      var w = 34 + azar() * 46;
-      var t = alto * (0.55 + azar() * 0.6);
-      d += " L" + (x + w * 0.5).toFixed(1) + " " + (y - t).toFixed(1) + " L" + (x + w).toFixed(1) + " " + (y - t * 0.08).toFixed(1);
-      x += w * 0.78;
-    }
-    return d + " L" + ancho + " 900 Z";
-  }
-
-  function ola(y, amplitud, largo, ancho) {
-    var d = "M0 " + y;
-    for (var x = 0; x < ancho * 2; x += largo) {
-      d += " Q" + (x + largo / 4) + " " + (y - amplitud) + " " + (x + largo / 2) + " " + y + " T" + (x + largo) + " " + y;
-    }
-    return d + " L" + ancho * 2 + " 900 L0 900 Z";
-  }
-
-  function escena() {
-    var A = 1200;
-    var svg = s("svg", { viewBox: "0 0 1200 900", preserveAspectRatio: "xMidYMax slice", "aria-hidden": "true" });
-    var defs = s("defs");
-    var mar = s("linearGradient", { id: "g-mar", x1: "0", y1: "0", x2: "0", y2: "1" }, [
-      s("stop", { offset: "0", "stop-color": "#2b9fda" }), s("stop", { offset: "1", "stop-color": "#0d7fc0" })]);
-    var sol = s("radialGradient", { id: "g-sol" }, [
-      s("stop", { offset: "0", "stop-color": "#fff6d6" }), s("stop", { offset: "1", "stop-color": "#fff6d6", "stop-opacity": "0" })]);
-    defs.appendChild(mar);
-    defs.appendChild(sol);
-    svg.appendChild(defs);
-    svg.appendChild(s("circle", { cx: "760", cy: "260", r: "190", fill: "url(#g-sol)" }));
-    svg.appendChild(s("circle", { cx: "760", cy: "260", r: "58", fill: "#ffd36b" }));
-    var nubes = s("g", { class: "nube", opacity: ".92" });
-    [[150, 170, 1], [520, 120, .8], [1350, 190, 1.1], [1720, 130, .9]].forEach(function (n) {
-      nubes.appendChild(s("g", { transform: "translate(" + n[0] + " " + n[1] + ") scale(" + n[2] + ")" }, [
-        s("ellipse", { cx: "0", cy: "0", rx: "70", ry: "20", fill: "#fff" }),
-        s("ellipse", { cx: "-24", cy: "-14", rx: "34", ry: "24", fill: "#fff" }),
-        s("ellipse", { cx: "22", cy: "-18", rx: "40", ry: "30", fill: "#fff" })]));
+  function olas() {
+    var svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", "0 0 1440 110");
+    svg.setAttribute("preserveAspectRatio", "none");
+    svg.setAttribute("aria-hidden", "true");
+    [
+      ["#8ed3f2", ".3", "M0,64 C120,88 260,40 420,52 C580,64 660,96 820,88 C980,80 1080,36 1220,44 C1320,50 1400,70 1440,76 L1440,110 L0,110 Z"],
+      ["#cdeaf9", ".75", "M0,80 C160,60 300,92 470,84 C640,76 740,44 900,56 C1060,68 1180,96 1320,88 C1370,85 1420,78 1440,74 L1440,110 L0,110 Z"],
+      ["#ffffff", "1", "M0,96 C180,78 340,102 520,94 C700,86 820,66 1000,74 C1180,82 1320,100 1440,92 L1440,110 L0,110 Z"],
+    ].forEach(function (o) {
+      var p = document.createElementNS(NS, "path");
+      p.setAttribute("fill", o[0]);
+      p.setAttribute("fill-opacity", o[1]);
+      p.setAttribute("d", o[2]);
+      svg.appendChild(p);
     });
-    svg.appendChild(nubes);
-    svg.appendChild(s("rect", { x: "0", y: "450", width: String(A), height: "260", fill: "url(#g-mar)" }));
-    svg.appendChild(s("path", { class: "ola ola-2", d: ola(500, 9, 120, A), fill: "#59b9ea", opacity: ".75" }));
-    svg.appendChild(s("path", { class: "ola", d: ola(540, 12, 160, A), fill: "#8ad0f2", opacity: ".8" }));
-    svg.appendChild(s("path", { d: "M0 600 C 200 570, 420 590, 640 585 S 1000 560, 1200 590 L1200 900 L0 900 Z", fill: "#eef8fe" }));
-    svg.appendChild(s("path", { class: "ola", d: ola(598, 5, 90, A), fill: "#ffffff", opacity: ".7" }));
-    // Carpas sobre la playa
-    [[300, 690, 1], [392, 700, .8], [880, 682, 1.05]].forEach(function (c) {
-      svg.appendChild(s("g", { transform: "translate(" + c[0] + " " + c[1] + ") scale(" + c[2] + ")" }, [
-        s("path", { d: "M-44 0 L0 -54 L44 0 Z", fill: "#ffffff", stroke: "#0d5482", "stroke-width": "4", "stroke-linejoin": "round" }),
-        s("path", { d: "M0 -54 L-10 0 L10 0 Z", fill: "#0097de" })]));
-    });
-    svg.appendChild(s("path", { d: bosque(790, 95, 7, A), fill: "#0a5c8f" }));
-    svg.appendChild(s("path", { d: bosque(835, 120, 31, A), fill: "#0d5482" }));
-    svg.appendChild(s("path", { d: bosque(880, 80, 57, A), fill: "#0a4469" }));
-    return svg;
+    return h("div.lg-olas", { "aria-hidden": "true" }, svg);
   }
 
-  function pieConexion(estado) {
+  function chipConexion(estado) {
     var enLinea = estado && estado.en_linea;
-    return h("div.ingreso-pie",
-      h("span.conexion" + (enLinea ? ".en-linea" : ".sin-linea"), h("i"), h("span", enLinea ? "Conectado al sistema general" : (estado && estado.vinculado ? "Sin internet: el sistema funciona igual" : "Funcionando en la red del camping"))),
-      estado && estado.version ? h("span.texto-3.chico", "Versión " + String(estado.version).split("+")[0]) : null);
+    var texto = enLinea ? "Conectado al sistema general" : (estado && estado.vinculado ? "Sin internet: funciona igual" : "Red del camping");
+    return h("span.conexion.lg-conexion" + (enLinea ? ".en-linea" : ".sin-linea"), { title: texto }, h("i"), h("span", texto));
+  }
+
+  // Galería: las fotos que el administrador carga en Mi AJB, guardadas en la notebook.
+  // Mientras no hay ninguna (o sin internet la primera vez) se ve el logo completo.
+  var INTERVALO_FOTOS = 3000;
+  var TRANSICION_FOTOS = 1600;
+  function galeria(nombre) {
+    var velo = h("div.lg-visual-velo");
+    var marco = h("div.lg-visual-marco",
+      h("div.lg-visual-respaldo", h("img.lg-visual-logo", { src: "img/logo-completo.webp", alt: "", width: "960", height: "535" })),
+      velo,
+      h("div.lg-visual-pie", h("p.lg-visual-lema", h("span", nombre + ","), h("span", "siempre en marcha."))));
+    var fotos = [];
+    var activa = -1;
+    var reloj = null;
+    function mostrar(i) {
+      var anterior = activa >= 0 ? fotos[activa] : null;
+      activa = i;
+      fotos.forEach(function (f, j) {
+        f.classList.toggle("activa", j === i);
+        f.classList.toggle("previa", f === anterior);
+      });
+      if (anterior) setTimeout(function () { anterior.classList.remove("previa"); }, TRANSICION_FOTOS + 100);
+      marco.classList.add("con-fotos");
+      if (!reloj && fotos.length > 1) reloj = setInterval(siguiente, INTERVALO_FOTOS + TRANSICION_FOTOS);
+    }
+    function siguiente() {
+      if (!document.body.contains(marco)) { clearInterval(reloj); return; }
+      for (var k = 1; k < fotos.length; k++) {
+        var j = (activa + k) % fotos.length;
+        if (fotos[j].cargada) { mostrar(j); return; }
+      }
+    }
+    P.get("/login/imagenes", { sinRedireccion: true }).then(function (r) {
+      (r.imagenes || []).forEach(function (im, i) {
+        var img = h("img.lg-visual-foto", { alt: "", decoding: "async" });
+        img.addEventListener("load", function () { img.cargada = true; if (activa < 0) mostrar(i); });
+        marco.insertBefore(img, velo);
+        fotos.push(img);
+        img.src = P.apiBase + "/" + im.url;
+      });
+    }).catch(function () { /* queda el logo */ });
+    return h("aside.lg-visual", { "aria-hidden": "true" }, marco);
+  }
+
+  // Campo con ícono a la izquierda (y, en la contraseña, el ojo adentro del recuadro).
+  function campoLg(etiqueta, icono, input, conOjo) {
+    input.classList.add("lg-input");
+    var control = h("div.lg-control", P.icono(icono, "lg-control-icono"), input);
+    if (conOjo) {
+      var ojo = h("button.lg-ojo", { type: "button", "aria-label": "Mostrar contraseña", "aria-pressed": "false" }, P.icono("ojo"));
+      ojo.addEventListener("click", function () {
+        var ver = input.type === "password";
+        input.type = ver ? "text" : "password";
+        ojo.setAttribute("aria-label", ver ? "Ocultar contraseña" : "Mostrar contraseña");
+        ojo.setAttribute("aria-pressed", String(ver));
+        P.reemplazar(ojo, P.icono(ver ? "ojo-tachado" : "ojo"));
+        input.focus();
+      });
+      control.appendChild(ojo);
+    }
+    return h("label.lg-campo", h("span.lg-etiqueta", etiqueta), control);
+  }
+
+  function cajaError() {
+    var caja = h("p.lg-error", { role: "alert", hidden: true });
+    caja.mostrar = function (texto) { P.reemplazar(caja, P.icono("alerta"), h("span", texto)); caja.hidden = false; };
+    caja.ocultar = function () { caja.hidden = true; };
+    return caja;
+  }
+
+  function botonIngresar(texto) {
+    return h("button.lg-submit", { type: "submit" }, h("span", texto), P.icono("flecha", "lg-submit-flecha"));
   }
 
   P.pantallaIngreso = function (app, estado) {
-    var error = h("div", { hidden: true });
-    var usuario = P.input({ placeholder: "Usuario o DNI", autocomplete: "username", autofocus: true });
-    var clave = P.input({ tipo: "password", placeholder: "Contraseña", autocomplete: "current-password" });
-    var ver = P.btn("", { tipo: "texto", icono: "ojo", etiqueta: "Mostrar contraseña", onclick: function () { clave.type = clave.type === "password" ? "text" : "password"; } });
-    var recordar = P.check("Mantener la sesión iniciada", true, "En PCs compartidas, destildalo.");
-    var boton = P.btn("Ingresar", { tipo: "primario", grande: true, submit: true });
-    var form = h("form", { novalidate: true },
-      h("div", h("h1", estado.nombre || "Camping"), h("p.subtitulo", "Ingresá con tu usuario de la boca o de administración.")),
-      error,
-      P.campo("Usuario", usuario),
-      P.campo("Contraseña", h("div.fila", { style: { flexWrap: "nowrap", gap: "6px" } }, clave, ver)),
-      recordar,
-      boton);
-    form.addEventListener("submit", function (ev) {
-      ev.preventDefault();
-      error.hidden = true;
-      if (!usuario.value.trim() || !clave.value) { mostrarError("Escribí tu usuario y tu contraseña."); return; }
-      P.ejecutar(boton, function () {
-        return P.post("/login", { usuario: usuario.value.trim(), password: clave.value, recordar: recordar.input.checked }, { sinRedireccion: true }).then(function (r) {
-          P.sesion.guardar(r.token, recordar.input.checked);
-          P.alIngresar(r);
-        });
-      }).catch(function (e) { mostrarError(e.message); clave.select(); });
-    });
-    function mostrarError(texto) { P.reemplazar(error, P.mensaje(texto, "error")); error.hidden = false; }
-
-    var panel = h("div.ingreso-panel",
-      h("img.ingreso-logo", { src: "img/logo-color.png", alt: "Mi AJB" }),
-      !estado.configurado ? h("div", { style: { maxWidth: "400px", marginBottom: "16px" } },
-        P.mensaje(estado.local ? "Todavía no hay usuarios. Creá el administrador del camping para empezar." : "El sistema todavía no está configurado: terminá la configuración inicial en la notebook servidor.", "aviso")) : null,
-      !estado.configurado && estado.local ? formularioPrimerUso() : form,
-      h("p.ingreso-nota", "¿Sos administrador del sistema general? Ingresá con tu DNI y tu contraseña de Mi AJB (la primera vez, con internet)."),
-      pieConexion(estado));
-    P.reemplazar(app, h("main.ingreso",
-      h("section.ingreso-escena", escena(), h("div.ingreso-leyenda",
-        h("h2", estado.nombre || "Camping"),
-        h("p", "Ventas, caja, stock y afiliados del predio. Sigue funcionando aunque se corte internet."))),
-      panel));
+    var nombre = estado.nombre || "Camping";
+    var tarjeta;
+    if (!estado.configurado && estado.local) tarjeta = formularioPrimerUso();
+    else if (!estado.configurado) {
+      tarjeta = h("div",
+        h("h1.lg-titulo#lg-titulo", "Todavía no está listo"),
+        h("p.lg-bajada", "El sistema todavía no está configurado: terminá la configuración inicial en la notebook servidor."));
+    } else tarjeta = formularioIngreso(nombre);
+    var version = estado.version ? h("p.lg-version", "Versión " + String(estado.version).split("+")[0]) : null;
+    P.reemplazar(app, h("main.lg",
+      h("header.lg-cabecera", h("div.lg-cabecera-interior",
+        h("div.lg-marca",
+          h("img", { src: "img/logo-isotipo-color.png", alt: "", width: "60", height: "72" }),
+          h("span.lg-marca-texto", h("strong", nombre), h("span", "Sistema del predio"))),
+        chipConexion(estado))),
+      h("div.lg-escenario",
+        h("div.lg-interior",
+          h("section.lg-tarjeta", { "aria-labelledby": "lg-titulo" }, tarjeta, version),
+          galeria(nombre)),
+        olas())));
+    var primero = app.querySelector(".lg-input");
+    if (primero) setTimeout(function () { try { primero.focus(); } catch (e) { /* nada */ } }, 60);
   };
 
-  function formularioPrimerUso() {
-    var nombre = P.input({ placeholder: "Nombre y apellido", autofocus: true });
-    var usuario = P.input({ placeholder: "Por ejemplo: administracion" });
-    var clave = P.input({ tipo: "password", placeholder: "Al menos 6 caracteres" });
-    var repetir = P.input({ tipo: "password" });
-    var error = h("div", { hidden: true });
-    var boton = P.btn("Crear administrador e ingresar", { tipo: "primario", grande: true, submit: true });
-    var form = h("form", { novalidate: true },
-      h("div", h("h1", "Configuración inicial"), h("p.subtitulo", "Este usuario administra el camping: crea los usuarios de cada boca, carga productos y ve la caja.")),
+  function formularioIngreso(nombre) {
+    var usuario = P.input({ placeholder: "Usuario o DNI", autocomplete: "username" });
+    usuario.setAttribute("autocapitalize", "none");
+    usuario.setAttribute("spellcheck", "false");
+    var clave = P.input({ tipo: "password", placeholder: "Tu contraseña", autocomplete: "current-password" });
+    var recordar = h("input.lg-recordar-check", { type: "checkbox", checked: true });
+    var error = cajaError();
+    var boton = botonIngresar("Ingresar");
+    var form = h("form.lg-form", { novalidate: true },
+      h("h1.lg-titulo#lg-titulo", (P.saludo ? P.saludo() : "Hola") + "."),
+      h("p.lg-bajada", "Ingresá al sistema de " + nombre + " con tu usuario y tu contraseña."),
+      campoLg("Usuario", "persona", usuario),
+      campoLg("Contraseña", "candado", clave, true),
+      h("label.lg-recordar", recordar, h("span", "Mantener sesión iniciada")),
       error,
-      P.campo("Nombre", nombre), P.campo("Usuario", usuario), P.campo("Contraseña", clave), P.campo("Repetí la contraseña", repetir),
       boton);
     form.addEventListener("submit", function (ev) {
       ev.preventDefault();
-      if (clave.value !== repetir.value) { P.reemplazar(error, P.mensaje("Las contraseñas no coinciden.", "error")); error.hidden = false; return; }
+      error.ocultar();
+      if (!usuario.value.trim() || !clave.value) { error.mostrar("Escribí tu usuario y tu contraseña."); (usuario.value.trim() ? clave : usuario).focus(); return; }
+      P.ejecutar(boton, function () {
+        return P.post("/login", { usuario: usuario.value.trim(), password: clave.value, recordar: recordar.checked }, { sinRedireccion: true }).then(function (r) {
+          P.sesion.guardar(r.token, recordar.checked);
+          P.alIngresar(r);
+        });
+      }).catch(function (e) { error.mostrar(e.message); clave.select(); });
+    });
+    return form;
+  }
+
+  function formularioPrimerUso() {
+    var nombre = P.input({ placeholder: "Nombre y apellido" });
+    var usuario = P.input({ placeholder: "Por ejemplo: administracion" });
+    usuario.setAttribute("autocapitalize", "none");
+    var clave = P.input({ tipo: "password", placeholder: "Al menos 4 caracteres", autocomplete: "new-password" });
+    var repetir = P.input({ tipo: "password", placeholder: "Otra vez la misma", autocomplete: "new-password" });
+    var error = cajaError();
+    var boton = botonIngresar("Crear administrador e ingresar");
+    var form = h("form.lg-form", { novalidate: true },
+      h("h1.lg-titulo.lg-titulo-chico#lg-titulo", "Configuración inicial"),
+      h("p.lg-bajada", "Todavía no hay usuarios. Este usuario administra el camping: crea los usuarios de cada boca, carga productos y ve la caja."),
+      campoLg("Nombre", "persona", nombre),
+      campoLg("Usuario", "credencial", usuario),
+      campoLg("Contraseña", "candado", clave, true),
+      campoLg("Repetí la contraseña", "candado", repetir, true),
+      error,
+      boton);
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      error.ocultar();
+      if (clave.value !== repetir.value) { error.mostrar("Las contraseñas no coinciden."); repetir.focus(); return; }
       P.ejecutar(boton, function () {
         return P.post("/primer-uso", { nombre: nombre.value, usuario: usuario.value, password: clave.value, recordar: true }).then(function (r) {
           P.sesion.guardar(r.token, true);
           P.aviso("¡Listo! Ya podés cargar bocas, cajas, productos y usuarios.", "ok");
           P.alIngresar(r);
         });
-      }).catch(function (e) { P.reemplazar(error, P.mensaje(e.message, "error")); error.hidden = false; });
+      }).catch(function (e) { error.mostrar(e.message); });
     });
     return form;
   }

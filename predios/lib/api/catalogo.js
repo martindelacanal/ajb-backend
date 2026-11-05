@@ -416,8 +416,8 @@ async function guardarUsuario(ctx) {
   const bocas = Array.isArray(b.bocas) ? [...new Set(b.bocas.map((x) => U.id(x, "La boca")))] : [];
   if (datos.rol === "CAJERO" && !bocas.length) throw U.error("Asigná al menos una boca al usuario");
   const password = b.password ? String(b.password) : "";
-  if (!id && password.length < 6) throw U.error("La contraseña tiene que tener al menos 6 caracteres");
-  if (password && password.length < 6) throw U.error("La contraseña tiene que tener al menos 6 caracteres");
+  if (!id && password.length < 4) throw U.error("La contraseña tiene que tener al menos 4 caracteres");
+  if (password && password.length < 4) throw U.error("La contraseña tiene que tener al menos 4 caracteres");
   if (password) datos.password_hash = U.hashPassword(password);
   return ctx.db.tx(async (t) => {
     const dup = await t.get("SELECT id FROM predio_usuario WHERE predio_id = ? AND usuario = ? AND id <> ?", [ctx.pid, datos.usuario, id || -1]);

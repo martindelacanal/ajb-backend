@@ -32,8 +32,8 @@
     function rango(d, hs) { desde.value = d; hasta.value = hs; cargar(); }
     c.appendChild(h("div.pagina-cabecera",
       h("div", h("h1.titulo-pagina", "Estadísticas"), h("p.subtitulo", "Cómo vienen las ventas, las compras y el stock del predio.")),
-      h("div.fila", { style: { alignItems: "flex-end" } },
-        P.campo("Desde", desde), P.campo("Hasta", hasta), P.campo("Boca", boca),
+      h("div.fila-campos.filtros-fechas",
+        P.campo("Desde", desde, { clase: "fecha" }), P.campo("Hasta", hasta, { clase: "fecha" }), P.campo("Boca", boca, { clase: "boca" }),
         h("div.campo", h("span.campo-etiqueta", "Rápido"), h("div.fila", { style: { gap: "4px" } },
           P.btn("Hoy", { tipo: "suave", chico: true, onclick: function () { rango(P.hoy(), P.hoy()); } }),
           P.btn("7 días", { tipo: "suave", chico: true, onclick: function () { rango(P.sumarDias(P.hoy(), -6), P.hoy()); } }),

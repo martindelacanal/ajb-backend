@@ -166,8 +166,8 @@
     c.appendChild(h("div.hoja.hoja-cuerpo",
       h("div.fila-separada", h("h2.seccion-titulo", "Productos"),
         P.esAdmin() ? P.btn("Nuevo producto", { tipo: "secundario", chico: true, icono: "mas", onclick: function () { nuevoProducto({}); } }) : null),
-      h("div.fila", { style: { marginTop: "14px", alignItems: "flex-end" } },
-        h("div", { style: { flex: "1 1 320px" } }, P.campo("Producto", combo.el), ayudaProducto),
+      h("div.fila-campos", { style: { marginTop: "14px" } },
+        P.campo("Producto", h("div", combo.el, ayudaProducto), { clase: "crece" }),
         P.campo("Cantidad", cantidad), P.campo("Precio unitario", h("div.campo-con-prefijo", h("span", "$"), unitario)),
         h("div.campo", h("span.campo-etiqueta", " "), P.btn("Agregar", { tipo: "celeste", icono: "mas", onclick: agregarLinea }))),
       h("div", { style: { marginTop: "16px" } }, tablaLineas)));

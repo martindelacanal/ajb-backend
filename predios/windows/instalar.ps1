@@ -127,7 +127,9 @@ Ok "Node.js $versionNode listo en $nodeDir"
 Paso "Abriendo el puerto $Puerto para las PCs del camping"
 Get-NetFirewallRule -DisplayName "AJB Predio*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 New-NetFirewallRule -DisplayName "AJB Predio (puerto $Puerto)" -Direction Inbound -Protocol TCP -LocalPort $Puerto -Action Allow -Profile Any | Out-Null
-Ok "Regla de firewall creada"
+# Para que las PCs encuentren la notebook por su nombre (http://nombre:puerto): NetBIOS, mDNS y LLMNR.
+New-NetFirewallRule -DisplayName "AJB Predio (nombre en la red)" -Direction Inbound -Protocol UDP -LocalPort 137,5353,5355 -Action Allow -Profile Any | Out-Null
+Ok "Reglas de firewall creadas"
 
 # --- Energía: la notebook no se suspende ni se apaga al cerrar la tapa
 Paso "Configurando la energia para que el servidor no se duerma"
@@ -172,9 +174,8 @@ $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
   Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" -and $_.PrefixOrigin -ne "WellKnown" } |
   Select-Object -ExpandProperty IPAddress
 $sufijoPuerto = if ($Puerto -eq 80) { "" } else { ":$Puerto" }
-$direcciones = @()
+$direcciones = @("http://$($env:COMPUTERNAME.ToLower())$sufijoPuerto")
 foreach ($ip in $ips) { $direcciones += "http://$ip$sufijoPuerto" }
-$direcciones += "http://$($env:COMPUTERNAME)$sufijoPuerto"
 
 $escritorio = [Environment]::GetFolderPath("CommonDesktopDirectory")
 $texto = @(
@@ -184,7 +185,8 @@ $texto = @(
   ""
 ) + ($direcciones | ForEach-Object { "   $_" }) + @(
   "",
-  "Conviene usar la primera direccion. Si la notebook cambia de IP, usa la del nombre del equipo.",
+  "La primera es con el nombre de la notebook: no cambia aunque cambie la IP. Si en alguna PC no abre, usa la de numeros.",
+  "El nombre se puede cambiar desde el sistema: Sistema > Direcciones para las PCs > Cambiar el nombre en la red.",
   "Para crear el acceso directo de caja en cada PC, copia y ejecuta herramientas\crear-acceso-pc-caja.bat.",
   "En esta notebook tambien funciona: $url"
 )

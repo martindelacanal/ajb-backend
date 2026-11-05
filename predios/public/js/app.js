@@ -85,16 +85,16 @@
   }
 
   function cambiarClave() {
-    var actual = P.input({ tipo: "password" });
-    var nueva = P.input({ tipo: "password" });
-    var repetir = P.input({ tipo: "password" });
+    var actual = P.inputClave({ autocomplete: "current-password" });
+    var nueva = P.inputClave();
+    var repetir = P.inputClave();
     var m = P.modal({
       titulo: "Cambiar mi contraseña",
-      contenido: h("div.columna", P.campo("Contraseña actual", actual), P.campo("Contraseña nueva", nueva, { ayuda: "Al menos 6 caracteres" }), P.campo("Repetí la nueva", repetir)),
+      contenido: h("div.columna", P.campo("Contraseña actual", actual), P.campo("Contraseña nueva", nueva, { ayuda: "Al menos 4 caracteres" }), P.campo("Repetí la nueva", repetir)),
       acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn("Guardar", { tipo: "primario", onclick: function (ev) {
-        if (nueva.value !== repetir.value) { P.aviso("Las contraseñas nuevas no coinciden", "error"); return; }
+        if (nueva.input.value !== repetir.input.value) { P.aviso("Las contraseñas nuevas no coinciden", "error"); return; }
         P.ejecutar(ev.currentTarget, function () {
-          return P.post("/sesion/clave", { actual: actual.value, nueva: nueva.value }).then(function (r) { P.aviso(r.mensaje, "ok"); m.cerrar(); });
+          return P.post("/sesion/clave", { actual: actual.input.value, nueva: nueva.input.value }).then(function (r) { P.aviso(r.mensaje, "ok"); m.cerrar(); });
         });
       } })],
     });
@@ -235,14 +235,57 @@
       h("a.riel-marca", { href: "#/inicio" }, h("img", { src: "img/logo-blanco-isotipo.png", alt: "" }), h("span", h("strong", ses.predio.nombre || "Predio"), h("span", "Sistema del predio · AJB"))),
       h("div.nav", itemsAdmin().map(function (it) {
         var contador = it.ruta === "/inicio" ? h("span.nav-contador", { "data-contador": "inicio", hidden: true }) : null;
-        return h("a.nav-item", { href: "#" + it.ruta, "data-ruta": it.ruta, onclick: function () { riel.classList.remove("abierto"); } }, P.icono(it.icono), it.texto, contador);
+        return h("a.nav-item", { href: "#" + it.ruta, "data-ruta": it.ruta, onclick: function () { cerrarMenu(); } }, P.icono(it.icono), it.texto, contador);
       })),
       h("div.riel-pie", P.modo === "remoto" ? "Abierto desde Mi AJB" : "Funciona en la red del camping"));
-    var botonMenu = P.btn("", { tipo: "texto", icono: "menu", etiqueta: "Menú", onclick: function () { riel.classList.toggle("abierto"); } });
+    // En el celular el menú es un cajón: se cierra tocando afuera, arrastrándolo a la izquierda o con Escape.
+    var veloMenu = h("div.riel-velo", { "aria-hidden": "true", onclick: function () { cerrarMenu(); } });
+    function abrirMenu() { riel.classList.add("abierto"); veloMenu.classList.add("abierto"); botonMenu.setAttribute("aria-expanded", "true"); }
+    function cerrarMenu() {
+      riel.classList.remove("abierto");
+      veloMenu.classList.remove("abierto");
+      riel.style.transform = "";
+      veloMenu.style.opacity = "";
+      botonMenu.setAttribute("aria-expanded", "false");
+    }
+    var toque = null;
+    riel.addEventListener("touchstart", function (ev) {
+      if (!riel.classList.contains("abierto") || ev.touches.length !== 1) return;
+      toque = { x: ev.touches[0].clientX, y: ev.touches[0].clientY, dx: 0, horizontal: null };
+    }, { passive: true });
+    riel.addEventListener("touchmove", function (ev) {
+      if (!toque) return;
+      var dx = ev.touches[0].clientX - toque.x;
+      var dy = ev.touches[0].clientY - toque.y;
+      if (toque.horizontal === null && (Math.abs(dx) > 8 || Math.abs(dy) > 8)) {
+        toque.horizontal = Math.abs(dx) > Math.abs(dy);
+        if (toque.horizontal) riel.classList.add("arrastrando");
+      }
+      if (!toque.horizontal) return;
+      toque.dx = Math.min(0, dx);
+      riel.style.transform = "translateX(" + toque.dx + "px)";
+      veloMenu.style.opacity = String(Math.max(0, 1 + toque.dx / (riel.offsetWidth || 280)));
+    }, { passive: true });
+    function soltar() {
+      if (!toque) return;
+      var dx = toque.dx;
+      toque = null;
+      riel.classList.remove("arrastrando");
+      if (dx < -60) cerrarMenu();
+      else { riel.style.transform = ""; veloMenu.style.opacity = ""; }
+    }
+    riel.addEventListener("touchend", soltar);
+    riel.addEventListener("touchcancel", soltar);
+    var botonMenu = P.btn("", { tipo: "texto", icono: "menu", etiqueta: "Menú", onclick: function () {
+      if (riel.classList.contains("abierto")) cerrarMenu(); else abrirMenu();
+    } });
     botonMenu.classList.add("barra-menu");
+    botonMenu.setAttribute("aria-controls", "riel");
+    botonMenu.setAttribute("aria-expanded", "false");
+    P.cerrarMenu = cerrarMenu;
     var puesto = P.puesto();
     pagina = h("div#pagina");
-    return h("div.estructura", riel, h("div.contenido",
+    return h("div.estructura", riel, veloMenu, h("div.contenido",
       P.modo === "remoto" ? h("div.remoto#banda-remota") : null,
       h("header.barra", botonMenu,
         puesto && puesto.caja_id ? h("span.puesto-chip", P.icono("caja"), h("span", puesto.boca + " · " + puesto.caja)) : null,
@@ -266,6 +309,10 @@
         chipConexion(), botonUsuario()),
       pagina);
   }
+
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === "Escape" && P.cerrarMenu && document.querySelector(".riel.abierto") && !P.hayVentana()) P.cerrarMenu();
+  });
 
   P.repintarMarco = function () {
     var ses = P.estado.sesion;

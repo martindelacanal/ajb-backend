@@ -102,6 +102,18 @@ sin precio de venta no se pueden vender hasta que el administrador lo cargue.
 también desde la ficha. Lo que nunca se usó se borra del todo; lo que tiene ventas, compras,
 solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib/api/eliminar.js`).
 
+## Ingreso y red local
+
+- El ingreso es igual al de Mi AJB. Las fotos salen de la galería del login del sistema general
+  (`GET {servidor}/login/imagenes`). La notebook las baja al arrancar y cada 6 horas a
+  `datos/galeria/` y las sirve en `/api/login/imagenes`, así se ven aunque no haya internet.
+  Sin fotos, se ve el logo.
+- **Nombre en la red**: Sistema → «Cambiar el nombre en la red» renombra la notebook
+  (`Rename-Computer`, corre como SYSTEM) y abre UDP 137/5353/5355 en el firewall.
+  Las PCs entran con `http://nombre:puerto`, que Windows resuelve solo por NetBIOS/LLMNR.
+  El nombre nuevo se aplica al reiniciar, y desde la misma pantalla se puede reiniciar la notebook.
+- Las contraseñas de usuarios del camping tienen como mínimo 4 caracteres.
+
 ## Reglas de negocio que conviene recordar
 
 - Solicitud entre bocas: el producto **sale** de la boca de origen (que lo despacha) y **llega** a

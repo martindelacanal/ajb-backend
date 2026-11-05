@@ -17,6 +17,42 @@
     c.appendChild(h("nav.solapas", items.map(function (s) { return h("a.solapa", { href: "#" + s.ruta, "aria-current": actual === s.ruta ? "page" : null }, s.texto); })));
   }
 
+  // Nombre de la notebook en la red: las PCs entran con http://nombre:puerto en lugar de la IP.
+  function reiniciarNotebook() {
+    P.confirmar("La notebook se reinicia en 20 segundos. Mientras tanto nadie puede vender ni cobrar; el sistema vuelve solo en uno o dos minutos.", { titulo: "¿Reiniciar la notebook ahora?", aceptar: "Reiniciar ahora", peligro: true }).then(function (ok) {
+      if (!ok) return;
+      P.post("/sistema/reiniciar-equipo").then(function (r) { P.aviso(r.mensaje, "ok", 15000); }).catch(P.error);
+    });
+  }
+  function formNombreRed(red, alGuardar) {
+    var puerto = (/:(\d+)$/.exec(red.por_nombre) || [])[1];
+    var input = P.input({ valor: red.pendiente || red.nombre, max: 15, placeholder: "Por ejemplo: CAMPING" });
+    input.setAttribute("autocapitalize", "characters");
+    input.setAttribute("spellcheck", "false");
+    var vista = h("strong");
+    function pintarVista() { vista.textContent = "http://" + (input.value.trim() || "nombre").toLowerCase() + (puerto ? ":" + puerto : ""); }
+    input.addEventListener("input", pintarVista);
+    pintarVista();
+    var m = P.modal({
+      titulo: "Nombre de la notebook en la red",
+      subtitulo: "Las PCs del camping van a poder entrar escribiendo el nombre en lugar de los números de la IP.",
+      contenido: h("div.columna",
+        P.campo("Nombre", input, { ayuda: "De 2 a 15 letras, números o guiones, empezando con una letra." }),
+        h("p", { style: { margin: 0 } }, "Las PCs van a entrar a: ", vista),
+        P.mensaje("Para que tome el nombre nuevo hay que reiniciar la notebook (tarda uno o dos minutos y el sistema vuelve solo). Si en alguna PC no abre con el nombre, sigue funcionando con la IP.", "info")),
+      acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn("Guardar nombre", { tipo: "primario", icono: "check", onclick: function (ev) {
+        P.ejecutar(ev.currentTarget, function () {
+          return P.post("/sistema/red", { nombre: input.value.trim() }).then(function (r) {
+            m.cerrar();
+            P.aviso(r.mensaje, "ok", 9000);
+            if (alGuardar) alGuardar();
+            if (r.pendiente) reiniciarNotebook();
+          });
+        }).catch(function () {});
+      } })],
+    });
+  }
+
   function tamano(b) {
     if (b > 1024 * 1024) return P.f.numero(P.redondear(b / 1024 / 1024, 1)) + " MB";
     return P.f.entero(b / 1024) + " KB";
@@ -99,7 +135,13 @@
             h("div.hoja.hoja-cuerpo",
               h("h2.seccion-titulo", "Direcciones para las PCs del camping"),
               h("p.texto-3", "En cada PC, abrí el navegador y entrá a:"),
-              h("ul.lista-simple", d.servidor.direcciones.map(function (x) { return h("li", h("strong", x.url), h("span.texto-3.chico", x.interfaz)); })),
+              h("ul.lista-simple",
+                d.red ? h("li", h("strong", d.red.por_nombre), h("span.texto-3.chico", "con el nombre de la notebook")) : null,
+                d.servidor.direcciones.map(function (x) { return h("li", h("strong", x.url), h("span.texto-3.chico", "IP · " + x.interfaz)); })),
+              d.red && d.red.pendiente ? h("div", { style: { marginTop: "10px" } }, P.mensaje(h("span", "El nombre nuevo, ", h("strong", d.red.pendiente), ", se aplica cuando se reinicie la notebook."), "aviso")) : null,
+              h("div.fila", { style: { marginTop: "12px" } },
+                P.btn("Cambiar el nombre en la red", { tipo: "secundario", icono: "red", deshabilitado: !(d.red && d.red.puede_cambiar), onclick: function () { formNombreRed(d.red, cargar); } }),
+                d.red && d.red.pendiente ? P.btn("Reiniciar la notebook", { tipo: "texto", icono: "refrescar", onclick: reiniciarNotebook }) : null),
               h("p.texto-3.chico", { style: { marginBottom: 0 } }, "Equipo " + d.equipo.nombre + " · " + d.equipo.sistema + " · Node " + d.equipo.node))),
           h("div.hoja.hoja-cuerpo",
             h("div.fila-separada", h("h2.seccion-titulo", "Respaldos de la base de datos"),

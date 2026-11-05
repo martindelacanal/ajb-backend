@@ -17,7 +17,9 @@ INSTALAR (una sola vez, en la notebook que queda en el camping)
      (usuario y contraseña). También pueden entrar los administradores del sistema
      general con su DNI y su contraseña de Mi AJB (la primera vez con internet).
 4. En el escritorio queda "Sistema del Camping - direcciones.txt" con la dirección
-   para las demás PCs (por ejemplo http://192.168.0.10:8080).
+   para las demás PCs: con el nombre de la notebook (por ejemplo http://camping:8080)
+   y con la IP (por ejemplo http://192.168.0.10:8080). El nombre se cambia desde el
+   sistema: Sistema > Direcciones para las PCs > Cambiar el nombre en la red.
 
 El sistema queda instalado en C:\AJB-Predio y arranca solo cada vez que se enciende
 la notebook (no hace falta iniciar sesión en Windows). Si se cae, se levanta solo.

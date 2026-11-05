@@ -234,7 +234,7 @@ async function cambiarClave(ctx) {
   const u = await N.exigir(ctx.db, ctx, "predio_usuario", ctx.usuario.id, "El usuario ya no existe");
   if (Number(u.es_admin_general)) throw U.error("Tu contraseña es la del sistema general: cambiala desde ahí");
   if (!U.verificarPassword(actual, u.password_hash)) throw U.error("La contraseña actual no es correcta", 403);
-  if (nueva.length < 6) throw U.error("La contraseña nueva tiene que tener al menos 6 caracteres");
+  if (nueva.length < 4) throw U.error("La contraseña nueva tiene que tener al menos 4 caracteres");
   await ctx.db.tx(async (t) => {
     await N.actualizar(t, ctx, "predio_usuario", u.id, { password_hash: U.hashPassword(nueva) });
     await N.auditar(t, ctx, "Cambio de contraseña propia", "usuario", u.id, null);
@@ -267,7 +267,7 @@ async function primerUso(ctx) {
   if (!/^[a-z0-9._-]+$/.test(usuario)) throw U.error("El usuario sólo puede tener letras, números, punto, guion o guion bajo");
   const nombre = U.texto(ctx.body.nombre, { max: 120, campo: "El nombre", requerido: true });
   const password = String(ctx.body.password || "");
-  if (password.length < 6) throw U.error("La contraseña tiene que tener al menos 6 caracteres");
+  if (password.length < 4) throw U.error("La contraseña tiene que tener al menos 4 caracteres");
   const actor = { ...ctx, usuario: { id: null, nombre: "Configuración inicial" } };
   const id = await ctx.db.tx(async (t) => {
     const nuevo = await N.insertar(t, actor, "predio_usuario", {
