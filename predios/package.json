@@ -1,0 +1,18 @@
+{
+  "name": "ajb-predio-local",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sistema local de los predios de AJB (Camping Miramar, Parador de la Montaña): ventas, caja, stock, compras y afiliados. Funciona sin internet y se sincroniza con el sistema general.",
+  "main": "servidor.js",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.13 <23"
+  },
+  "scripts": {
+    "start": "node servidor.js",
+    "dev": "node servidor.js --base .local --puerto 8090",
+    "semilla": "node herramientas/semilla-local.js --base .local",
+    "paquete": "node herramientas/empaquetar.js",
+    "test": "node --test"
+  }
+}
