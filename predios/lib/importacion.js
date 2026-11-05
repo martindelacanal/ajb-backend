@@ -113,7 +113,7 @@ async function siguienteCodigo(t, pid) {
 }
 
 // ctx: { db, pid }. Con simular = true sólo devuelve el plan.
-async function importarCatalogo(ctx, datos, { simular = false, origen = "el sistema anterior" } = {}) {
+async function importarCatalogo(ctx, datos, { simular = false, origen = "del sistema anterior" } = {}) {
   if (!datos || typeof datos !== "object") throw U.error("El archivo no tiene el formato esperado");
   const ctxImp = { ...ctx, usuario: { id: null, nombre: IMPORTADOR, rol: "ADMIN" }, origen: "SISTEMA" };
   return ctx.db.tx(async (t) => {
@@ -148,7 +148,7 @@ async function importarCatalogo(ctx, datos, { simular = false, origen = "el sist
         usuario_nombre: "Sistema anterior",
       });
     }
-    await N.auditar(t, c, `Importación del catálogo de ${origen}`, "sistema", null, {
+    await N.auditar(t, c, `Importación del catálogo ${origen}`, "sistema", null, {
       proveedores: resultado.proveedores, productos: resultado.productos,
       productos_sin_precio: resultado.productos_sin_precio, salteados: resultado.salteados,
     });
