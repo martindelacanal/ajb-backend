@@ -159,6 +159,21 @@ test("PDF conserva el autorizado cero y explicita montos históricos faltantes",
   }
 });
 
+test("PDF muestra el tipo y los conceptos del plan de cuentas como en la pantalla, no en MAYÚSCULAS", async () => {
+  preparar();
+  const pdf = await generarConstanciaReintegro({ ...solicitud,
+    tipo_reintegro: "REINTEGRO DE PRACTICAS MEDICAS",
+    conceptos: [{ nombre: "PROTESIS ODONTOLOGICAS" }, { nombre: "COSEGURO IOMA" }, { nombre: "Con cobertura PAMI" }],
+  });
+  const contenido = extraerTextoPdf(pdf);
+  assert.ok(contenido.includes("Tipo de Reintegro: Reintegro de prácticas médicas"), "tipo en oración con tildes");
+  assert.ok(contenido.includes("Conceptos: Prótesis odontológicas, Coseguro IOMA, Con cobertura PAMI"), "siglas y textos ya escritos se respetan");
+  assert.ok(!contenido.includes("REINTEGRO DE PRACTICAS MEDICAS"));
+  const sinConceptos = extraerTextoPdf(await generarConstanciaReintegro({ ...solicitud, tipo_reintegro: null, conceptos: [], concepto: "KINESIOLOGIA" }));
+  assert.ok(sinConceptos.includes("Tipo de Reintegro: No informado"));
+  assert.ok(sinConceptos.includes("Conceptos: Kinesiología"));
+});
+
 test("fechas civiles y números de comprobante no sufren desplazamiento ni truncado", () => {
   assert.equal(formatearFechaConstancia("2026-09-25"), "25/09/2026");
   assert.equal(formatearFechaConstancia("2026-09-25T00:00:00.000Z"), "25/09/2026");
