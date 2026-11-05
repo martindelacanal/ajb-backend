@@ -171,7 +171,7 @@ L.stock = {
     { clave: "codigo", titulo: "Código", expr: "p.codigo", buscar: true },
     { clave: "cantidad", titulo: "Cantidad", expr: "s.cantidad", tipo: "qty" },
     { clave: "precio_venta", titulo: "Precio de venta", expr: "p.precio_venta", tipo: "money" },
-    { clave: "valor", titulo: "Valor a costo", expr: "s.cantidad * COALESCE(p.precio_compra, 0)", tipo: "money" },
+    { clave: "valor", titulo: "Valor a costo", expr: "s.cantidad * COALESCE(p.precio_compra, 0)", tipo: "money", soloAdmin: true },
     { clave: "destino", titulo: "Destino", expr: "p.destino", tipo: "opcion", opciones: DESTINOS },
     { clave: "fecha_caducidad", titulo: "Caducidad", expr: "p.fecha_caducidad", tipo: "date" },
     { clave: "fecha_modificacion", titulo: "Último movimiento", expr: "s.fecha_modificacion", tipo: "dt" },
@@ -190,7 +190,7 @@ L.stock = {
     },
   ],
   orden: { clave: "producto", dir: "asc" },
-  totales: [{ clave: "cantidad", expr: "SUM(s.cantidad)" }, { clave: "valor", expr: "SUM(s.cantidad * COALESCE(p.precio_compra, 0))" }],
+  totales: [{ clave: "cantidad", expr: "SUM(s.cantidad)" }, { clave: "valor", expr: "SUM(s.cantidad * COALESCE(p.precio_compra, 0))", soloAdmin: true }],
   resumen: {
     grupos: [
       { clave: "boca", titulo: "Boca", expr: "b.nombre" },
@@ -200,7 +200,7 @@ L.stock = {
     medidas: [
       { titulo: "Productos", expr: "COUNT(*)", tipo: "int" },
       { titulo: "Unidades", expr: "SUM(s.cantidad)", tipo: "qty" },
-      { titulo: "Valor a costo", expr: "SUM(s.cantidad * COALESCE(p.precio_compra, 0))", tipo: "money" },
+      { titulo: "Valor a costo", expr: "SUM(s.cantidad * COALESCE(p.precio_compra, 0))", tipo: "money", soloAdmin: true },
     ],
   },
 };
@@ -1079,7 +1079,9 @@ async function ejecutar(ctx, nombre, query = {}) {
   const valoresFrom = [];
   const fromSql = traducir(def.from, valoresFrom, nombres);
 
-  const columnas = def.columnas;
+  const admin = esAdmin(ctx);
+  const columnas = def.columnas.filter((c) => admin || !c.soloAdmin);
+  const totalesDef = (def.totales || []).filter((t) => admin || !t.soloAdmin);
   const ordenCol = columnas.find((c) => c.clave === query.orden) || columnas.find((c) => c.clave === def.orden?.clave) || columnas[0];
   const dir = (query.dir || (query.orden ? "asc" : def.orden?.dir) || "asc").toLowerCase() === "desc" ? "DESC" : "ASC";
   const desempate = columnas.find((c) => c.clave === "id") || columnas[0];
@@ -1087,7 +1089,7 @@ async function ejecutar(ctx, nombre, query = {}) {
   const select = columnas.map((c) => `${c.expr} AS ${c.clave}`).join(", ");
 
   if (query.formato === "csv") {
-    if (query.modo === "resumen") return csvResumen(ctx, def, query, { fromSql, valoresFrom, where, valores });
+    if (query.modo === "resumen") return csvResumen(ctx, def, query, { fromSql, valoresFrom, where, valores, admin });
     const filas = await db.all(
       `SELECT ${select} FROM ${fromSql} WHERE ${where} ORDER BY ${ordenSql} LIMIT 100000`,
       [...valoresFrom, ...valores]
@@ -1108,13 +1110,13 @@ async function ejecutar(ctx, nombre, query = {}) {
     [...valoresFrom, ...valores, tam, (pagina - 1) * tam]
   );
   let totales = null;
-  if (def.totales && total > 0) {
+  if (totalesDef.length && total > 0) {
     const fila = await db.get(
-      `SELECT ${def.totales.map((t) => `${t.expr} AS ${t.clave}`).join(", ")} FROM ${fromSql} WHERE ${where}`,
+      `SELECT ${totalesDef.map((t) => `${t.expr} AS ${t.clave}`).join(", ")} FROM ${fromSql} WHERE ${where}`,
       [...valoresFrom, ...valores]
     );
     totales = {};
-    for (const t of def.totales) totales[t.clave] = redondear(Number(fila?.[t.clave] || 0), 3);
+    for (const t of totalesDef) totales[t.clave] = redondear(Number(fila?.[t.clave] || 0), 3);
   }
   return {
     filas: filas.map((f) => {
@@ -1130,12 +1132,12 @@ async function ejecutar(ctx, nombre, query = {}) {
   };
 }
 
-async function csvResumen(ctx, def, query, { fromSql, valoresFrom, where, valores }) {
+async function csvResumen(ctx, def, query, { fromSql, valoresFrom, where, valores, admin }) {
   if (!def.resumen) throw error("Este listado no tiene resumen");
   const grupo = def.resumen.grupos.find((g) => g.clave === query.grupo) || def.resumen.grupos[0];
   const exprs = [grupo.expr];
   if (grupo.extra) exprs.push(grupo.extra.expr);
-  const medidas = def.resumen.medidas;
+  const medidas = def.resumen.medidas.filter((m) => admin || !m.soloAdmin);
   const select = [
     ...exprs.map((e, i) => `${e} AS g${i}`),
     ...medidas.map((m, i) => `${m.expr} AS m${i}`),
@@ -1212,10 +1214,11 @@ function meta(ctx, nombre) {
   const def = L[nombre];
   if (!def) throw error("El listado no existe", 404);
   if (def.roles && !def.roles.includes(ctx.usuario?.rol)) throw error("No tenés permiso para ver este listado", 403);
+  const admin = esAdmin(ctx);
   return {
     nombre,
     titulo: def.titulo,
-    columnas: def.columnas.filter((c) => !c.interna).map((c) => ({
+    columnas: def.columnas.filter((c) => !c.interna && (admin || !c.soloAdmin)).map((c) => ({
       clave: c.clave, titulo: c.titulo, tipo: c.tipo || "texto", oculta: !!c.oculta, signo: !!c.signo,
       opciones: c.opciones ? c.opciones.map((o) => ({ valor: o.valor, texto: o.texto })) : undefined,
     })),
@@ -1225,7 +1228,7 @@ function meta(ctx, nombre) {
     })),
     orden: def.orden,
     buscador: def.columnas.some((c) => c.buscar),
-    totales: (def.totales || []).map((t) => t.clave),
+    totales: (def.totales || []).filter((t) => admin || !t.soloAdmin).map((t) => t.clave),
     resumen: def.resumen ? def.resumen.grupos.map((g) => ({ clave: g.clave, titulo: g.titulo })) : [],
   };
 }

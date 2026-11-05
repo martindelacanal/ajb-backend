@@ -122,6 +122,11 @@ test("flujo completo del camping", async () => {
   await ok("POST", `/caja/apertura/${apertura.id}/verificar`, { token: cajero, cuerpo: { correcto: 1 } });
   const escaneado = await ok("GET", `/productos/buscar?q=7790001&boca_id=${proveeduria}&venta=1`, { token: cajero });
   assert.equal(escaneado[0].exacto, true);
+  // Un cajero que no es del almacén no ve costos ni márgenes.
+  assert.equal(escaneado[0].precio_compra, undefined);
+  const metaStock = await ok("GET", "/listados/stock/meta", { token: cajero });
+  assert.ok(!metaStock.columnas.some((c) => c.clave === "valor"));
+  assert.equal((await api("GET", "/listados/productos", { token: cajero })).status, 403);
   const venta = await ok("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: prod.id, cantidad: 2 }], forma_pago: "EFECTIVO", recibido: 2000 } });
   assert.equal(venta.total, 1540);
   assert.equal(venta.vuelto, 460);

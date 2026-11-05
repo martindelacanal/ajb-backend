@@ -14,6 +14,17 @@ function precioVenta(compra, margen) {
   return U.redondear(Number(compra || 0) * (1 + Number(margen || 0) / 100), 2);
 }
 
+// El costo de compra y el margen los ve el administrador y quien carga compras (el almacén).
+async function veCostos(db, ctx) {
+  if (esAdmin(ctx)) return true;
+  const bocas = bocasDe(ctx);
+  if (!bocas.length) return false;
+  const fila = await db.get(
+    `SELECT COUNT(*) AS n FROM predio_boca WHERE predio_id = ? AND es_almacen = 1 AND id IN (${bocas.map(() => "?").join(", ")})`,
+    [ctx.pid, ...bocas]);
+  return Number(fila?.n || 0) > 0;
+}
+
 // ------------------------------------------------------------------ opciones
 
 async function opciones(ctx) {
@@ -49,9 +60,10 @@ async function opciones(ctx) {
     case "productos": {
       const filas = await db.all(
         "SELECT id, nombre, codigo, precio_venta, precio_compra, margen, destino FROM predio_producto WHERE predio_id = ? AND activo = 1 ORDER BY nombre", [pid]);
+      const costos = await veCostos(db, ctx);
       return filas.map((f) => ({
         valor: f.id, texto: f.nombre, codigo: f.codigo, precio_venta: Number(f.precio_venta || 0),
-        precio_compra: Number(f.precio_compra || 0), margen: Number(f.margen || 0), destino: f.destino,
+        precio_compra: costos ? Number(f.precio_compra || 0) : undefined, margen: costos ? Number(f.margen || 0) : undefined, destino: f.destino,
       }));
     }
     case "usuarios": {
@@ -94,9 +106,10 @@ async function buscarProductos(ctx) {
     WHERE ${where} ORDER BY ${orden} LIMIT 30`;
   if (q) params.push(q);
   const filas = await db.all(sql, params);
+  const costos = await veCostos(db, ctx);
   return filas.map((f) => ({
     id: f.id, nombre: f.nombre, codigo: f.codigo, precio_venta: Number(f.precio_venta || 0),
-    precio_compra: Number(f.precio_compra || 0), margen: Number(f.margen || 0), destino: f.destino,
+    precio_compra: costos ? Number(f.precio_compra || 0) : undefined, margen: costos ? Number(f.margen || 0) : undefined, destino: f.destino,
     perecedero: !!Number(f.perecedero), fecha_caducidad: f.fecha_caducidad, stock_boca: Number(f.stock_boca || 0),
     exacto: !!q && f.codigo === q,
   }));
