@@ -44,6 +44,15 @@ la migración es `scripts/migrar-predios.js`. En el front Angular: `src/app/comp
   publica la versión nueva; la notebook la descarga, la instala en `app/versiones/<versión>/` y se
   reinicia sola. Si no arranca dos veces seguidas, el lanzador vuelve a la anterior.
 
+## Firma de actualizaciones y paquetes
+
+El sistema general firma con Ed25519 el código que publica y los paquetes para pendrive; la
+notebook verifica con la `clave_publica` que trae su `config.json` (la pone el instalador) y
+rechaza lo que no coincide. La clave privada está en el `.env` del EC2 como
+`PREDIOS_FIRMA_PRIVADA` (PEM en base64). **No cambiarla**: las notebooks ya instaladas dejarían de
+aceptar actualizaciones y habría que reinstalarlas. Sin la variable (desarrollo), se genera una en
+`.cache/predios/firma-privada.pem`.
+
 ## Desarrollo
 
 ```sh

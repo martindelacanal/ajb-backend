@@ -467,7 +467,7 @@ module.exports = {
   rutas: [
     { m: "GET", p: "/opciones/:fuente", h: opciones },
     { m: "GET", p: "/productos/buscar", h: buscarProductos },
-    { m: "GET", p: "/productos/:id", h: detalleProducto },
+    { m: "GET", p: "/productos/:id", h: detalleProducto, roles: ["ADMIN"] },
     { m: "POST", p: "/productos", h: crearProducto, escritura: true, roles: ["ADMIN"] },
     { m: "PUT", p: "/productos/:id", h: editarProducto, escritura: true, roles: ["ADMIN"] },
     { m: "GET", p: "/proveedores/:id", h: detalleProveedor, roles: ["ADMIN"] },

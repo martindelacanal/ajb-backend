@@ -6,7 +6,7 @@
 const U = require("../util");
 const N = require("../negocio");
 const { TIPOS_PERMISO, textoDe } = require("../listados");
-const { exigirAdmin, esAdmin, bocasDe, claveCorrecta, exigirPuesto } = require("./comun");
+const { exigirAdmin, esAdmin, bocasDe, validarClave, exigirPuesto } = require("./comun");
 
 const TIPOS = TIPOS_PERMISO.map((t) => t.valor);
 
@@ -15,7 +15,12 @@ async function pedir(ctx) {
   const tipo = U.opcion(ctx.body.tipo, TIPOS, "El tipo de autorización");
   const referenciaId = ctx.body.referencia_id ? U.id(ctx.body.referencia_id, "La referencia") : (tipo === "VER_VENTAS_CAJA" ? ctx.sesion?.caja_id || null : null);
   const detalle = U.texto(ctx.body.detalle, { max: 255 });
+  if (tipo === "ANULAR_VENTA" && !referenciaId) throw U.error("Indicá qué venta querés anular");
   return ctx.db.tx(async (t) => {
+    if (tipo === "ANULAR_VENTA") {
+      const v = await N.exigir(t, ctx, "predio_venta", referenciaId, "No encontramos la venta");
+      if (Number(v.caja_id) !== Number(ctx.sesion?.caja_id)) throw U.error("Sólo podés pedir anular ventas de tu caja", 403);
+    }
     const abierto = await t.get(
       `SELECT id FROM predio_permiso WHERE predio_id = ? AND usuario_id = ? AND tipo = ? AND estado = 'PENDIENTE'
        AND (referencia_id = ? OR (referencia_id IS NULL AND ? IS NULL)) ORDER BY id DESC LIMIT 1`,
@@ -59,7 +64,7 @@ async function resolver(ctx) {
 
 // Valida la clave del día sin consumir nada (para abrir pantallas protegidas en esa PC).
 async function probarClave(ctx) {
-  if (!claveCorrecta(ctx.body.clave)) throw U.error("La clave no es correcta", 403, { codigo: "CLAVE_INCORRECTA" });
+  validarClave(ctx, ctx.body.clave, "PRUEBA", null);
   return { ok: true };
 }
 

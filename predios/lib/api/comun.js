@@ -26,9 +26,40 @@ function exigirPuesto(ctx) {
   return s;
 }
 
+// Intentos fallidos de la clave del día por usuario (en memoria): 5 cada 10 minutos.
+const fallosClave = new Map();
+const VENTANA_CLAVE_MS = 10 * 60 * 1000;
+
+function controlarIntentosClave(ctx) {
+  const k = `${ctx.pid}:${ctx.usuario?.id || ctx.ip || "anon"}`;
+  const e = fallosClave.get(k);
+  if (e && Date.now() - e.inicio < VENTANA_CLAVE_MS && e.n >= 5) {
+    throw error("Demasiados intentos con la clave. Esperá unos minutos o pedí la autorización a distancia.", 429, { codigo: "CLAVE_BLOQUEADA" });
+  }
+}
+
+function registrarFalloClave(ctx, tipo, referenciaId) {
+  const k = `${ctx.pid}:${ctx.usuario?.id || ctx.ip || "anon"}`;
+  const e = fallosClave.get(k);
+  if (!e || Date.now() - e.inicio >= VENTANA_CLAVE_MS) fallosClave.set(k, { inicio: Date.now(), n: 1 });
+  else e.n++;
+  if (fallosClave.size > 2000) fallosClave.delete(fallosClave.keys().next().value);
+  // La auditoría del intento fallido va fuera de la transacción (que se revierte).
+  ctx.db.tx((t) => auditar(t, { ...ctx, db: t }, "Clave del día incorrecta", "permiso", null, { tipo, referencia_id: referenciaId || null }))
+    .catch(() => {});
+}
+
 function claveCorrecta(clave) {
   const limpia = String(clave || "").replace(/\D/g, "");
   return limpia.length > 0 && igualesSeguros(limpia, claveDelDia());
+}
+
+function validarClave(ctx, clave, tipo, referenciaId) {
+  controlarIntentosClave(ctx);
+  if (!claveCorrecta(clave)) {
+    registrarFalloClave(ctx, tipo, referenciaId);
+    throw error("La clave no es correcta. Pedile al administrador que la escriba.", 403, { codigo: "CLAVE_INCORRECTA" });
+  }
 }
 
 // Autoriza una acción restringida para un usuario de boca. Un administrador no la necesita.
@@ -37,10 +68,7 @@ function claveCorrecta(clave) {
 async function autorizar(t, ctx, tipo, { clave, permisoId, referenciaId, detalle } = {}) {
   if (esAdmin(ctx)) return { metodo: "ADMIN", permisoId: null };
   if (clave !== undefined && clave !== null && String(clave).trim() !== "") {
-    if (!claveCorrecta(clave)) {
-      await auditar(t, ctx, "Clave del día incorrecta", "permiso", null, { tipo, referencia_id: referenciaId || null });
-      throw error("La clave no es correcta. Pedile al administrador que la escriba.", 403, { codigo: "CLAVE_INCORRECTA" });
-    }
+    validarClave(ctx, clave, tipo, referenciaId);
     const config = await leerConfig(t, ctx);
     const ahora = new Date();
     const id = await insertar(t, ctx, "predio_permiso", {
@@ -72,7 +100,8 @@ async function autorizar(t, ctx, tipo, { clave, permisoId, referenciaId, detalle
     }
     if (permiso.estado !== "APROBADO") throw error("El administrador todavía no aprobó el pedido", 403, { codigo: "SIN_AUTORIZACION" });
     if (permiso.vence && permiso.vence < fechaHora()) throw error("La autorización venció. Pedila de nuevo.", 403, { codigo: "SIN_AUTORIZACION" });
-    if (permiso.referencia_id && referenciaId && Number(permiso.referencia_id) !== Number(referenciaId)) {
+    // Si la acción es sobre algo puntual (una venta, una caja), el permiso tiene que ser para eso mismo.
+    if (referenciaId && Number(permiso.referencia_id) !== Number(referenciaId)) {
       throw error("La autorización es para otra operación", 403);
     }
     // VER_VENTAS_CAJA se puede usar varias veces mientras esté vigente.
@@ -107,5 +136,6 @@ module.exports = {
   exigirPuesto,
   autorizar,
   claveCorrecta,
+  validarClave,
   disponibleAfiliado,
 };

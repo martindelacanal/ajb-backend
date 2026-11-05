@@ -47,6 +47,7 @@ function leerConfig() {
     token: config.token || process.env.PREDIO_TOKEN || "",
     puerto: Number(argumento("puerto", config.puerto || process.env.PREDIO_PUERTO || 8080)),
     actualizaciones_automaticas: config.actualizaciones_automaticas !== false,
+    clave_publica: config.clave_publica || null,
   };
 }
 

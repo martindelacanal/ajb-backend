@@ -99,6 +99,7 @@ function alcanceBocas(expr) {
 const L = {};
 
 L.productos = {
+  roles: ["ADMIN"],
   titulo: "Productos y stock general",
   from: `predio_producto p
     LEFT JOIN (SELECT producto_id, SUM(cantidad) AS total FROM predio_stock WHERE predio_id = :pid GROUP BY producto_id) st ON st.producto_id = p.id
@@ -205,6 +206,7 @@ L.stock = {
 };
 
 L.proveedores = {
+  roles: ["ADMIN"],
   titulo: "Proveedores",
   from: `predio_proveedor pr
     LEFT JOIN (SELECT proveedor_id, COUNT(*) AS compras, SUM(total_items) AS total, MAX(fecha_factura) AS ultima
@@ -229,6 +231,7 @@ L.proveedores = {
 
 L.compras = {
   titulo: "Compras",
+  alcance: alcanceBocas("c.boca_id"),
   from: `predio_compra c
     JOIN predio_proveedor pr ON pr.predio_id = c.predio_id AND pr.id = c.proveedor_id
     LEFT JOIN (SELECT compra_id, COUNT(*) AS items FROM predio_compra_item WHERE predio_id = :pid GROUP BY compra_id) it ON it.compra_id = c.id`,
@@ -267,6 +270,7 @@ L.compras = {
 };
 
 L.compras_productos = {
+  roles: ["ADMIN"],
   titulo: "Compras por producto",
   from: `predio_compra_item i
     JOIN predio_compra c ON c.predio_id = i.predio_id AND c.id = i.compra_id
@@ -369,6 +373,7 @@ L.solicitudes = {
 };
 
 L.bajas = {
+  roles: ["ADMIN"],
   titulo: "Bajas de stock",
   from: `predio_baja x
     JOIN predio_producto p ON p.predio_id = x.predio_id AND p.id = x.producto_id
@@ -517,6 +522,7 @@ L.ventas = {
 };
 
 L.ventas_productos = {
+  roles: ["ADMIN"],
   titulo: "Ventas por producto",
   from: `predio_venta_item i
     JOIN predio_venta v ON v.predio_id = i.predio_id AND v.id = i.venta_id

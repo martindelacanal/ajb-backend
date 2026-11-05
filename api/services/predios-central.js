@@ -16,15 +16,43 @@ const { crearMysql } = require("../../predios/lib/db-mysql");
 const { armarPaquete } = require("../../predios/lib/paquete");
 const { aplicarMaestros } = require("../../predios/lib/maestros");
 const { sembrarPredio, PREDIOS } = require("../../predios/lib/semilla");
+const firma = require("../../predios/lib/firma");
 
 // Estados de reserva que NO cuentan como estadía (rechazada, solicitud de sorteo,
 // no adjudicada, convenio rechazado, cancelada).
 const ESTADOS_EXCLUIDOS = [4, 6, 8, 12, 13];
 
+// Clave privada Ed25519 del sistema general (PREDIOS_FIRMA_PRIVADA: PEM o PEM en base64).
+// Sin variable, se genera una vez y se guarda en .cache/predios (sólo para desarrollo).
+let claveCache = null;
+function claveFirma() {
+  if (claveCache) return claveCache;
+  let privada = String(process.env.PREDIOS_FIRMA_PRIVADA || "").trim();
+  if (privada && !privada.includes("BEGIN")) privada = Buffer.from(privada, "base64").toString("utf8");
+  if (!privada) {
+    const archivo = path.join(rutaCache(), "firma-privada.pem");
+    if (!fs.existsSync(archivo)) fs.writeFileSync(archivo, firma.generarPar().privada, { mode: 0o600 });
+    privada = fs.readFileSync(archivo, "utf8");
+  }
+  claveCache = { privada, publica: firma.publicaDe(privada) };
+  return claveCache;
+}
+
 let paqueteCache = null;
 function paqueteCodigo() {
-  if (!paqueteCache) paqueteCache = armarPaquete(DIR_PREDIOS);
+  if (!paqueteCache) {
+    paqueteCache = armarPaquete(DIR_PREDIOS);
+    paqueteCache.firma = firma.firmar(paqueteCache.buffer, claveFirma().privada);
+  }
   return paqueteCache;
+}
+
+// Envuelve un paquete para pendrive con la firma del sistema general.
+function paqueteFirmado(datos) {
+  const contenido = JSON.stringify(datos);
+  return zlib.gzipSync(Buffer.from(JSON.stringify({
+    tipo: "predio-paquete-firmado", firma: firma.firmar(Buffer.from(contenido), claveFirma().privada), contenido,
+  })));
 }
 
 function enLinea(predio) {
@@ -301,6 +329,7 @@ async function armarInstalador(pool, predio, { urlServidor, token, puerto = 8080
     token,
     puerto,
     actualizaciones_automaticas: true,
+    clave_publica: claveFirma().publica,
   };
   const datosIniciales = zlib.gzipSync(Buffer.from(JSON.stringify({
     tipo: "predio-datos-iniciales", predio_id: predio.id, generado: U.fechaHora(), tablas: await instantaneaCompleta(pool, predio.id),
@@ -333,6 +362,8 @@ function nuevoToken() {
 module.exports = {
   DIR_PREDIOS,
   paqueteCodigo,
+  paqueteFirmado,
+  claveFirma,
   enLinea,
   serviciosDe,
   obtenerPredio,
