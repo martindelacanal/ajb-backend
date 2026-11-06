@@ -105,6 +105,15 @@ const TABLAS_LOCALES = [
      status INTEGER,
      respuesta TEXT
    )`,
+  `CREATE TABLE IF NOT EXISTS predio_peticion (
+     operacion_id TEXT NOT NULL,
+     usuario_id INTEGER NOT NULL,
+     peticion_sha256 TEXT NOT NULL,
+     fecha TEXT NOT NULL,
+     status INTEGER NOT NULL,
+     respuesta TEXT NOT NULL,
+     PRIMARY KEY (usuario_id, operacion_id)
+   )`,
 ];
 
 function crearSqlite(archivo, { predioId }) {
@@ -130,6 +139,7 @@ function crearSqlite(archivo, { predioId }) {
 
   const candado = new Candado();
   let enTransaccion = false;
+  let controlTransacciones = null;
 
   const ejecutor = {
     all(sql, params = []) {
@@ -166,28 +176,38 @@ function crearSqlite(archivo, { predioId }) {
     ...comunes,
     conexion,
     archivo,
-    async all(sql, params) { return ejecutor.all(sql, params); },
-    async get(sql, params) { return ejecutor.get(sql, params); },
+    async all(sql, params) { return candado.con(async () => ejecutor.all(sql, params)); },
+    async get(sql, params) { return candado.con(async () => ejecutor.get(sql, params)); },
     async run(sql, params) {
-      if (enTransaccion) return candado.con(async () => ejecutor.run(sql, params));
-      return ejecutor.run(sql, params);
+      if (controlTransacciones) return db.tx(t => t.run(sql, params));
+      return candado.con(async () => ejecutor.run(sql, params));
     },
     async tx(trabajo) {
       return candado.con(async () => {
+        if (controlTransacciones) await controlTransacciones.antesTransaccion();
         enTransaccion = true;
-        conexion.exec("BEGIN IMMEDIATE");
+        let confirmado = false;
         try {
+          conexion.exec("BEGIN IMMEDIATE");
           const r = await trabajo(transaccional);
+          if (controlTransacciones) await controlTransacciones.antesCommit();
           conexion.exec("COMMIT");
+          confirmado = true;
+          enTransaccion = false;
+          if (controlTransacciones) await controlTransacciones.despuesTransaccion();
           return r;
         } catch (e) {
-          try { conexion.exec("ROLLBACK"); } catch (_e) { /* ya revertida */ }
+          if (!confirmado) {
+            try { conexion.exec("ROLLBACK"); } catch (_e) { /* ya revertida */ }
+            if (controlTransacciones) await controlTransacciones.abortarTransaccion();
+          }
           throw e;
         } finally {
           enTransaccion = false;
         }
       });
     },
+    configurarTransacciones(control) { controlTransacciones = control || null; },
     // Trabajo sincrónico exclusivo: nunca corre en medio de una transacción abierta.
     async exclusivo(trabajo) {
       return candado.con(async () => trabajo());

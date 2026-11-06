@@ -1,0 +1,159 @@
+/* PCs de respaldo y testigo local. Consultar esta pantalla no modifica el grupo. */
+(function () {
+  "use strict";
+  if (window.__SIN_SOPORTE) return;
+  var P = window.P;
+  var h = P.h;
+
+  P.panelGrupoLocal = function () {
+    if (P.modo === "remoto") return h("div.hoja.hoja-cuerpo", h("p.texto-3", "Para preparar las PCs de respaldo, abrí Sistema desde una PC de la red del predio."));
+    var cerrado = false, consultando = false, trabajando = false, confirmando = false, activando = false;
+    var datos = null, huella = null, reinicio = null;
+    var estado = h("div", { role: "status", "aria-live": "polite" }, P.chip("Consultando", "PENDIENTE"));
+    var mensaje = h("div", { hidden: true });
+    var problema = h("div", { hidden: true, role: "alert" });
+    var aviso = h("p.texto-3.chico", { role: "status", hidden: true, style: { margin: 0 } });
+    var pcServicio = h("strong", "Consultando…"), preferida = h("strong", "—"), pcTestigo = h("strong", "Pendiente de instalar");
+    var equipos = h("ul.lista-simple", { hidden: true });
+    var sinEquipos = h("p.texto-3.chico", { style: { margin: 0 } }, "Todavía no hay PCs de respaldo agregadas.");
+    var reducida = P.mensaje("Protección reducida: no hay una copia de respaldo confirmada disponible. Revisá las PCs de respaldo para recuperar la protección.", "aviso");
+    reducida.hidden = true;
+    var retorno = h("p.texto-3.chico", { style: { margin: 0 }, hidden: true }, "Cuando vuelve la PC preferida, primero recibe los datos pendientes y después retoma el servicio.");
+    var testigo = botonInstalador("Instalar testigo en una PC de caja", "Testigo");
+    var respaldo = botonInstalador("Agregar PC de respaldo", "Respaldo");
+    var acceso = botonInstalador("Preparar acceso de caja", "Acceso");
+    var activar = P.btn("Activar reemplazo automático", { tipo: "primario", icono: "check", deshabilitado: true, onclick: activarGrupo });
+    var revisar = P.btn("Actualizar estado", { tipo: "texto", icono: "refrescar", onclick: function () { cargar(); } });
+    var panel = h("section.hoja.hoja-cuerpo.columna", { "aria-label": "PCs de respaldo del predio" },
+      h("div.fila-separada", h("h2.seccion-titulo", "PCs de respaldo"), estado),
+      h("p.texto-3", { style: { margin: 0 } }, "Podés seguir trabajando con una sola PC. Si agregás respaldos, otra PC puede continuar atendiendo las cajas cuando falle la que está en servicio."),
+      h("div.datos", h("div.dato", h("span", "PC en servicio"), pcServicio), h("div.dato", h("span", "PC preferida"), preferida), h("div.dato", h("span", "Testigo en la red"), pcTestigo)),
+      mensaje, problema, reducida,
+      h("ol", { style: { margin: 0, paddingLeft: "22px" } },
+        h("li", "Instalá el testigo en una PC de caja que permanezca encendida. Es liviano y no guarda la base de ventas ni stock."),
+        h("li", "Agregá las PCs de respaldo que necesites y completá su incorporación."),
+        h("li", "Activá el reemplazo automático y prepará el acceso de cada caja.")),
+      equipos, sinEquipos, retorno,
+      h("div.fila", testigo, respaldo, acceso, activar),
+      h("p.texto-3.chico", { style: { margin: 0 } }, "En las cajas, usá «Sistema del Camping - Caja»: abre localhost:8091 y encuentra la PC en servicio."),
+      aviso, h("div.fila", revisar));
+
+    function actualizarControles() {
+      var ocupado = trabajando || confirmando || activando || !datos;
+      testigo.disabled = ocupado || !datos.puedePrepararTestigo;
+      respaldo.disabled = ocupado || !datos.puedePrepararRespaldo;
+      acceso.disabled = ocupado || !datos.testigo;
+      activar.disabled = ocupado || !datos.puedeActivar;
+      activar.hidden = !!datos && (datos.estado === "EN_MARCHA" || datos.estado === "SIN_TESTIGO");
+      revisar.disabled = consultando || activando;
+    }
+    function botonInstalador(texto, rol) {
+      var boton = P.btn(texto, { tipo: "secundario", icono: "descargar", deshabilitado: true, onclick: function () {
+        if (trabajando || activando || cerrado) return;
+        trabajando = true; actualizarControles();
+        P.ejecutar(boton, function () {
+          return P.descargarPost("/sistema/grupo-local/instalador", { rol: rol }, "AJB-Predio-" + rol + ".zip").then(function () {
+            if (cerrado) return;
+            aviso.textContent = "Instalador descargado. En la " + (rol === "Testigo" ? "PC de caja elegida para el testigo" : rol === "Respaldo" ? "PC de respaldo" : "PC de caja") + ", descomprimí el ZIP y ejecutá INSTALAR-APOYO.bat como administrador.";
+            aviso.hidden = false;
+          });
+        }).catch(function () {}).finally(function () { trabajando = false; if (!cerrado) { actualizarControles(); cargar(); } });
+      } });
+      return boton;
+    }
+    function estadoVisible(d) {
+      var estados = {
+        SIN_CONFIGURAR: ["Una sola PC", "CONFIRMADA"],
+        PREPARANDO: ["Preparando las PCs", "PENDIENTE"],
+        EN_MARCHA: ["Reemplazo automático activo", "CONFIRMADA"],
+        SIN_TESTIGO: ["Testigo sin conexión", "PENDIENTE"],
+      };
+      return estados[d.estado] || ["Revisar configuración", "PENDIENTE"];
+    }
+    function mostrar(d) {
+      datos = d;
+      var lista = (d.miembros || []).slice().sort(function (a, b) { return String(a.id).localeCompare(String(b.id)); });
+      var nueva = JSON.stringify({ habilitado: d.habilitado, grupoId: d.grupoId, principal: d.principal, testigo: d.testigo, miembros: lista,
+        escritor: d.escritor, degradado: d.degradado, estado: d.estado, puedeActivar: d.puedeActivar,
+        puedePrepararTestigo: d.puedePrepararTestigo, puedePrepararRespaldo: d.puedePrepararRespaldo, mensaje: d.mensaje });
+      if (huella !== nueva) {
+        huella = nueva;
+        var visible = estadoVisible(d);
+        P.reemplazar(estado, P.chip(visible[0], visible[1]));
+        pcServicio.textContent = (d.escritor && d.escritor.nombre) || (d.estado === "SIN_CONFIGURAR" && d.principal && d.principal.nombre) || "Esperando servidor";
+        preferida.textContent = (d.principal && d.principal.nombre) || "Esta PC";
+        pcTestigo.textContent = (d.testigo && (d.testigo.nombre || "PC de caja")) || "Pendiente de instalar";
+        mensaje.hidden = !d.mensaje && d.estado !== "SIN_TESTIGO";
+        if (!mensaje.hidden) P.reemplazar(mensaje, P.mensaje(d.mensaje || "Encendé la PC testigo y verificá que esté conectada a la red del predio.", d.estado === "SIN_TESTIGO" ? "aviso" : "info"));
+        reducida.hidden = !d.degradado;
+        retorno.hidden = !d.habilitado;
+        var otras = lista.filter(function (m) { return !d.principal || m.id !== d.principal.id; });
+        equipos.hidden = !otras.length; sinEquipos.hidden = !!otras.length;
+        P.reemplazar(equipos, otras.map(function (m) {
+          var atendiendo = d.escritor && m.id === d.escritor.id;
+          var texto = atendiendo ? "En servicio" : d.estado === "PREPARANDO" ? "Incorporada" : m.actualizado === true ? "Copia actualizada" : m.actualizado === false ? "Actualizando copia" : "Esperando confirmación";
+          return h("li", h("div", h("strong", m.nombre || "PC de respaldo"), m.preferido ? h("div.texto-3.chico", "PC preferida") : null),
+            P.chip(texto, atendiendo || m.actualizado === true ? "CONFIRMADA" : "PENDIENTE"));
+        }));
+      }
+      problema.hidden = true;
+      actualizarControles();
+    }
+    function cargar() {
+      if (cerrado || consultando || activando) return Promise.resolve();
+      consultando = true; actualizarControles();
+      return P.get("/sistema/grupo-local", { sinRedireccion: true }).then(function (d) { if (!cerrado) mostrar(d); })
+        .catch(function (e) {
+          if (cerrado) return;
+          problema.hidden = false;
+          P.reemplazar(problema, P.mensaje(e.message || "No se pudo consultar el estado de las PCs.", "error"));
+        }).finally(function () { consultando = false; if (!cerrado) actualizarControles(); });
+    }
+    function esperarReinicio(intento) {
+      if (cerrado) return;
+      reinicio = setTimeout(function () {
+        P.get("/sistema/grupo-local", { sinRedireccion: true }).then(function (d) {
+          if (cerrado) return;
+          if (d.estado !== "EN_MARCHA" && d.estado !== "SIN_TESTIGO") throw new Error("El servidor todavía está preparando el reemplazo");
+          activando = false; mostrar(d);
+          aviso.textContent = d.estado === "EN_MARCHA" ? "El reemplazo automático está activo. Mantené encendida la PC testigo." : "El servidor volvió. Encendé la PC testigo para habilitar el reemplazo automático.";
+          aviso.hidden = false;
+        }).catch(function () {
+          if (cerrado) return;
+          if (intento < 29) { esperarReinicio(intento + 1); return; }
+          activando = false; huella = null;
+          aviso.textContent = "El servidor todavía no responde. Revisá que las PCs estén encendidas y usá «Actualizar estado» cuando vuelva a estar disponible.";
+          aviso.hidden = false; actualizarControles();
+        });
+      }, 2000);
+    }
+    function activarGrupo() {
+      if (cerrado || confirmando || trabajando || activando || !datos || !datos.puedeActivar) return;
+      confirmando = true; actualizarControles();
+      P.confirmar("El servidor se reiniciará y las cajas tendrán una interrupción breve. Mantené encendida y conectada a la red la PC que cumple la función de testigo.", {
+        titulo: "¿Activar el reemplazo automático?", aceptar: "Activar y reiniciar",
+      }).then(function (ok) {
+        confirmando = false;
+        if (!ok || cerrado) { if (!cerrado) actualizarControles(); return; }
+        activando = true; actualizarControles();
+        P.ejecutar(activar, function () {
+          return P.post("/sistema/grupo-local/activar", {}).then(function () {
+            if (cerrado) return;
+            P.reemplazar(estado, P.chip("Esperando el reinicio", "PENDIENTE"));
+            aviso.textContent = "Activación solicitada. Esperando que el servidor vuelva a responder…";
+            aviso.hidden = false; esperarReinicio(0);
+          });
+        }).catch(function (e) {
+          if (cerrado) return;
+          if (!e.status || e.codigo === "RESULTADO_INCIERTO") {
+            aviso.textContent = "Comprobando si el servidor terminó la activación…"; aviso.hidden = false; esperarReinicio(0);
+          } else { activando = false; actualizarControles(); }
+        }).finally(function () { if (!cerrado) actualizarControles(); });
+      }).catch(function (e) { confirmando = false; if (!cerrado) { actualizarControles(); P.error(e); } });
+    }
+    P.alSalir(function () { cerrado = true; clearTimeout(reinicio); });
+    P.intervalo(function () { return cargar(); }, 30000);
+    actualizarControles(); cargar();
+    return panel;
+  };
+})();

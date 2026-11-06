@@ -58,6 +58,61 @@
     return P.f.entero(b / 1024) + " KB";
   }
 
+  function descargarRespaldoCompleto() {
+    var clave = P.inputClave({ requerido: true, max: 1024, autofocus: true });
+    var repetir = P.inputClave({ requerido: true, max: 1024 });
+    var error = P.mensaje("", "error");
+    error.setAttribute("role", "alert");
+    error.hidden = true;
+    function limpiarClaves() {
+      [clave.input, repetir.input].forEach(function (input) { input.value = ""; input.type = "password"; });
+    }
+    function invalido(texto, input) {
+      P.reemplazar(error, P.icono("alerta"), h("div", texto));
+      error.hidden = false;
+      input.classList.add("invalido");
+      input.setAttribute("aria-invalid", "true");
+      input.focus();
+    }
+    var descargar = P.btn("Descargar respaldo completo", { tipo: "primario", icono: "descargar", onclick: function (ev) {
+      if (clave.input.value.length < 12 || clave.input.value.length > 1024) {
+        invalido("Elegí una clave de recuperación de al menos 12 caracteres.", clave.input);
+        return;
+      }
+      if (clave.input.value !== repetir.input.value) {
+        invalido("Las claves no coinciden. Volvé a escribir la misma clave.", repetir.input);
+        return;
+      }
+      P.ejecutar(ev.currentTarget, function () {
+        return P.descargarPost("/sistema/respaldo-completo", { clave: clave.input.value }, "predio.ajbrespaldo").then(function () {
+          m.cerrar();
+          P.aviso("Respaldo completo descargado. Conservá el archivo y la clave de recuperación.", "ok", 9000);
+        });
+      }).catch(function () {});
+    } });
+    [clave.input, repetir.input].forEach(function (input) {
+      input.addEventListener("input", function () {
+        error.hidden = true;
+        input.classList.remove("invalido");
+        input.removeAttribute("aria-invalid");
+      });
+      input.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter") { ev.preventDefault(); descargar.click(); }
+      });
+    });
+    var m = P.modal({
+      titulo: "Respaldo completo para otra PC",
+      contenido: h("div.columna",
+        h("p", { style: { margin: 0 } }, "Conserva los datos del predio y los cambios pendientes de sincronizar, también sin internet."),
+        h("p.texto-3", { style: { margin: 0 } }, "El archivo .ajbrespaldo queda protegido con esta clave. La vas a necesitar para recuperarlo en otra PC."),
+        P.campo("Clave de recuperación", clave, { requerido: true, ayuda: "Al menos 12 caracteres. Guardala para poder recuperar el respaldo." }),
+        P.campo("Repetí la clave", repetir, { requerido: true }), error),
+      alCerrar: limpiarClaves,
+      acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), descargar],
+    });
+    P.alSalir(function () { m.cerrar(); limpiarClaves(); });
+  }
+
   function enlaceServidor(url, texto) {
     return /^https?:\/\/[^\s]+$/i.test(String(url || ""))
       ? h("a", { href: url, style: { overflowWrap: "anywhere" } }, texto || url)
@@ -104,6 +159,7 @@
       return;
     }
     var zona = h("div.columna", P.cargando());
+    if (P.panelGrupoLocal) c.appendChild(P.panelGrupoLocal());
     c.appendChild(zona);
     var accionServidor = false;
     var temporizadorReinicio = null;
@@ -229,9 +285,9 @@
           h("div.grilla.grilla-2",
             h("div.hoja.hoja-cuerpo",
               h("h2.seccion-titulo", "Sin internet: pasar datos en pendrive"),
-              h("p.texto-3", "Exportá los datos del camping para subirlos en Mi AJB > Predios, o cargá el paquete que bajaste de ahí (afiliados con reserva, cambios hechos a distancia y actualizaciones)."),
+              h("p.texto-3", d.grupo_local && d.grupo_local.habilitado ? "Con respaldo automático, los cambios se suben desde la PC en servicio cuando vuelve internet. Podés cargar un paquete del sistema general para actualizar afiliados, órdenes y código." : "Exportá los datos del camping para subirlos en Mi AJB > Predios, o cargá el paquete que bajaste de ahí (afiliados con reserva, cambios hechos a distancia y actualizaciones)."),
               h("div.fila",
-                P.btn("Exportar datos para el sistema general", { tipo: "primario", icono: "descargar", onclick: function (ev) {
+                P.btn("Exportar datos para el sistema general", { tipo: "primario", icono: "descargar", deshabilitado: !!(d.grupo_local && d.grupo_local.habilitado), onclick: function (ev) {
                   P.ejecutar(ev.currentTarget, function () { return P.descargar("/sistema/exportar", "predio.ajbpredio").then(function () { P.aviso("Archivo generado. Copialo al pendrive.", "ok"); }); }).catch(function () {});
                 } }),
                 P.btn("Cargar paquete del sistema general", { tipo: "secundario", icono: "subir", onclick: function () { archivo.click(); } }), archivo)),
@@ -247,6 +303,11 @@
                 P.btn("Cambiar el nombre en la red", { tipo: "secundario", icono: "red", deshabilitado: !(d.red && d.red.puede_cambiar), onclick: function () { formNombreRed(d.red, cargar); } }),
                 d.red && d.red.pendiente ? P.btn("Reiniciar la notebook", { tipo: "texto", icono: "refrescar", onclick: reiniciarNotebook }) : null),
               h("p.texto-3.chico", { style: { marginBottom: 0 } }, "Equipo " + d.equipo.nombre + " · " + d.equipo.sistema + " · Node " + d.equipo.node))),
+          h("div.hoja.hoja-cuerpo.columna",
+            h("h2.seccion-titulo", "Respaldo completo para otra PC"),
+            h("p.texto-3", { style: { margin: 0 } }, "Guardá una copia protegida de los datos del predio, incluidos los cambios pendientes de sincronizar, aunque no haya internet."),
+            h("p.texto-3.chico", { style: { margin: 0 } }, "Para recuperar el archivo .ajbrespaldo en otra PC, ejecutá herramientas\\RECUPERAR-RESPALDO.bat y elegí el archivo, su clave y una carpeta nueva. La copia se recupera detenida, lista para revisar e incorporar al grupo."),
+            h("div.fila", P.btn("Descargar respaldo completo", { tipo: "primario", icono: "descargar", onclick: descargarRespaldoCompleto }))),
           h("div.hoja.hoja-cuerpo",
             h("div.fila-separada", h("h2.seccion-titulo", "Respaldos de la base de datos"),
               P.btn("Crear respaldo ahora", { tipo: "secundario", icono: "historial", onclick: function (ev) {

@@ -1,5 +1,6 @@
 "use strict";
 const U = require("../../predios/lib/util");
+const { validarAutorizacionHa, esAutorizacionHa } = require("./predios-ha");
 
 function identidad(datos = {}) {
   const instancia = String(datos.instancia_id || "");
@@ -9,14 +10,14 @@ function identidad(datos = {}) {
   return { instancia_id: instancia, equipo_id: equipo || null };
 }
 
-function exigirPropietario(predio, datos, { exigirLocal = false } = {}) {
+function exigirPropietario(predio, datos, { exigirLocal = false, haAutorizada = null } = {}) {
   const quien = identidad(datos);
   if (exigirLocal && predio.escritor !== "LOCAL") throw U.error("Esta instalación todavía no tiene el control de los datos", 409, { codigo: "SIN_CONTROL" });
   if (predio.escritor === "LOCAL") {
     if (predio.instancia_id && predio.instancia_id !== quien.instancia_id) {
       throw U.error(`Ya hay un servidor asignado a este predio (${predio.equipo || "otro equipo"}). Usá ese servidor. Un reemplazo requiere transferir el control desde la administración.`, 409, { codigo: "OTRA_INSTALACION" });
     }
-    if (predio.equipo_id && predio.equipo_id !== quien.equipo_id) {
+    if (predio.equipo_id && predio.equipo_id !== quien.equipo_id && !esAutorizacionHa(haAutorizada, predio, quien)) {
       throw U.error("La instalación fue copiada a otro equipo. Este predio ya tiene un servidor asignado; no se habilitaron escrituras ni sincronización desde esta PC.", 409, { codigo: "OTRO_EQUIPO" });
     }
   }
@@ -38,9 +39,10 @@ async function conPropietarioBloqueado(pool, predioId, trabajo) {
   } finally { conexion.release(); }
 }
 
-async function saludarPredio(pool, predioId, body) {
+async function saludarPredio(pool, predioId, body, opcionesHa = {}) {
   return conPropietarioBloqueado(pool, predioId, async (c, p) => {
-    const quien = exigirPropietario(p, body);
+    const haAutorizada = await validarAutorizacionHa(c, p, { ...opcionesHa, instanciaId: body.instancia_id, equipoId: body.equipo_id });
+    const quien = exigirPropietario(p, body, { haAutorizada });
     if (p.escritor === "LOCAL" && p.instancia_id && !p.equipo_id && quien.equipo_id && p.equipo
       && String(body.equipo || "").trim().toLowerCase() !== String(p.equipo).trim().toLowerCase()) {
       throw U.error("El nombre del equipo no coincide con el servidor existente. No se vinculó esta copia al predio; revisá el reemplazo desde la administración.", 409, { codigo: "OTRO_EQUIPO" });
@@ -57,16 +59,17 @@ async function saludarPredio(pool, predioId, body) {
   });
 }
 
-async function tomarControl(pool, predioId, body) {
+async function tomarControl(pool, predioId, body, opcionesHa = {}) {
   return conPropietarioBloqueado(pool, predioId, async (c, p) => {
-    const quien = exigirPropietario(p, body);
+    const haAutorizada = await validarAutorizacionHa(c, p, { ...opcionesHa, instanciaId: body.instancia_id, equipoId: body.equipo_id });
+    const quien = exigirPropietario(p, body, { haAutorizada });
     // Los instaladores anteriores aún no envían identidad de hardware y buscan
     // actualizaciones después de tomar control. Se admite su primera activación
     // serializada; la nueva versión vincula el equipo al siguiente saludo.
     if (!quien.equipo_id && p.escritor === "LOCAL" && p.instancia_id && p.equipo_id) {
       throw U.error("Actualizá el sistema del predio antes de habilitar este equipo como servidor", 409, { codigo: "FALTA_IDENTIDAD_EQUIPO" });
     }
-    const equipo = p.escritor === "LOCAL" && p.instancia_id && !p.equipo_id ? null : quien.equipo_id;
+    const equipo = haAutorizada.haAutorizada ? p.equipo_id : p.escritor === "LOCAL" && p.instancia_id && !p.equipo_id ? null : quien.equipo_id;
     await c.query("UPDATE predio SET escritor = 'LOCAL', instancia_id = ?, equipo_id = ? WHERE id = ?", [quien.instancia_id, equipo, p.id]);
     await c.query("INSERT INTO predio_evento (predio_id, tipo, detalle) VALUES (?, 'TOMA_DE_CONTROL', ?)", [p.id, JSON.stringify({ instancia: quien.instancia_id, equipo_id: quien.equipo_id, anterior: p.instancia_id })]);
     return { ok: true, autoriza_escritura: true };

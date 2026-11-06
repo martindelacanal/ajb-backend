@@ -7,6 +7,7 @@
   var raiz = document.documentElement;
   var P = (window.P = {});
   P.modo = raiz.getAttribute("data-modo") === "remoto" ? "remoto" : "local";
+  P.haHabilitado = raiz.getAttribute("data-ha") === "1";
   P.apiBase = raiz.getAttribute("data-api") || "/api";
   P.predioCodigo = raiz.getAttribute("data-predio") || null;
   P.estado = { sesion: null, avisos: null, conexion: null, remoto: null };
@@ -254,6 +255,89 @@
   }
   P.ErrorApi = ErrorApi;
 
+  function huellaPeticion(texto) {
+    var h1 = 2166136261, h2 = 5381;
+    for (var i = 0; i < texto.length; i++) { h1 = Math.imul(h1 ^ texto.charCodeAt(i), 16777619); h2 = (Math.imul(h2, 33) ^ texto.charCodeAt(i)) | 0; }
+    return (h1 >>> 0).toString(16) + "-" + (h2 >>> 0).toString(16) + "-" + texto.length;
+  }
+  var pestanaOperaciones = null;
+  var operacionesBloqueadas = false;
+  function idPestanaOperaciones() {
+    var clave = "predio.pestana-operaciones." + (P.predioCodigo || "local");
+    if (pestanaOperaciones) {
+      if (sessionStorage.getItem(clave) !== pestanaOperaciones) throw new Error("No se conserva la identidad de esta pestaña");
+      return pestanaOperaciones;
+    }
+    var entradas = window.performance && window.performance.getEntriesByType ? window.performance.getEntriesByType("navigation") : [];
+    var recarga = entradas.length ? entradas[0].type === "reload" || entradas[0].type === "back_forward" : window.performance && window.performance.navigation && window.performance.navigation.type === 1;
+    var anterior = recarga ? sessionStorage.getItem(clave) : null;
+    var candidato;
+    if (/^[a-f0-9]{32}$/.test(anterior || "")) candidato = anterior;
+    else {
+      if (anterior) throw new Error("La identidad guardada de esta pestaña no es válida");
+      var bytes = new Uint8Array(16); window.crypto.getRandomValues(bytes);
+      candidato = Array.prototype.map.call(bytes, function (n) { return ("0" + n.toString(16)).slice(-2); }).join("");
+      sessionStorage.setItem(clave, candidato);
+    }
+    if (sessionStorage.getItem(clave) !== candidato) throw new Error("No se pudo guardar la identidad de esta pestaña");
+    pestanaOperaciones = candidato;
+    return pestanaOperaciones;
+  }
+  function ordenarPeticion(valor) {
+    if (Array.isArray(valor)) return valor.map(ordenarPeticion);
+    if (valor && typeof valor === "object") {
+      var salida = Object.create(null);
+      Object.keys(valor).sort().forEach(function (k) { salida[k] = ordenarPeticion(valor[k]); });
+      return salida;
+    }
+    return valor;
+  }
+  function prepararPeticion(metodo, ruta, body, token) {
+    if (operacionesBloqueadas) throw ErrorApi("Hay una operación confirmada que necesita revisión. Recargá la página y verificá su resultado antes de registrar otra.", 409, { codigo: "CONFIRMACION_PENDIENTE_REVISION" });
+    if (!window.crypto || !window.crypto.getRandomValues) throw ErrorApi("Este navegador no permite preparar una operación segura. Usá un navegador actualizado.", 409);
+    var pestana;
+    try { pestana = idPestanaOperaciones(); } catch (_e) { throw ErrorApi("Permití el almacenamiento de este sitio antes de registrar operaciones.", 409); }
+    var clave = "predio.operaciones." + (P.predioCodigo || "local") + "." + huellaPeticion(token) + "." + pestana;
+    var firma = huellaPeticion(metodo + "\n" + ruta + "\n" + (body ? JSON.stringify(ordenarPeticion(JSON.parse(body))) : ""));
+    var pendientes;
+    try {
+      var guardado = localStorage.getItem(clave);
+      pendientes = guardado === null ? {} : JSON.parse(guardado);
+      if (!pendientes || Array.isArray(pendientes) || typeof pendientes !== "object" || Object.keys(pendientes).some(function (k) { return !/^[a-f0-9]{32}$/.test(pendientes[k]); })) throw new Error("Pendientes no válidos");
+    } catch (_e) { throw ErrorApi("No se pueden leer las operaciones pendientes. Revisá el almacenamiento de este sitio antes de continuar.", 409); }
+    var id = pendientes[firma];
+    if (!/^[a-f0-9]{32}$/.test(id || "")) {
+      if (Object.keys(pendientes).length >= 100) throw ErrorApi("Hay operaciones sin confirmar. Pedí ayuda a administración antes de continuar.", 409);
+      if (!window.crypto || !window.crypto.getRandomValues) throw ErrorApi("Este navegador no permite preparar una operación segura. Usá un navegador actualizado.", 409);
+      var bytes = new Uint8Array(16); window.crypto.getRandomValues(bytes);
+      id = Array.prototype.map.call(bytes, function (n) { return ("0" + n.toString(16)).slice(-2); }).join("");
+      pendientes[firma] = id;
+    }
+    try {
+      localStorage.setItem(clave, JSON.stringify(pendientes));
+      if (JSON.parse(localStorage.getItem(clave) || "{}")[firma] !== id) throw new Error("Sin almacenamiento");
+    } catch (_e) { throw ErrorApi("El navegador no puede guardar la operación pendiente. Permití el almacenamiento de este sitio antes de continuar.", 409); }
+    return { id: id, completar: function () {
+      var actuales;
+      try {
+        actuales = JSON.parse(localStorage.getItem(clave) || "{}");
+        if (actuales[firma] === id) {
+          delete actuales[firma]; localStorage.setItem(clave, JSON.stringify(actuales));
+          if (JSON.parse(localStorage.getItem(clave) || "{}")[firma] === id) throw new Error("La confirmación no se guardó");
+        }
+      } catch (_e) {
+        operacionesBloqueadas = true;
+        // Si el borrado llegó al disco pero falló su comprobación, se conserva
+        // el identificador para consultar otra vez la respuesta ya confirmada.
+        if (actuales && typeof actuales === "object" && !Array.isArray(actuales)) {
+          actuales[firma] = id;
+          try { localStorage.setItem(clave, JSON.stringify(actuales)); } catch (_ignorado) { /* se informa el fallo y no se da éxito normal */ }
+        }
+        throw ErrorApi("El servidor confirmó la operación, pero este navegador no pudo guardar la confirmación. Revisala antes de reintentar.", 0, { codigo: "RESULTADO_INCIERTO" });
+      }
+    } };
+  }
+
   P.api = function (metodo, ruta, cuerpo, opciones) {
     opciones = opciones || {};
     var cabeceras = {};
@@ -263,6 +347,11 @@
     if (cuerpo !== undefined && cuerpo !== null) {
       if (cuerpo instanceof Blob || cuerpo instanceof ArrayBuffer) { body = cuerpo; cabeceras["Content-Type"] = "application/octet-stream"; }
       else { body = JSON.stringify(cuerpo); cabeceras["Content-Type"] = "application/json"; }
+    }
+    var operacion = null;
+    if (P.haHabilitado && P.modo === "local" && token && ["POST", "PUT", "DELETE"].indexOf(metodo) >= 0 && ruta.indexOf("/sistema/") !== 0 && cabeceras["Content-Type"] === "application/json") {
+      try { operacion = prepararPeticion(metodo, ruta, body, token); } catch (e) { return Promise.reject(e); }
+      cabeceras["X-AJB-Operacion"] = operacion.id;
     }
     return fetch(P.apiBase + ruta, { method: metodo, headers: cabeceras, body: body, cache: "no-store" })
       .catch(function () {
@@ -281,7 +370,14 @@
         }
         return r.text().then(function (texto) {
           var datos = null;
-          try { datos = texto ? JSON.parse(texto) : null; } catch (e) { datos = { mensaje: texto }; }
+          try {
+            if (operacion && r.ok && !texto) throw new Error("Respuesta incompleta");
+            datos = texto ? JSON.parse(texto) : null;
+          } catch (e) {
+            if (operacion && r.ok) throw ErrorApi("No se pudo confirmar el resultado. Volvé a consultar la operación antes de continuar.", 0, { codigo: "RESULTADO_INCIERTO" });
+            datos = { mensaje: texto };
+          }
+          if (operacion && r.status < 500) operacion.completar();
           if (r.status === 202 && datos && datos.encolado) {
             P.aviso(datos.mensaje, "cola", 7000);
             return datos;
@@ -318,6 +414,12 @@
   };
   P.descargar = function (ruta, nombre) {
     return P.api("GET", ruta, null, { blob: true, nombre: nombre }).then(function (r) {
+      P.guardarArchivo(r.blob, r.nombre || nombre);
+      return r;
+    });
+  };
+  P.descargarPost = function (ruta, cuerpo, nombre) {
+    return P.api("POST", ruta, cuerpo, { blob: true, nombre: nombre }).then(function (r) {
       P.guardarArchivo(r.blob, r.nombre || nombre);
       return r;
     });

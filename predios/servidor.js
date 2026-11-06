@@ -24,6 +24,13 @@ const { crearDescubrimiento } = require("./lib/descubrimiento");
 const { leerRuntime, invocarControl, migrarRuntime, prepararAccesoCaja } = require("./lib/runtime");
 const { leerTls, prepararTls } = require("./lib/tls-local");
 const { revisarPreciosVencidos } = require("./lib/precios");
+const { crearRespaldo } = require("./lib/respaldo-local");
+const { ejecutarPeticion } = require("./lib/peticiones-idempotentes");
+const { bloquearInstalacion } = require("./lib/bloqueo-local");
+const { aplicarPendiente } = require("./lib/respaldo-lan");
+const { leerConfiguracionLan, crearServicioLan } = require("./lib/servicio-lan");
+const { crearGrupoLocal } = require("./lib/grupo-local");
+const LAN = require("./lib/http-lan");
 
 const DIR_APP = __dirname;
 const DIR_PUBLICO = path.join(DIR_APP, "public");
@@ -67,9 +74,33 @@ function leerVersion() {
 const config = leerConfig();
 if (fs.existsSync(path.join(BASE, "arranque.js")) && leerRuntime(BASE).detenido) process.exit(0);
 const VERSION = leerVersion();
+const liberarInstalacion = bloquearInstalacion(BASE);
+process.once("exit", liberarInstalacion);
+let configHa = leerConfiguracionLan(BASE);
+const recuperacionHa = configHa ? aplicarPendiente({ base: BASE, config: { ...config, respaldo_lan: configHa } }) : null;
 const db = crearSqlite(path.join(BASE, "datos", "predio.db"), { predioId: config.predio_id });
-asegurarEsquema(db);
+if (!recuperacionHa?.incompatible) asegurarEsquema(db);
 const controlEquipo = crearControlEquipo({ db, config, log });
+let ha = null;
+let congelado = fs.existsSync(path.join(BASE, "ha-activacion-pendiente.json"));
+function autoridadLocal() {
+  const e = ha?.estado();
+  return { autorizado: !congelado && e?.escritor === true,
+    motivo: !congelado && e?.escritor === true ? null : congelado ? "Preparando el respaldo automático. Las operaciones están pausadas hasta completar la activación."
+      : e?.error || "Esta PC está de respaldo. El acceso de caja utiliza automáticamente el servidor actual.",
+    otro_servidor: e?.testigo?.escritorDatos || null };
+}
+function instalarAutoridad(haNueva, packet) {
+  configHa = haNueva;
+  ha = crearServicioLan({ base: BASE, config, db, ha: haNueva, log,
+    alReiniciar: () => { setTimeout(() => apagar(75), 100).unref(); } });
+  if (packet) ha.registrarInicial(packet);
+  controlEquipo.configurarAutoridadLocal(autoridadLocal);
+  db.configurarTransacciones(ha);
+  return ha;
+}
+if (configHa) instalarAutoridad(configHa);
+else if (congelado) controlEquipo.configurarAutoridadLocal(autoridadLocal);
 let descubrimiento = null;
 let servidorHttps = null;
 let tlsCargado = null;
@@ -125,11 +156,11 @@ async function actualizarHttps() {
 
 // ------------------------------------------------------------------ ejecución de órdenes remotas
 
-async function ejecutarRemoto({ metodo, ruta, cuerpo, query, actor }) {
+async function ejecutarRemoto({ metodo, ruta, cuerpo, query, actor, db: dbOperacion = db }) {
   controlEquipo.comprobar();
   const encontrada = api.buscarRuta(metodo, ruta);
   if (!encontrada || encontrada.ruta.soloLocal || encontrada.ruta.publica) throw U.error("Operación no permitida a distancia", 403);
-  const base = { db, pid: config.predio_id, modo: "local", origen: "REMOTO", ip: "sistema-general", servicios };
+  const base = { db: dbOperacion, pid: config.predio_id, modo: "local", origen: "REMOTO", ip: "sistema-general", servicios };
   const usuarioFila = await sesion.asegurarUsuarioGeneral(base, {
     id: Number(actor?.general_id) || 0,
     nombre: `${actor?.nombre || "Administración"} (sistema general)`,
@@ -150,6 +181,8 @@ const servicios = { version: VERSION };
 const agente = crearAgente({
   db, config, base: BASE, version: VERSION, log,
   controlEquipo,
+  grupoLocal: () => ha?.estado() || { habilitado: congelado, escritor: false },
+  pruebaHa: () => ha.pruebaCentral(),
   api: { ejecutarRemoto },
   alActualizar: () => apagar(75),
   alReiniciar: () => {
@@ -158,6 +191,44 @@ const agente = crearAgente({
   },
 });
 servicios.agente = agente;
+const grupoLocal = crearGrupoLocal({ base: BASE, dirApp: DIR_APP, version: VERSION, config, db,
+  equipoId: controlEquipo.equipoId, haActual: () => ha?.estado(), log,
+  bloquearEscritura() {
+    const archivo = path.join(BASE, "ha-activacion-pendiente.json");
+    if (!fs.existsSync(archivo)) {
+      const fd = fs.openSync(archivo, "wx", 0o600);
+      try { fs.writeFileSync(fd, JSON.stringify({ iniciada: new Date().toISOString() })); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    }
+    congelado = true;
+    controlEquipo.configurarAutoridadLocal(autoridadLocal);
+    agente.detener();
+    descubrimiento?.detener();
+  },
+  activarLocal({ ha: nueva, packet, autoridadIniciada = false }) {
+    // grupo-local ya guardó la configuración con ACL privadas y fsync.
+    if (runtimePublico().disponible) {
+      const lanzador = path.join(BASE, "arranque.js"), temporal = lanzador + ".ha.tmp";
+      const fd = fs.openSync(temporal, "w", 0o600);
+      try { fs.writeFileSync(fd, fs.readFileSync(path.join(DIR_APP, "lanzador.js"))); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      fs.renameSync(temporal, lanzador);
+    }
+    ha?.detener();
+    instalarAutoridad(nueva, autoridadIniciada ? null : packet);
+    return ha;
+  },
+  reiniciar() {
+    // La semilla y el testigo ya están confirmados; el próximo arranque sigue
+    // exclusivamente la autoridad del grupo, incluso tras un corte de luz.
+    fs.rmSync(path.join(BASE, "ha-activacion-pendiente.json"), { force: true });
+    congelado = false;
+    setTimeout(() => {
+      // Reinicia también el supervisor para que cargue la protección que impide
+      // volver a una versión anterior que desconocía el grupo de respaldo.
+      if (runtimePublico().disponible) invocarControl(BASE, "Reiniciar").catch(e => log("No se pudo reiniciar el supervisor; usá Reiniciar servidor: " + e.message));
+      else apagar(75);
+    }, 1200).unref();
+  },
+});
 
 // ------------------------------------------------------------------ respaldos
 
@@ -308,6 +379,18 @@ function rutaGaleria(req, res, rutaApi) {
 
 async function rutaSistema(ctx, metodo, ruta, req, res) {
   if (ctx.usuario?.rol !== "ADMIN") throw U.error("Esta sección es del administrador", 403);
+  if (metodo === "GET" && ruta === "/sistema/grupo-local") return grupoLocal.estado();
+  if (metodo === "POST" && ruta === "/sistema/grupo-local/instalador") {
+    controlEquipo.comprobar();
+    if (!req.socket.encrypted && !ctx.esLocalhost) throw U.error("Prepará el instalador desde HTTPS o desde esta PC servidor", 409);
+    const cuerpo = await leerCuerpo(req, 1000);
+    const paquete = await grupoLocal.instalador(cuerpo.rol);
+    return { archivo: paquete.buffer, nombreArchivo: paquete.nombreArchivo, tipo: "application/zip" };
+  }
+  if (metodo === "POST" && ruta === "/sistema/grupo-local/activar") {
+    await leerCuerpo(req, 1000);
+    return grupoLocal.activar();
+  }
   if (metodo === "GET" && ruta === "/sistema/estado") {
     const respaldos = fs.readdirSync(path.join(BASE, "datos", "respaldos")).filter((f) => f.endsWith(".db")).sort().reverse()
       .map((f) => ({ nombre: f, tamano: fs.statSync(path.join(BASE, "datos", "respaldos", f)).size }));
@@ -317,7 +400,7 @@ async function rutaSistema(ctx, metodo, ruta, req, res) {
       equipo: { nombre: os.hostname(), sistema: `${os.type()} ${os.release()}`, node: process.version, memoria_libre: os.freemem(), memoria_total: os.totalmem(), encendido_hace: Math.round(os.uptime()) },
       servidor: { puerto: config.puerto, direcciones: direccionesLan(), base: BASE, version: VERSION, iniciado: servidorIniciado },
       red: estadoRed(),
-      runtime: runtimePublico(), escritura: controlEquipo.estado(), https: estadoHttps(),
+      runtime: runtimePublico(), escritura: controlEquipo.estado(), https: estadoHttps(), grupo_local: ha?.estado() || null,
       base_datos: { archivo: db.archivo, tamano },
       respaldos: respaldos.slice(0, 40),
     };
@@ -375,6 +458,14 @@ async function rutaSistema(ctx, metodo, ruta, req, res) {
     await db.tx((t) => N.auditar(t, ctx, "Respaldo manual", "sistema", null, { archivo: nombre }));
     return { mensaje: "Respaldo creado", archivo: nombre };
   }
+  if (metodo === "POST" && ruta === "/sistema/respaldo-completo") {
+    controlEquipo.comprobar();
+    const cuerpo = await leerCuerpo(req, 16 * 1024);
+    if (typeof cuerpo.clave !== "string" || cuerpo.clave.length < 12 || cuerpo.clave.length > 1024) throw U.error("La clave de recuperación debe tener entre 12 y 1024 caracteres");
+    const copia = await crearRespaldo({ db, base: BASE, config, clave: cuerpo.clave, version: VERSION });
+    await db.tx((t) => N.auditar(t, ctx, "Exportación de respaldo completo", "sistema", null, { archivo: copia.nombre, bytes: copia.buffer.length, sha256: copia.sha256 }));
+    return { archivo: copia.buffer, nombreArchivo: copia.nombre, tipo: "application/octet-stream" };
+  }
   const descarga = /^\/sistema\/respaldos\/([A-Za-z0-9._-]+\.db)$/.exec(ruta);
   if (metodo === "GET" && descarga) {
     const archivo = path.join(BASE, "datos", "respaldos", descarga[1]);
@@ -382,6 +473,7 @@ async function rutaSistema(ctx, metodo, ruta, req, res) {
     return { archivo: fs.readFileSync(archivo), nombreArchivo: descarga[1], tipo: "application/octet-stream" };
   }
   if (metodo === "GET" && ruta === "/sistema/exportar") {
+    if (ha) throw U.error("Con respaldo automático, sincronizá desde la PC que está en servicio cuando vuelva internet. Para recuperar otra PC usá el respaldo completo.", 409);
     const { buffer, nombre } = await agente.exportar();
     await db.tx((t) => N.auditar(t, ctx, "Exportación de datos para el sistema general", "sistema", null, { archivo: nombre, bytes: buffer.length }));
     return { archivo: buffer, nombreArchivo: nombre, tipo: "application/octet-stream" };
@@ -467,7 +559,7 @@ function servirEstatico(req, res, ruta) {
   const ext = path.extname(final).toLowerCase();
   const esIndice = final.endsWith("index.html");
   let contenido = fs.readFileSync(final);
-  if (esIndice) contenido = Buffer.from(contenido.toString("utf8").replace(/__VERSION__/g, encodeURIComponent(VERSION)));
+  if (esIndice) contenido = Buffer.from(contenido.toString("utf8").replace(/__VERSION__/g, encodeURIComponent(VERSION)).replace("<html", `<html data-ha="${ha ? "1" : "0"}"`));
   enviar(req, res, 200, contenido, TIPOS[ext] || "application/octet-stream", {
     "Cache-Control": esIndice ? "no-cache" : "public, max-age=604800, immutable",
   });
@@ -481,6 +573,18 @@ async function manejar(req, res) {
   cabecerasSeguridad(res);
   const url = new URL(req.url, "http://local");
   const ruta = url.pathname;
+  if (ruta === "/lan/incorporar") {
+    if (!req.socket.encrypted || req.method !== "POST") return LAN.respuesta(res, 403, { mensaje: "La incorporación necesita HTTPS" });
+    try {
+      const cuerpo = await LAN.leer(req, 128 * 1024);
+      return LAN.respuesta(res, 200, await grupoLocal.incorporar({ metodo: req.method, ruta: req.url, cabeceras: req.headers, cuerpo }));
+    } catch (e) { return LAN.respuesta(res, e.status || 403, { mensaje: e.message }); }
+  }
+  if (ruta.startsWith("/lan/")) {
+    if (ha && await ha.manejar(req, res)) return;
+    return LAN.respuesta(res, 404, { mensaje: "No encontramos esa operación" });
+  }
+  if (ha && !congelado && !ha.estado().escritor) return ha.reenviar(req, res);
   if (!ruta.startsWith("/api/")) {
     if (req.method !== "GET" && req.method !== "HEAD") return enviar(req, res, 405, { mensaje: "Método no permitido" });
     return servirEstatico(req, res, ruta);
@@ -512,6 +616,12 @@ async function manejar(req, res) {
     ctx.body = req.method === "GET" || req.method === "HEAD" ? {} : await leerCuerpo(req, 3 * 1024 * 1024);
     const encontrada = api.buscarRuta(req.method === "HEAD" ? "GET" : req.method, rutaApi);
     if (encontrada?.ruta.escritura || rutaApi === "/sesion/puesto" || (rutaApi === "/primer-uso" && agente.configurado())) controlEquipo.comprobar();
+    const operacionId = req.headers["x-ajb-operacion"];
+    if (ha && encontrada?.ruta.escritura && ctx.usuario && !operacionId) throw U.error("Actualizá la pantalla antes de registrar la operación", 409, { codigo: "OPERACION_SIN_IDENTIFICADOR" });
+    if (operacionId && ctx.usuario && !["GET", "HEAD"].includes(req.method) && ctx.db.dialecto === "sqlite") {
+      const r = await ejecutarPeticion(ctx, { id: operacionId, metodo: req.method, ruta: rutaApi }, (contexto) => api.ejecutar(contexto, req.method, rutaApi));
+      return enviar(req, res, r.status, r.respuesta);
+    }
     const resultado = await api.ejecutar(ctx, req.method === "HEAD" ? "GET" : req.method, rutaApi);
     if (rutaApi === "/estado-publico" && resultado) resultado.escritura = controlEquipo.estado();
     if (resultado && resultado.csv !== undefined) {
@@ -547,6 +657,7 @@ function apagar(codigo = 0) {
   salirConCodigo = codigo;
   log(codigo === 75 ? "Reiniciando para aplicar cambios…" : "Apagando el servidor…");
   agente.detener();
+  ha?.detener();
   descubrimiento?.detener();
   const abiertos = [servidor, servidorHttps].filter((s) => s?.listening);
   let restantes = abiertos.length;
@@ -572,13 +683,15 @@ servidor.listen(config.puerto, "0.0.0.0", () => {
   log(`Sistema del predio ${config.predio_nombre} v${VERSION} escuchando en el puerto ${config.puerto}`);
   for (const d of direccionesLan()) log(`  Abrí en las PCs del camping: ${d.url}`);
   if (!agente.configurado()) log("  Sin vincular al sistema general: funciona sólo en la red local.");
-  if (agente.configurado()) {
+  if (agente.configurado() && !ha && !congelado) {
     descubrimiento = crearDescubrimiento({ codigo: config.predio_codigo, puertoHttp: config.puerto,
       equipoId: controlEquipo.equipoId, instanciaId: agente.instancia(), clave: () => config.clave_lan,
       puedeSerEscritor: () => controlEquipo.puedeAnunciarEscritor(),
       alOtro: (otro) => controlEquipo.otroServidor(otro), alListo: () => controlEquipo.redComprobada(), log });
   }
   agente.iniciar();
+  if (ha && !congelado) ha.iniciar().catch(e => log("Respaldo local: " + e.message));
+  if (congelado) grupoLocal.reanudarActivacion().catch(e => log("La activación del respaldo sigue pausada: " + e.message));
   respaldoDiario();
   setInterval(respaldoDiario, 3 * 3600 * 1000).unref();
   migrarRuntime(BASE, DIR_APP, log).then(async (portable) => {

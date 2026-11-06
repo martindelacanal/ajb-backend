@@ -56,6 +56,24 @@ test("una instalación anterior ya dueña migra al control de equipo sin exigir 
   assert.equal(c.puedeEscribir(), true);
 });
 
+test("un respaldo restaurado sigue en espera incluso en el equipo original y no lo activa una respuesta central", (t) => {
+  const db = crearSqlite(":memory:", { predioId: 1 }); asegurarEsquema(db); t.after(() => db.cerrar());
+  const equipoId = "d".repeat(64);
+  escribirMeta(db, "escritor", "LOCAL");
+  escribirMeta(db, "equipo_propietario_id", equipoId);
+  escribirMeta(db, "control_confirmado", equipoId);
+  escribirMeta(db, "restauracion_pendiente", JSON.stringify({ modo: "STANDBY" }));
+  for (const id of [equipoId, "e".repeat(64)]) {
+    const control = crearControlEquipo({ db, config: {}, equipoId: id });
+    control.redComprobada();
+    assert.equal(control.estado().restauracion_pendiente, true);
+    assert.equal(control.puedeEscribir(), false);
+    assert.equal(control.puedeAnunciarEscritor(), false);
+    assert.equal(control.confirmarCentral(), false);
+    assert.throws(() => control.comprobar(), (e) => e.codigo === "SERVIDOR_SOLO_LECTURA");
+  }
+});
+
 test("los anuncios LAN requieren firma de este predio y una PC de consulta no desplaza al servidor", () => {
   const clave = "a".repeat(64);
   const datos = { tipo: "AJB_PREDIO_SERVIDOR", codigo: "MIRAMAR", iniciado: 100, fase: "ACTIVO" };

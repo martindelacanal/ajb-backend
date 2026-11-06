@@ -20,6 +20,7 @@ const { obtenerOrigenesPermitidos } = require("../security/http-config");
 const { crearNotificacion } = require("../services/notificaciones");
 const C = require("../services/predios-central");
 const propietario = require("../services/predios-propietario");
+const { validarAutorizacionHa } = require("../services/predios-ha");
 const { entregarAvisos } = require("../services/predios-avisos");
 const U = require("../../predios/lib/util");
 const apiPredio = require("../../predios/lib/api");
@@ -401,9 +402,16 @@ function crearRouterSync() {
       if (!Number(fila.activo)) return res.status(403).json({ mensaje: "El predio está desactivado en el sistema general" });
       req.predio = C.normalizar(fila);
       req.instalacionId = fila.instalacion_id;
+      req.opcionesHa = { token, cabecera: req.headers["x-predio-ha"] || null };
       const instanciaCabecera = String(req.headers["x-predio-instancia"] || "");
-      if (!["/version", "/codigo"].includes(req.path) && req.predio.escritor === "LOCAL" && req.predio.instancia_id) {
-        propietario.exigirPropietario(req.predio, { instancia_id: instanciaCabecera, equipo_id: req.headers["x-predio-equipo"] || "" });
+      if (!["/version", "/codigo"].includes(req.path)) {
+        const actual = await propietario.conPropietarioBloqueado(pool(), req.predio.id, async (conexion, predio) => {
+          const datos = { instancia_id: instanciaCabecera, equipo_id: req.headers["x-predio-equipo"] || "" };
+          const haAutorizada = await validarAutorizacionHa(conexion, predio, { ...req.opcionesHa, instanciaId: datos.instancia_id, equipoId: datos.equipo_id });
+          if (predio.escritor === "LOCAL" && predio.instancia_id) propietario.exigirPropietario(predio, datos, { haAutorizada });
+          return predio;
+        });
+        req.predio = C.normalizar(actual);
       }
       await pool().query("UPDATE predio_instalacion SET ultimo_uso = NOW(), ultima_ip = ?, instancia_id = COALESCE(?, instancia_id) WHERE id = ?",
         [String(req.ip || "").slice(0, 45), instanciaCabecera.slice(0, 64) || null, fila.instalacion_id]);
@@ -422,7 +430,7 @@ function crearRouterSync() {
 
   router.post("/hola", async (req, res) => {
     try {
-      const saludo = await propietario.saludarPredio(pool(), req.predio.id, req.body || {});
+      const saludo = await propietario.saludarPredio(pool(), req.predio.id, req.body || {}, req.opcionesHa);
       const p = C.normalizar(saludo.predio);
       res.json({
         predio: { id: p.id, codigo: p.codigo, nombre: p.nombre },
@@ -441,7 +449,7 @@ function crearRouterSync() {
 
   router.post("/tomar-control", async (req, res) => {
     try {
-      res.json(await propietario.tomarControl(pool(), req.predio.id, req.body || {}));
+      res.json(await propietario.tomarControl(pool(), req.predio.id, req.body || {}, req.opcionesHa));
     } catch (e) { responderError(res, e); }
   });
 
@@ -462,7 +470,8 @@ function crearRouterSync() {
         await conexion.beginTransaction();
         const [[actual]] = await conexion.query("SELECT * FROM predio WHERE id = ? FOR UPDATE", [p.id]);
         if (!actual) throw U.error("No encontramos el predio", 404);
-        propietario.exigirPropietario(actual, b, { exigirLocal: true });
+        const haAutorizada = await validarAutorizacionHa(conexion, actual, { ...req.opcionesHa, instanciaId: b.instancia_id, equipoId: b.equipo_id });
+        propietario.exigirPropietario(actual, b, { exigirLocal: true, haAutorizada });
         resultado = await C.aplicarCambios(conexion, p, Array.isArray(b.cambios) ? b.cambios : []);
         await conexion.query("UPDATE predio SET ultimo_push = NOW(), ultimo_seq = GREATEST(ultimo_seq, ?) WHERE id = ?", [Number(b.hasta_seq) || 0, p.id]);
         await conexion.commit();
@@ -495,14 +504,16 @@ function crearRouterSync() {
 
   router.get("/comandos", async (req, res) => {
     try {
-      const p = req.predio;
-      const [comandos] = await pool().query(
-        `SELECT id, tipo, metodo, ruta, cuerpo, query, actor FROM predio_comando
-         WHERE predio_id = ? AND (estado = 'PENDIENTE' OR (estado = 'ENTREGADO' AND entregado_en < NOW() - INTERVAL 60 SECOND))
-         ORDER BY id LIMIT 20`, [p.id]);
-      if (comandos.length) {
-        await pool().query(`UPDATE predio_comando SET estado = 'ENTREGADO', entregado_en = NOW(), intentos = intentos + 1 WHERE id IN (?)`, [comandos.map((c) => c.id)]);
-      }
+      const comandos = await conAutoridadSync(req, async (conexion, p) => {
+        const [filas] = await conexion.query(
+          `SELECT id, tipo, metodo, ruta, cuerpo, query, actor FROM predio_comando
+           WHERE predio_id = ? AND (estado = 'PENDIENTE' OR (estado = 'ENTREGADO' AND entregado_en < NOW() - INTERVAL 60 SECOND))
+           ORDER BY id LIMIT 20`, [p.id]);
+        if (filas.length) {
+          await conexion.query(`UPDATE predio_comando SET estado = 'ENTREGADO', entregado_en = NOW(), intentos = intentos + 1 WHERE id IN (?)`, [filas.map(c => c.id)]);
+        }
+        return filas;
+      });
       res.json({
         comandos: comandos.map((c) => ({
           id: c.id, tipo: c.tipo, metodo: c.metodo, ruta: c.ruta,
@@ -514,16 +525,27 @@ function crearRouterSync() {
 
   router.post("/comandos/:id/resultado", async (req, res) => {
     try {
-      const p = req.predio;
       const b = req.body || {};
       const respuesta = JSON.stringify(b.respuesta ?? null);
-      await pool().query(
-        `UPDATE predio_comando SET estado = ?, status = ?, resultado = ?, resuelto_en = NOW()
-         WHERE predio_id = ? AND id = ? AND estado IN ('PENDIENTE', 'ENTREGADO')`,
-        [b.ok ? "OK" : "ERROR", Number(b.status) || (b.ok ? 200 : 500), respuesta.slice(0, 4000000), p.id, Number(req.params.id)]);
+      await conAutoridadSync(req, (conexion, p) => conexion.query(
+          `UPDATE predio_comando SET estado = ?, status = ?, resultado = ?, resuelto_en = NOW()
+           WHERE predio_id = ? AND id = ? AND estado IN ('PENDIENTE', 'ENTREGADO')`,
+          [b.ok ? "OK" : "ERROR", Number(b.status) || (b.ok ? 200 : 500), respuesta.slice(0, 4000000), p.id, Number(req.params.id)]));
       res.json({ ok: true });
     } catch (e) { responderError(res, e); }
   });
+
+  // El middleware acredita la petición, pero otro servidor puede registrar un
+  // término posterior mientras ésta espera. Las mutaciones de órdenes vuelven
+  // a comprobarlo bajo el mismo lock que conserva la escritura del resultado.
+  async function conAutoridadSync(req, trabajo) {
+    return propietario.conPropietarioBloqueado(pool(), req.predio.id, async (conexion, p) => {
+      const datos = { instancia_id: req.headers["x-predio-instancia"] || "", equipo_id: req.headers["x-predio-equipo"] || "" };
+      const haAutorizada = await validarAutorizacionHa(conexion, p, { ...req.opcionesHa, instanciaId: datos.instancia_id, equipoId: datos.equipo_id });
+      if (p.escritor === "LOCAL" && p.instancia_id) propietario.exigirPropietario(p, datos, { haAutorizada });
+      return trabajo(conexion, p);
+    });
+  }
 
   router.get("/maestros", async (req, res) => {
     try {

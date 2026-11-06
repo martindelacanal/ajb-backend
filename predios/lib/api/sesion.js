@@ -288,12 +288,12 @@ async function autenticar(ctx, token) {
   if (!s) return null;
   const ahora = U.fechaHora();
   if (s.vence && s.vence < ahora) {
-    await ctx.db.run("DELETE FROM predio_sesion WHERE token_hash = ?", [hash]);
+    if (!ctx.soloLectura) await ctx.db.run("DELETE FROM predio_sesion WHERE token_hash = ?", [hash]);
     return null;
   }
   const u = await ctx.db.get("SELECT * FROM predio_usuario WHERE predio_id = ? AND id = ?", [ctx.pid, s.usuario_id]);
   if (!u || Number(u.activo) !== 1) return null;
-  if (!s.ultimo_uso || s.ultimo_uso < U.fechaHora(new Date(Date.now() - 60000))) {
+  if (!ctx.soloLectura && (!s.ultimo_uso || s.ultimo_uso < U.fechaHora(new Date(Date.now() - 60000)))) {
     const vence = s.recordar ? null : U.fechaHora(new Date(Date.now() + 12 * 3600 * 1000));
     await ctx.db.run("UPDATE predio_sesion SET ultimo_uso = ?, vence = ? WHERE token_hash = ?", [ahora, vence, hash]);
   }

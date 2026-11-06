@@ -63,7 +63,7 @@ async function corregirCodigosVerificados(db, pid, cuerpo) {
   });
 }
 
-function crearAgente({ db, config, base, version, log, api, alActualizar, alReiniciar, controlEquipo }) {
+function crearAgente({ db, config, base, version, log, api, alActualizar, alReiniciar, controlEquipo, grupoLocal = () => ({ habilitado: false }), pruebaHa }) {
   const pid = Number(config.predio_id);
   const equipoId = controlEquipo?.equipoId || identidadEquipo();
   const estado = {
@@ -94,9 +94,22 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
     return Boolean(config.servidor && config.token && pid);
   }
 
+  function puedeSincronizar() {
+    const grupo = grupoLocal();
+    return !leerMeta(db, "restauracion_pendiente") && (!grupo.habilitado || grupo.escritor === true);
+  }
+  async function guardarMeta(clave, valor) { await db.exclusivo(() => escribirMeta(db, clave, valor)); }
+
   async function pedir(metodo, ruta, { cuerpo, binario = false, timeout = 20000, crudo = false } = {}) {
     const url = `${String(config.servidor).replace(/\/+$/, "")}/predios-sync${ruta}`;
     const cabeceras = { Authorization: `Bearer ${config.token}`, "X-Predio": String(config.predio_codigo || ""), "X-Predio-Instancia": instancia, "X-Predio-Equipo": equipoId };
+    if (!/^\/(?:version|codigo)(?:\?|$)/.test(ruta)) {
+      if (!puedeSincronizar()) throw U.error("Esta PC está en espera: sólo el servidor actual sincroniza con el sistema general", 503);
+      if (grupoLocal().habilitado) {
+        if (!pruebaHa) throw U.error("Falta la autorización del testigo para sincronizar", 503);
+        cabeceras["X-Predio-HA"] = await pruebaHa();
+      }
+    }
     let body;
     if (cuerpo !== undefined) {
       if (Buffer.isBuffer(cuerpo)) { body = cuerpo; cabeceras["Content-Type"] = "application/octet-stream"; }
@@ -107,6 +120,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
         cabeceras["Content-Type"] = "application/json";
       }
     }
+    if (!/^\/(?:version|codigo)(?:\?|$)/.test(ruta) && !puedeSincronizar()) throw U.error("El servidor cambió mientras se preparaba la sincronización. Se reintentará desde la PC actual.", 503);
     const r = await fetch(url, { method: metodo, headers: cabeceras, body, signal: AbortSignal.timeout(timeout) });
     if (crudo) return r;
     if (!r.ok) {
@@ -163,16 +177,16 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
       const { cambios, hasta } = await db.exclusivo(() => lote(desde));
       if (hasta === desde) break;
       const r = await pedir("POST", "/push", { cuerpo: { instancia_id: instancia, equipo_id: equipoId, desde_seq: desde, hasta_seq: hasta, cambios }, timeout: 60000 });
-      await db.exclusivo(() => {
-        escribirMeta(db, "outbox_cursor", hasta);
-        db.conexion.prepare("DELETE FROM predio_outbox WHERE seq <= ?").run(hasta);
+      await db.tx(async t => {
+        await t.run("INSERT INTO predio_meta(clave,valor) VALUES('outbox_cursor',?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor", [String(hasta)]);
+        await t.run("DELETE FROM predio_outbox WHERE seq <= ?", [hasta]);
       });
       enviados += cambios.length;
       atenderRespuesta(r);
     }
     if (enviados) {
       estado.ultima_subida = U.fechaHora();
-      escribirMeta(db, "ultima_subida", estado.ultima_subida);
+      await guardarMeta("ultima_subida", estado.ultima_subida);
     }
     return enviados;
   }
@@ -226,6 +240,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
   }
 
   async function descargarInstantanea() {
+    if (grupoLocal().habilitado) throw U.error("Un servidor de respaldo recibe la base actual de la red local, no la instantánea del sistema general", 409);
     const tablas = {};
     for (const tabla of NOMBRES_TABLAS) {
       tablas[tabla] = [];
@@ -255,30 +270,72 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
 
   // ---------------------------------------------------------------- órdenes remotas
 
+  function resultadoGuardado(previo) {
+    return { ok: !!previo.ok, status: previo.status, respuesta: JSON.parse(previo.respuesta || "null") };
+  }
+
+  function resultadoError(c, e) {
+    if (!e.status) log(`Error al ejecutar la orden ${c.id}: ${e.stack || e.message}`);
+    return { ok: false, status: e.status || 500, respuesta: { mensaje: e.status ? e.message : "No se pudo aplicar en el camping", codigo: e.codigo, faltantes: e.faltantes, problemas: e.problemas } };
+  }
+
+  async function guardarResultado(t, c, resultado) {
+    // Guardar JSON completo: truncarlo por bytes/caracteres puede volver ilegible
+    // la respuesta al recuperar o volver a entregar la misma orden.
+    await t.run("INSERT INTO predio_comando_ejecutado (comando_id, fecha, ok, status, respuesta) VALUES (?, ?, ?, ?, ?)",
+      [c.id, U.fechaHora(), resultado.ok ? 1 : 0, resultado.status, JSON.stringify(resultado.respuesta ?? null)]);
+  }
+
   async function ejecutarComando(c) {
+    const soloDatos = c.tipo !== "SISTEMA" || ["CORREGIR_CODIGOS_VERIFICADOS", "SINCRONIZAR_TODO"].includes(c.ruta);
+    if (soloDatos) {
+      // Negocio, outbox y deduplicación comparten el mismo COMMIT. Un corte
+      // previo al registro revierte el negocio; otro envío no puede duplicarlo.
+      return db.tx(async (t) => {
+        const previo = await t.get("SELECT * FROM predio_comando_ejecutado WHERE comando_id = ?", [c.id]);
+        if (previo) return resultadoGuardado(previo);
+        let resultado;
+        await t.run("SAVEPOINT comando_remoto");
+        try {
+          const respuesta = c.tipo === "SISTEMA" ? await comandoSistema(c, t)
+            : await api.ejecutarRemoto({ metodo: c.metodo, ruta: c.ruta, cuerpo: c.cuerpo, query: c.query, actor: c.actor, db: t });
+          resultado = { ok: true, status: 200, respuesta };
+        } catch (e) {
+          // Las APIs anidadas usan t.tx: un error no debe dejar cambios parciales
+          // cuando conservamos la respuesta fallida para las futuras entregas.
+          await t.run("ROLLBACK TO comando_remoto");
+          resultado = resultadoError(c, e);
+        }
+        await t.run("RELEASE comando_remoto");
+        // Fuera del catch de negocio: si falla este INSERT, la transacción
+        // entera debe abortar y la orden debe poder reintentarse.
+        await guardarResultado(t, c, resultado);
+        return resultado;
+      });
+    }
+
+    // Las órdenes de sistema restantes leen archivos, actualizan maestros por
+    // red o programan una actualización/reinicio. No son efectos transaccionales
+    // de SQLite; toleran repetición si hay un corte antes de guardar el resultado.
     const previo = db.conexion.prepare("SELECT * FROM predio_comando_ejecutado WHERE comando_id = ?").get(c.id);
-    if (previo) return { ok: !!previo.ok, status: previo.status, respuesta: JSON.parse(previo.respuesta || "null") };
+    if (previo) return resultadoGuardado(previo);
     let resultado;
     try {
-      if (c.tipo === "SISTEMA") resultado = { ok: true, status: 200, respuesta: await comandoSistema(c) };
-      else {
-        const respuesta = await api.ejecutarRemoto({ metodo: c.metodo, ruta: c.ruta, cuerpo: c.cuerpo, query: c.query, actor: c.actor });
-        resultado = { ok: true, status: 200, respuesta };
-      }
+      resultado = { ok: true, status: 200, respuesta: await comandoSistema(c) };
     } catch (e) {
-      resultado = { ok: false, status: e.status || 500, respuesta: { mensaje: e.status ? e.message : "No se pudo aplicar en el camping", codigo: e.codigo, faltantes: e.faltantes, problemas: e.problemas } };
-      if (!e.status) log(`Error al ejecutar la orden ${c.id}: ${e.stack || e.message}`);
+      resultado = resultadoError(c, e);
     }
-    await db.exclusivo(() => db.conexion.prepare("INSERT OR REPLACE INTO predio_comando_ejecutado (comando_id, fecha, ok, status, respuesta) VALUES (?, ?, ?, ?, ?)")
-      .run(c.id, U.fechaHora(), resultado.ok ? 1 : 0, resultado.status, JSON.stringify(resultado.respuesta ?? null).slice(0, 200000)));
+    await db.tx(async (t) => {
+      if (!await t.get("SELECT comando_id FROM predio_comando_ejecutado WHERE comando_id = ?", [c.id])) await guardarResultado(t, c, resultado);
+    });
     return resultado;
   }
 
-  async function comandoSistema(c) {
+  async function comandoSistema(c, ejecutor = db) {
     const accion = c.ruta;
-    if (accion === "CORREGIR_CODIGOS_VERIFICADOS") return corregirCodigosVerificados(db, pid, c.cuerpo);
+    if (accion === "CORREGIR_CODIGOS_VERIFICADOS") return corregirCodigosVerificados(ejecutor, pid, c.cuerpo);
     if (accion === "SINCRONIZAR_TODO") {
-      await reenviarTodo();
+      await reenviarTodo(ejecutor);
       return { mensaje: "Se reenviarán todos los datos" };
     }
     if (accion === "ACTUALIZAR") {
@@ -328,13 +385,15 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
     const resumen = await db.tx((t) => aplicarMaestros(t, { ...ctx, db: t }, maestros));
     ultimoMaestros = Date.now();
     estado.maestros = { ...resumen, fecha: U.fechaHora(), afiliados: (maestros.afiliados || []).length };
-    escribirMeta(db, "maestros_resumen", JSON.stringify(estado.maestros));
+    await guardarMeta("maestros_resumen", JSON.stringify(estado.maestros));
   }
 
   // ---------------------------------------------------------------- actualizaciones
 
   async function buscarActualizacion(forzar = false) {
-    if (!forzar && Date.now() - ultimaVersion < 30 * 60 * 1000) return null;
+    const grupo = grupoLocal();
+    const intervalo = grupo.habilitado && !grupo.escritor ? 60000 : 30 * 60 * 1000;
+    if (!forzar && Date.now() - ultimaVersion < intervalo) return null;
     ultimaVersion = Date.now();
     const info = await pedir("GET", "/version");
     estado.version_disponible = info.version || null;
@@ -350,8 +409,19 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
   }
 
   function instalarActualizacion(buffer) {
-    estado.actualizando = true;
     const datos = leerPaquete(buffer);
+    if (grupoLocal().habilitado && !datos.archivos.some(a => a.ruta === "lib/servicio-lan.js")) throw U.error("Esa versión es anterior al respaldo automático. No se instala sobre un grupo activo.", 409);
+    if (grupoLocal().habilitado) {
+      const esquema = datos.archivos.find(a => a.ruta === "lib/esquema.js");
+      const actual = fs.readFileSync(path.join(__dirname, "esquema.js"), "utf8").replace(/\r\n/g, "\n");
+      const modelo = datos.archivos.find(a => a.ruta === "lib/respaldo-lan.js");
+      const modeloEntrante = modelo && /\bAJB_LAN_MODELO_\d+\b/.exec(Buffer.from(modelo.contenido, "base64").toString("utf8"))?.[0];
+      const modeloPropio = /\bAJB_LAN_MODELO_\d+\b/.exec(fs.readFileSync(path.join(__dirname, "respaldo-lan.js"), "utf8"))?.[0];
+      if (!esquema || Buffer.from(esquema.contenido, "base64").toString("utf8").replace(/\r\n/g, "\n") !== actual || !modeloEntrante || modeloEntrante !== modeloPropio) {
+        throw U.error("Esta actualización cambia la estructura de los datos y requiere actualizar el grupo de forma coordinada. El servidor conserva su versión actual para seguir operando.", 409, { codigo: "HA_ACTUALIZACION_COORDINADA" });
+      }
+    }
+    estado.actualizando = true;
     if (datos.version === version) { estado.actualizando = false; return { actualizado: false, version }; }
     const carpetaVersiones = path.join(base, "app", "versiones");
     fs.mkdirSync(carpetaVersiones, { recursive: true });
@@ -366,6 +436,17 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
 
   async function ciclo() {
     if (corriendo || detenido || !configurado()) return;
+    if (!puedeSincronizar()) {
+      estado.en_linea = false; estado.ultimo_error = "Esta PC está en espera del servidor actual";
+      // Una PC en espera puede obtener código firmado. No anuncia control,
+      // descarga tablas, consume órdenes ni sube cambios comerciales.
+      if (grupoLocal().habilitado) {
+        corriendo = true;
+        try { await buscarActualizacion(false); } catch (e) { log("Actualización del respaldo: " + e.message); }
+        finally { corriendo = false; programar(); }
+      } else programar();
+      return;
+    }
     corriendo = true;
     try {
       const hola = await pedir("POST", "/hola", {
@@ -387,20 +468,20 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
         fs.writeFileSync(temporal, JSON.stringify({ ...guardada, clave_lan: hola.clave_lan }, null, 2), { mode: 0o600 });
         fs.renameSync(temporal, archivo);
       }
-      escribirMeta(db, "ultimo_contacto", estado.ultimo_contacto);
-      escribirMeta(db, "escritor", hola.escritor || "");
+      await guardarMeta("ultimo_contacto", estado.ultimo_contacto);
+      await guardarMeta("escritor", hola.escritor || "");
       atenderRespuesta(hola);
       fallos = 0;
 
       if (hola.accion === "DESCARGAR_DATOS") {
         await descargarInstantanea();
         const control = await pedir("POST", "/tomar-control", { cuerpo: { instancia_id: instancia, equipo_id: equipoId } });
-        if (control.autoriza_escritura === true) { controlEquipo?.confirmarCentral(); escribirMeta(db, "escritor", "LOCAL"); }
+        if (control.autoriza_escritura === true) await db.exclusivo(() => { controlEquipo?.confirmarCentral(); escribirMeta(db, "escritor", "LOCAL"); });
       } else if (hola.accion === "TOMAR_CONTROL") {
         const control = await pedir("POST", "/tomar-control", { cuerpo: { instancia_id: instancia, equipo_id: equipoId } });
-        if (control.autoriza_escritura === true) { controlEquipo?.confirmarCentral(); escribirMeta(db, "escritor", "LOCAL"); }
+        if (control.autoriza_escritura === true) await db.exclusivo(() => { controlEquipo?.confirmarCentral(); escribirMeta(db, "escritor", "LOCAL"); });
       }
-      if (hola.autoriza_escritura === true) controlEquipo?.confirmarCentral();
+      if (hola.autoriza_escritura === true) await db.exclusivo(() => controlEquipo?.confirmarCentral());
       if (controlEquipo && !controlEquipo.puedeEscribir()) {
         estado.conflicto = controlEquipo.estado().motivo;
         await buscarActualizacion(false).catch((e) => log(`Actualización: ${e.message}`));
@@ -475,7 +556,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
       const ctx = { db, pid, usuario: { id: null, nombre: "Paquete del sistema general" }, origen: "SISTEMA" };
       resumen.maestros = await db.tx((t) => aplicarMaestros(t, { ...ctx, db: t }, datos.maestros));
       estado.maestros = { ...resumen.maestros, fecha: U.fechaHora(), afiliados: (datos.maestros.afiliados || []).length };
-      escribirMeta(db, "maestros_resumen", JSON.stringify(estado.maestros));
+      await guardarMeta("maestros_resumen", JSON.stringify(estado.maestros));
     }
     for (const c of datos.comandos || []) {
       const r = await ejecutarComando(c);
@@ -489,15 +570,11 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
   }
 
   // Vuelve a encolar todas las filas para subirlas (reparación de la réplica central).
-  async function reenviarTodo() {
-    await db.exclusivo(() => {
-      db.conexion.exec("BEGIN IMMEDIATE");
-      try {
-        for (const tabla of NOMBRES_TABLAS) {
-          db.conexion.prepare(`INSERT INTO predio_outbox (tabla, fila_id, op) SELECT '${tabla}', id, 'U' FROM ${tabla} WHERE predio_id = ?`).run(pid);
-        }
-        db.conexion.exec("COMMIT");
-      } catch (e) { db.conexion.exec("ROLLBACK"); throw e; }
+  async function reenviarTodo(ejecutor = db) {
+    await ejecutor.tx(async (t) => {
+      for (const tabla of NOMBRES_TABLAS) {
+        await t.run(`INSERT INTO predio_outbox (tabla, fila_id, op) SELECT '${tabla}', id, 'U' FROM ${tabla} WHERE predio_id = ?`, [pid]);
+      }
     });
   }
 
@@ -507,7 +584,9 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
     instancia: () => instancia,
     iniciar() {
       detenido = false;
-      try { cargarDatosIniciales(); } catch (e) { log(`No se pudieron cargar los datos iniciales: ${e.message}`); }
+      if (!grupoLocal().habilitado && !leerMeta(db, "restauracion_pendiente")) {
+        try { cargarDatosIniciales(); } catch (e) { log(`No se pudieron cargar los datos iniciales: ${e.message}`); }
+      }
       if (configurado()) { temporizador = setTimeout(ciclo, 1500); temporizador.unref?.(); }
     },
     detener() { detenido = true; clearTimeout(temporizador); },

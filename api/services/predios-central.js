@@ -191,6 +191,8 @@ async function importarExportacion(pool, predio, datos, { forzar = false, usuari
     await conexion.beginTransaction();
     const [[actual]] = await conexion.query("SELECT * FROM predio WHERE id = ? FOR UPDATE", [predio.id]);
     if (!actual) throw U.error("No encontramos el predio", 404);
+    const [grupos] = await conexion.query("SELECT id FROM predio_evento WHERE predio_id = ? AND tipo = 'HA_REGISTRO' LIMIT 1", [predio.id]);
+    if (grupos.length) throw U.error("Este predio tiene respaldo automático. Sincronizá desde la PC que está en servicio; un archivo de tablas no puede reemplazar la base ni el control del grupo.", 409, { codigo: "HA_IMPORTACION_NO_PERMITIDA" });
     if (!forzar) exigirPropietario(actual, datos);
     const avisos = await nuevosAvisos(conexion, predio.id, Array.isArray(datos.tablas?.predio_aviso) ? datos.tablas.predio_aviso : []);
     for (const tabla of NOMBRES_TABLAS) {

@@ -191,6 +191,56 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
   Las claves privadas permanecen en el servidor con permisos de SYSTEM y administradores.
   La renovación del certificado del servidor conserva la misma raíz de confianza.
 
+## PCs de respaldo y reemplazo automático sin internet
+
+Una PC sola conserva el funcionamiento habitual. Para agregar respaldo, desde
+**Sistema → PCs de respaldo**, en el servidor del camping:
+
+1. Prepará el instalador de **Testigo** y ejecutalo como administrador en una PC
+   de caja que quede encendida. Coordina el grupo y no guarda la base comercial.
+2. Prepará un instalador de **Respaldo** por PC y ejecutá `INSTALAR-APOYO.bat`
+   en cada una. La incorporación se hace por la red local; el paquete vence en
+   una hora y corresponde a una sola PC.
+3. Cuando estén incorporadas, elegí **Activar reemplazo automático**. Se pausan
+   las operaciones brevemente para copiar la base actual, incluidos los cambios
+   todavía pendientes de subir. Un corte durante este paso conserva la pausa y
+   reanuda la misma copia al volver a arrancar.
+4. Prepará el **Acceso de caja** en las otras PCs y usá el acceso compartido
+   «Sistema del Camping - Caja». Abre siempre `http://127.0.0.1:8091` y sigue
+   al servidor acreditado, conservando el origen y la sesión del navegador.
+
+Si se interrumpe una instalación, ejecutá `CONTINUAR-INSTALACION.bat` dentro de
+la carpeta que creó en esa PC. Reutiliza su identidad y certificados; no borres
+esa carpeta para volver a empezar.
+
+El administrador recibe un aviso con la PC que toma el control. Cuando vuelve
+la principal, recibe la última copia y retoma el servicio; la otra vuelve a ser
+respaldo. Con dos servidores, si uno falla se continúa desde la copia disponible
+y se avisa que falta redundancia. Una copia atrasada nunca se activa como si
+estuviera al día. El testigo tiene que estar disponible para operar en este modo.
+
+Los datos entre servidores viajan por HTTPS con las autoridades públicas fijadas
+durante la incorporación. Las copias completas se conservan cifradas. La identidad
+física, claves propias y configuración de cada PC quedan fuera de la base replicada.
+El testigo es único: copiar su carpeta a otro hardware no crea una segunda autoridad.
+
+Sólo la PC en servicio sincroniza datos con Mi AJB; los respaldos también pueden
+descargar actualizaciones de código firmado. Una actualización que cambie el
+esquema requiere una transición coordinada del grupo y se retiene antes de
+instalarla, para no migrar una sola PC y dejar respaldos incompatibles. Una versión
+sin soporte del grupo nunca se usa como rollback. Las exportaciones `.ajbpredio`
+no reemplazan una réplica central que ya tenga un grupo HA registrado.
+
+## Recuperar un respaldo completo en otra PC
+
+En una instalación o paquete completo actualizado, ejecutá
+`herramientas/RECUPERAR-RESPALDO.bat` (o el mismo archivo dentro de `instalador`).
+Elegí el archivo `.ajbrespaldo`, ingresá su clave y revisá el predio, la fecha y los
+cambios pendientes. El asistente crea una carpeta nueva y deja la copia **detenida,
+en espera**; conserva la base completa y sus identificadores de operaciones.
+Para reincorporar la PC al grupo se usa el instalador de Respaldo con el testigo
+disponible. Recuperar el archivo no instala servicios ni habilita otro escritor.
+
 ## Reglas de negocio que conviene recordar
 
 - Solicitud entre bocas: el producto **sale** de la boca de origen (que lo despacha) y **llega** a

@@ -94,9 +94,26 @@ function carpetaDe(version) {
   return version ? path.join(VERSIONES, version) : null;
 }
 
+function requiereControlLan() {
+  // La presencia alcanza: una configuración incompleta, ilegible o una
+  // activación interrumpida tampoco pueden volver al escritor de una PC vieja.
+  return ["predio-ha.json", "ha-activacion-pendiente.json"].some((nombre) => {
+    try { fs.lstatSync(path.join(BASE, nombre)); return true; }
+    catch (e) { return e.code !== "ENOENT"; }
+  });
+}
+
+function carpetaCompatible(carpeta) {
+  try {
+    return fs.statSync(path.join(carpeta, "servidor.js")).isFile()
+      && (!requiereControlLan() || fs.statSync(path.join(carpeta, "lib", "servicio-lan.js")).isFile());
+  } catch (_e) { return false; }
+}
+
 function versionValida(version) {
+  if (typeof version !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9.+_-]{0,127}$/.test(version) || version.includes("..")) return false;
   const c = carpetaDe(version);
-  return Boolean(c && fs.existsSync(path.join(c, "servidor.js")));
+  return Boolean(c && carpetaCompatible(c));
 }
 
 function elegirVersion() {
@@ -128,10 +145,12 @@ function iniciar() {
   if (terminando || debePermanecerDetenido()) { terminar(); return; }
   const version = elegirVersion();
   let script;
-  if (version) script = path.join(carpetaDe(version), "servidor.js");
-  else if (fs.existsSync(path.join(__dirname, "servidor.js"))) script = path.join(__dirname, "servidor.js");
+  if (version && versionValida(version)) script = path.join(carpetaDe(version), "servidor.js");
+  else if (carpetaCompatible(__dirname)) script = path.join(__dirname, "servidor.js");
   else {
-    log("No hay ninguna versión instalada. Volvé a correr el instalador.");
+    log(requiereControlLan()
+      ? "El grupo LAN requiere una versión compatible con su control de escritura. El servidor queda detenido; instalá una versión actualizada."
+      : "No hay ninguna versión instalada. Volvé a correr el instalador.");
     setTimeout(iniciar, 30000);
     return;
   }
