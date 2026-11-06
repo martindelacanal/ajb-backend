@@ -26,6 +26,7 @@ const TABLAS = {
       es_origen: "bool",
       es_destino: "bool",
       es_almacen: "bool",
+      margen_venta: "pct",
       descripcion: "str:255",
       activo: "bool",
       orden: "int",
@@ -108,9 +109,14 @@ const TABLAS = {
     },
     indices: [["nombre"], ["codigo"]],
   },
+  predio_producto_margen_boca: {
+    columnas: { producto_id: "int!", boca_id: "int!", margen: "pct!" },
+    unicos: [["producto_id", "boca_id"]],
+  },
   predio_precio_historial: {
     columnas: {
       producto_id: "int!",
+      boca_id: "int",
       fecha: "dt!",
       precio_compra: "money",
       margen: "pct",
@@ -179,6 +185,8 @@ const TABLAS = {
       cantidad: "qty!",
       precio_unitario: "money!",
       precio_anterior: "money",
+      venta_anterior: "money",
+      historial_anterior_id: "int",
       margen: "pct",
       precio_venta: "money",
       actualizo_precio: "bool",
@@ -457,6 +465,17 @@ const TABLAS = {
 
 const NOMBRES_TABLAS = Object.keys(TABLAS);
 
+// Un archivo completo anterior a los márgenes no tenía tabla de excepciones.
+// Al restaurarlo, no deben quedar reglas vinculadas a IDs del catálogo reemplazado.
+function tablasDeInstantanea(tablas = {}) {
+  if (!Object.hasOwn(tablas, "predio_producto_margen_boca") && Array.isArray(tablas.predio_producto)
+      && Array.isArray(tablas.predio_compra) && Array.isArray(tablas.predio_boca)
+      && tablas.predio_boca.every(b => !Object.hasOwn(b, "margen_venta"))) {
+    return { ...tablas, predio_producto_margen_boca: [] };
+  }
+  return tablas;
+}
+
 function columnasDe(tabla) {
   const def = TABLAS[tabla];
   if (!def) throw new Error(`Tabla desconocida: ${tabla}`);
@@ -547,6 +566,7 @@ function indicesSqlite(tabla) {
 module.exports = {
   TABLAS,
   NOMBRES_TABLAS,
+  tablasDeInstantanea,
   columnasDe,
   tipoSql,
   parsearTipo,

@@ -11,7 +11,7 @@ const crypto = require("node:crypto");
 
 const DIR_PREDIOS = path.join(__dirname, "..", "..", "predios");
 const U = require("../../predios/lib/util");
-const { NOMBRES_TABLAS, columnasDe, TABLAS } = require("../../predios/lib/esquema");
+const { NOMBRES_TABLAS, columnasDe, TABLAS, tablasDeInstantanea } = require("../../predios/lib/esquema");
 const { crearMysql } = require("../../predios/lib/db-mysql");
 const { armarPaquete } = require("../../predios/lib/paquete");
 const { aplicarMaestros } = require("../../predios/lib/maestros");
@@ -195,8 +195,9 @@ async function importarExportacion(pool, predio, datos, { forzar = false, usuari
     if (grupos.length) throw U.error("Este predio tiene respaldo automático. Sincronizá desde la PC que está en servicio; un archivo de tablas no puede reemplazar la base ni el control del grupo.", 409, { codigo: "HA_IMPORTACION_NO_PERMITIDA" });
     if (!forzar) exigirPropietario(actual, datos);
     const avisos = await nuevosAvisos(conexion, predio.id, Array.isArray(datos.tablas?.predio_aviso) ? datos.tablas.predio_aviso : []);
+    const tablas = tablasDeInstantanea(datos.tablas || {});
     for (const tabla of NOMBRES_TABLAS) {
-      const filas = Array.isArray(datos.tablas?.[tabla]) ? datos.tablas[tabla] : null;
+      const filas = Array.isArray(tablas[tabla]) ? tablas[tabla] : null;
       if (!filas) continue;
       await conexion.query(`DELETE FROM \`${tabla}\` WHERE predio_id = ?`, [predio.id]);
       for (let i = 0; i < filas.length; i += 300) await upsertFilas(conexion, predio.id, tabla, filas.slice(i, i + 300));

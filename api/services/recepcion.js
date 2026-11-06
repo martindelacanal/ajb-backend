@@ -143,11 +143,13 @@ async function listar(c, codigos, b) {
     cond.push("EXISTS (SELECT 1 FROM predio_huesped hp WHERE hp.reserva_id=r.id AND hp.predio_id=? AND hp.entrada IS NOT NULL AND " + modo + ")");
     p.push(U.id(b.predioId));
   }
-  if (b.q) {
-    cond.push("(r.id=? OR u.documento=? OR CONCAT_WS(' ',u.apellido,u.nombre) LIKE ?)");
-    p.push(Number(b.q) || 0, b.q, "%" + U.texto(b.q, {
-      max: 80
-    }) + "%");
+  const busqueda = U.texto(b.q || "", { max: 80 }) || "";
+  if (busqueda) {
+    const reserva = /^(?:T-)?(\d+)$/i.exec(busqueda);
+    // El titular figura como "Apellido, Nombre" y la reserva como "T-123" en la tabla.
+    cond.push("(r.id=? OR u.documento LIKE ? OR CONCAT_WS(' ',u.apellido,u.nombre) LIKE ? OR CONCAT_WS(' ',u.nombre,u.apellido) LIKE ?)");
+    const nombre = "%" + busqueda.replace(/,\s*/g, " ") + "%";
+    p.push(reserva ? Number(reserva[1]) : 0, busqueda + "%", nombre, nombre);
   }
   if (b.desde) {
     cond.push(fechaFinVisibleSql("e") + ">=?");

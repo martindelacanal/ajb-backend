@@ -1,16 +1,17 @@
 "use strict";
 
 // Ventas en las cajas de cada boca. El precio sale siempre del producto (el servidor manda),
-// el efectivo genera movimiento de caja y el descuento de haberes consume el disponible.
+// el efectivo genera movimiento de caja y el saldo se descuenta de la cuenta de la estadía.
 
 const U = require("../util");
 const N = require("../negocio");
+const { productoEnBoca, bloquearPrecios } = require("../precio-boca");
 const { emitirAviso } = require("../avisos");
 const { autorizacionDescuento } = require("../autorizacion-descuento");
 const { FORMAS_PAGO } = require("../listados");
 const { esAdmin, bocasDe, exigirPuesto, exigirBoca, autorizar, disponibleAfiliado, turnoDeCaja } = require("./comun");
 
-const FORMAS = FORMAS_PAGO.map((f) => f.valor);
+const FORMAS = FORMAS_PAGO.map((f) => f.valor).filter(f => f !== "DESCUENTO");
 const MOVEDORES_STOCK = ["VENTA_DIRECTA"];
 
 async function stockParaVenta(t, ctx, bocaId, productoId) {
@@ -65,14 +66,15 @@ async function avisarSinStock(ctx) {
     let producto = null;
     let stock = null;
     if (productoId) {
-      producto = await N.exigir(t, ctx, "predio_producto", productoId, "No encontramos el producto");
+      producto = await productoEnBoca(t, ctx, productoId, puesto.boca_id);
+      if (!producto) throw U.error("No encontramos el producto", 404);
       if (!Number(producto.activo) || producto.destino === "USO_INTERNO") throw U.error("Este producto no se puede vender", 409, { codigo: "PRODUCTO_NO_VENDIBLE" });
       stock = await N.stockActual(t, ctx, puesto.boca_id, productoId);
       if (stock >= cantidad) throw U.error("El producto ya tiene stock suficiente. Volvé a buscarlo en la lista de ventas.", 409, { codigo: "STOCK_DISPONIBLE" });
     }
     const id = await avisarFaltante(t, ctx, { producto, busqueda, cantidad, stock });
     const config = await N.leerConfig(t, ctx);
-    return { id, puede_vender: !!producto && Number(producto.precio_venta || 0) > 0 && config.vender_sin_stock !== "0", mensaje: "El aviso quedó registrado para el administrador. Si no hay internet, se enviará al sistema general al sincronizar." };
+    return { id, puede_vender: Number(producto?.precio_caja || 0) > 0 && config.vender_sin_stock !== "0", mensaje: "El aviso quedó registrado para el administrador. Si no hay internet, se enviará al sistema general al sincronizar." };
   });
 }
 
@@ -158,18 +160,18 @@ async function crearVenta(ctx) {
   const items = Array.isArray(b.items) ? b.items : [];
   if (!items.length) throw U.error("Agregá al menos un producto a la venta");
   if (items.length > 200) throw U.error("Una venta puede tener hasta 200 renglones");
-  let forma = U.opcion(b.forma_pago || "EFECTIVO", FORMAS, "La forma de pago");
-  if (U.bool(b.devolucion)) forma = "DESCUENTO";
-  if (forma === "MIXTO" && (!Array.isArray(b.pagos) || b.pagos.length !== 2)) throw U.error("Elegí los dos medios de pago.");
-  const codigoPago = ["QR", "TARJETA_DEBITO", "TARJETA_CREDITO", "TRANSFERENCIA"].includes(forma)
-    ? U.texto(b.codigo_pago, { max: 60, campo: "El código de pago" }) : null;
-  let afiliadoId = b.afiliado_id ? U.id(b.afiliado_id, "El afiliado") : null;
-  if (forma === "DESCUENTO" && !afiliadoId && !b.pagos) throw U.error("Para cobrar con descuento de haberes indicá el DNI o legajo del afiliado");
 
   const agrupados = new Map();
+  const preciosEsperados = new Map();
   for (const it of items) {
     if (!it || typeof it !== "object") throw U.error("Revisá los productos de la venta.");
     const productoId = U.id(it.producto_id, "El producto");
+    if (it.precio_unitario != null) {
+      const esperado = U.numero(it.precio_unitario, { min: 0, campo: "El precio mostrado en caja" });
+      if (preciosEsperados.has(productoId) && preciosEsperados.get(productoId) !== esperado)
+        throw U.error("Hay dos precios distintos para el mismo producto. Volvé a agregarlo al carrito.", 409);
+      preciosEsperados.set(productoId, esperado);
+    }
     const cantidad = U.numero(it.cantidad, { min: 0.001, max: 99999, decimales: 3, campo: "La cantidad" });
     agrupados.set(productoId, U.redondear((agrupados.get(productoId) || 0) + cantidad, 3));
   }
@@ -183,18 +185,31 @@ async function crearVenta(ctx) {
         return { ...respuesta, ticket: await datosTicket(t, ctx, respuesta.id) };
       }
     }
+    if (U.bool(b.devolucion) || b.forma_pago === "DESCUENTO" || (Array.isArray(b.pagos) && b.pagos.some(p => p?.forma === "DESCUENTO"))) {
+      throw U.error("Elegí Saldo y seleccioná al huésped. El descuento de haberes se liquida al salir.");
+    }
+    const forma = U.opcion(b.forma_pago || "EFECTIVO", FORMAS, "La forma de pago");
+    if (forma === "MIXTO" && (!Array.isArray(b.pagos) || b.pagos.length !== 2)) throw U.error("Elegí las dos formas de pago.");
+    const codigoPago = ["QR", "TARJETA_DEBITO", "TARJETA_CREDITO", "TRANSFERENCIA"].includes(forma)
+      ? U.texto(b.codigo_pago, { max: 60, campo: "El código de pago" }) : null;
+    const afiliadoId = b.afiliado_id ? U.id(b.afiliado_id, "El afiliado") : null;
+    // Compras y cambios de margen bloquean primero la configuración, luego el
+    // producto y el stock. La caja obtiene el precio vigente en ese mismo orden.
+    if (t.forUpdate) await bloquearPrecios(t, ctx);
     const caja = await N.exigir(t, ctx, "predio_caja", puesto.caja_id, "La caja ya no existe");
     if (!Number(caja.activo)) throw U.error("La caja está deshabilitada", 409);
     if (Number(caja.boca_id) !== Number(puesto.boca_id)) throw U.error("Elegí nuevamente la boca y la caja", 409, { codigo: "SIN_PUESTO" });
     const config = await N.leerConfig(t, ctx);
     const lineas = [];
+    const preciosCambiaron = [];
     const faltantes = [];
     const productos = new Map();
     const stocks = new Map();
     // Todas las cajas bloquean los productos en el mismo orden. Se conserva el
     // orden del carrito para el ticket y se evitan bloqueos cruzados entre cajas.
     for (const productoId of [...agrupados.keys()].sort((a, b) => a - b)) {
-      const p = await N.exigir(t, ctx, "predio_producto", productoId, "Uno de los productos no existe");
+      const p = await productoEnBoca(t, ctx, productoId, caja.boca_id, { bloquear: true });
+      if (!p) throw U.error("Uno de los productos no existe", 404);
       productos.set(productoId, p);
       if (p.destino !== "USO_INTERNO") stocks.set(productoId, await stockParaVenta(t, ctx, caja.boca_id, productoId));
     }
@@ -202,7 +217,9 @@ async function crearVenta(ctx) {
       const p = productos.get(productoId);
       if (!Number(p.activo)) throw U.error(`«${p.nombre}» está dado de baja`);
       if (p.destino === "USO_INTERNO") throw U.error(`«${p.nombre}» es de uso interno y no se vende`);
-      const precio = U.redondear(Number(p.precio_venta || 0), 2);
+      const precio = Number(p.precio_caja);
+      if (preciosEsperados.has(productoId) && preciosEsperados.get(productoId) !== precio)
+        preciosCambiaron.push({ producto_id: productoId, precio_venta: precio });
       if (precio <= 0) throw U.error(`«${p.nombre}» no tiene precio de venta: pedile al administrador que lo cargue`, 409, { codigo: "SIN_PRECIO" });
       const stock = stocks.get(productoId);
       if (MOVEDORES_STOCK.includes(p.destino) ? stock < cantidad : stock <= 0) {
@@ -210,6 +227,8 @@ async function crearVenta(ctx) {
       }
       lineas.push({ producto: p, cantidad, precio, subtotal: U.redondear(precio * cantidad, 2) });
     }
+    if (preciosCambiaron.length) throw U.error("Cambiaron precios del carrito. Revisá el total antes de cobrar.", 409,
+      { codigo: "PRECIOS_CAMBIARON", precios: preciosCambiaron });
     const avisosPrevios = await avisosAceptados(t, ctx, agrupados, b.avisos_sin_stock);
     const sinAviso = faltantes.filter((f) => !avisosPrevios.has(f.producto_id));
     if (faltantes.length) {
@@ -233,14 +252,6 @@ async function crearVenta(ctx) {
     const centavos = pagos.reduce((suma, p) => suma + Math.round(p.importe * 100), 0);
     if (centavos !== Math.round(total * 100)) throw U.error("Las partes del pago deben sumar el total de la venta.");
     const efectivo=pagos.find(p=>p.forma==="EFECTIVO")?.importe||0;
-    const parteHaberes=pagos.find(p=>p.forma==="DESCUENTO");
-    if(parteHaberes&&parteHaberes.huesped_id){
-      const h=await N.exigir(t,ctx,"predio_huesped",U.id(parteHaberes.huesped_id),"No encontramos al huésped",{bloquear:true});
-      const a=await t.get("SELECT id FROM predio_afiliado WHERE predio_id=? AND dni=? AND usuario_general_id IS NOT NULL",[ctx.pid,h.dni]);
-      if(!h.entrada||h.salida||!Number(h.afiliado)||!a)throw U.error("El descuento requiere un afiliado presente.",409);
-      afiliadoId=a.id;
-    }
-    if(parteHaberes&&!afiliadoId)throw U.error("Seleccioná el afiliado para aplicar el descuento.");
     let afiliado = null;
     let departamental = null;
     let saldoDisponible = null;
@@ -249,17 +260,6 @@ async function crearVenta(ctx) {
       if (afiliado.departamental_id) departamental = await N.obtener(t, ctx, "predio_departamental", afiliado.departamental_id);
       const disp = await disponibleAfiliado(t, ctx, afiliadoId);
       saldoDisponible = disp.disponible;
-      if (parteHaberes) {
-        if (!disp.habilitado) throw U.error("El afiliado no está habilitado para comprar con descuento de haberes", 409, { codigo: "SIN_DISPONIBLE", disponible: 0 });
-        if (disp.disponible < parteHaberes.importe) {
-          throw U.error(
-            disp.disponible <= 0
-              ? "Al afiliado no le queda disponible para descuento de haberes: tiene que pagar de otra forma."
-              : `Al afiliado le quedan ${U.pesos(disp.disponible)} de descuento y la venta es de ${U.pesos(total)}. Tiene que pagar de otra forma o sacar productos.`,
-            409, { codigo: "SIN_DISPONIBLE", disponible: disp.disponible, total });
-        }
-        saldoDisponible = U.redondear(disp.disponible - parteHaberes.importe, 2);
-      }
     }
 
     let recibido = null;
@@ -276,8 +276,6 @@ async function crearVenta(ctx) {
       usuario_nombre: N.nombreActor(ctx), fecha: ahora, afiliado_id: afiliado ? afiliado.id : null,
       afiliado_dni: afiliado?.dni || null, afiliado_legajo: afiliado?.legajo || null, afiliado_nombre: afiliado?.nombre || null,
       afiliado_departamental: departamental?.nombre || null, saldo_disponible: saldoDisponible,
-      importe_haberes: parteHaberes?.importe || null,
-      autorizacion_descuento: parteHaberes ? autorizacionDescuento(config, parteHaberes.importe) : null,
       forma_pago: forma, codigo_pago: codigoPago, total, recibido, vuelto, estado: "CONFIRMADA", impresiones: 0,
       observaciones: U.texto(b.observaciones, { max: 255 }),
     });

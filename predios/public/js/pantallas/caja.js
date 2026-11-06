@@ -127,18 +127,17 @@
     }
     function mostrarCifras(r) {
       var a = r.apertura;
-      var pendiente = desdePanel ? "Sin confirmar" : h("a", { href: "#", onclick: function (ev) { ev.preventDefault(); P.verificarApertura(true); } }, "Confirmalo");
       P.reemplazar(cifras,
-        P.cifra("Efectivo en la caja", P.f.pesos(r.resumen.saldo_esperado), "Según los movimientos"),
-        P.cifra("Ventas desde el último cierre", P.f.entero(r.resumen.ventas_cantidad), P.f.pesos(r.resumen.ventas_total)),
-        desdePanel ? P.cifra("Ventas en efectivo", P.f.pesos(r.resumen.ventas_efectivo), "Desde el último cierre") :
-          P.cifra("Tu turno", r.turno ? P.f.pesos(r.turno.total) : "—", r.turno ? r.turno.cantidad + " venta(s)" : ""),
-        P.cifra("Saldo de apertura", a ? P.f.pesos(a.importe) : "Sin cargar",
-          a ? (a.verificacion === "CORRECTO" ? "Confirmado" : a.verificacion === "NO_COINCIDE" ? "No coincide" : pendiente) : "Lo carga el administrador"));
+        P.cifra("Efectivo en la caja", P.f.pesos(r.resumen.saldo_esperado)),
+        P.cifra("Ventas desde el último cierre", P.f.entero(r.resumen.ventas_cantidad)),
+        desdePanel ? P.cifra("Ventas en efectivo", P.f.pesos(r.resumen.ventas_efectivo)) :
+          P.cifra("Tu turno", r.turno ? P.f.pesos(r.turno.total) : "—"),
+        P.cifra("Saldo de apertura", a ? P.f.pesos(a.importe) : "Sin cargar"));
     }
     c.appendChild(h("a.volver", { href: desdePanel ? "#/caja" : "#/vender" }, P.icono("volver"), desdePanel ? "Todas las cajas" : "Vender"));
     return P.get(rutaEstado).then(function (r) {
       var nombre = r.boca.nombre + " · " + r.caja.nombre;
+      var esPropia = P.puesto() && Number(P.puesto().caja_id) === Number(cajaId);
       var caja = [{ valor: cajaId, texto: nombre }];
       var acciones = [P.btn("Mis ventas", { tipo: "suave", chico: true, icono: "lista", onclick: function () { P.ruta.ir(desdePanel ? "/caja/" + cajaId + "/ventas" : "/mis-ventas"); } })];
       if (desdePanel) {
@@ -149,7 +148,7 @@
         acciones.push(P.btn("Ver saldo de apertura", { tipo: "suave", chico: true, icono: "efectivo", onclick: function () { P.verificarApertura(true); } }));
       }
       if (P.modo === "local") acciones.push(P.btn("Cerrar caja", { tipo: "primario", icono: "candado", onclick: function () { P.cerrarCaja(cajaId, refrescar); } }));
-      c.appendChild(P.cabeceraConAcciones("Caja", nombre, acciones));
+      c.appendChild(P.cabeceraConAcciones(esPropia ? "Mi caja" : "Caja", esPropia ? null : nombre, acciones));
       mostrarCifras(r);
       c.appendChild(cifras);
       tabla = P.tabla({ listado: "caja", sinEtiquetaBuscar: true, filtrosFijos: { f_caja: cajaId }, columnasOcultas: ["boca", "caja"],
@@ -162,7 +161,7 @@
     var puesto = P.puesto();
     if (!puesto || !puesto.caja_id) { c.appendChild(P.vacio("caja", "No estás trabajando en una caja", "", P.btn("Elegir caja", { tipo: "primario", onclick: function () { P.ruta.ir("/puesto"); } }))); return; }
     return detalleCaja(c, puesto.caja_id, false);
-  }, { titulo: "Caja", local: true });
+  }, { titulo: "Mi caja", local: true });
 
   P.ruta.registrar(/^\/caja\/(\d+)$/, function (c, params) { return detalleCaja(c, Number(params[0]), true); }, { admin: true, titulo: "Caja" });
 
@@ -246,7 +245,7 @@
   P.ruta.registrar(/^\/caja$/, function (c) {
     var cajasOp = [];
     var vista = P.cache["caja:vista"] || "movimientos";
-    c.appendChild(P.cabeceraConAcciones("Caja", "Todas las cajas de todas las bocas: aperturas, ajustes, cierres y movimientos.", [
+    c.appendChild(P.cabeceraConAcciones("Caja", null, [
       P.btn("Saldo de apertura", { tipo: "secundario", icono: "efectivo", onclick: function () { modalApertura(cajasOp, null, refrescar); } }),
       P.btn("Ajuste de caja", { tipo: "primario", icono: "transferencia", onclick: function () { modalAjuste(cajasOp, null, refrescar); } }),
     ]));

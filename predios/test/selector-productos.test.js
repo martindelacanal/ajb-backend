@@ -70,6 +70,36 @@ const resolver = () => new Promise(resolve => setImmediate(resolve));
 async function enter(combo, texto) { combo.input.value = texto; combo.input.disparar("keydown", { key: "Enter" }); await resolver(); }
 function opcion(s) { return s.documento.body.querySelectorAll(".combo-opcion")[0]; }
 
+test("el selector de huéspedes sólo autoelige un documento completo con una única estadía presente", async () => {
+  const s = pantalla(), seleccion = [];
+  const presentes = [{ valor: 1, texto: "Ana", dni: "12345" }, { valor: 2, texto: "Bea", dni: "12346" }];
+  const combo = s.P.combo({
+    buscar: async q => presentes.filter(p => p.dni.startsWith(q)).map(p => ({ ...p, exacto: q === p.dni })),
+    elegirExactoAlEscribir: true, elegirUnico: false, alElegir: p => seleccion.push(p.valor),
+  });
+  async function escribir(q) {
+    combo.input.value = q;
+    combo.input.disparar("input");
+    await new Promise(resolve => setTimeout(resolve, 190));
+  }
+  combo.foco();
+  await escribir("123");
+  assert.equal(s.documento.body.querySelectorAll(".combo-opcion").length, 2);
+  assert.deepEqual(seleccion, []);
+  presentes.pop();
+  await escribir("1234");
+  assert.ok(opcion(s));
+  assert.deepEqual(seleccion, []);
+  presentes.push({ valor: 3, texto: "Otra estadía", dni: "12345" });
+  await escribir("12345");
+  assert.equal(s.documento.body.querySelectorAll(".combo-opcion").length, 2);
+  assert.deepEqual(seleccion, []);
+  presentes.pop();
+  await escribir("12345");
+  assert.deepEqual(seleccion, [1]);
+  assert.equal(opcion(s), undefined);
+});
+
 test("Enter agrega únicamente la coincidencia exacta del código completo", async () => {
   const s = pantalla();
   s.P.get = async () => [{ id: 1, nombre: "Coca Zero 1,5 L", codigo: "7790895000436", exacto: true }];

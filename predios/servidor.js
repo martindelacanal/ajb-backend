@@ -24,6 +24,7 @@ const { crearDescubrimiento } = require("./lib/descubrimiento");
 const { leerRuntime, invocarControl, migrarRuntime, prepararAccesoCaja } = require("./lib/runtime");
 const { leerTls, prepararTls } = require("./lib/tls-local");
 const { revisarPreciosVencidos } = require("./lib/precios");
+const { listarRespaldos, rotarRespaldos } = require("./lib/rotacion-respaldos");
 const { crearRespaldo } = require("./lib/respaldo-local");
 const { ejecutarPeticion } = require("./lib/peticiones-idempotentes");
 const { resolverActorRemoto } = require("./lib/actor-remoto");
@@ -231,16 +232,17 @@ const grupoLocal = crearGrupoLocal({ base: BASE, dirApp: DIR_APP, version: VERSI
 
 function respaldar(motivo = "diario") {
   const carpeta = path.join(BASE, "datos", "respaldos");
-  const nombre = motivo === "diario" ? `predio-${U.hoy()}.db` : `predio-${U.fechaHora().replace(/[: ]/g, "-")}-${motivo}.db`;
+  const prefijo = motivo === "diario" ? `predio-${U.hoy()}` : `predio-${U.fechaHora().replace(/[: ]/g, "-")}-${motivo}`;
+  let nombre = prefijo + ".db";
+  if (motivo === "diario" && fs.existsSync(path.join(carpeta, nombre))) { rotarRespaldos(carpeta); return null; }
+  for (let n = 1; fs.existsSync(path.join(carpeta, nombre)); n++) nombre = prefijo + "-" + n + ".db";
   const destino = path.join(carpeta, nombre);
-  if (motivo === "diario" && fs.existsSync(destino)) return null;
-  fs.rmSync(destino, { force: true });
-  db.conexion.exec(`VACUUM INTO '${destino.replace(/'/g, "''")}'`);
-  const todos = fs.readdirSync(carpeta).filter((f) => f.endsWith(".db")).sort();
-  const diarios = todos.filter((f) => /^predio-\d{4}-\d{2}-\d{2}\.db$/.test(f));
-  for (const viejo of diarios.slice(0, Math.max(0, diarios.length - 30))) fs.rmSync(path.join(carpeta, viejo), { force: true });
-  const otros = todos.filter((f) => !diarios.includes(f));
-  for (const viejo of otros.slice(0, Math.max(0, otros.length - 10))) fs.rmSync(path.join(carpeta, viejo), { force: true });
+  // No publica ni cuenta una copia parcial si se interrumpe VACUUM.
+  const temporal = destino + ".tmp";
+  fs.rmSync(temporal, { force: true });
+  db.conexion.exec(`VACUUM INTO '${temporal.replace(/'/g, "''")}'`);
+  fs.renameSync(temporal, destino);
+  rotarRespaldos(carpeta);
   log(`Respaldo creado: ${nombre}`);
   return nombre;
 }
@@ -389,8 +391,7 @@ async function rutaSistema(ctx, metodo, ruta, req, res) {
     return grupoLocal.activar();
   }
   if (metodo === "GET" && ruta === "/sistema/estado") {
-    const respaldos = fs.readdirSync(path.join(BASE, "datos", "respaldos")).filter((f) => f.endsWith(".db")).sort().reverse()
-      .map((f) => ({ nombre: f, tamano: fs.statSync(path.join(BASE, "datos", "respaldos", f)).size }));
+    const respaldos = listarRespaldos(path.join(BASE, "datos", "respaldos")).map(({ nombre, tamano }) => ({ nombre, tamano }));
     const tamano = fs.existsSync(db.archivo) ? fs.statSync(db.archivo).size : 0;
     return {
       sincronizacion: agente.estadoPublico(),
@@ -399,7 +400,7 @@ async function rutaSistema(ctx, metodo, ruta, req, res) {
       red: estadoRed(),
       runtime: runtimePublico(), escritura: controlEquipo.estado(), https: estadoHttps(), grupo_local: ha?.estado() || null,
       base_datos: { archivo: db.archivo, tamano },
-      respaldos: respaldos.slice(0, 40),
+      respaldos,
     };
   }
   if (metodo === "POST" && ruta === "/sistema/arranque") {

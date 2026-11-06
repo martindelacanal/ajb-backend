@@ -8,7 +8,7 @@
   P.cabeceraConAcciones = function (titulo, subtitulo, acciones) {
     return h("div.pagina-cabecera.pagina-cabecera-con-acciones",
       h("div.cabecera-titulo-acciones", h("h1.titulo-pagina", titulo), acciones),
-      h("p.subtitulo", subtitulo));
+      subtitulo ? h("p.subtitulo", subtitulo) : null);
   };
 
   // ------------------------------------------------------------------ campos
@@ -206,7 +206,10 @@
       return promesa.then(function (r) {
         if (n === pedido && !seleccionando) {
           input.setAttribute("aria-busy", "false");
-          resultados = r || []; indice = -1; pintar(texto);
+          resultados = r || []; indice = -1;
+          if (opciones.elegirExactoAlEscribir && texto && input.value.trim() === texto && document.activeElement === input &&
+            resultados.length === 1 && resultados[0].exacto && !resultados[0].requiereEleccion) elegir(resultados[0]);
+          else pintar(texto);
         }
         return r;
       }).catch(function (e) {
@@ -347,7 +350,7 @@
       valor: function () { return actual ? actual.valor : null; },
       opcion: function () { return actual; },
       fijar: function (valor, texto, extra) { actual = valor === null || valor === undefined ? null : Object.assign({ valor: valor, texto: texto }, extra || {}); input.value = actual ? texto : ""; },
-      limpiar: function () { actual = null; input.value = ""; cerrarLista(); },
+      limpiar: function () { clearTimeout(temporizador); actual = null; input.value = ""; cerrarLista(); },
       foco: function () { input.focus(); },
       recargar: function (ops) { opciones.opciones = ops; },
     };

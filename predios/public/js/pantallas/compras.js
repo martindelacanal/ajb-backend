@@ -1,5 +1,4 @@
-/* Compras: una compra por factura. Lista dinámica de productos con el precio anterior,
-   el margen y el control de que la suma coincida con el total de la factura. */
+/* Compras: ingreso de stock por factura y revisión opcional de precios de venta. */
 (function () {
   "use strict";
   if (window.__SIN_SOPORTE) return;
@@ -26,13 +25,14 @@
             h("thead", h("tr", h("th", "Producto"), h("th.der", "Cantidad"), h("th.der", "Unitario"), h("th.der", "Anterior"), h("th.der", "Margen"), h("th.der", "Venta"), h("th.der", "Total"))),
             h("tbody", d.items.map(function (i) {
               return h("tr", h("td", h("strong", i.producto), h("div.texto-3.chico", i.codigo || "")), h("td.der", P.f.numero(i.cantidad)), h("td.der", P.f.pesos(i.precio_unitario)),
-                h("td.der.texto-3", P.f.pesos(i.precio_anterior)), h("td.der", P.f.pct(i.margen)), h("td.der", P.f.pesos(i.precio_venta)), h("td.der.fuerte", P.f.pesos(i.subtotal)));
+                h("td.der.texto-3", P.f.pesos(i.precio_anterior)), h("td.der", P.f.pct(i.margen)),
+                h("td.der", P.f.pesos(i.precio_venta), h("div.texto-3.chico", Number(i.actualizo_precio) ? "Actualizado" : "Conservado")), h("td.der.fuerte", P.f.pesos(i.subtotal)));
             })),
             h("tfoot", h("tr", h("td", { colspan: "6" }, "Total"), h("td.der", P.f.pesos(c.total_items)))))),
           c.observaciones ? P.mensaje(c.observaciones) : null),
         acciones: [
           P.esAdmin() && c.estado !== "ANULADA" ? P.btn("Anular compra", { tipo: "peligro", icono: "borrar", onclick: function () {
-            P.pedirTexto("Anular la compra N° " + c.id, { etiqueta: "Motivo", requerido: true, aceptar: "Anular", peligro: true, subtitulo: "Se descuenta del almacén lo que había ingresado. Los precios no se modifican." }).then(function (motivo) {
+            P.pedirTexto("Anular la compra N° " + c.id, { etiqueta: "Motivo", requerido: true, aceptar: "Anular", peligro: true, subtitulo: "Se descontará el stock ingresado. Se restaurarán los precios que todavía dependan de esta compra." }).then(function (motivo) {
               if (!motivo) return;
               P.post("/compras/" + c.id + "/anular", { motivo: motivo }).then(function (r) { if (!r.encolado) P.aviso(r.mensaje, "ok"); m.cerrar(); if (alCambiar) alCambiar(); }).catch(P.error);
             });
@@ -44,7 +44,7 @@
   };
 
   P.ruta.registrar(/^\/compras$/, function (c) {
-    c.appendChild(P.cabeceraConAcciones("Compras", "Una compra por factura. Lo comprado entra al almacén y actualiza el precio de cada producto.",
+    c.appendChild(P.cabeceraConAcciones("Compras", null,
       puedeComprar() ? P.btn("Cargar compra", { tipo: "primario", icono: "mas", onclick: function () { P.ruta.ir("/compras/nueva"); } }) : null));
     var vista = P.cache["compras:vista"] || "compras";
     var zona = h("div", { style: { marginTop: "14px" } });
@@ -61,15 +61,20 @@
 
   // ------------------------------------------------------------------ nueva compra
   P.ruta.registrar(/^\/compras\/nueva$/, function (c) {
-    if (!puedeComprar()) { c.appendChild(P.vacio("candado", "Las compras las carga el almacén o un administrador", "")); return; }
+    if (!puedeComprar()) { c.appendChild(P.vacio("candado", "Las compras las carga la proveeduría o un administrador", "")); return; }
     var CLAVE = "predio.compra-borrador";
     var estado = { proveedor: null, factura: "", fecha_factura: P.hoy(), remito: "", fecha_remito: "", total_factura: "", observaciones: "", lineas: [] };
     try { var b = JSON.parse(sessionStorage.getItem(CLAVE) || "null"); if (b && b.lineas) estado = Object.assign(estado, b); } catch (e) { /* nada */ }
     function guardar() { try { sessionStorage.setItem(CLAVE, JSON.stringify(estado)); } catch (e) { /* nada */ } }
 
+    var destinoStock = h("div.texto-3");
+    P.opciones("bocas", true).then(function (bocas) {
+      var destino = bocas.find(function (boca) { return boca.es_almacen; });
+      destinoStock.textContent = destino ? "Proveeduría que recibe el stock: " + destino.texto : "Falta elegir la proveeduría en Gestión → Bocas y cajas.";
+    }).catch(P.error);
     c.appendChild(h("div.pagina-cabecera", h("div",
       h("a.volver", { href: "#/compras" }, P.icono("volver"), "Compras"),
-      h("h1.titulo-pagina", "Cargar compra"), h("p.subtitulo", "Completá los datos de la factura y agregá los productos uno por uno (podés usar el escáner)."))));
+      h("h1.titulo-pagina", "Cargar compra"))));
 
     // Factura
     var proveedor = P.combo({
@@ -118,8 +123,8 @@
       alCambiarTexto: function () { elegido = null; ayudaProducto.textContent = ""; },
       alElegir: function (o) {
         elegido = o.dato;
-        ayudaProducto.textContent = "Precio anterior: " + P.f.pesos(elegido.precio_compra) + " · Margen: " + P.f.pct(elegido.margen) + " · Venta actual: " + P.f.pesos(elegido.precio_venta);
-        if (!unitario.value) unitario.value = elegido.precio_compra ? P.f.numero(elegido.precio_compra) : "";
+        ayudaProducto.textContent = "Costo de referencia: " + P.f.pesos(elegido.precio_compra) + " · Venta general: " + P.f.pesos(elegido.precio_venta);
+        unitario.value = P.f.numero(elegido.ultimo_costo != null ? elegido.ultimo_costo : elegido.precio_compra);
         cantidad.focus();
         cantidad.select();
       },
@@ -143,12 +148,12 @@
     function agregarLinea() {
       if (!elegido) { P.aviso("Elegí un producto", "error"); combo.foco(); return; }
       var cant = P.numeroDe(cantidad.value);
-      var precio = P.numeroDe(unitario.value);
+      var precio = P.importeDe(unitario.value);
       if (!(cant > 0)) { P.aviso("La cantidad tiene que ser mayor que cero", "error"); cantidad.focus(); return; }
       if (!(precio >= 0)) { P.aviso("Cargá el precio unitario", "error"); unitario.focus(); return; }
       var existente = estado.lineas.filter(function (l) { return l.producto.id === elegido.id; })[0];
-      if (existente) { existente.cantidad = P.redondear(existente.cantidad + cant, 3); existente.precio_unitario = precio; }
-      else estado.lineas.push({ producto: elegido, cantidad: cant, precio_unitario: precio, margen: elegido.margen });
+      if (existente) { existente.cantidad = P.redondear(existente.cantidad + cant, 3); existente.precio_unitario = precio; existente.producto = elegido; }
+      else estado.lineas.push({ producto: elegido, cantidad: cant, precio_unitario: precio });
       elegido = null;
       combo.limpiar();
       cantidad.value = "1";
@@ -170,9 +175,18 @@
         P.campo("Producto", h("div", combo.el, ayudaProducto), { clase: "crece" }),
         P.campo("Cantidad", cantidad), P.campo("Precio unitario", h("div.campo-con-prefijo", h("span", "$"), unitario)),
         h("div.campo", h("span.campo-etiqueta", " "), P.btn("Agregar", { tipo: "celeste", icono: "mas", onclick: agregarLinea }))),
-      h("div", { style: { marginTop: "16px" } }, tablaLineas)));
-    c.appendChild(h("div.grilla", { style: { gridTemplateColumns: "minmax(0,1fr) minmax(280px, 380px)", marginTop: "16px", alignItems: "start" } },
-      problemas, h("div.columna", resumen, P.btn("Cargar compra", { tipo: "primario", grande: true, icono: "check", id: "cargar-compra", onclick: function (ev) { enviar(ev.currentTarget); } }))));
+      h("div.compra-lineas", tablaLineas)));
+    var revisarCompra = P.btn("Revisar compra", { tipo: "primario", grande: true, icono: "check", id: "cargar-compra", onclick: revisar });
+    c.appendChild(h("div.compra-resumen",
+      h("div.columna", destinoStock, problemas),
+      h("div.columna", resumen, revisarCompra)));
+
+    function oferta(linea) {
+      var ultimo = linea.producto.ultimo_costo;
+      if (ultimo != null && linea.precio_unitario < Number(ultimo)) return "Costo menor al de la última compra (" + P.f.pesos(ultimo) + ").";
+      if (linea.precio_unitario < Number(linea.producto.precio_compra)) return "Costo menor al de referencia (" + P.f.pesos(linea.producto.precio_compra) + ").";
+      return "";
+    }
 
     function pintarLineas() {
       P.vaciar(tablaLineas);
@@ -182,36 +196,34 @@
         return;
       }
       tablaLineas.appendChild(h("div.tabla-desplazable", h("table.tabla.lineas",
-        h("thead", h("tr", h("th.der", "Cantidad"), h("th", "Producto"), h("th.der", "Unitario"), h("th.der", "Anterior"), h("th.der", "Margen %"), h("th.der", "Venta nueva"), h("th.der", "Total"), h("th"))),
+        h("thead", h("tr", h("th.der", "Cantidad"), h("th", "Producto"), h("th.der", "Costo unitario"), h("th.der", "Costo de referencia"), h("th.der", "Total"), h("th"))),
         h("tbody", estado.lineas.map(function (l, i) {
           function numero(clave, clase) {
-            var input = h("input.campo-control." + clase, { value: P.f.numero(l[clave]), inputmode: "decimal" });
+            var mostrar = function (valor) { return String(valor).replace(".", ","); };
+            var input = h("input.campo-control." + clase, { value: mostrar(l[clave]), inputmode: "decimal", "aria-label": (clave === "cantidad" ? "Cantidad de " : "Costo unitario de ") + l.producto.nombre });
             input.addEventListener("change", function () {
-              var v = P.numeroDe(input.value);
-              if (isNaN(v) || v < (clave === "margen" ? -100 : 0)) { input.value = P.f.numero(l[clave]); return; }
+              var v = clave === "cantidad" ? P.numeroDe(input.value) : P.importeDe(input.value);
+              if (!Number.isFinite(v) || v < 0 || (clave === "cantidad" && v === 0)) { input.value = mostrar(l[clave]); return; }
               l[clave] = v; guardar(); pintarLineas();
             });
             return input;
           }
-          var venta = P.redondear(l.precio_unitario * (1 + (Number(l.producto.margen) || 0) / 100));
-          var subio = l.producto.precio_compra && l.precio_unitario !== l.producto.precio_compra;
+          var alerta = oferta(l);
           return h("tr",
             h("td.der", numero("cantidad", "num")),
-            h("td", h("strong", l.producto.nombre), h("div.texto-3.chico", l.producto.codigo || "")),
+            h("td", h("strong", l.producto.nombre), h("div.texto-3.chico", l.producto.codigo || ""), alerta ? h("div.compra-oferta", P.icono("alerta"), alerta) : null),
             h("td.der", numero("precio_unitario", "num")),
-            h("td.der", h("span" + (subio ? (l.precio_unitario > l.producto.precio_compra ? ".negativo" : ".positivo") : ".texto-3"), P.f.pesos(l.producto.precio_compra))),
-            h("td.der", P.f.pct(l.producto.margen)),
-            h("td.der", P.f.pesos(venta), h("div.texto-3.chico", "Hoy " + P.f.pesos(l.producto.precio_venta))),
+            h("td.der.texto-3", P.f.pesos(l.producto.precio_compra)),
             h("td.der.fuerte", P.f.pesos(l.cantidad * l.precio_unitario)),
             h("td.acciones", P.btn("", { tipo: "texto", chico: true, icono: "cerrar", etiqueta: "Quitar", onclick: function () { estado.lineas.splice(i, 1); guardar(); pintarLineas(); } })));
         })))));
       pintarResumen();
     }
 
-    function suma() { return P.redondear(estado.lineas.reduce(function (s, l) { return s + l.cantidad * l.precio_unitario; }, 0)); }
+    function suma() { return P.redondear(estado.lineas.reduce(function (s, l) { return s + P.redondear(l.cantidad * l.precio_unitario); }, 0)); }
     function pintarResumen() {
       var s = suma();
-      var t = P.numeroDe(estado.total_factura);
+      var t = P.importeDe(estado.total_factura);
       var dif = isNaN(t) ? null : P.redondear(t - s);
       P.reemplazar(resumen, h("div.resumen-cuentas",
         h("div", h("span", "Productos"), h("strong", String(estado.lineas.length))),
@@ -222,28 +234,72 @@
             : h("div.fuerte.no-cuadra", h("span", dif > 0 ? "Faltan" : "Sobran"), h("span.dinero", P.f.pesos(Math.abs(dif))))));
     }
 
-    function enviar(boton) {
+    function revisar() {
       P.vaciar(problemas);
+      var error;
+      if (!estado.proveedor) error = "Elegí el proveedor de la factura.";
+      else if (!estado.lineas.length) error = "Agregá al menos un producto a la compra.";
+      else if (!estado.factura.trim() && !estado.remito.trim()) error = "Cargá el número de factura o de remito.";
+      else if (!Number.isFinite(P.importeDe(estado.total_factura)) || Math.abs(P.redondear(P.importeDe(estado.total_factura) - suma())) > 0.05) error = "Revisá el total de la factura y la suma de los productos.";
+      if (error) { P.reemplazar(problemas, P.mensaje(error, "error")); return; }
+      var contador = h("strong", { "aria-live": "polite" });
+      var todos = P.check("Seleccionar todos", false, null, function (marcar) {
+        controles.forEach(function (control) { control.input.checked = marcar; });
+        actualizar();
+      });
+      var controles = estado.lineas.map(function (linea) {
+        var nuevo = P.precioDeVenta(linea.precio_unitario, linea.producto.margen);
+        return P.check(linea.producto.nombre, false, "Venta general: " + P.f.pesos(linea.producto.precio_venta) + " → " + P.f.pesos(nuevo), actualizar);
+      });
+      function actualizar() {
+        var n = controles.filter(function (control) { return control.input.checked; }).length;
+        todos.input.checked = n === controles.length;
+        todos.input.indeterminate = n > 0 && n < controles.length;
+        contador.textContent = n ? n + " de " + controles.length + " para actualizar" : "Se conservan todos los precios";
+      }
+      actualizar();
+      var seleccion = h("ul.lista-simple.compra-seleccion", controles.map(function (control, i) {
+        var alerta = oferta(estado.lineas[i]);
+        return h("li", control, alerta ? h("div.compra-oferta", P.icono("alerta"), alerta) : null);
+      }));
+      var m = P.modal({
+        titulo: "¿Qué precios querés actualizar?",
+        subtitulo: "El stock de todos los productos ingresa a la proveeduría. Marcá sólo los que deban cambiar su precio en caja.",
+        contenido: h("div.columna",
+          estado.lineas.some(oferta) ? P.mensaje("Hay productos con un costo más bajo. Si son ofertas, dejalos sin marcar para conservar su precio de venta.", "aviso") : null,
+          h("div.fila-separada", todos, contador), seleccion,
+          h("div.texto-3.chico", "Las bocas con margen propio aplican ese margen sobre el nuevo costo. Los precios de venta se redondean hacia arriba a $100.")),
+        acciones: [P.btn("Volver", { tipo: "secundario", onclick: function () { m.cerrar(); } }),
+          P.btn("Confirmar compra", { tipo: "primario", icono: "check", onclick: function (ev) { enviar(ev.currentTarget, controles, m); } })],
+      });
+    }
+
+    function enviar(boton, controles, modal) {
       var cuerpo = {
         proveedor_id: estado.proveedor ? estado.proveedor.valor : null,
         factura: estado.factura, fecha_factura: estado.fecha_factura || null, remito: estado.remito, fecha_remito: estado.fecha_remito || null,
-        total_factura: estado.total_factura === "" ? null : P.numeroDe(estado.total_factura), observaciones: estado.observaciones,
-        items: estado.lineas.map(function (l) { return { producto_id: l.producto.id, cantidad: l.cantidad, precio_unitario: l.precio_unitario }; }),
+        total_factura: P.importeDe(estado.total_factura), observaciones: estado.observaciones,
+        items: estado.lineas.map(function (l, i) { return {
+          producto_id: l.producto.id, cantidad: l.cantidad, precio_unitario: l.precio_unitario,
+          actualizar_precio: controles[i].input.checked, costo_referencia: l.producto.precio_compra,
+        }; }),
       };
-      if (!cuerpo.proveedor_id) { P.reemplazar(problemas, P.mensaje("Elegí el proveedor de la factura.", "error")); return; }
+      revisarCompra.disabled = true;
       P.ejecutar(boton, function () {
         return P.post("/compras", cuerpo).then(function (r) {
+          modal.cerrar();
           try { sessionStorage.removeItem(CLAVE); } catch (e) { /* nada */ }
           P.aviso(r.mensaje || "Compra cargada", "ok");
           (r.avisos || []).forEach(function (a) { P.aviso(a, "cola", 9000); });
           P.ruta.ir("/compras");
         });
       }).catch(function (e) {
+        modal.cerrar();
         var lista = e.datos && e.datos.problemas;
         P.reemplazar(problemas, h("div.mensaje.mensaje-error", P.icono("alerta"), h("div", h("strong", "Revisá la compra antes de cargarla"),
           lista && lista.length ? h("ul", lista.map(function (x) { return h("li", x); })) : h("div", e.message))));
         problemas.scrollIntoView({ behavior: "smooth", block: "center" });
-      });
+      }).finally(function () { revisarCompra.disabled = false; });
     }
 
     pintarLineas();

@@ -1,0 +1,36 @@
+.gestion-cabecera { margin-bottom: 10px; }
+.compra-lineas { margin-top: 16px; min-width: 0; }
+.compra-resumen {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 380px);
+  align-items: start;
+  gap: 16px;
+  margin-top: 16px;
+}
+.compra-seleccion > li { align-items: flex-start; flex-wrap: wrap; }
+.compra-seleccion .check { flex: 1 1 210px; }
+.compra-oferta {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 4px;
+  color: #795008;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.compra-oferta .icono { width: 16px; height: 16px; flex: none; }
+.precios-bocas { display: grid; gap: 12px; }
+.precio-boca-fila {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(110px, auto);
+  gap: 16px;
+  align-items: end;
+  border-bottom: 1px solid var(--borde);
+  padding-bottom: 12px;
+}
+.precio-boca-total { display: grid; gap: 4px; text-align: right; }
+.precios-nuevo summary { color: var(--azul); font-weight: 700; cursor: pointer; }
+.precios-nuevo[open] summary { margin-bottom: 12px; }
+@media (max-width: 680px) {
+  .compra-resumen { grid-template-columns: minmax(0, 1fr); }
+}

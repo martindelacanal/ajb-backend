@@ -49,15 +49,18 @@ async function sembrarPredio(t, ctx, codigo) {
   let bocas = 0;
   let cajas = 0;
   let orden = 0;
+  const proveeduria = await N.bocaAlmacen(t, ctx);
   for (const b of def.bocas) {
     orden++;
-    let fila = await t.get("SELECT id FROM predio_boca WHERE predio_id = ? AND LOWER(nombre) = LOWER(?)", [ctx.pid, b.nombre]);
+    let fila = await t.get("SELECT id, activo FROM predio_boca WHERE predio_id = ? AND LOWER(nombre) = LOWER(?)", [ctx.pid, b.nombre]);
     let id = fila ? fila.id : null;
     if (!id) {
       id = await N.insertar(t, actor, "predio_boca", {
-        nombre: b.nombre, es_origen: b.origen, es_destino: b.destino, es_almacen: b.almacen ? 1 : 0, activo: 1, orden,
+        nombre: b.nombre, es_origen: b.origen, es_destino: b.destino, es_almacen: b.almacen && !proveeduria ? 1 : 0, activo: 1, orden,
       });
       bocas++;
+    } else if (b.almacen && !proveeduria && Number(fila.activo)) {
+      await N.actualizar(t, actor, "predio_boca", id, { es_almacen: 1, es_origen: 1 });
     }
     for (const c of b.cajas || []) {
       fila = await t.get("SELECT id FROM predio_caja WHERE predio_id = ? AND boca_id = ? AND LOWER(nombre) = LOWER(?)", [ctx.pid, id, c]);

@@ -6,6 +6,7 @@
 
 const { error, hoy, sumarDias, esFechaIso, redondear } = require("./util");
 const { limiteRevision, fechaRevisionSql, historialRevisionSql } = require("./precios");
+const { precioGeneralSql, precioBocaSql, joinMargenSql } = require("./precio-boca");
 
 const DESTINOS = [
   { valor: "VENTA_DIRECTA", texto: "Venta directa" },
@@ -130,7 +131,7 @@ L.productos = {
     { clave: "codigo", titulo: "Código", expr: "p.codigo", buscar: true },
     { clave: "precio_compra", titulo: "Compra", expr: "p.precio_compra", tipo: "money" },
     { clave: "margen", titulo: "Margen", expr: "p.margen", tipo: "pct" },
-    { clave: "precio_venta", titulo: "Venta", expr: "p.precio_venta", tipo: "money" },
+    { clave: "precio_venta", titulo: "Venta", expr: precioGeneralSql, tipo: "money" },
     { clave: "revision_precio", titulo: "Revisión de precio", expr: `CASE WHEN ${PRECIO_PENDIENTE} THEN 'Revisar: más de 4 meses o sin fecha' WHEN COALESCE(st.positivo, 0) <= 0 THEN 'Sin stock' ELSE 'Al día' END` },
     { clave: "fecha_revision_precio", titulo: "Última revisión de precio", expr: FECHA_REVISION, tipo: "dt", oculta: true },
     { clave: "stock", titulo: "Stock", expr: "COALESCE(st.total, 0)", tipo: "qty" },
@@ -207,7 +208,7 @@ L.stock = {
   titulo: "Stock por boca",
   from: `predio_stock s
     JOIN predio_producto p ON p.predio_id = s.predio_id AND p.id = s.producto_id
-    JOIN predio_boca b ON b.predio_id = s.predio_id AND b.id = s.boca_id`,
+    JOIN predio_boca b ON b.predio_id = s.predio_id AND b.id = s.boca_id ${joinMargenSql}`,
   where: "s.predio_id = :pid",
   alcance: alcanceBocas("s.boca_id"),
   columnas: [
@@ -216,7 +217,7 @@ L.stock = {
     { clave: "producto", titulo: "Producto", expr: "p.nombre", buscar: true },
     { clave: "codigo", titulo: "Código", expr: "p.codigo", buscar: true },
     { clave: "cantidad", titulo: "Cantidad", expr: "s.cantidad", tipo: "qty" },
-    { clave: "precio_venta", titulo: "Precio de venta", expr: "p.precio_venta", tipo: "money" },
+    { clave: "precio_venta", titulo: "Precio de venta", expr: precioBocaSql, tipo: "money" },
     { clave: "valor", titulo: "Valor a costo", expr: "s.cantidad * COALESCE(p.precio_compra, 0)", tipo: "money", soloAdmin: true },
     { clave: "destino", titulo: "Destino", expr: "p.destino", tipo: "opcion", opciones: DESTINOS },
     { clave: "fecha_caducidad", titulo: "Caducidad", expr: "p.fecha_caducidad", tipo: "date" },
@@ -917,6 +918,8 @@ L.bocas = {
     { clave: "nombre", titulo: "Boca", expr: "b.nombre", buscar: true },
     { clave: "es_origen", titulo: "Origen", expr: "b.es_origen", tipo: "bool" },
     { clave: "es_destino", titulo: "Destino", expr: "b.es_destino", tipo: "bool" },
+    { clave: "es_almacen", titulo: "Proveeduría", expr: "b.es_almacen", tipo: "bool" },
+    { clave: "margen_venta", titulo: "Margen de venta", expr: "b.margen_venta", tipo: "pct" },
     { clave: "cajas", titulo: "Cajas", expr: "COALESCE(c.cajas, 0)", tipo: "int" },
     { clave: "activo", titulo: "Activa", expr: "b.activo", tipo: "bool" },
   ],

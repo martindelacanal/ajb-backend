@@ -137,6 +137,7 @@ test("el paquete de pendrive nunca lleva actores PREDIO, incluso si incluye una 
     "area_turismo INTEGER", "area_coseguro INTEGER", "modulo_turismo INTEGER", "modulo_coseguro INTEGER", "modulo_olimpiadas INTEGER", "bloqueo_tipo TEXT", "bloqueo_modulos TEXT", "bloqueo_mensaje TEXT", "requiere_cambio_clave INTEGER", "es_familiar TEXT", "usuario_familiar_id INTEGER"]) s.db.exec("ALTER TABLE usuario ADD COLUMN " + columna);
   s.db.conexion.prepare("INSERT INTO predio_comando(predio_id,tipo,metodo,ruta,actor) VALUES(1,'API','POST','/proveedores',?),(1,'API','POST','/proveedores',?)")
     .run(JSON.stringify({ tipo: "PREDIO", predio_id: 1, predio_usuario_id: 7 }), JSON.stringify({ general_id: 7, nombre: "General" }));
+  s.db.conexion.prepare("INSERT INTO predio_comando(predio_id,tipo,metodo,ruta,actor) VALUES(1,'API','POST','/compras',?)").run(JSON.stringify({ general_id: 7, capacidad: "precios-boca-v1" }));
   t.mock.method(C, "armarMaestros", async () => ({}));
   t.mock.method(C, "paqueteCodigo", () => ({ buffer: Buffer.from("código firmado de fixture"), version: "fixture" }));
   t.mock.method(C, "paqueteFirmado", datos => Buffer.from(JSON.stringify(datos)));
@@ -144,6 +145,7 @@ test("el paquete de pendrive nunca lleva actores PREDIO, incluso si incluye una 
   for (const conCodigo of ["0", "1"]) {
     const r = await pedir(s, token, "/api/predios/MIRAMAR/paquete?codigo=" + conCodigo); assert.equal(r.status, 200);
     const paquete = await r.json();
+    assert.equal(paquete.comandos_precios.length, 1); assert.equal(paquete.comandos_precios[0].ruta, "/compras");
     assert.equal(paquete.comandos.length, 1); assert.equal(paquete.comandos[0].actor.general_id, 7);
     assert.equal(paquete.comandos.some(c => c.actor.tipo === "PREDIO"), false);
     assert.equal(!!paquete.codigo, conCodigo === "1");

@@ -180,11 +180,17 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
 
 ## Precios, compras y recordatorios
 
-- Cada compra actualiza automáticamente el costo del producto y recalcula su precio
-  de venta con el margen vigente. Cada compra conserva un asiento en el historial de
-  precios, aunque el importe sea igual al anterior. El margen se modifica en la ficha.
+- Cada compra ingresa en la boca marcada como **proveeduría** en Gestión → Bocas y
+  cajas. Antes de confirmarla, se eligen los productos que actualizarán su precio en
+  caja. Los demás conservan su costo de referencia y su precio de venta. El costo
+  efectivamente pagado queda en la factura, también cuando era una oferta.
+- Cada boca puede tener un margen de venta sobre el costo de referencia. En Gestión
+  → Productos → Precios por boca se puede fijar un margen especial para ese producto.
+  Si faltan ambos márgenes, la caja usa el precio general del producto. El precio
+  de venta se redondea al siguiente múltiplo de $100 (por ejemplo, $1550 pasa a $1600).
+  Los cambios de precio se consultan en el historial de la ficha.
 - La revisión de precios se registra aparte de las modificaciones de nombre o código.
-  Un cambio real de costo, margen o precio, una compra o la confirmación explícita de
+  Un cambio real de costo, margen o precio general, una compra con actualización o la confirmación explícita de
   revisión renuevan su fecha. El historial importado aporta la referencia anterior.
 - Si un producto activo tiene stock positivo y lleva **más de cuatro meses calendario**
   sin revisar su precio, el administrador recibe un recordatorio. Gestión → Productos

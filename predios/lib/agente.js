@@ -15,7 +15,7 @@ const path = require("node:path");
 const zlib = require("node:zlib");
 const crypto = require("node:crypto");
 const U = require("./util");
-const { TABLAS, NOMBRES_TABLAS, columnasDe } = require("./esquema");
+const { TABLAS, NOMBRES_TABLAS, columnasDe, tablasDeInstantanea } = require("./esquema");
 const { leerMeta, escribirMeta } = require("./db-sqlite");
 const { aplicarMaestros } = require("./maestros");
 const { instalarPaquete, leerPaquete } = require("./paquete");
@@ -103,7 +103,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
   async function pedir(metodo, ruta, { cuerpo, binario = false, timeout = 20000, crudo = false } = {}) {
     const url = `${String(config.servidor).replace(/\/+$/, "")}/predios-sync${ruta}`;
     const cabeceras = { Authorization: `Bearer ${config.token}`, "X-Predio": String(config.predio_codigo || ""), "X-Predio-Instancia": instancia, "X-Predio-Equipo": equipoId };
-    cabeceras["X-Predio-Capacidades"] = "cuentas-predio-v1";
+    cabeceras["X-Predio-Capacidades"] = "cuentas-predio-v1,precios-boca-v1";
     if (!/^\/(?:version|codigo)(?:\?|$)/.test(ruta)) {
       if (!puedeSincronizar()) throw U.error("Esta PC está en espera: sólo el servidor actual sincroniza con el sistema general", 503);
       if (grupoLocal().habilitado) {
@@ -221,6 +221,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
 
   // Carga todas las tablas (instalación nueva o reemplazo de la notebook) sin reenviarlas.
   function cargarInstantanea(tablas, origen) {
+    tablas = tablasDeInstantanea(tablas);
     db.conexion.exec("BEGIN IMMEDIATE");
     try {
       for (const tabla of NOMBRES_TABLAS) {
@@ -559,7 +560,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
       estado.maestros = { ...resumen.maestros, fecha: U.fechaHora(), afiliados: (datos.maestros.afiliados || []).length };
       await guardarMeta("maestros_resumen", JSON.stringify(estado.maestros));
     }
-    for (const c of datos.comandos || []) {
+    for (const c of [...(datos.comandos || []), ...(datos.comandos_precios || [])].sort((a, b) => a.id - b.id)) {
       const r = await ejecutarComando(c);
       resumen.comandos++;
       if (!r.ok) resumen.errores++;

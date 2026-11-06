@@ -23,7 +23,7 @@
       { ruta: "/gestion/afiliados", texto: "Afiliados" },
       { ruta: "/gestion/bocas", texto: "Bocas y cajas" },
     ];
-    c.appendChild(h("div.pagina-cabecera", h("div", h("h1.titulo-pagina", "Gestión"), h("p.subtitulo", "Productos, stock, proveedores, afiliados y bocas del predio."))));
+    c.appendChild(h("div.pagina-cabecera.gestion-cabecera", h("h1.titulo-pagina", "Gestión")));
     c.appendChild(h("nav.solapas", { "aria-label": "Secciones de gestión" }, solapas.map(function (s) {
       return h("a.solapa", { href: "#" + s.ruta, "aria-current": actual === s.ruta ? "page" : null }, s.texto);
     })));
@@ -96,6 +96,19 @@
   }
 
   // ------------------------------------------------------------------ productos
+  function porcentajeOpcional(control) {
+    return control.value.trim() ? P.numeroDe(control.value) : null;
+  }
+  function porcentajeValido(valor) {
+    return valor === null || (Number.isFinite(valor) && valor >= -100 && valor <= 10000);
+  }
+  function marcarMargenInvalido(control) {
+    P.aviso("Ingresá un margen entre −100 % y 10.000 %, o dejá el campo vacío para heredar el precio.", "error");
+    control.classList.add("invalido");
+    control.focus();
+  }
+  function valorEditable(n) { return n == null ? "" : String(Number(n)).replace(".", ","); }
+
   function botonEliminar(clave, id, modal, alEliminar) {
     var b = P.btn("Eliminar", { tipo: "peligro", icono: "borrar", onclick: function () {
       modal().cerrar();
@@ -108,23 +121,27 @@
   P.formProducto = function (base, alGuardar, alEliminar) {
     base = base || {};
     var editar = !!base.id;
-    var cargar = editar ? P.get("/productos/" + base.id) : Promise.resolve(null);
-    cargar.then(function (detalle) {
+    var cargar = editar ? P.get("/productos/" + base.id) : P.opciones("bocas", true);
+    cargar.then(function (datos) {
+      var detalle = editar ? datos : null;
       var p = detalle ? detalle.producto : base;
+      var bocas = detalle ? detalle.margenes_boca : datos.map(function (b) {
+        return { boca_id: b.valor, boca: b.texto, margen_boca: b.margen_venta, margen: null, activo: 1 };
+      });
       var nombre = P.input({ valor: p.nombre, max: 160, placeholder: "Ej.: Agua mineral 500 ml" });
       var codigo = P.input({ valor: p.codigo, max: 60, placeholder: "Escaneá el código de barras o escribí uno propio" });
       codigo.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); compra.focus(); } });
-      var compra = P.dinero({ valor: p.precio_compra !== undefined && p.precio_compra !== null ? P.f.numero(p.precio_compra) : "" });
-      var margen = P.input({ inputmode: "decimal", valor: p.margen !== undefined && p.margen !== null ? P.f.numero(p.margen) : "", placeholder: "0" });
+      var compra = P.dinero({ valor: valorEditable(p.precio_compra) });
+      var margen = P.input({ inputmode: "decimal", valor: valorEditable(p.margen), placeholder: "0" });
       margen.style.textAlign = "right";
       var venta = P.dinero({ soloLectura: true });
-      var manual = P.check("Fijar el precio de venta a mano", false, "Si no, se calcula: compra + margen.");
-      var ayudaVenta = h("span", "Calculado automáticamente");
+      var manual = P.check("Fijar el precio de venta a mano", false);
+      var ayudaVenta = h("span", "Redondeado hacia arriba a $100.");
       var precioIntervenido = false;
       var destino = P.select(DESTINOS, p.destino || "VENTA_DIRECTA");
       var ayudaDestino = h("span.campo-ayuda", AYUDA_DESTINO[destino.value]);
       destino.addEventListener("change", function () { ayudaDestino.textContent = AYUDA_DESTINO[destino.value]; });
-      var cantidad = P.input({ inputmode: "decimal", valor: editar ? P.f.numero(stockAlmacenDe(detalle)) : "0" });
+      var cantidad = P.input({ inputmode: "decimal", valor: editar ? valorEditable(stockAlmacenDe(detalle)) : "0" });
       cantidad.style.textAlign = "right";
       var perecedero = P.check("Es perecedero", Number(p.perecedero) === 1, null, function (v) {
         zonaVence.hidden = !v;
@@ -134,28 +151,59 @@
       var zonaVence = P.campo("Fecha de caducidad (opcional)", vence);
       zonaVence.hidden = Number(p.perecedero) !== 1;
       var filaCaducidad = h("div.grilla.grilla-2.producto-caducidad" + (Number(p.perecedero) === 1 ? ".con-fecha" : ""), perecedero, zonaVence);
-      var minimo = P.input({ inputmode: "decimal", valor: p.stock_minimo ? P.f.numero(p.stock_minimo) : "", placeholder: "Opcional" });
+      var minimo = P.input({ inputmode: "decimal", valor: p.stock_minimo ? valorEditable(p.stock_minimo) : "", placeholder: "Opcional" });
       var activo = P.check("Producto activo", editar ? Number(p.activo) === 1 : true, "Los dados de baja no aparecen para vender ni comprar.");
 
+      var margenesEditados = false;
+      var preciosBoca = (bocas || []).map(function (boca) {
+        var input = P.input({ inputmode: "decimal", valor: valorEditable(boca.margen) });
+        input.addEventListener("input", function () { margenesEditados = true; actualizarPorBoca(); });
+        var total = h("strong.numero");
+        return {
+          boca: boca, input: input, total: total,
+          fila: h("div.precio-boca-fila",
+            P.campo(boca.boca + (Number(boca.activo) === 0 ? " (inactiva)" : ""), input),
+            h("div.precio-boca-total", h("span.campo-ayuda", "Precio en caja"), total)),
+        };
+      });
+      function actualizarPorBoca() {
+        var costo = P.importeDe(compra.value);
+        var general = P.importeDe(venta.value);
+        preciosBoca.forEach(function (f) {
+          var excepcion = porcentajeOpcional(f.input);
+          var usaBoca = f.boca.margen_boca != null;
+          f.input.placeholder = usaBoca ? "De la boca: " + P.f.pct(f.boca.margen_boca) : "General del producto";
+          var porcentaje = excepcion != null ? excepcion : usaBoca ? Number(f.boca.margen_boca) : null;
+          var usaPrecioGeneral = porcentaje == null || !(costo > 0);
+          var base = usaPrecioGeneral ? general : costo;
+          f.total.textContent = porcentajeValido(porcentaje) && Number.isFinite(base) ? P.f.pesos(P.precioDeVenta(base, usaPrecioGeneral ? null : porcentaje)) : "—";
+        });
+      }
       function calcular() {
         venta.readOnly = !manual.input.checked;
-        ayudaVenta.textContent = manual.input.checked ? "Precio definido a mano" : "Calculado automáticamente";
-        if (manual.input.checked) return;
-        var c = P.numeroDe(compra.value), mg = P.numeroDe(margen.value);
-        venta.value = isNaN(c) ? "" : P.f.numero(P.redondear(c * (1 + (isNaN(mg) ? 0 : mg) / 100)));
+        if (manual.input.checked) {
+          var importe = P.importeDe(venta.value);
+          ayudaVenta.textContent = Number.isFinite(importe) ? "Precio en caja: " + P.f.pesos(P.precioDeVenta(importe)) : "Redondeado hacia arriba a $100.";
+        } else {
+          var c = P.importeDe(compra.value), mg = porcentajeOpcional(margen);
+          ayudaVenta.textContent = "Redondeado hacia arriba a $100.";
+          venta.value = !Number.isFinite(c) || !porcentajeValido(mg) ? "" : valorEditable(P.precioDeVenta(c, mg));
+        }
+        actualizarPorBoca();
       }
       [compra, margen].forEach(function (i) { i.addEventListener("input", function () { precioIntervenido = true; calcular(); }); });
       manual.input.addEventListener("change", function () { precioIntervenido = true; calcular(); if (manual.input.checked) venta.focus(); });
+      venta.addEventListener("input", calcular);
       if (editar && p.precio_venta !== undefined) {
-        var calc = P.redondear(Number(p.precio_compra || 0) * (1 + Number(p.margen || 0) / 100));
-        venta.value = P.f.numero(p.precio_venta);
-        if (Math.abs(calc - Number(p.precio_venta)) > 0.01) ayudaVenta.textContent = "Precio guardado. Se recalcula al cambiar la compra o el margen.";
+        venta.value = valorEditable(p.precio_venta);
+        if (P.precioDeVenta(p.precio_compra, p.margen) !== Number(p.precio_venta)) ayudaVenta.textContent = "Precio guardado. Se recalcula al cambiar la compra o el margen.";
+        actualizarPorBoca();
       } else calcular();
 
       var formulario = h("div.columna",
         h("div.grilla.grilla-2", P.campo("Nombre", nombre, { requerido: true }), P.campo("Código de barras o único", codigo)),
         h("div.grilla.grilla-2", P.campo("Destino del producto", h("div", destino, ayudaDestino)),
-          P.campo(editar ? "Cantidad en almacén (ajuste)" : "Cantidad en almacén", cantidad, { ayuda: editar ? "Si la cambiás, queda registrado como ajuste manual." : "El almacén recibe los productos: ahí empieza su recorrido." })),
+          P.campo(editar ? "Cantidad en proveeduría (ajuste)" : "Cantidad en proveeduría", cantidad, { ayuda: editar ? "Si la cambiás, queda registrado como ajuste manual." : "Stock inicial en la boca que recibe las compras." })),
         h("div.grilla.grilla-2",
           P.campo("Precio de compra", h("div.campo-con-prefijo", h("span", "$"), compra)),
           P.campo("Margen de utilidad (%)", margen)),
@@ -165,42 +213,74 @@
         P.campo("Stock mínimo para avisos", minimo, { ayuda: "Avisa al personal de la boca y a administración cuando el stock queda por debajo de esta cantidad. Con 0, no se generan avisos de stock mínimo." }),
         editar ? activo : null);
 
-      var contenido = formulario;
+      var panelBocas = h("div.columna",
+        h("span.texto-3", "Ingresá el margen especial (%) de este producto para cada boca. Si lo dejás vacío, se usa el margen de la boca o el precio general del producto."),
+        h("div.precios-bocas", preciosBoca.map(function (f) { return f.fila; })));
+      var desplegableBocas, contenido;
+      function mostrarPanel(v) {
+        if (!editar) { desplegableBocas.open = v === "bocas"; return; }
+        formulario.hidden = v !== "datos";
+        stockLista.hidden = v !== "stock";
+        precios.hidden = v !== "precios";
+        panelBocas.hidden = v !== "bocas";
+        solapa.fijar(v);
+      }
       if (detalle) {
         var stockLista = h("ul.lista-simple", detalle.stock.map(function (s) { return h("li", h("span", s.boca), h("strong.numero", P.f.numero(s.cantidad))); }));
         var precios = h("ul.lista-simple", detalle.precios.map(function (x) {
           var actor = /sistema (anterior|actual)/i.test(x.usuario_nombre || "") ? "" : x.usuario_nombre;
-          return h("li", h("div", h("strong", P.f.fechaHora(x.fecha)), h("div.texto-3.chico", (({ ALTA: "Alta", EDICION: "Edición", COMPRA: "Compra N° " + x.referencia_id, IMPORTACION: "Precio registrado" })[x.origen] || x.origen) + (actor ? " · " + actor : ""))),
+          var origen = ({ ALTA: "Alta", EDICION: "Edición", COMPRA: "Compra N° " + x.referencia_id, IMPORTACION: "Precio registrado",
+            ANULACION_COMPRA: "Anulación de compra", ANULACION_BOCA: "Anulación de compra", MARGEN_BOCA: "Cambio de margen de la boca",
+            MARGEN_PRODUCTO: "Cambio de margen del producto", COMPRA_BOCA: "Compra N° " + x.referencia_id, EDICION_BOCA: "Edición", ALTA_BOCA: "Alta" })[x.origen] || x.origen;
+          return h("li", h("div", h("strong", P.f.fechaHora(x.fecha)), h("div.texto-3.chico", origen + (x.boca ? " · " + x.boca : " · General") + (actor ? " · " + actor : ""))),
             h("div", { style: { textAlign: "right" } }, h("div", "Compra " + P.f.pesos(x.precio_compra) + " · " + P.f.pct(x.margen)), h("strong", "Venta " + P.f.pesos(x.precio_venta))));
         }));
-        var solapa = P.segmentado([{ valor: "datos", texto: "Datos" }, { valor: "stock", texto: "Stock por boca" }, { valor: "precios", texto: "Historial de precios" }], "datos", function (v) {
-          formulario.hidden = v !== "datos"; stockLista.hidden = v !== "stock"; precios.hidden = v !== "precios";
-        });
+        var solapa = P.segmentado([{ valor: "datos", texto: "Datos" }, { valor: "stock", texto: "Stock por boca" },
+          { valor: "bocas", texto: "Precios por boca" }, { valor: "precios", texto: "Historial de precios" }], "datos", mostrarPanel);
         stockLista.hidden = true;
         precios.hidden = true;
+        panelBocas.hidden = true;
         var creacion = P.f.fechaHora(p.fecha_creacion);
         var modificacion = P.f.fechaHora(p.fecha_modificacion);
-        contenido = h("div.columna", solapa, formulario, stockLista, precios,
+        contenido = h("div.columna", solapa, formulario, stockLista, panelBocas, precios,
           h("p.texto-3.chico", { style: { margin: 0 } }, "Creado el " + (creacion || "—") + (modificacion && modificacion !== creacion ? " · Modificado el " + modificacion : "")));
+      } else {
+        desplegableBocas = h("details.precios-nuevo", h("summary", "Precios por boca"), panelBocas);
+        contenido = h("div.columna", formulario, desplegableBocas);
       }
       var m = P.modal({
         titulo: editar ? p.nombre : "Nuevo producto", subtitulo: editar ? "ID " + p.id + (p.codigo ? " · Código " + p.codigo : "") : null,
         ancho: "ancha", contenido: contenido,
         acciones: [editar && alEliminar ? botonEliminar("productos", p.id, function () { return m; }, alEliminar) : null,
           P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn(editar ? "Guardar cambios" : "Crear producto", { tipo: "primario", icono: "check", onclick: function (ev) {
+          if (!porcentajeValido(porcentajeOpcional(margen))) { mostrarPanel("datos"); marcarMargenInvalido(margen); return; }
+          var invalido = preciosBoca.find(function (f) { return !porcentajeValido(porcentajeOpcional(f.input)); });
+          if (invalido) {
+            mostrarPanel("bocas");
+            marcarMargenInvalido(invalido.input); return;
+          }
+          var compraIngresada = P.importeDe(compra.value), manualIngresado = P.importeDe(venta.value);
+          if ((compra.value.trim() && !Number.isFinite(compraIngresada)) || (manual.input.checked && !Number.isFinite(manualIngresado))) {
+            mostrarPanel("datos");
+            (compra.value.trim() && !Number.isFinite(compraIngresada) ? compra : venta).focus();
+            P.aviso("Revisá el precio ingresado. Usá un importe con hasta dos decimales.", "error"); return;
+          }
           var cuerpo = {
-            nombre: nombre.value, codigo: codigo.value, precio_compra: P.numeroDe(compra.value) || 0, margen: P.numeroDe(margen.value) || 0,
+            nombre: nombre.value, codigo: codigo.value, precio_compra: compraIngresada || 0, margen: porcentajeOpcional(margen) || 0,
             destino: destino.value, perecedero: perecedero.input.checked, fecha_caducidad: perecedero.input.checked ? vence.value || null : null,
             stock_minimo: P.numeroDe(minimo.value) || 0, cantidad_almacen: P.numeroDe(cantidad.value) || 0,
-            precio_venta_manual: manual.input.checked ? P.numeroDe(venta.value) : null,
+            precio_venta_manual: manual.input.checked ? P.precioDeVenta(manualIngresado) : null,
           };
+          if (margenesEditados) cuerpo.margenes_boca = preciosBoca.filter(function (f) { return f.input.value.trim() !== ""; }).map(function (f) {
+            return { boca_id: f.boca.boca_id, margen: porcentajeOpcional(f.input) };
+          });
           if (editar) {
             cuerpo.activo = activo.input.checked;
             if (P.numeroDe(cantidad.value) === stockAlmacenDe(detalle)) delete cuerpo.cantidad_almacen;
             // Guardar nombre, stock u otros datos no debe cambiar un precio ya fijado.
             if (!precioIntervenido) { delete cuerpo.precio_compra; delete cuerpo.margen; delete cuerpo.precio_venta_manual; }
           }
-          if (!cuerpo.nombre.trim()) { nombre.classList.add("invalido"); nombre.focus(); return; }
+          if (!cuerpo.nombre.trim()) { mostrarPanel("datos"); nombre.classList.add("invalido"); nombre.focus(); return; }
           P.ejecutar(ev.currentTarget, function () {
             return (editar ? P.put("/productos/" + p.id, cuerpo) : P.post("/productos", cuerpo)).then(function (r) {
               if (!r.encolado) P.aviso(r.mensaje, "ok");
@@ -344,16 +424,22 @@
     var nombre = P.input({ valor: base.nombre, max: 80 });
     var sentidoInicial = editar ? (Number(base.es_origen) && Number(base.es_destino) ? "AMBOS" : Number(base.es_origen) ? "ORIGEN" : "DESTINO") : "AMBOS";
     var sentido = P.segmentado([{ valor: "ORIGEN", texto: "Sólo origen" }, { valor: "DESTINO", texto: "Sólo destino" }, { valor: "AMBOS", texto: "Origen y destino" }], sentidoInicial);
-    var almacen = P.check("Es el almacén (recibe las compras)", Number(base.es_almacen) === 1, "Sólo puede haber un almacén.");
+    var esProveeduria = Number(base.es_almacen) === 1;
+    var almacen = P.check("Usar como proveeduría", esProveeduria, esProveeduria ? "Esta boca recibe las compras. Para cambiarla, elegí otra boca como proveeduría." : "Recibirá el stock de las nuevas compras y reemplazará a la proveeduría actual.");
+    almacen.input.disabled = esProveeduria;
+    var margen = P.input({ inputmode: "decimal", valor: valorEditable(base.margen_venta), placeholder: "Usar precio general" });
     var desc = P.input({ valor: base.descripcion, max: 255, placeholder: "Opcional" });
     var activo = P.check("Boca activa", editar ? Number(base.activo) === 1 : true);
     var m = P.modal({
       titulo: editar ? base.nombre : "Nueva boca de expendio",
       contenido: h("div.columna", P.campo("Nombre", nombre, { requerido: true }),
         P.campo("Sentido", sentido, { ayuda: "Origen: entrega productos (tiene stock). Destino: recibe o consume productos." }),
-        almacen, P.campo("Descripción", desc), editar ? activo : null),
+        almacen, P.campo("Margen de venta de la boca (%)", margen, { ayuda: "Se aplica al costo de referencia de cada producto. Podés definir un margen especial en su ficha." }),
+        P.campo("Descripción", desc), editar ? activo : null),
       acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn("Guardar", { tipo: "primario", onclick: function (ev) {
-        var cuerpo = { nombre: nombre.value, sentido: sentido.valor(), es_almacen: almacen.input.checked, descripcion: desc.value };
+        var valorMargen = porcentajeOpcional(margen);
+        if (!porcentajeValido(valorMargen)) { marcarMargenInvalido(margen); return; }
+        var cuerpo = { nombre: nombre.value, sentido: sentido.valor(), es_almacen: almacen.input.checked, descripcion: desc.value, margen_venta: valorMargen };
         if (editar) cuerpo.activo = activo.input.checked;
         P.ejecutar(ev.currentTarget, function () {
           return (editar ? P.put("/bocas/" + base.id, cuerpo) : P.post("/bocas", cuerpo)).then(function (r) { if (!r.encolado) P.aviso(r.mensaje, "ok"); P.olvidarOpciones(); m.cerrar(); if (alGuardar) alGuardar(); });
@@ -389,6 +475,7 @@
     P.solapasGestion(c, "/gestion/bocas");
     var tBocas = P.tabla({
       listado: "bocas",
+      celdas: { margen_venta: function (valor) { return valor == null ? "General" : P.f.pct(valor); } },
       alClickFila: function (f) { P.get("/bocas/" + f.id).then(function (r) { formBoca(r.boca, function () { tBocas.recargar(); }); }).catch(P.error); },
     });
     var tCajas = P.tabla({
@@ -451,9 +538,8 @@
 
   P.ruta.registrar(/^\/usuarios$/, function (c) {
     var t = P.tabla({ listado: "usuarios", sinEtiquetaBuscar: true, alClickFila: function (f) { formUsuario({ id: f.id }, function () { t.recargar(); }); } });
-    c.appendChild(h("div.pagina-cabecera",
-      h("div", h("h1.titulo-pagina", "Usuarios"), h("p.subtitulo", "Los usuarios del camping. Cada usuario de boca entra directo a la boca que tiene asignada.")),
-      h("div.pagina-acciones", P.btn("Nuevo usuario", { tipo: "primario", icono: "mas", onclick: function () { formUsuario({}, function () { t.recargar(); }); } }))));
+    c.appendChild(P.cabeceraConAcciones("Usuarios", null,
+      P.btn("Nuevo usuario", { tipo: "primario", icono: "mas", onclick: function () { formUsuario({}, function () { t.recargar(); }); } })));
     c.appendChild(t.el);
   }, { admin: true, titulo: "Usuarios" });
 })();

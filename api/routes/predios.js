@@ -101,11 +101,17 @@ function enviarResultado(res, r) {
   return res.json(r === undefined ? { ok: true } : r);
 }
 
+// Una notebook anterior no sabe conservar el precio de una compra en oferta.
+function actorParaOrden(actor, ruta) {
+  if (/^\/(?:compras|productos|bocas)(?:\/|$)/.test(ruta)) actor.capacidad = "precios-boca-v1";
+  return actor;
+}
+
 async function encolarYEsperar(res, predio, usuario, { metodo, ruta, cuerpo, query }) {
   const actor = { general_id: usuario.id, nombre: nombreUsuario(usuario), documento: usuario.documento };
   const [r] = await pool().query(
     "INSERT INTO predio_comando (predio_id, tipo, metodo, ruta, cuerpo, query, actor, descripcion, creado_por) VALUES (?, 'API', ?, ?, ?, ?, ?, ?, ?)",
-    [predio.id, metodo, ruta, JSON.stringify(cuerpo || {}), JSON.stringify(query || {}), JSON.stringify(actor), `${metodo} ${ruta}`.slice(0, 255), usuario.id]);
+    [predio.id, metodo, ruta, JSON.stringify(cuerpo || {}), JSON.stringify(query || {}), JSON.stringify(actorParaOrden(actor, ruta)), `${metodo} ${ruta}`.slice(0, 255), usuario.id]);
   return esperarComando(res, predio, r.insertId);
 }
 
@@ -191,7 +197,7 @@ async function ejecutarComoAdminPredio(res, predio, cuenta, token, { metodo, rut
       const actor = { tipo: "PREDIO", predio_id: Number(p.id), predio_usuario_id: Number(usuario.id), credencial_sha256: U.sha256(usuario.password_hash), cuenta_revision: Number(revisiones[0]?.id || 0) };
       const [r] = await conexion.query(
         "INSERT INTO predio_comando (predio_id, tipo, metodo, ruta, cuerpo, query, actor, descripcion, creado_por) VALUES (?, 'API', ?, ?, ?, ?, ?, ?, ?)",
-        [p.id, metodo, ruta, JSON.stringify(cuerpo || {}), JSON.stringify(query || {}), JSON.stringify(actor), `${metodo} ${ruta}`.slice(0, 255), null]);
+        [p.id, metodo, ruta, JSON.stringify(cuerpo || {}), JSON.stringify(query || {}), JSON.stringify(actorParaOrden(actor, ruta)), `${metodo} ${ruta}`.slice(0, 255), null]);
       salida = { comandoId: r.insertId, predio: p };
     }
     await conexion.commit();
@@ -388,10 +394,12 @@ function crearRouterAdmin() {
       // Los importadores anteriores ejecutan las órdenes antes de actualizar su
       // código. Las identidades propias sólo viajan por sync con capacidad v1.
       const comandos = pendientes.filter(c => JSON.parse(c.actor || "null")?.tipo !== "PREDIO");
+      const serializadas = comandos.map((c) => ({ id: c.id, tipo: c.tipo, metodo: c.metodo, ruta: c.ruta, cuerpo: JSON.parse(c.cuerpo || "null"), query: JSON.parse(c.query || "null"), actor: JSON.parse(c.actor || "null") }));
       const datos = {
         tipo: "predio-paquete", predio_id: p.id, predio_codigo: p.codigo, generado: U.fechaHora(),
         maestros: await C.armarMaestros(pool(), p),
-        comandos: comandos.map((c) => ({ id: c.id, tipo: c.tipo, metodo: c.metodo, ruta: c.ruta, cuerpo: JSON.parse(c.cuerpo || "null"), query: JSON.parse(c.query || "null"), actor: JSON.parse(c.actor || "null") })),
+        comandos: serializadas.filter(c => c.actor?.capacidad !== "precios-boca-v1"),
+        comandos_precios: serializadas.filter(c => c.actor?.capacidad === "precios-boca-v1"),
       };
       if (req.query.codigo === "1") {
         const paquete = C.paqueteCodigo();
@@ -597,13 +605,14 @@ function crearRouterSync() {
 
   router.get("/comandos", async (req, res) => {
     try {
-      const aceptaCuentasPredio = String(req.headers["x-predio-capacidades"] || "").split(",").some(c => c.trim() === "cuentas-predio-v1");
+      const capacidades = String(req.headers["x-predio-capacidades"] || "").split(",").map(c => c.trim());
       const comandos = await conAutoridadSync(req, async (conexion, p) => {
         const [filas] = await conexion.query(
           `SELECT id, tipo, metodo, ruta, cuerpo, query, actor FROM predio_comando
            WHERE predio_id = ? AND (estado = 'PENDIENTE' OR (estado = 'ENTREGADO' AND entregado_en < NOW() - INTERVAL 60 SECOND))
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.tipo')), '') <> 'PREDIO')
-           ORDER BY id LIMIT 20`, [p.id, aceptaCuentasPredio ? 1 : 0]);
+             AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'precios-boca-v1')
+           ORDER BY id LIMIT 20`, [p.id, capacidades.includes("cuentas-predio-v1") ? 1 : 0, capacidades.includes("precios-boca-v1") ? 1 : 0]);
         if (filas.length) {
           await conexion.query(`UPDATE predio_comando SET estado = 'ENTREGADO', entregado_en = NOW(), intentos = intentos + 1 WHERE id IN (?)`, [filas.map(c => c.id)]);
         }

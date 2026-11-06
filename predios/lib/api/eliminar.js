@@ -30,6 +30,7 @@ const ENTIDADES = {
     ],
     // Filas propias del producto que se borran con él (precios, stock cargado a mano).
     dependientes: [
+      { tabla: "predio_producto_margen_boca", col: "producto_id" },
       { tabla: "predio_precio_historial", col: "producto_id" },
       { tabla: "predio_movimiento", col: "producto_id" },
       { tabla: "predio_stock", col: "producto_id" },

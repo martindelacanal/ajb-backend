@@ -1,11 +1,11 @@
 "use strict";
 
-// Compras a proveedores: una compra por factura. Suma stock en el almacén, guarda el
-// precio anterior y siempre recalcula la venta con el margen vigente del producto.
+// La factura ingresa stock a la proveeduría; sus costos sólo pasan al catálogo
+// para los productos que la persona eligió al confirmar.
 
 const U = require("../util");
 const N = require("../negocio");
-const { precioVenta } = require("./catalogo");
+const PB = require("../precio-boca");
 const { resolverRevisionProducto, fuentePrecioVigente } = require("../precios");
 const { esAdmin, bocasDe } = require("./comun");
 
@@ -46,11 +46,13 @@ async function crearCompra(ctx) {
     const cantidad = Number(String(it.cantidad ?? "").replace(",", "."));
     const precio = Number(String(it.precio_unitario ?? "").replace(",", "."));
     if (!Number.isFinite(cantidad) || cantidad <= 0) problemas.push(`En la fila ${n} la cantidad tiene que ser mayor que cero.`);
-    if (!Number.isFinite(precio) || precio < 0) problemas.push(`En la fila ${n} el precio unitario no es válido.`);
+    if (it.precio_unitario == null || it.precio_unitario === "" || !Number.isFinite(precio) || precio < 0 || precio > 99999999) problemas.push(`En la fila ${n} el precio unitario no es válido.`);
     lineas.push({
       producto_id: productoId,
       cantidad: U.redondear(cantidad, 3),
       precio_unitario: U.redondear(precio, 2),
+      actualizar: !!U.bool(it.actualizar_precio),
+      costo_referencia: it.costo_referencia == null ? null : U.numero(it.costo_referencia, { min: 0, campo: "El costo de referencia" }),
       subtotal: U.redondear(cantidad * precio, 2),
     });
   });
@@ -69,14 +71,14 @@ async function crearCompra(ctx) {
   if (problemas.length) throw U.error(problemas[0], 422, { codigo: "COMPRA_CON_ERRORES", problemas });
 
   return ctx.db.tx(async (t) => {
+    await PB.bloquearPrecios(t, ctx);
     const proveedor = await N.exigir(t, ctx, "predio_proveedor", proveedorId, "No encontramos el proveedor");
     if (!Number(proveedor.activo)) throw U.error("El proveedor está dado de baja");
-    let bocaId = b.boca_id ? U.id(b.boca_id, "La boca") : null;
-    if (!bocaId) {
-      const almacen = await N.bocaAlmacen(t, ctx);
-      if (!almacen) throw U.error("Marcá una boca como almacén en Gestión → Bocas para recibir las compras", 409);
-      bocaId = almacen.id;
-    }
+    const almacen = await N.bocaAlmacen(t, ctx);
+    if (!almacen) throw U.error("Elegí una proveeduría en Gestión → Bocas para recibir las compras", 409);
+    const bocaId = Number(almacen.id);
+    if (b.boca_id != null && U.id(b.boca_id, "La boca") !== bocaId)
+      throw U.error(`Las compras ingresan a la proveeduría ${almacen.nombre}. Volvé a revisar la compra.`, 409);
     await puedeComprar(t, ctx, bocaId);
     if (factura) {
       const dup = await t.get(
@@ -91,21 +93,29 @@ async function crearCompra(ctx) {
     const avisos = [];
     for (const l of lineas) {
       const p = await N.exigir(t, ctx, "predio_producto", l.producto_id, "Uno de los productos no existe", { bloquear: true });
+      if (!Number(p.activo)) throw U.error(`«${p.nombre}» está dado de baja. Revisá la compra.`, 409);
       const anterior = Number(p.precio_compra || 0);
+      if (l.actualizar && l.costo_referencia !== null && l.costo_referencia !== anterior)
+        throw U.error(`El costo de referencia de «${p.nombre}» cambió. Quitá el producto y volvé a agregarlo para revisar el precio.`, 409);
       // El margen vigente se lee al confirmar; un formulario viejo no lo sobrescribe.
       const margen = Number(p.margen || 0);
-      const nuevoVenta = precioVenta(l.precio_unitario, margen);
+      const nuevoVenta = l.actualizar ? PB.precioVenta(l.precio_unitario, margen) : PB.redondearVenta(p.precio_venta);
+      const fuenteAnterior = l.actualizar ? await fuentePrecioVigente(t, ctx, l.producto_id) : null;
       await N.insertar(t, ctx, "predio_compra_item", {
         compra_id: compraId, producto_id: l.producto_id, cantidad: l.cantidad, precio_unitario: l.precio_unitario,
         precio_anterior: anterior, margen, precio_venta: nuevoVenta,
-        actualizo_precio: 1, subtotal: l.subtotal,
+        venta_anterior: PB.redondearVenta(p.precio_venta), historial_anterior_id: fuenteAnterior?.id || null,
+        actualizo_precio: l.actualizar ? 1 : 0, subtotal: l.subtotal,
       });
       await N.moverStock(t, ctx, {
         bocaId, productoId: l.producto_id, cantidad: l.cantidad, tipo: "COMPRA", referenciaTipo: "compra", referenciaId: compraId,
         detalle: `Compra N° ${compraId} · ${proveedor.razon_social}${factura ? ` · Fc ${factura}` : ""}`,
       });
+      if (!l.actualizar) continue;
+      const preciosAntes = await PB.preciosDeProducto(t, ctx, l.producto_id);
       const cambios = { precio_compra: l.precio_unitario, precio_venta: nuevoVenta, fecha_revision_precio: U.fechaHora() };
       await N.actualizar(t, ctx, "predio_producto", l.producto_id, cambios);
+      await PB.registrarCambioProducto(t, ctx, l.producto_id, preciosAntes, "COMPRA_BOCA", compraId);
       await N.insertar(t, ctx, "predio_precio_historial", {
         producto_id: l.producto_id, fecha: U.fechaHora(), precio_compra: l.precio_unitario, margen,
         precio_venta: nuevoVenta, origen: "COMPRA", referencia_id: compraId,
@@ -142,6 +152,7 @@ async function anularCompra(ctx) {
   const id = U.id(ctx.params.id);
   const motivo = U.texto(ctx.body.motivo, { max: 255, campo: "El motivo", requerido: true });
   return ctx.db.tx(async (t) => {
+    await PB.bloquearPrecios(t, ctx);
     const c = await N.exigir(t, ctx, "predio_compra", id, "No encontramos la compra", { bloquear: true });
     if (c.estado === "ANULADA") throw U.error("La compra ya está anulada", 409);
     const items = await t.all("SELECT * FROM predio_compra_item WHERE predio_id = ? AND compra_id = ? ORDER BY producto_id", [ctx.pid, id]);
@@ -152,15 +163,21 @@ async function anularCompra(ctx) {
       const vigente = await fuentePrecioVigente(t, ctx, it.producto_id);
       // Una edición/revisión posterior es una decisión distinta: anular una
       // compra nunca la revierte, aunque los importes sean iguales o del mismo segundo.
-      if (vigente?.origen === "COMPRA" && Number(vigente.referencia_id) === id
+      if (Number(it.actualizo_precio) && vigente?.origen === "COMPRA" && Number(vigente.referencia_id) === id
         && Number(p.precio_compra || 0) === Number(vigente.precio_compra || 0)
-        && Number(p.precio_venta || 0) === Number(vigente.precio_venta || 0)) {
+        && PB.redondearVenta(p.precio_venta) === PB.redondearVenta(vigente.precio_venta)) {
         const anterior = await fuentePrecioVigente(t, ctx, it.producto_id, id);
-        const costo = Number(anterior?.precio_compra ?? it.precio_anterior ?? 0);
-        const venta = precioVenta(costo, Number(p.margen || 0));
+        // Una referencia importada puede contener el precio histórico del sistema anterior.
+        // La compra nueva guarda lo que realmente estaba vigente antes de aplicarse.
+        const usarCaptura = it.venta_anterior != null && (!anterior || Number(anterior.id) === Number(it.historial_anterior_id));
+        const costo = Number(usarCaptura ? it.precio_anterior : (anterior?.precio_compra ?? it.precio_anterior ?? 0));
+        const ventaAnterior = usarCaptura ? it.venta_anterior : anterior?.precio_venta;
+        const venta = ventaAnterior != null ? PB.redondearVenta(ventaAnterior) : PB.precioVenta(costo, p.margen);
+        const preciosAntes = await PB.preciosDeProducto(t, ctx, it.producto_id);
         await N.actualizar(t, ctx, "predio_producto", it.producto_id, {
           precio_compra: costo, precio_venta: venta, fecha_revision_precio: anterior?.fecha || null,
         });
+        await PB.registrarCambioProducto(t, ctx, it.producto_id, preciosAntes, "ANULACION_BOCA", id);
         await N.insertar(t, ctx, "predio_precio_historial", {
           producto_id: it.producto_id, fecha: U.fechaHora(), precio_compra: costo, margen: Number(p.margen || 0),
           precio_venta: venta, origen: "ANULACION_COMPRA", referencia_id: id, usuario_nombre: N.nombreActor(ctx),

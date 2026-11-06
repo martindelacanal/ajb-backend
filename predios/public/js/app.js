@@ -38,7 +38,7 @@
       puesto.caja_id ? { ruta: "/vender", texto: "Vender", icono: "vender" } : null,
       { ruta: "/solicitudes", texto: "Solicitudes", icono: "solicitud", contador: "solicitudes" },
       { ruta: "/stock", texto: "Stock", icono: "stock" },
-      puesto.caja_id ? { ruta: "/mi-caja", texto: "Caja", icono: "caja" } : null,
+      puesto.caja_id ? { ruta: "/mi-caja", texto: "Mi caja", icono: "caja" } : null,
       almacen ? { ruta: "/compras", texto: "Compras", icono: "compras" } : null,
     ].filter(Boolean);
   }
@@ -294,12 +294,13 @@
   }
 
   // ------------------------------------------------------------------ marco
-  function marcoAdmin() {
+  function marco() {
     var ses = P.estado.sesion;
     var riel = h("nav.riel#riel", { "aria-label": "Menú principal" },
-      h("a.riel-marca", { href: "#/inicio" }, h("img", { src: "img/logo-blanco-isotipo.png", alt: "" }), h("span", h("strong", ses.predio.nombre || "Predio"), h("span", "Sistema del predio · AJB"))),
-      h("div.nav", itemsAdmin().map(function (it) {
-        var contador = it.ruta === "/inicio" ? h("span.nav-contador", { "data-contador": "inicio", hidden: true }) : null;
+      h("a.riel-marca", { href: "#/" }, h("img", { src: "img/logo-blanco-isotipo.png", alt: "" }), h("span", h("strong", ses.predio.nombre || "Predio"), h("span", "Sistema del predio · AJB"))),
+      h("div.nav", (P.esAdmin() ? itemsAdmin() : itemsCajero()).map(function (it) {
+        var clave = it.ruta === "/inicio" ? "inicio" : it.contador;
+        var contador = clave ? h("span.nav-contador", { "data-contador": clave, hidden: true }) : null;
         return h("a.nav-item", { href: "#" + it.ruta, "data-ruta": it.ruta, onclick: function () { cerrarMenu(); } }, P.icono(it.icono), it.texto, contador);
       })),
       h("div.riel-pie", P.modo === "remoto" ? "Abierto desde Mi AJB" : "Funciona en la red del camping"));
@@ -349,30 +350,14 @@
     botonMenu.setAttribute("aria-expanded", "false");
     P.cerrarMenu = cerrarMenu;
     var puesto = P.puesto();
+    var etiquetaPuesto = puesto && [puesto.boca, puesto.caja].filter(Boolean).join(" · ");
     pagina = h("div#pagina");
     return h("div.estructura", riel, veloMenu, h("div.contenido",
       P.modo === "remoto" ? h("div.remoto#banda-remota") : null,
       h("header.barra", botonMenu,
-        puesto && puesto.caja_id ? h("span.puesto-chip", { title: puesto.boca + " · " + puesto.caja }, P.icono("caja"), h("span", puesto.boca + " · " + puesto.caja)) : null,
+        etiquetaPuesto ? h("span.puesto-chip", { title: etiquetaPuesto }, P.icono("caja"), h("span", etiquetaPuesto)) : null,
         h("div.espacio"), chipConexion(), campana(), botonUsuario()),
       pagina));
-  }
-
-  function marcoCajero() {
-    var ses = P.estado.sesion;
-    var puesto = P.puesto() || {};
-    pagina = h("div#pagina");
-    return h("div",
-      h("header.cabecera-caja",
-        h("a.riel-marca", { href: "#/vender" }, h("img", { src: "img/logo-blanco-isotipo.png", alt: "" }), h("span", h("strong", ses.predio.nombre || "Predio"))),
-        h("nav.pestanas-caja", { "aria-label": "Secciones" }, itemsCajero().map(function (it) {
-          return h("a.pestana", { href: "#" + it.ruta, "data-ruta": it.ruta }, P.icono(it.icono), it.texto,
-            it.contador ? h("span.nav-contador", { "data-contador": it.contador, hidden: true }) : null);
-        })),
-        h("div.espacio"),
-        puesto.boca ? h("span.puesto-chip", h("span", puesto.boca + (puesto.caja ? " · " + puesto.caja : "")), P.btn("Cambiar", { tipo: "texto", chico: true, onclick: function () { P.ruta.ir("/puesto"); } })) : null,
-        chipConexion(), campana(), botonUsuario()),
-      pagina);
   }
 
   document.addEventListener("keydown", function (ev) {
@@ -382,7 +367,7 @@
   P.repintarMarco = function () {
     var ses = P.estado.sesion;
     if (!ses) return;
-    P.reemplazar(app, ses.usuario.rol === "ADMIN" ? marcoAdmin() : marcoCajero());
+    P.reemplazar(app, marco());
     actualizarConexion();
     pintarContadores();
     if (P.modo === "remoto") pintarBandaRemota();

@@ -295,7 +295,7 @@ input[type="password"]::-ms-reveal, input[type="password"]::-ms-clear { display:
 .riel-pie { margin-top: auto; padding: 12px 8px 0; font-size: 12px; opacity: .7; }
 
 .contenido { min-width: 0; display: flex; flex-direction: column; }
-.barra { position: sticky; top: 0; z-index: 50; display: flex; align-items: center; gap: 14px; min-height: 64px; padding: 10px 28px; background: rgba(244, 250, 254, .86); backdrop-filter: saturate(1.4) blur(10px); -webkit-backdrop-filter: saturate(1.4) blur(10px); border-bottom: 1px solid var(--linea); }
+.barra { position: sticky; top: 0; z-index: 50; display: flex; align-items: center; gap: 14px; min-height: 64px; padding: 10px 28px; background: var(--blanco); border-bottom: 1px solid var(--linea); }
 .barra-menu { display: none; }
 .pagina { width: 100%; max-width: 1440px; margin: 0 auto; padding: 26px 28px 60px; animation: entrar 260ms cubic-bezier(.2, .8, .2, 1); }
 .pagina-cabecera { display: flex; gap: 16px; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; margin-bottom: 20px; }
@@ -358,24 +358,6 @@ input[type="password"]::-ms-reveal, input[type="password"]::-ms-clear { display:
 .remoto { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 28px; background: var(--tinta); color: var(--blanco); font-size: 13.5px; font-weight: 600; }
 .remoto strong { font-weight: 800; }
 .remoto .conexion { background: rgba(255, 255, 255, .1); box-shadow: none; color: var(--blanco); }
-
-/* cabecera del usuario de boca (sin riel) */
-.cabecera-caja { position: sticky; top: 0; z-index: 50; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding: 10px 24px; background: var(--azul); color: var(--blanco); }
-.cabecera-caja .riel-marca { padding: 0; }
-.cabecera-caja .riel-marca img { width: 38px; }
-.pestanas-caja { display: flex; gap: 4px; flex-wrap: wrap; }
-.pestana { display: inline-flex; align-items: center; gap: 8px; padding: 9px 14px; border-radius: var(--radio-chico); color: rgba(255, 255, 255, .85); font-weight: 700; text-decoration: none; }
-.pestana:hover { background: rgba(255, 255, 255, .1); color: var(--blanco); }
-.pestana[aria-current="page"] { background: var(--blanco); color: var(--azul); }
-.cabecera-caja .puesto-chip { background: rgba(255, 255, 255, .12); box-shadow: none; color: var(--blanco); }
-.cabecera-caja .puesto-chip small { color: rgba(255, 255, 255, .7); }
-.cabecera-caja .conexion { background: rgba(255, 255, 255, .12); box-shadow: none; color: var(--blanco); }
-.cabecera-caja .usuario-boton { color: var(--blanco); }
-.cabecera-caja .usuario-boton:hover { background: rgba(255, 255, 255, .1); }
-.cabecera-caja .usuario-nombre small { color: rgba(255, 255, 255, .7); }
-.cabecera-caja .avatar { background: var(--blanco); color: var(--azul); }
-.cabecera-caja .btn-texto { color: var(--blanco); }
-.cabecera-caja .btn-texto:hover { background: rgba(255, 255, 255, .1); }
 
 /* pestañas internas (Gestión) */
 .solapas { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 18px; padding: 4px; border-radius: var(--radio); background: var(--cielo); box-shadow: inset 0 0 0 1px var(--borde); width: fit-content; max-width: 100%; }
@@ -607,6 +589,16 @@ table.tabla { width: 100%; border-collapse: separate; border-spacing: 0; font-si
 .lista-simple { margin: 0; padding: 0; list-style: none; }
 .lista-simple li { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 11px 0; border-bottom: 1px solid var(--linea); }
 .lista-simple li:last-child { border-bottom: 0; }
+.sistema-estado .btn { max-width: 100%; white-space: normal; }
+.inicio-cifras { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.inicio-cuerpo { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 16px; }
+.inicio-cuerpo > section, .inicio-cifras > div { min-width: 0; overflow-wrap: anywhere; }
+.inicio-cuerpo h2 { margin-bottom: 12px; }
+.inicio-cuerpo .lista-simple li { flex-wrap: wrap; }
+.inicio-cuerpo .lista-simple li > * { min-width: 0; max-width: 100%; }
+@media (max-width: 700px) {
+  .inicio-cifras, .inicio-cuerpo { grid-template-columns: minmax(0, 1fr); }
+}
 .inicio-cajas li { flex-wrap: wrap; align-items: flex-start; }
 .inicio-cajas li > div { min-width: 0; max-width: 100%; }
 .inicio-cajas li > div:first-child { flex: 1 1 180px; overflow-wrap: anywhere; }
@@ -646,7 +638,7 @@ table.tabla { width: 100%; border-collapse: separate; border-spacing: 0; font-si
 /* ---------------------------------------------------------------- impresión dentro de la app (no tickets) */
 @media print {
   body { background: var(--blanco); }
-  .riel, .barra, .cabecera-caja, .remoto, .avisos, .no-imprimir { display: none !important; }
+  .riel, .barra, .remoto, .avisos, .no-imprimir { display: none !important; }
   .estructura { display: block; }
   .pagina { padding: 0; }
 }

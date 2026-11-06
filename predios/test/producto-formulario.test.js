@@ -95,6 +95,8 @@ async function pantalla(t, { nuevo = false, producto = {}, fechas } = {}) {
       return Number(texto);
     },
     redondear: v => Math.round((Number(v) + Number.EPSILON) * 100) / 100,
+    precioDeVenta: require("../public/js/precio-venta"),
+    importeDe(v) { return P.numeroDe(v); },
     input: (op = {}) => h("input", { value: op.valor ?? "", readOnly: !!op.soloLectura, type: op.tipo || "text" }),
     dinero: op => P.input(op),
     select: (_opciones, valor) => h("select", { value: valor }),
@@ -115,6 +117,7 @@ async function pantalla(t, { nuevo = false, producto = {}, fechas } = {}) {
     btn: (texto, op) => h("button", { onclick: op.onclick }, texto),
     modal(op) { modal = op; return { cerrar() {} }; },
     get: ruta => llamar("GET", ruta),
+    opciones: tipo => llamar("GET", "/opciones/" + tipo),
     async put(ruta, body) { escritos.push({ metodo: "PUT", ruta, body }); return llamar("PUT", ruta, body); },
     async post(ruta, body) { escritos.push({ metodo: "POST", ruta, body }); return llamar("POST", ruta, body); },
     ejecutar: (_boton, fn) => Promise.resolve().then(fn).catch(e => { errores.push(e); throw e; }),
@@ -150,20 +153,20 @@ test("editar sólo el nombre conserva el precio fijado, su revisión y el stock 
   const s = await pantalla(t);
   assert.equal(s.checks.get("Fijar el precio de venta a mano").checked, false);
   assert.equal(s.control("Precio de venta").readOnly, true);
-  assert.equal(s.P.numeroDe(s.control("Precio de venta").value), 999);
+  assert.equal(s.P.numeroDe(s.control("Precio de venta").value), 1000);
   s.escribir("Nombre", "Nombre corregido");
   const body = await s.guardar();
-  for (const clave of ["precio_compra", "margen", "precio_venta_manual", "cantidad_almacen", "confirmar_revision_precio"]) assert.equal(Object.hasOwn(body, clave), false, clave);
+  for (const clave of ["precio_compra", "margen", "precio_venta_manual", "margenes_boca", "cantidad_almacen", "confirmar_revision_precio"]) assert.equal(Object.hasOwn(body, clave), false, clave);
   const p = await s.ficha();
   assert.equal(p.nombre, "Nombre corregido");
-  assert.equal(p.precio_venta, 999);
+  assert.equal(p.precio_venta, 1000);
   assert.equal(p.fecha_revision_precio, "2026-01-01 10:00:00");
   assert.equal((await s.db.get("SELECT COUNT(*) AS n FROM predio_precio_historial WHERE producto_id = ?", [s.id])).n, 1);
   assert.equal((await s.db.get("SELECT cantidad FROM predio_stock WHERE producto_id = ?", [s.id])).cantidad, 4);
 });
 
 test("cambiar compra o margen recalcula la venta y persiste una revisión de precio", async t => {
-  for (const [etiqueta, valor, esperado] of [["Precio de compra", "200,50", 280.7], ["Margen de utilidad (%)", "25", 125]]) {
+  for (const [etiqueta, valor, esperado] of [["Precio de compra", "200,50", 300], ["Margen de utilidad (%)", "25", 200]]) {
     await t.test(etiqueta, async t => {
       const s = await pantalla(t);
       s.escribir(etiqueta, valor);
@@ -190,8 +193,8 @@ test("habilitar manual permite fijar la venta y mantiene su importe al modificar
   s.escribir("Precio de compra", "120");
   assert.equal(s.control("Precio de venta").value, "175,25");
   const body = await s.guardar();
-  assert.equal(body.precio_venta_manual, 175.25);
-  assert.equal((await s.ficha()).precio_venta, 175.25);
+  assert.equal(body.precio_venta_manual, 200);
+  assert.equal((await s.ficha()).precio_venta, 200);
 });
 
 test("desactivar manual vuelve al cálculo automático antes de guardar", async t => {
@@ -201,10 +204,23 @@ test("desactivar manual vuelve al cálculo automático antes de guardar", async 
   s.escribir("Precio de compra", "200");
   s.manual(false);
   assert.equal(s.control("Precio de venta").readOnly, true);
-  assert.equal(s.P.numeroDe(s.control("Precio de venta").value), 280);
+  assert.equal(s.P.numeroDe(s.control("Precio de venta").value), 300);
   const body = await s.guardar();
   assert.equal(body.precio_venta_manual, null);
-  assert.equal((await s.ficha()).precio_venta, 280);
+  assert.equal((await s.ficha()).precio_venta, 300);
+});
+
+test("cambiar el margen especial desde la ficha conserva el precio general y deja historial en esa boca", async t => {
+  const s = await pantalla(t);
+  s.escribir("Comedor", "55");
+  const body = await s.guardar();
+  assert.equal(body.margenes_boca.length, 1);
+  assert.equal(body.margenes_boca[0].margen, 55);
+  assert.equal(Object.hasOwn(body, "precio_venta_manual"), false);
+  const detalle = await s.P.get("/productos/" + s.id);
+  assert.equal(detalle.producto.precio_venta, 1000);
+  assert.equal(detalle.margenes_boca.find(b => b.boca === "Comedor").precio_venta, 200);
+  assert.ok(detalle.precios.some(f => f.boca === "Comedor" && f.origen === "MARGEN_PRODUCTO" && f.precio_venta === 200));
 });
 
 test("un producto nuevo empieza en automático y calcula su venta con los importes ingresados", async t => {

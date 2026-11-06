@@ -88,11 +88,11 @@ test("flujo completo del camping", async () => {
   const mal = await api("POST", "/compras", { token: admin, cuerpo: { proveedor_id: prov.id, factura: "A-0001-1", fecha_factura: "2026-11-01", total_factura: 9999, items: [{ producto_id: prod.id, cantidad: 20, precio_unitario: 550 }] } });
   assert.equal(mal.status, 422);
   assert.match(mal.json.mensaje, /faltan|sobran/);
-  const compra = await ok("POST", "/compras", { token: admin, cuerpo: { proveedor_id: prov.id, factura: "A-0001-1", fecha_factura: "2026-11-01", remito: "R-1", fecha_remito: "2026-11-01", total_factura: 11000, items: [{ producto_id: prod.id, cantidad: 20, precio_unitario: 550 }] } });
+  const compra = await ok("POST", "/compras", { token: admin, cuerpo: { proveedor_id: prov.id, factura: "A-0001-1", fecha_factura: "2026-11-01", remito: "R-1", fecha_remito: "2026-11-01", total_factura: 11000, items: [{ producto_id: prod.id, cantidad: 20, precio_unitario: 550, actualizar_precio: true }] } });
   const detCompra = await ok("GET", `/compras/${compra.id}`, { token: admin });
   assert.equal(detCompra.items[0].precio_anterior, 500);
   const ficha2 = await ok("GET", `/productos/${prod.id}`, { token: admin });
-  assert.equal(ficha2.producto.precio_venta, 770);
+  assert.equal(ficha2.producto.precio_venta, 800);
   const dup = await api("POST", "/compras", { token: admin, cuerpo: { proveedor_id: prov.id, factura: "A-0001-1", fecha_factura: "2026-11-01", total_factura: 550, items: [{ producto_id: prod.id, cantidad: 1, precio_unitario: 550 }] } });
   assert.equal(dup.status, 409);
 
@@ -140,24 +140,33 @@ test("flujo completo del camping", async () => {
   assert.ok(!metaStock.columnas.some((c) => c.clave === "valor"));
   assert.equal((await api("GET", "/listados/productos", { token: cajero })).status, 403);
   const venta = await ok("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: prod.id, cantidad: 2 }], forma_pago: "EFECTIVO", recibido: 2000 } });
-  assert.equal(venta.total, 1540);
-  assert.equal(venta.vuelto, 460);
+  assert.equal(venta.total, 1600);
+  assert.equal(venta.vuelto, 400);
   const estado = await ok("GET", "/caja/estado", { token: cajero });
-  assert.equal(estado.resumen.saldo_esperado, 6540);
+  assert.equal(estado.resumen.saldo_esperado, 6600);
 
-  // Afiliado manual con límite y venta por descuento
+  // Los tickets anteriores se siguen liquidando e imprimiendo. La caja nueva
+  // sólo acepta saldo autorizado en la estadía.
   const af = await ok("POST", "/afiliados", { token: admin, cuerpo: { dni: "30111222", legajo: "4455", nombre: "Pérez, Ana", limite: 2000 } });
   const busq = await ok("GET", "/afiliados/buscar?q=4455", { token: cajero });
   assert.equal(busq.resultados[0].disponible, 2000);
-  const textoFirmado = "Autorización del Camping Miramar.";
-  await ok("PUT", "/config", { token: admin, cuerpo: { texto_autorizacion: textoFirmado } });
-  const ventaDesc = await ok("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: prod.id, cantidad: 1 }], devolucion: 1, afiliado_id: af.id } });
-  assert.equal(ventaDesc.ticket.afiliado.disponible, 1230);
-  const autorizacionFirmada = textoFirmado + "\nSUMA: SETECIENTOS SETENTA PESOS ($ 770,00)";
-  assert.equal(ventaDesc.ticket.empresa.texto_autorizacion, autorizacionFirmada);
-  const excede = await api("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: prod.id, cantidad: 2 }], forma_pago: "DESCUENTO", afiliado_id: af.id } });
-  assert.equal(excede.status, 409);
-  assert.equal(excede.json.codigo, "SIN_DISPONIBLE");
+  const autorizacionFirmada = "Autorización del Camping Miramar.\nSUMA: SETECIENTOS SETENTA PESOS ($ 770,00)";
+  const historica = require("../lib/db-sqlite").crearSqlite(path.join(base, "datos", "predio.db"), { predioId: 1 });
+  let ventaAnteriorId;
+  try {
+    ventaAnteriorId = await historica.tx(tx => require("../lib/negocio").insertar(tx, { pid: 1 }, "predio_venta", {
+      fecha: "2025-01-10 10:00:00", boca_id: proveeduria, caja_id: cajaProv, estado: "CONFIRMADA", forma_pago: "DESCUENTO",
+      afiliado_id: af.id, afiliado_legajo: "4455", afiliado_nombre: "Pérez, Ana", afiliado_dni: "30111222",
+      total: 770, importe_haberes: 770, saldo_disponible: 1230, autorizacion_descuento: autorizacionFirmada,
+    }));
+  } finally { historica.cerrar(); }
+  for (const medioAnterior of [{ devolucion: 1 }, { forma_pago: "DESCUENTO" }]) {
+    const rechazada = await api("POST", "/ventas", { token: cajero, cuerpo: {
+      items: [{ producto_id: prod.id, cantidad: 1 }], afiliado_id: af.id, ...medioAnterior,
+    } });
+    assert.equal(rechazada.status, 400);
+    assert.match(rechazada.json.mensaje, /Elegí Saldo/);
+  }
   const qr = await ok("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: prod.id, cantidad: 1 }], forma_pago: "QR", codigo_pago: "MP-123" } });
 
   // Anulación con clave
@@ -169,9 +178,9 @@ test("flujo completo del camping", async () => {
   // Ajuste y cierre
   await ok("POST", "/caja/ajuste", { token: admin, cuerpo: { caja_id: cajaProv, concepto: "RETIRO_DINERO", tipo: "EGRESO", importe: 1000, recibo: "R-9" } });
   const previa = await ok("GET", "/caja/cierre/previa", { token: cajero });
-  assert.equal(previa.resumen.saldo_esperado, 5540);
+  assert.equal(previa.resumen.saldo_esperado, 5600);
   const cierre = await ok("POST", "/caja/cierre", { token: cajero, cuerpo: { efectivo_contado: 5500, queda_en_caja: 500 } });
-  assert.equal(cierre.diferencia, -40);
+  assert.equal(cierre.diferencia, -100);
   const { caja } = await ok("GET", `/cajas/${cajaProv}`, { token: admin });
   await ok("PUT", `/cajas/${cajaProv}`, { token: admin, cuerpo: { ...caja, ancho_ticket: 58 } });
   const ticketCierre = await ok("GET", `/caja/cierres/${cierre.id}`, { token: cajero });
@@ -188,21 +197,11 @@ test("flujo completo del camping", async () => {
   await ok("POST", "/afiliados/limites/masivo", { token: admin, cuerpo: { filtros: { limite: "gte:1000" }, nuevo_limite: 50000 } });
   await ok("PUT", `/afiliados/${af.id}`, { token: admin, cuerpo: { nombre: "Ana Pérez", legajo: "4455-B" } });
   await ok("PUT", "/config", { token: admin, cuerpo: { texto_autorizacion: "", razon_social: "Asociación del Camping" } });
-  const reimpresa = await ok("POST", `/ventas/${ventaDesc.id}/impresion`, { token: cajero, cuerpo: {} });
-  assert.deepEqual(reimpresa.afiliado, ventaDesc.ticket.afiliado);
+  const reimpresa = await ok("POST", `/ventas/${ventaAnteriorId}/impresion`, { token: cajero, cuerpo: {} });
+  assert.equal(reimpresa.afiliado.nombre, "Pérez, Ana");
+  assert.equal(reimpresa.afiliado.legajo, "4455");
   assert.equal(reimpresa.afiliado.disponible, 1230);
   assert.equal(reimpresa.empresa.texto_autorizacion, autorizacionFirmada);
-  const ventaEstandar = await ok("POST", "/ventas", { token: cajero, cuerpo: {
-    items: [{ producto_id: prod.id, cantidad: 0.25 }], forma_pago: "DESCUENTO", afiliado_id: af.id,
-  } });
-  const textoEstandar = ventaEstandar.ticket.empresa.texto_autorizacion;
-  assert.match(textoEstandar, /Asociación del Camping/);
-  assert.match(textoEstandar, /en ____ cuota\/s, de acuerdo/);
-  assert.match(textoEstandar, /CIENTO NOVENTA Y DOS PESOS CON 50\/100 \(\$ 192,50\)/);
-  assert.equal(ventaEstandar.ticket.venta.autorizacion_descuento, textoEstandar);
-  await ok("PUT", "/config", { token: admin, cuerpo: { razon_social: "Entidad nueva", texto_autorizacion: "Redacción nueva." } });
-  const copiaEstandar = await ok("POST", `/ventas/${ventaEstandar.id}/impresion`, { token: cajero, cuerpo: {} });
-  assert.equal(copiaEstandar.empresa.texto_autorizacion, textoEstandar);
 
   // Todos los listados en JSON, CSV completo y CSV resumido
   const nombres = ["productos", "stock", "proveedores", "compras", "compras_productos", "solicitudes", "bajas", "movimientos", "ventas",
@@ -238,7 +237,7 @@ test("flujo completo del camping", async () => {
     assert.equal(cargadas.filas.some(f => f.estado === "ANULADA"), false, lista);
   }
   const est = await ok("GET", "/estadisticas", { token: admin });
-  assert.ok(est.kpi.ventas >= 2);
+  assert.equal(est.kpi.ventas, 1); // Sólo la venta en efectivo sigue confirmada dentro del período.
   await ok("GET", "/inicio", { token: admin });
   await ok("GET", "/avisos", { token: admin });
   await ok("GET", "/avisos", { token: cajero });

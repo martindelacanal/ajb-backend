@@ -5,6 +5,7 @@
 
 const U = require("../util");
 const N = require("../negocio");
+const PB = require("../precio-boca");
 const { DESTINOS } = require("../listados");
 const { gtinValido, proximidadCodigo } = require("../codigo-barras");
 const { resolverRevisionProducto } = require("../precios");
@@ -12,10 +13,6 @@ const { revisarProducto: revisarStockMinimoProducto, bloquearStockProducto } = r
 const { exigirAdmin, esAdmin, bocasDe, exigirPuesto, exigirBoca } = require("./comun");
 
 const DESTINOS_VALIDOS = DESTINOS.map((d) => d.valor);
-
-function precioVenta(compra, margen) {
-  return U.redondear(Number(compra || 0) * (1 + Number(margen || 0) / 100), 2);
-}
 
 // El costo de compra y el margen los ve el administrador y quien carga compras (el almacén).
 async function veCostos(db, ctx) {
@@ -44,9 +41,10 @@ async function opciones(ctx) {
       if (fuente === "bocas_destino") extra = " AND b.es_destino = 1";
       if (fuente === "bocas_venta") extra = " AND EXISTS (SELECT 1 FROM predio_caja c WHERE c.predio_id = b.predio_id AND c.boca_id = b.id AND c.activo = 1)";
       const filas = await db.all(
-        `SELECT b.id, b.nombre, b.es_origen, b.es_destino, b.es_almacen FROM predio_boca b
+        `SELECT b.id, b.nombre, b.es_origen, b.es_destino, b.es_almacen, b.margen_venta FROM predio_boca b
          WHERE b.predio_id = ? AND b.activo = 1${extra} ORDER BY b.nombre`, [pid]);
-      return filas.map((f) => ({ valor: f.id, texto: f.nombre, es_origen: !!Number(f.es_origen), es_destino: !!Number(f.es_destino), es_almacen: !!Number(f.es_almacen) }));
+      return filas.map((f) => ({ valor: f.id, texto: f.nombre, es_origen: !!Number(f.es_origen), es_destino: !!Number(f.es_destino),
+        es_almacen: !!Number(f.es_almacen), margen_venta: esAdmin(ctx) ? f.margen_venta : undefined }));
     }
     case "cajas": {
       const filas = await db.all(
@@ -65,7 +63,7 @@ async function opciones(ctx) {
         "SELECT id, nombre, codigo, precio_venta, precio_compra, margen, destino FROM predio_producto WHERE predio_id = ? AND activo = 1 ORDER BY nombre", [pid]);
       const costos = await veCostos(db, ctx);
       return filas.map((f) => ({
-        valor: f.id, texto: f.nombre, codigo: f.codigo, precio_venta: Number(f.precio_venta || 0),
+        valor: f.id, texto: f.nombre, codigo: f.codigo, precio_venta: PB.redondearVenta(f.precio_venta),
         precio_compra: costos ? Number(f.precio_compra || 0) : undefined, margen: costos ? Number(f.margen || 0) : undefined, destino: f.destino,
       }));
     }
@@ -107,9 +105,17 @@ async function buscarProductos(ctx) {
   } else if (bocaId) exigirBoca(ctx, bocaId);
   const db = ctx.db;
   const params = [bocaId || -1, ctx.pid];
+  const uniones = `LEFT JOIN predio_boca b ON b.predio_id = p.predio_id AND b.id = ?
+    ${PB.joinMargenSql} LEFT JOIN predio_stock s ON s.predio_id = p.predio_id AND s.producto_id = p.id AND s.boca_id = b.id`;
+  const costos = await veCostos(db, ctx);
+  const ultimoCosto = costos && !soloVenta && !catalogoAviso
+    ? `(SELECT ci.precio_unitario FROM predio_compra_item ci JOIN predio_compra c ON c.predio_id = ci.predio_id AND c.id = ci.compra_id
+        WHERE ci.predio_id = p.predio_id AND ci.producto_id = p.id AND c.estado = 'CARGADA' ORDER BY ci.compra_id DESC LIMIT 1)` : "NULL";
+  const columnas = `p.id, p.nombre, p.codigo, ${PB.precioBocaSql} AS precio_venta, p.precio_compra, ${ultimoCosto} AS ultimo_costo,
+    p.margen, p.destino, p.perecedero, p.fecha_caducidad, COALESCE(s.cantidad, 0) AS stock_boca`;
   let where = "p.predio_id = ? AND p.activo = 1";
   if (soloVenta) {
-    where += " AND p.destino <> 'USO_INTERNO' AND COALESCE(p.precio_venta, 0) > 0";
+    where += ` AND p.destino <> 'USO_INTERNO' AND (${PB.precioBocaSql}) > 0`;
     where += " AND COALESCE(s.cantidad, 0) > 0";
   }
   const baseWhere = where;
@@ -122,10 +128,7 @@ async function buscarProductos(ctx) {
     for (const p of palabras) params.push(`%${db.normParam(p)}%`, `${p}%`);
     orden = "CASE WHEN p.codigo = ? THEN 0 ELSE 1 END, p.nombre";
   }
-  const sql = `SELECT p.id, p.nombre, p.codigo, p.precio_venta, p.precio_compra, p.margen, p.destino, p.perecedero, p.fecha_caducidad,
-      COALESCE(s.cantidad, 0) AS stock_boca
-    FROM predio_producto p
-    LEFT JOIN predio_stock s ON s.predio_id = p.predio_id AND s.producto_id = p.id AND s.boca_id = ?
+  const sql = `SELECT ${columnas} FROM predio_producto p ${uniones}
     WHERE ${where} ORDER BY ${orden} LIMIT 30`;
   if (q) params.push(q);
   const filas = await db.all(sql, params);
@@ -133,10 +136,7 @@ async function buscarProductos(ctx) {
   // el importado, se agregan como máximo ocho sugerencias, nunca coincidencias exactas.
   if (/^\d{8,60}$/.test(q) && !filas.some((f) => f.codigo === q)) {
     const candidatos = await db.all(
-      `SELECT p.id, p.nombre, p.codigo, p.precio_venta, p.precio_compra, p.margen, p.destino, p.perecedero, p.fecha_caducidad,
-         COALESCE(s.cantidad, 0) AS stock_boca
-       FROM predio_producto p
-       LEFT JOIN predio_stock s ON s.predio_id = p.predio_id AND s.producto_id = p.id AND s.boca_id = ?
+      `SELECT ${columnas} FROM predio_producto p ${uniones}
        WHERE ${baseWhere} AND p.codigo IS NOT NULL AND LENGTH(p.codigo) BETWEEN ? AND ?`,
       [bocaId || -1, ctx.pid, Math.max(6, q.length - 6), Math.min(60, q.length + 1)]);
     const ids = new Set(filas.map((f) => Number(f.id)));
@@ -146,9 +146,9 @@ async function buscarProductos(ctx) {
       .slice(0, 8).map((f) => f.fila);
     filas.push(...cercanos);
   }
-  const costos = await veCostos(db, ctx);
   return filas.slice(0, 30).map((f) => ({
     id: f.id, nombre: f.nombre, codigo: f.codigo, precio_venta: Number(f.precio_venta || 0),
+    ultimo_costo: costos ? (f.ultimo_costo == null ? null : Number(f.ultimo_costo)) : undefined,
     precio_compra: costos ? Number(f.precio_compra || 0) : undefined, margen: costos ? Number(f.margen || 0) : undefined, destino: f.destino,
     perecedero: !!Number(f.perecedero), fecha_caducidad: f.fecha_caducidad, stock_boca: Number(f.stock_boca || 0),
     exacto: !!q && f.codigo === q,
@@ -164,8 +164,9 @@ async function consultarCodigo(ctx) {
   exigirBoca(ctx, puesto.boca_id);
   const codigo = U.texto(ctx.query.codigo, { max: 60, requerido: true, campo: "El código escaneado" });
   const filas = await ctx.db.all(
-    `SELECT p.id, p.nombre, p.codigo, p.precio_venta, p.destino, COALESCE(s.cantidad, 0) AS stock_boca
-     FROM predio_producto p LEFT JOIN predio_stock s ON s.predio_id = p.predio_id AND s.producto_id = p.id AND s.boca_id = ?
+    `SELECT p.id, p.nombre, p.codigo, ${PB.precioBocaSql} AS precio_venta, p.destino, COALESCE(s.cantidad, 0) AS stock_boca
+     FROM predio_producto p JOIN predio_boca b ON b.predio_id = p.predio_id AND b.id = ? ${PB.joinMargenSql}
+     LEFT JOIN predio_stock s ON s.predio_id = p.predio_id AND s.producto_id = p.id AND s.boca_id = b.id
      WHERE p.predio_id = ? AND p.activo = 1 AND p.destino <> 'USO_INTERNO' AND p.codigo = ? LIMIT 2`, [puesto.boca_id, ctx.pid, codigo]);
   if (filas.length !== 1) return { producto: null, estado: filas.length ? "CODIGO_DUPLICADO" : "NO_ENCONTRADO" };
   const p = filas[0];
@@ -231,9 +232,12 @@ async function detalleProducto(ctx) {
      WHERE b.predio_id = ? AND (s.cantidad IS NOT NULL OR b.es_almacen = 1) ORDER BY b.es_almacen DESC, b.nombre`,
     [id, ctx.pid]);
   const precios = await db.all(
-    "SELECT fecha, precio_compra, margen, precio_venta, origen, referencia_id, usuario_nombre FROM predio_precio_historial WHERE predio_id = ? AND producto_id = ? ORDER BY id DESC LIMIT 30",
+    `SELECT h.fecha, h.precio_compra, h.margen, h.precio_venta, h.origen, h.referencia_id, h.usuario_nombre, h.boca_id, b.nombre AS boca
+     FROM predio_precio_historial h LEFT JOIN predio_boca b ON b.predio_id = h.predio_id AND b.id = h.boca_id
+     WHERE h.predio_id = ? AND h.producto_id = ? ORDER BY h.id DESC LIMIT 100`,
     [ctx.pid, id]);
-  return { producto: p, stock, precios };
+  return { producto: { ...p, precio_venta: PB.redondearVenta(p.precio_venta) }, stock, precios,
+    margenes_boca: await PB.preciosDeProducto(db, ctx, id) };
 }
 
 function validarProducto(body, { parcial = false } = {}) {
@@ -263,17 +267,19 @@ async function crearProducto(ctx) {
   exigirAdmin(ctx);
   const datos = validarProducto(ctx.body);
   const cantidadAlmacen = U.numero(ctx.body.cantidad_almacen ?? 0, { min: 0, max: 9999999, decimales: 3, campo: "La cantidad en almacén" });
-  // El precio de venta es siempre compra + margen: lo calcula el sistema.
   datos.precio_venta = ctx.body.precio_venta_manual !== undefined && ctx.body.precio_venta_manual !== null && ctx.body.precio_venta_manual !== ""
-    ? U.numero(ctx.body.precio_venta_manual, { min: 0, campo: "El precio de venta" })
-    : precioVenta(datos.precio_compra, datos.margen);
+    ? PB.redondearVenta(U.numero(ctx.body.precio_venta_manual, { min: 0, campo: "El precio de venta" }))
+    : PB.precioVenta(datos.precio_compra, datos.margen);
   return ctx.db.tx(async (t) => {
+    await PB.bloquearPrecios(t, ctx);
     await bloquearCodigos(t, ctx);
     const dup = await codigoDuplicado(t, ctx, datos.codigo);
     if (dup) throw U.error(`Ese código ya lo tiene «${dup.nombre}». Cada producto necesita un código distinto.`, 409);
     const nombreDup = await t.get("SELECT id FROM predio_producto WHERE predio_id = ? AND LOWER(nombre) = LOWER(?) AND activo = 1", [ctx.pid, datos.nombre]);
     if (nombreDup) throw U.error("Ya hay un producto activo con ese nombre", 409);
     const id = await N.insertar(t, ctx, "predio_producto", { ...datos, activo: 1, fecha_revision_precio: U.fechaHora() });
+    await PB.guardarExcepciones(t, ctx, id, ctx.body.margenes_boca, await PB.preciosDeProducto(t, ctx, id));
+    await PB.registrarCambioProducto(t, ctx, id, [], "ALTA_BOCA");
     await N.insertar(t, ctx, "predio_precio_historial", {
       producto_id: id, fecha: U.fechaHora(), precio_compra: datos.precio_compra, margen: datos.margen,
       precio_venta: datos.precio_venta, origen: "ALTA", usuario_nombre: N.nombreActor(ctx),
@@ -297,15 +303,17 @@ async function editarProducto(ctx) {
   const datos = validarProducto(ctx.body, { parcial: true });
   if (ctx.body.activo !== undefined) datos.activo = U.bool(ctx.body.activo);
   return ctx.db.tx(async (t) => {
+    await PB.bloquearPrecios(t, ctx);
     if (datos.codigo !== undefined || datos.activo === 1) await bloquearCodigos(t, ctx);
     const antes = await N.exigir(t, ctx, "predio_producto", id, "No encontramos el producto", { bloquear: true });
+    const preciosAntes = await PB.preciosDeProducto(t, ctx, id);
     if (datos.stock_minimo !== undefined || datos.activo !== undefined) await bloquearStockProducto(t, ctx, id);
     const compra = datos.precio_compra !== undefined ? datos.precio_compra : Number(antes.precio_compra || 0);
     const margen = datos.margen !== undefined ? datos.margen : Number(antes.margen || 0);
     if (ctx.body.precio_venta_manual !== undefined && ctx.body.precio_venta_manual !== null && ctx.body.precio_venta_manual !== "") {
-      datos.precio_venta = U.numero(ctx.body.precio_venta_manual, { min: 0, campo: "El precio de venta" });
+      datos.precio_venta = PB.redondearVenta(U.numero(ctx.body.precio_venta_manual, { min: 0, campo: "El precio de venta" }));
     } else if (datos.precio_compra !== undefined || datos.margen !== undefined) {
-      datos.precio_venta = precioVenta(compra, margen);
+      datos.precio_venta = PB.precioVenta(compra, margen);
     }
     if (datos.codigo || datos.activo === 1) {
       const dup = await codigoDuplicado(t, ctx, datos.codigo === undefined ? antes.codigo : datos.codigo, id);
@@ -314,6 +322,9 @@ async function editarProducto(ctx) {
     const revisarPrecio = ctx.body.confirmar_revision_precio === true || ["precio_compra", "margen", "precio_venta"].some((c) => datos[c] !== undefined && Number(datos[c] || 0) !== Number(antes[c] || 0));
     if (revisarPrecio) datos.fecha_revision_precio = U.fechaHora();
     await N.actualizar(t, ctx, "predio_producto", id, datos);
+    await PB.guardarExcepciones(t, ctx, id, ctx.body.margenes_boca, preciosAntes);
+    if (revisarPrecio || ctx.body.margenes_boca !== undefined)
+      await PB.registrarCambioProducto(t, ctx, id, preciosAntes, ctx.body.margenes_boca !== undefined ? "MARGEN_PRODUCTO" : "EDICION_BOCA");
     const despues = await N.obtener(t, ctx, "predio_producto", id);
     const cambios = N.diferencias(antes, despues);
     if (revisarPrecio) {
@@ -433,6 +444,7 @@ function validarBoca(body) {
     es_origen: esOrigen,
     es_destino: esDestino,
     es_almacen: U.bool(body.es_almacen),
+    margen_venta: U.numero(body.margen_venta, { min: -100, max: 10000, requerido: false, campo: "El margen de la boca" }),
     descripcion: U.texto(body.descripcion, { max: 255 }),
   };
 }
@@ -440,9 +452,13 @@ function validarBoca(body) {
 async function guardarBoca(ctx) {
   exigirAdmin(ctx);
   const id = ctx.params.id ? U.id(ctx.params.id) : null;
-  const datos = validarBoca(ctx.body);
-  if (ctx.body.activo !== undefined) datos.activo = U.bool(ctx.body.activo);
   return ctx.db.tx(async (t) => {
+    await PB.bloquearPrecios(t, ctx);
+    const antes = id ? await N.exigir(t, ctx, "predio_boca", id, "No encontramos la boca", { bloquear: true }) : null;
+    const datos = validarBoca({ ...antes, ...ctx.body });
+    if (ctx.body.activo !== undefined) datos.activo = U.bool(ctx.body.activo);
+    if (antes?.es_almacen && (!datos.es_almacen || datos.activo === 0)) throw U.error("Elegí otra boca como proveeduría antes de quitar la actual.", 409);
+    if (datos.es_almacen && Number(datos.activo ?? antes?.activo ?? 1) === 0) throw U.error("La proveeduría debe estar activa.", 409);
     const dup = await t.get("SELECT id FROM predio_boca WHERE predio_id = ? AND LOWER(nombre) = LOWER(?) AND id <> ?", [ctx.pid, datos.nombre, id || -1]);
     if (dup) throw U.error("Ya hay una boca con ese nombre", 409);
     if (datos.es_almacen) {
@@ -450,14 +466,15 @@ async function guardarBoca(ctx) {
       datos.es_origen = 1;
     }
     if (id) {
-      const antes = await N.exigir(t, ctx, "predio_boca", id, "No encontramos la boca");
       await N.actualizar(t, ctx, "predio_boca", id, datos);
       const cambios = N.diferencias(antes, await N.obtener(t, ctx, "predio_boca", id));
+      if (cambios.margen_venta) await PB.registrarMargenBoca(t, ctx, id);
       if (Object.keys(cambios).length) await N.auditar(t, ctx, "Modificación de boca", "boca", id, cambios);
       return { id, mensaje: "Boca actualizada" };
     }
     const orden = await t.get("SELECT COALESCE(MAX(orden), 0) + 1 AS o FROM predio_boca WHERE predio_id = ?", [ctx.pid]);
     const nuevo = await N.insertar(t, ctx, "predio_boca", { ...datos, activo: 1, orden: Number(orden.o) });
+    if (datos.margen_venta != null) await PB.registrarMargenBoca(t, ctx, nuevo);
     await N.auditar(t, ctx, "Alta de boca", "boca", nuevo, datos);
     return { id: nuevo, mensaje: "Boca creada" };
   });
@@ -590,7 +607,7 @@ async function guardarConfigApi(ctx) {
 }
 
 module.exports = {
-  precioVenta,
+  precioVenta: PB.precioVenta,
   rutas: [
     { m: "GET", p: "/opciones/:fuente", h: opciones },
     { m: "GET", p: "/productos/buscar", h: buscarProductos },

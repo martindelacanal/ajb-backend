@@ -14,6 +14,7 @@
 
 const U = require("./util");
 const N = require("./negocio");
+const { redondearVenta } = require("./precio-boca");
 const { IMPORTADOR } = require("./listados");
 
 const DESTINOS = ["VENTA_DIRECTA", "VENTA_COMPUESTA", "USO_INTERNO", "ALQUILER"];
@@ -56,7 +57,7 @@ function limpiarProducto(p) {
     codigo: texto(p.codigo, 60),
     precio_compra: compra,
     margen: numero(p.margen, -100, 10000),
-    precio_venta: venta,
+    precio_venta: redondearVenta(venta),
     destino: DESTINOS.includes(p.destino) ? p.destino : "VENTA_DIRECTA",
     perecedero: p.perecedero ? 1 : 0,
     referencia: ref ? {

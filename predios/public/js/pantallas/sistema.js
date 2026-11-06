@@ -13,7 +13,7 @@
       { ruta: "/sistema/autorizaciones", texto: "Autorizaciones" },
       { ruta: "/sistema/auditoria", texto: "Auditoría" },
     ];
-    c.appendChild(h("div.pagina-cabecera", h("div", h("h1.titulo-pagina", "Sistema"), h("p.subtitulo", "Conexión con el sistema general, respaldos, configuración y registro de todo lo que se hizo."))));
+    c.appendChild(h("div.pagina-cabecera", h("h1.titulo-pagina", "Sistema")));
     c.appendChild(h("nav.solapas", items.map(function (s) { return h("a.solapa", { href: "#" + s.ruta, "aria-current": actual === s.ruta ? "page" : null }, s.texto); })));
   }
 
@@ -159,8 +159,7 @@
       return;
     }
     var zona = h("div.columna", P.cargando());
-    if (P.panelGrupoLocal) c.appendChild(P.panelGrupoLocal());
-    c.appendChild(zona);
+    c.appendChild(h("div.columna.sistema-estado", P.panelGrupoLocal ? P.panelGrupoLocal() : null, zona));
     var accionServidor = false;
     var temporizadorReinicio = null;
     var inicioServidor = null;
@@ -313,7 +312,7 @@
               P.btn("Crear respaldo ahora", { tipo: "secundario", icono: "historial", onclick: function (ev) {
                 P.ejecutar(ev.currentTarget, function () { return P.post("/sistema/respaldo").then(function (r) { P.aviso(r.mensaje, "ok"); cargar(); }); }).catch(function () {});
               } })),
-            h("p.texto-3", "Se hace una copia por día automáticamente (se guardan 30). Base actual: " + tamano(d.base_datos.tamano) + "."),
+            h("p.texto-3", "Se crea una copia diaria. Se conservan los 30 respaldos más recientes, incluidos los manuales. Base actual: " + tamano(d.base_datos.tamano) + "."),
             d.respaldos.length ? h("ul.lista-simple", d.respaldos.slice(0, 12).map(function (x) {
               return h("li", h("span", x.nombre), h("div.fila", h("span.texto-3.chico", tamano(x.tamano)),
                 P.btn("", { tipo: "texto", chico: true, icono: "descargar", etiqueta: "Descargar", onclick: function () { P.descargar("/sistema/respaldos/" + encodeURIComponent(x.nombre), x.nombre).catch(P.error); } })));
@@ -374,7 +373,6 @@
 
   P.ruta.registrar(/^\/sistema\/auditoria$/, function (c) {
     solapas(c, "/sistema/auditoria");
-    c.appendChild(h("p.texto-3", { style: { marginTop: "-6px" } }, "Todo lo que se hizo en el sistema, quién y cuándo (también los cambios hechos a distancia desde el sistema general)."));
     c.appendChild(P.tabla({
       listado: "auditoria",
       alClickFila: function (f) {

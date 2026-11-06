@@ -105,7 +105,7 @@ test("saldo personal, reparto, venta mixta y reversión conservan stock, caja y 
   const p = await call("POST", "/productos", {
     nombre: "Producto",
     destino: "VENTA_DIRECTA",
-    precio_venta_manual: 50
+    precio_venta_manual: 100
   });
   await db.tx(tx => N.moverStock(tx, ctx, {
     bocaId: caja.boca_id,
@@ -116,7 +116,7 @@ test("saldo personal, reparto, venta mixta y reversión conservan stock, caja y 
   const venta = {
     items: [{
       producto_id: p.id,
-      cantidad: 1
+      cantidad: 0.5
     }],
     forma_pago: "MIXTO",
     pagos: [{
@@ -140,6 +140,10 @@ test("saldo personal, reparto, venta mixta y reversión conservan stock, caja y 
   assert.equal(resumen.ventas_efectivo, 20);
   assert.equal(resumen.saldo_esperado, 120);
   assert.equal((await call("GET", "/saldos/presentes", {}, { q: "99.911.223" }))[0].id, b.id);
+  const sugerencias = await call("GET", "/saldos/presentes", {}, { q: "99.911" });
+  assert.deepEqual(sugerencias.map(p => p.id).sort(), [a.id, b.id].sort());
+  assert.ok(sugerencias.every(p => !p.exacto));
+  assert.deepEqual(await call("GET", "/saldos/presentes", {}, { q: "%" }), []);
   assert.equal((await cuenta()).saldo, 70);
   assert.equal((await db.get("SELECT importe FROM predio_caja_movimiento WHERE venta_id=?", [v.id])).importe, 20);
   await assert.rejects(call("POST", "/ventas", venta), /saldo no alcanza/);
@@ -190,7 +194,9 @@ test("saldo personal, reparto, venta mixta y reversión conservan stock, caja y 
     habilitado_descuento: 1,
     origen: "SISTEMA"
   }));
-  const mixta = await call("POST", "/ventas", {
+  assert.deepEqual((await call("GET", "/saldos/presentes", {}, { q: "l-2" })).map(p => [p.id, p.exacto]), [[a.id, false]]);
+  assert.deepEqual((await call("GET", "/saldos/presentes", {}, { q: "l-23" })).map(p => [p.id, p.exacto]), [[a.id, true]]);
+  await assert.rejects(call("POST", "/ventas", {
     items: venta.items,
     forma_pago: "MIXTO",
     pagos: [{
@@ -201,13 +207,8 @@ test("saldo personal, reparto, venta mixta y reversión conservan stock, caja y 
       forma: "QR",
       importe: 25
     }]
-  });
-  assert.equal(mixta.ticket.venta.importe_haberes, 25);
-  assert.equal(mixta.ticket.afiliado.id, afiliado);
-  const liq = await call("POST", "/afiliados/" + afiliado + "/liquidaciones", {
-    forma_pago: "DESCUENTO_HABERES"
-  });
-  assert.equal(liq.total, 25);
+  }), /Elegí Saldo/);
+  await assert.rejects(call("POST", "/ventas", { items: venta.items, forma_pago: "SALDO", huesped_id: a.id }), /saldo no alcanza/);
   const carga = {
     operacion: U.uuid(),
     accion: "CARGA",
@@ -219,11 +220,13 @@ test("saldo personal, reparto, venta mixta y reversión conservan stock, caja y 
   await mover(carga);
   assert.equal((await cuenta()).saldo, 80);
   await mover({ accion: "CARGA", medio: "TRANSFERENCIA", huesped_id: a.id, importe: 10 });
-  await call("POST", "/ventas", {
-    items: venta.items,
-    forma_pago: "SALDO",
-    huesped_id: a.id
+  const mixta = await call("POST", "/ventas", {
+    items: [{ producto_id: p.id, cantidad: 1 }], forma_pago: "MIXTO",
+    pagos: [{ forma: "SALDO", huesped_id: a.id, importe: 50 }, { forma: "QR", importe: 50 }]
   });
+  assert.deepEqual(mixta.ticket.pagos.map(p => [p.forma, p.importe]), [["SALDO", 50], ["QR", 50]]);
+  assert.equal(mixta.ticket.venta.importe_haberes, null);
+  assert.equal((await cuenta()).saldo, 40);
   // Ficha manual aún sin enlazar por la sincronización de Turismo.
   await db.tx(tx => N.actualizar(tx, ctx, "predio_afiliado", afiliado, { usuario_general_id: null, origen: "MANUAL" }));
   const pedidoPlanilla = { operacion: U.uuid(), accion: "LIQUIDAR", medio: "HABERES", esperado: 40 };

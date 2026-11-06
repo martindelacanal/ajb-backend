@@ -75,7 +75,7 @@ SI ALGO NO ANDA
 ---------------
 - C:\AJB-Predio\herramientas\reiniciar-servidor.bat  reinicia el sistema.
 - C:\AJB-Predio\logs\  tiene los registros de cada día.
-- C:\AJB-Predio\datos\respaldos\  tiene una copia de la base por día (30 días).
+- C:\AJB-Predio\datos\respaldos\  conserva las últimas 30 copias de la base (diarias y manuales).
 - Volver a ejecutar INSTALAR.bat repara la instalación SIN borrar los datos.
 - Desde Mi AJB > Predios la administración puede reiniciar, actualizar o pedir los
   registros a distancia (sin TeamViewer).

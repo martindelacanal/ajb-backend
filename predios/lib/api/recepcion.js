@@ -276,15 +276,15 @@ async function buscarSaldo(ctx) {
     max: 30,
     requerido: true
   });
-  const documento = /^[\d.\s-]+$/.test(q) ? q.replace(/[.\s-]/g, "") : q;
-  return ctx.db.all(`SELECT h.id,h.reserva_id,h.dni,h.nombre,h.saldo,
-     CASE WHEN a.habilitado_descuento=1 THEN COALESCE(a.limite,0) - (
-       SELECT COALESCE(SUM(COALESCE(v.importe_haberes,v.total)),0) FROM predio_venta v
-       WHERE v.predio_id=a.predio_id AND v.afiliado_id=a.id AND (v.forma_pago='DESCUENTO' OR v.importe_haberes>0)
-       AND v.estado='CONFIRMADA' AND v.liquidacion_id IS NULL) ELSE 0 END AS disponible_haberes
-    FROM predio_huesped h LEFT JOIN predio_afiliado a ON a.predio_id=h.predio_id AND a.dni=h.dni AND a.usuario_general_id IS NOT NULL
-    WHERE h.predio_id=? AND h.entrada IS NOT NULL AND h.salida IS NULL AND (h.dni=? OR h.legajo=?)
-    ORDER BY h.id LIMIT 10`, [ctx.pid, documento, q]);
+  const documento = /^[\d.\s-]+$/.test(q) ? q.replace(/[.\s-]/g, "") : "";
+  const legajo = q.toUpperCase();
+  const prefijoLegajo = legajo.replace(/[!%_]/g, "!$&") + "%";
+  const filas = await ctx.db.all(`SELECT id,reserva_id,dni,legajo,nombre,saldo FROM predio_huesped
+    WHERE predio_id=? AND entrada IS NOT NULL AND salida IS NULL
+      AND (dni LIKE ? OR UPPER(legajo) LIKE ? ESCAPE '!')
+    ORDER BY CASE WHEN dni=? OR UPPER(legajo)=? THEN 0 ELSE 1 END, nombre, reserva_id, id LIMIT 10`,
+    [ctx.pid, documento ? documento + "%" : null, prefijoLegajo, documento, legajo]);
+  return filas.map(h => ({ ...h, exacto: h.dni === documento || String(h.legajo || "").toUpperCase() === legajo }));
 }
 async function aplicarVenta(t, ctx, huespedId, n, venta, reversa = false) {
   const h = await N.exigir(t, ctx, "predio_huesped", U.id(huespedId), "No encontramos al huésped", {

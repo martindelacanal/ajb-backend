@@ -124,7 +124,7 @@ test("Origen ya no aparece ni se aplica desde preferencias antiguas en Productos
   const meta = listados.meta({ usuario: { rol: "ADMIN" } }, "productos");
   assert.equal(meta.filtros.some(f => f.clave === "origen"), false);
   assert.equal(meta.columnas.some(c => c.clave === "almacen"), false);
-  assert.equal(listados.meta({ usuario: { rol: "ADMIN" } }, "bocas").columnas.some(c => c.clave === "es_almacen"), false);
+  assert.equal(listados.meta({ usuario: { rol: "ADMIN" } }, "bocas").columnas.find(c => c.clave === "es_almacen").titulo, "Proveeduría");
   assert.equal(t.el.querySelector(".tabla-filtros-numero").textContent, "1");
   t.el.querySelector(".tabla-exportar").disparar("click"); s.menus.at(-1)[0].accion(); await resolver();
   for (const ruta of [s.solicitudes.at(-1), s.descargas.at(-1)]) {

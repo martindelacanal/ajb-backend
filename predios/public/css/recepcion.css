@@ -1,3 +1,4 @@
+.rec-listado-filtros {margin-bottom:18px;overflow:hidden;}
 .pagina > .rec-seccion, .pagina > .rec-resumen {margin-bottom:18px;}
 .rec-seccion {margin: 0 0 18px;padding: 20px;}
 .rec-seccion > h2,.rec-cotizacion h3 {margin:0 0 10px;font-size:19px;color:var(--azul-hondo);}

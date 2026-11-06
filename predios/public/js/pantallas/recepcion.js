@@ -94,7 +94,7 @@
     return h("span", v);
   }
   P.ruta.registrar(/^\/recepcion$/, function (c) {
-    var q = input(""),
+    var q = P.input({ tipo: "search", max: 80, placeholder: "Buscar por titular, DNI o reserva…" }),
       desde = input(P.hoy(), "date"),
       hasta = input("", "date"),
       tipo = sel(opciones(TIPOS), "", "Todos"),
@@ -138,23 +138,36 @@
         })) : P.mensaje("No hay reservas con esos filtros. Podés cambiar las fechas o crear una reserva.", "info"), h("div.fila", ant, espacio("Página " + pag), sig));
       });
     }
-    var seq = 0;
+    var seq = 0, espera;
     function filtrar() {
+      clearTimeout(espera);
       pag = 1;
-      return cargar();
+      actualizarBoton();
+      cargar().catch(P.error);
     }
-    c.appendChild(cab("Reservas y estadías", "Recepción del predio", btn("Crear reserva", function () {
-      ir("nueva");
-    }, "primario")));
-    var form = h("form.hoja.rec-seccion", {
-      onsubmit: function (e) {
-        e.preventDefault();
-        filtrar().catch(P.error);
-      }
-    }, grid(P.campo("Titular, DNI o reserva", q), P.campo("Desde", desde), P.campo("Hasta", hasta), P.campo("Servicio", serv), P.campo("Tipo", tipo), P.campo("Ocupación", presencia)), h("div.fila", at, h("button.btn.btn-secundario", {
-      type: "submit"
-    }, "Aplicar filtros")));
-    c.appendChild(form);
+    P.alSalir(function () { clearTimeout(espera); seq++; });
+    c.appendChild(cab("Reservas y estadías", null, P.btn("Crear reserva", { tipo: "primario", icono: "mas", onclick: function () { ir("nueva"); } })));
+    q.setAttribute("aria-label", "Buscar por titular, DNI o reserva");
+    q.addEventListener("input", function () { clearTimeout(espera); seq++; espera = setTimeout(filtrar, 300); });
+    q.addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); filtrar(); } });
+    var panel = h("div.tabla-filtros#recepcion-filtros", { role: "region", "aria-label": "Filtros de reservas", hidden: true },
+      h("div.filtro-rango-fechas", { role: "group", "aria-label": "Rango de fechas" }, P.campo("Desde", desde), P.campo("Hasta", hasta)),
+      P.campo("Servicio", serv), P.campo("Tipo", tipo), P.campo("Ocupación", presencia), at);
+    panel.addEventListener("change", filtrar);
+    var cantidad = h("span.tabla-filtros-numero", { "aria-hidden": "true" });
+    var filtros = P.btn("Filtros", { tipo: "secundario", icono: "filtro", onclick: function () { panel.hidden = !panel.hidden; actualizarBoton(); } });
+    filtros.classList.add("tabla-boton-filtros");
+    filtros.setAttribute("aria-controls", panel.id);
+    filtros.appendChild(cantidad);
+    function actualizarBoton() {
+      var n = [desde.value, hasta.value, serv.value, tipo.value, presencia.value, at.input.checked].filter(Boolean).length;
+      cantidad.textContent = String(n);
+      cantidad.hidden = !n;
+      filtros.setAttribute("aria-label", "Filtros" + (n ? " (" + n + " activos)" : ""));
+      filtros.setAttribute("aria-expanded", String(!panel.hidden));
+    }
+    actualizarBoton();
+    c.appendChild(h("div.hoja.rec-listado-filtros", h("div.tabla-barra", P.campo(null, q, { clase: "tabla-buscar" }), filtros), panel));
     c.appendChild(out);
     return get("opciones").then(function (o) {
       o.servicios.forEach(function (s) {
@@ -565,7 +578,7 @@
     if (Number(r.afiliado)) {
       if (liquidar && n > 0) met.HABERES = MEDIOS.HABERES;else if (!liquidar) met.AL_SALIR = MEDIOS.AL_SALIR;
     }
-    var medio = sel(opciones(met)),
+    var medio = sel(opciones(met), accion === "LIQUIDAR" && met.HABERES ? "HABERES" : null),
       caja = sel([], null, "Elegí una caja"),
       campoCaja = P.campo("Caja de efectivo", caja);
     if (!repartir && (!liquidar || n)) P.opciones("cajas").then(function (xs) {

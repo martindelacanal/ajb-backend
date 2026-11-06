@@ -12,41 +12,31 @@
     return "Buenas tardes";
   };
 
-  function fechaLarga() {
-    var d = new Date(P.hoy() + "T12:00:00Z");
-    return new Intl.DateTimeFormat("es-AR", { weekday: "long", day: "numeric", month: "long", timeZone: "UTC" }).format(d);
-  }
-
   P.ruta.registrar(/^\/inicio$/, function (c) {
     var ses = P.estado.sesion;
     var nombre = String(ses.usuario.nombre || "").replace(" (sistema general)", "").split(" ")[0];
-    c.appendChild(h("div.pagina-cabecera",
-      h("div", h("h1.titulo-pagina", P.saludo() + ", " + nombre), h("p.subtitulo", "Hoy es " + fechaLarga() + ". Esto es lo que pasa en " + (ses.predio.nombre || "el predio") + "."))));
-    var cifras = h("div.grilla.grilla-4");
-    var izquierda = h("div.columna");
-    var derecha = h("div.columna");
+    c.appendChild(h("div.pagina-cabecera", h("h1.titulo-pagina", P.saludo() + ", " + nombre)));
+    var cifras = h("div.grilla.inicio-cifras");
+    var cuerpo = h("div.grilla.inicio-cuerpo");
     c.appendChild(cifras);
-    c.appendChild(h("div.grilla", { style: { gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1fr)", marginTop: "16px" }, class: "inicio-cuerpo" }, izquierda, derecha));
-    var estilo = c.querySelector(".inicio-cuerpo");
-    if (window.innerWidth < 1000) estilo.style.gridTemplateColumns = "minmax(0, 1fr)";
+    c.appendChild(cuerpo);
     cifras.appendChild(P.cargando());
 
     function cargar() {
       return Promise.all([P.get("/inicio"), P.get("/caja/panel"), P.get("/avisos")]).then(function (r) {
         var d = r[0], panel = r[1], avisos = r[2];
         P.reemplazar(cifras,
-          P.cifra("Ventas de hoy", P.f.entero(d.hoy.ventas), "En todas las bocas"),
-          P.cifra("Vendido hoy", P.f.pesos(d.hoy.total), "Todas las formas de pago"),
-          P.cifra("Efectivo en cajas", P.f.pesos(d.efectivo_en_cajas), "Según los movimientos de caja"),
-          P.cifra("Afiliados en el predio", P.f.entero(d.afiliados_en_predio), h("a", { href: "#/gestion/afiliados?en_predio=1" }, "Ver quiénes son")));
-        P.reemplazar(izquierda,
-          h("div.hoja.hoja-cuerpo", h("div.fila-separada", h("h2.seccion-titulo", "Ventas de hoy por boca"), h("a.chico", { href: "#/estadisticas" }, "Estadísticas")),
-            h("div", { style: { marginTop: "14px" } }, P.barrasH(d.hoy.por_boca.map(function (b) { return { etiqueta: b.boca + " (" + b.ventas + ")", valor: b.total }; }), { formato: P.f.pesos }))),
-          h("div.hoja.hoja-cuerpo", h("div.fila-separada", h("h2.seccion-titulo", "Últimas ventas"), h("a.chico", { href: "#/estadisticas/ventas" }, "Ver todas")),
+          P.cifra("Ventas de hoy", P.f.entero(d.hoy.ventas)),
+          P.cifra("Vendido hoy", P.f.pesos(d.hoy.total)),
+          P.cifra("Efectivo en cajas", P.f.pesos(d.efectivo_en_cajas)),
+          P.cifra("Afiliados en el predio", P.f.entero(d.afiliados_en_predio)));
+        var porBoca = h("section.hoja.hoja-cuerpo", h("h2.seccion-titulo", "Ventas de hoy por boca"),
+          P.barrasH(d.hoy.por_boca.map(function (b) { return { etiqueta: b.boca + " (" + b.ventas + ")", valor: b.total }; }), { formato: P.f.pesos }));
+        var ultimas = h("section.hoja.hoja-cuerpo", h("h2.seccion-titulo", "Últimas ventas"),
             d.ultimas_ventas.length ? h("ul.lista-simple", d.ultimas_ventas.map(function (v) {
               return h("li", h("div", h("strong", "N° " + v.id + " · " + v.boca), h("div.texto-3.chico", P.f.fechaHora(v.fecha) + " · " + (P.FORMAS[v.forma_pago] || v.forma_pago) + (v.afiliado_nombre ? " · " + v.afiliado_nombre : ""))),
                 h("strong.dinero", P.f.pesos(v.total)));
-            })) : h("p.texto-3", "Todavía no hay ventas.")));
+            })) : h("p.texto-3", "Todavía no hay ventas."));
         var pendientes = [];
         (avisos.permisos || []).forEach(function (p) {
           pendientes.push(h("li", h("div", h("strong", p.usuario_nombre), h("div.texto-3.chico", ({ SOLICITUD_PRODUCTO: "Pide permiso para pedir productos", ANULAR_VENTA: "Pide anular una venta", VER_VENTAS_CAJA: "Pide ver las ventas de la caja" })[p.tipo] + (p.boca ? " · " + p.boca : "") + (p.detalle ? " · " + p.detalle : ""))),
@@ -66,15 +56,15 @@
           pendientes.push(h("li", h("div", h("strong", "Vencimientos"), h("div.texto-3.chico", avisos.vencimientos + " producto(s) vencidos o que vencen en 7 días")),
             P.btn("Ver", { tipo: "secundario", chico: true, onclick: function () { P.cache["tabla:productos"] = { filtros: { vencimiento: "7" } }; P.ruta.ir("/gestion/productos"); } })));
         }
-        P.reemplazar(derecha,
-          h("div.hoja.hoja-cuerpo", h("h2.seccion-titulo", "Para resolver"),
+        P.reemplazar(cuerpo, porBoca,
+          h("section.hoja.hoja-cuerpo", h("h2.seccion-titulo", "Para resolver"),
             pendientes.length ? h("ul.lista-simple", pendientes) : h("p.texto-3", { style: { marginBottom: 0 } }, "Nada pendiente por ahora.")),
-          h("div.hoja.hoja-cuerpo", h("div.fila-separada", h("h2.seccion-titulo", "Cajas"), h("a.chico", { href: "#/caja" }, "Ir a caja")),
+          ultimas, h("section.hoja.hoja-cuerpo", h("h2.seccion-titulo", "Cajas"),
             panel.cajas.length ? h("ul.lista-simple.inicio-cajas", panel.cajas.map(function (cj) {
               var ap = cj.apertura;
               return h("li", h("div",
                 h("strong", cj.boca + " · " + cj.nombre),
-                h("div.texto-3.chico", (cj.turno ? "Atiende " + cj.turno.usuario_nombre : "Sin turno abierto") + " · " + cj.ventas_cantidad + " venta(s) desde el último cierre")),
+                h("div.texto-3.chico", cj.turno ? "Atiende " + cj.turno.usuario_nombre : "Sin turno abierto")),
                 h("div", { style: { textAlign: "right" } }, h("strong.dinero", P.f.pesos(cj.saldo)), h("div", { style: { marginTop: "4px" } },
                   !ap ? P.chip("Sin saldo de apertura", "VENCIDO") : ap.verificacion === "CORRECTO" ? P.chip("Apertura confirmada", "CORRECTO") : ap.verificacion === "NO_COINCIDE" ? P.chip("Apertura no coincide", "NO_COINCIDE") : P.chip("Apertura sin confirmar", "PENDIENTE"))));
             })) : h("p.texto-3", "No hay cajas. Crealas en Gestión > Bocas y cajas.")));
