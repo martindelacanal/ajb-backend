@@ -13,6 +13,7 @@ const { validarPassword } = require("../security/password-policy");
 const { DNI_MENSAJE, esDniValido } = require("../security/dni");
 const { verificarTokenConAutorizacionActual, resolverAccesoFamiliar, ErrorSesionUsuario } = require("../security/autorizacion-sesion");
 const { crearSesion } = require("../security/sesiones-persistentes");
+const { ingresarPredio } = require("../security/predios-acceso");
 const { datosPublicosAcceso, exigirAccesoCuenta, exigirAltaParaUsuario, ErrorRestriccionCuenta, cuerpoRestriccion } = require("../security/restricciones-cuenta");
 const { condicionModuloNotificacion } = require("../services/notificaciones-modulos");
 const { crearNotificacion, obtenerPreferenciasNotificaciones, guardarPreferenciasNotificaciones } = require("../services/notificaciones");
@@ -735,6 +736,25 @@ router.delete("/admin/login/imagenes/:id", verifyToken, async (req, res) => {
 router.post("/signin", async (req, res) => {
   const { documento, password, recordar, validas } = normalizarCredencialesSignin(req.body);
 
+  async function ingresarCuentaPredio() {
+    try {
+      const resultado = await ingresarPredio({ db: mysqlConnection.promise(), identificador: documento, password, recordar, predioCodigo: req.body?.predio });
+      return res.status(200).json(resultado);
+    } catch (e) {
+      const status = e.statusCode || e.status;
+      if (status && status < 500) return res.status(status).json({ mensaje: e.message, codigo: e.codigo || e.code, ...(e.predios ? { predios: e.predios } : {}) });
+      console.error("[signin-predio] Operación no disponible:", e?.code || "error_interno");
+      return res.status(503).json({ mensaje: "No pudimos verificar el acceso al predio. Volvé a intentar en unos minutos." });
+    }
+  }
+
+  // Los DNI generales existentes conservan prioridad; una contraseña incorrecta
+  // nunca cambia silenciosamente de identidad. Un selector resuelve homónimos.
+  if (req.body?.predio || !/^\d{1,10}$/.test(documento)) {
+    if (!/^[a-zA-Z0-9._-]{1,60}$/.test(documento) || !password || password.length > 128) return res.status(400).json("Usuario o contraseña inválidos");
+    return ingresarCuentaPredio();
+  }
+
   if (!validas) {
     return res.status(400).json("Documento o contraseña invalidos");
   }
@@ -773,6 +793,8 @@ router.post("/signin", async (req, res) => {
             res.status(500).json("Error interno");
           }
         }
+      } else if (!rows.length) {
+        return ingresarCuentaPredio();
       } else {
         res.status(401).send();
       }

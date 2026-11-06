@@ -600,6 +600,11 @@ table.tabla { width: 100%; border-collapse: separate; border-spacing: 0; font-si
 .lista-simple { margin: 0; padding: 0; list-style: none; }
 .lista-simple li { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 11px 0; border-bottom: 1px solid var(--linea); }
 .lista-simple li:last-child { border-bottom: 0; }
+.inicio-cajas li { flex-wrap: wrap; align-items: flex-start; }
+.inicio-cajas li > div { min-width: 0; max-width: 100%; }
+.inicio-cajas li > div:first-child { flex: 1 1 180px; overflow-wrap: anywhere; }
+.inicio-cajas li > div:last-child { margin-left: auto; }
+.inicio-cajas .chip { max-width: 100%; white-space: normal; }
 
 .paso-cuenta { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 50%; background: var(--cielo); color: var(--azul); font-weight: 800; }
 .esperando { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 18px; text-align: center; }

@@ -103,6 +103,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
   async function pedir(metodo, ruta, { cuerpo, binario = false, timeout = 20000, crudo = false } = {}) {
     const url = `${String(config.servidor).replace(/\/+$/, "")}/predios-sync${ruta}`;
     const cabeceras = { Authorization: `Bearer ${config.token}`, "X-Predio": String(config.predio_codigo || ""), "X-Predio-Instancia": instancia, "X-Predio-Equipo": equipoId };
+    cabeceras["X-Predio-Capacidades"] = "cuentas-predio-v1";
     if (!/^\/(?:version|codigo)(?:\?|$)/.test(ruta)) {
       if (!puedeSincronizar()) throw U.error("Esta PC está en espera: sólo el servidor actual sincroniza con el sistema general", 503);
       if (grupoLocal().habilitado) {

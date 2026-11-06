@@ -17,8 +17,10 @@ camping, funciona sin internet y se sincroniza con el sistema general.
 | `public/` | Pantallas (HTML + CSS + JavaScript sin compilar, compatible con Chrome 80+ / Firefox 78+). |
 | `windows/` | Instalador (`INSTALAR.bat` + `instalar.ps1`) y utilidades para la notebook y las PCs de caja. |
 
-En el backend central: `api/routes/predios.js` (tres routers) y `api/services/predios-central.js`;
-la migración es `scripts/migrar-predios.js`. En el front Angular: `src/app/components/predios/`.
+En el backend central: `api/routes/predios.js` (administración general, cuentas propias,
+sincronización y pantalla remota) y `api/services/predios-central.js`. La migración del modelo
+es `scripts/migrar-predios.js`; las sesiones de cuentas propias usan
+`scripts/migrar-predios-acceso.js`. En el front Angular: `src/app/components/predios/`.
 
 ## Cómo se sincroniza
 
@@ -37,6 +39,12 @@ la migración es `scripts/migrar-predios.js`. En el front Angular: `src/app/comp
   mano se une solo con su ficha cuando coincide el DNI o el legajo.
 - **Administradores generales**: entran en el camping con DNI y contraseña de Mi AJB. La primera
   vez se valida contra el sistema general; después queda un hash local para entrar sin internet.
+- **Administradores propios del predio**: también pueden entrar por el login de Mi AJB con su
+  usuario y contraseña del camping. Se abre únicamente su predio. La cuenta debe estar activa,
+  tener rol `ADMIN` y haber llegado a la réplica central mediante la sincronización. Si hay
+  cuentas con las mismas credenciales en varios predios, el login pide elegir uno. Ver
+  [Ingreso remoto de cuentas propias](docs/acceso-remoto.md), incluida la actualización necesaria
+  para aplicar sus órdenes en el camping.
 - **Sin internet por días**: en el camping, Sistema → *Exportar datos* (`.ajbpredio`) para subir en
   Mi AJB; y en Mi AJB, *Descargar paquete* (`.ajbpaquete`: afiliados, órdenes en cola y, opcional,
   la versión nueva) para cargar en el camping.
@@ -76,6 +84,19 @@ DB_HOST=… DB_USER=admin DB_PASSWORD=… node scripts/migrar-predios.js --allow
 La migración es idempotente: crea/completa las tablas, siembra MIRAMAR (14 bocas, 6 cajas) y
 otorga DML a `miajb_runtime` en cada host que tenga. Si se agregan columnas a `lib/esquema.js`,
 volver a correrla en las dos bases (la notebook se actualiza sola al arrancar).
+
+Para habilitar el ingreso de administradores propios desde Mi AJB, aplicar además la migración
+de sesiones **sólo en las bases centrales**, antes de publicar el acceso:
+
+```sh
+node scripts/migrar-predios-acceso.js --check --target=develop
+node scripts/migrar-predios-acceso.js --apply --target=develop
+# Producción: usa su bloque del .env y exige TLS verify-full.
+node scripts/migrar-predios-acceso.js --apply --target=production --allow-production
+```
+
+Esta migración crea `predio_acceso_sesion` y concede DML sobre esa tabla a `miajb_runtime`.
+Conserva las cuentas existentes y el esquema de las notebooks; no crea usuarios generales.
 
 ## Catálogo del sistema anterior
 

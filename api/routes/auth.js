@@ -7,6 +7,7 @@ const { enviarCorreoPlantilla } = require("../services/correo");
 const { crearServicioRecuperacion, ErrorRecuperacion, MENSAJE_SOLICITUD } = require("../security/recuperacion-password");
 const { renovarSesion, cerrarSesion, ErrorAutenticacion } = require("../security/sesiones-persistentes");
 const { ErrorRestriccionCuenta, cuerpoRestriccion } = require("../security/restricciones-cuenta");
+const { renovarSesionPredio, cerrarSesionPredio, esTokenPredio } = require("../security/predios-acceso");
 
 async function enviarCodigo({ para, codigo }) {
   return enviarCorreoPlantilla({
@@ -26,6 +27,7 @@ function crearRouterAuth({ db = mysqlConnection.promise(), jwtSecret = process.e
   const router = express.Router();
   const recuperacion = crearServicioRecuperacion({ db, jwtSecret, enviarCodigo: enviar });
   const responderError = (res, error) => {
+    if ((error.statusCode || error.status) === 401 && (error.codigo || error.code)) return res.status(401).json({ mensaje: error.message, code: "SESSION_REVOKED" });
     if (error.code === "PASSWORD_POLICY") return res.status(400).json({ mensaje: error.message, code: error.code, politicaPassword: error.politicaPassword });
     if (error instanceof ErrorRestriccionCuenta) return res.status(error.statusCode).json(cuerpoRestriccion(error));
     if (error instanceof ErrorRecuperacion || error instanceof ErrorAutenticacion) {
@@ -38,12 +40,19 @@ function crearRouterAuth({ db = mysqlConnection.promise(), jwtSecret = process.e
   };
 
   router.post("/sesion/renovar", async (req, res) => {
-    try { res.json(await renovarSesion({ db, refreshToken: req.body?.refreshToken, jwtSecret })); }
+    try {
+      const renovar = String(req.body?.refreshToken || "").startsWith("predio.") ? renovarSesionPredio : renovarSesion;
+      res.json(await renovar({ db, refreshToken: req.body?.refreshToken, jwtSecret }));
+    }
     catch (error) { responderError(res, error); }
   });
   router.post("/sesion/cerrar", async (req, res) => {
     try {
       const bearer = /^Bearer ([^\s]+)$/.exec(req.headers.authorization || "");
+      if ((bearer && esTokenPredio(bearer[1])) || String(req.body?.refreshToken || "").startsWith("predio.")) {
+        await cerrarSesionPredio({ db, token: bearer?.[1], refreshToken: req.body?.refreshToken, jwtSecret });
+        return res.status(204).end();
+      }
       let sid;
       if (bearer) {
         try { sid = jwt.verify(bearer[1], jwtSecret, { ignoreExpiration: true }).sid; }

@@ -70,7 +70,7 @@
           h("div.hoja.hoja-cuerpo", h("h2.seccion-titulo", "Para resolver"),
             pendientes.length ? h("ul.lista-simple", pendientes) : h("p.texto-3", { style: { marginBottom: 0 } }, "Nada pendiente por ahora.")),
           h("div.hoja.hoja-cuerpo", h("div.fila-separada", h("h2.seccion-titulo", "Cajas"), h("a.chico", { href: "#/caja" }, "Ir a caja")),
-            panel.cajas.length ? h("ul.lista-simple", panel.cajas.map(function (cj) {
+            panel.cajas.length ? h("ul.lista-simple.inicio-cajas", panel.cajas.map(function (cj) {
               var ap = cj.apertura;
               return h("li", h("div",
                 h("strong", cj.boca + " · " + cj.nombre),

@@ -23,6 +23,7 @@ function prueba(par, { equipo = A, termino = 1, estado = {}, datos = {}, token =
 }
 function escenario(t, extra = {}) {
   const db = new DatabaseSync(":memory:");
+  db.function("JSON_UNQUOTE", v => v);
   t.after(() => db.close());
   db.exec(`CREATE TABLE predio(id INTEGER PRIMARY KEY, escritor TEXT, instancia_id TEXT, equipo_id TEXT, equipo TEXT,
     ultima_conexion TEXT, version_local TEXT, pendientes_local INTEGER, ultima_escritura_central TEXT);
@@ -240,4 +241,19 @@ test("HTTP: entrega y resultado del escritor HA vigente conservan la identidad r
   const fila = s.db.prepare("SELECT estado,status,resultado FROM predio_comando WHERE id=77").get();
   assert.equal(fila.estado, "OK"); assert.equal(fila.status, 201); assert.deepEqual(JSON.parse(fila.resultado), { aplicada: true });
   assert.equal(s.fila().equipo_id, A);
+});
+
+test("HTTP: sólo nodos con capacidad exacta reciben actores PREDIO; el filtro previo al límite no bloquea órdenes generales", async t => {
+  const s = escenario(t), p = claves(), fecha = Date.now();
+  const cabecera = prueba(p, { equipo: B, termino: 3, estado: { emitido_ms: fecha, vence_ms: fecha + 5000 } });
+  const url = await httpComandos(t, s);
+  const insertar = s.db.prepare("INSERT INTO predio_comando(id,predio_id,estado,tipo,metodo,ruta,actor) VALUES(?,1,'PENDIENTE','API','POST','/proveedores',?)");
+  for (let id = 1; id <= 21; id++) insertar.run(id, JSON.stringify({ tipo: "PREDIO", predio_id: 1, predio_usuario_id: 7 }));
+  const headers = { Authorization: `Bearer ${TOKEN}`, "X-Predio-Instancia": INSTANCIA, "X-Predio-Equipo": B, "X-Predio-HA": cabecera, "X-Predio-Capacidades": "cuentas-predio-v10" };
+  const viejo = await fetch(url + "/comandos", { headers }); assert.equal(viejo.status, 200);
+  assert.deepEqual((await viejo.json()).comandos.map(c => c.id), [77]);
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM predio_comando WHERE id<=21 AND estado='PENDIENTE'").get().n, 21);
+  const nuevo = await fetch(url + "/comandos", { headers: { ...headers, "X-Predio-Capacidades": "otra-capacidad, cuentas-predio-v1" } }); assert.equal(nuevo.status, 200);
+  const entregadas = (await nuevo.json()).comandos;
+  assert.equal(entregadas.length, 20); assert.ok(entregadas.every(c => c.actor.tipo === "PREDIO"));
 });

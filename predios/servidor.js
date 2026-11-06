@@ -26,6 +26,7 @@ const { leerTls, prepararTls } = require("./lib/tls-local");
 const { revisarPreciosVencidos } = require("./lib/precios");
 const { crearRespaldo } = require("./lib/respaldo-local");
 const { ejecutarPeticion } = require("./lib/peticiones-idempotentes");
+const { resolverActorRemoto } = require("./lib/actor-remoto");
 const { bloquearInstalacion } = require("./lib/bloqueo-local");
 const { aplicarPendiente } = require("./lib/respaldo-lan");
 const { leerConfiguracionLan, crearServicioLan } = require("./lib/servicio-lan");
@@ -161,14 +162,10 @@ async function ejecutarRemoto({ metodo, ruta, cuerpo, query, actor, db: dbOperac
   const encontrada = api.buscarRuta(metodo, ruta);
   if (!encontrada || encontrada.ruta.soloLocal || encontrada.ruta.publica) throw U.error("Operación no permitida a distancia", 403);
   const base = { db: dbOperacion, pid: config.predio_id, modo: "local", origen: "REMOTO", ip: "sistema-general", servicios };
-  const usuarioFila = await sesion.asegurarUsuarioGeneral(base, {
-    id: Number(actor?.general_id) || 0,
-    nombre: `${actor?.nombre || "Administración"} (sistema general)`,
-    documento: String(actor?.documento || actor?.general_id || "0"),
-  });
+  const usuarioRemoto = await resolverActorRemoto({ db: dbOperacion, pid: config.predio_id, actor });
   const ctx = {
     ...base,
-    usuario: { id: Number(usuarioFila.id), usuario: usuarioFila.usuario, nombre: usuarioFila.nombre, rol: "ADMIN", bocas: [], es_admin_general: true },
+    usuario: usuarioRemoto,
     sesion: {},
     query: query || {},
     body: cuerpo || {},

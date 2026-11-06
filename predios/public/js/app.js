@@ -106,6 +106,7 @@
     P.post("/logout", {}, { sinRedireccion: true }).catch(function () {}).then(function () {
       P.sesion.borrar();
       P.estado.sesion = null;
+      if (typeof P.notificarCierreRemoto === "function") P.notificarCierreRemoto();
       location.hash = "";
       iniciar();
     });
@@ -511,5 +512,8 @@
     });
   }
 
+  P.alRenovarSesionRemota = function () {
+    if (P.modo === "remoto" && !P.estado.sesion) iniciar();
+  };
   iniciar();
 })();

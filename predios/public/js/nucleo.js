@@ -243,6 +243,26 @@
       P.sesion.guardar(decodeURIComponent(m[1]), false);
       history.replaceState(null, "", location.pathname + "#/inicio");
     }
+    if (window.parent !== window && typeof window.addEventListener === "function") {
+      var origenSesionPadre = null;
+      var sesionRemotaCerrada = false;
+      try {
+        var paginaPadre = new URL(document.referrer);
+        if (paginaPadre.protocol === "https:" || paginaPadre.protocol === "http:") origenSesionPadre = paginaPadre.origin;
+      } catch (_e) { /* Sin un origen conocido no se aceptan credenciales. */ }
+      window.addEventListener("message", function (e) {
+        var datos = e.data;
+        if (sesionRemotaCerrada || !origenSesionPadre || e.source !== window.parent || e.origin !== origenSesionPadre || !datos
+          || datos.tipo !== "AJB_PREDIO_SESION" || datos.codigo !== P.predioCodigo
+          || typeof datos.token !== "string" || !datos.token || datos.token.length > 16384) return;
+        P.sesion.guardar(datos.token, false);
+        if (typeof P.alRenovarSesionRemota === "function") P.alRenovarSesionRemota();
+      });
+      P.notificarCierreRemoto = function () {
+        sesionRemotaCerrada = true;
+        if (origenSesionPadre) window.parent.postMessage({ tipo: "AJB_PREDIO_CERRAR", codigo: P.predioCodigo }, origenSesionPadre);
+      };
+    }
   }
 
   // ------------------------------------------------------------------ API
@@ -360,6 +380,12 @@
           : "No hay conexión con el sistema general.", 0);
       })
       .then(function (r) {
+        // Una respuesta de autenticación antigua puede llegar después del
+        // token renovado del padre. El servidor rechazó esa petición antes de
+        // ejecutar la API; se reintenta una sola vez con la sesión actual.
+        if (P.modo === "remoto" && r.status === 401 && P.sesion.token() && token !== P.sesion.token() && !opciones.renovacionReintentada) {
+          return P.api(metodo, ruta, cuerpo, Object.assign({}, opciones, { renovacionReintentada: true }));
+        }
         if (opciones.blob) {
           if (!r.ok) return r.json().catch(function () { return {}; }).then(function (j) { throw ErrorApi(j.mensaje || "No se pudo descargar", r.status, j); });
           return r.blob().then(function (b) {

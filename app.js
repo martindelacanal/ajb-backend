@@ -78,7 +78,7 @@ app.use('/api/signin', (req, res, next) => {
     return;
   }
 
-  const documento = String(req.body?.documento || '').trim().slice(0, 20);
+  const documento = String(req.body?.documento || '').trim().toLowerCase().slice(0, 60);
   const clave = `${req.ip}:${documento}`;
   const ahora = Date.now();
   let estado = intentosLogin.get(clave);
@@ -152,6 +152,7 @@ const turismoPlacasRoute = require('./api/routes/turismo-placas');
 // Portada pública (sin token) y placas de turismo: rutas propias, sin middleware global.
 app.use('/api', publicoRoute);
 app.use('/api', authRoute);
+app.use('/api', prediosRoutes.crearRouterCuenta());
 app.use('/api', usuariosAccesoRoute);
 app.use('/api', usuariosImportacionRoute);
 app.use('/api', turismoPlacasRoute);

@@ -27,6 +27,7 @@ const apiPredio = require("../../predios/lib/api");
 const sesionPredio = require("../../predios/lib/api/sesion");
 const { crearMysql } = require("../../predios/lib/db-mysql");
 const { TIPOS_PERMISO, textoDe } = require("../../predios/lib/listados");
+const { autenticarCuentaPredio, cerrarSesionPredio, esTokenPredio } = require("../security/predios-acceso");
 
 const pool = () => mysqlConnection.promise();
 const DIR_PUBLICO = path.join(C.DIR_PREDIOS, "public");
@@ -104,7 +105,10 @@ async function encolarYEsperar(res, predio, usuario, { metodo, ruta, cuerpo, que
   const [r] = await pool().query(
     "INSERT INTO predio_comando (predio_id, tipo, metodo, ruta, cuerpo, query, actor, descripcion, creado_por) VALUES (?, 'API', ?, ?, ?, ?, ?, ?, ?)",
     [predio.id, metodo, ruta, JSON.stringify(cuerpo || {}), JSON.stringify(query || {}), JSON.stringify(actor), `${metodo} ${ruta}`.slice(0, 255), usuario.id]);
-  const id = r.insertId;
+  return esperarComando(res, predio, r.insertId);
+}
+
+async function esperarComando(res, predio, id) {
   accesoRemoto.set(predio.codigo, Date.now());
   if (C.enLinea(predio)) {
     const limite = Date.now() + 15000;
@@ -125,6 +129,90 @@ async function encolarYEsperar(res, predio, usuario, { metodo, ruta, cuerpo, que
       ? "El predio está tardando en responder: el cambio quedó en cola y se aplica en unos segundos."
       : "El predio está sin conexión: el cambio quedó en cola y se aplica apenas vuelva internet.",
   });
+}
+
+function tokenBearer(req) {
+  const token = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization || "")?.[1];
+  if (!token) throw U.error("Iniciá sesión para continuar", 401, { codigo: "SIN_SESION" });
+  return token;
+}
+
+async function contextoCuentaPredio(db, predio, cuenta, ip = null) {
+  const bocas = (await db.all("SELECT id FROM predio_boca WHERE predio_id = ? AND activo = 1", [predio.id])).map(b => Number(b.id));
+  const base = { db, pid: predio.id, modo: "central", origen: "REMOTO", ip, servicios: {},
+    revisarPreciosCentral: predio.escritor === "CENTRAL",
+    usuario: { id: Number(cuenta.id), usuario: cuenta.usuario, nombre: cuenta.nombre, rol: "ADMIN", bocas, es_admin_general: false }, sesion: {} };
+  base.alAvisosPrecios = (t, filas) => entregarAvisos({ query: async (sql, params) => {
+    if (/^\s*SELECT/i.test(sql)) return [await t.all(sql, params)];
+    const r = await t.run(sql, params); return [{ insertId: r.insertId }];
+  } }, predio, filas);
+  base.alAvisosStock = base.alAvisosPrecios;
+  return base;
+}
+
+async function ejecutarComoAdminPredio(res, predio, cuenta, token, { metodo, ruta, cuerpo, query, ip }) {
+  const encontrada = apiPredio.buscarRuta(metodo, ruta);
+  if (!encontrada) throw U.error("No encontramos esa operación", 404);
+  if (encontrada.ruta.soloLocal) throw U.error("Esta operación se hace desde las PCs del camping", 409);
+  if (!encontrada.ruta.escritura) {
+    const db = crearMysql(pool(), { predioId: predio.id });
+    const base = await contextoCuentaPredio(db, predio, cuenta, ip);
+    if (predio.escritor === "CENTRAL" && (ruta === "/afiliados/buscar" || ruta.startsWith("/listados/afiliados") || ruta === "/inicio")) {
+      await C.refrescarMaestrosCentral(pool(), predio).catch(() => {});
+    }
+    return enviarResultado(res, await apiPredio.ejecutar({ ...base, body: cuerpo, query }, metodo, ruta));
+  }
+  const conexion = await pool().getConnection();
+  let salida;
+  try {
+    await conexion.beginTransaction();
+    const [[actual]] = await conexion.query("SELECT * FROM predio WHERE id = ? FOR UPDATE", [predio.id]);
+    const [[usuario]] = await conexion.query("SELECT * FROM predio_usuario WHERE predio_id = ? AND id = ? FOR UPDATE", [predio.id, cuenta.id]);
+    // La validación posterior al lock une token, contraseña vigente y actor. Un
+    // token viejo no puede tomar el hash nuevo después de un cambio de clave.
+    const vigente = await autenticarCuentaPredio({ db: conexion, token, jwtSecret: process.env.JWT_SECRET });
+    if (!actual || !Number(actual.activo) || Number(vigente.predio_id) !== Number(actual.id) || Number(vigente.id) !== Number(cuenta.id)
+      || !usuario || usuario.rol !== "ADMIN" || Number(usuario.activo) !== 1 || Number(usuario.es_admin_general) === 1) throw U.error("Tu cuenta ya no tiene acceso a este predio", 401, { codigo: "SIN_SESION" });
+    const p = C.normalizar(actual);
+    if (p.escritor === "CENTRAL") {
+      // Todo el negocio comparte la transacción que bloqueó la identidad; no
+      // crea un usuario del sistema general ni abre transacciones anidadas.
+      const db = crearMysql({ query: (...args) => conexion.query(...args), getConnection: async () => ({
+        query: (...args) => conexion.query(...args), beginTransaction: async () => {}, commit: async () => {}, rollback: async () => {}, release() {},
+      }) }, { predioId: p.id });
+      const base = await contextoCuentaPredio(db, p, vigente, ip);
+      const resultado = await apiPredio.ejecutar({ ...base, body: cuerpo, query }, metodo, ruta);
+      await conexion.query("UPDATE predio SET ultima_escritura_central = NOW() WHERE id = ?", [p.id]);
+      salida = { resultado, predio: p };
+    } else {
+      const [revisiones] = await conexion.query("SELECT id FROM predio_auditoria WHERE predio_id = ? AND entidad = 'usuario' AND entidad_id = ? ORDER BY id DESC LIMIT 1 FOR UPDATE", [p.id, usuario.id]);
+      const actor = { tipo: "PREDIO", predio_id: Number(p.id), predio_usuario_id: Number(usuario.id), credencial_sha256: U.sha256(usuario.password_hash), cuenta_revision: Number(revisiones[0]?.id || 0) };
+      const [r] = await conexion.query(
+        "INSERT INTO predio_comando (predio_id, tipo, metodo, ruta, cuerpo, query, actor, descripcion, creado_por) VALUES (?, 'API', ?, ?, ?, ?, ?, ?, ?)",
+        [p.id, metodo, ruta, JSON.stringify(cuerpo || {}), JSON.stringify(query || {}), JSON.stringify(actor), `${metodo} ${ruta}`.slice(0, 255), null]);
+      salida = { comandoId: r.insertId, predio: p };
+    }
+    await conexion.commit();
+  } catch (e) { await conexion.rollback(); throw e; }
+  finally { conexion.release(); }
+  return salida.comandoId ? esperarComando(res, salida.predio, salida.comandoId) : enviarResultado(res, salida.resultado);
+}
+
+function crearRouterCuenta() {
+  const router = express.Router();
+  async function cuenta(req) { return autenticarCuentaPredio({ db: pool(), token: tokenBearer(req), jwtSecret: process.env.JWT_SECRET }); }
+  router.get("/predios-cuenta/permisos", async (req, res) => {
+    try { res.json(await cuenta(req)); } catch (e) { responderError(res, e); }
+  });
+  router.post("/predios-cuenta/acceso", async (req, res) => {
+    try {
+      const actual = await cuenta(req), b = req.body || {};
+      if ((b.predio_id !== undefined && Number(b.predio_id) !== Number(actual.predio_id))
+        || [b.codigo, b.predio_codigo].some(c => c !== undefined && String(c).toUpperCase() !== actual.predio_codigo)) throw U.error("Tu cuenta sólo puede abrir su propio predio", 403);
+      res.json({ token: tokenBearer(req), ruta: `/predios-app/${actual.predio_codigo}/` });
+    } catch (e) { responderError(res, e); }
+  });
+  return router;
 }
 
 // ================================================================== ADMINISTRACIÓN
@@ -293,8 +381,11 @@ function crearRouterAdmin() {
   router.get("/predios/:codigo/paquete", proteger, async (req, res) => {
     try {
       const p = await predioDe(req);
-      const [comandos] = await pool().query(
+      const [pendientes] = await pool().query(
         "SELECT id, tipo, metodo, ruta, cuerpo, query, actor FROM predio_comando WHERE predio_id = ? AND estado IN ('PENDIENTE', 'ENTREGADO') ORDER BY id", [p.id]);
+      // Los importadores anteriores ejecutan las órdenes antes de actualizar su
+      // código. Las identidades propias sólo viajan por sync con capacidad v1.
+      const comandos = pendientes.filter(c => JSON.parse(c.actor || "null")?.tipo !== "PREDIO");
       const datos = {
         tipo: "predio-paquete", predio_id: p.id, predio_codigo: p.codigo, generado: U.fechaHora(),
         maestros: await C.armarMaestros(pool(), p),
@@ -504,11 +595,13 @@ function crearRouterSync() {
 
   router.get("/comandos", async (req, res) => {
     try {
+      const aceptaCuentasPredio = String(req.headers["x-predio-capacidades"] || "").split(",").some(c => c.trim() === "cuentas-predio-v1");
       const comandos = await conAutoridadSync(req, async (conexion, p) => {
         const [filas] = await conexion.query(
           `SELECT id, tipo, metodo, ruta, cuerpo, query, actor FROM predio_comando
            WHERE predio_id = ? AND (estado = 'PENDIENTE' OR (estado = 'ENTREGADO' AND entregado_en < NOW() - INTERVAL 60 SECOND))
-           ORDER BY id LIMIT 20`, [p.id]);
+             AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.tipo')), '') <> 'PREDIO')
+           ORDER BY id LIMIT 20`, [p.id, aceptaCuentasPredio ? 1 : 0]);
         if (filas.length) {
           await conexion.query(`UPDATE predio_comando SET estado = 'ENTREGADO', entregado_en = NOW(), intentos = intentos + 1 WHERE id IN (?)`, [filas.map(c => c.id)]);
         }
@@ -616,6 +709,14 @@ function crearRouterApp() {
   async function autenticar(req) {
     const token = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization || "")?.[1];
     if (!token) throw U.error("Abrí el predio desde el sistema general", 401, { codigo: "SIN_SESION" });
+    if (esTokenPredio(token)) {
+      const cuenta = await autenticarCuentaPredio({ db: pool(), token, jwtSecret: process.env.JWT_SECRET });
+      if (String(cuenta.predio_codigo) !== String(req.params.codigo).toUpperCase()) throw U.error("Tu cuenta sólo puede abrir su propio predio", 403);
+      const predio = await C.obtenerPredio(pool(), req.params.codigo);
+      if (!predio || Number(predio.id) !== Number(cuenta.predio_id) || Number(predio.activo) !== 1) throw U.error("Tu cuenta ya no tiene acceso a este predio", 401, { codigo: "SIN_SESION" });
+      accesoRemoto.set(predio.codigo, Date.now());
+      return { usuario: cuenta, predio, cuentaPredio: true, token };
+    }
     let datos;
     try { datos = jwt.verify(token, process.env.JWT_SECRET); } catch (_e) { throw U.error("La sesión remota venció. Volvé a abrir el predio desde el sistema general.", 401, { codigo: "SIN_SESION" }); }
     if (datos.tipo !== "predio-remoto" || String(datos.pcod) !== String(req.params.codigo).toUpperCase()) throw U.error("Acceso no válido", 401, { codigo: "SIN_SESION" });
@@ -642,13 +743,13 @@ function crearRouterApp() {
   router.all("/:codigo/api/*", async (req, res) => {
     cabeceras(res);
     try {
-      const { usuario, predio } = await autenticar(req);
+      const { usuario, predio, cuentaPredio, token } = await autenticar(req);
       const ruta = `/${req.params[0]}`.replace(/\/+$/, "") || "/";
       const metodo = req.method === "HEAD" ? "GET" : req.method;
       const nombre = `${nombreUsuario(usuario)} (sistema general)`;
       const db = crearMysql(pool(), { predioId: predio.id });
       const bocas = (await db.all("SELECT id FROM predio_boca WHERE predio_id = ?", [predio.id])).map((b) => Number(b.id));
-      const base = {
+      const base = cuentaPredio ? await contextoCuentaPredio(db, predio, usuario, req.ip) : {
         db, pid: predio.id, modo: "central", origen: "REMOTO", ip: req.ip, servicios: {},
         usuario: { id: null, usuario: `dni${usuario.documento}`, nombre, rol: "ADMIN", bocas, es_admin_general: true },
         sesion: {}, query: { ...req.query }, body: req.body && typeof req.body === "object" ? req.body : {},
@@ -661,7 +762,11 @@ function crearRouterApp() {
         });
       }
       if (metodo === "GET" && ruta === "/estado-remoto") return res.json(await estadoRemoto(predio));
-      if (metodo === "POST" && ruta === "/logout") return res.json({ ok: true });
+      if (metodo === "POST" && ruta === "/logout") {
+        if (cuentaPredio) await cerrarSesionPredio({ db: pool(), token, jwtSecret: process.env.JWT_SECRET });
+        return res.json({ ok: true });
+      }
+      if (cuentaPredio) return await ejecutarComoAdminPredio(res, predio, usuario, token, { metodo, ruta, cuerpo: req.body && typeof req.body === "object" ? req.body : {}, query: { ...req.query }, ip: req.ip });
       return await ejecutarComoAdminGeneral(res, predio, usuario, { metodo, ruta, cuerpo: base.body, query: base.query });
     } catch (e) { responderError(res, e); }
   });
@@ -695,4 +800,4 @@ function crearRouterApp() {
   return router;
 }
 
-module.exports = { crearRouterAdmin, crearRouterSync, crearRouterApp };
+module.exports = { crearRouterAdmin, crearRouterSync, crearRouterApp, crearRouterCuenta };
