@@ -50,6 +50,7 @@ const TABLAS = {
       usuario: "str:60!",
       nombre: "str:120!",
       rol: "str:20!",
+      gestionar_reservas: "bool",
       password_hash: "str:200",
       activo: "bool",
       es_admin_general: "bool",
@@ -353,6 +354,7 @@ const TABLAS = {
       afiliado_nombre: "str:160",
       afiliado_departamental: "str:80",
       saldo_disponible: "money",
+      importe_haberes: "money",
       autorizacion_descuento: "text",
       forma_pago: "str:20!",
       codigo_pago: "str:60",
@@ -369,6 +371,18 @@ const TABLAS = {
       observaciones: "str:255",
     },
     indices: [["fecha"], ["caja_id", "fecha"], ["afiliado_id"], ["turno_id"], ["liquidacion_id"]],
+  },
+  predio_recepcion_recibo: { columnas: { clave: "str:64!", huella: "str:64!", respuesta: "text!" }, unicos: [["clave"]] },
+  predio_huesped: {
+    columnas: { reserva_id: "int!", dni: "str:12!", ultima_revision: "int", legajo: "str:30", nombre: "str:160!", entrada: "date", salida: "date", saldo: "money!", afiliado: "bool", titular: "bool" },
+    unicos: [["reserva_id", "dni"]], indices: [["dni"], ["legajo"]],
+  },
+  predio_estadia_mov: {
+    columnas: { reserva_id: "int!", huesped_id: "int", venta_id: "int", liquidacion_id: "int", fecha: "dt!", concepto: "str:40!", medio: "str:20", importe: "money!", detalle: "str:255", usuario_id: "int", usuario_nombre: "str:120" },
+    indices: [["reserva_id", "id"], ["venta_id"]],
+  },
+  predio_venta_pago: {
+    columnas: { venta_id: "int!", forma: "str:20!", importe: "money!", huesped_id: "int" }, indices: [["venta_id"]],
   },
   predio_venta_item: {
     columnas: {

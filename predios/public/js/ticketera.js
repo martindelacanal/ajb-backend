@@ -105,7 +105,7 @@
     var p = new Papel(datos.ancho);
     var v = datos.venta, e = datos.empresa || {};
     encabezado(p, e, v, marca);
-    p.texto("PAGO: " + (descuento ? "DESCUENTO" : P.FORMAS[v.forma_pago] || v.forma_pago));
+    p.texto("PAGO: " + (descuento && v.forma_pago!=="MIXTO" ? "DESCUENTO" : P.FORMAS[v.forma_pago] || v.forma_pago));
     referenciaVenta(p, v, reimpresion);
     if (v.usuario_nombre) p.texto("ATENDIO: " + v.usuario_nombre);
     p.separar();
@@ -118,7 +118,8 @@
     });
     p.separar();
     p.par("IMPORTE TOTAL", P.f.pesos(v.total));
-    if (v.forma_pago === "EFECTIVO" && v.recibido != null) {
+    (datos.pagos || []).forEach(function (pago) { if (v.forma_pago === "MIXTO") p.par(P.FORMAS[pago.forma] || pago.forma, P.f.pesos(pago.importe)); });
+    if (v.recibido != null) {
       p.par("RECIBIDO", P.f.pesos(v.recibido));
       p.par("VUELTO", P.f.pesos(v.vuelto || 0));
     }
@@ -139,7 +140,7 @@
     var v = datos.venta, e = datos.empresa || {}, a = datos.afiliado || {};
     encabezado(p, e, v, "TALON DE DESCUENTO");
     referenciaVenta(p, v, reimpresion);
-    p.par("IMPORTE", P.f.pesos(v.total));
+    p.par("IMPORTE", P.f.pesos(v.importe_haberes || v.total));
     if (a.disponible != null) p.par("SALDO DISPONIBLE", P.f.pesos(a.disponible));
     p.separar();
     if (v.estado === "ANULADA") p.texto("DESCUENTO ANULADO", "centro");
@@ -164,7 +165,7 @@
     opciones = opciones || {};
     var comanda = opciones.comanda === undefined ? datos.imprimir_comanda : opciones.comanda;
     var reimpresion = opciones.reimpresion || datos.reimpresion;
-    var descuento = ["DESCUENTO", "DESCUENTO_HABERES"].includes(datos.venta.forma_pago);
+    var descuento = Number(datos.venta.importe_haberes)>0 || ["DESCUENTO", "DESCUENTO_HABERES"].includes(datos.venta.forma_pago);
     var partes = [comprobante(datos, reimpresion, comanda ? "CLIENTE" : "", descuento)];
     if (descuento) partes.push(talonDescuento(datos, reimpresion));
     if (comanda) partes.push(comprobante(datos, reimpresion, "COMANDA - PREPARACION", descuento));

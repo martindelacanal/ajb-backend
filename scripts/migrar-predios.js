@@ -28,6 +28,14 @@ const permiteProduccion = args.includes("--allow-production");
 const USUARIO_RUNTIME = "miajb_runtime";
 
 const DDL_CENTRALES = {
+  recepcion_particular: `CREATE TABLE IF NOT EXISTS recepcion_particular (usuario_id INT NOT NULL PRIMARY KEY, predio_id INT NOT NULL, creado DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB`,
+  recepcion_reserva_evento: `CREATE TABLE IF NOT EXISTS recepcion_reserva_evento (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, predio_id INT NOT NULL, reserva_id INT NOT NULL,
+    operacion VARCHAR(64) NOT NULL, huella CHAR(64) NOT NULL, actor VARCHAR(140) NOT NULL,
+    empleado_id INT NULL, fecha DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    anterior MEDIUMTEXT, actual MEDIUMTEXT NOT NULL, motivo VARCHAR(255),
+    UNIQUE KEY uq_recepcion_peticion(predio_id,operacion), KEY ix_recepcion_reserva(reserva_id,id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
   predio: `CREATE TABLE IF NOT EXISTS predio (
     id INT NOT NULL AUTO_INCREMENT,
     codigo VARCHAR(30) NOT NULL,
@@ -199,9 +207,9 @@ async function main() {
   await c.end();
 }
 
-main().catch((e) => {
+if (require.main === module) main().catch((e) => {
   console.error("✘", e.message);
   process.exit(1);
 });
 
-module.exports = { TODAS, TABLAS };
+module.exports = { TODAS, TABLAS, DDL_CENTRALES };

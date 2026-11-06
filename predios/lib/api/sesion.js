@@ -151,7 +151,7 @@ async function armarSesion(ctx, usuario, sesion) {
   }
   return {
     usuario: {
-      id: usuario.id, usuario: usuario.usuario, nombre: usuario.nombre, rol: usuario.rol,
+      id: usuario.id, usuario: usuario.usuario, nombre: usuario.nombre, rol: usuario.rol, gestionar_reservas: !!Number(usuario.gestionar_reservas),
       es_admin_general: !!Number(usuario.es_admin_general), bocas,
     },
     puestos,
@@ -299,7 +299,7 @@ async function autenticar(ctx, token) {
   }
   const bocas = await bocasUsuario(ctx.db, ctx, u);
   return {
-    usuario: { id: Number(u.id), usuario: u.usuario, nombre: u.nombre, rol: u.rol, bocas, es_admin_general: !!Number(u.es_admin_general) },
+    usuario: { id: Number(u.id), usuario: u.usuario, nombre: u.nombre, rol: u.rol, gestionar_reservas: !!Number(u.gestionar_reservas), bocas, es_admin_general: !!Number(u.es_admin_general) },
     sesion: { token_hash: hash, boca_id: s.boca_id, caja_id: s.caja_id, turno_id: s.turno_id },
   };
 }

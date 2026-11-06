@@ -13,6 +13,7 @@
     { valor: "TARJETA_DEBITO", texto: "Débito", icono: "tarjeta" },
     { valor: "TARJETA_CREDITO", texto: "Crédito", icono: "tarjeta" },
     { valor: "TRANSFERENCIA", texto: "Transferencia", icono: "transferencia" },
+    { valor: "SALDO", texto: "Saldo", icono: "saldo" },
     { valor: "DESCUENTO", texto: "Descuento", icono: "descuento" },
   ];
 
@@ -28,6 +29,8 @@
     var claveBorrador = "predio.venta." + puesto.caja_id;
     var estado = vacia();
     try { var b = JSON.parse(sessionStorage.getItem(claveBorrador) || "null"); if (b && b.items) estado = Object.assign(vacia(), b); } catch (e) { /* nada */ }
+    if (estado.forma === "DESCUENTO") estado.forma = "EFECTIVO";
+    estado.afiliado = null; estado.devolucion = false;
     var ultimaVenta = null;
     try { ultimaVenta = Number(sessionStorage.getItem("predio.ultima-venta." + puesto.caja_id)) || null; } catch (e) { /* nada */ }
 
@@ -234,31 +237,17 @@
     var buscarAfiliado = P.input({ placeholder: "DNI o legajo  (F4)", inputmode: "numeric" });
     buscarAfiliado.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); buscarAf(); } });
     function buscarAf() {
-      var q = buscarAfiliado.value.trim();
-      if (!q) return;
-      P.get("/afiliados/buscar" + P.qs({ q: q })).then(function (r) {
-        if (!r.resultados.length) {
-          P.aviso("No encontramos un afiliado con «" + q + "». Podés vender igual sin afiliado.", "error");
-          return;
-        }
-        if (r.resultados.length === 1) { elegirAfiliado(r.resultados[0]); return; }
-        var m = P.modal({
-          titulo: "Elegí el afiliado",
-          contenido: h("ul.lista-simple", r.resultados.map(function (a) {
-            return h("li", h("div", h("strong", a.nombre), h("div.texto-3.chico", [a.dni ? "DNI " + P.documento(a.dni) : null, a.legajo ? "Legajo " + a.legajo : null, a.departamental].filter(Boolean).join(" · "))),
-              P.btn("Elegir", { tipo: "primario", chico: true, onclick: function () { m.cerrar(); elegirAfiliado(a); } }));
-          })),
-        });
+      var q = buscarAfiliado.value.trim(); if (!q) return;
+      P.get("/saldos/presentes" + P.qs({q:q})).then(function (filas) {
+        if (buscarAfiliado.value.trim()!==q) return;
+        if (!filas.length) { P.aviso("No hay una persona presente con ese DNI o legajo.", "error"); return; }
+        function elegir(p) { estado.huesped=p; buscarAfiliado.value=""; pintarTodo(); (document.getElementById("parte-pago")||(botonCobrar.disabled?document.getElementById("dividir-pago"):botonCobrar)).focus(); }
+        if(filas.length===1){elegir(filas[0]);return;}
+        var m=P.modal({titulo:"Elegí la estadía",contenido:h("div.columna",filas.map(function(p){
+          return P.btn(p.nombre+" · T-"+p.reserva_id+" · "+P.f.pesos(p.saldo),{onclick:function(){m.cerrar();elegir(p);}});
+        }))});
       }).catch(P.error);
     }
-    function elegirAfiliado(a) {
-      estado.afiliado = a;
-      buscarAfiliado.value = "";
-      if (!a.habilitado_descuento || a.disponible <= 0) estado.devolucion = false;
-      pintarTodo();
-      combo.foco();
-    }
-
     var recibido = P.dinero({ placeholder: "Monto recibido" });
     recibido.addEventListener("input", function () { estado.recibido = recibido.value; pintarTotales(); guardarBorrador(); });
     recibido.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); cobrar(); } });
@@ -282,42 +271,29 @@
       }).catch(function (e) { comanda.input.checked = anterior; P.error(e); }).finally(function () { comanda.input.disabled = false; });
     });
 
-    function pintarAfiliado() {
-      P.vaciar(zonaAfiliado);
-      zonaAfiliado.appendChild(h("h2", "Afiliado (opcional)"));
-      if (!estado.afiliado) {
-        zonaAfiliado.appendChild(h("div.fila", { style: { marginTop: "10px", flexWrap: "nowrap" } }, buscarAfiliado, P.btn("", { tipo: "secundario", icono: "buscar", etiqueta: "Buscar afiliado", onclick: buscarAf })));
-        return;
-      }
-      var a = estado.afiliado;
-      var t = total();
-      var sinDisponible = !a.habilitado_descuento || a.disponible <= 0;
-      var check = P.check("Devolución: usar su descuento de haberes", estado.devolucion,
-        sinDisponible ? "No tiene disponible: tiene que pagar de otra forma." : "Disponible: " + P.f.pesos(a.disponible),
-        function (v) { estado.devolucion = v; estado.forma = v ? "DESCUENTO" : "EFECTIVO"; pintarTodo(); });
-      check.input.disabled = sinDisponible;
-      zonaAfiliado.appendChild(h("div.afiliado-tarjeta", { style: { marginTop: "10px" } },
-        h("span.avatar", P.iniciales(a.nombre)),
-        h("div.espacio",
-          h("strong", a.nombre),
-          h("div.texto-3.chico", [a.dni ? "DNI " + P.documento(a.dni) : null, a.legajo ? "Legajo " + a.legajo : null].filter(Boolean).join(" · ")),
-          h("div.texto-3.chico", [a.departamental, a.en_predio ? "En el predio" : (a.estadia ? "Estadía " + P.f.fecha(a.estadia.fecha_inicio) + " al " + P.f.fecha(a.estadia.fecha_fin) : null)].filter(Boolean).join(" · "))),
-        P.btn("", { tipo: "texto", chico: true, icono: "cerrar", etiqueta: "Quitar afiliado", onclick: function () { estado.afiliado = null; estado.devolucion = false; if (estado.forma === "DESCUENTO") estado.forma = "EFECTIVO"; pintarTodo(); } })));
-      zonaAfiliado.appendChild(h("div", { style: { marginTop: "10px" } }, check));
-      if (estado.devolucion && t > a.disponible) {
-        zonaAfiliado.appendChild(h("div", { style: { marginTop: "10px" } }, P.mensaje("La compra (" + P.f.pesos(t) + ") supera su disponible (" + P.f.pesos(a.disponible) + "). Tiene que pagar de otra forma o sacar productos.", "error")));
-      }
+    function partes() {
+      var n=estado.segunda?P.redondear(P.numeroDe(estado.parte)||0,2):total();
+      var a=[{forma:estado.forma,importe:n}];
+      if(estado.segunda)a.push({forma:estado.segunda,importe:P.redondear(total()-n,2)});
+      return a.map(function(p){if(p.forma==="SALDO"||p.forma==="DESCUENTO")p.huesped_id=estado.huesped&&estado.huesped.id;return p;});
     }
-
+    function usaSaldo(){return [estado.forma,estado.segunda].some(function(f){return f==="SALDO"||f==="DESCUENTO";});}
+    function pintarAfiliado() {
+      P.vaciar(zonaAfiliado); zonaAfiliado.hidden=!usaSaldo(); if(!usaSaldo())return;
+      if(!estado.huesped){zonaAfiliado.appendChild(P.campo("DNI o legajo del huésped",buscarAfiliado,{ayuda:"Solo personas con ingreso registrado y sin salida."}));
+        zonaAfiliado.appendChild(P.btn("Buscar huésped",{onclick:buscarAf}));}
+      else zonaAfiliado.appendChild(h("div.columna",h("strong",estado.huesped.nombre+" · T-"+estado.huesped.reserva_id),
+        h("span","Saldo: "+P.f.pesos(estado.huesped.saldo)),[estado.forma,estado.segunda].indexOf("DESCUENTO")>=0?h("span","Disponible por haberes: "+P.f.pesos(estado.huesped.disponible_haberes||0)):null,P.btn("Cambiar persona",{tipo:"texto",onclick:function(){estado.huesped=null;pintarTodo();buscarAfiliado.focus();}})));
+    }
     function pintarFormas() {
       P.vaciar(zonaFormas);
       zonaFormas.appendChild(h("h2", "Forma de pago"));
-      zonaFormas.appendChild(h("div.formas", { style: { marginTop: "10px" } }, FORMAS.filter(function (f) { return f.valor !== "DESCUENTO" || estado.devolucion; }).map(function (f) {
+      zonaFormas.appendChild(h("div.formas", { style: { marginTop: "10px" } }, FORMAS.map(function (f) {
         return h("button.forma", { type: "button", "aria-pressed": String(estado.forma === f.valor), onclick: function () {
-          estado.forma = f.valor;
+          estado.forma = f.valor; if(estado.segunda===f.valor)estado.segunda=null;
           if (f.valor !== "DESCUENTO") estado.devolucion = false;
           pintarTodo();
-          if (f.valor === "EFECTIVO") recibido.focus(); else if (f.valor !== "DESCUENTO") codigo.focus();
+          if (f.valor === "EFECTIVO") recibido.focus(); else if(f.valor==="SALDO"&&!estado.huesped)buscarAfiliado.focus();
         } }, P.icono(f.icono), f.texto);
       })));
     }
@@ -325,37 +301,48 @@
     function pintarPago() {
       P.vaciar(zonaPago);
       var t = total();
-      if (estado.forma === "EFECTIVO") {
-        recibido.value = estado.recibido;
-        var sugeridos = [];
-        [1000, 2000, 5000, 10000, 20000].forEach(function (m) { var v = Math.ceil(t / m) * m; if (v > t && sugeridos.indexOf(v) < 0) sugeridos.push(v); });
-        zonaPago.appendChild(h("div.cuenta-bloque",
-          P.campo("Efectivo recibido", h("div.campo-con-prefijo", h("span", "$"), recibido)),
-          h("div.rapidos",
-            P.btn("Justo", { tipo: "suave", chico: true, onclick: function () { estado.recibido = P.f.numero(t); recibido.value = estado.recibido; pintarTotales(); } }),
-            sugeridos.slice(0, 3).map(function (v) { return P.btn(P.f.pesos(v).replace(",00", ""), { tipo: "suave", chico: true, onclick: function () { estado.recibido = String(v); recibido.value = estado.recibido; pintarTotales(); } }); })),
-          h("div#vuelto")));
-      } else if (estado.forma !== "DESCUENTO") {
-        codigo.value = estado.codigo;
-        zonaPago.appendChild(h("div.cuenta-bloque", P.campo("Código de pago", codigo, { ayuda: "Si el posnet o la app te da un número de operación, anotalo: queda en el ticket." })));
+      var dividir = P.check("Dividir entre dos medios",!!estado.segunda,null,function(v){
+        estado.segunda=v?(estado.forma==="EFECTIVO"?"QR":"EFECTIVO"):null;estado.parte="";estado.recibido="";pintarTodo();document.getElementById(v?"parte-pago":"dividir-pago").focus();});
+      dividir.input.id="dividir-pago";
+      zonaPago.appendChild(dividir);
+      if(estado.segunda){
+        var segundo=P.select(FORMAS.filter(function(f){return f.valor!==estado.forma;}),estado.segunda,{alCambiar:function(v){estado.segunda=v;pintarTodo();document.getElementById("segundo-pago").focus();}});segundo.id="segundo-pago";
+        var parte=P.dinero({valor:estado.parte,placeholder:"0,00",id:"parte-pago"});
+        parte.addEventListener("input",function(){estado.parte=parte.value;pintarTotales();guardarBorrador();});
+        zonaPago.appendChild(h("div.cuenta-bloque",P.campo("Importe con "+FORMAS.find(function(f){return f.valor===estado.forma;}).texto,parte),P.campo("Segundo medio",segundo),h("p#resto-pago",{"aria-live":"polite"})));
       }
+      if(estado.forma==="EFECTIVO"||estado.segunda==="EFECTIVO"){
+        recibido.value=estado.recibido;zonaPago.appendChild(h("div.cuenta-bloque",P.campo("Efectivo recibido",recibido,{ayuda:"Dejalo vacío si recibís el importe justo."}),h("div#vuelto")));
+      }
+      if(estado.forma!=="EFECTIVO"&&estado.forma!=="SALDO"&&estado.forma!=="DESCUENTO"&&!estado.segunda){codigo.value=estado.codigo;zonaPago.appendChild(P.campo("Código de pago (opcional)",codigo));}
     }
-
     function pintarTotales() {
       var t = total();
       P.reemplazar(zonaTotal, h("div.total", h("span", "Total"), h("strong", P.f.pesos(t))));
       var v = document.getElementById("vuelto");
       var habilitado = estado.items.length > 0;
-      if (v && estado.forma === "EFECTIVO") {
+      var pagos=partes();var cash=pagos.find(function(p){return p.forma==="EFECTIVO";});
+      var resto=document.getElementById("resto-pago");if(resto)resto.textContent=pagos[1].importe<0?"El primer importe supera el total.":"Resto con el segundo medio: "+P.f.pesos(pagos[1].importe);
+      if(pagos.some(function(p){return !(p.importe>0)||(p.forma==="SALDO"&&(!estado.huesped||p.importe>Number(estado.huesped.saldo)));}))habilitado=false;
+      var problema="";
+      if(estado.segunda&&pagos.some(function(p){return !(p.importe>0);}))problema="Indicá dos importes mayores que cero que sumen el total.";
+      pagos.forEach(function(p){if(p.forma!=="SALDO"&&p.forma!=="DESCUENTO")return;
+        var disponible=estado.huesped?Number(p.forma==="SALDO"?estado.huesped.saldo:estado.huesped.disponible_haberes||0):0;
+        if(!estado.huesped)problema="Buscá el huésped para completar el cobro.";
+        else if(p.importe>disponible)problema="Faltan "+P.f.pesos(p.importe-disponible)+" en "+(p.forma==="SALDO"?"el saldo de la estadía":"el disponible de haberes")+". Podés cambiar la distribución.";
+      });
+      if (v && cash) {
         P.vaciar(v);
         v.className = "";
         var r = P.numeroDe(estado.recibido);
-        if (estado.recibido && !isNaN(r)) {
-          if (r >= t) { v.className = "vuelto"; v.appendChild(h("span", "Vuelto")); v.appendChild(h("strong", P.f.pesos(r - t))); }
-          else { v.className = "vuelto falta"; v.appendChild(h("span", "Falta")); v.appendChild(h("strong", P.f.pesos(t - r))); habilitado = false; }
+        if (estado.recibido && (!Number.isFinite(r)||!/^[0-9][0-9.,]*$/.test(estado.recibido.trim())))problema="Corregí el efectivo recibido: ingresá un importe numérico.";
+        else if (estado.recibido && !isNaN(r)) {
+          if (r >= cash.importe) { v.className = "vuelto"; v.appendChild(h("span", "Vuelto")); v.appendChild(h("strong", P.f.pesos(r - cash.importe))); }
+          else { v.className = "vuelto falta"; v.appendChild(h("span", "Falta")); v.appendChild(h("strong", P.f.pesos(cash.importe - r))); habilitado = false; }
         }
       }
       if (estado.devolucion && estado.afiliado && t > estado.afiliado.disponible) habilitado = false;
+      if(problema&&estado.items.length){zonaTotal.appendChild(h("p.texto-3",{"aria-live":"polite"},problema));habilitado=false;}
       botonCobrar.disabled = !habilitado;
     }
 
@@ -368,8 +355,8 @@
       guardarBorrador();
     }
 
-    cuenta.appendChild(zonaAfiliado);
     cuenta.appendChild(zonaFormas);
+    cuenta.appendChild(zonaAfiliado);
     cuenta.appendChild(zonaPago);
     cuenta.appendChild(zonaTotal);
     cuenta.appendChild(h("div.cuenta-bloque", comanda));
@@ -386,10 +373,11 @@
       var cuerpo = {
         items: estado.items.map(function (it) { return { producto_id: it.producto.id, cantidad: it.cantidad }; }),
         avisos_sin_stock: estado.items.filter(function (it) { return it.aviso_sin_stock && it.aviso_sin_stock.id; }).map(function (it) { return { id: it.aviso_sin_stock.id, producto_id: it.producto.id }; }),
-        forma_pago: estado.forma,
+        forma_pago: estado.segunda ? "MIXTO" : estado.forma,
+        pagos: partes(),
         devolucion: estado.devolucion,
         afiliado_id: estado.afiliado ? estado.afiliado.id : null,
-        recibido: estado.forma === "EFECTIVO" && estado.recibido ? P.numeroDe(estado.recibido) : null,
+        recibido: (estado.forma === "EFECTIVO" || estado.segunda === "EFECTIVO") && estado.recibido ? P.numeroDe(estado.recibido) : null,
         codigo_pago: estado.forma !== "EFECTIVO" && estado.forma !== "DESCUENTO" ? estado.codigo : null,
       };
       P.ejecutar(botonCobrar, function () {
@@ -405,7 +393,7 @@
           ventaHecha(r);
         });
       }).catch(function (e) {
-        if (e.codigo === "SIN_DISPONIBLE" && estado.afiliado) { estado.afiliado.disponible = Number(e.datos.disponible || 0); pintarTodo(); }
+        if(usaSaldo()){estado.huesped=null;pintarTodo();}
       }).finally(function () { cobrando = false; });
     }
 
@@ -459,7 +447,7 @@
     function teclas(ev) {
       if (P.hayVentana()) return;
       if (ev.key === "F2") { ev.preventDefault(); combo.foco(); }
-      else if (ev.key === "F4") { ev.preventDefault(); if (!estado.afiliado) buscarAfiliado.focus(); }
+      else if (ev.key === "F4") { ev.preventDefault(); if (usaSaldo()&&!estado.huesped) buscarAfiliado.focus(); }
       else if (ev.key === "F9") { ev.preventDefault(); cobrar(); }
     }
     document.addEventListener("keydown", teclas);

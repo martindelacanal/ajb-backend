@@ -111,10 +111,11 @@ async function datosTicket(db, ctx, ventaId) {
   const items = await db.all("SELECT * FROM predio_venta_item WHERE predio_id = ? AND venta_id = ? ORDER BY id", [ctx.pid, ventaId]);
   const config = await N.leerConfig(db, ctx);
   // Las ventas anteriores a la captura de la autorización conservan el total original.
-  const esDescuento = ["DESCUENTO", "DESCUENTO_HABERES"].includes(v.forma_pago);
+  const esDescuento = Number(v.importe_haberes)>0 || ["DESCUENTO", "DESCUENTO_HABERES"].includes(v.forma_pago);
   const autorizacion = esDescuento ? (v.autorizacion_descuento ?? autorizacionDescuento(config, v.total)) : config.texto_autorizacion;
   return {
     venta: v,
+    pagos: await db.all("SELECT forma,importe FROM predio_venta_pago WHERE predio_id=? AND venta_id=? ORDER BY id", [ctx.pid,ventaId]),
     items,
     afiliado: v.afiliado_id ? {
       id: v.afiliado_id, nombre: v.afiliado_nombre, dni: v.afiliado_dni, legajo: v.afiliado_legajo,
@@ -147,10 +148,11 @@ async function crearVenta(ctx) {
   if (items.length > 200) throw U.error("Una venta puede tener hasta 200 renglones");
   let forma = U.opcion(b.forma_pago || "EFECTIVO", FORMAS, "La forma de pago");
   if (U.bool(b.devolucion)) forma = "DESCUENTO";
+  if (forma === "MIXTO" && (!Array.isArray(b.pagos) || b.pagos.length !== 2)) throw U.error("Elegí los dos medios de pago.");
   const codigoPago = ["QR", "TARJETA_DEBITO", "TARJETA_CREDITO", "TRANSFERENCIA"].includes(forma)
     ? U.texto(b.codigo_pago, { max: 60, campo: "El código de pago" }) : null;
-  const afiliadoId = b.afiliado_id ? U.id(b.afiliado_id, "El afiliado") : null;
-  if (forma === "DESCUENTO" && !afiliadoId) throw U.error("Para cobrar con descuento de haberes indicá el DNI o legajo del afiliado");
+  let afiliadoId = b.afiliado_id ? U.id(b.afiliado_id, "El afiliado") : null;
+  if (forma === "DESCUENTO" && !afiliadoId && !b.pagos) throw U.error("Para cobrar con descuento de haberes indicá el DNI o legajo del afiliado");
 
   const agrupados = new Map();
   for (const it of items) {
@@ -200,33 +202,51 @@ async function crearVenta(ctx) {
     const total = U.redondear(lineas.reduce((s, l) => s + l.subtotal, 0), 2);
     if (total <= 0 && forma !== "EFECTIVO") throw U.error("El total de la venta tiene que ser mayor que cero");
 
+    const pagos = b.pagos === undefined ? [{forma, importe:total, huesped_id:b.huesped_id||null}] : b.pagos;
+    if (!Array.isArray(pagos) || pagos.length !== (forma==="MIXTO"?2:1) || new Set(pagos.map(p=>p.forma)).size !== pagos.length) throw U.error("Revisá los medios de pago.");
+    let suma=0;
+    for(const p of pagos){
+      if(!FORMAS.includes(p.forma)||p.forma==="MIXTO"||(pagos.length===1&&p.forma!==forma))throw U.error("El medio de pago no es válido.");
+      p.importe=U.numero(p.importe,{min:0.01,max:99999999,campo:"La parte del pago"});
+      suma+=Math.round(p.importe*100);
+    }
+    if(suma!==Math.round(total*100))throw U.error("Las partes del pago deben sumar el total de la venta.");
+    const efectivo=pagos.find(p=>p.forma==="EFECTIVO")?.importe||0;
+    const parteHaberes=pagos.find(p=>p.forma==="DESCUENTO");
+    if(parteHaberes&&parteHaberes.huesped_id){
+      const h=await N.exigir(t,ctx,"predio_huesped",U.id(parteHaberes.huesped_id),"No encontramos al huésped",{bloquear:true});
+      const a=await t.get("SELECT id FROM predio_afiliado WHERE predio_id=? AND dni=? AND usuario_general_id IS NOT NULL",[ctx.pid,h.dni]);
+      if(!h.entrada||h.salida||!Number(h.afiliado)||!a)throw U.error("El descuento requiere un afiliado presente.",409);
+      afiliadoId=a.id;
+    }
+    if(parteHaberes&&!afiliadoId)throw U.error("Seleccioná el afiliado para aplicar el descuento.");
     let afiliado = null;
     let departamental = null;
     let saldoDisponible = null;
     if (afiliadoId) {
-      afiliado = await N.exigir(t, ctx, "predio_afiliado", afiliadoId, "No encontramos al afiliado");
+      afiliado = await N.exigir(t, ctx, "predio_afiliado", afiliadoId, "No encontramos al afiliado",{bloquear:true});
       if (afiliado.departamental_id) departamental = await N.obtener(t, ctx, "predio_departamental", afiliado.departamental_id);
       const disp = await disponibleAfiliado(t, ctx, afiliadoId);
       saldoDisponible = disp.disponible;
-      if (forma === "DESCUENTO") {
+      if (parteHaberes) {
         if (!disp.habilitado) throw U.error("El afiliado no está habilitado para comprar con descuento de haberes", 409, { codigo: "SIN_DISPONIBLE", disponible: 0 });
-        if (disp.disponible < total) {
+        if (disp.disponible < parteHaberes.importe) {
           throw U.error(
             disp.disponible <= 0
               ? "Al afiliado no le queda disponible para descuento de haberes: tiene que pagar de otra forma."
               : `Al afiliado le quedan ${U.pesos(disp.disponible)} de descuento y la venta es de ${U.pesos(total)}. Tiene que pagar de otra forma o sacar productos.`,
             409, { codigo: "SIN_DISPONIBLE", disponible: disp.disponible, total });
         }
-        saldoDisponible = U.redondear(disp.disponible - total, 2);
+        saldoDisponible = U.redondear(disp.disponible - parteHaberes.importe, 2);
       }
     }
 
     let recibido = null;
     let vuelto = null;
-    if (forma === "EFECTIVO") {
-      recibido = b.recibido === undefined || b.recibido === null || b.recibido === "" ? total : U.numero(b.recibido, { min: 0, max: 99999999, campo: "El efectivo recibido" });
-      if (recibido < total) throw U.error(`El efectivo recibido (${U.pesos(recibido)}) no alcanza para el total (${U.pesos(total)})`);
-      vuelto = U.redondear(recibido - total, 2);
+    if (efectivo) {
+      recibido = b.recibido === undefined || b.recibido === null || b.recibido === "" ? efectivo : U.numero(b.recibido, { min: 0, max: 99999999, campo: "El efectivo recibido" });
+      if (recibido < efectivo) throw U.error(`El efectivo recibido (${U.pesos(recibido)}) no alcanza para el total (${U.pesos(total)})`);
+      vuelto = U.redondear(recibido - efectivo, 2);
     }
 
     const ahora = U.fechaHora();
@@ -235,10 +255,15 @@ async function crearVenta(ctx) {
       usuario_nombre: N.nombreActor(ctx), fecha: ahora, afiliado_id: afiliado ? afiliado.id : null,
       afiliado_dni: afiliado?.dni || null, afiliado_legajo: afiliado?.legajo || null, afiliado_nombre: afiliado?.nombre || null,
       afiliado_departamental: departamental?.nombre || null, saldo_disponible: saldoDisponible,
-      autorizacion_descuento: forma === "DESCUENTO" ? autorizacionDescuento(config, total) : null,
+      importe_haberes: parteHaberes?.importe || null,
+      autorizacion_descuento: parteHaberes ? autorizacionDescuento(config, parteHaberes.importe) : null,
       forma_pago: forma, codigo_pago: codigoPago, total, recibido, vuelto, estado: "CONFIRMADA", impresiones: 0,
       observaciones: U.texto(b.observaciones, { max: 255 }),
     });
+    for (const p of pagos) {
+      if(p.forma==="SALDO")await require("./recepcion").aplicarVenta(t,ctx,p.huesped_id,p.importe,ventaId);
+      await N.insertar(t,ctx,"predio_venta_pago",{venta_id:ventaId,forma:p.forma,importe:p.importe,huesped_id:p.forma==="SALDO"?p.huesped_id:null});
+    }
     for (const l of lineas) {
       await N.insertar(t, ctx, "predio_venta_item", {
         venta_id: ventaId, producto_id: l.producto.id, descripcion: l.producto.nombre, codigo: l.producto.codigo,
@@ -251,9 +276,9 @@ async function crearVenta(ctx) {
         });
       }
     }
-    if (forma === "EFECTIVO" && total > 0) {
+    if (efectivo > 0) {
       await N.insertar(t, ctx, "predio_caja_movimiento", {
-        caja_id: caja.id, boca_id: caja.boca_id, fecha: ahora, concepto: "VENTA", tipo: "INGRESO", importe: total,
+        caja_id: caja.id, boca_id: caja.boca_id, fecha: ahora, concepto: "VENTA", tipo: "INGRESO", importe: efectivo,
         observaciones: `Venta N° ${ventaId}`, venta_id: ventaId, turno_id: puesto.turno_id || null,
         usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
       });
@@ -320,9 +345,12 @@ async function anularVenta(ctx) {
         });
       }
     }
-    if (v.forma_pago === "EFECTIVO" && Number(v.total) > 0) {
+    const pagos=await t.all("SELECT * FROM predio_venta_pago WHERE predio_id=? AND venta_id=?",[ctx.pid,id]);
+    const efectivo=pagos.length?Number(pagos.find(p=>p.forma==="EFECTIVO")?.importe||0):(v.forma_pago==="EFECTIVO"?Number(v.total):0);
+    for(const p of pagos)if(p.forma==="SALDO")await require("./recepcion").aplicarVenta(t,ctx,p.huesped_id,Number(p.importe),id,true);
+    if (efectivo > 0) {
       await N.insertar(t, ctx, "predio_caja_movimiento", {
-        caja_id: v.caja_id, boca_id: v.boca_id, fecha: U.fechaHora(), concepto: "ANULACION_VENTA", tipo: "EGRESO", importe: Number(v.total),
+        caja_id: v.caja_id, boca_id: v.boca_id, fecha: U.fechaHora(), concepto: "ANULACION_VENTA", tipo: "EGRESO", importe: efectivo,
         observaciones: `Anulación de la venta N° ${id}`, venta_id: id, turno_id: turnoDeCaja(ctx, v.caja_id),
         usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
       });
@@ -332,7 +360,7 @@ async function anularVenta(ctx) {
       anulacion_autorizacion: autorizacion.metodo,
     });
     await N.auditar(t, ctx, "Anulación de venta", "venta", id, { motivo, total: Number(v.total), forma_pago: v.forma_pago, autorizacion: autorizacion.metodo });
-    return { id, mensaje: `Venta N° ${id} anulada`, devolver_efectivo: v.forma_pago === "EFECTIVO" ? Number(v.total) : 0 };
+    return { id, mensaje: `Venta N° ${id} anulada`, devolver_efectivo: efectivo };
   });
 }
 

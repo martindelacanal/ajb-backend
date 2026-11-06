@@ -599,6 +599,11 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
       if (!estado.en_linea) throw U.error(estado.ultimo_error || "No hay conexión con el sistema general", 503);
       return estadoPublico();
     },
+    async recepcion(accion, datos, actor) {
+      if (!configurado()) throw U.error("Vinculá el predio con Mi AJB para consultar Turismo.", 503);
+      try { return await pedir("POST", "/recepcion", { cuerpo: { accion, datos, empleado_id: actor.id }, timeout: 60000 }); }
+      catch (e) { if (e.status) throw e; throw U.error("Sin conexión con Turismo. Volvé a intentar con la misma operación.", 503); }
+    },
     async verificarAdminGeneral(documento, password) {
       if (!configurado()) throw new Error("sin configurar");
       return pedir("POST", "/verificar-admin", { cuerpo: { documento, password }, timeout: 10000 });

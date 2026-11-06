@@ -63,6 +63,7 @@ async function ejecutarComoAdminGeneral(res, predio, usuario, { metodo, ruta, cu
       general_usuario_id: Number(usuario.id), documento: String(usuario.documento || "") },
     sesion: {}, query: { ...(query || {}) }, body: cuerpo && typeof cuerpo === "object" ? cuerpo : {},
   };
+  base.servicios.recepcion = (accion, datos, actor, t) => require("../services/recepcion").operar(t.conexionTurismo, predio, actor, accion, datos);
   base.alAvisosStock = base.alAvisosPrecios;
   const encontrada = apiPredio.buscarRuta(metodo, ruta);
   if (!encontrada) throw U.error("No encontramos esa operación", 404);
@@ -146,6 +147,7 @@ async function contextoCuentaPredio(db, predio, cuenta, ip = null) {
     if (/^\s*SELECT/i.test(sql)) return [await t.all(sql, params)];
     const r = await t.run(sql, params); return [{ insertId: r.insertId }];
   } }, predio, filas);
+  base.servicios.recepcion = (accion, datos, actor, t) => require("../services/recepcion").operar(t.conexionTurismo, predio, actor, accion, datos);
   base.alAvisosStock = base.alAvisosPrecios;
   return base;
 }
@@ -640,6 +642,18 @@ function crearRouterSync() {
     });
   }
 
+  router.post("/recepcion", async (req, res) => {
+    let c;
+    try {
+      if (req.predio.escritor !== "LOCAL") throw U.error("La instalación no es el escritor del predio", 409);
+      c = await pool().getConnection();
+      await c.beginTransaction();
+      const [[actor]] = await c.query("SELECT id,nombre,rol,gestionar_reservas,general_usuario_id FROM predio_usuario WHERE predio_id=? AND id=? AND activo=1", [req.predio.id, U.id(req.body.empleado_id)]);
+      if (!actor || (actor.rol !== "ADMIN" && !Number(actor.gestionar_reservas))) throw U.error("La cuenta no tiene permiso de recepción sincronizado.",403);
+      const r = await require("../services/recepcion").operar(c, req.predio, actor, req.body.accion, req.body.datos || {});
+      await c.commit(); res.json(r);
+    } catch(e) { if(c) await c.rollback(); responderError(res,e); } finally { if(c) c.release(); }
+  });
   router.get("/maestros", async (req, res) => {
     try {
       res.json(await C.armarMaestros(pool(), req.predio));

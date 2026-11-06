@@ -8305,6 +8305,7 @@ async function calcularTarifaPrecioUnico(connection, {
 }
 
 async function calcularTarifaTemporadasGestionadas(connection, {
+  recepcion = false,
   recurso,
   personas,
   noches,
@@ -8414,6 +8415,7 @@ async function calcularTarifaTemporadasGestionadas(connection, {
         precio_original: centavosANumero(precioOriginalCentavos),
         tarifa_id: detalle.tarifa_id,
         tarifa_regla_id: detalle.tarifa_regla_id,
+        ...(recepcion ? { por_persona: !!detalle.precio_por_persona } : {}),
         usa_porcentaje: cobra && detalle.usa_porcentaje,
         porcentaje_descuento: cobra ? detalle.porcentaje_descuento : 0,
       };
@@ -8488,6 +8490,7 @@ async function calcularTarifaBaseReserva(connection, {
   fechaFin,
   temporadaTarifaId = null,
   departamentalId = null,
+  recepcion = false,
   // Calendario: no exige cobertura completa; las noches sin tarifa se omiten.
   tolerarHuecos = false,
 }) {
@@ -8518,7 +8521,7 @@ async function calcularTarifaBaseReserva(connection, {
     obtenerFechaCivilArgentina(),
     Number(recursoConfigurado.anticipacion_minima_dias || 0)
   );
-  if (!tolerarHuecos && fechaMinima && fechaInicioNormalizada < fechaMinima) {
+  if (!recepcion && !tolerarHuecos && fechaMinima && fechaInicioNormalizada < fechaMinima) {
     throw crearErrorNegocio(
       `Este servicio requiere ${Number(recursoConfigurado.anticipacion_minima_dias || 0)} días de anticipación`,
       422,
@@ -8564,6 +8567,7 @@ async function calcularTarifaBaseReserva(connection, {
   );
   if (!temporadaTarifaId) {
     const tarifaGestionada = await calcularTarifaTemporadasGestionadas(connection, {
+      recepcion,
       recurso: recursoConfigurado,
       personas: personasNormalizadas,
       noches,
@@ -14251,19 +14255,21 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
   }
 
   const queryParams = [...querySearchParams];
+  const soloAtipicas = filters.operacion_atipica === true ? "AND EXISTS (SELECT 1 FROM recepcion_reserva_evento e WHERE e.reserva_id = r.id)" : "";
   let query = `
     SELECT 
       r.id,
       COALESCE(er.nombre, 'Sin estado') AS estado,
       COALESCE(s.nombre, 'Convenio hotelero') AS servicio,
-      COALESCE(rec.nombre, ch.nombre, 'Pendiente de adjudicación') AS recurso,
+      COALESCE(rec.nombre, ch.nombre, IF(re.id IS NULL,'Pendiente de adjudicación','Sin recurso')) AS recurso,
+      JSON_UNQUOTE(JSON_EXTRACT(re.actual,'$.tipo')) AS tipo_predio,
       COALESCE(r.modalidad, 'FECHA_LIBRE') AS modalidad,
       bf.nombre AS bloque,
       u.documento AS afiliado,
       u.nombre AS afiliado_nombre,
       u.apellido AS afiliado_apellido,
       DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') AS fecha_inicio,
-      DATE_FORMAT(r.fecha_fin, '%d/%m/%Y') AS fecha_fin,
+      DATE_FORMAT(IF(JSON_UNQUOTE(JSON_EXTRACT(re.actual,'$.dia_sin_noche'))='true' AND DATEDIFF(r.fecha_fin,r.fecha_inicio)=1,r.fecha_inicio,r.fecha_fin), '%d/%m/%Y') AS fecha_fin,
       COALESCE(r.observaciones, '') AS observaciones,
       DATE_FORMAT(r.fecha_creacion, '%d/%m/%Y') AS fecha_creacion,
       r.precio_total AS importe,
@@ -14278,7 +14284,8 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
     LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
     INNER JOIN usuario u ON r.usuario_id = u.id
-    WHERE er.nombre <> 'Pendiente_Aprobacion_Titular'
+    LEFT JOIN recepcion_reserva_evento re ON re.id=(SELECT MAX(ev.id) FROM recepcion_reserva_evento ev WHERE ev.reserva_id=r.id)
+    WHERE er.nombre <> 'Pendiente_Aprobacion_Titular' ${soloAtipicas}
       ${queryBuscar}
       ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
       ${toDate ? "AND r.fecha_fin <= ?" : ""}
@@ -14331,7 +14338,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
       LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
       INNER JOIN usuario u ON r.usuario_id = u.id
-      WHERE er.nombre <> 'Pendiente_Aprobacion_Titular'
+      WHERE er.nombre <> 'Pendiente_Aprobacion_Titular' ${soloAtipicas}
         ${queryBuscar}
         ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
         ${toDate ? "AND r.fecha_fin <= ?" : ""}
@@ -19571,4 +19578,9 @@ router.__test = Object.freeze({
   darDeBajaTarifasTemporada,
 });
 
+// Recepción utiliza las mismas reglas y bloqueos que el formulario de Turismo.
+router.negocioRecepcion = { calcularTarifaBaseReserva, calcularAdicionalesReserva, guardarAdicionalesReserva,
+  obtenerUsuarioPrincipalFamilia, crearOBuscarUsuariosReserva, insertarTarifasFamiliaresCalculadas,
+  bloquearYValidarDisponibilidadReserva, asignarNumeroParcelaCamping, validarNumeroParcelaCampingExistente,
+  archivarVersionReservaAntesDeReemplazo, cerrarGuardiaArchivoReserva, aplicarDescuentosReserva, guardarReservaDescuentos };
 module.exports = router;

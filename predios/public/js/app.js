@@ -22,6 +22,7 @@
       { ruta: "/caja", texto: "Caja", icono: "caja" },
       { ruta: "/compras", texto: "Compras", icono: "compras" },
       { ruta: "/gestion", texto: "Gestión", icono: "gestion" },
+      { ruta: "/recepcion", texto: "Reservas y estadías", icono: "usuarios" },
       { ruta: "/usuarios", texto: "Usuarios", icono: "usuarios" },
       { ruta: "/estadisticas", texto: "Estadísticas", icono: "estadisticas" },
       { ruta: "/sistema", texto: "Sistema", icono: "sistema" },
@@ -33,6 +34,7 @@
     var ses = P.estado.sesion;
     var almacen = (ses.puestos || []).some(function (p) { return p.es_almacen; });
     return [
+      ses.usuario.gestionar_reservas ? { ruta: "/recepcion", texto: "Reservas y estadías", icono: "usuarios" } : null,
       puesto.caja_id ? { ruta: "/vender", texto: "Vender", icono: "vender" } : null,
       { ruta: "/solicitudes", texto: "Solicitudes", icono: "solicitud", contador: "solicitudes" },
       { ruta: "/stock", texto: "Stock", icono: "stock" },

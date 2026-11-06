@@ -116,8 +116,8 @@ async function autorizar(t, ctx, tipo, { clave, permisoId, referenciaId, detalle
 async function disponibleAfiliado(t, ctx, afiliadoId) {
   const fila = await t.get(
     `SELECT a.limite, a.habilitado_descuento,
-       (SELECT COALESCE(SUM(v.total), 0) FROM predio_venta v
-        WHERE v.predio_id = a.predio_id AND v.afiliado_id = a.id AND v.forma_pago = 'DESCUENTO'
+       (SELECT COALESCE(SUM(COALESCE(v.importe_haberes,v.total)), 0) FROM predio_venta v
+        WHERE v.predio_id = a.predio_id AND v.afiliado_id = a.id AND (v.forma_pago = 'DESCUENTO' OR v.importe_haberes>0)
           AND v.estado = 'CONFIRMADA' AND v.liquidacion_id IS NULL) AS pendiente
      FROM predio_afiliado a WHERE a.predio_id = ? AND a.id = ?`,
     [ctx.pid, afiliadoId]

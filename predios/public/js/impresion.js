@@ -4,7 +4,7 @@
   if (window.__SIN_SOPORTE) return;
   var P = window.P;
   var h = P.h;
-  var FORMAS = { EFECTIVO: "Efectivo", QR: "QR", TARJETA_DEBITO: "Tarjeta de débito", TARJETA_CREDITO: "Tarjeta de crédito", TRANSFERENCIA: "Transferencia", DESCUENTO: "Descuento de haberes", DESCUENTO_HABERES: "Descuento de haberes" };
+  var FORMAS = { SALDO: "Saldo de estadía", MIXTO: "Pago combinado", EFECTIVO: "Efectivo", QR: "QR", TARJETA_DEBITO: "Tarjeta de débito", TARJETA_CREDITO: "Tarjeta de crédito", TRANSFERENCIA: "Transferencia", DESCUENTO: "Descuento de haberes", DESCUENTO_HABERES: "Descuento de haberes" };
   P.FORMAS = FORMAS;
 
   function imprimirHtml(cuerpo, estilo, titulo) {

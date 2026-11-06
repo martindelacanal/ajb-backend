@@ -67,8 +67,8 @@ async function detalle(ctx) {
     `SELECT forma_pago, COUNT(*) AS cantidad, COALESCE(SUM(total), 0) AS total FROM predio_venta
      WHERE predio_id = ? AND afiliado_id = ? AND estado = 'CONFIRMADA' GROUP BY forma_pago`, [ctx.pid, id]);
   const pendientes = await db.get(
-    `SELECT COUNT(*) AS cantidad, MIN(fecha) AS desde, MAX(fecha) AS hasta, COALESCE(SUM(total), 0) AS total FROM predio_venta
-     WHERE predio_id = ? AND afiliado_id = ? AND estado = 'CONFIRMADA' AND forma_pago = 'DESCUENTO' AND liquidacion_id IS NULL`, [ctx.pid, id]);
+    `SELECT COUNT(*) AS cantidad, MIN(fecha) AS desde, MAX(fecha) AS hasta, COALESCE(SUM(COALESCE(importe_haberes,total)), 0) AS total FROM predio_venta
+     WHERE predio_id = ? AND afiliado_id = ? AND estado = 'CONFIRMADA' AND (forma_pago = 'DESCUENTO' OR importe_haberes>0) AND liquidacion_id IS NULL`, [ctx.pid, id]);
   return {
     afiliado: a,
     estadias,
@@ -206,8 +206,8 @@ async function crearLiquidacion(ctx) {
   return ctx.db.tx(async (t) => {
     const a = await N.exigir(t, ctx, "predio_afiliado", afiliadoId, "No encontramos al afiliado");
     const ventas = await t.all(
-      `SELECT id, fecha, total FROM predio_venta WHERE predio_id = ? AND afiliado_id = ? AND estado = 'CONFIRMADA'
-       AND forma_pago = 'DESCUENTO' AND liquidacion_id IS NULL ORDER BY fecha`, [ctx.pid, afiliadoId]);
+      `SELECT id, fecha, COALESCE(importe_haberes,total) AS total FROM predio_venta WHERE predio_id = ? AND afiliado_id = ? AND estado = 'CONFIRMADA'
+       AND (forma_pago='DESCUENTO' OR importe_haberes>0) AND liquidacion_id IS NULL ORDER BY fecha`, [ctx.pid, afiliadoId]);
     if (!ventas.length) throw U.error("El afiliado no tiene consumos por descuento pendientes de liquidar", 409);
     const consumos = U.redondear(ventas.reduce((s, v) => s + Number(v.total), 0), 2);
     const total = U.redondear(consumos * (1 - porcentaje / 100), 2);
@@ -221,7 +221,7 @@ async function crearLiquidacion(ctx) {
     });
     await t.run(
       `UPDATE predio_venta SET liquidacion_id = ? WHERE predio_id = ? AND afiliado_id = ? AND estado = 'CONFIRMADA'
-       AND forma_pago = 'DESCUENTO' AND liquidacion_id IS NULL`, [id, ctx.pid, afiliadoId]);
+       AND (forma_pago='DESCUENTO' OR importe_haberes>0) AND liquidacion_id IS NULL`, [id, ctx.pid, afiliadoId]);
     if (pagada && forma === "EFECTIVO" && cajaId) {
       const caja = await N.exigir(t, ctx, "predio_caja", cajaId, "No encontramos la caja");
       await N.insertar(t, ctx, "predio_caja_movimiento", {
@@ -234,8 +234,8 @@ async function crearLiquidacion(ctx) {
   });
 }
 
-async function verLiquidacion(ctx) {
-  exigirAdmin(ctx);
+async function verLiquidacion(ctx) { exigirAdmin(ctx); return datosLiquidacion(ctx); }
+async function datosLiquidacion(ctx) {
   const id = U.id(ctx.params.id);
   const db = ctx.db;
   const l = await N.exigir(db, ctx, "predio_liquidacion", id, "No encontramos la liquidación");
@@ -244,7 +244,7 @@ async function verLiquidacion(ctx) {
      LEFT JOIN predio_departamental d ON d.predio_id = a.predio_id AND d.id = a.departamental_id
      WHERE a.predio_id = ? AND a.id = ?`, [ctx.pid, l.afiliado_id]);
   const ventas = await db.all(
-    `SELECT v.id, v.fecha, v.total, b.nombre AS boca FROM predio_venta v JOIN predio_boca b ON b.predio_id = v.predio_id AND b.id = v.boca_id
+    `SELECT v.id, v.fecha, COALESCE(v.importe_haberes,v.total) AS total, b.nombre AS boca FROM predio_venta v JOIN predio_boca b ON b.predio_id = v.predio_id AND b.id = v.boca_id
      WHERE v.predio_id = ? AND v.liquidacion_id = ? ORDER BY v.fecha`, [ctx.pid, id]);
   const config = await N.leerConfig(db, ctx);
   return { liquidacion: l, afiliado: a, ventas, empresa: { nombre_predio: config.nombre_predio, razon_social: config.razon_social, cuit: config.cuit, direccion: config.direccion, texto_autorizacion: config.texto_autorizacion } };
@@ -273,13 +273,15 @@ async function anularLiquidacion(ctx) {
     if (l.estado === "ANULADA") throw U.error("La liquidación ya está anulada", 409);
     await t.run("UPDATE predio_venta SET liquidacion_id = NULL WHERE predio_id = ? AND liquidacion_id = ?", [ctx.pid, id]);
     await N.actualizar(t, ctx, "predio_liquidacion", id, { estado: "ANULADA", observaciones: `${l.observaciones ? `${l.observaciones} · ` : ""}Anulada: ${motivo}`.slice(0, 255) });
+    const mov=await t.get("SELECT * FROM predio_estadia_mov WHERE predio_id=? AND liquidacion_id=?",[ctx.pid,id]);
+    if(mov)await N.insertar(t,ctx,"predio_estadia_mov",{reserva_id:mov.reserva_id,concepto:mov.concepto,medio:"HABERES",importe:-Number(mov.importe),fecha:U.fechaHora(),detalle:"Anulación de planilla "+id+": "+motivo,usuario_id:ctx.usuario.id,usuario_nombre:N.nombreActor(ctx)});
     await N.auditar(t, ctx, "Liquidación anulada", "afiliado", l.afiliado_id, { liquidacion_id: id, motivo });
     return { id, mensaje: "Liquidación anulada: los consumos vuelven a quedar pendientes" };
   });
 }
 
 module.exports = {
-  limpiarDni,
+  limpiarDni, datosLiquidacion,
   rutas: [
     { m: "GET", p: "/afiliados/buscar", h: buscar },
     { m: "POST", p: "/afiliados/limites/previa", h: previaMasivo, roles: ["ADMIN"] },

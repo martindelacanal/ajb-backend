@@ -24,6 +24,7 @@ function valorMysql(v) {
 function envolver(conexionPromesa, comunes) {
   return {
     ...comunes,
+    conexionTurismo: conexionPromesa,
     async all(sql, params = []) {
       const [filas] = await conexionPromesa.query(sql, params.map(valorMysql));
       return filas.map(normalizarFila);

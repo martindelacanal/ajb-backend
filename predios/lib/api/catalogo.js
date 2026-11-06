@@ -525,6 +525,7 @@ async function guardarUsuario(ctx) {
     rol: U.opcion(b.rol || "CAJERO", ["ADMIN", "CAJERO"], "El rol"),
   };
   if (!/^[a-z0-9._-]+$/.test(datos.usuario)) throw U.error("El usuario sólo puede tener letras, números, punto, guion o guion bajo");
+  if (b.gestionar_reservas !== undefined) datos.gestionar_reservas = U.bool(b.gestionar_reservas);
   if (b.activo !== undefined) datos.activo = U.bool(b.activo);
   const bocas = Array.isArray(b.bocas) ? [...new Set(b.bocas.map((x) => U.id(x, "La boca")))] : [];
   if (datos.rol === "CAJERO" && !bocas.length) throw U.error("Asigná al menos una boca al usuario");

@@ -14,6 +14,7 @@ const DESTINOS = [
   { valor: "ALQUILER", texto: "Alquiler" },
 ];
 const FORMAS_PAGO = [
+  { valor: "SALDO", texto: "Saldo de estadía" }, { valor: "MIXTO", texto: "Pago combinado" },
   { valor: "EFECTIVO", texto: "Efectivo" },
   { valor: "QR", texto: "QR" },
   { valor: "TARJETA_DEBITO", texto: "Tarjeta de débito" },
@@ -723,9 +724,9 @@ L.cierres = {
 };
 
 const SQL_CONSUMO = `LEFT JOIN (SELECT afiliado_id,
-      SUM(total) AS consumido,
-      SUM(CASE WHEN liquidacion_id IS NULL THEN total ELSE 0 END) AS pendiente
-    FROM predio_venta WHERE predio_id = :pid AND forma_pago = 'DESCUENTO' AND estado = 'CONFIRMADA' GROUP BY afiliado_id) v ON v.afiliado_id = a.id
+      SUM(COALESCE(importe_haberes,total)) AS consumido,
+      SUM(CASE WHEN liquidacion_id IS NULL THEN COALESCE(importe_haberes,total) ELSE 0 END) AS pendiente
+    FROM predio_venta WHERE predio_id = :pid AND (forma_pago='DESCUENTO' OR importe_haberes>0) AND estado = 'CONFIRMADA' GROUP BY afiliado_id) v ON v.afiliado_id = a.id
   LEFT JOIN (SELECT afiliado_id, MIN(fecha_inicio) AS desde, MAX(fecha_fin) AS hasta,
       MAX(CASE WHEN fecha_inicio <= :hoy AND fecha_fin >= :hoy THEN 1 ELSE 0 END) AS en_predio
     FROM predio_estadia WHERE predio_id = :pid AND activo = 1 AND fecha_fin >= :hace60 GROUP BY afiliado_id) e ON e.afiliado_id = a.id

@@ -1,0 +1,20 @@
+.pagina > .rec-seccion, .pagina > .rec-resumen {margin-bottom:18px;}
+.rec-seccion {margin: 0 0 18px;padding: 20px;}
+.rec-seccion > h2,.rec-cotizacion h3 {margin:0 0 10px;font-size:19px;color:var(--azul-hondo);}
+.rec-grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:start;}
+.rec-seccion > .fila {margin-top:12px;}
+.rec-tabla {max-width:100%;overflow-x:auto;}
+.rec-tabla table {width:100%;border-collapse:collapse;text-align:left;}
+.rec-tabla th,.rec-tabla td {padding:9px 12px;border-bottom:1px solid var(--linea);vertical-align:top;}
+.rec-tabla th {color:var(--texto-2);background:var(--papel);font-size:13px;}
+.rec-tabla a {color:var(--azul);font-weight:700;}
+.rec-resumen,.rec-cotizacion {padding:14px 16px;background:var(--cielo);border-radius:var(--radio-chico);}
+.rec-resumen {display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;}
+.rec-viajero {min-width:0;padding:12px;border:1px solid var(--borde);border-radius:var(--radio-chico);}
+.rec-viajero legend,.rec-evento summary {font-weight:700;color:var(--azul-hondo);}
+.rec-viajero .rec-grid + .rec-grid,.rec-cotizacion button {margin-top:12px;}
+.rec-evento {padding:10px 0;border-bottom:1px solid var(--linea);}
+.rec-evento summary {cursor:pointer;}
+.rec-evento[open] summary {margin-bottom:10px;}
+.rec-seccion [hidden],.rec-seccion[hidden],.zona-saldo[hidden] {display:none;}
+@media(max-width:600px){.rec-seccion{padding:14px}.rec-grid{grid-template-columns:1fr}.rec-tabla th,.rec-tabla td{padding:8px;}}

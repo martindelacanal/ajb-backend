@@ -91,6 +91,7 @@
     llave: "M15 9a4 4 0 1 0-3.9 4.9L4 21h3v-2h2v-2h2l1.1-1.1A4 4 0 0 0 15 9z|M15.5 8.5h.01",
     menu: "M4 6h16M4 12h16M4 18h16",
     ojo: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z|M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
+    saldo: "M3 7h17v13H3z|M3 7V5l13-3 1 5|M16 11h5v5h-5z",
     efectivo: "M3 6h18v12H3z|M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z|M6 9v.01M18 15v.01",
     qr: "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4z|M14 14h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z",
     tarjeta: "M3 6h18v12H3z|M3 10h18|M7 15h4",

@@ -43,8 +43,7 @@ async function resumenAbierto(t, ctx, caja) {
   const egresos = U.redondear(Number(mov.egresos), 2);
   const desde = ultimo ? ultimo.fecha : "0000-00-00 00:00:00";
   const ventas = await t.all(
-    `SELECT forma_pago, COUNT(*) AS cantidad, COALESCE(SUM(total), 0) AS total FROM predio_venta
-     WHERE predio_id = ? AND caja_id = ? AND estado = 'CONFIRMADA' AND fecha > ? GROUP BY forma_pago`,
+    `SELECT COALESCE(p.forma,v.forma_pago) AS forma_pago, COUNT(*) AS cantidad, SUM(COALESCE(p.importe,v.total)) AS total FROM predio_venta v LEFT JOIN predio_venta_pago p ON p.predio_id=v.predio_id AND p.venta_id=v.id WHERE v.predio_id=? AND v.caja_id=? AND v.estado='CONFIRMADA' AND v.fecha>? GROUP BY COALESCE(p.forma,v.forma_pago)`,
     [ctx.pid, caja.id, desde]);
   const anuladas = await t.get(
     "SELECT COUNT(*) AS n FROM predio_venta WHERE predio_id = ? AND caja_id = ? AND estado = 'ANULADA' AND fecha > ?",
@@ -56,7 +55,7 @@ async function resumenAbierto(t, ctx, caja) {
     ingresos,
     egresos,
     saldo_esperado: saldo,
-    ventas_cantidad: porForma.reduce((s, v) => s + v.cantidad, 0),
+    ventas_cantidad: Number((await t.get("SELECT COUNT(*) AS n FROM predio_venta WHERE predio_id=? AND caja_id=? AND estado=\'CONFIRMADA\' AND fecha>?",[ctx.pid,caja.id,desde])).n),
     ventas_total: U.redondear(porForma.reduce((s, v) => s + v.total, 0), 2),
     ventas_efectivo: U.redondear(porForma.filter((v) => v.forma_pago === "EFECTIVO").reduce((s, v) => s + v.total, 0), 2),
     ventas_anuladas: Number(anuladas?.n || 0),

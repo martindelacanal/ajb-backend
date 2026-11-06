@@ -237,7 +237,7 @@ async function armarMaestros(db, predio) {
        JOIN usuario u ON u.id = r.usuario_id
        LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
        LEFT JOIN recurso rc ON rc.id = r.recurso_id
-       WHERE s.codigo IN (?) AND r.estado_reserva_id NOT IN (?) AND r.fecha_fin >= ? AND r.fecha_inicio <= ?
+       WHERE s.codigo IN (?) AND NOT EXISTS (SELECT 1 FROM recepcion_particular rp WHERE rp.usuario_id=u.id) AND r.estado_reserva_id NOT IN (?) AND r.fecha_fin >= ? AND r.fecha_inicio <= ?
        ORDER BY r.fecha_inicio`, [servicios, ESTADOS_EXCLUIDOS, desde, hasta]);
   }
   const porUsuario = new Map();
@@ -263,6 +263,13 @@ async function armarMaestros(db, predio) {
     });
   }
   return {
+    // Si se cortó la red después del COMMIT de Turismo, la notebook recupera
+    // cada confirmación en orden. La misma clave evita duplicar cargos o saldos.
+    recepcion_confirmada: predio.escritor === "LOCAL" && servicios.length ? (await db.query(
+      `SELECT e.id,e.operacion,e.empleado_id,e.actor,e.motivo,e.actual FROM recepcion_reserva_evento e
+       JOIN reserva r ON r.id=e.reserva_id JOIN servicio s ON s.id=r.servicio_id
+       WHERE e.predio_id=? AND s.codigo IN (?) AND NOT EXISTS (SELECT 1 FROM predio_recepcion_recibo p WHERE p.predio_id=e.predio_id AND p.clave=e.operacion)
+       ORDER BY e.id LIMIT 100`,[predio.id,servicios]))[0] : [],
     generado: U.fechaHora(),
     ventana_desde: desde,
     departamentales: departamentales.map((d) => ({ id: d.id, nombre: d.nombre, activo: String(d.habilitado || "Y").toUpperCase() !== "N" })),

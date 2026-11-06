@@ -114,6 +114,10 @@ async function aplicarMaestros(t, ctx, maestros) {
       }
     }
   }
+  for(const e of maestros.recepcion_confirmada||[]){
+    const r={...JSON.parse(e.actual),evento_id:Number(e.id)};
+    await require("./api/recepcion").aplicarConfirmacion(t,{...ctx,usuario:{id:e.empleado_id,nombre:e.actor},origen:"SISTEMA"},r,e.operacion,r.huella_local,e.motivo);
+  }
   return resumen;
 }
 
