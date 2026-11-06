@@ -202,12 +202,28 @@
     });
   };
 
+  P.salirDeCaja = function () {
+    return P.post("/sesion/salir-puesto", {}).then(function (r) {
+      return r.usuario ? r : P.get("/sesion");
+    }).then(function (sesion) {
+      P.estado.sesion = sesion;
+      P.repintarMarco();
+      P.ruta.ir("/inicio");
+      P.aviso("Saliste de la caja y volviste a administración", "ok");
+    });
+  };
+
   P.pantallaPuesto = function (contenedor) {
     var ses = P.estado.sesion;
     var puestos = (ses.puestos || []).filter(function (p) { return P.esAdmin() ? p.cajas.length : true; });
     contenedor.appendChild(h("div.pagina-cabecera", h("div",
       h("h1.titulo-pagina", P.esAdmin() ? "Trabajar en una caja" : "¿Dónde trabajás hoy?"),
       h("p.subtitulo", P.esAdmin() ? "Elegí la caja para vender o cerrar caja como administrador." : "Elegí tu boca y la caja. Podés cambiarla después desde tu nombre, arriba a la derecha."))));
+    if (P.esAdmin() && P.puesto() && P.puesto().caja_id) {
+      contenedor.appendChild(P.btn("Salir de caja y volver a administración", { tipo: "secundario", icono: "salir", onclick: function (ev) {
+        P.ejecutar(ev.currentTarget, P.salirDeCaja).catch(function () {});
+      } }));
+    }
     if (!puestos.length) {
       contenedor.appendChild(h("div.hoja.hoja-cuerpo", P.mensaje("No tenés bocas asignadas. Pedile al administrador que te asigne una.", "aviso")));
       return;

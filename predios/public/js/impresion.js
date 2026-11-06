@@ -18,6 +18,7 @@
       ".it { margin: 4px 0; } .it .n { font-weight: 700; word-break: break-word; } .p { font-size: " + (base - 1) + "px; }" +
       ".firma { margin-top: 26px; border-top: 1px solid #000; padding-top: 2px; font-size: " + (base - 1) + "px; }" +
       ".marca { margin: 6px 0; padding: 4px; border: 2px solid #000; text-align: center; font-weight: 800; letter-spacing: .1em; }" +
+      ".copia-comanda { break-before: page; page-break-before: always; padding-top: 3mm; }" +
       "p { margin: 3px 0; }";
   };
 
@@ -94,7 +95,11 @@
       linea(),
       e.leyenda ? h("div.c.p", e.leyenda) : null,
       h("div.c.p", "Sistema del predio · AJB"));
-    return imprimirHtml(nodo, ESTILO_TICKET(datos.ancho === 58 ? 58 : 80), "Ticket " + v.id);
+    var conComanda = opciones.comanda === undefined ? !!datos.imprimir_comanda : !!opciones.comanda;
+    var trabajo = conComanda ? h("div",
+      h("div.copia-cliente", h("div.marca", "CLIENTE"), nodo),
+      h("div.copia-comanda", h("div.marca", "COMANDA · PREPARACIÓN"), nodo.cloneNode(true))) : nodo;
+    return imprimirHtml(trabajo, ESTILO_TICKET(datos.ancho === 58 ? 58 : 80), "Ticket " + v.id);
   };
 
   P.imprimirCierre = function (datos, ancho) {

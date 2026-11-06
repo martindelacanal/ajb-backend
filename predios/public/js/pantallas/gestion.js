@@ -119,6 +119,7 @@
       margen.style.textAlign = "right";
       var venta = P.dinero({ soloLectura: true });
       var manual = P.check("Fijar el precio de venta a mano", false, "Si no, se calcula: compra + margen.");
+      var revisionPrecio = P.check("Confirmar que revisé el precio", false, "Actualiza la fecha de revisión aunque el importe siga igual.");
       var destino = P.select(DESTINOS, p.destino || "VENTA_DIRECTA");
       var ayudaDestino = h("span.campo-ayuda", AYUDA_DESTINO[destino.value]);
       destino.addEventListener("change", function () { ayudaDestino.textContent = AYUDA_DESTINO[destino.value]; });
@@ -152,6 +153,7 @@
           P.campo("Margen de utilidad (%)", margen),
           P.campo("Precio de venta", h("div.campo-con-prefijo", h("span", "$"), venta), { ayuda: "Calculado automáticamente" })),
         manual,
+        editar ? revisionPrecio : null,
         h("div.grilla.grilla-2", P.campo("Destino del producto", h("div", destino, ayudaDestino)),
           P.campo(editar ? "Cantidad en almacén (ajuste)" : "Cantidad en almacén", cantidad, { ayuda: editar ? "Si la cambiás, queda registrado como ajuste manual." : "El almacén recibe los productos: ahí empieza su recorrido." })),
         h("div.grilla.grilla-2", h("div.columna", perecedero, zonaVence), P.campo("Stock mínimo (para avisos)", minimo)),
@@ -182,6 +184,7 @@
             destino: destino.value, perecedero: perecedero.input.checked, fecha_caducidad: perecedero.input.checked ? vence.value || null : null,
             stock_minimo: P.numeroDe(minimo.value) || 0, cantidad_almacen: P.numeroDe(cantidad.value) || 0,
             precio_venta_manual: manual.input.checked ? P.numeroDe(venta.value) : null,
+            confirmar_revision_precio: revisionPrecio.input.checked,
           };
           if (editar) { cuerpo.activo = activo.input.checked; if (P.numeroDe(cantidad.value) === stockAlmacenDe(detalle)) delete cuerpo.cantidad_almacen; }
           if (!cuerpo.nombre.trim()) { nombre.classList.add("invalido"); nombre.focus(); return; }
@@ -212,6 +215,7 @@
       seleccion: seleccionEliminar("productos"),
       celdas: {
         stock: function (v, f) { return h("span.numero" + (Number(v) < 0 ? ".negativo" : ""), P.f.numero(v)); },
+        revision_precio: function (v) { return /^Revisar/.test(v || "") ? P.chip(v, "PENDIENTE") : (v || ""); },
         fecha_caducidad: function (v) {
           if (!v) return "";
           var vencido = v < P.hoy();
@@ -219,7 +223,7 @@
           return vencido ? P.chip(P.f.fecha(v), "ANULADA") : pronto ? P.chip(P.f.fecha(v), "PENDIENTE") : P.f.fecha(v);
         },
       },
-      barra: [],
+      barra: [P.btn("Precios para revisar", { tipo: "secundario", chico: true, icono: "reloj", onclick: function () { tabla.fijarFiltro("revision_precio", "pendiente"); } })],
     });
     c.appendChild(h("div.fila", { style: { marginBottom: "14px" } },
       P.btn("Nuevo producto", { tipo: "primario", icono: "mas", onclick: function () { P.formProducto({}, function () { tabla.recargar(); }); } }),

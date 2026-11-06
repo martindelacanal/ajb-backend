@@ -5,6 +5,7 @@
 // motor responde la página JSON, el CSV completo y el CSV resumido, en SQLite y MySQL.
 
 const { error, hoy, sumarDias, esFechaIso, redondear } = require("./util");
+const { limiteRevision, fechaRevisionSql, historialRevisionSql } = require("./precios");
 
 const DESTINOS = [
   { valor: "VENTA_DIRECTA", texto: "Venta directa" },
@@ -107,12 +108,17 @@ function alcanceBocas(expr) {
 
 const L = {};
 
+const FECHA_REVISION = fechaRevisionSql();
+const PRECIO_PENDIENTE = `p.activo = 1 AND COALESCE(st.positivo, 0) > 0 AND (${FECHA_REVISION} IS NULL OR ${FECHA_REVISION} < pl.fecha)`;
+
 L.productos = {
   roles: ["ADMIN"],
   titulo: "Productos y stock general",
   from: `predio_producto p
-    LEFT JOIN (SELECT producto_id, SUM(cantidad) AS total FROM predio_stock WHERE predio_id = :pid GROUP BY producto_id) st ON st.producto_id = p.id
-    LEFT JOIN predio_stock sa ON sa.predio_id = p.predio_id AND sa.producto_id = p.id AND sa.boca_id = :almacen`,
+    LEFT JOIN (SELECT producto_id, SUM(cantidad) AS total, SUM(CASE WHEN cantidad > 0 THEN cantidad ELSE 0 END) AS positivo FROM predio_stock WHERE predio_id = :pid GROUP BY producto_id) st ON st.producto_id = p.id
+    LEFT JOIN predio_stock sa ON sa.predio_id = p.predio_id AND sa.producto_id = p.id AND sa.boca_id = :almacen
+    ${historialRevisionSql()}
+    LEFT JOIN (SELECT :revision_limite AS fecha) pl ON 1 = 1`,
   where: "p.predio_id = :pid",
   columnas: [
     { clave: "id", titulo: "ID", expr: "p.id", tipo: "int" },
@@ -121,6 +127,8 @@ L.productos = {
     { clave: "precio_compra", titulo: "Compra", expr: "p.precio_compra", tipo: "money" },
     { clave: "margen", titulo: "Margen", expr: "p.margen", tipo: "pct" },
     { clave: "precio_venta", titulo: "Venta", expr: "p.precio_venta", tipo: "money" },
+    { clave: "revision_precio", titulo: "Revisión de precio", expr: `CASE WHEN ${PRECIO_PENDIENTE} THEN 'Revisar: más de 4 meses o sin fecha' WHEN COALESCE(st.positivo, 0) <= 0 THEN 'Sin stock' ELSE 'Al día' END` },
+    { clave: "fecha_revision_precio", titulo: "Última revisión de precio", expr: FECHA_REVISION, tipo: "dt", oculta: true },
     { clave: "stock", titulo: "Stock", expr: "COALESCE(st.total, 0)", tipo: "qty" },
     { clave: "destino", titulo: "Destino", expr: "p.destino", tipo: "opcion", opciones: DESTINOS },
     { clave: "perecedero", titulo: "Perecedero", expr: "p.perecedero", tipo: "bool" },
@@ -130,6 +138,10 @@ L.productos = {
     { clave: "fecha_modificacion", titulo: "Modificado", expr: "p.fecha_modificacion", tipo: "dt", oculta: true },
   ],
   filtros: [
+    { clave: "revision_precio", titulo: "Revisión de precio", tipo: "opciones", opciones: [
+      { valor: "pendiente", texto: "Con stock y precio para revisar", sql: PRECIO_PENDIENTE },
+      { valor: "vigente", texto: "Con stock y precio revisado", sql: `p.activo = 1 AND COALESCE(st.positivo, 0) > 0 AND ${FECHA_REVISION} >= pl.fecha` },
+    ] },
     { clave: "destino", titulo: "Destino", tipo: "opciones", expr: "p.destino", opciones: DESTINOS },
     { clave: "perecedero", titulo: "Perecedero", tipo: "opciones", expr: "p.perecedero", opciones: SI_NO },
     {
@@ -1030,6 +1042,7 @@ function parametrosBase(ctx) {
     hoy30: sumarDias(h, 30),
     hace60: sumarDias(h, -60),
     almacen: ctx.almacenId || -1,
+    revision_limite: limiteRevision(ctx.ahora || new Date()),
   };
 }
 

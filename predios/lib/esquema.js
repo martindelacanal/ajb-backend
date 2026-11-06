@@ -39,6 +39,7 @@ const TABLAS = {
       nombre: "str:80!",
       ancho_ticket: "int",
       impresion_automatica: "bool",
+      imprimir_comanda: "bool",
       activo: "bool",
     },
     indices: [["boca_id"]],
@@ -65,7 +66,7 @@ const TABLAS = {
   predio_aviso: {
     columnas: {
       tipo: "str:40!", usuario_id: "int", general_usuario_id: "int", general_documento: "str:20",
-      titulo: "str:180!", mensaje: "text!", fecha: "dt!", detalle: "text",
+      titulo: "str:180!", mensaje: "text!", fecha: "dt!", detalle: "text", resuelto_fecha: "dt",
     },
     indices: [["usuario_id", "fecha"], ["tipo", "fecha"]],
   },
@@ -96,6 +97,7 @@ const TABLAS = {
       precio_compra: "money",
       margen: "pct",
       precio_venta: "money",
+      fecha_revision_precio: "dt",
       destino: "str:20!",
       perecedero: "bool",
       fecha_caducidad: "date",
@@ -117,6 +119,10 @@ const TABLAS = {
       usuario_nombre: "str:120",
     },
     indices: [["producto_id"]],
+  },
+  predio_precio_control: {
+    columnas: { producto_id: "int!", revision_clave: "str:40!", aviso_id: "int", resuelto_fecha: "dt" },
+    unicos: [["producto_id"]],
   },
   predio_stock: {
     columnas: {

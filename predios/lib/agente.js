@@ -20,6 +20,7 @@ const { leerMeta, escribirMeta } = require("./db-sqlite");
 const { aplicarMaestros } = require("./maestros");
 const { instalarPaquete, leerPaquete } = require("./paquete");
 const { verificar } = require("./firma");
+const { identidadEquipo } = require("./control-equipo");
 
 const LOTE_PUSH = 400;
 
@@ -62,8 +63,9 @@ async function corregirCodigosVerificados(db, pid, cuerpo) {
   });
 }
 
-function crearAgente({ db, config, base, version, log, api, alActualizar, alReiniciar }) {
+function crearAgente({ db, config, base, version, log, api, alActualizar, alReiniciar, controlEquipo }) {
   const pid = Number(config.predio_id);
+  const equipoId = controlEquipo?.equipoId || identidadEquipo();
   const estado = {
     en_linea: false,
     ultimo_contacto: leerMeta(db, "ultimo_contacto"),
@@ -94,7 +96,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
 
   async function pedir(metodo, ruta, { cuerpo, binario = false, timeout = 20000, crudo = false } = {}) {
     const url = `${String(config.servidor).replace(/\/+$/, "")}/predios-sync${ruta}`;
-    const cabeceras = { Authorization: `Bearer ${config.token}`, "X-Predio": String(config.predio_codigo || ""), "X-Predio-Instancia": instancia };
+    const cabeceras = { Authorization: `Bearer ${config.token}`, "X-Predio": String(config.predio_codigo || ""), "X-Predio-Instancia": instancia, "X-Predio-Equipo": equipoId };
     let body;
     if (cuerpo !== undefined) {
       if (Buffer.isBuffer(cuerpo)) { body = cuerpo; cabeceras["Content-Type"] = "application/octet-stream"; }
@@ -109,9 +111,11 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
     if (crudo) return r;
     if (!r.ok) {
       let mensaje = `HTTP ${r.status}`;
-      try { const j = await r.json(); mensaje = j.mensaje || j.message || (typeof j === "string" ? j : mensaje); } catch (_e) { /* sin cuerpo */ }
+      let codigo = null;
+      try { const j = await r.json(); mensaje = j.mensaje || j.message || (typeof j === "string" ? j : mensaje); codigo = j.codigo || null; } catch (_e) { /* sin cuerpo */ }
       const e = new Error(mensaje);
       e.status = r.status;
+      e.codigo = codigo;
       throw e;
     }
     if (binario) return Buffer.from(await r.arrayBuffer());
@@ -158,7 +162,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
       const desde = cursorEnviado();
       const { cambios, hasta } = await db.exclusivo(() => lote(desde));
       if (hasta === desde) break;
-      const r = await pedir("POST", "/push", { cuerpo: { instancia_id: instancia, desde_seq: desde, hasta_seq: hasta, cambios }, timeout: 60000 });
+      const r = await pedir("POST", "/push", { cuerpo: { instancia_id: instancia, equipo_id: equipoId, desde_seq: desde, hasta_seq: hasta, cambios }, timeout: 60000 });
       await db.exclusivo(() => {
         escribirMeta(db, "outbox_cursor", hasta);
         db.conexion.prepare("DELETE FROM predio_outbox WHERE seq <= ?").run(hasta);
@@ -366,7 +370,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
     try {
       const hola = await pedir("POST", "/hola", {
         cuerpo: {
-          instancia_id: instancia, version, equipo: os.hostname(), pendientes: pendientes(),
+          instancia_id: instancia, equipo_id: equipoId, version, equipo: os.hostname(), pendientes: pendientes(),
           vacia: baseVacia(), bootstrap: leerMeta(db, "bootstrap"), bootstrap_generado: leerMeta(db, "bootstrap_generado"),
         },
       });
@@ -374,6 +378,15 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
       estado.ultimo_contacto = U.fechaHora();
       estado.ultimo_error = null;
       estado.escritor = hola.escritor;
+      if (/^[a-f0-9]{64}$/.test(String(hola.clave_lan || "")) && config.clave_lan !== hola.clave_lan) {
+        config.clave_lan = hola.clave_lan;
+        const archivo = path.join(base, "config.json");
+        let guardada = {};
+        try { guardada = JSON.parse(fs.readFileSync(archivo, "utf8").replace(/^\uFEFF/, "")); } catch (_e) { /* instalación configurada por entorno */ }
+        const temporal = `${archivo}.${process.pid}.tmp`;
+        fs.writeFileSync(temporal, JSON.stringify({ ...guardada, clave_lan: hola.clave_lan }, null, 2), { mode: 0o600 });
+        fs.renameSync(temporal, archivo);
+      }
       escribirMeta(db, "ultimo_contacto", estado.ultimo_contacto);
       escribirMeta(db, "escritor", hola.escritor || "");
       atenderRespuesta(hola);
@@ -381,9 +394,17 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
 
       if (hola.accion === "DESCARGAR_DATOS") {
         await descargarInstantanea();
-        await pedir("POST", "/tomar-control", { cuerpo: { instancia_id: instancia } });
+        const control = await pedir("POST", "/tomar-control", { cuerpo: { instancia_id: instancia, equipo_id: equipoId } });
+        if (control.autoriza_escritura === true) { controlEquipo?.confirmarCentral(); escribirMeta(db, "escritor", "LOCAL"); }
       } else if (hola.accion === "TOMAR_CONTROL") {
-        await pedir("POST", "/tomar-control", { cuerpo: { instancia_id: instancia } });
+        const control = await pedir("POST", "/tomar-control", { cuerpo: { instancia_id: instancia, equipo_id: equipoId } });
+        if (control.autoriza_escritura === true) { controlEquipo?.confirmarCentral(); escribirMeta(db, "escritor", "LOCAL"); }
+      }
+      if (hola.autoriza_escritura === true) controlEquipo?.confirmarCentral();
+      if (controlEquipo && !controlEquipo.puedeEscribir()) {
+        estado.conflicto = controlEquipo.estado().motivo;
+        await buscarActualizacion(false).catch((e) => log(`Actualización: ${e.message}`));
+        return;
       }
       if (hola.conflicto) {
         estado.conflicto = hola.conflicto;
@@ -395,6 +416,11 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
         await buscarActualizacion(false).catch((e) => log(`Actualización: ${e.message}`));
       }
     } catch (e) {
+      if (e.status === 409 && ["OTRO_EQUIPO", "OTRA_INSTALACION", "SIN_CONTROL"].includes(e.codigo)) {
+        controlEquipo?.rechazarCentral(e.message);
+        estado.conflicto = e.message;
+        await buscarActualizacion(false).catch((fallo) => log(`Actualización: ${fallo.message}`));
+      }
       fallos++;
       estado.en_linea = false;
       estado.ultimo_error = e.name === "TimeoutError" || e.name === "AbortError" ? "Sin respuesta del sistema general" : (e.cause?.code ? "Sin conexión a internet" : e.message);
@@ -425,7 +451,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
     for (const tabla of NOMBRES_TABLAS) tablas[tabla] = db.conexion.prepare(`SELECT * FROM ${tabla} WHERE predio_id = ?`).all(pid).map((f) => ({ ...f }));
     const max = db.conexion.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM predio_outbox").get();
     const datos = {
-      tipo: "predio-exportacion", formato: 1, predio_id: pid, predio_codigo: config.predio_codigo, instancia_id: instancia,
+      tipo: "predio-exportacion", formato: 1, predio_id: pid, predio_codigo: config.predio_codigo, instancia_id: instancia, equipo_id: equipoId,
       version, generado: U.fechaHora(), hasta_seq: Math.max(Number(max.m), cursorEnviado()), tablas,
     };
     const buffer = zlib.gzipSync(Buffer.from(JSON.stringify(datos)), { level: 6 });
@@ -511,6 +537,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
       servidor: config.servidor || null,
       predio: { id: pid, codigo: config.predio_codigo, nombre: config.predio_nombre },
       instancia,
+      equipo_id: equipoId,
       en_linea: estado.en_linea,
       ultimo_contacto: estado.ultimo_contacto,
       ultima_subida: estado.ultima_subida,

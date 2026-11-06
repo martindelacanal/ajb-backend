@@ -141,10 +141,10 @@ async function armarSesion(ctx, usuario, sesion) {
   let puesto = null;
   if (sesion.caja_id) {
     puesto = await ctx.db.get(
-      `SELECT c.id AS caja_id, c.nombre AS caja, c.ancho_ticket, c.impresion_automatica, b.id AS boca_id, b.nombre AS boca, b.es_almacen
+      `SELECT c.id AS caja_id, c.nombre AS caja, c.ancho_ticket, c.impresion_automatica, c.imprimir_comanda, b.id AS boca_id, b.nombre AS boca, b.es_almacen
        FROM predio_caja c JOIN predio_boca b ON b.predio_id = c.predio_id AND b.id = c.boca_id
        WHERE c.predio_id = ? AND c.id = ?`, [ctx.pid, sesion.caja_id]);
-    if (puesto) puesto.turno_id = sesion.turno_id;
+    if (puesto) { puesto.turno_id = sesion.turno_id; puesto.imprimir_comanda = !!Number(puesto.imprimir_comanda); }
   } else if (sesion.boca_id) {
     const b = await ctx.db.get("SELECT id AS boca_id, nombre AS boca, es_almacen FROM predio_boca WHERE predio_id = ? AND id = ?", [ctx.pid, sesion.boca_id]);
     if (b) puesto = { ...b, caja_id: null };
@@ -206,9 +206,18 @@ async function cerrarTurno(ctx) {
 }
 
 async function salirPuesto(ctx) {
-  await cerrarTurno(ctx);
-  await ctx.db.run("UPDATE predio_sesion SET boca_id = NULL, caja_id = NULL, turno_id = NULL WHERE token_hash = ?", [ctx.sesion.token_hash]);
-  return { ok: true };
+  const s = ctx.sesion || {};
+  if (!s.token_hash) throw U.error("Iniciá sesión para continuar", 401);
+  await ctx.db.tx(async (t) => {
+    if (s.turno_id) {
+      await t.run("UPDATE predio_turno SET fin = ?, estado = 'CERRADO' WHERE predio_id = ? AND id = ? AND usuario_id = ? AND estado = 'ABIERTO'",
+        [U.fechaHora(), ctx.pid, s.turno_id, ctx.usuario.id]);
+    }
+    await t.run("UPDATE predio_sesion SET boca_id = NULL, caja_id = NULL, turno_id = NULL WHERE token_hash = ? AND usuario_id = ?", [s.token_hash, ctx.usuario.id]);
+    await N.auditar(t, ctx, "Salida del puesto de caja", "caja", s.caja_id || null, { boca_id: s.boca_id || null, turno_id: s.turno_id || null });
+  });
+  const usuario = await N.exigir(ctx.db, ctx, "predio_usuario", ctx.usuario.id, "El usuario ya no existe");
+  return { ok: true, ...(await armarSesion(ctx, usuario, {})) };
 }
 
 async function logout(ctx) {

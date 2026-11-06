@@ -17,6 +17,7 @@
 
 require("dotenv").config();
 const mysql = require("mysql2/promise");
+const fs = require("node:fs");
 const { TABLAS, NOMBRES_TABLAS, columnasDe, tipoSql, ddlTabla } = require("../predios/lib/esquema");
 const { crearMysql } = require("../predios/lib/db-mysql");
 const { sembrarPredio, PREDIOS } = require("../predios/lib/semilla");
@@ -36,6 +37,7 @@ const DDL_CENTRALES = {
     activo TINYINT(1) NOT NULL DEFAULT 1,
     escritor ENUM('CENTRAL','LOCAL') NOT NULL DEFAULT 'CENTRAL' COMMENT 'Quién es dueño de los datos: el sistema general hasta que se instala la notebook',
     instancia_id VARCHAR(64) NULL,
+    equipo_id VARCHAR(64) NULL,
     version_local VARCHAR(60) NULL,
     equipo VARCHAR(120) NULL,
     ultima_conexion DATETIME NULL,
@@ -131,11 +133,15 @@ async function main() {
   const c = await mysql.createConnection({
     host, user: process.env.DB_USER, password: process.env.DB_PASSWORD, database: process.env.DB_DATABASE,
     port: Number(process.env.DB_PORT || 3306), timezone: "-03:00", dateStrings: true, decimalNumbers: true,
+    ssl: String(process.env.DB_SSL_MODE || "disabled").toLowerCase() === "disabled" ? undefined
+      : { ca: fs.readFileSync(process.env.DB_SSL_CA_PATH), rejectUnauthorized: true },
   });
+  await c.query("SET SESSION time_zone = '-03:00'");
   console.log(`Base: ${process.env.DB_DATABASE} en ${host} (usuario ${process.env.DB_USER})`);
   const faltantes = [];
   for (const t of TODAS) if (!(await tablaExiste(c, t))) faltantes.push(t);
   const columnasFaltantes = [];
+  if (!faltantes.includes("predio") && !(await columnasExistentes(c, "predio")).has("equipo_id")) columnasFaltantes.push("predio.equipo_id");
   for (const t of NOMBRES_TABLAS) {
     if (faltantes.includes(t)) continue;
     const existentes = await columnasExistentes(c, t);
@@ -146,6 +152,7 @@ async function main() {
   if (soloRevisar) { await c.end(); return; }
 
   for (const [t, ddl] of Object.entries(DDL_CENTRALES)) await c.query(ddl);
+  if (!(await columnasExistentes(c, "predio")).has("equipo_id")) await c.query("ALTER TABLE predio ADD COLUMN equipo_id VARCHAR(64) NULL");
   for (const t of NOMBRES_TABLAS) {
     await c.query(ddlTabla(t, "mysql"));
     const existentes = await columnasExistentes(c, t);

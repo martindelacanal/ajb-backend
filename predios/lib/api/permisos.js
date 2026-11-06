@@ -6,6 +6,7 @@
 const U = require("../util");
 const N = require("../negocio");
 const { listarAvisos, leerAviso } = require("../avisos");
+const { revisarPreciosVencidos } = require("../precios");
 const { TIPOS_PERMISO, textoDe } = require("../listados");
 const { exigirAdmin, esAdmin, bocasDe, validarClave, exigirPuesto } = require("./comun");
 
@@ -70,6 +71,7 @@ async function probarClave(ctx) {
 }
 
 async function avisos(ctx) {
+  if (esAdmin(ctx) && !ctx.soloLectura) await revisarPreciosVencidos(ctx.db, ctx);
   const db = ctx.db;
   const pid = ctx.pid;
   const hoy = U.hoy();

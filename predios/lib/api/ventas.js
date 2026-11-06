@@ -77,7 +77,7 @@ async function avisarSinStock(ctx) {
 
 async function datosTicket(db, ctx, ventaId) {
   const v = await db.get(
-    `SELECT v.*, b.nombre AS boca, c.nombre AS caja, c.ancho_ticket
+    `SELECT v.*, b.nombre AS boca, c.nombre AS caja, c.ancho_ticket, c.imprimir_comanda
      FROM predio_venta v
      JOIN predio_boca b ON b.predio_id = v.predio_id AND b.id = v.boca_id
      JOIN predio_caja c ON c.predio_id = v.predio_id AND c.id = v.caja_id
@@ -100,6 +100,7 @@ async function datosTicket(db, ctx, ventaId) {
     venta: v,
     items,
     afiliado,
+    imprimir_comanda: !!Number(v.imprimir_comanda),
     ancho: Number(v.ancho_ticket) === 58 ? 58 : 80,
     empresa: {
       nombre_predio: config.nombre_predio,

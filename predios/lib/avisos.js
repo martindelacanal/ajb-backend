@@ -35,7 +35,7 @@ async function listarAvisos(ctx) {
   const d = await destinatarioSql(ctx);
   const filas = await ctx.db.all(
     `SELECT a.* FROM predio_aviso a
-     WHERE a.predio_id = ? AND ${d.sql}
+     WHERE a.predio_id = ? AND ${d.sql} AND a.resuelto_fecha IS NULL
        AND NOT EXISTS (SELECT 1 FROM predio_aviso_lectura l WHERE l.predio_id = a.predio_id AND l.aviso_id = a.id AND l.usuario_id = ?)
      ORDER BY a.id DESC LIMIT 50`, [ctx.pid, ...d.params, ctx.usuario.id]);
   return filas.map((a) => {

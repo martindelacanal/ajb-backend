@@ -18,6 +18,7 @@ const { aplicarMaestros } = require("../../predios/lib/maestros");
 const { sembrarPredio, PREDIOS } = require("../../predios/lib/semilla");
 const firma = require("../../predios/lib/firma");
 const { nuevosAvisos, entregarAvisos } = require("./predios-avisos");
+const { exigirPropietario } = require("./predios-propietario");
 
 // Estados de reserva que NO cuentan como estadía (rechazada, solicitud de sorteo,
 // no adjudicada, convenio rechazado, cancelada).
@@ -40,6 +41,10 @@ function claveFirma() {
 }
 
 let paqueteCache = null;
+function claveLan(predioId) {
+  return crypto.createHmac("sha256", claveFirma().privada).update(`predio-lan:${Number(predioId)}`).digest("hex");
+}
+
 function paqueteCodigo() {
   if (!paqueteCache) {
     paqueteCache = armarPaquete(DIR_PREDIOS);
@@ -184,7 +189,9 @@ async function importarExportacion(pool, predio, datos, { forzar = false, usuari
   const resumen = {};
   try {
     await conexion.beginTransaction();
-    await conexion.query("SELECT id FROM predio WHERE id = ? FOR UPDATE", [predio.id]);
+    const [[actual]] = await conexion.query("SELECT * FROM predio WHERE id = ? FOR UPDATE", [predio.id]);
+    if (!actual) throw U.error("No encontramos el predio", 404);
+    if (!forzar) exigirPropietario(actual, datos);
     const avisos = await nuevosAvisos(conexion, predio.id, Array.isArray(datos.tablas?.predio_aviso) ? datos.tablas.predio_aviso : []);
     for (const tabla of NOMBRES_TABLAS) {
       const filas = Array.isArray(datos.tablas?.[tabla]) ? datos.tablas[tabla] : null;
@@ -195,8 +202,8 @@ async function importarExportacion(pool, predio, datos, { forzar = false, usuari
     }
     await entregarAvisos(conexion, predio, avisos);
     await conexion.query(
-      "UPDATE predio SET escritor = 'LOCAL', instancia_id = ?, ultimo_seq = GREATEST(ultimo_seq, ?), ultimo_push = NOW(), version_local = COALESCE(?, version_local) WHERE id = ?",
-      [datos.instancia_id || predio.instancia_id, Number(datos.hasta_seq) || 0, datos.version || null, predio.id]);
+      "UPDATE predio SET escritor = 'LOCAL', instancia_id = ?, equipo_id = COALESCE(?, equipo_id), ultimo_seq = GREATEST(ultimo_seq, ?), ultimo_push = NOW(), version_local = COALESCE(?, version_local) WHERE id = ?",
+      [datos.instancia_id || predio.instancia_id, datos.equipo_id || null, Number(datos.hasta_seq) || 0, datos.version || null, predio.id]);
     await conexion.commit();
   } catch (e) {
     await conexion.rollback();
@@ -339,6 +346,7 @@ async function armarInstalador(pool, predio, { urlServidor, token, puerto = 8080
     puerto,
     actualizaciones_automaticas: true,
     clave_publica: claveFirma().publica,
+    clave_lan: claveLan(predio.id),
   };
   const datosIniciales = zlib.gzipSync(Buffer.from(JSON.stringify({
     tipo: "predio-datos-iniciales", predio_id: predio.id, generado: U.fechaHora(), tablas: await instantaneaCompleta(pool, predio.id),
@@ -373,6 +381,7 @@ module.exports = {
   paqueteCodigo,
   paqueteFirmado,
   claveFirma,
+  claveLan,
   enLinea,
   serviciosDe,
   obtenerPredio,

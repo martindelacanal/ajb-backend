@@ -138,12 +138,55 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
   con `producto_id`, `nombre_esperado`, `codigo_anterior` y `codigo_nuevo`; valida todo
   antes de aplicar y admite repetición. Primero actualizar la notebook, luego encolar
   la reparación: las versiones anteriores no conocen esta orden.
-- La lista habitual de ventas ofrece productos con stock positivo en la boca elegida;
-  los servicios, las ventas compuestas y los alquileres conservan su tratamiento sin
-  descuento de unidades. «¿No aparece el producto?» permite buscar una excepción y
-  confirmar el aviso al administrador con producto, boca, caja, operador y horario.
-  El aviso no modifica existencias. La configuración que prohíbe vender sin stock se
-  respeta también en este circuito; las ventas excepcionales autorizadas generan aviso.
+- La lista de ventas ofrece productos con precio de venta y stock positivo en la boca elegida,
+  incluso cuando se busca por nombre o código. Los agotados y los productos sin precio
+  no se agregan al desplegable; un escaneo exacto permite informar el motivo.
+  El aviso de falta de precio aparece al escanear ese producto.
+  «¿No aparece el producto?» reúne la consulta y el envío del aviso en un solo diálogo,
+  sin una segunda confirmación ni un desplegable de agotados.
+  Los servicios, las ventas compuestas y los alquileres conservan su tratamiento sin
+  descuento de unidades. El aviso informa al administrador sin modificar existencias;
+  la configuración que prohíbe vender sin stock sigue vigente.
+- Cada caja conserva su opción «Imprimir comanda». El ticket del cliente y la copia
+  completa marcada COMANDA se imprimen en un único trabajo. La opción se sincroniza
+  y no afecta a las demás cajas.
+- Un administrador puede salir del puesto desde Ventas, el menú o la selección de
+  cajas sin elegir otra. Se cierra su turno y se libera su puesto; sigue autenticado
+  para administrar y no se altera el dinero de la caja.
+
+## Precios, compras y recordatorios
+
+- Cada compra actualiza automáticamente el costo del producto y recalcula su precio
+  de venta con el margen vigente. Cada compra conserva un asiento en el historial de
+  precios, aunque el importe sea igual al anterior. El margen se modifica en la ficha.
+- La revisión de precios se registra aparte de las modificaciones de nombre o código.
+  Un cambio real de costo, margen o precio, una compra o la confirmación explícita de
+  revisión renuevan su fecha. El historial importado aporta la referencia anterior.
+- Si un producto activo tiene stock positivo y lleva **más de cuatro meses calendario**
+  sin revisar su precio, el administrador recibe un recordatorio. Gestión → Productos
+  incluye el filtro «Precios pendientes de revisión» y su fecha. Se puede seguir vendiendo.
+  Se revisa periódicamente sin internet; un recordatorio resuelto no se repite hasta
+  que vuelva a vencer o reaparezca stock pendiente.
+
+## Arranque, servidor único y HTTPS en la red local
+
+- El instalador configura el arranque con Windows por defecto. La tarea `AJB Predio`
+  ejecuta el supervisor y recupera caídas. Se puede instalar sin arranque automático.
+  `herramientas/iniciar-servidor.bat`, `detener-servidor.bat`, `reiniciar-servidor.bat`
+  y `configurar-arranque.bat` permiten controlarlo manualmente. Detener conserva el
+  apagado intencional; reiniciar vuelve a habilitar el arranque automático.
+- Cada instalación conserva la identidad de su equipo. Copiar la carpeta o base a otra
+  PC no habilita un segundo escritor. Una instalación nueva vinculada debe activar su
+  control una vez con Mi AJB; después sigue trabajando sin conexión. La LAN consulta
+  servidores del mismo predio con mensajes autenticados y muestra el servidor existente.
+  Mi AJB serializa la toma de control; reinstalar otra PC no reemplaza automáticamente
+  al servidor dueño del predio.
+- HTTPS local utiliza un certificado propio del predio, con el nombre de la notebook
+  y sus IP, y conserva HTTP para compatibilidad. Para que cada PC deje de advertir sobre
+  el certificado hay que instalar una vez la raíz pública desde el paquete
+  `certificados-PCs` generado por el servidor, comprobando su huella SHA-256.
+  Las claves privadas permanecen en el servidor con permisos de SYSTEM y administradores.
+  La renovación del certificado del servidor conserva la misma raíz de confianza.
 
 ## Reglas de negocio que conviene recordar
 

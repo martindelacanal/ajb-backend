@@ -330,7 +330,7 @@
           if (exactos.length === 1) elegir(exactos[0]);
           else if (r.length === 1 && texto && opciones.elegirUnico !== false && !r[0].requiereEleccion) elegir(r[0]);
           else if (r.length && opciones.alEnterConResultados) opciones.alEnterConResultados(texto, r);
-          else if (!r.length && opciones.alEnterSinCoincidencia) opciones.alEnterSinCoincidencia(texto);
+          else if (!r.length && opciones.alEnterSinCoincidencia) { cerrarLista(); opciones.alEnterSinCoincidencia(texto); }
         }).catch(P.error);
       }
     });
@@ -381,8 +381,10 @@
       placeholder: "Escaneá el código o escribí el nombre del producto",
       elegirUnico: false,
       buscar: function (texto) {
-        return P.get("/productos/buscar" + P.qs({ q: texto, boca_id: opciones.bocaId ? opciones.bocaId() : null, venta: opciones.venta ? 1 : null, sin_stock: opciones.sinStock ? 1 : null })).then(function (r) {
-          return r.map(function (p) {
+        return P.get("/productos/buscar" + P.qs({ q: texto, boca_id: opciones.bocaId ? opciones.bocaId() : null, venta: opciones.venta ? 1 : null })).then(function (r) {
+          return r.filter(function (p) {
+            return !opciones.venta || (Number(p.precio_venta) > 0 && p.destino !== "USO_INTERNO" && (p.destino !== "VENTA_DIRECTA" || Number(p.stock_boca) > 0));
+          }).map(function (p) {
             return {
               valor: p.id, texto: p.nombre, codigo: p.codigo, exacto: p.exacto, dato: p, busqueda: texto,
               requiereEleccion: !!p.sugerido,

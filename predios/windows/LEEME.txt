@@ -23,6 +23,27 @@ INSTALAR (una sola vez, en la notebook que queda en el camping)
 
 El sistema queda instalado en C:\AJB-Predio y arranca solo cada vez que se enciende
 la notebook (no hace falta iniciar sesión en Windows). Si se cae, se levanta solo.
+Desde Sistema podes cambiar el arranque automatico. Detener el servidor lo deja
+apagado y deshabilita el arranque; Reiniciar servidor lo vuelve a habilitar.
+Las herramientas iniciar-servidor.bat, detener-servidor.bat, reiniciar-servidor.bat
+y configurar-arranque.bat permiten controlarlo tambien desde Windows.
+
+HTTPS SIN EL AVISO DEL NAVEGADOR
+-------------------------------
+El instalador prepara HTTPS con el nombre y la IP de la notebook. Sistema muestra
+la direccion y la huella SHA-256. En cada PC de caja, una sola vez:
+1. Copia la carpeta certificados-PCs completa desde la notebook servidor.
+2. Comproba que la huella de LEEME.txt coincida con la de Sistema en la notebook.
+3. Clic derecho en CONFIAR-EN-ESTA-PC.bat > Ejecutar como administrador.
+4. Reabri el navegador y usa la direccion HTTPS que muestra Sistema.
+No copies datos/tls: contiene las claves privadas del servidor.
+
+UN SOLO SERVIDOR POR PREDIO
+--------------------------
+Copiar la carpeta o base a otra PC no habilita un segundo servidor de escritura.
+Una instalacion nueva necesita validar una vez su equipo con Mi AJB; despues puede
+operar sin internet. Si detecta otro servidor, muestra su direccion y queda en
+consulta para evitar que dos PCs modifiquen bases distintas del mismo predio.
 
 EN CADA PC DE LAS BOCAS (comedor, confitería, proveeduría, etc.)
 -----------------------------------------------------------------

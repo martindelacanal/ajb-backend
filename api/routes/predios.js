@@ -19,6 +19,8 @@ const { verificarTokenConAutorizacionActual } = require("../security/autorizacio
 const { obtenerOrigenesPermitidos } = require("../security/http-config");
 const { crearNotificacion } = require("../services/notificaciones");
 const C = require("../services/predios-central");
+const propietario = require("../services/predios-propietario");
+const { entregarAvisos } = require("../services/predios-avisos");
 const U = require("../../predios/lib/util");
 const apiPredio = require("../../predios/lib/api");
 const sesionPredio = require("../../predios/lib/api/sesion");
@@ -50,6 +52,11 @@ async function ejecutarComoAdminGeneral(res, predio, usuario, { metodo, ruta, cu
   const bocas = (await db.all("SELECT id FROM predio_boca WHERE predio_id = ?", [predio.id])).map((b) => Number(b.id));
   const base = {
     db, pid: predio.id, modo: "central", origen: "REMOTO", ip: null, servicios: {},
+    revisarPreciosCentral: predio.escritor === "CENTRAL",
+    alAvisosPrecios: (t, filas) => entregarAvisos({ query: async (sql, params) => {
+      if (/^\s*SELECT/i.test(sql)) return [await t.all(sql, params)];
+      const r = await t.run(sql, params); return [{ insertId: r.insertId }];
+    } }, predio, filas),
     usuario: { id: null, usuario: `dni${usuario.documento}`, nombre, rol: "ADMIN", bocas, es_admin_general: true,
       general_usuario_id: Number(usuario.id), documento: String(usuario.documento || "") },
     sesion: {}, query: { ...(query || {}) }, body: cuerpo && typeof cuerpo === "object" ? cuerpo : {},
@@ -393,8 +400,12 @@ function crearRouterSync() {
       if (!Number(fila.activo)) return res.status(403).json({ mensaje: "El predio está desactivado en el sistema general" });
       req.predio = C.normalizar(fila);
       req.instalacionId = fila.instalacion_id;
+      const instanciaCabecera = String(req.headers["x-predio-instancia"] || "");
+      if (!["/version", "/codigo"].includes(req.path) && req.predio.escritor === "LOCAL" && req.predio.instancia_id) {
+        propietario.exigirPropietario(req.predio, { instancia_id: instanciaCabecera, equipo_id: req.headers["x-predio-equipo"] || "" });
+      }
       await pool().query("UPDATE predio_instalacion SET ultimo_uso = NOW(), ultima_ip = ?, instancia_id = COALESCE(?, instancia_id) WHERE id = ?",
-        [String(req.ip || "").slice(0, 45), String(req.headers["x-predio-instancia"] || "").slice(0, 64) || null, fila.instalacion_id]);
+        [String(req.ip || "").slice(0, 45), instanciaCabecera.slice(0, 64) || null, fila.instalacion_id]);
       next();
     } catch (e) { responderError(res, e); }
   });
@@ -410,34 +421,15 @@ function crearRouterSync() {
 
   router.post("/hola", async (req, res) => {
     try {
-      const p = req.predio;
-      const b = req.body || {};
-      const instancia = String(b.instancia_id || "").slice(0, 64);
-      await pool().query(
-        "UPDATE predio SET ultima_conexion = NOW(), version_local = ?, equipo = ?, pendientes_local = ? WHERE id = ?",
-        [String(b.version || "").slice(0, 60) || null, String(b.equipo || "").slice(0, 120) || null, Number(b.pendientes) || 0, p.id]);
-      let accion = null;
-      let conflicto = null;
-      if (p.escritor === "CENTRAL") {
-        const escrituraPosterior = p.ultima_escritura_central && b.bootstrap_generado && p.ultima_escritura_central > b.bootstrap_generado;
-        if (b.vacia || (escrituraPosterior && !Number(b.pendientes))) accion = "DESCARGAR_DATOS";
-        else accion = "TOMAR_CONTROL";
-      } else if (p.instancia_id && p.instancia_id !== instancia) {
-        // Notebook nueva que reemplaza a la anterior: si todavía no cargó nada propio,
-        // baja los datos más recientes del sistema general y toma el control.
-        const recienInstalada = String(b.bootstrap || "").startsWith("instalador") && !Number(b.pendientes);
-        if (b.vacia || recienInstalada) accion = "DESCARGAR_DATOS";
-        else {
-          conflicto = `Otra instalación (${p.equipo || "otro equipo"}) tiene el control de los datos de este predio. Si esta notebook la reemplaza, reinstalala con un instalador nuevo de Mi AJB y dejala conectarse antes de cargar datos.`;
-        }
-      } else if (!p.instancia_id) {
-        accion = "TOMAR_CONTROL";
-      }
+      const saludo = await propietario.saludarPredio(pool(), req.predio.id, req.body || {});
+      const p = C.normalizar(saludo.predio);
       res.json({
         predio: { id: p.id, codigo: p.codigo, nombre: p.nombre },
         escritor: p.escritor,
-        accion,
-        conflicto,
+        accion: saludo.accion,
+        conflicto: null,
+        autoriza_escritura: saludo.autoriza_escritura,
+        clave_lan: C.claveLan(p.id),
         remoto_activo: remotoActivo(p),
         comandos_pendientes: await comandosPendientes(p),
         version_disponible: C.paqueteCodigo().version,
@@ -448,12 +440,7 @@ function crearRouterSync() {
 
   router.post("/tomar-control", async (req, res) => {
     try {
-      const p = req.predio;
-      const instancia = String(req.body?.instancia_id || "").slice(0, 64);
-      if (!instancia) throw U.error("Falta la instancia");
-      await pool().query("UPDATE predio SET escritor = 'LOCAL', instancia_id = ? WHERE id = ?", [instancia, p.id]);
-      await C.evento(pool(), p.id, "TOMA_DE_CONTROL", { instancia, equipo: p.equipo, anterior: p.instancia_id });
-      res.json({ ok: true });
+      res.json(await propietario.tomarControl(pool(), req.predio.id, req.body || {}));
     } catch (e) { responderError(res, e); }
   });
 
@@ -468,13 +455,13 @@ function crearRouterSync() {
     const p = req.predio;
     const b = req.body || {};
     try {
-      if (p.escritor === "LOCAL" && p.instancia_id && b.instancia_id !== p.instancia_id) {
-        throw U.error("Otra instalación tiene el control de este predio", 409, { codigo: "OTRA_INSTALACION" });
-      }
       const conexion = await pool().getConnection();
       let resultado;
       try {
         await conexion.beginTransaction();
+        const [[actual]] = await conexion.query("SELECT * FROM predio WHERE id = ? FOR UPDATE", [p.id]);
+        if (!actual) throw U.error("No encontramos el predio", 404);
+        propietario.exigirPropietario(actual, b, { exigirLocal: true });
         resultado = await C.aplicarCambios(conexion, p, Array.isArray(b.cambios) ? b.cambios : []);
         await conexion.query("UPDATE predio SET ultimo_push = NOW(), ultimo_seq = GREATEST(ultimo_seq, ?) WHERE id = ?", [Number(b.hasta_seq) || 0, p.id]);
         await conexion.commit();

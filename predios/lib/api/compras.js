@@ -1,11 +1,12 @@
 "use strict";
 
 // Compras a proveedores: una compra por factura. Suma stock en el almacén, guarda el
-// precio anterior de cada producto y, si se pide, recalcula el precio de venta.
+// precio anterior y siempre recalcula la venta con el margen vigente del producto.
 
 const U = require("../util");
 const N = require("../negocio");
 const { precioVenta } = require("./catalogo");
+const { resolverRevisionProducto, fuentePrecioVigente } = require("../precios");
 const { esAdmin, bocasDe } = require("./comun");
 
 async function puedeComprar(t, ctx, bocaId) {
@@ -46,17 +47,10 @@ async function crearCompra(ctx) {
     const precio = Number(String(it.precio_unitario ?? "").replace(",", "."));
     if (!Number.isFinite(cantidad) || cantidad <= 0) problemas.push(`En la fila ${n} la cantidad tiene que ser mayor que cero.`);
     if (!Number.isFinite(precio) || precio < 0) problemas.push(`En la fila ${n} el precio unitario no es válido.`);
-    let margen = null;
-    if (it.margen !== undefined && it.margen !== null && it.margen !== "") {
-      margen = Number(String(it.margen).replace(",", "."));
-      if (!Number.isFinite(margen) || margen < -100 || margen > 10000) problemas.push(`En la fila ${n} el margen no es válido.`);
-    }
     lineas.push({
       producto_id: productoId,
       cantidad: U.redondear(cantidad, 3),
       precio_unitario: U.redondear(precio, 2),
-      margen,
-      actualizar_precio: it.actualizar_precio === undefined ? 1 : U.bool(it.actualizar_precio),
       subtotal: U.redondear(cantidad * precio, 2),
     });
   });
@@ -98,31 +92,26 @@ async function crearCompra(ctx) {
     for (const l of lineas) {
       const p = await N.exigir(t, ctx, "predio_producto", l.producto_id, "Uno de los productos no existe", { bloquear: true });
       const anterior = Number(p.precio_compra || 0);
-      // El margen lo define el administrador: un usuario del almacén no lo cambia desde la compra.
-      const margen = l.margen === null || !esAdmin(ctx) ? Number(p.margen || 0) : U.redondear(l.margen, 2);
+      // El margen vigente se lee al confirmar; un formulario viejo no lo sobrescribe.
+      const margen = Number(p.margen || 0);
       const nuevoVenta = precioVenta(l.precio_unitario, margen);
       await N.insertar(t, ctx, "predio_compra_item", {
         compra_id: compraId, producto_id: l.producto_id, cantidad: l.cantidad, precio_unitario: l.precio_unitario,
-        precio_anterior: anterior, margen, precio_venta: l.actualizar_precio ? nuevoVenta : Number(p.precio_venta || 0),
-        actualizo_precio: l.actualizar_precio, subtotal: l.subtotal,
+        precio_anterior: anterior, margen, precio_venta: nuevoVenta,
+        actualizo_precio: 1, subtotal: l.subtotal,
       });
       await N.moverStock(t, ctx, {
         bocaId, productoId: l.producto_id, cantidad: l.cantidad, tipo: "COMPRA", referenciaTipo: "compra", referenciaId: compraId,
         detalle: `Compra N° ${compraId} · ${proveedor.razon_social}${factura ? ` · Fc ${factura}` : ""}`,
       });
-      const cambios = { precio_compra: l.precio_unitario, margen };
-      if (l.actualizar_precio) cambios.precio_venta = nuevoVenta;
+      const cambios = { precio_compra: l.precio_unitario, precio_venta: nuevoVenta, fecha_revision_precio: U.fechaHora() };
       await N.actualizar(t, ctx, "predio_producto", l.producto_id, cambios);
-      if (anterior !== l.precio_unitario || Number(p.margen || 0) !== margen || (l.actualizar_precio && Number(p.precio_venta || 0) !== nuevoVenta)) {
-        await N.insertar(t, ctx, "predio_precio_historial", {
-          producto_id: l.producto_id, fecha: U.fechaHora(), precio_compra: l.precio_unitario, margen,
-          precio_venta: l.actualizar_precio ? nuevoVenta : Number(p.precio_venta || 0), origen: "COMPRA", referencia_id: compraId,
-          usuario_nombre: N.nombreActor(ctx),
-        });
-      }
-      if (!l.actualizar_precio && anterior !== l.precio_unitario) {
-        avisos.push(`«${p.nombre}» cambió de costo y no se actualizó su precio de venta.`);
-      }
+      await N.insertar(t, ctx, "predio_precio_historial", {
+        producto_id: l.producto_id, fecha: U.fechaHora(), precio_compra: l.precio_unitario, margen,
+        precio_venta: nuevoVenta, origen: "COMPRA", referencia_id: compraId,
+        usuario_nombre: N.nombreActor(ctx),
+      });
+      await resolverRevisionProducto(t, ctx, l.producto_id);
     }
     await N.auditar(t, ctx, "Carga de compra", "compra", compraId, {
       proveedor: proveedor.razon_social, factura, remito, total: totalItems, productos: lineas.length,
@@ -155,16 +144,40 @@ async function anularCompra(ctx) {
   return ctx.db.tx(async (t) => {
     const c = await N.exigir(t, ctx, "predio_compra", id, "No encontramos la compra", { bloquear: true });
     if (c.estado === "ANULADA") throw U.error("La compra ya está anulada", 409);
-    const items = await t.all("SELECT * FROM predio_compra_item WHERE predio_id = ? AND compra_id = ?", [ctx.pid, id]);
+    const items = await t.all("SELECT * FROM predio_compra_item WHERE predio_id = ? AND compra_id = ? ORDER BY producto_id", [ctx.pid, id]);
+    const preciosRestaurados = [];
+    const avisos = [];
     for (const it of items) {
+      const p = await N.exigir(t, ctx, "predio_producto", it.producto_id, "Uno de los productos ya no existe", { bloquear: true });
+      const vigente = await fuentePrecioVigente(t, ctx, it.producto_id);
+      // Una edición/revisión posterior es una decisión distinta: anular una
+      // compra nunca la revierte, aunque los importes sean iguales o del mismo segundo.
+      if (vigente?.origen === "COMPRA" && Number(vigente.referencia_id) === id
+        && Number(p.precio_compra || 0) === Number(vigente.precio_compra || 0)
+        && Number(p.precio_venta || 0) === Number(vigente.precio_venta || 0)) {
+        const anterior = await fuentePrecioVigente(t, ctx, it.producto_id, id);
+        const costo = Number(anterior?.precio_compra ?? it.precio_anterior ?? 0);
+        const venta = precioVenta(costo, Number(p.margen || 0));
+        await N.actualizar(t, ctx, "predio_producto", it.producto_id, {
+          precio_compra: costo, precio_venta: venta, fecha_revision_precio: anterior?.fecha || null,
+        });
+        await N.insertar(t, ctx, "predio_precio_historial", {
+          producto_id: it.producto_id, fecha: U.fechaHora(), precio_compra: costo, margen: Number(p.margen || 0),
+          precio_venta: venta, origen: "ANULACION_COMPRA", referencia_id: id, usuario_nombre: N.nombreActor(ctx),
+        });
+        preciosRestaurados.push({ producto_id: p.id, producto: p.nombre, costo_anterior: Number(p.precio_compra || 0), costo_restaurado: costo, venta_restaurada: venta, fuente_historial_id: anterior?.id || null });
+        if (!anterior) avisos.push(`«${p.nombre}»: se recuperó el costo anterior guardado en la compra; no hay una revisión de precio previa en el historial. Revisá su ficha.`);
+      }
       await N.moverStock(t, ctx, {
         bocaId: c.boca_id, productoId: it.producto_id, cantidad: -Number(it.cantidad), tipo: "ANULACION_COMPRA",
         referenciaTipo: "compra", referenciaId: id, detalle: `Anulación de la compra N° ${id}`,
       });
     }
     await N.actualizar(t, ctx, "predio_compra", id, { estado: "ANULADA", anulada_fecha: U.fechaHora(), anulada_por: N.nombreActor(ctx), anulacion_motivo: motivo });
-    await N.auditar(t, ctx, "Anulación de compra", "compra", id, { motivo });
-    return { id, mensaje: "Compra anulada. El stock del almacén se descontó." };
+    await N.auditar(t, ctx, "Anulación de compra", "compra", id, { motivo, precios_restaurados: preciosRestaurados });
+    return { id, avisos, precios_restaurados: preciosRestaurados, mensaje: "Compra anulada. El stock del almacén se descontó."
+      + (preciosRestaurados.length ? " Se restauraron los precios que dependían de esta compra, conservando las revisiones posteriores." : "")
+      + (avisos.length ? " Hay productos sin historial previo: revisá sus precios en Gestión → Productos." : "") };
   });
 }
 

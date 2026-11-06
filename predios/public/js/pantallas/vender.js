@@ -40,6 +40,7 @@
     c.appendChild(h("div.pagina-cabecera",
       h("div", h("h1.titulo-pagina", "Vender"), h("p.subtitulo", puesto.boca + " · " + puesto.caja + " · ", turno)),
       h("div.pagina-acciones",
+        P.esAdmin() ? P.btn("Salir de caja", { tipo: "secundario", icono: "salir", onclick: function (ev) { P.ejecutar(ev.currentTarget, P.salirDeCaja).catch(function () {}); } }) : null,
         P.btn("Vaciar", { tipo: "texto", icono: "borrar", onclick: function () {
           if (!estado.items.length) return;
           P.confirmar("¿Sacar todos los productos de la venta en curso?", { aceptar: "Vaciar", peligro: true }).then(function (ok) { if (ok) { estado = vacia(); pintarTodo(); combo.foco(); } });
@@ -62,61 +63,86 @@
     var tablaItems = h("div.items");
     var izquierda = h("div.columna",
       h("div.hoja.vender-buscador", combo.el,
-        h("div.vender-ayuda", h("span.texto-3.chico", "Se muestran los productos con stock de esta boca y los servicios."),
+        h("div.vender-ayuda", h("span.texto-3.chico", "Se muestran productos con precio y stock de esta boca, y los servicios con precio."),
           P.btn("¿No aparece el producto?", { tipo: "texto", chico: true, icono: "buscar", onclick: function () { buscarProductoAusente(combo.input.value.trim()); } }))),
       h("div.hoja", tablaItems));
 
     function buscarProductoAusente(texto) {
-      var elegido = null;
-      var buscador = P.comboProducto({
-        venta: true, sinStock: true, mostrarStock: true, abrirAlEnfocar: false, textoLibre: true,
-        bocaId: function () { return puesto.boca_id; },
-        placeholder: "Escaneá o buscá el producto sin stock",
-        alCambiarTexto: function () { elegido = null; },
-        alElegir: function (o) { elegido = o.dato; confirmarAviso(elegido, o.busqueda || buscador.input.value, m); },
-        alEnterSinCoincidencia: function () { P.aviso("No hay un producto sin stock con ese dato. Podés avisar al administrador sobre la búsqueda."); },
+      var avisosPrevios = document.getElementById("avisos");
+      if (avisosPrevios) P.vaciar(avisosPrevios);
+      var consulta = { producto: null, estado: "NO_ENCONTRADO" };
+      var busquedaResuelta = null;
+      var pedidoConsulta = 0;
+      var enviando = false;
+      var buscador = P.input({ valor: texto || "", placeholder: "Escaneá el código completo o describí el producto", max: 160 });
+      var informacion = h("div.columna", { "aria-live": "polite" });
+      var enviar = P.btn("Enviar aviso", { tipo: "primario", icono: "mensaje", onclick: function () {
+        if (enviando) return;
+        var busqueda = buscador.value.trim();
+        if (busqueda.length < 2) { buscador.focus(); return; }
+        if ((consulta.estado === "SIN_PRECIO" || consulta.estado === "CODIGO_DUPLICADO") && busquedaResuelta === busqueda) { m.cerrar(); return; }
+        enviando = true;
+        buscador.disabled = true;
+        P.ejecutar(enviar, function () {
+          return consultar().then(function (r) {
+            if (r.estado === "SIN_PRECIO" || r.estado === "CODIGO_DUPLICADO") return;
+            if (r.estado === "DISPONIBLE" && r.producto) { m.cerrar(); combo.limpiar(); agregar(r.producto); return; }
+            return P.post("/ventas/avisar-sin-stock", { producto_id: r.producto ? r.producto.id : null, busqueda: busqueda, cantidad: 1, confirmar: true }).then(function (aviso) {
+              m.cerrar(); combo.limpiar();
+              P.aviso(aviso.mensaje || "Aviso enviado al administrador", "ok");
+              if (r.producto && aviso.puede_vender) agregar(r.producto);
+            });
+          });
+        }).catch(function (e) { P.reemplazar(informacion, P.mensaje(e.message, "error")); }).finally(function () { enviando = false; buscador.disabled = false; enviar.disabled = buscador.value.trim().length < 2; });
+      } });
+      function pintarConsulta() {
+        var p = consulta.producto;
+        var sinPrecio = consulta.estado === "SIN_PRECIO";
+        var duplicado = consulta.estado === "CODIGO_DUPLICADO";
+        var disponible = consulta.estado === "DISPONIBLE";
+        P.reemplazar(enviar, P.icono(disponible ? "mas" : sinPrecio || duplicado ? "check" : "mensaje"), disponible ? "Agregar a la venta" : sinPrecio || duplicado ? "Entendido" : "Enviar aviso");
+        enviar.disabled = enviando || buscador.value.trim().length < 2;
+        P.reemplazar(informacion,
+          p ? h("div.datos", P.dato("Producto", p.nombre), P.dato("Código de barras", p.codigo), P.dato("Stock en la boca", P.f.numero(p.stock_boca))) : null,
+          P.mensaje(sinPrecio
+            ? "«" + p.nombre + "» no tiene precio de venta cargado. Pedile al administrador que lo cargue antes de venderlo."
+            : duplicado ? "Este código está asociado a más de un producto. Pedile al administrador que revise los códigos del catálogo antes de venderlo."
+            : disponible ? "El producto ahora tiene precio y stock suficiente. Podés agregarlo a la venta."
+              : p ? "Este producto no tiene stock suficiente registrado en esta boca. Al enviar el aviso, el administrador recibirá el producto, tu usuario, la boca, la caja y el horario para revisar los movimientos."
+                : "No encontramos una coincidencia exacta disponible para vender. Podés enviar el código o la descripción al administrador junto con tu usuario, la boca, la caja y el horario.", "aviso"),
+          !sinPrecio && !duplicado && !disponible ? h("p.texto-3.chico", p ? "Si la configuración permite vender sin stock, se agregará el producto después de enviar el aviso." : "Los productos sin stock o sin precio no se incluyen en los desplegables. Escaneá el código completo para consultar uno en particular.") : null);
+      }
+      function consultar() {
+        var busqueda = buscador.value.trim();
+        if (busquedaResuelta === busqueda) return Promise.resolve(consulta);
+        var n = ++pedidoConsulta;
+        var promesa = /^\d{4,60}$/.test(busqueda)
+          ? P.get("/productos/consultar-codigo" + P.qs({ codigo: busqueda }))
+          : Promise.resolve({ producto: null, estado: "NO_ENCONTRADO" });
+        return promesa.then(function (r) {
+          if (n === pedidoConsulta) { consulta = r; busquedaResuelta = busqueda; pintarConsulta(); }
+          return r;
+        });
+      }
+      var demora = null;
+      buscador.addEventListener("input", function () {
+        pedidoConsulta++; busquedaResuelta = null; consulta = { producto: null, estado: "NO_ENCONTRADO" };
+        clearTimeout(demora); pintarConsulta();
+        demora = setTimeout(function () { consultar().catch(function (e) { P.reemplazar(informacion, P.mensaje(e.message, "error")); }); }, 160);
       });
-      buscador.input.value = texto || "";
+      buscador.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter") { ev.preventDefault(); clearTimeout(demora); consultar().catch(function (e) { P.reemplazar(informacion, P.mensaje(e.message, "error")); }); }
+      });
       var m = P.modal({
-        titulo: "Producto que no aparece",
+        titulo: "Producto no disponible",
         subtitulo: puesto.boca + " · " + puesto.caja,
         contenido: h("div.columna",
-          P.mensaje("Buscá el producto en el catálogo sin stock de esta boca. Antes de agregarlo tenés que aceptar el aviso al administrador para que revise los movimientos.", "aviso"),
-          P.campo("Producto o código de barras", buscador.el),
-          h("p.texto-3.chico", "Si tampoco está en el catálogo, podés enviar la búsqueda al administrador para que la revise.")),
-        acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }),
-          P.btn("Avisar al administrador", { tipo: "primario", icono: "mensaje", onclick: function () {
-            var busqueda = buscador.input.value.trim();
-            if (busqueda.length < 2) { P.aviso("Escaneá el código o escribí al menos dos caracteres del producto", "error"); buscador.foco(); return; }
-            confirmarAviso(elegido, busqueda, m);
-          } })],
-        alCerrar: function () { combo.foco(); },
+          P.campo("Producto o código de barras", buscador), informacion),
+        acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), enviar],
+        alCerrar: function () { clearTimeout(demora); pedidoConsulta++; combo.foco(); },
       });
-    }
-
-    function confirmarAviso(producto, busqueda, anterior) {
-      var enviando = false;
-      var aceptar = P.btn("Aceptar y avisar", { tipo: "primario", icono: "mensaje", onclick: function () {
-        if (enviando) return;
-        enviando = true;
-        P.ejecutar(aceptar, function () {
-          return P.post("/ventas/avisar-sin-stock", { producto_id: producto ? producto.id : null, busqueda: busqueda, cantidad: 1, confirmar: true }).then(function (r) {
-            m.cerrar();
-            if (anterior) anterior.cerrar();
-            combo.limpiar();
-            P.aviso(r.mensaje || "Aviso enviado al administrador", "ok");
-            if (producto && r.puede_vender) agregar(producto);
-          });
-        }).catch(function () {}).finally(function () { enviando = false; });
-      } });
-      var m = P.modal({
-        titulo: "Avisar por una venta sin stock",
-        contenido: h("div.columna",
-          h("div.datos", P.dato("Producto o búsqueda", producto ? producto.nombre : busqueda), producto ? P.dato("Stock registrado", P.f.numero(producto.stock_boca)) : null, P.dato("Boca y caja", puesto.boca + " · " + puesto.caja)),
-          P.mensaje("Al aceptar, el administrador recibirá un aviso con el producto o código buscado, tu usuario, la boca, la caja y el horario del intento de venta.", "aviso"),
-          h("p.texto-3.chico", producto ? "Si la configuración permite vender sin stock, se agregará el producto a la venta. El administrador podrá revisar y corregir los movimientos correspondientes." : "El aviso permite revisar el catálogo y el stock. Para cargar la venta necesitás elegir un producto registrado.")),
-        acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), aceptar],
-      });
+      pintarConsulta();
+      consultar().catch(function (e) { P.reemplazar(informacion, P.mensaje(e.message, "error")); });
     }
 
     function agregar(p) {
@@ -214,6 +240,15 @@
     var zonaTotal = h("div");
     var botonCobrar = P.btn("Cobrar", { tipo: "primario", grande: true, icono: "check", tecla: "F9", onclick: function () { cobrar(); } });
     botonCobrar.style.width = "100%";
+    var comanda = P.check("Imprimir comanda", !!puesto.imprimir_comanda, "Agrega una copia completa para preparación. Esta opción se guarda para esta caja.", function (valor) {
+      var anterior = !!puesto.imprimir_comanda;
+      comanda.input.disabled = true;
+      P.post("/cajas/" + puesto.caja_id + "/comanda", { imprimir_comanda: valor }).then(function (r) {
+        puesto.imprimir_comanda = !!r.imprimir_comanda;
+        comanda.input.checked = puesto.imprimir_comanda;
+        if (P.estado.sesion.puesto) P.estado.sesion.puesto.imprimir_comanda = puesto.imprimir_comanda;
+      }).catch(function (e) { comanda.input.checked = anterior; P.error(e); }).finally(function () { comanda.input.disabled = false; });
+    });
 
     function pintarAfiliado() {
       P.vaciar(zonaAfiliado);
@@ -305,6 +340,7 @@
     cuenta.appendChild(zonaFormas);
     cuenta.appendChild(zonaPago);
     cuenta.appendChild(zonaTotal);
+    cuenta.appendChild(h("div.cuenta-bloque", comanda));
     cuenta.appendChild(botonCobrar);
     cuenta.appendChild(h("div.atajos",
       P.btn("Mis ventas", { tipo: "suave", chico: true, icono: "lista", onclick: function () { P.ruta.ir("/mis-ventas"); } }),

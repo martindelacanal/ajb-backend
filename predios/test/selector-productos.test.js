@@ -159,3 +159,20 @@ test("volver del popup no deja un cierre de blur pendiente que quite la nueva li
   assert.ok(opcion(s));
   assert.equal(s.elegidos.length, 0);
 });
+
+test("ventas excluye físicos sin stock y todo producto sin precio, incluso al escribir", async () => {
+  const s = pantalla();
+  s.P.get = async () => [
+    { id: 1, nombre: "Sin precio", precio_venta: 0, destino: "VENTA_DIRECTA", stock_boca: 20 },
+    { id: 2, nombre: "Sin stock", precio_venta: 100, destino: "VENTA_DIRECTA", stock_boca: 0 },
+    { id: 3, nombre: "Stock negativo", precio_venta: 100, destino: "VENTA_DIRECTA", stock_boca: -1 },
+    { id: 4, nombre: "Disponible", precio_venta: 100, destino: "VENTA_DIRECTA", stock_boca: 1 },
+    { id: 5, nombre: "Servicio sin precio", precio_venta: 0, destino: "VENTA_COMPUESTA", stock_boca: 0 },
+    { id: 6, nombre: "Servicio", precio_venta: 100, destino: "VENTA_COMPUESTA", stock_boca: 0 },
+    { id: 7, nombre: "Interno", precio_venta: 100, destino: "USO_INTERNO", stock_boca: 1 },
+  ];
+  await enter(s.crear({ venta: true }), "producto");
+  const opciones = s.documento.body.querySelectorAll(".combo-opcion");
+  assert.equal(opciones.length, 2);
+  assert.equal(s.elegidos.length, 0);
+});

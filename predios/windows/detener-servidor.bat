@@ -1,12 +1,7 @@
 @echo off
 title Detener el sistema del predio
-net session >nul 2>&1
-if %errorlevel% neq 0 (
-  powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
-  exit /b
-)
-echo Deteniendo el sistema del predio (vuelve a arrancar solo al reiniciar Windows o en 5 minutos)...
-schtasks /End /TN "AJB Predio" >nul 2>&1
-powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name = 'node.exe'\" | Where-Object { $_.CommandLine -like '*AJB-Predio*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
-echo Detenido.
-timeout /t 5
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0control-servidor.ps1" -Accion Detener
+if errorlevel 1 (echo No se pudo detener el servidor. & pause & exit /b 1)
+echo Servidor detenido. El arranque automatico queda desactivado, incluso despues de reiniciar Windows.
+echo Para volver a habilitarlo, usa reiniciar-servidor.bat.
+pause

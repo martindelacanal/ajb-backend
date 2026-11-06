@@ -149,7 +149,7 @@
       if (!(precio >= 0)) { P.aviso("Cargá el precio unitario", "error"); unitario.focus(); return; }
       var existente = estado.lineas.filter(function (l) { return l.producto.id === elegido.id; })[0];
       if (existente) { existente.cantidad = P.redondear(existente.cantidad + cant, 3); existente.precio_unitario = precio; }
-      else estado.lineas.push({ producto: elegido, cantidad: cant, precio_unitario: precio, margen: elegido.margen, actualizar_precio: true });
+      else estado.lineas.push({ producto: elegido, cantidad: cant, precio_unitario: precio, margen: elegido.margen });
       elegido = null;
       combo.limpiar();
       cantidad.value = "1";
@@ -183,7 +183,7 @@
         return;
       }
       tablaLineas.appendChild(h("div.tabla-desplazable", h("table.tabla.lineas",
-        h("thead", h("tr", h("th.der", "Cantidad"), h("th", "Producto"), h("th.der", "Unitario"), h("th.der", "Anterior"), h("th.der", "Margen %"), h("th.der", "Venta nueva"), h("th.centro", "Actualizar venta"), h("th.der", "Total"), h("th"))),
+        h("thead", h("tr", h("th.der", "Cantidad"), h("th", "Producto"), h("th.der", "Unitario"), h("th.der", "Anterior"), h("th.der", "Margen %"), h("th.der", "Venta nueva"), h("th.der", "Total"), h("th"))),
         h("tbody", estado.lineas.map(function (l, i) {
           function numero(clave, clase) {
             var input = h("input.campo-control." + clase, { value: P.f.numero(l[clave]), inputmode: "decimal" });
@@ -194,18 +194,15 @@
             });
             return input;
           }
-          var venta = P.redondear(l.precio_unitario * (1 + (Number(l.margen) || 0) / 100));
+          var venta = P.redondear(l.precio_unitario * (1 + (Number(l.producto.margen) || 0) / 100));
           var subio = l.producto.precio_compra && l.precio_unitario !== l.producto.precio_compra;
-          var check = h("input", { type: "checkbox", checked: l.actualizar_precio, "aria-label": "Actualizar el precio de venta de " + l.producto.nombre, style: { width: "20px", height: "20px", accentColor: "var(--azul)" } });
-          check.addEventListener("change", function () { l.actualizar_precio = check.checked; guardar(); });
           return h("tr",
             h("td.der", numero("cantidad", "num")),
             h("td", h("strong", l.producto.nombre), h("div.texto-3.chico", l.producto.codigo || "")),
             h("td.der", numero("precio_unitario", "num")),
             h("td.der", h("span" + (subio ? (l.precio_unitario > l.producto.precio_compra ? ".negativo" : ".positivo") : ".texto-3"), P.f.pesos(l.producto.precio_compra))),
-            h("td.der", numero("margen", "pct")),
+            h("td.der", P.f.pct(l.producto.margen)),
             h("td.der", P.f.pesos(venta), h("div.texto-3.chico", "Hoy " + P.f.pesos(l.producto.precio_venta))),
-            h("td.centro", check),
             h("td.der.fuerte", P.f.pesos(l.cantidad * l.precio_unitario)),
             h("td.acciones", P.btn("", { tipo: "texto", chico: true, icono: "cerrar", etiqueta: "Quitar", onclick: function () { estado.lineas.splice(i, 1); guardar(); pintarLineas(); } })));
         })))));
@@ -232,7 +229,7 @@
         proveedor_id: estado.proveedor ? estado.proveedor.valor : null,
         factura: estado.factura, fecha_factura: estado.fecha_factura || null, remito: estado.remito, fecha_remito: estado.fecha_remito || null,
         total_factura: estado.total_factura === "" ? null : P.numeroDe(estado.total_factura), observaciones: estado.observaciones,
-        items: estado.lineas.map(function (l) { return { producto_id: l.producto.id, cantidad: l.cantidad, precio_unitario: l.precio_unitario, margen: l.margen, actualizar_precio: l.actualizar_precio }; }),
+        items: estado.lineas.map(function (l) { return { producto_id: l.producto.id, cantidad: l.cantidad, precio_unitario: l.precio_unitario }; }),
       };
       if (!cuerpo.proveedor_id) { P.reemplazar(problemas, P.mensaje("Elegí el proveedor de la factura.", "error")); return; }
       P.ejecutar(boton, function () {

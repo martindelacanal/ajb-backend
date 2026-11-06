@@ -13,7 +13,9 @@
 
 param(
   [string]$Destino = "C:\AJB-Predio",
-  [int]$Puerto = 0
+  [int]$Puerto = 0,
+  [bool]$ArranqueAutomatico = $true,
+  [bool]$Https = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,6 +28,15 @@ function Aviso($texto) { Write-Host "    $texto" -ForegroundColor Yellow }
 
 $Origen = Split-Path -Parent $PSScriptRoot
 $NombreTarea = "AJB Predio"
+$Destino = [IO.Path]::GetFullPath($Destino).TrimEnd('\')
+if ($Destino -eq [IO.Path]::GetPathRoot($Destino).TrimEnd('\') -or $Destino -eq [IO.Path]::GetFullPath($Origen).TrimEnd('\')) {
+  throw 'Elegi una carpeta propia para la instalacion, distinta de la raiz del disco y del paquete de origen.'
+}
+function Confirmar-Subcarpeta([string]$Ruta, [string]$Raiz) {
+  $resuelta = [IO.Path]::GetFullPath($Ruta)
+  $limite = [IO.Path]::GetFullPath($Raiz).TrimEnd('\') + '\'
+  if (-not $resuelta.StartsWith($limite, [StringComparison]::OrdinalIgnoreCase)) { throw "Ruta fuera de la instalacion: $resuelta" }
+}
 
 Write-Host ""
 Write-Host "  Sistema del predio - AJB" -ForegroundColor White
@@ -60,7 +71,7 @@ if ($tareaExistente) {
   Start-Sleep -Seconds 2
 }
 Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
-  Where-Object { $_.CommandLine -and $_.CommandLine -like "*$Destino*" } |
+  Where-Object { $_.ExecutablePath -and $_.ExecutablePath -eq (Join-Path $Destino 'node\node.exe') -and $_.CommandLine -and ($_.CommandLine -match ('(?i)(?:"' + [regex]::Escape((Join-Path $Destino 'arranque.js')) + '"|--base\s+"?' + [regex]::Escape($Destino) + '(?:"|\s|$))')) } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 New-Item -ItemType Directory -Force -Path $Destino | Out-Null
@@ -80,6 +91,7 @@ Copy-Item (Join-Path $Origen "arranque.js") (Join-Path $Destino "arranque.js") -
 New-Item -ItemType Directory -Force -Path (Join-Path $Destino "app\versiones") | Out-Null
 Get-ChildItem (Join-Path $Origen "app\versiones") -Directory | ForEach-Object {
   $dest = Join-Path $Destino ("app\versiones\" + $_.Name)
+  Confirmar-Subcarpeta $dest (Join-Path $Destino 'app\versiones')
   if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
   Copy-Item $_.FullName $dest -Recurse -Force
 }
@@ -116,8 +128,11 @@ if ($zipNode -or -not (Test-Path $nodeExe)) {
   $extraer = Join-Path $env:TEMP ("node-extraer-" + [Guid]::NewGuid().ToString("N"))
   Expand-Archive -Path $zipNode.FullName -DestinationPath $extraer -Force
   $interna = Get-ChildItem $extraer -Directory | Select-Object -First 1
+  Confirmar-Subcarpeta $nodeDir $Destino
   if (Test-Path $nodeDir) { Remove-Item $nodeDir -Recurse -Force }
+  Confirmar-Subcarpeta $interna.FullName $extraer
   Move-Item $interna.FullName $nodeDir
+  Confirmar-Subcarpeta $extraer $env:TEMP
   Remove-Item $extraer -Recurse -Force -ErrorAction SilentlyContinue
 }
 $versionNode = & $nodeExe --version
@@ -129,6 +144,7 @@ Get-NetFirewallRule -DisplayName "AJB Predio*" -ErrorAction SilentlyContinue | R
 New-NetFirewallRule -DisplayName "AJB Predio (puerto $Puerto)" -Direction Inbound -Protocol TCP -LocalPort $Puerto -Action Allow -Profile Any | Out-Null
 # Para que las PCs encuentren la notebook por su nombre (http://nombre:puerto): NetBIOS, mDNS y LLMNR.
 New-NetFirewallRule -DisplayName "AJB Predio (nombre en la red)" -Direction Inbound -Protocol UDP -LocalPort 137,5353,5355 -Action Allow -Profile Any | Out-Null
+New-NetFirewallRule -DisplayName "AJB Predio (detectar servidor local)" -Direction Inbound -Protocol UDP -LocalPort 39876 -RemoteAddress LocalSubnet -Action Allow -Profile Any | Out-Null
 Ok "Reglas de firewall creadas"
 
 # --- Energía: la notebook no se suspende ni se apaga al cerrar la tapa
@@ -143,19 +159,24 @@ powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 | Out-Null
 powercfg /setactive SCHEME_CURRENT | Out-Null
 Ok "Sin suspension ni hibernacion; cerrar la tapa no apaga el servidor"
 
-# --- Tarea programada (arranca con Windows, sin iniciar sesión)
-Paso "Creando la tarea '$NombreTarea' (arranque automatico)"
-if ($tareaExistente) { Unregister-ScheduledTask -TaskName $NombreTarea -Confirm:$false }
-$accion = New-ScheduledTaskAction -Execute $nodeExe -Argument ('"' + (Join-Path $Destino "arranque.js") + '"') -WorkingDirectory $Destino
-$alEncender = New-ScheduledTaskTrigger -AtStartup
-$revision = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5)
-$quien = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-$opciones = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
-  -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName $NombreTarea -Action $accion -Trigger @($alEncender, $revision) -Principal $quien -Settings $opciones `
-  -Description "Servidor local del sistema del predio (AJB). Se inicia al encender y se revisa cada 5 minutos." | Out-Null
-Start-ScheduledTask -TaskName $NombreTarea
-Ok "Tarea creada e iniciada"
+# --- HTTPS local: certificado de esta instalacion, utilizable tambien sin internet.
+if ($Https) {
+  Paso 'Preparando HTTPS para las PCs del camping'
+  try { & (Join-Path $Destino 'herramientas\preparar-https.ps1') -Base $Destino }
+  catch { Aviso ('HTTPS todavia no esta listo: ' + $_.Exception.Message + '. HTTP sigue disponible.') }
+}
+
+# --- Tarea programada y eleccion de arranque (por defecto automatico).
+Paso "Configurando la tarea '$NombreTarea'"
+$runtimeArchivo = Join-Path $Destino 'runtime.json'
+if ((Test-Path -LiteralPath $runtimeArchivo) -and -not $PSBoundParameters.ContainsKey('ArranqueAutomatico')) {
+  $runtimePrevio = Get-Content -LiteralPath $runtimeArchivo -Raw -Encoding UTF8 | ConvertFrom-Json
+  $ArranqueAutomatico = $runtimePrevio.autoarranque -ne $false
+}
+@{ autoarranque = $ArranqueAutomatico; detenido = $false } | ConvertTo-Json | Set-Content -LiteralPath $runtimeArchivo -Encoding UTF8
+& (Join-Path $Destino 'herramientas\control-servidor.ps1') -Base $Destino -Accion Registrar
+& (Join-Path $Destino 'herramientas\control-servidor.ps1') -Base $Destino -Accion Iniciar
+Ok ('Servidor iniciado. Arranque automatico: ' + $ArranqueAutomatico)
 
 # --- Espera a que responda
 Paso "Esperando que el sistema arranque"
@@ -176,6 +197,13 @@ $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
 $sufijoPuerto = if ($Puerto -eq 80) { "" } else { ":$Puerto" }
 $direcciones = @("http://$($env:COMPUTERNAME.ToLower())$sufijoPuerto")
 foreach ($ip in $ips) { $direcciones += "http://$ip$sufijoPuerto" }
+$tlsArchivo = Join-Path $Destino 'datos\tls\config.json'
+if (Test-Path -LiteralPath $tlsArchivo) {
+  $tlsConfig = Get-Content -LiteralPath $tlsArchivo -Raw -Encoding UTF8 | ConvertFrom-Json
+  $puertoSeguro = [int]$tlsConfig.puerto
+  $direcciones = @("https://$($env:COMPUTERNAME.ToLower()):$puertoSeguro") + $direcciones
+  $url = "https://localhost:$puertoSeguro"
+}
 
 $escritorio = [Environment]::GetFolderPath("CommonDesktopDirectory")
 $texto = @(
@@ -188,6 +216,9 @@ $texto = @(
   "La primera es con el nombre de la notebook: no cambia aunque cambie la IP. Si en alguna PC no abre, usa la de numeros.",
   "El nombre se puede cambiar desde el sistema: Sistema > Direcciones para las PCs > Cambiar el nombre en la red.",
   "Para crear el acceso directo de caja en cada PC, copia y ejecuta herramientas\crear-acceso-pc-caja.bat.",
+  "Para HTTPS sin avisos del navegador, copia certificados-PCs a cada PC y ejecuta la herramienta de confianza una vez. Nunca copies datos\tls: contiene claves privadas.",
+  "Detener-servidor.bat desactiva el arranque automatico. Reiniciar-servidor.bat vuelve a habilitarlo. Configurar-arranque.bat permite elegir el inicio manual.",
+  "Una instalacion nueva debe conectarse una vez a Mi AJB para registrar el equipo; despues funciona sin internet. Si hay otro servidor activo, usa su direccion.",
   "En esta notebook tambien funciona: $url"
 )
 $texto | Set-Content (Join-Path $Destino "DIRECCIONES-PARA-LAS-PCS.txt") -Encoding UTF8
@@ -196,7 +227,7 @@ Set-Content (Join-Path $escritorio "Sistema del Camping.url") -Value "[InternetS
 
 Write-Host ""
 Write-Host "==========================================================" -ForegroundColor Green
-Write-Host "  Listo. El sistema queda funcionando y arranca solo." -ForegroundColor Green
+Write-Host ("  Listo. El sistema queda funcionando. Arranque automatico: " + $ArranqueAutomatico) -ForegroundColor Green
 Write-Host "==========================================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "  En las PCs del camping entra a:" -ForegroundColor White

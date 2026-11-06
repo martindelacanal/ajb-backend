@@ -53,7 +53,10 @@ test("la búsqueda de ventas respeta boca, stock y coincidencias aproximadas sin
   assert.equal(leido[0].precio_compra, undefined);
   assert.deepEqual(await llamar(cajero, "GET", "/productos/buscar", {}, { q: "7790895000997", venta: "1" }), []);
   const excepcion = await llamar(cajero, "GET", "/productos/buscar", {}, { q: "Coca", venta: "1", sin_stock: "1" });
-  assert.deepEqual(excepcion.map((p) => p.id), [agotado.id]);
+  assert.deepEqual(excepcion, []);
+  const diagnostico = await llamar(cajero, "GET", "/productos/consultar-codigo", {}, { codigo: "7790895000997" });
+  assert.equal(diagnostico.estado, "SIN_STOCK");
+  assert.equal(diagnostico.producto.id, agotado.id);
   assert.deepEqual(await llamar(cajero, "GET", "/productos/buscar", {}, { venta: "1", sin_stock: "1" }), []);
   await assert.rejects(llamar(cajero, "GET", "/productos/buscar", {}, { venta: "1", boca_id: "999" }), { status: 403 });
   await assert.rejects(llamar({ ...cajero, sesion: {} }, "GET", "/productos/buscar", {}, { venta: "1" }), { status: 409, codigo: "SIN_PUESTO" });

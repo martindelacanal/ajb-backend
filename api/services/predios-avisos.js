@@ -25,7 +25,8 @@ async function nuevosAvisos(conexion, predioId, filas) {
 
 async function entregarAvisos(conexion, predio, filas) {
   for (const aviso of filas) {
-    if (!["ACCESO_FALLIDO", "VENTA_SIN_STOCK"].includes(aviso.tipo)) continue;
+    if (!["ACCESO_FALLIDO", "VENTA_SIN_STOCK", "PRECIO_SIN_REVISAR"].includes(aviso.tipo)) continue;
+    if (aviso.resuelto_fecha) continue;
     let condicion = "";
     const params = [];
     if (aviso.general_usuario_id) {
@@ -42,7 +43,7 @@ async function entregarAvisos(conexion, predio, filas) {
       if (!local?.general_usuario_id) continue;
       condicion = " AND u.id = ?";
       params.push(Number(local.general_usuario_id));
-    } else if (aviso.tipo !== "VENTA_SIN_STOCK") {
+    } else if (!["VENTA_SIN_STOCK", "PRECIO_SIN_REVISAR"].includes(aviso.tipo)) {
       // Un identificador desconocido jamás convierte un aviso privado en masivo.
       continue;
     }

@@ -14,6 +14,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const net = require("node:net");
+const crypto = require("node:crypto");
 
 function argumento(nombre, porDefecto) {
   const i = process.argv.indexOf(`--${nombre}`);
@@ -67,9 +69,19 @@ function borrar(nombre) {
   fs.rmSync(path.join(APP, nombre), { force: true });
 }
 
+function estadoArranque() {
+  try { return JSON.parse(fs.readFileSync(path.join(BASE, "runtime.json"), "utf8").replace(/^\uFEFF/, "")); }
+  catch (_e) { return { autoarranque: true, detenido: false }; }
+}
+function debePermanecerDetenido() {
+  const estado = estadoArranque();
+  return estado.detenido === true || (process.argv.includes("--automatico") && estado.autoarranque === false);
+}
+if (debePermanecerDetenido()) process.exit(0);
+
 // Una sola instancia del lanzador por instalación.
 const archivoPid = path.join(APP, "lanzador.pid");
-try {
+if (process.platform !== "win32") try {
   const previo = Number(fs.readFileSync(archivoPid, "utf8"));
   if (previo && previo !== process.pid) {
     process.kill(previo, 0);
@@ -77,7 +89,6 @@ try {
     process.exit(0);
   }
 } catch (_e) { /* no hay otro */ }
-fs.writeFileSync(archivoPid, String(process.pid));
 
 function carpetaDe(version) {
   return version ? path.join(VERSIONES, version) : null;
@@ -114,6 +125,7 @@ let fallosSeguidos = 0;
 let terminando = false;
 
 function iniciar() {
+  if (terminando || debePermanecerDetenido()) { terminar(); return; }
   const version = elegirVersion();
   let script;
   if (version) script = path.join(carpetaDe(version), "servidor.js");
@@ -154,7 +166,7 @@ function iniciar() {
   hijo.on("exit", (codigo) => {
     clearInterval(vigilancia);
     hijo = null;
-    if (terminando) return;
+    if (terminando || debePermanecerDetenido()) { process.exit(0); return; }
     const duracion = Date.now() - inicio;
     if (codigo === 75) {
       log("El servidor pidió reiniciarse");
@@ -193,5 +205,31 @@ process.on("SIGINT", terminar);
 process.on("SIGTERM", terminar);
 process.on("exit", () => { try { if (Number(fs.readFileSync(archivoPid, "utf8")) === process.pid) fs.rmSync(archivoPid, { force: true }); } catch (_e) { /* nada */ } });
 
-log(`Lanzador iniciado en ${BASE} (Node ${process.version})`);
-iniciar();
+function arrancar() {
+  fs.writeFileSync(archivoPid, String(process.pid));
+  log(`Lanzador iniciado en ${BASE} (Node ${process.version})`);
+  iniciar();
+  setInterval(() => {
+    if (!debePermanecerDetenido() || terminando) return;
+    // El servidor ve CONTROL y cierra sus datos primero; un proceso trabado
+    // se termina después, sin que la tarea de Windows vuelva a iniciarlo.
+    terminando = true;
+    if (!hijo) process.exit(0);
+    hijo.once("exit", () => process.exit(0));
+    setTimeout(() => { if (hijo) hijo.kill("SIGTERM"); process.exit(0); }, 6000).unref();
+  }, 500).unref();
+}
+
+if (process.platform === "win32") {
+  // Una named pipe es un mutex del equipo: incluso dos carpetas con el mismo
+  // predio no pueden mantener dos supervisores. Windows la libera si hay un fallo.
+  let codigo = BASE;
+  try { const c = JSON.parse(fs.readFileSync(path.join(BASE, "config.json"), "utf8").replace(/^\uFEFF/, "")); codigo = `${c.predio_id}:${c.predio_codigo}`; } catch (_e) { /* desarrollo */ }
+  const cerrojo = net.createServer((socket) => socket.end());
+  const nombre = `\\\\.\\pipe\\ajb-predio-${crypto.createHash("sha256").update(codigo.toLowerCase()).digest("hex").slice(0, 24)}`;
+  cerrojo.on("error", (e) => {
+    console.log(e.code === "EADDRINUSE" ? "Ya hay un servidor de este predio iniciado en esta PC." : `No se pudo reservar el servidor: ${e.message}`);
+    process.exit(e.code === "EADDRINUSE" ? 0 : 1);
+  });
+  cerrojo.listen(nombre, arrancar);
+} else arrancar();

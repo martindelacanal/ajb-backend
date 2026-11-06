@@ -7,6 +7,7 @@
 //   <base>/datos/respaldos/   copias diarias
 
 const http = require("node:http");
+const https = require("node:https");
 const fs = require("node:fs");
 const path = require("node:path");
 const zlib = require("node:zlib");
@@ -18,6 +19,11 @@ const api = require("./lib/api");
 const sesion = require("./lib/api/sesion");
 const { crearAgente } = require("./lib/agente");
 const N = require("./lib/negocio");
+const { crearControlEquipo } = require("./lib/control-equipo");
+const { crearDescubrimiento } = require("./lib/descubrimiento");
+const { leerRuntime, invocarControl, migrarRuntime } = require("./lib/runtime");
+const { leerTls, prepararTls } = require("./lib/tls-local");
+const { revisarPreciosVencidos } = require("./lib/precios");
 
 const DIR_APP = __dirname;
 const DIR_PUBLICO = path.join(DIR_APP, "public");
@@ -49,6 +55,7 @@ function leerConfig() {
     puerto: Number(argumento("puerto", config.puerto || process.env.PREDIO_PUERTO || 8080)),
     actualizaciones_automaticas: config.actualizaciones_automaticas !== false,
     clave_publica: config.clave_publica || null,
+    clave_lan: config.clave_lan || null,
   };
 }
 
@@ -58,13 +65,68 @@ function leerVersion() {
 }
 
 const config = leerConfig();
+if (fs.existsSync(path.join(BASE, "arranque.js")) && leerRuntime(BASE).detenido) process.exit(0);
 const VERSION = leerVersion();
 const db = crearSqlite(path.join(BASE, "datos", "predio.db"), { predioId: config.predio_id });
 asegurarEsquema(db);
+const controlEquipo = crearControlEquipo({ db, config, log });
+let descubrimiento = null;
+let servidorHttps = null;
+let tlsCargado = null;
+let errorHttps = null;
+let preparandoHttps = null;
+
+function estadoHttps() {
+  return { ...(tlsCargado?.publico || { preparado: false, puerto: 8443 }), activo: Boolean(servidorHttps?.listening),
+    url: `https://${os.hostname().toLowerCase()}:${tlsCargado?.puerto || 8443}`,
+    carpeta_certificados: path.join(BASE, "certificados-PCs"), error: errorHttps };
+}
+
+function runtimePublico() {
+  return { ...leerRuntime(BASE), disponible: process.platform === "win32" && fs.existsSync(path.join(BASE, "arranque.js")) };
+}
+
+async function actualizarHttps() {
+  if (preparandoHttps) return preparandoHttps;
+  preparandoHttps = (async () => {
+    try {
+      await prepararTls(BASE);
+      const datos = leerTls(BASE);
+      if (datos.puerto === config.puerto) throw new Error("HTTPS necesita un puerto distinto al de HTTP");
+      if (servidorHttps && tlsCargado?.puerto !== datos.puerto) {
+        await new Promise((resolve) => servidorHttps.close(resolve));
+        servidorHttps = null;
+      }
+      if (!servidorHttps) {
+        const nuevo = https.createServer(datos.opciones, manejarSeguro);
+        nuevo.keepAliveTimeout = 30000;
+        nuevo.requestTimeout = 300000;
+        await new Promise((resolve, reject) => {
+          nuevo.once("error", reject);
+          nuevo.listen(datos.puerto, "0.0.0.0", () => { nuevo.removeListener("error", reject); resolve(); });
+        });
+        nuevo.on("error", (e) => { errorHttps = e.message; log(`HTTPS local: ${e.message}`); });
+        servidorHttps = nuevo;
+        log(`HTTPS local disponible en https://${os.hostname().toLowerCase()}:${datos.puerto}; cada PC debe confiar una vez en el certificado del predio.`);
+      } else if (tlsCargado?.hash !== datos.hash) {
+        servidorHttps.setSecureContext(datos.opciones);
+        log("Certificado HTTPS local renovado sin detener las ventas.");
+      }
+      tlsCargado = datos;
+      errorHttps = null;
+    } catch (e) {
+      errorHttps = /ENOENT/.test(String(e.code)) ? "HTTPS todavía no está preparado en esta instalación." : e.message;
+      if (runtimePublico().disponible) log(`HTTPS local: ${errorHttps}. HTTP sigue disponible.`);
+    }
+    return estadoHttps();
+  })().finally(() => { preparandoHttps = null; });
+  return preparandoHttps;
+}
 
 // ------------------------------------------------------------------ ejecución de órdenes remotas
 
 async function ejecutarRemoto({ metodo, ruta, cuerpo, query, actor }) {
+  controlEquipo.comprobar();
   const encontrada = api.buscarRuta(metodo, ruta);
   if (!encontrada || encontrada.ruta.soloLocal || encontrada.ruta.publica) throw U.error("Operación no permitida a distancia", 403);
   const base = { db, pid: config.predio_id, modo: "local", origen: "REMOTO", ip: "sistema-general", servicios };
@@ -87,9 +149,13 @@ let salirConCodigo = null;
 const servicios = { version: VERSION };
 const agente = crearAgente({
   db, config, base: BASE, version: VERSION, log,
+  controlEquipo,
   api: { ejecutarRemoto },
   alActualizar: () => apagar(75),
-  alReiniciar: () => apagar(75),
+  alReiniciar: () => {
+    if (runtimePublico().disponible) invocarControl(BASE, "Reiniciar").catch((e) => log(`No se pudo reiniciar el servidor: ${e.message}`));
+    else apagar(75);
+  },
 });
 servicios.agente = agente;
 
@@ -251,9 +317,35 @@ async function rutaSistema(ctx, metodo, ruta, req, res) {
       equipo: { nombre: os.hostname(), sistema: `${os.type()} ${os.release()}`, node: process.version, memoria_libre: os.freemem(), memoria_total: os.totalmem(), encendido_hace: Math.round(os.uptime()) },
       servidor: { puerto: config.puerto, direcciones: direccionesLan(), base: BASE, version: VERSION, iniciado: servidorIniciado },
       red: estadoRed(),
+      runtime: runtimePublico(), escritura: controlEquipo.estado(), https: estadoHttps(),
       base_datos: { archivo: db.archivo, tamano },
       respaldos: respaldos.slice(0, 40),
     };
+  }
+  if (metodo === "POST" && ruta === "/sistema/arranque") {
+    if (!runtimePublico().disponible) throw U.error("El arranque se configura en la instalación portable de Windows", 409);
+    const cuerpo = await leerCuerpo(req, 1000);
+    if (typeof cuerpo.automatico !== "boolean") throw U.error("Indicá si el arranque debe ser automático");
+    await invocarControl(BASE, "Configurar", { automatico: cuerpo.automatico });
+    await db.tx((t) => N.auditar(t, ctx, "Configuración del arranque del servidor", "sistema", null, { automatico: cuerpo.automatico }));
+    return { mensaje: cuerpo.automatico ? "El servidor se iniciará al encender Windows." : "El servidor queda en inicio manual. Seguirá funcionando hasta que lo detengas.", runtime: runtimePublico() };
+  }
+  if (metodo === "POST" && ["/sistema/servidor/detener", "/sistema/servidor/reiniciar"].includes(ruta)) {
+    if (!runtimePublico().disponible) throw U.error("Este control corresponde a la instalación portable de Windows", 409);
+    const reiniciar = ruta.endsWith("/reiniciar");
+    await db.tx((t) => N.auditar(t, ctx, reiniciar ? "Reinicio del servidor" : "Detención intencional del servidor", "sistema", null, { autoarranque: reiniciar }));
+    await invocarControl(BASE, reiniciar ? "Reiniciar" : "Detener");
+    return { mensaje: reiniciar ? "El servidor se reinicia y vuelve a quedar con arranque automático." : "El servidor se detiene y desactiva el arranque automático. Para volver a iniciarlo, usá las herramientas de la notebook.", reiniciando: reiniciar };
+  }
+  if (metodo === "POST" && ruta === "/sistema/https/preparar") {
+    if (!runtimePublico().disponible) throw U.error("HTTPS se prepara en la instalación portable de Windows", 409);
+    const estado = await actualizarHttps();
+    if (!estado.activo) throw U.error(estado.error || "No se pudo iniciar HTTPS", 409);
+    return { mensaje: "HTTPS está listo. Configurá la confianza del certificado una vez en cada PC del camping.", https: estado };
+  }
+  if (metodo === "GET" && ruta === "/sistema/https/certificado") {
+    if (!tlsCargado) throw U.error("El certificado HTTPS todavía no está preparado", 404);
+    return { archivo: tlsCargado.raiz, nombreArchivo: "autoridad.cer", tipo: "application/pkix-cert" };
   }
   if (metodo === "GET" && ruta === "/sistema/red") return estadoRed();
   if (metodo === "POST" && ruta === "/sistema/red") {
@@ -266,7 +358,7 @@ async function rutaSistema(ctx, metodo, ruta, req, res) {
     execFile("shutdown.exe", ["/r", "/t", "20", "/c", "AJB Predio: reinicio pedido por el administrador"], { windowsHide: true }, (e) => {
       if (e) log(`No se pudo reiniciar la notebook: ${e.message}`);
     });
-    return { mensaje: "La notebook se reinicia en 20 segundos. El sistema vuelve solo en uno o dos minutos." };
+    return { mensaje: leerRuntime(BASE).autoarranque ? "La notebook se reinicia en 20 segundos. El sistema vuelve solo en uno o dos minutos." : "La notebook se reinicia en 20 segundos. El servidor está configurado en inicio manual: después usá iniciar-servidor.bat." };
   }
   if (metodo === "POST" && ruta === "/sistema/sincronizar") {
     const r = await agente.sincronizarAhora();
@@ -389,6 +481,7 @@ async function manejar(req, res) {
     db, pid: config.predio_id, modo: "local", origen: "LOCAL", ip,
     esLocalhost: ip === "127.0.0.1" || ip === "::1",
     agenteHttp: req.headers["user-agent"] || "", servicios,
+    soloLectura: !controlEquipo.puedeEscribir(),
     query: Object.fromEntries(url.searchParams.entries()),
   };
   try {
@@ -398,6 +491,7 @@ async function manejar(req, res) {
     if ((req.method === "GET" || req.method === "HEAD") && rutaApi.startsWith("/login/imagen")) return rutaGaleria(req, res, rutaApi);
     if (rutaApi.startsWith("/sistema/")) {
       if (!ctx.usuario) throw U.error("Iniciá sesión para continuar", 401, { codigo: "SIN_SESION" });
+      if (req.method === "POST" && rutaApi === "/sistema/importar") controlEquipo.comprobar();
       const r = await rutaSistema(ctx, req.method, rutaApi, req, res);
       if (r && r.archivo) {
         return enviar(req, res, 200, r.archivo, r.tipo, { "Content-Disposition": `attachment; filename="${r.nombreArchivo}"` });
@@ -405,7 +499,10 @@ async function manejar(req, res) {
       return enviar(req, res, 200, r);
     }
     ctx.body = req.method === "GET" || req.method === "HEAD" ? {} : await leerCuerpo(req, 3 * 1024 * 1024);
+    const encontrada = api.buscarRuta(req.method === "HEAD" ? "GET" : req.method, rutaApi);
+    if (encontrada?.ruta.escritura || rutaApi === "/sesion/puesto" || (rutaApi === "/primer-uso" && agente.configurado())) controlEquipo.comprobar();
     const resultado = await api.ejecutar(ctx, req.method === "HEAD" ? "GET" : req.method, rutaApi);
+    if (rutaApi === "/estado-publico" && resultado) resultado.escritura = controlEquipo.estado();
     if (resultado && resultado.csv !== undefined) {
       return enviar(req, res, 200, resultado.csv, "text/csv; charset=utf-8", { "Content-Disposition": `attachment; filename="${resultado.nombreArchivo}"` });
     }
@@ -420,12 +517,13 @@ async function manejar(req, res) {
   }
 }
 
-const servidor = http.createServer((req, res) => {
+function manejarSeguro(req, res) {
   manejar(req, res).catch((e) => {
     log(`Error no controlado: ${e.stack || e.message}`);
     try { enviar(req, res, 500, { mensaje: "Error interno" }); } catch (_e) { /* respuesta enviada */ }
   });
-});
+}
+const servidor = http.createServer(manejarSeguro);
 servidor.keepAliveTimeout = 30000;
 servidor.requestTimeout = 300000;
 
@@ -438,10 +536,12 @@ function apagar(codigo = 0) {
   salirConCodigo = codigo;
   log(codigo === 75 ? "Reiniciando para aplicar cambios…" : "Apagando el servidor…");
   agente.detener();
-  servidor.close(() => {
-    db.cerrar();
-    process.exit(salirConCodigo || 0);
-  });
+  descubrimiento?.detener();
+  const abiertos = [servidor, servidorHttps].filter((s) => s?.listening);
+  let restantes = abiertos.length;
+  function cerrar() { if (--restantes <= 0) { db.cerrar(); process.exit(salirConCodigo || 0); } }
+  for (const s of abiertos) s.close(cerrar);
+  if (!restantes) { db.cerrar(); process.exit(salirConCodigo || 0); }
   setTimeout(() => { db.cerrar(); process.exit(salirConCodigo || 0); }, 4000).unref();
 }
 
@@ -461,9 +561,34 @@ servidor.listen(config.puerto, "0.0.0.0", () => {
   log(`Sistema del predio ${config.predio_nombre} v${VERSION} escuchando en el puerto ${config.puerto}`);
   for (const d of direccionesLan()) log(`  Abrí en las PCs del camping: ${d.url}`);
   if (!agente.configurado()) log("  Sin vincular al sistema general: funciona sólo en la red local.");
+  if (agente.configurado()) {
+    descubrimiento = crearDescubrimiento({ codigo: config.predio_codigo, puertoHttp: config.puerto,
+      equipoId: controlEquipo.equipoId, instanciaId: agente.instancia(), clave: () => config.clave_lan,
+      puedeSerEscritor: () => controlEquipo.puedeAnunciarEscritor(),
+      alOtro: (otro) => controlEquipo.otroServidor(otro), alListo: () => controlEquipo.redComprobada(), log });
+  }
   agente.iniciar();
   respaldoDiario();
   setInterval(respaldoDiario, 3 * 3600 * 1000).unref();
+  migrarRuntime(BASE, DIR_APP, log).then(() => actualizarHttps()).catch((e) => log(`Configuración de Windows: ${e.message}`));
+  setInterval(() => actualizarHttps(), 6 * 3600 * 1000).unref();
+  function revisarPrecios() {
+    if (!controlEquipo.puedeEscribir()) return;
+    revisarPreciosVencidos(db, { pid: config.predio_id, usuario: { id: null, nombre: "Revisión de precios" }, origen: "SISTEMA", modo: "local" })
+      .catch((e) => log(`Revisión de precios: ${e.message}`));
+  }
+  setTimeout(revisarPrecios, 6000).unref();
+  setInterval(revisarPrecios, 6 * 3600 * 1000).unref();
+  setInterval(() => {
+    const marca = path.join(BASE, "app", "CONTROL");
+    if (!fs.existsSync(marca)) return;
+    try {
+      const orden = JSON.parse(fs.readFileSync(marca, "utf8").replace(/^\uFEFF/, ""));
+      fs.rmSync(marca, { force: true });
+      if (orden.accion === "DETENER") apagar(0);
+      else if (orden.accion === "REINICIAR") apagar(75);
+    } catch (e) { log(`Control del servidor: ${e.message}`); }
+  }, 500).unref();
   // Fotos del ingreso: al arrancar y cada 6 horas (si no hay internet, quedan las guardadas).
   setTimeout(() => actualizarGaleria().catch(() => {}), 15000).unref();
   setInterval(() => actualizarGaleria().catch(() => {}), 6 * 3600 * 1000).unref();

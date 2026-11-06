@@ -7,6 +7,7 @@ const U = require("../util");
 const N = require("../negocio");
 const { DESTINOS } = require("../listados");
 const { gtinValido, proximidadCodigo } = require("../codigo-barras");
+const { resolverRevisionProducto } = require("../precios");
 const { exigirAdmin, esAdmin, bocasDe, exigirPuesto, exigirBoca } = require("./comun");
 
 const DESTINOS_VALIDOS = DESTINOS.map((d) => d.valor);
@@ -93,17 +94,21 @@ async function buscarProductos(ctx) {
     if (bocaId && bocaId !== Number(puesto.boca_id)) throw U.error("La búsqueda de ventas corresponde a la boca de tu caja", 403);
     bocaId = Number(puesto.boca_id);
     exigirBoca(ctx, bocaId);
-    // El catálogo de excepción sólo se abre mediante una búsqueda concreta.
-    if (sinStock && q.length < 2) return [];
+    // Los productos agotados no forman un catálogo alternativo de ventas.
+    if (sinStock) return [];
+    if (q && /^\d{1,60}$/.test(q)) {
+      const puntual = await consultarCodigo({ ...ctx, query: { codigo: q } });
+      // Un código exacto no vendible debe explicar su problema; no sugerir otro
+      // producto de código parecido como si el escaneo no hubiera encontrado nada.
+      if (["SIN_PRECIO", "SIN_STOCK", "CODIGO_DUPLICADO"].includes(puntual.estado)) return [];
+    }
   } else if (bocaId) exigirBoca(ctx, bocaId);
   const db = ctx.db;
   const params = [bocaId || -1, ctx.pid];
   let where = "p.predio_id = ? AND p.activo = 1";
   if (soloVenta) {
-    where += " AND p.destino <> 'USO_INTERNO'";
-    where += sinStock
-      ? " AND p.destino = 'VENTA_DIRECTA' AND COALESCE(s.cantidad, 0) <= 0"
-      : " AND (p.destino <> 'VENTA_DIRECTA' OR COALESCE(s.cantidad, 0) > 0)";
+    where += " AND p.destino <> 'USO_INTERNO' AND COALESCE(p.precio_venta, 0) > 0";
+    where += " AND (p.destino <> 'VENTA_DIRECTA' OR COALESCE(s.cantidad, 0) > 0)";
   }
   const baseWhere = where;
   let orden = "p.nombre";
@@ -148,6 +153,22 @@ async function buscarProductos(ctx) {
     sugerido: !!q && f.codigo !== q && proximidadCodigo(f.codigo, q) !== null,
     coincidencia: !!q && f.codigo === q ? "EXACTA" : (proximidadCodigo(f.codigo, q) !== null ? "CODIGO_APROXIMADO" : "TEXTO"),
   }));
+}
+
+// Diagnóstico puntual del código leído, sin enumerar los productos excluidos.
+async function consultarCodigo(ctx) {
+  const puesto = exigirPuesto(ctx);
+  exigirBoca(ctx, puesto.boca_id);
+  const codigo = U.texto(ctx.query.codigo, { max: 60, requerido: true, campo: "El código escaneado" });
+  const filas = await ctx.db.all(
+    `SELECT p.id, p.nombre, p.codigo, p.precio_venta, p.destino, COALESCE(s.cantidad, 0) AS stock_boca
+     FROM predio_producto p LEFT JOIN predio_stock s ON s.predio_id = p.predio_id AND s.producto_id = p.id AND s.boca_id = ?
+     WHERE p.predio_id = ? AND p.activo = 1 AND p.destino <> 'USO_INTERNO' AND p.codigo = ? LIMIT 2`, [puesto.boca_id, ctx.pid, codigo]);
+  if (filas.length !== 1) return { producto: null, estado: filas.length ? "CODIGO_DUPLICADO" : "NO_ENCONTRADO" };
+  const p = filas[0];
+  p.precio_venta = Number(p.precio_venta || 0);
+  p.stock_boca = Number(p.stock_boca || 0);
+  return { producto: p, estado: p.precio_venta <= 0 ? "SIN_PRECIO" : (p.destino === "VENTA_DIRECTA" && p.stock_boca <= 0 ? "SIN_STOCK" : "DISPONIBLE") };
 }
 
 // Serializa todas las altas/ediciones de códigos del catálogo en los dos motores.
@@ -249,7 +270,7 @@ async function crearProducto(ctx) {
     if (dup) throw U.error(`Ese código ya lo tiene «${dup.nombre}». Cada producto necesita un código distinto.`, 409);
     const nombreDup = await t.get("SELECT id FROM predio_producto WHERE predio_id = ? AND LOWER(nombre) = LOWER(?) AND activo = 1", [ctx.pid, datos.nombre]);
     if (nombreDup) throw U.error("Ya hay un producto activo con ese nombre", 409);
-    const id = await N.insertar(t, ctx, "predio_producto", { ...datos, activo: 1 });
+    const id = await N.insertar(t, ctx, "predio_producto", { ...datos, activo: 1, fecha_revision_precio: U.fechaHora() });
     await N.insertar(t, ctx, "predio_precio_historial", {
       producto_id: id, fecha: U.fechaHora(), precio_compra: datos.precio_compra, margen: datos.margen,
       precio_venta: datos.precio_venta, origen: "ALTA", usuario_nombre: N.nombreActor(ctx),
@@ -286,14 +307,17 @@ async function editarProducto(ctx) {
       const dup = await codigoDuplicado(t, ctx, datos.codigo === undefined ? antes.codigo : datos.codigo, id);
       if (dup) throw U.error(`Ese código ya lo tiene «${dup.nombre}»`, 409);
     }
+    const revisarPrecio = ctx.body.confirmar_revision_precio === true || ["precio_compra", "margen", "precio_venta"].some((c) => datos[c] !== undefined && Number(datos[c] || 0) !== Number(antes[c] || 0));
+    if (revisarPrecio) datos.fecha_revision_precio = U.fechaHora();
     await N.actualizar(t, ctx, "predio_producto", id, datos);
     const despues = await N.obtener(t, ctx, "predio_producto", id);
     const cambios = N.diferencias(antes, despues);
-    if (cambios.precio_compra || cambios.margen || cambios.precio_venta) {
+    if (revisarPrecio) {
       await N.insertar(t, ctx, "predio_precio_historial", {
         producto_id: id, fecha: U.fechaHora(), precio_compra: despues.precio_compra, margen: despues.margen,
         precio_venta: despues.precio_venta, origen: "EDICION", usuario_nombre: N.nombreActor(ctx),
       });
+      await resolverRevisionProducto(t, ctx, id);
     }
     // Ajuste manual de la cantidad en almacén (queda como movimiento "Ajuste manual").
     if (ctx.body.cantidad_almacen !== undefined && ctx.body.cantidad_almacen !== null && ctx.body.cantidad_almacen !== "") {
@@ -564,6 +588,7 @@ module.exports = {
   rutas: [
     { m: "GET", p: "/opciones/:fuente", h: opciones },
     { m: "GET", p: "/productos/buscar", h: buscarProductos },
+    { m: "GET", p: "/productos/consultar-codigo", h: consultarCodigo, soloLocal: true },
     { m: "POST", p: "/productos/:id/codigo-barras", h: corregirCodigoBarras, escritura: true },
     { m: "GET", p: "/productos/:id", h: detalleProducto, roles: ["ADMIN"] },
     { m: "POST", p: "/productos", h: crearProducto, escritura: true, roles: ["ADMIN"] },

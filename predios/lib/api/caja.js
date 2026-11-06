@@ -244,11 +244,27 @@ async function panelCajas(ctx) {
   return { cajas: salida };
 }
 
+async function configurarComanda(ctx) {
+  const id = U.id(ctx.params.id, "La caja");
+  if (typeof ctx.body.imprimir_comanda !== "boolean") throw U.error("Indicá si la caja imprime comanda");
+  if (!esAdmin(ctx) && Number(ctx.sesion?.caja_id) !== id) throw U.error("Sólo podés cambiar la comanda de la caja en la que estás trabajando", 403);
+  return ctx.db.tx(async (t) => {
+    const caja = await exigirAccesoCaja(t, ctx, id);
+    if (!Number(caja.activo)) throw U.error("La caja está deshabilitada", 409);
+    await N.actualizar(t, ctx, "predio_caja", id, { imprimir_comanda: ctx.body.imprimir_comanda ? 1 : 0 });
+    if (!!Number(caja.imprimir_comanda) !== ctx.body.imprimir_comanda) {
+      await N.auditar(t, ctx, "Configuración de comanda de caja", "caja", id, { imprimir_comanda: { antes: !!Number(caja.imprimir_comanda), despues: ctx.body.imprimir_comanda } });
+    }
+    return { id, imprimir_comanda: ctx.body.imprimir_comanda, mensaje: ctx.body.imprimir_comanda ? "Esta caja imprimirá una copia para preparación" : "Esta caja imprimirá sólo el ticket del cliente" };
+  });
+}
+
 module.exports = {
   saldoCaja,
   rutas: [
     { m: "GET", p: "/caja/estado", h: estado },
     { m: "GET", p: "/caja/panel", h: panelCajas, roles: ["ADMIN"] },
+    { m: "POST", p: "/cajas/:id/comanda", h: configurarComanda, escritura: true },
     { m: "POST", p: "/caja/apertura", h: cargarApertura, escritura: true, roles: ["ADMIN"] },
     { m: "POST", p: "/caja/apertura/:id/verificar", h: verificarApertura, escritura: true },
     { m: "POST", p: "/caja/ajuste", h: ajuste, escritura: true, roles: ["ADMIN"] },

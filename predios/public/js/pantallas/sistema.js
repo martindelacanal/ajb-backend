@@ -58,6 +58,38 @@
     return P.f.entero(b / 1024) + " KB";
   }
 
+  function enlaceServidor(url, texto) {
+    return /^https?:\/\/[^\s]+$/i.test(String(url || ""))
+      ? h("a", { href: url, style: { overflowWrap: "anywhere" } }, texto || url)
+      : h("span", texto || url || "—");
+  }
+
+  function conexionSegura(d, cargar) {
+    var seguro = d.https || {};
+    var huella = String(seguro.huella_sha256 || "");
+    var comando = /^[a-f0-9]{64}$/i.test(huella) ? "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\confiar-certificado.ps1 -Certificado .\\autoridad.cer -HuellaSha256 " + huella : null;
+    return h("div.columna",
+      h("div.fila-separada", h("h3.seccion-titulo", "Conexión segura para las PCs"), P.chip(seguro.activo ? "HTTPS activo" : seguro.preparado ? "HTTPS preparado" : "HTTPS pendiente", seguro.activo ? "CONFIRMADA" : "PENDIENTE")),
+      seguro.activo ? h("p", { style: { margin: 0 } }, "Usá ", enlaceServidor(seguro.url), " después de configurar la confianza en cada PC.")
+        : h("p.texto-3", { style: { margin: 0 } }, "Prepará HTTPS en la notebook servidor y configurá la confianza una vez en cada PC de caja."),
+      seguro.error ? P.mensaje(seguro.error, "aviso") : null,
+      seguro.preparado ? h("div.columna",
+        h("div.datos", P.dato("Huella SHA-256 del certificado", h("span.numero", { style: { overflowWrap: "anywhere" } }, huella || "—")),
+          P.dato("Vigencia de la autoridad", P.f.fecha(seguro.raiz_vence))),
+        h("ol", { style: { margin: 0, paddingLeft: "22px" } },
+          h("li", "En la notebook servidor, copiá la carpeta ", h("strong", { style: { overflowWrap: "anywhere" } }, seguro.carpeta_certificados || "certificados-PCs"), " completa a cada PC de caja."),
+          h("li", "Comprobá que la huella del certificado coincida con la que muestra esta pantalla en la notebook servidor."),
+          h("li", "En cada PC, hacé clic derecho en CONFIAR-EN-ESTA-PC.bat y elegí Ejecutar como administrador."),
+          h("li", "Cerrá y volvé a abrir el navegador. Entrá por la dirección HTTPS y actualizá el acceso directo de esa PC.")),
+        comando ? h("pre", { style: { margin: 0, padding: "12px", background: "var(--papel)", borderRadius: "8px", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: "12px" } }, comando) : null,
+        h("p.texto-3.chico", { style: { margin: 0 } }, "La confianza se configura en cada PC. Preparar HTTPS en el servidor no instala el certificado en las demás computadoras.")) : null,
+      h("div.fila",
+        seguro.preparado ? P.btn("Descargar certificado público", { tipo: "secundario", chico: true, icono: "descargar", onclick: function () { P.descargar("/sistema/https/certificado", "autoridad.cer").catch(P.error); } }) : null,
+        P.btn(seguro.preparado ? "Revisar HTTPS" : "Preparar HTTPS", { tipo: "secundario", chico: true, icono: "escudo", deshabilitado: !(d.runtime && d.runtime.disponible), onclick: function (ev) {
+          P.ejecutar(ev.currentTarget, function () { return P.post("/sistema/https/preparar", {}).then(function (r) { P.aviso(r.mensaje, "ok"); return cargar(); }); }).catch(function () {});
+        } })));
+  }
+
   P.ruta.registrar(/^\/sistema$/, function (c) {
     solapas(c, "/sistema");
     if (P.modo === "remoto") {
@@ -72,8 +104,77 @@
     }
     var zona = h("div.columna", P.cargando());
     c.appendChild(zona);
+    var accionServidor = false;
+    var temporizadorReinicio = null;
+    var inicioServidor = null;
+    var inicioAntesDeReiniciar = null;
+    P.alSalir(function () { clearTimeout(temporizadorReinicio); });
+    function servidorDetenido() {
+      P.reemplazar(zona, h("div.hoja.hoja-cuerpo.columna", { role: "status" },
+        h("h2.seccion-titulo", "Servidor detenido"),
+        P.mensaje("El servidor quedó apagado y el inicio automático está desactivado. Las PCs del camping no podrán operar hasta que lo vuelvas a iniciar.", "info"),
+        h("p", { style: { margin: 0 } }, "En la notebook servidor, abrí la carpeta de instalación y ejecutá ", h("strong", "herramientas\\iniciar-servidor.bat"), "."),
+        h("p.texto-3", { style: { margin: 0 } }, "Para iniciar y volver a activar el arranque automático, ejecutá herramientas\\reiniciar-servidor.bat. Después recargá esta página.")));
+    }
+    function esperarReinicio(intentos) {
+      if (P.ruta.actual() !== "/sistema") return;
+      P.get("/sistema/estado", { sinRedireccion: true }).then(function (d) {
+        if (!d.servidor || d.servidor.iniciado === inicioAntesDeReiniciar) throw new Error("El servidor anterior todavía está cerrando");
+        accionServidor = false; cargar();
+      }).catch(function () {
+        if (intentos >= 30) {
+          P.reemplazar(zona, h("div.hoja.hoja-cuerpo", P.mensaje("El servidor todavía no responde. Revisá la notebook servidor y recargá esta página cuando vuelva a estar en marcha.", "aviso")));
+          return;
+        }
+        temporizadorReinicio = setTimeout(function () { esperarReinicio(intentos + 1); }, 2000);
+      });
+    }
+    function controlarServidor(accion, boton) {
+      if (accionServidor) return;
+      var detener = accion === "detener";
+      P.confirmar(detener
+        ? "Se detiene el servidor de este predio y se desactiva su inicio automático. Para volver a operar tendrás que iniciarlo desde la notebook servidor."
+        : "Se reinicia el servidor del predio y se vuelve a activar su inicio automático. Las PCs tendrán una interrupción de unos segundos.", {
+        titulo: detener ? "¿Detener el servidor?" : "¿Reiniciar el servidor?", aceptar: detener ? "Detener servidor" : "Reiniciar servidor", peligro: detener,
+      }).then(function (ok) {
+        if (!ok || accionServidor) return;
+        accionServidor = true;
+        inicioAntesDeReiniciar = inicioServidor;
+        P.ejecutar(boton, function () {
+          return P.post("/sistema/servidor/" + accion, {}).then(function () {
+            if (detener) { servidorDetenido(); return; }
+            P.reemplazar(zona, h("div.hoja.hoja-cuerpo", P.cargando("Reiniciando el servidor. Esperando que vuelva a responder…")));
+            temporizadorReinicio = setTimeout(function () { esperarReinicio(0); }, 2500);
+          });
+        }).catch(function () { accionServidor = false; });
+      });
+    }
+    function controlServidor(d) {
+      var rt = d.runtime || {};
+      var escritura = d.escritura || {};
+      var automatico = P.check("Iniciar automáticamente con Windows", !!rt.autoarranque, "Si lo desactivás, el servidor sigue funcionando hasta que lo detengas o apagues la notebook.", function (valor) {
+        automatico.input.disabled = true;
+        P.post("/sistema/arranque", { automatico: valor }).then(function (r) { P.aviso(r.mensaje, "ok"); return cargar(); })
+          .catch(function (e) { automatico.input.checked = !!rt.autoarranque; P.error(e); }).finally(function () { automatico.input.disabled = !rt.disponible; });
+      });
+      automatico.input.disabled = !rt.disponible;
+      return h("div.hoja.hoja-cuerpo.columna",
+        h("div.fila-separada", h("h2.seccion-titulo", "Servidor de este predio"),
+          P.chip(escritura.autorizado === false ? "Modo consulta" : "En marcha", escritura.autorizado === false ? "PENDIENTE" : "CONFIRMADA")),
+        escritura.motivo ? P.mensaje(escritura.motivo, escritura.autorizado === false ? "aviso" : "info") : null,
+        escritura.otro_servidor && escritura.otro_servidor.url ? h("p", { style: { margin: 0 } }, "Servidor detectado en la red: ", enlaceServidor(escritura.otro_servidor.url, "Abrir el servidor del predio")) : null,
+        h("div.datos", P.dato("Notebook", d.equipo.nombre), P.dato("Inicio automático", rt.autoarranque ? "Activado" : "Desactivado"),
+          P.dato("Control de los datos", escritura.autorizado === false ? "Esta PC sólo consulta" : "Este servidor puede operar")),
+        automatico,
+        !rt.disponible ? h("p.texto-3.chico", { style: { margin: 0 } }, "Los controles de Windows están disponibles en la instalación portable de la notebook servidor.") : null,
+        h("div.fila",
+          P.btn("Reiniciar servidor", { tipo: "secundario", icono: "refrescar", deshabilitado: !rt.disponible, onclick: function (ev) { controlarServidor("reiniciar", ev.currentTarget); } }),
+          P.btn("Detener servidor", { tipo: "peligro", icono: "salir", deshabilitado: !rt.disponible, onclick: function (ev) { controlarServidor("detener", ev.currentTarget); } })));
+    }
     function cargar() {
+      if (accionServidor) return Promise.resolve();
       return P.get("/sistema/estado").then(function (d) {
+        inicioServidor = d.servidor.iniciado;
         var s = d.sincronizacion;
         var versionInstalada = String(s.version || "").split("+")[0];
         var hayNueva = s.version_disponible && s.version_disponible !== s.version;
@@ -92,6 +193,7 @@
           });
         });
         P.reemplazar(zona,
+          controlServidor(d),
           h("div.grilla.grilla-2",
             h("div.hoja.hoja-cuerpo",
               h("div.fila-separada", h("h2.seccion-titulo", "Sincronización con el sistema general"),
@@ -104,7 +206,7 @@
                 P.dato("Cambios por subir", P.f.entero(s.pendientes)),
                 P.dato("Afiliados con reserva", s.maestros ? P.f.entero(s.maestros.afiliados) + " (" + P.f.relativo(s.maestros.fecha) + ")" : "—")),
               s.ultimo_error && !s.en_linea ? h("p.texto-3.chico", "Último error: " + s.ultimo_error) : null,
-              h("p.texto-3.chico", "Sin internet el sistema funciona igual: todo se guarda en esta notebook y se sube solo cuando vuelve la conexión."),
+              h("p.texto-3.chico", d.escritura && d.escritura.autorizado === false ? "Esta instalación está en modo consulta. Usá el servidor autorizado para cargar ventas y movimientos." : "Sin internet el sistema funciona igual: todo se guarda en esta notebook y se sube solo cuando vuelve la conexión."),
               h("div.fila", { style: { marginTop: "6px" } },
                 P.btn("Sincronizar ahora", { tipo: "primario", icono: "refrescar", deshabilitado: !s.vinculado, onclick: function (ev) {
                   P.ejecutar(ev.currentTarget, function () { return P.post("/sistema/sincronizar").then(function (r) { P.aviso(r.mensaje, "ok"); cargar(); }); }).catch(function () {});
@@ -134,11 +236,12 @@
                 P.btn("Cargar paquete del sistema general", { tipo: "secundario", icono: "subir", onclick: function () { archivo.click(); } }), archivo)),
             h("div.hoja.hoja-cuerpo",
               h("h2.seccion-titulo", "Direcciones para las PCs del camping"),
-              h("p.texto-3", "En cada PC, abrí el navegador y entrá a:"),
+              h("p.texto-3", "Las direcciones HTTP permiten llegar al servidor. Para operar con conexión segura, configurá HTTPS como se indica debajo."),
               h("ul.lista-simple",
                 d.red ? h("li", h("strong", d.red.por_nombre), h("span.texto-3.chico", "con el nombre de la notebook")) : null,
                 d.servidor.direcciones.map(function (x) { return h("li", h("strong", x.url), h("span.texto-3.chico", "IP · " + x.interfaz)); })),
               d.red && d.red.pendiente ? h("div", { style: { marginTop: "10px" } }, P.mensaje(h("span", "El nombre nuevo, ", h("strong", d.red.pendiente), ", se aplica cuando se reinicie la notebook."), "aviso")) : null,
+              h("div", { style: { marginTop: "16px" } }, conexionSegura(d, cargar)),
               h("div.fila", { style: { marginTop: "12px" } },
                 P.btn("Cambiar el nombre en la red", { tipo: "secundario", icono: "red", deshabilitado: !(d.red && d.red.puede_cambiar), onclick: function () { formNombreRed(d.red, cargar); } }),
                 d.red && d.red.pendiente ? P.btn("Reiniciar la notebook", { tipo: "texto", icono: "refrescar", onclick: reiniciarNotebook }) : null),
