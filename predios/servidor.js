@@ -444,6 +444,17 @@ function leerCuerpo(req, limite, binario = false) {
 }
 
 function servirEstatico(req, res, ruta) {
+  if (ruta === "/crear-acceso-pc-caja.bat") {
+    const plantilla = fs.readFileSync(path.join(DIR_APP, "windows", "crear-acceso-pc-caja.bat"), "utf8");
+    const host = req.headers.host || "";
+    // Sólo un nombre/IP y puerto pueden incorporarse al BAT; el archivo también funciona sin dirección.
+    const valido = /^(?:[a-z0-9._-]+|\[[0-9a-f:]+\])(?::\d{1,5})?$/i.test(host);
+    const origen = valido ? (req.socket.encrypted ? "https://" : "http://") + host : "";
+    const contenido = plantilla.replace('set "AJB_DIRECCION="', 'set "AJB_DIRECCION=' + origen + '"');
+    return enviar(req, res, 200, contenido.replace(/\r?\n/g, "\r\n"), "application/octet-stream", {
+      "Content-Disposition": 'attachment; filename="crear-acceso-pc-caja.bat"', "Cache-Control": "no-store",
+    });
+  }
   let relativo = decodeURIComponent(ruta.split("?")[0]);
   if (relativo === "/" || relativo === "") relativo = "/index.html";
   const archivo = path.normalize(path.join(DIR_PUBLICO, relativo));

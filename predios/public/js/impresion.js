@@ -1,4 +1,4 @@
-/* Impresión: tickets de venta (tiquetera de 80 o 58 mm), cierres de caja y liquidaciones (A4). */
+/* Impresión del documento y comprobantes de compras y liquidaciones en A4. */
 (function () {
   "use strict";
   if (window.__SIN_SOPORTE) return;
@@ -7,23 +7,8 @@
   var FORMAS = { EFECTIVO: "Efectivo", QR: "QR", TARJETA_DEBITO: "Tarjeta de débito", TARJETA_CREDITO: "Tarjeta de crédito", TRANSFERENCIA: "Transferencia", DESCUENTO: "Descuento de haberes", DESCUENTO_HABERES: "Descuento de haberes" };
   P.FORMAS = FORMAS;
 
-  var ESTILO_TICKET = function (ancho) {
-    var util = ancho === 58 ? 48 : 72;
-    var base = ancho === 58 ? 11 : 12.5;
-    return "@page { size: " + ancho + "mm auto; margin: 0; }" +
-      "* { box-sizing: border-box; } html, body { margin: 0; padding: 0; background: #fff; color: #000; }" +
-      "body { width: " + util + "mm; margin: 0 auto; padding: 3mm 0 6mm; font-family: 'Segoe UI', Arial, Helvetica, sans-serif; font-size: " + base + "px; line-height: 1.32; -webkit-print-color-adjust: exact; }" +
-      ".c { text-align: center; } .d { text-align: right; } .b { font-weight: 800; } .g { font-size: " + (base + 4) + "px; } .gg { font-size: " + (base + 9) + "px; }" +
-      ".l { border-top: 1px dashed #000; margin: 6px 0; } .f { display: flex; justify-content: space-between; gap: 6px; }" +
-      ".it { margin: 4px 0; } .it .n { font-weight: 700; word-break: break-word; } .p { font-size: " + (base - 1) + "px; }" +
-      ".firma { margin-top: 26px; border-top: 1px solid #000; padding-top: 2px; font-size: " + (base - 1) + "px; }" +
-      ".marca { margin: 6px 0; padding: 4px; border: 2px solid #000; text-align: center; font-weight: 800; letter-spacing: .1em; }" +
-      ".copia-comanda { break-before: page; page-break-before: always; padding-top: 3mm; }" +
-      "p { margin: 3px 0; }";
-  };
-
   function imprimirHtml(cuerpo, estilo, titulo) {
-    return new Promise(function (resolver) {
+    return new Promise(function (resolver, rechazar) {
       var marco = h("iframe", { title: "Impresión", style: { position: "fixed", right: "0", bottom: "0", width: "0", height: "0", border: "0", visibility: "hidden" } });
       document.body.appendChild(marco);
       var doc = marco.contentWindow.document;
@@ -39,93 +24,23 @@
       function terminar() { if (listo) return; listo = true; setTimeout(function () { marco.remove(); resolver(); }, 600); }
       marco.contentWindow.onafterprint = terminar;
       setTimeout(function () {
-        try { marco.contentWindow.focus(); marco.contentWindow.print(); } catch (e) { window.print(); }
-        setTimeout(terminar, 60000);
+        try {
+          marco.contentWindow.focus();
+          marco.contentWindow.print();
+          if (!listo) setTimeout(terminar, 60000);
+        } catch (e) {
+          if (listo) return;
+          listo = true;
+          marco.remove();
+          rechazar(new Error("No se pudo imprimir el comprobante. Revisá la tiquetera o impresora y volvé a intentar."));
+        }
       }, 120);
     });
   }
   P.imprimirHtml = imprimirHtml;
 
-  function fila(izq, der, clase) { return h("div.f" + (clase ? "." + clase : ""), h("span", izq), h("span.d", der)); }
-  function linea() { return h("div.l"); }
   function documento(dni) { var d = String(dni || "").replace(/\D/g, ""); return d ? d.replace(/\B(?=(\d{3})+(?!\d))/g, ".") : ""; }
   P.documento = documento;
-
-  // datos = respuesta de /ventas/:id (venta, items, afiliado, empresa, ancho)
-  P.imprimirTicket = function (datos, opciones) {
-    opciones = opciones || {};
-    var v = datos.venta;
-    var e = datos.empresa || {};
-    var a = datos.afiliado;
-    var nodo = h("div",
-      h("div.c.b", (e.razon_social || "Asociación Judicial Bonaerense").toUpperCase()),
-      h("div.c.b.g", e.nombre_predio || "Camping"),
-      e.cuit ? h("div.c.p", "CUIT " + e.cuit) : null,
-      e.direccion ? h("div.c.p", e.direccion) : null,
-      linea(),
-      fila(h("span.b", "Ticket N° " + String(v.id).padStart(6, "0")), P.f.fechaHora(v.fecha)),
-      h("div.p", (v.boca || "") + " · " + (v.caja || "")),
-      h("div.p", "Atendió: " + (v.usuario_nombre || "")),
-      v.estado === "ANULADA" ? h("div.marca", "VENTA ANULADA") : null,
-      opciones.reimpresion || datos.reimpresion ? h("div.marca", "REIMPRESIÓN") : null,
-      linea(),
-      (datos.items || []).map(function (it) {
-        return h("div.it",
-          h("div.n", it.descripcion),
-          fila(P.f.numero(it.cantidad) + " × " + P.f.pesos(it.precio_unitario), h("span.b", P.f.pesos(it.subtotal))));
-      }),
-      linea(),
-      fila(h("span.b.gg", "TOTAL"), h("span.b.gg", P.f.pesos(v.total))),
-      h("p", "Forma de pago: ", h("span.b", FORMAS[v.forma_pago] || v.forma_pago)),
-      v.forma_pago === "EFECTIVO" && v.recibido !== null ? fila("Recibido " + P.f.pesos(v.recibido), "Vuelto " + P.f.pesos(v.vuelto || 0)) : null,
-      v.codigo_pago ? h("p", "Código de pago: " + v.codigo_pago) : null,
-      a ? [
-        linea(),
-        h("div.b", "Afiliado: " + a.nombre),
-        h("div", [a.dni ? "DNI " + documento(a.dni) : null, a.legajo ? "Legajo N° " + a.legajo : null].filter(Boolean).join(" · ")),
-        a.departamental ? h("div.p", "Departamental: " + a.departamental) : null,
-      ] : null,
-      v.forma_pago === "DESCUENTO" && a ? [
-        h("p.b", "Consumo con descuento de haberes"),
-        h("p", "Disponible luego de esta compra: " + P.f.pesos(a.disponible)),
-        h("p.p", e.texto_autorizacion || ""),
-        h("div.firma", "Firma"),
-        h("div.firma", "Aclaración"),
-      ] : null,
-      linea(),
-      e.leyenda ? h("div.c.p", e.leyenda) : null,
-      h("div.c.p", "Sistema del predio · AJB"));
-    var conComanda = opciones.comanda === undefined ? !!datos.imprimir_comanda : !!opciones.comanda;
-    var trabajo = conComanda ? h("div",
-      h("div.copia-cliente", h("div.marca", "CLIENTE"), nodo),
-      h("div.copia-comanda", h("div.marca", "COMANDA · PREPARACIÓN"), nodo.cloneNode(true))) : nodo;
-    return imprimirHtml(trabajo, ESTILO_TICKET(datos.ancho === 58 ? 58 : 80), "Ticket " + v.id);
-  };
-
-  P.imprimirCierre = function (datos, ancho) {
-    var c = datos.cierre;
-    var nodo = h("div",
-      h("div.c.b", (datos.empresa && datos.empresa.razon_social || "AJB").toUpperCase()),
-      h("div.c.b.g", "CIERRE DE CAJA N° " + c.id),
-      h("div.c", (c.boca || "") + " · " + (c.caja || "")),
-      h("div.c.p", P.f.fechaHora(c.fecha) + " · " + (c.usuario_nombre || "")),
-      linea(),
-      fila("Saldo inicial", P.f.pesos(c.saldo_inicial)),
-      fila("Ingresos", P.f.pesos(c.ingresos)),
-      fila("Egresos", P.f.pesos(c.egresos)),
-      fila(h("span.b", "Efectivo esperado"), h("span.b", P.f.pesos(c.saldo_esperado))),
-      fila("Efectivo contado", P.f.pesos(c.efectivo_contado)),
-      fila(h("span.b", Number(c.diferencia) === 0 ? "Sin diferencia" : (Number(c.diferencia) > 0 ? "Sobrante" : "Faltante")), h("span.b", P.f.pesos(Math.abs(c.diferencia)))),
-      fila("Retiro", P.f.pesos(c.retiro)),
-      fila("Queda en caja", P.f.pesos(c.queda_en_caja)),
-      linea(),
-      h("div.b", "Ventas: " + c.ventas_cantidad + " · " + P.f.pesos(c.ventas_total)),
-      (datos.ventas_por_forma || []).map(function (x) { return fila((FORMAS[x.forma_pago] || x.forma_pago) + " (" + x.cantidad + ")", P.f.pesos(x.total)); }),
-      c.observaciones ? [linea(), h("p", c.observaciones)] : null,
-      h("div.firma", "Firma del cajero"),
-      h("div.firma", "Firma de quien recibe"));
-    return imprimirHtml(nodo, ESTILO_TICKET(ancho === 58 ? 58 : 80), "Cierre " + c.id);
-  };
 
   var ESTILO_A4 = "@page { size: A4; margin: 16mm 14mm; } * { box-sizing: border-box; } body { margin: 0; font-family: 'Segoe UI', Arial, sans-serif; font-size: 12.5px; color: #12344d; }" +
     "h1 { margin: 0; font-size: 20px; color: #0d5482; } h2 { margin: 18px 0 8px; font-size: 14px; color: #0d5482; text-transform: uppercase; letter-spacing: .06em; }" +

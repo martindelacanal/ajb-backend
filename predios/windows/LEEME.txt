@@ -48,9 +48,15 @@ consulta para evitar que dos PCs modifiquen bases distintas del mismo predio.
 EN CADA PC DE LAS BOCAS (comedor, confitería, proveeduría, etc.)
 -----------------------------------------------------------------
 - Abrí el navegador (Chrome, Edge o Firefox) y entrá a la dirección del punto 4.
-- Recomendado: copiá C:\AJB-Predio\herramientas\crear-acceso-pc-caja.bat a esa PC
-  y ejecutalo. Crea el acceso "Sistema del Camping" en el escritorio que imprime los
-  tickets directo por la tiquetera (que tiene que ser la impresora predeterminada).
+- Para imprimir directo, elegí la tiquetera como impresora predeterminada en Windows.
+  En sus preferencias elegí el ancho del rollo que usa la caja (58 u 80 mm).
+  Desde Elegir caja > Configurar impresión directa en esta PC, descargá el acceso y
+  ejecutalo una vez con el usuario de caja. También sirve en la notebook servidor.
+  Podés hacerlo antes de empezar el turno o después de salir de la sesión anterior.
+  Se abre "Sistema del Camping - Caja". Ingresá y elegí tu boca y caja la primera vez.
+  Abrí siempre ese acceso del escritorio para imprimir los tickets sin elegir impresora.
+  Para documentos A4, entrá por el navegador habitual. Si hace falta usar un pendrive,
+  copiá herramientas\crear-acceso-pc-caja.bat del instalador y escribí la dirección del predio.
 - En Windows 8 o con navegadores viejos: instalá Chrome 109 o Firefox ESR 115
   (las últimas versiones que soportan Windows 7 y 8). Internet Explorer no sirve.
 

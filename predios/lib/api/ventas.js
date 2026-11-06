@@ -6,6 +6,7 @@
 const U = require("../util");
 const N = require("../negocio");
 const { emitirAviso } = require("../avisos");
+const { autorizacionDescuento } = require("../autorizacion-descuento");
 const { FORMAS_PAGO } = require("../listados");
 const { esAdmin, bocasDe, exigirPuesto, exigirBoca, autorizar, disponibleAfiliado } = require("./comun");
 
@@ -109,21 +110,16 @@ async function datosTicket(db, ctx, ventaId) {
   if (!v) throw U.error("No encontramos la venta", 404);
   const items = await db.all("SELECT * FROM predio_venta_item WHERE predio_id = ? AND venta_id = ? ORDER BY id", [ctx.pid, ventaId]);
   const config = await N.leerConfig(db, ctx);
-  let afiliado = null;
-  if (v.afiliado_id) {
-    const a = await db.get(
-      `SELECT a.*, d.nombre AS departamental FROM predio_afiliado a
-       LEFT JOIN predio_departamental d ON d.predio_id = a.predio_id AND d.id = a.departamental_id
-       WHERE a.predio_id = ? AND a.id = ?`, [ctx.pid, v.afiliado_id]);
-    if (a) {
-      const disp = await disponibleAfiliado(db, ctx, a.id);
-      afiliado = { id: a.id, nombre: a.nombre, dni: a.dni, legajo: a.legajo, departamental: a.departamental, disponible: disp.disponible };
-    }
-  }
+  // Las ventas anteriores a la captura de la autorización conservan el total original.
+  const esDescuento = ["DESCUENTO", "DESCUENTO_HABERES"].includes(v.forma_pago);
+  const autorizacion = esDescuento ? (v.autorizacion_descuento ?? autorizacionDescuento(config, v.total)) : config.texto_autorizacion;
   return {
     venta: v,
     items,
-    afiliado,
+    afiliado: v.afiliado_id ? {
+      id: v.afiliado_id, nombre: v.afiliado_nombre, dni: v.afiliado_dni, legajo: v.afiliado_legajo,
+      departamental: v.afiliado_departamental, disponible: v.saldo_disponible == null ? null : Number(v.saldo_disponible),
+    } : null,
     imprimir_comanda: !!Number(v.imprimir_comanda),
     ancho: Number(v.ancho_ticket) === 58 ? 58 : 80,
     empresa: {
@@ -132,7 +128,7 @@ async function datosTicket(db, ctx, ventaId) {
       cuit: config.cuit,
       direccion: config.direccion,
       leyenda: config.leyenda_ticket,
-      texto_autorizacion: config.texto_autorizacion,
+      texto_autorizacion: autorizacion,
     },
   };
 }
@@ -205,10 +201,14 @@ async function crearVenta(ctx) {
     if (total <= 0 && forma !== "EFECTIVO") throw U.error("El total de la venta tiene que ser mayor que cero");
 
     let afiliado = null;
+    let departamental = null;
+    let saldoDisponible = null;
     if (afiliadoId) {
       afiliado = await N.exigir(t, ctx, "predio_afiliado", afiliadoId, "No encontramos al afiliado");
+      if (afiliado.departamental_id) departamental = await N.obtener(t, ctx, "predio_departamental", afiliado.departamental_id);
+      const disp = await disponibleAfiliado(t, ctx, afiliadoId);
+      saldoDisponible = disp.disponible;
       if (forma === "DESCUENTO") {
-        const disp = await disponibleAfiliado(t, ctx, afiliadoId);
         if (!disp.habilitado) throw U.error("El afiliado no está habilitado para comprar con descuento de haberes", 409, { codigo: "SIN_DISPONIBLE", disponible: 0 });
         if (disp.disponible < total) {
           throw U.error(
@@ -217,6 +217,7 @@ async function crearVenta(ctx) {
               : `Al afiliado le quedan ${U.pesos(disp.disponible)} de descuento y la venta es de ${U.pesos(total)}. Tiene que pagar de otra forma o sacar productos.`,
             409, { codigo: "SIN_DISPONIBLE", disponible: disp.disponible, total });
         }
+        saldoDisponible = U.redondear(disp.disponible - total, 2);
       }
     }
 
@@ -233,6 +234,8 @@ async function crearVenta(ctx) {
       boca_id: caja.boca_id, caja_id: caja.id, turno_id: puesto.turno_id || null, usuario_id: ctx.usuario.id,
       usuario_nombre: N.nombreActor(ctx), fecha: ahora, afiliado_id: afiliado ? afiliado.id : null,
       afiliado_dni: afiliado?.dni || null, afiliado_legajo: afiliado?.legajo || null, afiliado_nombre: afiliado?.nombre || null,
+      afiliado_departamental: departamental?.nombre || null, saldo_disponible: saldoDisponible,
+      autorizacion_descuento: forma === "DESCUENTO" ? autorizacionDescuento(config, total) : null,
       forma_pago: forma, codigo_pago: codigoPago, total, recibido, vuelto, estado: "CONFIRMADA", impresiones: 0,
       observaciones: U.texto(b.observaciones, { max: 255 }),
     });

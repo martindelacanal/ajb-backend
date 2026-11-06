@@ -106,7 +106,7 @@
               return P.post("/caja/cierre", { caja_id: cajaId || undefined, efectivo_contado: c, queda_en_caja: P.numeroDe(queda.value) || 0, observaciones: obs.value }).then(function (x) {
                 m.cerrar();
                 P.aviso(x.mensaje, x.diferencia === 0 ? "ok" : "error", 8000);
-                if (x.id) P.get("/caja/cierres/" + x.id).then(function (d) { P.imprimirCierre(d, (P.puesto() || {}).ancho_ticket); }).catch(P.error);
+                if (x.id) P.get("/caja/cierres/" + x.id).then(P.imprimirCierre).catch(P.error);
                 if (alTerminar) alTerminar(x);
               });
             });
@@ -215,7 +215,7 @@
           h("div", h("span", "Ventas"), h("strong", ci.ventas_cantidad + " · " + P.f.pesos(ci.ventas_total))),
           d.ventas_por_forma.map(function (v) { return h("div.texto-3.chico", h("span", (P.FORMAS[v.forma_pago] || v.forma_pago) + " (" + v.cantidad + ")"), h("span", P.f.pesos(v.total))); }),
           ci.observaciones ? h("div.texto-3", ci.observaciones) : null),
-        acciones: [P.btn("Imprimir", { tipo: "primario", icono: "imprimir", onclick: function () { P.imprimirCierre(d, 80); } })],
+        acciones: [P.btn("Imprimir", { tipo: "primario", icono: "imprimir", onclick: function () { P.imprimirCierre(d).catch(P.error); } })],
       });
     }).catch(P.error);
   };

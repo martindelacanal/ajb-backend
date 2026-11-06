@@ -215,7 +215,7 @@ async function cerrar(ctx) {
 async function detalleCierre(ctx) {
   const id = U.id(ctx.params.id);
   const c = await ctx.db.get(
-    `SELECT ci.*, ca.nombre AS caja, b.nombre AS boca FROM predio_cierre ci
+    `SELECT ci.*, ca.nombre AS caja, ca.ancho_ticket, b.nombre AS boca FROM predio_cierre ci
      JOIN predio_caja ca ON ca.predio_id = ci.predio_id AND ca.id = ci.caja_id
      JOIN predio_boca b ON b.predio_id = ci.predio_id AND b.id = ci.boca_id
      WHERE ci.predio_id = ? AND ci.id = ?`, [ctx.pid, id]);
@@ -224,7 +224,10 @@ async function detalleCierre(ctx) {
   let detalle = [];
   try { detalle = JSON.parse(c.ventas_detalle || "[]"); } catch (_e) { detalle = []; }
   const config = await N.leerConfig(ctx.db, ctx);
-  return { cierre: c, ventas_por_forma: detalle, empresa: { nombre_predio: config.nombre_predio, razon_social: config.razon_social } };
+  return {
+    cierre: c, ancho: Number(c.ancho_ticket) === 58 ? 58 : 80, ventas_por_forma: detalle,
+    empresa: { nombre_predio: config.nombre_predio, razon_social: config.razon_social },
+  };
 }
 
 // Resumen de todas las cajas para el administrador.

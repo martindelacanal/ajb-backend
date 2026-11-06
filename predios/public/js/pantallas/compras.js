@@ -37,7 +37,7 @@
               P.post("/compras/" + c.id + "/anular", { motivo: motivo }).then(function (r) { if (!r.encolado) P.aviso(r.mensaje, "ok"); m.cerrar(); if (alCambiar) alCambiar(); }).catch(P.error);
             });
           } }) : null,
-          P.btn("Imprimir", { tipo: "secundario", icono: "imprimir", onclick: function () { P.imprimirCompra(d); } }),
+          P.btn("Imprimir", { tipo: "secundario", icono: "imprimir", onclick: function () { P.imprimirCompra(d).catch(P.error); } }),
         ],
       });
     }).catch(P.error);

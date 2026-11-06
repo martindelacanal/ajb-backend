@@ -239,6 +239,15 @@
             P.ejecutar(ev.currentTarget, function () { return P.elegirPuesto(p.boca_id, null).then(function () { P.ruta.ir(p.es_almacen ? "/compras" : "/solicitudes"); P.repintarMarco(); }); });
           } })));
     })));
+    if (P.modo === "local") {
+      contenedor.appendChild(h("details.hoja.hoja-cuerpo",
+        h("summary", "Configurar impresión directa en esta PC"),
+        h("ol",
+          h("li", "En Windows, elegí la tiquetera como impresora predeterminada y seleccioná en sus preferencias el ancho del rollo."),
+          h("li", h("a", { href: "/crear-acceso-pc-caja.bat", download: "crear-acceso-pc-caja.bat" }, "Descargá el acceso de caja"), " y ejecutalo en esta PC con tu usuario de Windows."),
+          h("li", "Si ya trabajabas en una caja, cerrá la sesión anterior. Ingresá y elegí la caja en la ventana nueva. En adelante, usá «Sistema del Camping - Caja» en el escritorio.")),
+        h("p.texto-3.chico", "El acceso usa Chrome o Edge y envía los tickets directo a la tiquetera. Para imprimir documentos A4, entrá desde el navegador habitual.")));
+    }
   };
 
   P.despuesDePuesto = function () {

@@ -53,6 +53,18 @@ test.after(() => {
   try { fs.rmSync(base, { recursive: true, force: true }); } catch (_e) { /* Windows */ }
 });
 
+test("el acceso descargable usa la dirección de esta PC y un perfil de impresión separado", async () => {
+  const url = new URL("/crear-acceso-pc-caja.bat", URL_BASE);
+  const r = await fetch(url);
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get("content-disposition"), /attachment; filename="crear-acceso-pc-caja\.bat"/);
+  const bat = await r.text();
+  assert.ok(bat.includes('set "AJB_DIRECCION=' + url.origin + '"'));
+  assert.match(bat, /--kiosk-printing --use-system-default-printer --user-data-dir=/);
+  assert.ok(bat.includes("Start-Process -FilePath $archivo"));
+  assert.doesNotMatch(bat, /(?<!\r)\n/);
+});
+
 test("flujo completo del camping", async () => {
   const inicial = await ok("POST", "/primer-uso", { cuerpo: { usuario: "admin", nombre: "Admin", password: "secreto1" } });
   const admin = inicial.token;
@@ -137,8 +149,12 @@ test("flujo completo del camping", async () => {
   const af = await ok("POST", "/afiliados", { token: admin, cuerpo: { dni: "30111222", legajo: "4455", nombre: "Pérez, Ana", limite: 2000 } });
   const busq = await ok("GET", "/afiliados/buscar?q=4455", { token: cajero });
   assert.equal(busq.resultados[0].disponible, 2000);
+  const textoFirmado = "Autorización del Camping Miramar.";
+  await ok("PUT", "/config", { token: admin, cuerpo: { texto_autorizacion: textoFirmado } });
   const ventaDesc = await ok("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: prod.id, cantidad: 1 }], devolucion: 1, afiliado_id: af.id } });
   assert.equal(ventaDesc.ticket.afiliado.disponible, 1230);
+  const autorizacionFirmada = textoFirmado + "\nSUMA: SETECIENTOS SETENTA PESOS ($ 770,00)";
+  assert.equal(ventaDesc.ticket.empresa.texto_autorizacion, autorizacionFirmada);
   const excede = await api("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: prod.id, cantidad: 2 }], forma_pago: "DESCUENTO", afiliado_id: af.id } });
   assert.equal(excede.status, 409);
   assert.equal(excede.json.codigo, "SIN_DISPONIBLE");
@@ -156,6 +172,10 @@ test("flujo completo del camping", async () => {
   assert.equal(previa.resumen.saldo_esperado, 5540);
   const cierre = await ok("POST", "/caja/cierre", { token: cajero, cuerpo: { efectivo_contado: 5500, queda_en_caja: 500 } });
   assert.equal(cierre.diferencia, -40);
+  const { caja } = await ok("GET", `/cajas/${cajaProv}`, { token: admin });
+  await ok("PUT", `/cajas/${cajaProv}`, { token: admin, cuerpo: { ...caja, ancho_ticket: 58 } });
+  const ticketCierre = await ok("GET", `/caja/cierres/${cierre.id}`, { token: cajero });
+  assert.equal(ticketCierre.ancho, 58);
   const estado2 = await ok("GET", "/caja/estado", { token: cajero });
   assert.equal(estado2.resumen.saldo_esperado, 500);
 
@@ -166,6 +186,23 @@ test("flujo completo del camping", async () => {
   const prev = await ok("POST", "/afiliados/limites/previa", { token: admin, cuerpo: { filtros: { limite: "gte:1000" } } });
   assert.equal(prev.cantidad, 1);
   await ok("POST", "/afiliados/limites/masivo", { token: admin, cuerpo: { filtros: { limite: "gte:1000" }, nuevo_limite: 50000 } });
+  await ok("PUT", `/afiliados/${af.id}`, { token: admin, cuerpo: { nombre: "Ana Pérez", legajo: "4455-B" } });
+  await ok("PUT", "/config", { token: admin, cuerpo: { texto_autorizacion: "", razon_social: "Asociación del Camping" } });
+  const reimpresa = await ok("POST", `/ventas/${ventaDesc.id}/impresion`, { token: cajero, cuerpo: {} });
+  assert.deepEqual(reimpresa.afiliado, ventaDesc.ticket.afiliado);
+  assert.equal(reimpresa.afiliado.disponible, 1230);
+  assert.equal(reimpresa.empresa.texto_autorizacion, autorizacionFirmada);
+  const ventaEstandar = await ok("POST", "/ventas", { token: cajero, cuerpo: {
+    items: [{ producto_id: prod.id, cantidad: 0.25 }], forma_pago: "DESCUENTO", afiliado_id: af.id,
+  } });
+  const textoEstandar = ventaEstandar.ticket.empresa.texto_autorizacion;
+  assert.match(textoEstandar, /Asociación del Camping/);
+  assert.match(textoEstandar, /en ____ cuota\/s, de acuerdo/);
+  assert.match(textoEstandar, /CIENTO NOVENTA Y DOS PESOS CON 50\/100 \(\$ 192,50\)/);
+  assert.equal(ventaEstandar.ticket.venta.autorizacion_descuento, textoEstandar);
+  await ok("PUT", "/config", { token: admin, cuerpo: { razon_social: "Entidad nueva", texto_autorizacion: "Redacción nueva." } });
+  const copiaEstandar = await ok("POST", `/ventas/${ventaEstandar.id}/impresion`, { token: cajero, cuerpo: {} });
+  assert.equal(copiaEstandar.empresa.texto_autorizacion, textoEstandar);
 
   // Todos los listados en JSON, CSV completo y CSV resumido
   const nombres = ["productos", "stock", "proveedores", "compras", "compras_productos", "solicitudes", "bajas", "movimientos", "ventas",
