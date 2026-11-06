@@ -100,16 +100,23 @@
 
   P.imprimirCompra = function (datos) {
     var c = datos.compra;
+    var temporal = c.estado === "TEMPORAL" || c.estado === "DESCARTADA";
+    var conFactura = !temporal && c.total_factura != null;
+    var ajuste = conFactura ? P.redondear(Number(c.total_factura) - Number(c.total_items), 2) : 0;
     var nodo = h("div",
-      h("div.cab", h("div", h("h1", "Compra N° " + c.id), h("div.gris", c.proveedor + (c.proveedor_cuit ? " · CUIT " + c.proveedor_cuit : ""))),
+      h("div.cab", h("div", h("h1", (temporal ? "Recepción temporal N° " : "Compra N° ") + c.id), h("div.gris", c.proveedor + (c.proveedor_cuit ? " · CUIT " + c.proveedor_cuit : ""))),
         h("div.der", c.factura ? h("div", "Factura " + c.factura + " del " + P.f.fecha(c.fecha_factura)) : null, c.remito ? h("div", "Remito " + c.remito + " del " + P.f.fecha(c.fecha_remito)) : null,
           h("div.gris", "Cargada el " + P.f.fechaHora(c.fecha_creacion) + " por " + (c.creado_por || "")))),
-      c.estado === "ANULADA" ? h("p", h("strong", "COMPRA ANULADA: " + (c.anulacion_motivo || ""))) : null,
+      c.estado === "TEMPORAL" ? h("p", "Mercadería recibida. Pendiente de factura definitiva.") : null,
+      c.estado === "ANULADA" || c.estado === "DESCARTADA" ? h("p", h("strong", c.estado + " · " + (c.anulacion_motivo || ""))) : null,
       h("table", h("thead", h("tr", h("th", "Producto"), h("th.num", "Cantidad"), h("th.num", "Unitario"), h("th.num", "Anterior"), h("th.num", "Margen"), h("th.num", "Total"))),
         h("tbody", (datos.items || []).map(function (i) {
           return h("tr", h("td", i.producto), h("td.num", P.f.numero(i.cantidad)), h("td.num", P.f.pesos(i.precio_unitario)), h("td.num", P.f.pesos(i.precio_anterior)), h("td.num", P.f.pct(i.margen)), h("td.num", P.f.pesos(i.subtotal)));
         }))),
-      h("div.totales", h("div.final", h("span", "Total"), h("span", P.f.pesos(c.total_items)))),
+      h("div.totales",
+        ajuste ? h("div", h("span", "Suma de productos"), h("strong", P.f.pesos(c.total_items))) : null,
+        ajuste ? h("div", h("span", "Redondeo"), h("strong", P.f.pesos(ajuste))) : null,
+        h("div.final", h("span", temporal ? "Total provisorio" : conFactura ? "Total de la factura" : "Total"), h("span", P.f.pesos(conFactura ? c.total_factura : c.total_items)))),
       c.observaciones ? h("p", c.observaciones) : null);
     return imprimirHtml(nodo, ESTILO_A4, "Compra " + c.id);
   };

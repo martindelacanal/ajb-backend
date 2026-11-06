@@ -233,8 +233,47 @@ test("un producto nuevo empieza en automático y calcula su venta con los import
   assert.equal(s.P.numeroDe(s.control("Precio de venta").value), 300);
   const body = await s.guardar();
   assert.equal(s.escritos[0].metodo, "POST");
+  assert.equal(body.codigo, null);
   assert.equal(body.precio_venta_manual, null);
-  assert.equal((await s.db.get("SELECT precio_venta FROM predio_producto WHERE nombre = ?", ["Producto nuevo"])).precio_venta, 300);
+  assert.deepEqual(await s.db.get("SELECT codigo, precio_venta FROM predio_producto WHERE nombre = ?", ["Producto nuevo"]), { codigo: null, precio_venta: 300 });
+});
+
+test("se puede quitar el código de un producto y buscarlo por nombre aunque haya otros sin código", async t => {
+  const s = await pantalla(t);
+  await s.P.post("/productos", { nombre: "Otro sin código" });
+  s.escribir("Código de barras o interno (opcional)", "  ");
+  await s.guardar();
+  assert.equal((await s.ficha()).codigo, null);
+  const encontrado = await api.ejecutar({ db: s.db, pid: 1, usuario: { rol: "ADMIN" }, query: { q: "guardado" } }, "GET", "/productos/buscar");
+  assert.deepEqual(encontrado.map(p => p.id), [s.id]);
+});
+
+test("stock de un producto incluye bocas en cero y respeta el alcance del cajero", async t => {
+  const s = await pantalla(t);
+  const consultar = (rol, bocas, query = {}) => api.ejecutar({ db: s.db, pid: 1, usuario: { rol, bocas }, query }, "GET", "/listados/stock");
+  const detalle = await s.P.get("/productos/" + s.id);
+  const bocaCero = detalle.stock.find(b => b.boca === "Comedor");
+  assert.equal(bocaCero.cantidad, 0);
+  assert.ok(s.modal.contenido.querySelector("ul").textContent.includes("Comedor0"));
+  const elegida = { f_producto: String(s.id) };
+  const general = await consultar("ADMIN", [], elegida);
+  assert.equal(general.total, detalle.stock.length);
+  assert.equal(general.totales.cantidad, 4);
+  assert.ok(general.filas.every(f => f.producto_id === s.id));
+  const caja = await consultar("CAJERO", [bocaCero.boca_id], { ...elegida, f_estado: "sin" });
+  assert.deepEqual(caja.filas.map(f => [f.boca, f.cantidad]), [["Comedor", 0]]);
+  assert.equal((await consultar("CAJERO", [bocaCero.boca_id], { ...elegida, f_boca: detalle.stock.find(b => b.es_almacen).boca_id })).total, 0);
+  assert.equal((await consultar("ADMIN", [])).total, 1);
+  const taza = await s.P.post("/productos", { nombre: "Taza de café", destino: "VENTA_COMPUESTA", receta: { insumo_id: s.id, rendimiento: 20 } });
+  const enAlmacen = detalle.stock.find(b => b.es_almacen).boca_id;
+  const porBoca = await consultar("CAJERO", [enAlmacen], { f_producto: taza.id });
+  assert.equal(porBoca.total, 1);
+  assert.equal(porBoca.filas[0].cantidad, 0);
+  assert.equal(porBoca.filas[0].porciones_disponibles, 80);
+  assert.equal(porBoca.totales.cantidad, 0);
+  const fichaTaza = await s.P.get("/productos/" + taza.id);
+  assert.equal(fichaTaza.stock.find(b => b.es_almacen).porciones_disponibles, 80);
+  assert.equal(fichaTaza.stock.find(b => b.boca_id === bocaCero.boca_id).porciones_disponibles, 0);
 });
 
 test("el pie evita fechas duplicadas al minuto y no expone actores heredados", async t => {

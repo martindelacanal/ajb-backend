@@ -336,7 +336,6 @@
         texto_autorizacion: h("textarea.campo-control", { maxlength: 1000 }, cf.texto_autorizacion || ""),
         minutos_permiso: P.input({ valor: cf.minutos_permiso, inputmode: "numeric", max: 4 }),
       };
-      var sinStock = P.check("Permitir vender aunque el sistema marque que no hay stock (pide confirmación)", cf.vender_sin_stock !== "0");
       c.appendChild(h("div.hoja.hoja-cuerpo",
         h("div.grilla.grilla-2",
           P.campo("Nombre del predio", campos.nombre_predio, { ayuda: "Aparece en el ingreso y en los tickets." }),
@@ -344,11 +343,10 @@
           P.campo("CUIT", campos.cuit), P.campo("Dirección", campos.direccion)),
         h("div", { style: { marginTop: "14px" } }, P.campo("Leyenda al pie del ticket", campos.leyenda_ticket)),
         h("div", { style: { marginTop: "14px" } }, P.campo("Texto de autorización del descuento de haberes", campos.texto_autorizacion, { ayuda: "Sale en el ticket de las compras con descuento y en la liquidación." })),
-        h("div.grilla.grilla-2", { style: { marginTop: "14px" } }, P.campo("Minutos que dura una autorización aprobada", campos.minutos_permiso), h("div", { style: { paddingTop: "24px" } }, sinStock)),
+        h("div.grilla.grilla-2", { style: { marginTop: "14px" } }, P.campo("Minutos que dura una autorización aprobada", campos.minutos_permiso)),
         h("div.fila", { style: { marginTop: "18px", justifyContent: "flex-end" } }, P.btn("Guardar configuración", { tipo: "primario", icono: "check", onclick: function (ev) {
           var cuerpo = {};
           Object.keys(campos).forEach(function (k) { cuerpo[k] = campos[k].value; });
-          cuerpo.vender_sin_stock = sinStock.input.checked ? "1" : "0";
           P.ejecutar(ev.currentTarget, function () { return P.put("/config", cuerpo).then(function (x) { if (!x.encolado) P.aviso(x.mensaje, "ok"); }); }).catch(function () {});
         } }))));
       c.appendChild(h("div.hoja.hoja-cuerpo", h("h2.seccion-titulo", "Clave del día"),

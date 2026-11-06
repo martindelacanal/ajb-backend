@@ -5,6 +5,7 @@
 
 const U = require("../util");
 const N = require("../negocio");
+const Porciones = require("../porciones");
 const PB = require("../precio-boca");
 const { DESTINOS } = require("../listados");
 const { gtinValido, proximidadCodigo } = require("../codigo-barras");
@@ -105,18 +106,20 @@ async function buscarProductos(ctx) {
   } else if (bocaId) exigirBoca(ctx, bocaId);
   const db = ctx.db;
   const params = [bocaId || -1, ctx.pid];
+  const enCaja = soloVenta || catalogoAviso;
+  const stockSql = enCaja ? Porciones.stockVentaSql : "COALESCE(s.cantidad, 0)";
   const uniones = `LEFT JOIN predio_boca b ON b.predio_id = p.predio_id AND b.id = ?
-    ${PB.joinMargenSql} LEFT JOIN predio_stock s ON s.predio_id = p.predio_id AND s.producto_id = p.id AND s.boca_id = b.id`;
+    ${PB.joinMargenSql} ${enCaja ? Porciones.joinStockVenta : "LEFT JOIN predio_stock s ON s.predio_id = p.predio_id AND s.producto_id = p.id AND s.boca_id = b.id"}`;
   const costos = await veCostos(db, ctx);
   const ultimoCosto = costos && !soloVenta && !catalogoAviso
     ? `(SELECT ci.precio_unitario FROM predio_compra_item ci JOIN predio_compra c ON c.predio_id = ci.predio_id AND c.id = ci.compra_id
-        WHERE ci.predio_id = p.predio_id AND ci.producto_id = p.id AND c.estado = 'CARGADA' ORDER BY ci.compra_id DESC LIMIT 1)` : "NULL";
+        WHERE ci.predio_id = p.predio_id AND ci.producto_id = p.id AND c.estado = 'CARGADA' ORDER BY ci.id DESC LIMIT 1)` : "NULL";
   const columnas = `p.id, p.nombre, p.codigo, ${PB.precioBocaSql} AS precio_venta, p.precio_compra, ${ultimoCosto} AS ultimo_costo,
-    p.margen, p.destino, p.perecedero, p.fecha_caducidad, COALESCE(s.cantidad, 0) AS stock_boca`;
+    p.margen, p.destino, p.perecedero, p.fecha_caducidad, ${stockSql} AS stock_boca`;
   let where = "p.predio_id = ? AND p.activo = 1";
   if (soloVenta) {
     where += ` AND p.destino <> 'USO_INTERNO' AND (${PB.precioBocaSql}) > 0`;
-    where += " AND COALESCE(s.cantidad, 0) > 0";
+    where += ` AND (${stockSql}) > 0`;
   }
   const baseWhere = where;
   let orden = "p.nombre";
@@ -164,9 +167,9 @@ async function consultarCodigo(ctx) {
   exigirBoca(ctx, puesto.boca_id);
   const codigo = U.texto(ctx.query.codigo, { max: 60, requerido: true, campo: "El código escaneado" });
   const filas = await ctx.db.all(
-    `SELECT p.id, p.nombre, p.codigo, ${PB.precioBocaSql} AS precio_venta, p.destino, COALESCE(s.cantidad, 0) AS stock_boca
+    `SELECT p.id, p.nombre, p.codigo, ${PB.precioBocaSql} AS precio_venta, p.destino, ${Porciones.stockVentaSql} AS stock_boca
      FROM predio_producto p JOIN predio_boca b ON b.predio_id = p.predio_id AND b.id = ? ${PB.joinMargenSql}
-     LEFT JOIN predio_stock s ON s.predio_id = p.predio_id AND s.producto_id = p.id AND s.boca_id = b.id
+     ${Porciones.joinStockVenta}
      WHERE p.predio_id = ? AND p.activo = 1 AND p.destino <> 'USO_INTERNO' AND p.codigo = ? LIMIT 2`, [puesto.boca_id, ctx.pid, codigo]);
   if (filas.length !== 1) return { producto: null, estado: filas.length ? "CODIGO_DUPLICADO" : "NO_ENCONTRADO" };
   const p = filas[0];
@@ -227,16 +230,19 @@ async function detalleProducto(ctx) {
   const db = ctx.db;
   const p = await N.exigir(db, ctx, "predio_producto", id, "No encontramos el producto");
   const stock = await db.all(
-    `SELECT b.id AS boca_id, b.nombre AS boca, b.es_almacen, COALESCE(s.cantidad, 0) AS cantidad
-     FROM predio_boca b LEFT JOIN predio_stock s ON s.predio_id = b.predio_id AND s.boca_id = b.id AND s.producto_id = ?
-     WHERE b.predio_id = ? AND (s.cantidad IS NOT NULL OR b.es_almacen = 1) ORDER BY b.es_almacen DESC, b.nombre`,
-    [id, ctx.pid]);
+    `SELECT b.id AS boca_id, b.nombre AS boca, b.es_almacen, b.activo, COALESCE(fis.cantidad, 0) AS cantidad,
+            ${Porciones.porcionesDisponiblesSql} AS porciones_disponibles
+     FROM predio_producto p JOIN predio_boca b ON b.predio_id = p.predio_id
+     LEFT JOIN predio_stock fis ON fis.predio_id = p.predio_id AND fis.boca_id = b.id AND fis.producto_id = p.id
+     ${Porciones.joinStockVenta}
+     WHERE p.predio_id = ? AND p.id = ? AND (b.activo = 1 OR fis.id IS NOT NULL) ORDER BY b.es_almacen DESC, b.nombre`,
+    [ctx.pid, id]);
   const precios = await db.all(
     `SELECT h.fecha, h.precio_compra, h.margen, h.precio_venta, h.origen, h.referencia_id, h.usuario_nombre, h.boca_id, b.nombre AS boca
      FROM predio_precio_historial h LEFT JOIN predio_boca b ON b.predio_id = h.predio_id AND b.id = h.boca_id
      WHERE h.predio_id = ? AND h.producto_id = ? ORDER BY h.id DESC LIMIT 100`,
     [ctx.pid, id]);
-  return { producto: { ...p, precio_venta: PB.redondearVenta(p.precio_venta) }, stock, precios,
+  return { producto: { ...p, receta: p.destino === "VENTA_COMPUESTA" ? await Porciones.leer(db, ctx, id) : null, precio_venta: PB.redondearVenta(p.precio_venta) }, stock, precios,
     margenes_boca: await PB.preciosDeProducto(db, ctx, id) };
 }
 
@@ -274,10 +280,11 @@ async function crearProducto(ctx) {
     await PB.bloquearPrecios(t, ctx);
     await bloquearCodigos(t, ctx);
     const dup = await codigoDuplicado(t, ctx, datos.codigo);
-    if (dup) throw U.error(`Ese código ya lo tiene «${dup.nombre}». Cada producto necesita un código distinto.`, 409);
+    if (dup) throw U.error(`Ese código ya lo tiene «${dup.nombre}». Revisá el código ingresado.`, 409);
     const nombreDup = await t.get("SELECT id FROM predio_producto WHERE predio_id = ? AND LOWER(nombre) = LOWER(?) AND activo = 1", [ctx.pid, datos.nombre]);
     if (nombreDup) throw U.error("Ya hay un producto activo con ese nombre", 409);
     const id = await N.insertar(t, ctx, "predio_producto", { ...datos, activo: 1, fecha_revision_precio: U.fechaHora() });
+    if (ctx.body.receta) await Porciones.guardar(t, ctx, id, datos.destino, ctx.body.receta);
     await PB.guardarExcepciones(t, ctx, id, ctx.body.margenes_boca, await PB.preciosDeProducto(t, ctx, id));
     await PB.registrarCambioProducto(t, ctx, id, [], "ALTA_BOCA");
     await N.insertar(t, ctx, "predio_precio_historial", {
@@ -292,7 +299,7 @@ async function crearProducto(ctx) {
         referenciaTipo: "producto", referenciaId: id, detalle: "Cantidad inicial al crear el producto",
       });
     }
-    await N.auditar(t, ctx, "Alta de producto", "producto", id, { ...datos, cantidad_almacen: cantidadAlmacen });
+    await N.auditar(t, ctx, "Alta de producto", "producto", id, { ...datos, receta: ctx.body.receta || undefined, cantidad_almacen: cantidadAlmacen });
     return { id, mensaje: "Producto creado" };
   });
 }
@@ -306,6 +313,13 @@ async function editarProducto(ctx) {
     await PB.bloquearPrecios(t, ctx);
     if (datos.codigo !== undefined || datos.activo === 1) await bloquearCodigos(t, ctx);
     const antes = await N.exigir(t, ctx, "predio_producto", id, "No encontramos el producto", { bloquear: true });
+    const cambiaReceta = ctx.body.receta !== undefined || (datos.destino !== undefined && datos.destino !== antes.destino);
+    let recetaAntes;
+    if (cambiaReceta) {
+      recetaAntes = await Porciones.leer(t, ctx, id);
+      if (datos.destino === "ALQUILER" && await Porciones.esInsumo(t, ctx, id)) throw U.error("Este producto se usa como insumo de una porción.");
+      await Porciones.guardar(t, ctx, id, datos.destino || antes.destino, ctx.body.receta);
+    }
     const preciosAntes = await PB.preciosDeProducto(t, ctx, id);
     if (datos.stock_minimo !== undefined || datos.activo !== undefined) await bloquearStockProducto(t, ctx, id);
     const compra = datos.precio_compra !== undefined ? datos.precio_compra : Number(antes.precio_compra || 0);
@@ -327,6 +341,10 @@ async function editarProducto(ctx) {
       await PB.registrarCambioProducto(t, ctx, id, preciosAntes, ctx.body.margenes_boca !== undefined ? "MARGEN_PRODUCTO" : "EDICION_BOCA");
     const despues = await N.obtener(t, ctx, "predio_producto", id);
     const cambios = N.diferencias(antes, despues);
+    if (cambiaReceta) {
+      const recetaDespues = await Porciones.leer(t, ctx, id);
+      if (JSON.stringify(recetaAntes) !== JSON.stringify(recetaDespues)) cambios.receta = { antes: recetaAntes, despues: recetaDespues };
+    }
     if (revisarPrecio) {
       await N.insertar(t, ctx, "predio_precio_historial", {
         producto_id: id, fecha: U.fechaHora(), precio_compra: despues.precio_compra, margen: despues.margen,
@@ -336,10 +354,10 @@ async function editarProducto(ctx) {
     }
     // Ajuste manual de la cantidad en almacén (queda como movimiento "Ajuste manual").
     if (ctx.body.cantidad_almacen !== undefined && ctx.body.cantidad_almacen !== null && ctx.body.cantidad_almacen !== "") {
-      const nueva = U.numero(ctx.body.cantidad_almacen, { min: -9999999, max: 9999999, decimales: 3, campo: "La cantidad en almacén" });
+      const nueva = U.numero(ctx.body.cantidad_almacen, { min: 0, max: 9999999, decimales: 3, campo: "La cantidad en almacén" });
       const almacen = await N.bocaAlmacen(t, ctx);
       if (almacen) {
-        const actual = await N.stockActual(t, ctx, almacen.id, id);
+        const actual = await N.bloquearSaldoStock(t, ctx, almacen.id, id);
         const delta = U.redondear(nueva - actual, 3);
         if (delta) {
           await N.moverStock(t, ctx, {
@@ -582,7 +600,7 @@ async function guardarUsuario(ctx) {
 
 // ------------------------------------------------------------------ configuración
 
-const CLAVES_CONFIG = ["nombre_predio", "razon_social", "cuit", "direccion", "leyenda_ticket", "texto_autorizacion", "vender_sin_stock", "minutos_permiso"];
+const CLAVES_CONFIG = ["nombre_predio", "razon_social", "cuit", "direccion", "leyenda_ticket", "texto_autorizacion", "minutos_permiso"];
 
 async function verConfig(ctx) {
   return { config: await N.leerConfig(ctx.db, ctx) };

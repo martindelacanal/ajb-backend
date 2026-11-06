@@ -7,6 +7,8 @@
 
 const U = require("../util");
 const N = require("../negocio");
+const Porciones = require("../porciones");
+const { bloquearPrecios } = require("../precio-boca");
 const { MOTIVOS_BAJA } = require("../listados");
 const { exigirAdmin, esAdmin, bocasDe, autorizar } = require("./comun");
 
@@ -37,14 +39,29 @@ function leerLineas(body) {
   return [...agrupadas.entries()].map(([producto_id, cantidad]) => ({ producto_id, cantidad }));
 }
 
-async function verificarDisponibles(t, ctx, bocaId, lineas) {
+async function verificarDisponibles(t, ctx, bocaId, lineas, { mover = false } = {}) {
   const faltantes = [];
-  for (const l of lineas) {
+  for (const l of [...lineas].sort((a, b) => a.producto_id - b.producto_id)) {
     const p = await N.exigir(t, ctx, "predio_producto", l.producto_id, "Uno de los productos no existe");
-    const disponible = await N.stockActual(t, ctx, bocaId, l.producto_id);
+    const disponible = mover ? await N.bloquearSaldoStock(t, ctx, bocaId, l.producto_id) : await N.stockActual(t, ctx, bocaId, l.producto_id);
     l.nombre = p.nombre;
-    if (l.cantidad > disponible) faltantes.push({ producto_id: l.producto_id, producto: p.nombre, pedido: l.cantidad, disponible });
+    if (l.cantidad > disponible) faltantes.push({ producto_id: l.producto_id, producto: p.nombre, destino: p.destino, pedido: l.cantidad, disponible });
   }
+  return faltantes;
+}
+
+// Sólo el traspaso de un compuesto físico o de su insumo base admite una
+// diferencia de inventario. El pedido, por sí solo, todavía no mueve stock.
+async function controlarSalida(t, ctx, bocaId, lineas, confirmarCompuesto) {
+  const faltantes = await verificarDisponibles(t, ctx, bocaId, lineas, { mover: true });
+  for (const f of faltantes) {
+    const compuestoFisico = f.destino === "VENTA_COMPUESTA" && !await Porciones.leer(t, ctx, f.producto_id);
+    if (!compuestoFisico && !await Porciones.esInsumo(t, ctx, f.producto_id)) {
+      throw U.error(`Stock insuficiente de «${f.producto}» en el origen: hay ${f.disponible} y se necesitan ${f.pedido}.`, 409, { codigo: "SIN_STOCK", faltantes });
+    }
+  }
+  if (faltantes.length && confirmarCompuesto !== true) throw U.error("El traspaso de estos fraccionables dejará saldo negativo en el origen.", 409,
+    { codigo: "STOCK_INSUFICIENTE", faltantes });
   return faltantes;
 }
 
@@ -101,6 +118,7 @@ async function crearSolicitud(ctx) {
 async function despachar(ctx) {
   const id = U.id(ctx.params.id);
   return ctx.db.tx(async (t) => {
+    if (t.forUpdate) await bloquearPrecios(t, ctx);
     const s = await N.exigir(t, ctx, "predio_solicitud", id, "No encontramos la solicitud", { bloquear: true });
     if (s.estado !== "PENDIENTE") throw U.error("La solicitud ya no está pendiente", 409);
     if (!esAdmin(ctx) && !bocasDe(ctx).includes(Number(s.boca_origen_id))) {
@@ -111,6 +129,7 @@ async function despachar(ctx) {
       cantidad = U.numero(ctx.body.cantidad, { min: 0.001, max: 9999999, decimales: 3, campo: "La cantidad a despachar" });
     }
     const p = await N.exigir(t, ctx, "predio_producto", s.producto_id);
+    const faltantes = await controlarSalida(t, ctx, s.boca_origen_id, [{ producto_id: s.producto_id, cantidad }], ctx.body.confirmar_fraccionado);
     await N.moverStock(t, ctx, {
       bocaId: s.boca_origen_id, productoId: s.producto_id, cantidad: -cantidad, tipo: "TRASPASO_SALIDA",
       referenciaTipo: "solicitud", referenciaId: id, detalle: `Solicitud N° ${id}`,
@@ -118,7 +137,7 @@ async function despachar(ctx) {
     await N.actualizar(t, ctx, "predio_solicitud", id, {
       estado: "DESPACHADA", cantidad, fecha_despacho: U.fechaHora(), usuario_despacho_id: ctx.usuario.id, usuario_despacho: N.nombreActor(ctx),
     });
-    await N.auditar(t, ctx, "Despacho de solicitud", "solicitud", id, { producto: p.nombre, cantidad, pedida: Number(s.cantidad) });
+    await N.auditar(t, ctx, "Despacho de solicitud", "solicitud", id, { producto: p.nombre, cantidad, pedida: Number(s.cantidad), sin_stock: faltantes.length ? faltantes : undefined });
     return { id, mensaje: `Despachaste ${cantidad} × ${p.nombre}` };
   });
 }
@@ -129,11 +148,12 @@ async function recibirInterno(t, ctx, s, { permitirCualquiera = false } = {}) {
     throw U.error("La recibe la boca de destino o un administrador", 403);
   }
   const cantidad = Number(s.cantidad);
-  await N.moverStock(t, ctx, {
+  const recibido = await N.moverStock(t, ctx, {
     bocaId: s.boca_destino_id, productoId: s.producto_id, cantidad, tipo: "TRASPASO_ENTRADA",
     referenciaTipo: "solicitud", referenciaId: s.id, detalle: `Solicitud N° ${s.id}`,
   });
   if (Number(s.baja_automatica)) {
+    if (recibido < cantidad) throw U.error("El consumo automático dejaría stock negativo en la boca de destino. Revisá sus existencias.", 409, { codigo: "SIN_STOCK" });
     await N.insertar(t, ctx, "predio_baja", {
       fecha: U.fechaHora(), boca_id: s.boca_destino_id, producto_id: s.producto_id, cantidad, motivo: "CONSUMO_DESTINO",
       observaciones: `Baja automática al recibir la solicitud N° ${s.id}`, usuario_id: ctx.usuario?.id || null,
@@ -190,11 +210,9 @@ async function traspaso(ctx) {
   const bajaAutomatica = U.bool(b.baja_automatica);
   const observaciones = U.texto(b.observaciones, { max: 255 });
   return ctx.db.tx(async (t) => {
+    if (t.forUpdate) await bloquearPrecios(t, ctx);
     await validarBocas(t, ctx, origenId, destinoId);
-    const faltantes = await verificarDisponibles(t, ctx, origenId, lineas);
-    if (faltantes.length && !b.confirmar_sin_stock) {
-      throw U.error("Hay productos con menos stock que lo que querés mover", 409, { codigo: "STOCK_INSUFICIENTE", faltantes });
-    }
+    const faltantes = await controlarSalida(t, ctx, origenId, lineas, b.confirmar_fraccionado);
     const ahora = U.fechaHora();
     const ids = [];
     let lote = null;
@@ -217,7 +235,7 @@ async function traspaso(ctx) {
       await recibirInterno(t, ctx, s, { permitirCualquiera: true });
       ids.push(id);
     }
-    await N.auditar(t, ctx, "Traspaso directo entre bocas", "solicitud", lote, { origen: origenId, destino: destinoId, lineas, baja_automatica: bajaAutomatica });
+    await N.auditar(t, ctx, "Traspaso directo entre bocas", "solicitud", lote, { origen: origenId, destino: destinoId, lineas, baja_automatica: bajaAutomatica, sin_stock: faltantes.length ? faltantes : undefined });
     return { ids, lote, mensaje: `Traspaso registrado (${ids.length} producto${ids.length === 1 ? "" : "s"})` };
   });
 }
@@ -231,11 +249,11 @@ async function bajar(ctx) {
   const observaciones = U.texto(b.observaciones, { max: 255 });
   if (motivo === "OTROS" && !observaciones) throw U.error("Contá brevemente el motivo en las observaciones");
   return ctx.db.tx(async (t) => {
+    if (t.forUpdate) await bloquearPrecios(t, ctx);
     await N.exigir(t, ctx, "predio_boca", bocaId, "No encontramos la boca");
-    const faltantes = await verificarDisponibles(t, ctx, bocaId, lineas);
-    if (faltantes.length && !b.confirmar_sin_stock) {
-      throw U.error("Estás bajando más de lo que figura en el stock", 409, { codigo: "STOCK_INSUFICIENTE", faltantes });
-    }
+    const faltantes = await verificarDisponibles(t, ctx, bocaId, lineas, { mover: true });
+    if (faltantes.length) throw U.error(`La baja supera el stock de «${faltantes[0].producto}» en esta boca (${faltantes[0].disponible}).`, 409,
+      { codigo: "SIN_STOCK", faltantes });
     const ids = [];
     for (const l of lineas) {
       const id = await N.insertar(t, ctx, "predio_baja", {

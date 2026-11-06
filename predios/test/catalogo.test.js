@@ -116,7 +116,12 @@ test("importa el catálogo y elimina de a uno, varios o por filtro", async () =>
   const sinPrecioVenta = await api("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: milanesa.id, cantidad: 1 }], forma_pago: "QR" } });
   assert.equal(sinPrecioVenta.status, 409);
   assert.equal(sinPrecioVenta.json.codigo, "SIN_PRECIO");
-  await ok("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: desayuno.id, cantidad: 1 }], forma_pago: "QR", confirmar_sin_stock: true } });
+  await ok("PUT", `/productos/${desayuno.id}`, { token: admin, cuerpo: { cantidad_almacen: 1 } });
+  const almacen = opBocas.find(b => b.es_almacen).valor;
+  if (almacen !== proveeduria) await ok("POST", "/traspasos", { token: admin, cuerpo: {
+    boca_origen_id: almacen, boca_destino_id: proveeduria, producto_id: desayuno.id, cantidad: 1,
+  } });
+  await ok("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: desayuno.id, cantidad: 1 }], forma_pago: "QR" } });
 
   // Un cajero no puede eliminar.
   assert.equal((await api("POST", "/productos/eliminar", { token: cajero, cuerpo: { ids: [coca.id] } })).status, 403);
@@ -126,7 +131,7 @@ test("importa el catálogo y elimina de a uno, varios o por filtro", async () =>
   assert.equal(previa.cantidad, 2);
   assert.equal(previa.se_borran, 1);
   assert.equal(previa.se_dan_de_baja, 1);
-  assert.deepEqual(previa.muestra_baja[0].usos, ["ventas"]);
+  assert.deepEqual(previa.muestra_baja[0].usos, almacen === proveeduria ? ["ventas", "movimientos"] : ["ventas", "solicitudes", "movimientos"]);
   const r1 = await ok("POST", "/productos/eliminar", { token: admin, cuerpo: { ids: [desayuno.id, milanesa.id] } });
   assert.equal(r1.eliminados, 1);
   assert.equal(r1.dados_de_baja, 1);

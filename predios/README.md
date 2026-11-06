@@ -166,11 +166,12 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
   «¿No aparece el producto?» permite buscar en todo el catálogo, incluidos los agotados,
   elegir un producto y enviar el aviso en un solo diálogo. La búsqueda habitual de
   ventas exige stock positivo también para productos compuestos y alquileres.
-  El aviso aceptado se verifica al cobrar para no repetir la confirmación del mismo
-  producto y cantidad; se consume con esa venta y no puede reutilizarse en otra.
-  Los servicios, las ventas compuestas y los alquileres conservan su tratamiento sin
-  descuento de unidades. El aviso informa al administrador sin modificar existencias;
-  la configuración que prohíbe vender sin stock sigue vigente.
+  Si el stock disponible resulta insuficiente, la caja mantiene el carrito pendiente y
+  permite avisar al administrador. El cobro se habilita al corregir cantidades o reponer stock.
+  Para vender porciones, en la ficha de la venta compuesta se puede elegir un insumo
+  base e indicar cuántas porciones rinde cada unidad. Distintos tamaños pueden compartir
+  el mismo paquete. Caja registra las porciones vendidas y el consumo estimado del insumo
+  en los movimientos de la boca. Sin insumo configurado descuenta porciones del stock propio.
 - Cada caja conserva su opción «Imprimir comanda». El ticket del cliente y la copia
   completa marcada COMANDA se imprimen en un único trabajo. La opción se sincroniza
   y no afecta a las demás cajas.
@@ -184,6 +185,14 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
   cajas. Antes de confirmarla, se eligen los productos que actualizarán su precio en
   caja. Los demás conservan su costo de referencia y su precio de venta. El costo
   efectivamente pagado queda en la factura, también cuando era una oferta.
+- Con **Recibir como temporal** la mercadería queda disponible en la proveeduría.
+  Desde Compras se pueden corregir cantidades, reemplazar productos y completar
+  la factura definitiva. Cada corrección ajusta sólo la diferencia de stock.
+  Si hay que retirar más de lo que queda en esa boca, se deben revisar primero
+  las ventas y los traspasos.
+- Si la factura redondea al peso, la revisión muestra la diferencia entre los
+  renglones y el total facturado. Los ajustes mayores a cinco centavos requieren
+  confirmación. El comprobante conserva ambos importes.
 - Cada boca puede tener un margen de venta sobre el costo de referencia. En Gestión
   → Productos → Precios por boca se puede fijar un margen especial para ese producto.
   Si faltan ambos márgenes, la caja usa el precio general del producto. El precio
@@ -273,6 +282,10 @@ disponible. Recuperar el archivo no instala servicios ni habilita otro escritor.
 - Solicitud entre bocas: el producto **sale** de la boca de origen (que lo despacha) y **llega** a
   la de destino (que confirma la recepción). El stock baja al despachar y sube al recibir.
   «Dar de baja automáticamente» consume lo recibido en el destino (Limpieza, Cabañas…).
-- Venta directa descuenta stock de la boca; venta compuesta y alquiler no; uso interno no se vende.
+- Los traspasos aceptan fracciones como 0,5. El despacho de un compuesto físico o de un insumo
+  usado por una porción puede dejar stock negativo en el origen con confirmación explícita.
+- La caja comprueba todas las cantidades en la boca del puesto. La venta directa descuenta
+  unidades y la compuesta descuenta porciones o su insumo. El alquiler comprueba disponibilidad
+  y conserva las unidades para el siguiente alquiler.
 - Disponible de un afiliado = límite − consumos con descuento todavía sin liquidar.
 - Clave del día (autorizaciones en la PC de caja): día + mes + año sin ceros, p. ej. 5/11/2026 → `5112026`.

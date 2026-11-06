@@ -115,17 +115,16 @@ test("el intento sin stock avisa a administradores sin modificar stock y funcion
   assert.ok(!(await llamar(cajero, "GET", "/avisos")).notificaciones.some((a) => a.id === aviso.id));
 });
 
-test("confirmar una venta insuficiente emite aviso persistente y no acepta cadenas como confirmación", async (t) => {
+test("un intento bloqueado no genera cobro, movimiento ni aviso automático", async (t) => {
   const { db, cajero, llamar, crear } = await escenario(t);
-  const p = await crear("Venta excepcional", "7790895000430");
-  const cuerpo = { items: [{ producto_id: p.id, cantidad: 1 }], forma_pago: "QR" };
-  await assert.rejects(llamar(cajero, "POST", "/ventas", cuerpo), { status: 409, codigo: "STOCK_INSUFICIENTE" });
-  await assert.rejects(llamar(cajero, "POST", "/ventas", { ...cuerpo, confirmar_sin_stock: "false" }), { status: 409, codigo: "STOCK_INSUFICIENTE" });
-  assert.equal((await db.get("SELECT COUNT(*) AS n FROM predio_aviso")).n, 0);
-  const venta = await llamar(cajero, "POST", "/ventas", { ...cuerpo, confirmar_sin_stock: true });
-  const aviso = await db.get("SELECT * FROM predio_aviso WHERE tipo = 'VENTA_SIN_STOCK'");
-  assert.equal(JSON.parse(aviso.detalle).venta_id, venta.id);
-  assert.equal(JSON.parse(aviso.detalle).faltantes[0].producto_id, p.id);
+  const p = await crear("Venta bloqueada", "7790895000430");
+  for (const confirmar_sin_stock of [false, true, "false"]) {
+    const cuerpo = { items: [{ producto_id: p.id, cantidad: 1 }], forma_pago: "QR", confirmar_sin_stock };
+    await assert.rejects(llamar(cajero, "POST", "/ventas", cuerpo), { status: 409, codigo: "SIN_STOCK" });
+  }
+  for (const tabla of ["predio_venta", "predio_venta_pago", "predio_movimiento", "predio_aviso"]) {
+    assert.equal((await db.get(`SELECT COUNT(*) AS n FROM ${tabla}`)).n, 0);
+  }
 });
 
 test("dos cajas que intentan consumir la última unidad no venden ambas sin advertencia", async (t) => {

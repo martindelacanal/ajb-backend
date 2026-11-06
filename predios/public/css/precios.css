@@ -1,5 +1,6 @@
 .gestion-cabecera { margin-bottom: 10px; }
 .compra-lineas { margin-top: 16px; min-width: 0; }
+.compra-lineas .tabla-desplazable { max-height: 60vh; overflow: auto; }
 .compra-resumen {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(260px, 380px);
@@ -20,6 +21,10 @@
 }
 .compra-oferta .icono { width: 16px; height: 16px; flex: none; }
 .precios-bocas { display: grid; gap: 12px; }
+.stock-del-producto { width: fit-content; max-width: 100%; }
+.stock-del-producto li { display: grid; grid-template-columns: minmax(0, 14ch) minmax(0, auto); justify-content: start; gap: 1rem; }
+.stock-del-producto li > :last-child { text-align: right; }
+.stock-del-producto li span { min-width: 0; overflow-wrap: anywhere; }
 .precio-boca-fila {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(110px, auto);

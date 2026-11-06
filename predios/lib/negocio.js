@@ -104,6 +104,21 @@ async function auditar(t, ctx, accion, entidad, entidadId, detalle) {
   });
 }
 
+async function bloquearSaldoStock(t, ctx, bocaId, productoId) {
+  // Una consulta previa puede ver una instantánea vieja en MySQL. Sólo se usa
+  // para evitar altas innecesarias; el saldo válido sale de la lectura bloqueada.
+  const fila = await t.get("SELECT id FROM predio_stock WHERE predio_id = ? AND boca_id = ? AND producto_id = ?", [ctx.pid, bocaId, productoId]);
+  if (!fila) {
+    const id = await nuevoId(t, "predio_stock", ctx.pid);
+    // Si otra operación creó la fila mientras esperábamos, se conserva su saldo.
+    await t.run(`${t.insertIgnore} INTO predio_stock (predio_id, id, boca_id, producto_id, cantidad, fecha_modificacion) VALUES (?, ?, ?, ?, 0, ?)`,
+      [ctx.pid, id, bocaId, productoId, fechaHora()]);
+  }
+  const actual = await t.get(`SELECT cantidad FROM predio_stock WHERE predio_id = ? AND boca_id = ? AND producto_id = ?${t.forUpdate}`, [ctx.pid, bocaId, productoId]);
+  if (!actual) throw error("No pudimos comprobar el stock del producto. Volvé a intentar.", 409);
+  return Number(actual.cantidad);
+}
+
 async function stockActual(t, ctx, bocaId, productoId) {
   const fila = await t.get(
     "SELECT cantidad FROM predio_stock WHERE predio_id = ? AND boca_id = ? AND producto_id = ?",
@@ -163,12 +178,12 @@ const CONFIG_POR_DEFECTO = {
   direccion: "Miramar, Provincia de Buenos Aires",
   leyenda_ticket: "¡Gracias por tu visita! Comprobante no válido como factura.",
   texto_autorizacion: "Me dirijo a ustedes a efectos de autorizar expresamente a la Asociación Judicial Bonaerense a retener de mi sueldo la suma indicada, en las cuotas detalladas, de acuerdo al sistema de descuento vigente.",
-  vender_sin_stock: "1",
+  vender_sin_stock: "0",
   minutos_permiso: "30",
 };
 
 async function leerConfig(t, ctx) {
-  const filas = await t.all("SELECT clave, valor FROM predio_config WHERE predio_id = ?", [ctx.pid]);
+  const filas = await t.all("SELECT clave, valor FROM predio_config WHERE predio_id = ? AND clave NOT LIKE 'porcion.%' AND clave <> 'vender_sin_stock'", [ctx.pid]);
   const config = { ...CONFIG_POR_DEFECTO };
   for (const f of filas) config[f.clave] = f.valor;
   return config;
@@ -190,6 +205,7 @@ module.exports = {
   diferencias,
   auditar,
   stockActual,
+  bloquearSaldoStock,
   moverStock,
   bocaAlmacen,
   leerConfig,

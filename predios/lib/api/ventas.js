@@ -5,6 +5,7 @@
 
 const U = require("../util");
 const N = require("../negocio");
+const Porciones = require("../porciones");
 const { productoEnBoca, bloquearPrecios } = require("../precio-boca");
 const { emitirAviso } = require("../avisos");
 const { autorizacionDescuento } = require("../autorizacion-descuento");
@@ -12,24 +13,7 @@ const { FORMAS_PAGO } = require("../listados");
 const { esAdmin, bocasDe, exigirPuesto, exigirBoca, autorizar, disponibleAfiliado, turnoDeCaja } = require("./comun");
 
 const FORMAS = FORMAS_PAGO.map((f) => f.valor).filter(f => f !== "DESCUENTO");
-const MOVEDORES_STOCK = ["VENTA_DIRECTA"];
-
-async function stockParaVenta(t, ctx, bocaId, productoId) {
-  // Una consulta previa puede ver una instantánea vieja en MySQL. Sólo se usa
-  // para evitar altas innecesarias; el saldo válido sale de la lectura bloqueada.
-  const fila = await t.get("SELECT id FROM predio_stock WHERE predio_id = ? AND boca_id = ? AND producto_id = ?", [ctx.pid, bocaId, productoId]);
-  if (!fila) {
-    const id = await N.nuevoId(t, "predio_stock", ctx.pid);
-    // Si otra operación creó la fila mientras esperábamos, se conserva su saldo.
-    await t.run(`${t.insertIgnore} INTO predio_stock (predio_id, id, boca_id, producto_id, cantidad, fecha_modificacion) VALUES (?, ?, ?, ?, 0, ?)`,
-      [ctx.pid, id, bocaId, productoId, U.fechaHora()]);
-  }
-  const actual = await t.get(`SELECT cantidad FROM predio_stock WHERE predio_id = ? AND boca_id = ? AND producto_id = ?${t.forUpdate}`, [ctx.pid, bocaId, productoId]);
-  if (!actual) throw U.error("No pudimos comprobar el stock del producto. Volvé a intentar.", 409);
-  return Number(actual.cantidad);
-}
-
-async function avisarFaltante(t, ctx, { producto, busqueda, cantidad, stock, ventaId = null, faltantes = null }) {
+async function avisarFaltante(t, ctx, { producto, busqueda, cantidad, stock }) {
   const puesto = exigirPuesto(ctx);
   const caja = await N.exigir(t, ctx, "predio_caja", puesto.caja_id, "La caja ya no existe");
   if (!Number(caja.activo) || Number(caja.boca_id) !== Number(puesto.boca_id)) throw U.error("Elegí nuevamente la boca y la caja", 409, { codigo: "SIN_PUESTO" });
@@ -40,18 +24,11 @@ async function avisarFaltante(t, ctx, { producto, busqueda, cantidad, stock, ven
     usuario_id: ctx.usuario.id, usuario: N.nombreActor(ctx), producto_id: producto?.id || null,
     producto: producto?.nombre || null, codigo: producto?.codigo || null,
     busqueda: busqueda || producto?.codigo || producto?.nombre || null,
-    cantidad: cantidad || null, stock: stock ?? null, venta_id: ventaId, faltantes,
+    cantidad: cantidad || null, stock: stock ?? null,
   };
-  let mensaje = ventaId
-    ? `${N.nombreActor(ctx)} registró la venta N° ${ventaId} con stock insuficiente en ${boca.nombre} · ${caja.nombre}, el ${fecha}. Revisá los movimientos de stock.`
-    : `${N.nombreActor(ctx)} intentó vender «${producto?.nombre || busqueda}» sin stock registrado suficiente en ${boca.nombre} · ${caja.nombre}, el ${fecha}. Revisá los movimientos de stock.`;
-  if (ventaId && faltantes?.length) {
-    mensaje += " Productos: " + faltantes.map((f) => `«${f.producto}»: solicitado ${f.pedido}, stock ${f.disponible}`).join("; ") + ".";
-  }
-  const id = await emitirAviso(t, ctx, {
-    tipo: "VENTA_SIN_STOCK", titulo: ventaId ? "Venta con stock insuficiente" : "Intento de venta sin stock", mensaje, detalle,
-  });
-  await N.auditar(t, ctx, ventaId ? "Aviso de venta con stock insuficiente" : "Intento de venta de producto sin stock", "producto", producto?.id || null, detalle);
+  const mensaje = `${N.nombreActor(ctx)} intentó vender «${producto?.nombre || busqueda}» sin stock suficiente en ${boca.nombre} · ${caja.nombre}. Revisá los movimientos de stock.`;
+  const id = await emitirAviso(t, ctx, { tipo: "VENTA_SIN_STOCK", titulo: "Intento de venta sin stock", mensaje, detalle });
+  await N.auditar(t, ctx, "Intento de venta de producto sin stock", "producto", producto?.id || null, detalle);
   return id;
 }
 
@@ -61,45 +38,24 @@ async function avisarSinStock(ctx) {
   if (ctx.body.confirmar !== true) throw U.error("Aceptá el aviso para informar al administrador");
   const productoId = ctx.body.producto_id ? U.id(ctx.body.producto_id, "El producto") : null;
   const busqueda = U.texto(ctx.body.busqueda, { max: 160, requerido: !productoId, campo: "El producto o código buscado" });
-  const cantidad = U.numero(ctx.body.cantidad ?? 1, { min: 0.001, max: 99999, decimales: 3, campo: "La cantidad" });
+  const cantidad = U.numero(ctx.body.cantidad ?? 1, { min: 0.001, max: 200 * 99999, decimales: 3, campo: "La cantidad" });
   return ctx.db.tx(async (t) => {
     let producto = null;
     let stock = null;
     if (productoId) {
       producto = await productoEnBoca(t, ctx, productoId, puesto.boca_id);
       if (!producto) throw U.error("No encontramos el producto", 404);
-      if (!Number(producto.activo) || producto.destino === "USO_INTERNO") throw U.error("Este producto no se puede vender", 409, { codigo: "PRODUCTO_NO_VENDIBLE" });
-      stock = await N.stockActual(t, ctx, puesto.boca_id, productoId);
+      const avisoInsumo = ctx.body.insumo === true && await Porciones.esInsumo(t, ctx, productoId);
+      if ((!Number(producto.activo) || producto.destino === "USO_INTERNO") && !avisoInsumo) throw U.error("Este producto no se puede vender", 409, { codigo: "PRODUCTO_NO_VENDIBLE" });
+      const receta = producto.destino === "VENTA_COMPUESTA" ? await Porciones.leer(t, ctx, productoId) : null;
+      stock = await N.stockActual(t, ctx, puesto.boca_id, receta?.insumo_id || productoId);
+      if (receta) stock = Number(receta.activo) && stock > 0 ? Porciones.disponibles(stock, receta.rendimiento) : 0;
+      if (!Number(producto.activo)) stock = 0;
       if (stock >= cantidad) throw U.error("El producto ya tiene stock suficiente. Volvé a buscarlo en la lista de ventas.", 409, { codigo: "STOCK_DISPONIBLE" });
     }
     const id = await avisarFaltante(t, ctx, { producto, busqueda, cantidad, stock });
-    const config = await N.leerConfig(t, ctx);
-    return { id, puede_vender: Number(producto?.precio_caja || 0) > 0 && config.vender_sin_stock !== "0", mensaje: "El aviso quedó registrado para el administrador. Si no hay internet, se enviará al sistema general al sincronizar." };
+    return { id, puede_vender: false, mensaje: "El aviso quedó registrado para el administrador. Si no hay internet, se enviará al sistema general al sincronizar." };
   });
-}
-
-async function avisosAceptados(t, ctx, cantidades, pedidos) {
-  const salida = new Map();
-  if (!Array.isArray(pedidos)) return salida;
-  if (pedidos.length > 200) throw U.error("La venta incluye demasiados avisos de stock");
-  const candidatos = pedidos.map((p) => ({ id: Number(p?.id), productoId: Number(p?.producto_id) }))
-    .filter((p) => Number.isSafeInteger(p.id) && p.id > 0 && cantidades.has(p.productoId))
-    .sort((a, b) => a.id - b.id);
-  const vistos = new Set();
-  for (const p of candidatos) {
-    if (vistos.has(p.id)) continue;
-    vistos.add(p.id);
-    const aviso = await t.get(`SELECT id, tipo, detalle FROM predio_aviso WHERE predio_id = ? AND id = ?${t.forUpdate}`, [ctx.pid, p.id]);
-    if (!aviso || aviso.tipo !== "VENTA_SIN_STOCK") continue;
-    let d;
-    try { d = JSON.parse(aviso.detalle || "null"); } catch (_e) { continue; }
-    if (!d || d.venta_id || d.consumido_venta_id || Number(d.usuario_id) !== Number(ctx.usuario.id)
-      || Number(d.boca_id) !== Number(ctx.sesion.boca_id) || Number(d.caja_id) !== Number(ctx.sesion.caja_id)
-      || Number(d.producto_id) !== p.productoId || !Number.isFinite(Number(d.cantidad))
-      || Number(d.cantidad) < cantidades.get(p.productoId)) continue;
-    if (!salida.has(p.productoId)) salida.set(p.productoId, { id: aviso.id, detalle: d });
-  }
-  return salida;
 }
 
 async function datosTicket(db, ctx, ventaId) {
@@ -144,7 +100,7 @@ function puedeVerVenta(ctx, v) {
 function reciboVenta(ctx, puesto, body) {
   if (body.operacion === undefined) return null;
   if (!/^[a-zA-Z0-9_-]{16,64}$/.test(body.operacion)) throw U.error("El identificador de la venta no es válido.");
-  // El aviso de falta de stock puede requerir un segundo envío confirmado.
+  // La huella sigue reconociendo reintentos de clientes anteriores.
   const { confirmar_sin_stock, ...pedido } = body;
   return {
     clave: "venta:" + U.sha256(body.operacion).slice(0, 58),
@@ -199,19 +155,17 @@ async function crearVenta(ctx) {
     const caja = await N.exigir(t, ctx, "predio_caja", puesto.caja_id, "La caja ya no existe");
     if (!Number(caja.activo)) throw U.error("La caja está deshabilitada", 409);
     if (Number(caja.boca_id) !== Number(puesto.boca_id)) throw U.error("Elegí nuevamente la boca y la caja", 409, { codigo: "SIN_PUESTO" });
-    const config = await N.leerConfig(t, ctx);
     const lineas = [];
     const preciosCambiaron = [];
     const faltantes = [];
     const productos = new Map();
-    const stocks = new Map();
+    const requeridos = new Map();
     // Todas las cajas bloquean los productos en el mismo orden. Se conserva el
     // orden del carrito para el ticket y se evitan bloqueos cruzados entre cajas.
     for (const productoId of [...agrupados.keys()].sort((a, b) => a - b)) {
       const p = await productoEnBoca(t, ctx, productoId, caja.boca_id, { bloquear: true });
       if (!p) throw U.error("Uno de los productos no existe", 404);
       productos.set(productoId, p);
-      if (p.destino !== "USO_INTERNO") stocks.set(productoId, await stockParaVenta(t, ctx, caja.boca_id, productoId));
     }
     for (const [productoId, cantidad] of agrupados) {
       const p = productos.get(productoId);
@@ -221,24 +175,33 @@ async function crearVenta(ctx) {
       if (preciosEsperados.has(productoId) && preciosEsperados.get(productoId) !== precio)
         preciosCambiaron.push({ producto_id: productoId, precio_venta: precio });
       if (precio <= 0) throw U.error(`«${p.nombre}» no tiene precio de venta: pedile al administrador que lo cargue`, 409, { codigo: "SIN_PRECIO" });
-      const stock = stocks.get(productoId);
-      if (MOVEDORES_STOCK.includes(p.destino) ? stock < cantidad : stock <= 0) {
-        faltantes.push({ producto_id: productoId, producto: p.nombre, pedido: cantidad, disponible: stock });
+      const receta = p.destino === "VENTA_COMPUESTA" ? await Porciones.leer(t, ctx, productoId) : null;
+      if (receta && !Number.isInteger(cantidad)) throw U.error(`Ingresá una cantidad entera de porciones para «${p.nombre}».`);
+      const stockId = Number(receta?.insumo_id || productoId);
+      const linea = { producto: p, cantidad, precio, stockId, rendimiento: receta?.rendimiento, subtotal: U.redondear(precio * cantidad, 2) };
+      lineas.push(linea);
+      const grupo = requeridos.get(stockId) || { producto: receta?.nombre || p.nombre, lineas: [] };
+      grupo.lineas.push(linea);
+      if (receta) {
+        grupo.insumo = true;
+        grupo.inactivo = !Number(receta.activo);
       }
-      lineas.push({ producto: p, cantidad, precio, subtotal: U.redondear(precio * cantidad, 2) });
+      requeridos.set(stockId, grupo);
     }
     if (preciosCambiaron.length) throw U.error("Cambiaron precios del carrito. Revisá el total antes de cobrar.", 409,
       { codigo: "PRECIOS_CAMBIARON", precios: preciosCambiaron });
-    const avisosPrevios = await avisosAceptados(t, ctx, agrupados, b.avisos_sin_stock);
-    const sinAviso = faltantes.filter((f) => !avisosPrevios.has(f.producto_id));
-    if (faltantes.length) {
-      if (config.vender_sin_stock === "0") {
-        throw U.error(`No hay stock suficiente de «${faltantes[0].producto}» en esta boca`, 409, { codigo: "SIN_STOCK", faltantes });
+    for (const stockId of [...requeridos.keys()].sort((a, b) => a - b)) {
+      const grupo = requeridos.get(stockId);
+      const saldo = await N.bloquearSaldoStock(t, ctx, caja.boca_id, stockId);
+      const disponible = grupo.inactivo ? 0 : saldo;
+      let pedido = 0;
+      for (const linea of grupo.lineas) {
+        linea.consumo = linea.rendimiento ? Porciones.consumo(U.redondear(disponible - pedido, 3), linea.rendimiento, linea.cantidad) : linea.cantidad;
+        pedido = U.redondear(pedido + linea.consumo, 3);
       }
-      if (sinAviso.length && b.confirmar_sin_stock !== true && b.confirmar_sin_stock !== 1) {
-        throw U.error("Hay productos que figuran sin stock suficiente en esta boca", 409, { codigo: "STOCK_INSUFICIENTE", faltantes: sinAviso });
-      }
+      if (pedido > disponible) faltantes.push({ producto_id: stockId, producto: grupo.producto, insumo: grupo.insumo, pedido, disponible });
     }
+    if (faltantes.length) throw U.error(`No hay stock suficiente de «${faltantes[0].producto}» en esta boca`, 409, { codigo: "SIN_STOCK", faltantes });
     const total = U.redondear(lineas.reduce((s, l) => s + l.subtotal, 0), 2);
     if (total <= 0 && forma !== "EFECTIVO") throw U.error("El total de la venta tiene que ser mayor que cero");
 
@@ -288,10 +251,11 @@ async function crearVenta(ctx) {
         venta_id: ventaId, producto_id: l.producto.id, descripcion: l.producto.nombre, codigo: l.producto.codigo,
         cantidad: l.cantidad, precio_unitario: l.precio, subtotal: l.subtotal, destino: l.producto.destino,
       });
-      if (MOVEDORES_STOCK.includes(l.producto.destino)) {
+      if (l.producto.destino !== "ALQUILER") {
         await N.moverStock(t, ctx, {
-          bocaId: caja.boca_id, productoId: l.producto.id, cantidad: -l.cantidad, tipo: "VENTA",
-          referenciaTipo: "venta", referenciaId: ventaId, detalle: `Venta N° ${ventaId}`,
+          bocaId: caja.boca_id, productoId: l.stockId, cantidad: -l.consumo, tipo: "VENTA",
+          referenciaTipo: "venta", referenciaId: ventaId, motivo: l.stockId !== l.producto.id ? "CONSUMO_ESTIMADO" : null,
+          detalle: l.stockId !== l.producto.id ? `Venta N° ${ventaId} · ${l.cantidad} × ${l.producto.nombre} (consumo estimado)` : `Venta N° ${ventaId}`,
         });
       }
     }
@@ -300,15 +264,6 @@ async function crearVenta(ctx) {
         caja_id: caja.id, boca_id: caja.boca_id, fecha: ahora, concepto: "VENTA", tipo: "INGRESO", importe: efectivo,
         observaciones: `Venta N° ${ventaId}`, venta_id: ventaId, turno_id: puesto.turno_id || null,
         usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
-      });
-    }
-    if (faltantes.length) {
-      await N.auditar(t, ctx, "Venta sin stock suficiente", "venta", ventaId, { faltantes, avisos_aceptados: [...avisosPrevios.values()].map((a) => a.id) });
-      if (sinAviso.length) await avisarFaltante(t, ctx, { ventaId, faltantes: sinAviso });
-    }
-    for (const aviso of avisosPrevios.values()) {
-      await N.actualizar(t, ctx, "predio_aviso", aviso.id, {
-        detalle: JSON.stringify({ ...aviso.detalle, consumido_venta_id: ventaId, consumido_fecha: ahora }),
       });
     }
     const respuesta = { id: ventaId, total, vuelto, mensaje: `Venta N° ${ventaId} registrada` };
@@ -357,14 +312,15 @@ async function anularVenta(ctx) {
     const autorizacion = await autorizar(t, ctx, "ANULAR_VENTA", {
       clave: b.clave, permisoId: b.permiso_id, referenciaId: id, detalle: `Venta N° ${id} por ${U.pesos(v.total)}`,
     });
-    const items = await t.all("SELECT * FROM predio_venta_item WHERE predio_id = ? AND venta_id = ?", [ctx.pid, id]);
-    for (const it of items) {
-      if (MOVEDORES_STOCK.includes(it.destino)) {
-        await N.moverStock(t, ctx, {
-          bocaId: v.boca_id, productoId: it.producto_id, cantidad: Number(it.cantidad), tipo: "ANULACION_VENTA",
-          referenciaTipo: "venta", referenciaId: id, detalle: `Anulación de la venta N° ${id}`,
-        });
-      }
+    // Las porciones pueden cambiar de rendimiento después de cobrarse. El kardex
+    // conserva tanto el insumo como la cantidad exacta que salió en esa venta.
+    const movimientos = await t.all(`SELECT producto_id, cantidad FROM predio_movimiento
+      WHERE predio_id = ? AND boca_id = ? AND referencia_tipo = 'venta' AND referencia_id = ? AND tipo = 'VENTA' ORDER BY producto_id,id`, [ctx.pid, v.boca_id, id]);
+    for (const mov of movimientos) {
+      await N.moverStock(t, ctx, {
+        bocaId: v.boca_id, productoId: mov.producto_id, cantidad: -Number(mov.cantidad), tipo: "ANULACION_VENTA",
+        referenciaTipo: "venta", referenciaId: id, detalle: `Anulación de la venta N° ${id}`,
+      });
     }
     const pagos=await t.all("SELECT * FROM predio_venta_pago WHERE predio_id=? AND venta_id=?",[ctx.pid,id]);
     const efectivo=pagos.length?Number(pagos.find(p=>p.forma==="EFECTIVO")?.importe||0):(v.forma_pago==="EFECTIVO"?Number(v.total):0);

@@ -6,6 +6,8 @@
 
 const U = require("../util");
 const N = require("../negocio");
+const Porciones = require("../porciones");
+const { bloquearPrecios } = require("../precio-boca");
 const { construirWhere, LISTADOS, traducir } = require("../listados");
 const { exigirAdmin } = require("./comun");
 
@@ -22,6 +24,7 @@ const ENTIDADES = {
     plural: "productos",
     // Si aparece en alguna de estas tablas, se da de baja en lugar de borrarse.
     usos: [
+      { tabla: "predio_config", col: "valor", texto: "porciones", extra: "AND clave LIKE 'porcion.insumo.%'" },
       { tabla: "predio_venta_item", col: "producto_id", texto: "ventas" },
       { tabla: "predio_compra_item", col: "producto_id", texto: "compras" },
       { tabla: "predio_solicitud", col: "producto_id", texto: "solicitudes" },
@@ -152,9 +155,11 @@ function eliminar(clave) {
   return async (ctx) => {
     exigirAdmin(ctx);
     return ctx.db.tx(async (t) => {
+      if (clave === "productos") await bloquearPrecios(t, ctx);
       const filas = await elegidos(t, ctx, clave);
       const c = await clasificar(t, ctx, clave, filas);
       for (const l of lotes(c.borrar.map((f) => f.id))) {
+        if (clave === "productos") await Porciones.quitar(t, ctx, l);
         for (const d of ent.dependientes) {
           await t.run(`DELETE FROM ${d.tabla} WHERE predio_id = ? AND ${d.col} IN (${marcas(l.length)})`, [ctx.pid, ...l]);
         }

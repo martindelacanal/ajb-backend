@@ -103,7 +103,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
   async function pedir(metodo, ruta, { cuerpo, binario = false, timeout = 20000, crudo = false } = {}) {
     const url = `${String(config.servidor).replace(/\/+$/, "")}/predios-sync${ruta}`;
     const cabeceras = { Authorization: `Bearer ${config.token}`, "X-Predio": String(config.predio_codigo || ""), "X-Predio-Instancia": instancia, "X-Predio-Equipo": equipoId };
-    cabeceras["X-Predio-Capacidades"] = "cuentas-predio-v1,precios-boca-v1";
+    cabeceras["X-Predio-Capacidades"] = "cuentas-predio-v1,precios-boca-v1,stock-predio-v2";
     if (!/^\/(?:version|codigo)(?:\?|$)/.test(ruta)) {
       if (!puedeSincronizar()) throw U.error("Esta PC está en espera: sólo el servidor actual sincroniza con el sistema general", 503);
       if (grupoLocal().habilitado) {
@@ -560,7 +560,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
       estado.maestros = { ...resumen.maestros, fecha: U.fechaHora(), afiliados: (datos.maestros.afiliados || []).length };
       await guardarMeta("maestros_resumen", JSON.stringify(estado.maestros));
     }
-    for (const c of [...(datos.comandos || []), ...(datos.comandos_precios || [])].sort((a, b) => a.id - b.id)) {
+    for (const c of [...(datos.comandos || []), ...(datos.comandos_precios || []), ...(datos.comandos_stock || [])].sort((a, b) => a.id - b.id)) {
       const r = await ejecutarComando(c);
       resumen.comandos++;
       if (!r.ok) resumen.errores++;

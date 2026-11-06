@@ -62,68 +62,115 @@ test("el selector de aviso permite buscar todo activo y muestra stock/precio sin
   await assert.rejects(llamar(cajero, "GET", "/productos/buscar", {}, { contexto: "aviso", boca_id: "999" }), { status: 403 });
 });
 
-test("compuestas y alquileres agotados se diagnostican y requieren aviso/configuración sin consumir su stock", async (t) => {
+test("el aviso y las banderas de clientes anteriores nunca habilitan cobrar sin stock", async (t) => {
   const { db, admin, cajero, boca, crear, llamar } = await datos(t);
-  for (const [destino, codigo] of [["VENTA_COMPUESTA", "7790895067556"], ["ALQUILER", "7790895000430"]]) {
-    const p = await crear(destino, destino, 0, 1000, codigo);
-    assert.equal((await llamar(cajero, "GET", "/productos/consultar-codigo", {}, { codigo })).estado, "SIN_STOCK");
-    assert.deepEqual(await llamar(cajero, "GET", "/productos/buscar", {}, { venta: "1", q: codigo }), []);
-    const cuerpo = { items: [{ producto_id: p.id, cantidad: 2 }], forma_pago: "QR" };
-    await assert.rejects(llamar(cajero, "POST", "/ventas", cuerpo), { codigo: "STOCK_INSUFICIENTE" });
-    const aviso = await llamar(cajero, "POST", "/ventas/avisar-sin-stock", { producto_id: p.id, confirmar: true });
-    assert.equal(aviso.puede_vender, true);
-    await llamar(cajero, "POST", "/ventas", { ...cuerpo, confirmar_sin_stock: true });
+  await db.tx(tx => N.guardarConfig(tx, admin, "vender_sin_stock", "1"));
+  for (const destino of ["VENTA_DIRECTA", "VENTA_COMPUESTA", "ALQUILER"]) {
+    const p = await crear(destino, destino, 0);
+    const aviso = await llamar(cajero, "POST", "/ventas/avisar-sin-stock", { producto_id: p.id, cantidad: 2, confirmar: true });
+    assert.equal(aviso.puede_vender, false);
+    const cuerpo = { items: [{ producto_id: p.id, cantidad: 2 }], forma_pago: "QR", confirmar_sin_stock: true, avisos_sin_stock: [{ id: aviso.id, producto_id: p.id }] };
+    await assert.rejects(llamar(cajero, "POST", "/ventas", cuerpo), { codigo: "SIN_STOCK" });
     assert.equal(await N.stockActual(db, admin, boca.id, p.id), 0);
-    assert.equal((await db.get("SELECT COUNT(*) AS n FROM predio_movimiento WHERE producto_id = ? AND tipo = 'VENTA'", [p.id])).n, 0);
+    assert.equal((await db.get("SELECT COUNT(*) AS n FROM predio_venta")).n, 0);
   }
-  const sinPrecio = await crear("ALQUILER", "Alquiler sin precio", 0, 0);
-  assert.equal((await llamar(cajero, "POST", "/ventas/avisar-sin-stock", { producto_id: sinPrecio.id, confirmar: true })).puede_vender, false);
   const interno = await crear("USO_INTERNO", "No vendible", 0);
   await assert.rejects(llamar(cajero, "POST", "/ventas/avisar-sin-stock", { producto_id: interno.id, confirmar: true }), { codigo: "PRODUCTO_NO_VENDIBLE" });
-  await db.tx((tx) => N.guardarConfig(tx, admin, "vender_sin_stock", "0"));
-  assert.equal((await llamar(cajero, "POST", "/ventas/avisar-sin-stock", { producto_id: sinPrecio.id, confirmar: true })).puede_vender, false);
-  const bloqueado = await crear("VENTA_COMPUESTA", "No vender agotado", 0);
-  await assert.rejects(llamar(cajero, "POST", "/ventas", { items: [{ producto_id: bloqueado.id, cantidad: 1 }], forma_pago: "QR", confirmar_sin_stock: true }), { codigo: "SIN_STOCK" });
 });
 
-test("un aviso ya aceptado permite cobrar la misma cantidad sin otra confirmación ni aviso duplicado y se consume", async (t) => {
-  const { db, cajero, crear, llamar } = await datos(t);
-  const p = await crear("VENTA_DIRECTA", "Agotado aceptado", 0);
-  const aviso = await llamar(cajero, "POST", "/ventas/avisar-sin-stock", { producto_id: p.id, cantidad: 1, confirmar: true });
-  const cuerpo = { items: [{ producto_id: p.id, cantidad: 1 }], forma_pago: "QR", avisos_sin_stock: [{ id: aviso.id, producto_id: p.id }] };
-  await assert.rejects(llamar(cajero, "POST", "/ventas", { ...cuerpo, items: [{ producto_id: p.id, cantidad: 2 }], avisos_sin_stock: [{ id: aviso.id, producto_id: p.id, cantidad: 999 }] }), { codigo: "STOCK_INSUFICIENTE" });
-  await assert.rejects(llamar(cajero, "POST", "/ventas", { ...cuerpo, forma_pago: "EFECTIVO", recibido: 0 }), { status: 400 });
-  assert.equal(JSON.parse((await db.get("SELECT detalle FROM predio_aviso WHERE id = ?", [aviso.id])).detalle).consumido_venta_id, undefined);
-  const venta = await llamar(cajero, "POST", "/ventas", cuerpo);
-  assert.equal(JSON.parse((await db.get("SELECT detalle FROM predio_aviso WHERE id = ?", [aviso.id])).detalle).consumido_venta_id, venta.id);
-  assert.equal((await db.get("SELECT COUNT(*) AS n FROM predio_aviso WHERE tipo = 'VENTA_SIN_STOCK'")).n, 1);
-  await assert.rejects(llamar(cajero, "POST", "/ventas", cuerpo), { codigo: "STOCK_INSUFICIENTE" });
-});
-
-test("el aviso no sirve a otro usuario, caja o producto y no evita la configuración que prohíbe vender sin stock", async (t) => {
+test("dos tamaños vendidos juntos descuentan su consumo estimado del mismo paquete de la boca", async t => {
   const { db, admin, cajero, boca, crear, llamar } = await datos(t);
-  const p = await crear("ALQUILER", "Alquiler aceptado", 0);
-  const otroProducto = await crear("ALQUILER", "Otro alquiler", 0);
-  const aviso = await llamar(cajero, "POST", "/ventas/avisar-sin-stock", { producto_id: p.id, confirmar: true });
-  const cuerpo = { items: [{ producto_id: p.id, cantidad: 1 }], forma_pago: "QR", avisos_sin_stock: [{ id: aviso.id, producto_id: p.id }] };
-  await assert.rejects(llamar({ ...cajero, usuario: { ...cajero.usuario, id: 3 } }, "POST", "/ventas", cuerpo), { codigo: "STOCK_INSUFICIENTE" });
-  const otraCaja = await db.get("SELECT id FROM predio_caja WHERE boca_id = ? AND id <> ? LIMIT 1", [boca.id, cajero.sesion.caja_id]);
-  await assert.rejects(llamar({ ...cajero, sesion: { ...cajero.sesion, caja_id: otraCaja.id } }, "POST", "/ventas", cuerpo), { codigo: "STOCK_INSUFICIENTE" });
-  await assert.rejects(llamar(cajero, "POST", "/ventas", { ...cuerpo, items: [{ producto_id: otroProducto.id, cantidad: 1 }], avisos_sin_stock: [{ id: aviso.id, producto_id: otroProducto.id }] }), { codigo: "STOCK_INSUFICIENTE" });
-  await db.tx((tx) => N.guardarConfig(tx, admin, "vender_sin_stock", "0"));
-  await assert.rejects(llamar(cajero, "POST", "/ventas", cuerpo), { codigo: "SIN_STOCK" });
+  const paquete = await crear("USO_INTERNO", "Paquete de café", 0.1);
+  const chico = await crear("VENTA_COMPUESTA", "Café chico", 0, 1000, "7790895067556");
+  const grande = await crear("VENTA_COMPUESTA", "Café grande", 0);
+  for (const [p, rendimiento] of [[chico, 40], [grande, 20]]) {
+    await llamar(admin, "PUT", "/productos/" + p.id, { receta: { insumo_id: paquete.id, rendimiento } });
+  }
+  assert.equal((await llamar(cajero, "GET", "/productos/consultar-codigo", {}, { codigo: "7790895067556" })).producto.stock_boca, 4);
+  const porciones = await llamar(cajero, "GET", "/productos/buscar", {}, { q: "Café", venta: "1" });
+  assert.equal(porciones.find(p => p.id === grande.id).stock_boca, 2);
+  const intento = { items: [{ producto_id: chico.id, cantidad: 3 }, { producto_id: grande.id, cantidad: 1 }], forma_pago: "QR" };
+  await assert.rejects(llamar(cajero, "POST", "/ventas", intento), e => e.codigo === "SIN_STOCK" && e.faltantes[0].pedido === 0.125 && e.faltantes[0].producto_id === paquete.id);
+  const aviso = await llamar(cajero, "POST", "/ventas/avisar-sin-stock", { producto_id: paquete.id, cantidad: 0.125, insumo: true, confirmar: true });
+  assert.equal(aviso.puede_vender, false);
+  const venta = await llamar(cajero, "POST", "/ventas", { ...intento, items: [{ producto_id: chico.id, cantidad: 2 }, { producto_id: grande.id, cantidad: 1 }] });
+  assert.equal(await N.stockActual(db, admin, boca.id, paquete.id), 0);
+  assert.equal(venta.ticket.items.length, 2);
+  assert.equal((await db.get("SELECT SUM(cantidad) AS consumo FROM predio_movimiento WHERE tipo = 'VENTA' AND motivo = 'CONSUMO_ESTIMADO' AND referencia_id = ?", [venta.id])).consumo, -0.1);
+  assert.deepEqual(await llamar(cajero, "GET", "/productos/buscar", {}, { venta: "1", q: "Café" }), []);
+  await llamar(admin, "PUT", "/productos/" + chico.id, { receta: { insumo_id: paquete.id, rendimiento: 10 } });
+  await llamar(admin, "POST", "/ventas/" + venta.id + "/anular", { motivo: "Pedido duplicado" });
+  assert.equal(await N.stockActual(db, admin, boca.id, paquete.id), 0.1);
 });
 
-test("una venta mixta sólo vuelve a confirmar los faltantes que no estaban cubiertos", async (t) => {
-  const { db, cajero, crear, llamar } = await datos(t);
-  const a = await crear("VENTA_COMPUESTA", "Compuesto aceptado", 0);
-  const b = await crear("VENTA_COMPUESTA", "Compuesto nuevo", 0);
-  const aviso = await llamar(cajero, "POST", "/ventas/avisar-sin-stock", { producto_id: a.id, confirmar: true });
-  const cuerpo = { items: [{ producto_id: a.id, cantidad: 1 }, { producto_id: b.id, cantidad: 1 }], forma_pago: "QR", avisos_sin_stock: [{ id: aviso.id, producto_id: a.id }] };
-  await assert.rejects(llamar(cajero, "POST", "/ventas", cuerpo), (e) => e.codigo === "STOCK_INSUFICIENTE" && e.faltantes.length === 1 && e.faltantes[0].producto_id === b.id);
-  await llamar(cajero, "POST", "/ventas", { ...cuerpo, confirmar_sin_stock: true });
-  const avisos = await db.all("SELECT detalle FROM predio_aviso WHERE tipo = 'VENTA_SIN_STOCK' ORDER BY id");
-  assert.equal(avisos.length, 2);
-  assert.equal(JSON.parse(avisos[1].detalle).faltantes.length, 1);
-  assert.equal(JSON.parse(avisos[1].detalle).faltantes[0].producto_id, b.id);
+test("los compuestos sin receta usan porciones propias y los alquileres exigen la cantidad disponible", async t => {
+  const { db, admin, cajero, boca, crear, llamar } = await datos(t);
+  for (const destino of ["VENTA_COMPUESTA", "ALQUILER"]) {
+    const p = await crear(destino, destino, 2);
+    const cobrar = cantidad => llamar(cajero, "POST", "/ventas", { items: [{ producto_id: p.id, cantidad }], forma_pago: "QR" });
+    await assert.rejects(cobrar(3), { codigo: "SIN_STOCK" });
+    const venta = await cobrar(2);
+    assert.equal(await N.stockActual(db, admin, boca.id, p.id), destino === "ALQUILER" ? 2 : 0);
+    await llamar(admin, "POST", "/ventas/" + venta.id + "/anular", { motivo: "Revertir prueba" });
+    assert.equal(await N.stockActual(db, admin, boca.id, p.id), 2);
+  }
+});
+
+test("únicamente el traspaso fraccionable confirmado puede dejar su origen en negativo", async t => {
+  const { db, admin, boca, crear, llamar } = await datos(t);
+  const destino = await db.get("SELECT id FROM predio_boca WHERE id <> ? AND es_destino = 1 LIMIT 1", [boca.id]);
+  const queso = await crear("USO_INTERNO", "Queso por pieza", 0);
+  const porcion = await crear("VENTA_COMPUESTA", "Porción de queso", 0);
+  await llamar(admin, "PUT", "/productos/" + porcion.id, { receta: { insumo_id: queso.id, rendimiento: 8 } });
+  const comun = await crear("VENTA_DIRECTA", "Gaseosa", 0);
+  const cuerpo = producto_id => ({ boca_origen_id: boca.id, boca_destino_id: destino.id, lineas: [{ producto_id, cantidad: 0.5 }] });
+  await assert.rejects(llamar(admin, "POST", "/traspasos", { ...cuerpo(comun.id), confirmar_fraccionado: true }), { codigo: "SIN_STOCK" });
+  await assert.rejects(llamar(admin, "POST", "/traspasos", { ...cuerpo(queso.id), confirmar_sin_stock: true }), { codigo: "STOCK_INSUFICIENTE" });
+  await llamar(admin, "POST", "/traspasos", { ...cuerpo(queso.id), confirmar_fraccionado: true });
+  assert.equal(await N.stockActual(db, admin, boca.id, queso.id), -0.5);
+  assert.equal(await N.stockActual(db, admin, destino.id, queso.id), 0.5);
+  await assert.rejects(llamar(admin, "POST", "/bajas", { boca_id: boca.id, producto_id: queso.id, cantidad: 1, motivo: "VENCIMIENTO", confirmar_sin_stock: true }), { codigo: "SIN_STOCK" });
+  const solicitud = await llamar(admin, "POST", "/solicitudes", { ...cuerpo(comun.id), confirmar_sin_stock: true });
+  await assert.rejects(llamar(admin, "POST", "/solicitudes/" + solicitud.ids[0] + "/despachar", { confirmar_fraccionado: true }), { codigo: "SIN_STOCK" });
+  const s = await llamar(admin, "GET", "/solicitudes/" + solicitud.ids[0]);
+  assert.equal(s.solicitud.estado, "PENDIENTE");
+});
+
+
+test("un paquete alcanza para seis cobros separados con un rendimiento de seis porciones", async t => {
+  const { db, admin, cajero, boca, crear, llamar } = await datos(t);
+  const paquete = await crear("USO_INTERNO", "Paquete", 1);
+  const taza = await crear("VENTA_COMPUESTA", "Taza", 0);
+  await llamar(admin, "PUT", "/productos/" + taza.id, { receta: { insumo_id: paquete.id, rendimiento: 6 } });
+  for (let restantes = 6; restantes > 0; restantes--) {
+    const [p] = await llamar(cajero, "GET", "/productos/buscar", {}, { venta: "1", q: "Taza" });
+    assert.equal(p.stock_boca, restantes);
+    await llamar(cajero, "POST", "/ventas", { items: [{ producto_id: taza.id, cantidad: 1 }], forma_pago: "QR" });
+  }
+  assert.equal(await N.stockActual(db, admin, boca.id, paquete.id), 0);
+});
+
+
+test("los rendimientos altos conservan cada porción hasta la última milésima", async t => {
+  const { db, admin, cajero, boca, crear, llamar } = await datos(t);
+  const Porciones = require("../lib/porciones");
+  for (const rinde of [600, 750]) {
+    let saldo = 1;
+    for (let restantes = rinde; restantes > 0; restantes--) {
+      assert.equal(Porciones.disponibles(saldo, rinde), restantes);
+      saldo = Math.round(1000 * (saldo - Porciones.consumo(saldo, rinde, 1))) / 1000;
+    }
+    assert.equal(saldo, 0);
+    const base = await crear("USO_INTERNO", "Paquete " + rinde, 1);
+    const p = await crear("VENTA_COMPUESTA", "Porción " + rinde, 0);
+    await llamar(admin, "PUT", "/productos/" + p.id, { receta: { insumo_id: base.id, rendimiento: rinde } });
+    const buscar = () => llamar(cajero, "GET", "/productos/buscar", {}, { venta: "1", q: "Porción " + rinde });
+    const cobrar = cantidad => llamar(cajero, "POST", "/ventas", { items: [{ producto_id: p.id, cantidad }], forma_pago: "QR" });
+    assert.equal((await buscar())[0].stock_boca, rinde);
+    await assert.rejects(cobrar(rinde + 1), { codigo: "SIN_STOCK" });
+    await cobrar(rinde - 1);
+    assert.equal((await buscar())[0].stock_boca, 1);
+    await cobrar(1);
+    assert.equal(await N.stockActual(db, admin, boca.id, base.id), 0);
+  }
 });

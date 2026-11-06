@@ -101,9 +101,10 @@ function enviarResultado(res, r) {
   return res.json(r === undefined ? { ok: true } : r);
 }
 
-// Una notebook anterior no sabe conservar el precio de una compra en oferta.
+// Una notebook anterior podría confirmar una compra temporal o permitir un egreso sin saldo.
 function actorParaOrden(actor, ruta) {
-  if (/^\/(?:compras|productos|bocas)(?:\/|$)/.test(ruta)) actor.capacidad = "precios-boca-v1";
+  if (/^\/(?:compras|productos|ventas|traspasos|solicitudes|bajas)(?:\/|$)/.test(ruta)) actor.capacidad = "stock-predio-v2";
+  else if (/^\/bocas(?:\/|$)/.test(ruta)) actor.capacidad = "precios-boca-v1";
   return actor;
 }
 
@@ -398,8 +399,9 @@ function crearRouterAdmin() {
       const datos = {
         tipo: "predio-paquete", predio_id: p.id, predio_codigo: p.codigo, generado: U.fechaHora(),
         maestros: await C.armarMaestros(pool(), p),
-        comandos: serializadas.filter(c => c.actor?.capacidad !== "precios-boca-v1"),
+        comandos: serializadas.filter(c => !c.actor?.capacidad),
         comandos_precios: serializadas.filter(c => c.actor?.capacidad === "precios-boca-v1"),
+        comandos_stock: serializadas.filter(c => c.actor?.capacidad === "stock-predio-v2"),
       };
       if (req.query.codigo === "1") {
         const paquete = C.paqueteCodigo();
@@ -612,7 +614,9 @@ function crearRouterSync() {
            WHERE predio_id = ? AND (estado = 'PENDIENTE' OR (estado = 'ENTREGADO' AND entregado_en < NOW() - INTERVAL 60 SECOND))
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.tipo')), '') <> 'PREDIO')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'precios-boca-v1')
-           ORDER BY id LIMIT 20`, [p.id, capacidades.includes("cuentas-predio-v1") ? 1 : 0, capacidades.includes("precios-boca-v1") ? 1 : 0]);
+             AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'stock-predio-v2')
+           ORDER BY id LIMIT 20`, [p.id, capacidades.includes("cuentas-predio-v1") ? 1 : 0,
+             capacidades.includes("precios-boca-v1") ? 1 : 0, capacidades.includes("stock-predio-v2") ? 1 : 0]);
         if (filas.length) {
           await conexion.query(`UPDATE predio_comando SET estado = 'ENTREGADO', entregado_en = NOW(), intentos = intentos + 1 WHERE id IN (?)`, [filas.map(c => c.id)]);
         }

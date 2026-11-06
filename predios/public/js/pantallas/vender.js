@@ -111,7 +111,6 @@
             return P.post("/ventas/avisar-sin-stock", { producto_id: r.producto ? r.producto.id : null, busqueda: busqueda, cantidad: 1, confirmar: true }).then(function (aviso) {
               m.cerrar(); combo.limpiar();
               P.aviso(aviso.mensaje || "Aviso enviado al administrador", "ok");
-              if (r.producto && aviso.puede_vender) agregar(r.producto, { id: aviso.id, cantidad: 1 });
             });
           });
         }).catch(function (e) { P.reemplazar(informacion, P.mensaje(e.message, "error")); }).finally(function () { enviando = false; buscador.input.disabled = false; enviar.disabled = !consulta.producto && buscador.input.value.trim().length < 2; });
@@ -137,7 +136,7 @@
             : disponible ? "El producto ahora tiene precio y stock suficiente. Podés agregarlo a la venta."
               : p ? "Este producto no tiene stock suficiente registrado en esta boca. Al enviar el aviso, el administrador recibirá el producto, tu usuario, la boca, la caja y el horario para revisar los movimientos."
                 : "Buscá y elegí el producto de la lista. Acá podés consultar todo el catálogo, incluidos los productos agotados o sin precio.", "aviso"),
-          !soloInformar() && !disponible ? h("p.texto-3.chico", p ? (sinPrecio ? "También figura sin stock. Podés enviar el aviso al administrador; el producto no se agregará a la venta hasta que tenga precio." : "Si la configuración permite vender sin stock, se agregará el producto después de enviar el aviso.") : "Si tampoco lo encontrás en el catálogo, podés enviar la búsqueda al administrador.") : null);
+          !soloInformar() && !disponible ? h("p.texto-3.chico", p ? (sinPrecio ? "También figura sin stock. Podés enviar el aviso al administrador; el producto no se agregará a la venta hasta que tenga precio." : "Podrás venderlo cuando haya stock en esta boca.") : "Si tampoco lo encontrás en el catálogo, podés enviar la búsqueda al administrador.") : null);
       }
       function fijarProducto(p, busqueda) {
         var estadoProducto = p.estado_venta || (p.destino === "USO_INTERNO" ? "USO_INTERNO" : !(Number(p.precio_venta) > 0) ? "SIN_PRECIO" : Number(p.stock_boca) <= 0 ? "SIN_STOCK" : "DISPONIBLE");
@@ -174,14 +173,13 @@
       consultar().catch(function (e) { P.reemplazar(informacion, P.mensaje(e.message, "error")); });
     }
 
-    function agregar(p, avisoSinStock) {
+    function agregar(p) {
       if (!p) return;
       if (p.destino === "USO_INTERNO") { P.aviso("«" + p.nombre + "» es de uso interno y no se vende", "error"); return; }
       if (!(Number(p.precio_venta) > 0)) { P.aviso("«" + p.nombre + "» no tiene precio de venta: pedile al administrador que lo cargue", "error"); combo.foco(); return; }
       var existente = estado.items.filter(function (i) { return i.producto.id === p.id; })[0];
       if (existente) existente.cantidad = P.redondear(existente.cantidad + 1, 3);
       else { existente = { producto: p, cantidad: 1 }; estado.items.push(existente); }
-      if (avisoSinStock) existente.aviso_sin_stock = avisoSinStock;
       estado.resaltar = p.id;
       pintarTodo();
       combo.foco();
@@ -408,7 +406,6 @@
       cobrando = true;
       var cuerpo = {
         items: estado.items.map(function (it) { return { producto_id: it.producto.id, cantidad: it.cantidad, precio_unitario: it.producto.precio_venta }; }),
-        avisos_sin_stock: estado.items.filter(function (it) { return it.aviso_sin_stock && it.aviso_sin_stock.id; }).map(function (it) { return { id: it.aviso_sin_stock.id, producto_id: it.producto.id }; }),
         forma_pago: estado.segunda ? "MIXTO" : estado.forma,
         pagos: partes(),
         recibido: (estado.forma === "EFECTIVO" || estado.segunda === "EFECTIVO") && estado.recibido ? P.importeDe(estado.recibido) : null,
@@ -416,9 +413,7 @@
       };
       P.ejecutar(botonCobrar, function () {
         cuerpo.operacion = identificarVenta(cuerpo);
-        return confirmarStockVenta(function (confirmar) {
-          return P.post("/ventas", Object.assign({}, cuerpo, { confirmar_sin_stock: confirmar }));
-        }, "Vender igual").then(function (r) {
+        return P.post("/ventas", cuerpo).catch(informarFaltantes).then(function (r) {
           if (!r) return;
           ultimaVenta = r.id;
           try { sessionStorage.setItem("predio.ultima-venta." + puesto.caja_id, String(r.id)); } catch (e) { /* nada */ }
@@ -439,32 +434,21 @@
       }).finally(function () { cobrando = false; pintarTotales(); });
     }
 
-    function confirmarStockVenta(llamada) {
-      return llamada(false).catch(function (e) {
-        if (e.codigo !== "STOCK_INSUFICIENTE" && e.codigo !== "SIN_STOCK") throw e;
-        var faltantes = (e.datos && e.datos.faltantes) || [];
-        if (!faltantes.length) throw e;
-        var puedeVender = e.codigo === "STOCK_INSUFICIENTE";
-        return P.confirmar(h("div.columna",
-          P.mensaje(h("div", "El stock registrado no alcanza para esta venta.", h("ul", faltantes.map(function (f) {
-            return h("li", h("strong", f.producto), ": cantidad " + P.f.numero(f.pedido) + " · stock " + P.f.numero(f.disponible));
-          }))), "aviso"),
-          h("p", puedeVender
-            ? "Al aceptar se registrará la venta y el administrador recibirá un aviso con los productos, cantidades, usuario, boca, caja y horario para revisar los movimientos."
-            : "La configuración impide vender sin stock. Podés aceptar para avisar al administrador y pedirle que revise los movimientos; la venta seguirá pendiente.")), {
-          titulo: "Revisá el stock de la boca", aceptar: puedeVender ? "Avisar y vender igual" : "Aceptar y avisar",
-        }).then(function (aceptado) {
-          if (!aceptado) return null;
-          if (puedeVender) return llamada(true);
-          return faltantes.reduce(function (promesa, f) {
-            return promesa.then(function () {
-              return P.post("/ventas/avisar-sin-stock", { producto_id: f.producto_id, busqueda: f.producto, cantidad: f.pedido, confirmar: true });
-            });
-          }, Promise.resolve()).then(function () {
-            P.aviso("Aviso enviado al administrador. La venta sigue pendiente de corregir el stock.", "ok");
-            return null;
+    function informarFaltantes(e) {
+      var faltantes = (e.datos && e.datos.faltantes) || [];
+      if (e.codigo !== "SIN_STOCK" || !faltantes.length) throw e;
+      return P.confirmar(h("div.columna",
+        P.mensaje(h("div", "La venta sigue pendiente. Revisá las cantidades o pedí una reposición.", h("ul", faltantes.map(function (f) {
+          return h("li", h("strong", f.producto), " · se necesitan " + P.f.numero(f.pedido) + " · disponible " + P.f.numero(f.disponible));
+        }))), "aviso")), {
+        titulo: "Stock insuficiente en esta boca", aceptar: "Avisar al administrador",
+      }).then(function (aceptado) {
+        if (!aceptado) return null;
+        return faltantes.reduce(function (promesa, f) {
+          return promesa.then(function () {
+            return P.post("/ventas/avisar-sin-stock", { producto_id: f.producto_id, busqueda: f.producto, cantidad: f.pedido, insumo: !!f.insumo, confirmar: true });
           });
-        });
+        }, Promise.resolve()).then(function () { P.aviso("Aviso enviado al administrador.", "ok"); return null; });
       });
     }
 

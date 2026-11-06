@@ -39,16 +39,28 @@
       });
       function mostrarDisponible() {
         if (!elegido) { disponible.textContent = ""; return; }
+        var productoConsultado = elegido, origenConsultado = origen.value;
         var nombreOrigen = origen.options[origen.selectedIndex].textContent;
         disponible.textContent = "Consultando stock…";
         P.get("/stock/disponible" + P.qs({ boca_id: origen.value, producto_id: elegido.id })).then(function (x) {
+          if (elegido !== productoConsultado || origen.value !== origenConsultado) return;
           elegido.disponible = x.cantidad;
           disponible.textContent = "Disponible en " + nombreOrigen + ": " + P.f.numero(x.cantidad);
           disponible.style.color = x.cantidad <= 0 ? "var(--error)" : "";
         }).catch(function () { disponible.textContent = ""; });
       }
-      origen.addEventListener("change", function () { mostrarDisponible(); pintar(); });
-      var lista = h("div");
+      origen.addEventListener("change", function () {
+        if (elegido) elegido.disponible = undefined;
+        var id = origen.value;
+        lineas.forEach(function (l) {
+          l.disponible = undefined;
+          P.get("/stock/disponible" + P.qs({ boca_id: id, producto_id: l.producto.id })).then(function (r) {
+            if (origen.value === id) { l.disponible = r.cantidad; pintar(); }
+          }).catch(P.error);
+        });
+        mostrarDisponible(); pintar();
+      });
+      var lista = h("div.tabla-desplazable");
       function agregar() {
         if (!elegido) { combo.foco(); return; }
         var n = P.numeroDe(cantidad.value);
@@ -84,7 +96,7 @@
         ancho: "ancha",
         contenido: h("div.columna",
           h("div.grilla.grilla-2", P.campo("Sale de (boca de origen)", origen), P.campo("Llega a (boca de destino)", destino)),
-          h("div.fila-campos", P.campo("Producto", h("div", combo.el, disponible), { clase: "crece" }), P.campo("Cantidad", cantidad),
+          h("div.fila-campos", P.campo("Producto", h("div", combo.el, disponible), { clase: "crece" }), P.campo("Cantidad", cantidad, { ayuda: "Ej.: 0,5 para media unidad." }),
             h("div.campo", h("span.campo-etiqueta", " "), P.btn("Agregar", { tipo: "celeste", icono: "mas", onclick: agregar }))),
           lista,
           P.esAdmin() ? baja : null,
@@ -99,8 +111,8 @@
           }, autorizacion || {});
           P.ejecutar(ev.currentTarget, function () {
             return P.conConfirmacionStock(function (confirmar) {
-              return P.post(esTraspaso ? "/traspasos" : "/solicitudes", Object.assign({}, cuerpo, { confirmar_sin_stock: confirmar }));
-            }, esTraspaso ? "Mover igual" : "Pedir igual").then(function (x) {
+              return P.post(esTraspaso ? "/traspasos" : "/solicitudes", Object.assign({}, cuerpo, esTraspaso ? { confirmar_fraccionado: confirmar } : { confirmar_sin_stock: confirmar }));
+            }, esTraspaso ? "Confirmar saldo negativo" : "Pedir igual").then(function (x) {
               if (!x.encolado) P.aviso(x.mensaje, "ok");
               m.cerrar();
               if (alTerminar) alTerminar();
@@ -132,12 +144,12 @@
       var m = P.modal({
         titulo: "Bajar stock",
         subtitulo: "Para productos que se rompieron, vencieron o se usaron como materia prima o insumo.",
-        contenido: h("div.columna", P.campo("Boca", boca), P.campo("Producto", h("div", combo.el, disp)), P.campo("Cantidad", cantidad), P.campo("Motivo", motivo), P.campo("Observaciones", obs)),
+        contenido: h("div.columna", P.campo("Boca", boca), P.campo("Producto", h("div", combo.el, disp)), P.campo("Cantidad", cantidad, { ayuda: "Ej.: 0,5 para media unidad." }), P.campo("Motivo", motivo), P.campo("Observaciones", obs)),
         acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn("Dar de baja", { tipo: "peligro-lleno", icono: "baja", onclick: function (ev) {
           if (!elegido) { P.aviso("Elegí el producto", "error"); combo.foco(); return; }
           var cuerpo = { boca_id: Number(boca.value), producto_id: elegido.id, cantidad: P.numeroDe(cantidad.value), motivo: motivo.value, observaciones: obs.value };
           P.ejecutar(ev.currentTarget, function () {
-            return P.conConfirmacionStock(function (confirmar) { return P.post("/bajas", Object.assign({}, cuerpo, { confirmar_sin_stock: confirmar })); }, "Bajar igual").then(function (r) {
+            return P.post("/bajas", cuerpo).then(function (r) {
               if (!r.encolado) P.aviso(r.mensaje, "ok");
               m.cerrar();
               if (alTerminar) alTerminar();
@@ -182,7 +194,9 @@
         contenido: P.campo("Cantidad que despachás", cant, { ayuda: "Si no alcanza, podés mandar menos de lo pedido." }),
         acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn("Despachar", { tipo: "primario", icono: "despachar", onclick: function (ev) {
           P.ejecutar(ev.currentTarget, function () {
-            return P.post("/solicitudes/" + f.id + "/despachar", { cantidad: P.numeroDe(cant.value) }).then(function (r) { if (!r.encolado) P.aviso(r.mensaje, "ok"); m.cerrar(); recargar(); });
+            return P.conConfirmacionStock(function (confirmar) {
+              return P.post("/solicitudes/" + f.id + "/despachar", { cantidad: P.numeroDe(cant.value), confirmar_fraccionado: confirmar });
+            }, "Confirmar saldo negativo").then(function (r) { if (!r.encolado) P.aviso(r.mensaje, "ok"); m.cerrar(); recargar(); });
           }).catch(function () {});
         } })],
       });
@@ -222,7 +236,8 @@
   P.ruta.registrar(/^\/stock$/, function (c) {
     var puesto = P.puesto() || {};
     c.appendChild(h("div.pagina-cabecera", h("div", h("h1.titulo-pagina", "Stock"), h("p.subtitulo", "Lo que figura en el sistema para tus bocas."))));
-    c.appendChild(P.tabla({ listado: "stock", claveEstado: "stock-cajero-" + (puesto.boca_id || "todas"), filtrosIniciales: puesto.boca_id ? { boca: String(puesto.boca_id) } : {} }).el);
+    c.appendChild(P.tabla({ listado: "stock", claveEstado: "stock-cajero-" + (puesto.boca_id || "todas"),
+      filtrosIniciales: puesto.boca_id ? { boca: String(puesto.boca_id) } : {}, celdas: { cantidad: P.cantidadPorBoca } }).el);
   }, { titulo: "Stock" });
 
   // ------------------------------------------------------------------ mis ventas (cajero)
@@ -246,9 +261,9 @@
         ancho: "ancha",
         contenido: h("div.columna",
           v.estado === "ANULADA" ? P.mensaje("Anulada por " + v.anulada_por + " el " + P.f.fechaHora(v.anulada_fecha) + ": " + (v.anulacion_motivo || ""), "error") : null,
-          h("table.tabla", h("thead", h("tr", h("th", "Producto"), h("th.der", "Cantidad"), h("th.der", "Unitario"), h("th.der", "Subtotal"))),
+          h("div.tabla-desplazable", h("table.tabla", h("thead", h("tr", h("th", "Producto"), h("th.der", "Cantidad"), h("th.der", "Unitario"), h("th.der", "Subtotal"))),
             h("tbody", d.items.map(function (i) { return h("tr", h("td", i.descripcion), h("td.der", P.f.numero(i.cantidad)), h("td.der", P.f.pesos(i.precio_unitario)), h("td.der", P.f.pesos(i.subtotal))); })),
-            h("tfoot", h("tr", h("td", { colspan: "3" }, "Total"), h("td.der", P.f.pesos(v.total))))),
+            h("tfoot", h("tr", h("td", { colspan: "3" }, "Total"), h("td.der", P.f.pesos(v.total)))))),
           h("div.datos",
             P.dato("Forma de pago", P.FORMAS[v.forma_pago] || v.forma_pago), v.codigo_pago ? P.dato("Código de pago", v.codigo_pago) : null,
             v.forma_pago === "EFECTIVO" ? P.dato("Recibido / vuelto", P.f.pesos(v.recibido) + " / " + P.f.pesos(v.vuelto)) : null,

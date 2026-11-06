@@ -11,7 +11,7 @@
   ];
   var AYUDA_DESTINO = {
     VENTA_DIRECTA: "Se vende tal cual y descuenta stock de la boca.",
-    VENTA_COMPUESTA: "Se arma con otros productos (por ejemplo un plato): se vende sin descontar stock propio.",
+    VENTA_COMPUESTA: "Descuenta las porciones de esta boca o, si elegís un insumo base, la fracción estimada que usa cada porción.",
     USO_INTERNO: "Insumos del predio (limpieza, oficina): no se venden.",
     ALQUILER: "Se alquila y vuelve (sombrillas, reposeras): se cobra sin descontar stock.",
   };
@@ -96,6 +96,13 @@
   }
 
   // ------------------------------------------------------------------ productos
+  P.cantidadPorBoca = function (cantidad, fila) {
+    var fisico = h("strong.numero" + (Number(cantidad) < 0 ? ".negativo" : ""), P.f.numero(cantidad));
+    if (fila.porciones_disponibles == null) return fisico;
+    var porciones = Number(fila.porciones_disponibles);
+    return h("div.der", h("div", fisico, " en stock físico"),
+      h("div.chico", P.f.numero(porciones) + (porciones === 1 ? " porción estimada" : " porciones estimadas")));
+  };
   function porcentajeOpcional(control) {
     return control.value.trim() ? P.numeroDe(control.value) : null;
   }
@@ -129,7 +136,7 @@
         return { boca_id: b.valor, boca: b.texto, margen_boca: b.margen_venta, margen: null, activo: 1 };
       });
       var nombre = P.input({ valor: p.nombre, max: 160, placeholder: "Ej.: Agua mineral 500 ml" });
-      var codigo = P.input({ valor: p.codigo, max: 60, placeholder: "Escaneá el código de barras o escribí uno propio" });
+      var codigo = P.input({ valor: p.codigo, max: 60, placeholder: "Escaneá o escribí el código si lo tiene" });
       codigo.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); compra.focus(); } });
       var compra = P.dinero({ valor: valorEditable(p.precio_compra) });
       var margen = P.input({ inputmode: "decimal", valor: valorEditable(p.margen), placeholder: "0" });
@@ -140,7 +147,29 @@
       var precioIntervenido = false;
       var destino = P.select(DESTINOS, p.destino || "VENTA_DIRECTA");
       var ayudaDestino = h("span.campo-ayuda", AYUDA_DESTINO[destino.value]);
-      destino.addEventListener("change", function () { ayudaDestino.textContent = AYUDA_DESTINO[destino.value]; });
+      var zonaReceta = h("div.columna"), insumo, rendimiento;
+      var recetaInicial = p.receta;
+      function configurarPorcion() {
+        ayudaDestino.textContent = AYUDA_DESTINO[destino.value];
+        zonaReceta.hidden = destino.value !== "VENTA_COMPUESTA";
+        if (zonaReceta.hidden || insumo) return;
+        insumo = P.comboProducto({ abrirAlEnfocar: false, textoLibre: true, placeholder: "Ej.: paquete de café (opcional)" });
+        if (recetaInicial) insumo.fijar(recetaInicial.insumo_id, recetaInicial.nombre);
+        rendimiento = P.input({ inputmode: "numeric", valor: recetaInicial ? String(recetaInicial.rendimiento) : "", placeholder: "Ej.: 40" });
+        var ayuda = h("span.campo-ayuda");
+        function mostrarConsumo() {
+          var rinde = Number(rendimiento.value);
+          ayuda.textContent = Number.isInteger(rinde) && rinde > 0 && rinde <= 1000
+            ? "Consumo estimado por porción: " + P.f.numero(1 / rinde) + " unidades del insumo."
+            : "Estimá cuántas porciones de este tamaño salen de una unidad del insumo.";
+        }
+        rendimiento.addEventListener("input", mostrarConsumo);
+        mostrarConsumo();
+        zonaReceta.appendChild(h("div.grilla.grilla-2", P.campo("Insumo base", insumo.el, { ayuda: "Sin insumo se descuenta una porción del stock propio." }),
+          P.campo("Porciones por unidad de insumo", h("div", rendimiento, ayuda))));
+      }
+      destino.addEventListener("change", configurarPorcion);
+      configurarPorcion();
       var cantidad = P.input({ inputmode: "decimal", valor: editar ? valorEditable(stockAlmacenDe(detalle)) : "0" });
       cantidad.style.textAlign = "right";
       var perecedero = P.check("Es perecedero", Number(p.perecedero) === 1, null, function (v) {
@@ -201,9 +230,10 @@
       } else calcular();
 
       var formulario = h("div.columna",
-        h("div.grilla.grilla-2", P.campo("Nombre", nombre, { requerido: true }), P.campo("Código de barras o único", codigo)),
+        h("div.grilla.grilla-2", P.campo("Nombre", nombre, { requerido: true }), P.campo("Código de barras o interno (opcional)", codigo)),
         h("div.grilla.grilla-2", P.campo("Destino del producto", h("div", destino, ayudaDestino)),
           P.campo(editar ? "Cantidad en proveeduría (ajuste)" : "Cantidad en proveeduría", cantidad, { ayuda: editar ? "Si la cambiás, queda registrado como ajuste manual." : "Stock inicial en la boca que recibe las compras." })),
+        zonaReceta,
         h("div.grilla.grilla-2",
           P.campo("Precio de compra", h("div.campo-con-prefijo", h("span", "$"), compra)),
           P.campo("Margen de utilidad (%)", margen)),
@@ -226,7 +256,10 @@
         solapa.fijar(v);
       }
       if (detalle) {
-        var stockLista = h("ul.lista-simple", detalle.stock.map(function (s) { return h("li", h("span", s.boca), h("strong.numero", P.f.numero(s.cantidad))); }));
+        var stockLista = h("ul.lista-simple.stock-del-producto", detalle.stock.map(function (s) {
+          return h("li", h("span", s.boca + (Number(s.activo) === 0 ? " (inactiva)" : "")),
+            P.cantidadPorBoca(s.cantidad, s));
+        }));
         var precios = h("ul.lista-simple", detalle.precios.map(function (x) {
           var actor = /sistema (anterior|actual)/i.test(x.usuario_nombre || "") ? "" : x.usuario_nombre;
           var origen = ({ ALTA: "Alta", EDICION: "Edición", COMPRA: "Compra N° " + x.referencia_id, IMPORTACION: "Precio registrado",
@@ -266,11 +299,22 @@
             P.aviso("Revisá el precio ingresado. Usá un importe con hasta dos decimales.", "error"); return;
           }
           var cuerpo = {
-            nombre: nombre.value, codigo: codigo.value, precio_compra: compraIngresada || 0, margen: porcentajeOpcional(margen) || 0,
+            nombre: nombre.value, codigo: codigo.value.trim() || null, precio_compra: compraIngresada || 0, margen: porcentajeOpcional(margen) || 0,
             destino: destino.value, perecedero: perecedero.input.checked, fecha_caducidad: perecedero.input.checked ? vence.value || null : null,
             stock_minimo: P.numeroDe(minimo.value) || 0, cantidad_almacen: P.numeroDe(cantidad.value) || 0,
             precio_venta_manual: manual.input.checked ? P.precioDeVenta(manualIngresado) : null,
           };
+          if (destino.value === "VENTA_COMPUESTA") {
+            if (insumo.input.value.trim() && !insumo.valor()) { mostrarPanel("datos"); insumo.foco(); P.aviso("Elegí el insumo de la lista", "error"); return; }
+            var elegido = insumo.valor(), rinde = Number(rendimiento.value);
+            if (elegido && (!Number.isInteger(rinde) || rinde < 1 || rinde > 1000)) {
+              mostrarPanel("datos"); rendimiento.focus(); P.aviso("Ingresá entre 1 y 1000 porciones por unidad.", "error"); return;
+            }
+            if (!elegido && rendimiento.value.trim()) { mostrarPanel("datos"); insumo.foco(); P.aviso("Elegí el insumo al que corresponde este rendimiento.", "error"); return; }
+            if (Number(elegido) !== Number((recetaInicial && recetaInicial.insumo_id) || 0) || (elegido && rinde !== Number(recetaInicial && recetaInicial.rendimiento))) {
+              cuerpo.receta = elegido ? { insumo_id: Number(elegido), rendimiento: rinde } : null;
+            }
+          }
           if (margenesEditados) cuerpo.margenes_boca = preciosBoca.filter(function (f) { return f.input.value.trim() !== ""; }).map(function (f) {
             return { boca_id: f.boca.boca_id, margen: porcentajeOpcional(f.input) };
           });
@@ -350,7 +394,7 @@
 
   P.ruta.registrar(/^\/gestion\/stock$/, function (c) {
     subpagina(c, "Stock por boca", "Cuánto hay de cada producto en cada boca, según los movimientos.");
-    c.appendChild(P.tabla({ listado: "stock" }).el);
+    c.appendChild(P.tabla({ listado: "stock", celdas: { cantidad: P.cantidadPorBoca } }).el);
   }, { admin: true, titulo: "Stock por boca" });
 
   P.ruta.registrar(/^\/gestion\/movimientos$/, function (c) {

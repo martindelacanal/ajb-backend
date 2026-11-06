@@ -7,6 +7,7 @@
 const { error, hoy, sumarDias, esFechaIso, redondear } = require("./util");
 const { limiteRevision, fechaRevisionSql, historialRevisionSql } = require("./precios");
 const { precioGeneralSql, precioBocaSql, joinMargenSql } = require("./precio-boca");
+const Porciones = require("./porciones");
 
 const DESTINOS = [
   { valor: "VENTA_DIRECTA", texto: "Venta directa" },
@@ -41,6 +42,8 @@ const ESTADOS_SOLICITUD = [
 const TIPOS_MOVIMIENTO = [
   { valor: "ALTA_INICIAL", texto: "Alta inicial" },
   { valor: "COMPRA", texto: "Compra" },
+  { valor: "COMPRA_TEMPORAL", texto: "Recepción temporal" },
+  { valor: "CORRECCION_RECEPCION", texto: "Corrección de recepción" },
   { valor: "ANULACION_COMPRA", texto: "Anulación de compra" },
   { valor: "VENTA", texto: "Venta" },
   { valor: "ANULACION_VENTA", texto: "Anulación de venta" },
@@ -89,6 +92,7 @@ const IMPORTADOR = "Sistema anterior (importación)";
 // la carga inicial o un ajuste manual. Mismo criterio que api/eliminar.js.
 const PRODUCTO_USADO = ["predio_venta_item", "predio_compra_item", "predio_solicitud", "predio_baja"]
   .map((t) => `EXISTS (SELECT 1 FROM ${t} u WHERE u.predio_id = p.predio_id AND u.producto_id = p.id)`)
+  .concat("EXISTS (SELECT 1 FROM predio_config ri WHERE ri.predio_id = p.predio_id AND ri.clave LIKE 'porcion.insumo.%' AND ri.valor = p.id)")
   .concat("EXISTS (SELECT 1 FROM predio_movimiento u WHERE u.predio_id = p.predio_id AND u.producto_id = p.id AND u.tipo NOT IN ('ALTA_INICIAL', 'AJUSTE'))")
   .join(" OR ");
 
@@ -206,37 +210,47 @@ L.productos = {
 
 L.stock = {
   titulo: "Stock por boca",
-  from: `predio_stock s
-    JOIN predio_producto p ON p.predio_id = s.predio_id AND p.id = s.producto_id
-    JOIN predio_boca b ON b.predio_id = s.predio_id AND b.id = s.boca_id ${joinMargenSql}`,
-  where: "s.predio_id = :pid",
-  alcance: alcanceBocas("s.boca_id"),
+  from(query) {
+    // Para un producto puntual también queremos las bocas que nunca lo recibieron.
+    // La consulta general sólo recorre las existencias registradas.
+    const producto = Number(query.f_producto);
+    const origen = Number.isSafeInteger(producto) && producto > 0
+      ? `predio_producto p JOIN predio_boca b ON b.predio_id = p.predio_id
+         LEFT JOIN predio_stock fis ON fis.predio_id = p.predio_id AND fis.producto_id = p.id AND fis.boca_id = b.id`
+      : `predio_stock fis JOIN predio_producto p ON p.predio_id = fis.predio_id AND p.id = fis.producto_id
+         JOIN predio_boca b ON b.predio_id = fis.predio_id AND b.id = fis.boca_id`;
+    return `${origen} ${joinMargenSql} ${Porciones.joinStockVenta}`;
+  },
+  where: "p.predio_id = :pid AND (b.activo = 1 OR fis.id IS NOT NULL)",
+  alcance: alcanceBocas("b.id"),
   columnas: [
     { clave: "boca", titulo: "Boca", expr: "b.nombre", buscar: true },
     { clave: "producto_id", titulo: "ID", expr: "p.id", tipo: "int" },
     { clave: "producto", titulo: "Producto", expr: "p.nombre", buscar: true },
     { clave: "codigo", titulo: "Código", expr: "p.codigo", buscar: true },
-    { clave: "cantidad", titulo: "Cantidad", expr: "s.cantidad", tipo: "qty" },
+    { clave: "cantidad", titulo: "Cantidad física", expr: "COALESCE(fis.cantidad, 0)", tipo: "qty" },
+    { clave: "porciones_disponibles", titulo: "Porciones disponibles (estimadas)", expr: Porciones.porcionesDisponiblesSql, tipo: "int", oculta: true },
     { clave: "precio_venta", titulo: "Precio de venta", expr: precioBocaSql, tipo: "money" },
-    { clave: "valor", titulo: "Valor a costo", expr: "s.cantidad * COALESCE(p.precio_compra, 0)", tipo: "money", soloAdmin: true },
+    { clave: "valor", titulo: "Valor a costo", expr: "COALESCE(fis.cantidad, 0) * COALESCE(p.precio_compra, 0)", tipo: "money", soloAdmin: true },
     { clave: "destino", titulo: "Destino", expr: "p.destino", tipo: "opcion", opciones: DESTINOS },
     { clave: "fecha_caducidad", titulo: "Caducidad", expr: "p.fecha_caducidad", tipo: "date" },
-    { clave: "fecha_modificacion", titulo: "Último movimiento", expr: "s.fecha_modificacion", tipo: "dt" },
+    { clave: "fecha_modificacion", titulo: "Último movimiento", expr: "fis.fecha_modificacion", tipo: "dt" },
   ],
   filtros: [
-    { clave: "boca", titulo: "Boca", tipo: "id", expr: "s.boca_id", fuente: "bocas" },
+    { clave: "producto", titulo: "Producto", tipo: "id", expr: "p.id", fuente: "productos" },
+    { clave: "boca", titulo: "Boca", tipo: "id", expr: "b.id", fuente: "bocas" },
     { clave: "destino", titulo: "Destino", tipo: "opciones", expr: "p.destino", opciones: DESTINOS },
     {
-      clave: "estado", titulo: "Cantidad", tipo: "opciones",
+      clave: "estado", titulo: "Cantidad física", tipo: "opciones",
       opciones: [
-        { valor: "con", texto: "Con stock", sql: "s.cantidad > 0" },
-        { valor: "sin", texto: "En cero", sql: "s.cantidad = 0" },
-        { valor: "negativo", texto: "Negativo (revisar)", sql: "s.cantidad < 0" },
+        { valor: "con", texto: "Con stock", sql: "fis.cantidad > 0" },
+        { valor: "sin", texto: "En cero", sql: "COALESCE(fis.cantidad, 0) = 0" },
+        { valor: "negativo", texto: "Negativo (revisar)", sql: "fis.cantidad < 0" },
       ],
     },
   ],
   orden: { clave: "producto", dir: "asc" },
-  totales: [{ clave: "cantidad", expr: "SUM(s.cantidad)" }, { clave: "valor", expr: "SUM(s.cantidad * COALESCE(p.precio_compra, 0))", soloAdmin: true }],
+  totales: [{ clave: "cantidad", expr: "SUM(fis.cantidad)" }, { clave: "valor", expr: "SUM(fis.cantidad * COALESCE(p.precio_compra, 0))", soloAdmin: true }],
   resumen: {
     grupos: [
       { clave: "boca", titulo: "Boca", expr: "b.nombre" },
@@ -245,8 +259,8 @@ L.stock = {
     ],
     medidas: [
       { titulo: "Productos", expr: "COUNT(*)", tipo: "int" },
-      { titulo: "Unidades", expr: "SUM(s.cantidad)", tipo: "qty" },
-      { titulo: "Valor a costo", expr: "SUM(s.cantidad * COALESCE(p.precio_compra, 0))", tipo: "money", soloAdmin: true },
+      { titulo: "Unidades", expr: "SUM(fis.cantidad)", tipo: "qty" },
+      { titulo: "Valor a costo", expr: "SUM(fis.cantidad * COALESCE(p.precio_compra, 0))", tipo: "money", soloAdmin: true },
     ],
   },
 };
@@ -255,7 +269,7 @@ L.proveedores = {
   roles: ["ADMIN"],
   titulo: "Proveedores",
   from: `predio_proveedor pr
-    LEFT JOIN (SELECT proveedor_id, COUNT(*) AS compras, SUM(total_items) AS total, MAX(fecha_factura) AS ultima
+    LEFT JOIN (SELECT proveedor_id, COUNT(*) AS compras, SUM(COALESCE(total_factura, total_items)) AS total, MAX(fecha_factura) AS ultima
       FROM predio_compra WHERE predio_id = :pid AND estado = 'CARGADA' GROUP BY proveedor_id) c ON c.proveedor_id = pr.id`,
   where: "pr.predio_id = :pid",
   columnas: [
@@ -289,8 +303,11 @@ L.proveedores = {
   orden: { clave: "razon_social", dir: "asc" },
 };
 
-const columnaEstadoCompra = { clave: "estado", titulo: "Estado", expr: "c.estado", tipo: "opcion", opciones: [{ valor: "CARGADA", texto: "Cargada" }, { valor: "ANULADA", texto: "Anulada" }] };
-const filtroEstadoCompra = { clave: "estado", titulo: "Estado", tipo: "opciones", expr: "c.estado", opciones: [{ valor: "CARGADA", texto: "Cargadas" }, { valor: "ANULADA", texto: "Anuladas" }] };
+const estadosCompra = [{ valor: "CARGADA", texto: "Cargada" }, { valor: "TEMPORAL", texto: "Temporal" },
+  { valor: "ANULADA", texto: "Anulada" }, { valor: "DESCARTADA", texto: "Descartada" }];
+const columnaEstadoCompra = { clave: "estado", titulo: "Estado", expr: "c.estado", tipo: "opcion", opciones: estadosCompra };
+const filtroEstadoCompra = { clave: "estado", titulo: "Estado", tipo: "opciones", expr: "c.estado", opciones: estadosCompra };
+const totalComprado = "CASE WHEN c.estado = 'CARGADA' THEN COALESCE(c.total_factura, c.total_items) ELSE 0 END";
 
 L.compras = {
   titulo: "Compras",
@@ -307,27 +324,29 @@ L.compras = {
     { clave: "remito", titulo: "Remito", expr: "c.remito", buscar: true },
     { clave: "fecha_remito", titulo: "Fecha remito", expr: "c.fecha_remito", tipo: "date", oculta: true },
     { clave: "items", titulo: "Productos", expr: "COALESCE(it.items, 0)", tipo: "int" },
-    { clave: "total", titulo: "Total", expr: "c.total_items", tipo: "money" },
+    { clave: "total", titulo: "Total", expr: "COALESCE(c.total_factura, c.total_items)", tipo: "money" },
     columnaEstadoCompra,
     { clave: "creado_por", titulo: "Cargó", expr: "c.creado_por" },
     { clave: "fecha_creacion", titulo: "Fecha de carga", expr: "c.fecha_creacion", tipo: "dt" },
   ],
   filtros: [
     { clave: "proveedor", titulo: "Proveedor", tipo: "id", expr: "c.proveedor_id", fuente: "proveedores" },
+    { clave: "producto", titulo: "Producto", tipo: "id", fuente: "productos",
+      condicion: "EXISTS (SELECT 1 FROM predio_compra_item fp WHERE fp.predio_id = c.predio_id AND fp.compra_id = c.id AND fp.producto_id = ?)" },
     { clave: "desde", titulo: "Desde", tipo: "desde", expr: "c.fecha_factura" },
     { clave: "hasta", titulo: "Hasta", tipo: "hasta", expr: "c.fecha_factura" },
     filtroEstadoCompra,
   ],
   orden: { clave: "id", dir: "desc" },
-  totales: [{ clave: "total", expr: "SUM(c.total_items)" }, { clave: "items", expr: "SUM(COALESCE(it.items, 0))" }],
+  totales: [{ clave: "total", expr: `SUM(${totalComprado})` }, { clave: "items", expr: "SUM(CASE WHEN c.estado = 'CARGADA' THEN COALESCE(it.items, 0) ELSE 0 END)" }],
   resumen: {
     grupos: [
       { clave: "proveedor", titulo: "Proveedor", expr: "pr.razon_social" },
       { clave: "mes", titulo: "Mes", expr: "SUBSTR(c.fecha_factura, 1, 7)" },
     ],
     medidas: [
-      { titulo: "Compras", expr: "COUNT(*)", tipo: "int" },
-      { titulo: "Total", expr: "SUM(c.total_items)", tipo: "money" },
+      { titulo: "Compras cargadas", expr: "SUM(CASE WHEN c.estado = 'CARGADA' THEN 1 ELSE 0 END)", tipo: "int" },
+      { titulo: "Total facturado", expr: `SUM(${totalComprado})`, tipo: "money" },
     ],
   },
 };
@@ -359,16 +378,17 @@ L.compras_productos = {
     { clave: "hasta", titulo: "Hasta", tipo: "hasta", expr: "c.fecha_factura" },
   ],
   orden: { clave: "fecha_factura", dir: "desc" },
-  totales: [{ clave: "cantidad", expr: "SUM(i.cantidad)" }, { clave: "subtotal", expr: "SUM(i.subtotal)" }],
+  totales: [{ clave: "cantidad", expr: "SUM(CASE WHEN c.estado = 'CARGADA' THEN i.cantidad ELSE 0 END)" },
+    { clave: "subtotal", expr: "SUM(CASE WHEN c.estado = 'CARGADA' THEN i.subtotal ELSE 0 END)" }],
   resumen: {
     grupos: [
       { clave: "producto", titulo: "Producto", expr: "p.nombre" },
       { clave: "proveedor", titulo: "Proveedor", expr: "pr.razon_social" },
     ],
     medidas: [
-      { titulo: "Unidades", expr: "SUM(i.cantidad)", tipo: "qty" },
-      { titulo: "Total", expr: "SUM(i.subtotal)", tipo: "money" },
-      { titulo: "Precio promedio", expr: "SUM(i.subtotal) / NULLIF(SUM(i.cantidad), 0)", tipo: "money" },
+      { titulo: "Unidades facturadas", expr: "SUM(CASE WHEN c.estado = 'CARGADA' THEN i.cantidad ELSE 0 END)", tipo: "qty" },
+      { titulo: "Total en productos", expr: "SUM(CASE WHEN c.estado = 'CARGADA' THEN i.subtotal ELSE 0 END)", tipo: "money" },
+      { titulo: "Precio promedio", expr: "SUM(CASE WHEN c.estado = 'CARGADA' THEN i.subtotal END) / NULLIF(SUM(CASE WHEN c.estado = 'CARGADA' THEN i.cantidad END), 0)", tipo: "money" },
     ],
   },
 };
@@ -1095,7 +1115,7 @@ function construirWhere(def, ctx, query, db) {
     } else if (f.tipo === "id") {
       const n = Number(valor);
       if (!Number.isSafeInteger(n)) continue;
-      partes.push(`${f.expr} = ?`);
+      partes.push(f.condicion || `${f.expr} = ?`);
       valores.push(n);
     } else if (f.tipo === "desde") {
       if (!esFechaIso(valor)) continue;
@@ -1145,7 +1165,7 @@ async function ejecutar(ctx, nombre, query = {}) {
   const db = ctx.db;
   const { sql: where, valores, nombres } = construirWhere(def, ctx, query, db);
   const valoresFrom = [];
-  const fromSql = traducir(def.from, valoresFrom, nombres);
+  const fromSql = traducir(typeof def.from === "function" ? def.from(query) : def.from, valoresFrom, nombres);
 
   const admin = esAdmin(ctx);
   const columnas = def.columnas.filter((c) => admin || !c.soloAdmin);

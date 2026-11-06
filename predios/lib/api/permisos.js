@@ -154,10 +154,10 @@ async function estadisticas(ctx) {
      WHERE v.predio_id = ? AND v.estado = 'CONFIRMADA' AND v.fecha >= ? AND v.fecha < ?${filtroBoca}
      GROUP BY i.descripcion ORDER BY total DESC LIMIT 10`, p);
   const compras = await db.get(
-    `SELECT COUNT(*) AS cantidad, COALESCE(SUM(total_items), 0) AS total FROM predio_compra
+    `SELECT COUNT(*) AS cantidad, COALESCE(SUM(COALESCE(total_factura, total_items)), 0) AS total FROM predio_compra
      WHERE predio_id = ? AND estado = 'CARGADA' AND fecha_factura >= ? AND fecha_factura <= ?`, [pid, desde, hasta]);
   const comprasProveedor = await db.all(
-    `SELECT pr.razon_social AS clave, COUNT(*) AS compras, COALESCE(SUM(c.total_items), 0) AS total FROM predio_compra c
+    `SELECT pr.razon_social AS clave, COUNT(*) AS compras, COALESCE(SUM(COALESCE(c.total_factura, c.total_items)), 0) AS total FROM predio_compra c
      JOIN predio_proveedor pr ON pr.predio_id = c.predio_id AND pr.id = c.proveedor_id
      WHERE c.predio_id = ? AND c.estado = 'CARGADA' AND c.fecha_factura >= ? AND c.fecha_factura <= ?
      GROUP BY pr.razon_social ORDER BY total DESC LIMIT 8`, [pid, desde, hasta]);
