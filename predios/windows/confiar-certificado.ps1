@@ -29,7 +29,7 @@ try {
   $basicas = New-Object Security.Cryptography.X509Certificates.X509BasicConstraintsExtension
   $basicas.CopyFrom($restricciones)
   if (-not $basicas.CertificateAuthority -or $cert.Subject -cne $cert.Issuer -or $cert.Subject -notmatch '^CN=AJB Predio Raiz [a-f0-9]{32}$' -or $cert.HasPrivateKey) {
-    throw "El archivo no es el certificado publico de una raiz propia del predio." 
+    throw "El archivo no es el certificado publico de una raiz propia del predio."
   }
   if (-not $Quitar -and ($cert.NotBefore -gt (Get-Date) -or $cert.NotAfter -le (Get-Date))) { throw "El certificado del predio no esta vigente." }
   if ($SoloVerificar -and $Quitar) { throw "SoloVerificar y Quitar no se pueden combinar." }
