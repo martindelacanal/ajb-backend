@@ -1,8 +1,9 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 title Impresion directa - Sistema del Camping
-rem Al descargarlo desde Elegir caja, el servidor completa la direccion local.
+rem La preparacion de Windows completa la direccion del servidor de esta caja.
 set "AJB_DIRECCION="
+if /i "%~1"=="--abrir" if not defined AJB_DIRECCION exit /b 1
 if not defined AJB_DIRECCION (
   echo Escribi la direccion del sistema del camping, por ejemplo https://camping:8443
   set /p "AJB_DIRECCION=Direccion: "
@@ -13,6 +14,7 @@ set "AJB_NAVEGADOR="
 for %%P in ("%ProgramFiles%\Google\Chrome\Application\chrome.exe" "%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe" "%LocalAppData%\Google\Chrome\Application\chrome.exe" "%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe" "%ProgramFiles%\Microsoft\Edge\Application\msedge.exe" "%LocalAppData%\Microsoft\Edge\Application\msedge.exe") do (
   if not defined AJB_NAVEGADOR if exist "%%~P" set "AJB_NAVEGADOR=%%~P"
 )
+if /i "%~1"=="--abrir" goto abrir
 if not defined AJB_NAVEGADOR (
   echo Para imprimir directo, instala Chrome o Edge y volve a ejecutar este archivo.
   echo Mientras tanto podes imprimir desde el navegador eligiendo la tiquetera.
@@ -41,3 +43,12 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
+exit /b 0
+
+:abrir
+rem Usar el perfil del cajero que abre el acceso, nunca el del instalador o SYSTEM.
+if not defined AJB_NAVEGADOR (
+  start "" "%AJB_DIRECCION%"
+  exit /b
+)
+for %%N in ("%AJB_NAVEGADOR%") do start "" "%%~N" --no-first-run --kiosk-printing --use-system-default-printer "--user-data-dir=%LOCALAPPDATA%\AJB-Predio\Caja\%%~nN" "--app=%AJB_DIRECCION%"

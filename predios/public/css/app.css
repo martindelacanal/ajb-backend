@@ -289,6 +289,15 @@ input[type="password"]::-ms-reveal, input[type="password"]::-ms-clear { display:
 .pagina { width: 100%; max-width: 1440px; margin: 0 auto; padding: 26px 28px 60px; animation: entrar 260ms cubic-bezier(.2, .8, .2, 1); }
 .pagina-cabecera { display: flex; gap: 16px; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; margin-bottom: 20px; }
 .pagina-acciones { display: flex; gap: 10px; flex-wrap: wrap; }
+.caja-tarjeta { position: relative; }
+.caja-enlace { color: inherit; text-decoration: none; }
+.caja-enlace::after { content: ""; position: absolute; inset: 0; border-radius: var(--radio); }
+.caja-enlace:hover { color: var(--azul); text-decoration: underline; }
+.caja-enlace:focus-visible::after { outline: 3px solid var(--celeste); }
+.caja-tarjeta .btn { position: relative; z-index: 1; }
+.pagina-cabecera-con-acciones { display: block; }
+.cabecera-titulo-acciones { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px 10px; }
+.cabecera-titulo-acciones .titulo-pagina { margin-right: auto; }
 .volver { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 8px; color: var(--texto-3); font-weight: 700; text-decoration: none; }
 .volver:hover { color: var(--azul); }
 
@@ -517,7 +526,8 @@ table.tabla { width: 100%; border-collapse: separate; border-spacing: 0; font-si
 .vender-titulo { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .vender-cabecera .subtitulo { margin: 4px 0 0; }
 .vender-acciones { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 16px; }
-.vender-acciones .btn { min-height: 40px; }
+.vender-acciones .btn, .gestion-acciones-grupo .btn-suave.btn-chico,
+.cabecera-titulo-acciones .btn-suave.btn-chico { min-height: 40px; }
 .vender { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 18px; align-items: start; }
 @media (max-width: 1100px) { .vender { grid-template-columns: minmax(0, 1fr); } }
 .vender-buscador { padding: 16px; }

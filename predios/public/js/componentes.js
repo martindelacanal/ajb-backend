@@ -5,6 +5,12 @@
   var P = window.P;
   var h = P.h;
 
+  P.cabeceraConAcciones = function (titulo, subtitulo, acciones) {
+    return h("div.pagina-cabecera.pagina-cabecera-con-acciones",
+      h("div.cabecera-titulo-acciones", h("h1.titulo-pagina", titulo), acciones),
+      h("p.subtitulo", subtitulo));
+  };
+
   // ------------------------------------------------------------------ campos
   P.campo = function (etiqueta, control, opciones) {
     opciones = opciones || {};
@@ -426,7 +432,7 @@
       orden: guardado.orden || null,
       dir: guardado.dir || null,
       pagina: guardado.pagina || 1,
-      tam: guardado.tam || opciones.tam || 25,
+      tam: guardado.tam || opciones.tam || 10,
       filtros: Object.assign({}, guardado.filtros || opciones.filtrosIniciales || {}),
     };
     var meta = null;
@@ -554,18 +560,15 @@
     function guardar() { P.cache[claveEstado] = { q: estado.q, orden: estado.orden, dir: estado.dir, pagina: estado.pagina, tam: estado.tam, filtros: estado.filtros }; }
 
     function parametros(extra) {
-      var p = Object.assign({}, opciones.filtrosFijos || {});
+      var p = {};
       Object.keys(estado.filtros).forEach(function (k) {
+        if ((opciones.filtrosOcultos || []).indexOf(k) >= 0) return;
         var v = estado.filtros[k];
         if (v !== undefined && v !== null && v !== "") p["f_" + k] = v;
       });
-      (meta ? meta.filtros : []).forEach(function (f) {
-        if (f.defecto !== undefined && !(f.clave in estado.filtros)) p["f_" + f.clave] = f.defecto;
-        if (estado.filtros[f.clave] === "") p["f_" + f.clave] = "todos";
-      });
       if (estado.q) p.q = estado.q;
       if (estado.orden) { p.orden = estado.orden; p.dir = estado.dir || "asc"; }
-      return Object.assign(p, extra || {});
+      return Object.assign(p, extra || {}, opciones.filtrosFijos || {});
     }
 
     function armarBarra() {
@@ -580,12 +583,13 @@
           t = setTimeout(cargar, 300);
         });
         buscar.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); clearTimeout(t); cargar(); } });
-        barra.appendChild(P.campo("Buscar", buscar, { clase: "tabla-buscar" }));
+        if (opciones.sinEtiquetaBuscar) buscar.setAttribute("aria-label", "Buscar en " + meta.titulo);
+        barra.appendChild(P.campo(opciones.sinEtiquetaBuscar ? null : "Buscar", buscar, { clase: "tabla-buscar" }));
       }
       var ocultos = opciones.filtrosOcultos || [];
       meta.filtros.forEach(function (f) {
         if (ocultos.indexOf(f.clave) >= 0) return;
-        var valor = f.clave in estado.filtros ? estado.filtros[f.clave] : (f.defecto !== undefined ? f.defecto : "");
+        var valor = estado.filtros[f.clave] || "";
         var control;
         if (f.tipo === "opciones") {
           control = P.select(f.opciones, valor, { vacio: "Todos", alCambiar: function (v) { estado.filtros[f.clave] = v; estado.pagina = 1; cargar(); } });
@@ -652,7 +656,7 @@
       var ocultos = opciones.filtrosOcultos || [];
       var activos = meta.filtros.filter(function (f) {
         if (ocultos.indexOf(f.clave) >= 0) return false;
-        var valor = f.clave in estado.filtros ? estado.filtros[f.clave] : f.defecto;
+        var valor = estado.filtros[f.clave];
         return valor !== undefined && valor !== null && valor !== "" && valor !== "todos";
       }).length;
       cantidadFiltros.textContent = String(activos);
@@ -696,6 +700,10 @@
         var tbody = h("tbody", datos.filas.map(function (f) {
           var tr = h("tr" + (opciones.alClickFila ? ".clicable" : ""), {
             onclick: opciones.alClickFila ? function (ev) { if (!ev.target.closest("button, a, input, label")) opciones.alClickFila(f); } : null,
+            tabindex: opciones.alClickFila ? 0 : null,
+            onkeydown: opciones.alClickFila ? function (ev) {
+              if (ev.target === tr && ev.key === "Enter") { ev.preventDefault(); opciones.alClickFila(f); }
+            } : null,
           }, sel ? celdaSeleccion(f) : null, cols.map(function (c) {
             var especial = opciones.celdas && opciones.celdas[c.clave];
             var contenido = especial ? especial(f[c.clave], f) : P.formatoCelda(c, f[c.clave]);

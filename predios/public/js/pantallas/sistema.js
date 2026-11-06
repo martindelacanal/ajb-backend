@@ -67,7 +67,8 @@
   function conexionSegura(d, cargar) {
     var seguro = d.https || {};
     var huella = String(seguro.huella_sha256 || "");
-    var comando = /^[a-f0-9]{64}$/i.test(huella) ? "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\confiar-certificado.ps1 -Certificado .\\autoridad.cer -HuellaSha256 " + huella : null;
+    var comando = /^[a-f0-9]{64}$/i.test(huella) && /^https:\/\/[a-z0-9.-]+:\d{1,5}\/?$/i.test(seguro.url)
+      ? "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\confiar-certificado.ps1 -Certificado .\\autoridad.cer -HuellaSha256 " + huella + " -DireccionCaja " + seguro.url : null;
     return h("div.columna",
       h("div.fila-separada", h("h3.seccion-titulo", "Conexión segura para las PCs"), P.chip(seguro.activo ? "HTTPS activo" : seguro.preparado ? "HTTPS preparado" : "HTTPS pendiente", seguro.activo ? "CONFIRMADA" : "PENDIENTE")),
       seguro.activo ? h("p", { style: { margin: 0 } }, "Usá ", enlaceServidor(seguro.url), " después de configurar la confianza en cada PC.")
@@ -80,7 +81,7 @@
           h("li", "En la notebook servidor, copiá la carpeta ", h("strong", { style: { overflowWrap: "anywhere" } }, seguro.carpeta_certificados || "certificados-PCs"), " completa a cada PC de caja."),
           h("li", "Comprobá que la huella del certificado coincida con la que muestra esta pantalla en la notebook servidor."),
           h("li", "En cada PC, hacé clic derecho en CONFIAR-EN-ESTA-PC.bat y elegí Ejecutar como administrador."),
-          h("li", "Cerrá y volvé a abrir el navegador. Entrá por la dirección HTTPS y actualizá el acceso directo de esa PC.")),
+          h("li", "Dejá la tiquetera como predeterminada de Windows. Para vender, abrí «Sistema del Camping - Caja» en el escritorio. Para documentos A4, usá el navegador habitual.")),
         comando ? h("pre", { style: { margin: 0, padding: "12px", background: "var(--papel)", borderRadius: "8px", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: "12px" } }, comando) : null,
         h("p.texto-3.chico", { style: { margin: 0 } }, "La confianza se configura en cada PC. Preparar HTTPS en el servidor no instala el certificado en las demás computadoras.")) : null,
       h("div.fila",

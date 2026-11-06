@@ -116,32 +116,55 @@
     }).catch(P.error);
   };
 
-  // ------------------------------------------------------------------ caja del cajero
+  // El mismo detalle se abre desde el puesto o desde el panel, sin cambiar de turno.
+  function detalleCaja(c, cajaId, desdePanel) {
+    var rutaEstado = "/caja/estado" + P.qs({ caja_id: cajaId });
+    var cifras = h("div.grilla.grilla-4");
+    var tabla;
+    function refrescar() {
+      P.get(rutaEstado).then(mostrarCifras).catch(P.error);
+      tabla.recargar();
+    }
+    function mostrarCifras(r) {
+      var a = r.apertura;
+      var pendiente = desdePanel ? "Sin confirmar" : h("a", { href: "#", onclick: function (ev) { ev.preventDefault(); P.verificarApertura(true); } }, "Confirmalo");
+      P.reemplazar(cifras,
+        P.cifra("Efectivo en la caja", P.f.pesos(r.resumen.saldo_esperado), "Según los movimientos"),
+        P.cifra("Ventas desde el último cierre", P.f.entero(r.resumen.ventas_cantidad), P.f.pesos(r.resumen.ventas_total)),
+        desdePanel ? P.cifra("Ventas en efectivo", P.f.pesos(r.resumen.ventas_efectivo), "Desde el último cierre") :
+          P.cifra("Tu turno", r.turno ? P.f.pesos(r.turno.total) : "—", r.turno ? r.turno.cantidad + " venta(s)" : ""),
+        P.cifra("Saldo de apertura", a ? P.f.pesos(a.importe) : "Sin cargar",
+          a ? (a.verificacion === "CORRECTO" ? "Confirmado" : a.verificacion === "NO_COINCIDE" ? "No coincide" : pendiente) : "Lo carga el administrador"));
+    }
+    c.appendChild(h("a.volver", { href: desdePanel ? "#/caja" : "#/vender" }, P.icono("volver"), desdePanel ? "Todas las cajas" : "Vender"));
+    return P.get(rutaEstado).then(function (r) {
+      var nombre = r.boca.nombre + " · " + r.caja.nombre;
+      var caja = [{ valor: cajaId, texto: nombre }];
+      var acciones = [P.btn("Mis ventas", { tipo: "suave", chico: true, icono: "lista", onclick: function () { P.ruta.ir(desdePanel ? "/caja/" + cajaId + "/ventas" : "/mis-ventas"); } })];
+      if (desdePanel) {
+        acciones.push(
+          P.btn("Saldo de apertura", { tipo: "suave", chico: true, icono: "efectivo", onclick: function () { modalApertura(caja, cajaId, refrescar); } }),
+          P.btn("Ajuste de caja", { tipo: "suave", chico: true, icono: "transferencia", onclick: function () { modalAjuste(caja, cajaId, refrescar); } }));
+      } else {
+        acciones.push(P.btn("Ver saldo de apertura", { tipo: "suave", chico: true, icono: "efectivo", onclick: function () { P.verificarApertura(true); } }));
+      }
+      if (P.modo === "local") acciones.push(P.btn("Cerrar caja", { tipo: "primario", icono: "candado", onclick: function () { P.cerrarCaja(cajaId, refrescar); } }));
+      c.appendChild(P.cabeceraConAcciones("Caja", nombre, acciones));
+      mostrarCifras(r);
+      c.appendChild(cifras);
+      tabla = P.tabla({ listado: "caja", sinEtiquetaBuscar: true, filtrosFijos: { f_caja: cajaId }, columnasOcultas: ["boca", "caja"],
+        filtrosOcultos: ["boca", "caja"], claveEstado: "detalle-caja-" + cajaId, alClickFila: function (f) { if (f.cierre_id) P.verCierre(f.cierre_id); } });
+      c.appendChild(h("div", { style: { marginTop: "16px" } }, tabla.el));
+    });
+  }
+
   P.ruta.registrar(/^\/mi-caja$/, function (c) {
     var puesto = P.puesto();
     if (!puesto || !puesto.caja_id) { c.appendChild(P.vacio("caja", "No estás trabajando en una caja", "", P.btn("Elegir caja", { tipo: "primario", onclick: function () { P.ruta.ir("/puesto"); } }))); return; }
-    c.appendChild(h("div.pagina-cabecera",
-      h("div", h("h1.titulo-pagina", "Caja"), h("p.subtitulo", puesto.boca + " · " + puesto.caja)),
-      h("div.pagina-acciones",
-        P.btn("Ver saldo de apertura", { tipo: "secundario", icono: "efectivo", onclick: function () { P.verificarApertura(true); } }),
-        P.btn("Cerrar caja", { tipo: "primario", icono: "candado", onclick: function () { P.cerrarCaja(null, function () { cargar(); tabla.recargar(); }); } }))));
-    var cifras = h("div.grilla.grilla-4");
-    c.appendChild(cifras);
-    var tabla = P.tabla({ listado: "caja", columnasOcultas: ["boca", "caja"], filtrosOcultos: ["boca", "caja"], claveEstado: "mi-caja" });
-    c.appendChild(h("div", { style: { marginTop: "16px" } }, tabla.el));
-    function cargar() {
-      return P.get("/caja/estado").then(function (r) {
-        var a = r.apertura;
-        P.reemplazar(cifras,
-          P.cifra("Efectivo en la caja", P.f.pesos(r.resumen.saldo_esperado), "Según los movimientos"),
-          P.cifra("Ventas desde el último cierre", P.f.entero(r.resumen.ventas_cantidad), P.f.pesos(r.resumen.ventas_total)),
-          P.cifra("Tu turno", r.turno ? P.f.pesos(r.turno.total) : "—", r.turno ? r.turno.cantidad + " venta(s)" : ""),
-          P.cifra("Saldo de apertura", a ? P.f.pesos(a.importe) : "Sin cargar",
-            a ? (a.verificacion === "CORRECTO" ? "Confirmado" : a.verificacion === "NO_COINCIDE" ? "No coincide: avisá al administrador" : h("a", { href: "#", onclick: function (ev) { ev.preventDefault(); P.verificarApertura(true); } }, "Confirmalo")) : "Lo carga el administrador"));
-      });
-    }
-    return cargar();
+    return detalleCaja(c, puesto.caja_id, false);
   }, { titulo: "Caja", local: true });
+
+  P.ruta.registrar(/^\/caja\/(\d+)$/, function (c, params) { return detalleCaja(c, Number(params[0]), true); }, { admin: true, titulo: "Caja" });
 
   // ------------------------------------------------------------------ caja del administrador
   function modalApertura(cajas, cajaId, alTerminar) {
@@ -223,11 +246,10 @@
   P.ruta.registrar(/^\/caja$/, function (c) {
     var cajasOp = [];
     var vista = P.cache["caja:vista"] || "movimientos";
-    c.appendChild(h("div.pagina-cabecera",
-      h("div", h("h1.titulo-pagina", "Caja"), h("p.subtitulo", "Todas las cajas de todas las bocas: aperturas, ajustes, cierres y movimientos.")),
-      h("div.pagina-acciones",
-        P.btn("Saldo de apertura", { tipo: "secundario", icono: "efectivo", onclick: function () { modalApertura(cajasOp, null, refrescar); } }),
-        P.btn("Ajuste de caja", { tipo: "primario", icono: "transferencia", onclick: function () { modalAjuste(cajasOp, null, refrescar); } }))));
+    c.appendChild(P.cabeceraConAcciones("Caja", "Todas las cajas de todas las bocas: aperturas, ajustes, cierres y movimientos.", [
+      P.btn("Saldo de apertura", { tipo: "secundario", icono: "efectivo", onclick: function () { modalApertura(cajasOp, null, refrescar); } }),
+      P.btn("Ajuste de caja", { tipo: "primario", icono: "transferencia", onclick: function () { modalAjuste(cajasOp, null, refrescar); } }),
+    ]));
     var tarjetas = h("div.grilla", { style: { gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))" } }, P.cargando());
     c.appendChild(tarjetas);
     var zonaTabla = h("div", { style: { marginTop: "18px" } });
@@ -237,8 +259,8 @@
     var tabla = null;
     function pintarTabla() {
       tabla = vista === "movimientos"
-        ? P.tabla({ listado: "caja", alClickFila: function (f) { if (f.cierre_id) P.verCierre(f.cierre_id); } })
-        : P.tabla({ listado: "cierres", alClickFila: function (f) { P.verCierre(f.id); } });
+        ? P.tabla({ listado: "caja", sinEtiquetaBuscar: true, alClickFila: function (f) { if (f.cierre_id) P.verCierre(f.cierre_id); } })
+        : P.tabla({ listado: "cierres", sinEtiquetaBuscar: true, alClickFila: function (f) { P.verCierre(f.id); } });
       P.reemplazar(zonaTabla, tabla.el);
     }
     function cargarTarjetas() {
@@ -247,15 +269,16 @@
         if (!r[0].cajas.length) { P.reemplazar(tarjetas, P.vacio("caja", "No hay cajas", "Creá las cajas de cada boca en Gestión > Bocas y cajas.")); return; }
         P.reemplazar(tarjetas, r[0].cajas.map(function (cj) {
           var ap = cj.apertura;
-          return h("div.hoja.hoja-cuerpo",
-            h("div.fila-separada", h("div", h("strong", cj.boca), h("div.texto-3.chico", cj.nombre)),
+          var cajaElegida = [{ valor: cj.id, texto: cj.boca + " · " + cj.nombre }];
+          return h("div.hoja.hoja-cuerpo.caja-tarjeta",
+            h("div.fila-separada", h("div", h("a.caja-enlace", { href: "#/caja/" + cj.id, "aria-label": "Ver " + cj.boca + " · " + cj.nombre }, h("strong", cj.boca)), h("div.texto-3.chico", cj.nombre)),
               !ap ? P.chip("Sin apertura", "VENCIDO") : ap.verificacion === "CORRECTO" ? P.chip("Apertura OK", "CORRECTO") : ap.verificacion === "NO_COINCIDE" ? P.chip("No coincide", "NO_COINCIDE") : P.chip("Sin confirmar", "PENDIENTE")),
             h("div.cifra-valor", { style: { fontSize: "24px" } }, P.f.pesos(cj.saldo)),
             h("div.texto-3.chico", cj.ventas_cantidad + " venta(s) · " + P.f.pesos(cj.ventas_total) + " desde el último cierre"),
             h("div.texto-3.chico", cj.turno ? "Atiende " + cj.turno.usuario_nombre + " desde " + P.f.hora(cj.turno.inicio) : "Sin turno abierto"),
             h("div.fila", { style: { marginTop: "12px", gap: "6px" } },
-              P.btn("Apertura", { tipo: "suave", chico: true, onclick: function () { modalApertura(cajasOp, cj.id, refrescar); } }),
-              P.btn("Ajuste", { tipo: "suave", chico: true, onclick: function () { modalAjuste(cajasOp, cj.id, refrescar); } }),
+              P.btn("Apertura", { tipo: "suave", chico: true, onclick: function () { modalApertura(cajaElegida, cj.id, refrescar); } }),
+              P.btn("Ajuste", { tipo: "suave", chico: true, onclick: function () { modalAjuste(cajaElegida, cj.id, refrescar); } }),
               P.modo === "local" ? P.btn("Cerrar", { tipo: "suave", chico: true, onclick: function () { P.cerrarCaja(cj.id, refrescar); } }) : null));
         }));
       });

@@ -21,10 +21,7 @@
     var ses = P.estado.sesion;
     var nombre = String(ses.usuario.nombre || "").replace(" (sistema general)", "").split(" ")[0];
     c.appendChild(h("div.pagina-cabecera",
-      h("div", h("h1.titulo-pagina", P.saludo() + ", " + nombre), h("p.subtitulo", "Hoy es " + fechaLarga() + ". Esto es lo que pasa en " + (ses.predio.nombre || "el predio") + ".")),
-      h("div.pagina-acciones",
-        P.modo === "local" ? P.btn("Vender", { tipo: "primario", icono: "vender", onclick: function () { P.ruta.ir("/vender"); } }) : null,
-        P.btn("Cargar compra", { tipo: "secundario", icono: "compras", onclick: function () { P.ruta.ir("/compras/nueva"); } }))));
+      h("div", h("h1.titulo-pagina", P.saludo() + ", " + nombre), h("p.subtitulo", "Hoy es " + fechaLarga() + ". Esto es lo que pasa en " + (ses.predio.nombre || "el predio") + "."))));
     var cifras = h("div.grilla.grilla-4");
     var izquierda = h("div.columna");
     var derecha = h("div.columna");

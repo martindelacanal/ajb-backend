@@ -21,7 +21,7 @@ const { crearAgente } = require("./lib/agente");
 const N = require("./lib/negocio");
 const { crearControlEquipo } = require("./lib/control-equipo");
 const { crearDescubrimiento } = require("./lib/descubrimiento");
-const { leerRuntime, invocarControl, migrarRuntime } = require("./lib/runtime");
+const { leerRuntime, invocarControl, migrarRuntime, prepararAccesoCaja } = require("./lib/runtime");
 const { leerTls, prepararTls } = require("./lib/tls-local");
 const { revisarPreciosVencidos } = require("./lib/precios");
 
@@ -581,7 +581,14 @@ servidor.listen(config.puerto, "0.0.0.0", () => {
   agente.iniciar();
   respaldoDiario();
   setInterval(respaldoDiario, 3 * 3600 * 1000).unref();
-  migrarRuntime(BASE, DIR_APP, log).then(() => actualizarHttps()).catch((e) => log(`Configuración de Windows: ${e.message}`));
+  migrarRuntime(BASE, DIR_APP, log).then(async (portable) => {
+    const seguro = await actualizarHttps();
+    if (portable) {
+      const direccion = seguro.activo ? "https://localhost:" + seguro.puerto : "http://localhost:" + config.puerto;
+      await prepararAccesoCaja(BASE, direccion);
+      log("Acceso de caja preparado en el escritorio compartido de esta notebook: Sistema del Camping - Caja (" + direccion + ").");
+    }
+  }).catch((e) => log(`Configuración de Windows: ${e.message}`));
   setInterval(() => actualizarHttps(), 6 * 3600 * 1000).unref();
   function revisarPrecios() {
     if (!controlEquipo.puedeEscribir()) return;

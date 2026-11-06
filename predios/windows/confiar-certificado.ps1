@@ -5,6 +5,7 @@
 param(
   [Parameter(Mandatory = $true)][string]$Certificado,
   [Parameter(Mandatory = $true)][string]$HuellaSha256,
+  [string]$DireccionCaja,
   [switch]$SoloVerificar,
   [switch]$Quitar
 )
@@ -49,5 +50,8 @@ try {
       }
     } elseif ($existentes.Count -eq 0) { $almacen.Add($cert) }
   } finally { $almacen.Close() }
+  if ($DireccionCaja -and -not $Quitar) {
+    & (Join-Path $PSScriptRoot 'configurar-acceso-caja.ps1') -Direccion $DireccionCaja
+  }
   [pscustomobject]@{ configurado = -not [bool]$Quitar; huella_sha256 = $huella; sujeto = $cert.Subject } | ConvertTo-Json -Compress
 } finally { $cert.Dispose() }

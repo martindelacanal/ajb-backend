@@ -124,9 +124,9 @@
     });
     c.appendChild(h("div.gestion-acciones",
       h("div.gestion-acciones-grupo",
-      P.btn("Modificar límites", { tipo: "secundario", icono: "descuento", onclick: function () { limitesMasivos(function () { t.recargar(); }); } }),
-      P.btn("Liquidaciones y deudas", { tipo: "secundario", icono: "planilla", onclick: function () { P.ruta.ir("/gestion/liquidaciones"); } }),
-      P.btn("Historial de límites", { tipo: "secundario", icono: "historial", onclick: function () { P.ruta.ir("/gestion/limites"); } })),
+      P.btn("Modificar límites", { tipo: "suave", chico: true, icono: "descuento", onclick: function () { limitesMasivos(function () { t.recargar(); }); } }),
+      P.btn("Liquidaciones y deudas", { tipo: "suave", chico: true, icono: "planilla", onclick: function () { P.ruta.ir("/gestion/liquidaciones"); } }),
+      P.btn("Historial de límites", { tipo: "suave", chico: true, icono: "historial", onclick: function () { P.ruta.ir("/gestion/limites"); } })),
       h("div.gestion-accion-nueva", P.btn("Nuevo afiliado", { tipo: "primario", icono: "mas", onclick: function () { formAfiliado({}, function () { t.recargar(); }); } }))));
     c.appendChild(t.el);
   }, { admin: true, titulo: "Afiliados" });

@@ -6,7 +6,7 @@
 
 const U = require("../util");
 const N = require("../negocio");
-const { exigirAdmin, esAdmin, bocasDe } = require("./comun");
+const { exigirAdmin, esAdmin, bocasDe, turnoDeCaja } = require("./comun");
 
 const CONCEPTOS_AJUSTE = ["CIERRE_CAJA", "INGRESO_DINERO", "RETIRO_DINERO", "OTROS"];
 
@@ -72,10 +72,11 @@ async function estado(ctx) {
   const apertura = await db.get("SELECT * FROM predio_apertura WHERE predio_id = ? AND caja_id = ? AND fecha = ?", [ctx.pid, cajaId, U.hoy()]);
   const resumen = await resumenAbierto(db, ctx, caja);
   let turno = null;
-  if (ctx.sesion?.turno_id && Number(ctx.sesion.caja_id) === cajaId) {
+  const turnoId = turnoDeCaja(ctx, cajaId);
+  if (turnoId) {
     turno = await db.get(
       `SELECT COUNT(*) AS cantidad, COALESCE(SUM(total), 0) AS total FROM predio_venta
-       WHERE predio_id = ? AND turno_id = ? AND estado = 'CONFIRMADA'`, [ctx.pid, ctx.sesion.turno_id]);
+       WHERE predio_id = ? AND turno_id = ? AND estado = 'CONFIRMADA'`, [ctx.pid, turnoId]);
     turno = { cantidad: Number(turno.cantidad), total: U.redondear(Number(turno.total), 2) };
   }
   return { caja, boca: boca ? { id: boca.id, nombre: boca.nombre } : null, apertura: apertura || null, resumen, turno };
@@ -184,6 +185,7 @@ async function cerrar(ctx) {
     if (!esAdmin(ctx) && Number(ctx.sesion?.caja_id) !== cajaId) throw U.error("Cerrá la caja en la que estás trabajando", 403);
     const r = await resumenAbierto(t, ctx, caja);
     const diferencia = U.redondear(contado - r.saldo_esperado, 2);
+    const turnoId = turnoDeCaja(ctx, cajaId);
     const retiro = U.redondear(contado - queda, 2);
     const ahora = U.fechaHora();
     const cierreId = await N.insertar(t, ctx, "predio_cierre", {
@@ -196,14 +198,14 @@ async function cerrar(ctx) {
       await N.insertar(t, ctx, "predio_caja_movimiento", {
         caja_id: cajaId, boca_id: caja.boca_id, fecha: ahora, concepto: "OTROS", tipo: diferencia > 0 ? "INGRESO" : "EGRESO",
         importe: Math.abs(diferencia), observaciones: `${diferencia > 0 ? "Sobrante" : "Faltante"} en el cierre N° ${cierreId}`,
-        cierre_id: cierreId, turno_id: ctx.sesion?.turno_id || null, usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
+        cierre_id: cierreId, turno_id: turnoId, usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
       });
     }
     if (retiro > 0) {
       await N.insertar(t, ctx, "predio_caja_movimiento", {
         caja_id: cajaId, boca_id: caja.boca_id, fecha: ahora, concepto: "CIERRE_CAJA", tipo: "EGRESO", importe: retiro,
         observaciones: `Retiro de la recaudación · cierre N° ${cierreId}`, cierre_id: cierreId,
-        turno_id: ctx.sesion?.turno_id || null, usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
+        turno_id: turnoId, usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
       });
     }
     await t.run("UPDATE predio_caja_movimiento SET cierre_id = ? WHERE predio_id = ? AND caja_id = ? AND cierre_id IS NULL", [cierreId, ctx.pid, cajaId]);

@@ -128,12 +128,17 @@ async function disponibleAfiliado(t, ctx, afiliadoId) {
   return { limite, pendiente, disponible: redondear(limite - pendiente), habilitado: Number(fila.habilitado_descuento) === 1 };
 }
 
+function turnoDeCaja(ctx, cajaId) {
+  return Number(ctx.sesion?.caja_id) === Number(cajaId) ? ctx.sesion?.turno_id || null : null;
+}
+
 module.exports = {
   esAdmin,
   exigirAdmin,
   bocasDe,
   exigirBoca,
   exigirPuesto,
+  turnoDeCaja,
   autorizar,
   claveCorrecta,
   validarClave,

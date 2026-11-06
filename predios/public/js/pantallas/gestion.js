@@ -226,10 +226,10 @@
     });
     c.appendChild(h("div.gestion-acciones",
       h("div.gestion-acciones-grupo",
-      P.btn("Administrar solicitudes", { tipo: "secundario", icono: "solicitud", onclick: function () { P.ruta.ir("/gestion/solicitudes"); } }),
-      P.btn("Traspasos entre bocas", { tipo: "secundario", icono: "traspaso", onclick: function () { P.formSolicitud("traspaso", function () { tabla.recargar(); }); } }),
-      P.btn("Bajar stock", { tipo: "secundario", icono: "baja", onclick: function () { P.formBaja(function () { tabla.recargar(); }); } }),
-      P.btn("Más", { tipo: "secundario", icono: "lista", onclick: function (ev) {
+      P.btn("Administrar solicitudes", { tipo: "suave", chico: true, icono: "solicitud", onclick: function () { P.ruta.ir("/gestion/solicitudes"); } }),
+      P.btn("Traspasos entre bocas", { tipo: "suave", chico: true, icono: "traspaso", onclick: function () { P.formSolicitud("traspaso", function () { tabla.recargar(); }); } }),
+      P.btn("Bajar stock", { tipo: "suave", chico: true, icono: "baja", onclick: function () { P.formBaja(function () { tabla.recargar(); }); } }),
+      P.btn("Más", { tipo: "suave", chico: true, icono: "lista", onclick: function (ev) {
         P.menuFlotante(ev.currentTarget, [
           { texto: "Stock por boca", icono: "stock", accion: function () { P.ruta.ir("/gestion/stock"); } },
           { texto: "Movimientos de stock", icono: "historial", accion: function () { P.ruta.ir("/gestion/movimientos"); } },
@@ -319,7 +319,7 @@
       seleccion: seleccionEliminar("proveedores"),
     });
     c.appendChild(h("div.gestion-acciones",
-      h("div.gestion-acciones-grupo", P.btn("Compras por proveedor", { tipo: "secundario", icono: "estadisticas", onclick: function () { P.cache["compras:vista"] = "compras"; P.ruta.ir("/compras"); } })),
+      h("div.gestion-acciones-grupo", P.btn("Compras por proveedor", { tipo: "suave", chico: true, icono: "estadisticas", onclick: function () { P.cache["compras:vista"] = "compras"; P.ruta.ir("/compras"); } })),
       h("div.gestion-accion-nueva", P.btn("Nuevo proveedor", { tipo: "primario", icono: "mas", onclick: function () { P.formProveedor({}, function () { t.recargar(); }); } }))));
     c.appendChild(t.el);
   }, { admin: true, titulo: "Proveedores" });
@@ -435,7 +435,7 @@
   }
 
   P.ruta.registrar(/^\/usuarios$/, function (c) {
-    var t = P.tabla({ listado: "usuarios", alClickFila: function (f) { formUsuario({ id: f.id }, function () { t.recargar(); }); } });
+    var t = P.tabla({ listado: "usuarios", sinEtiquetaBuscar: true, alClickFila: function (f) { formUsuario({ id: f.id }, function () { t.recargar(); }); } });
     c.appendChild(h("div.pagina-cabecera",
       h("div", h("h1.titulo-pagina", "Usuarios"), h("p.subtitulo", "Los usuarios del camping. Cada usuario de boca entra directo a la boca que tiene asignada.")),
       h("div.pagina-acciones", P.btn("Nuevo usuario", { tipo: "primario", icono: "mas", onclick: function () { formUsuario({}, function () { t.recargar(); }); } }))));

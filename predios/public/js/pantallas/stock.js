@@ -222,7 +222,7 @@
   P.ruta.registrar(/^\/stock$/, function (c) {
     var puesto = P.puesto() || {};
     c.appendChild(h("div.pagina-cabecera", h("div", h("h1.titulo-pagina", "Stock"), h("p.subtitulo", "Lo que figura en el sistema para tus bocas."))));
-    c.appendChild(P.tabla({ listado: "stock", claveEstado: "stock-cajero", filtrosIniciales: puesto.boca_id ? { boca: String(puesto.boca_id) } : {} }).el);
+    c.appendChild(P.tabla({ listado: "stock", claveEstado: "stock-cajero-" + (puesto.boca_id || "todas"), filtrosIniciales: puesto.boca_id ? { boca: String(puesto.boca_id) } : {} }).el);
   }, { titulo: "Stock" });
 
   // ------------------------------------------------------------------ mis ventas (cajero)
@@ -262,10 +262,29 @@
     }).catch(P.error);
   };
 
+  function tablaVentasCaja(clave, alcance, alError) {
+    var tabla = P.tabla({
+      listado: "ventas", claveEstado: clave, filtrosFijos: alcance, filtrosOcultos: ["boca", "caja", "usuario"],
+      columnasOcultas: ["boca"],
+      alClickFila: function (f) { P.verVenta(f.id, tabla.recargar); },
+      alError: alError,
+    });
+    return tabla;
+  }
+
+  P.ruta.registrar(/^\/caja\/(\d+)\/ventas$/, function (c, params) {
+    var cajaId = params[0];
+    return P.get("/cajas/" + cajaId).then(function (d) {
+      c.appendChild(h("div.pagina-cabecera", h("div",
+        h("a.volver", { href: "#/caja/" + cajaId }, P.icono("volver"), "Volver a la caja"),
+        h("h1.titulo-pagina", "Ventas de " + d.caja.nombre))));
+      c.appendChild(tablaVentasCaja("ventas-caja-" + cajaId, { f_caja: cajaId }).el);
+    });
+  }, { admin: true, titulo: "Ventas de la caja" });
+
   P.ruta.registrar(/^\/mis-ventas$/, function (c) {
     var ambito = "turno";
     var zona = h("div", { style: { marginTop: "14px" } });
-    var tabla = null;
     var selector = P.segmentado([{ valor: "turno", texto: "Mi turno" }, { valor: "caja", texto: "Todas las de la caja" }], ambito, function (v) {
       if (v === "caja" && !P.esAdmin()) {
         P.conAutorizacion("VER_VENTAS_CAJA", { detalle: "Ver todas las ventas de la caja" }, function (aut) { return P.post("/ventas/ver-caja", aut); })
@@ -276,21 +295,14 @@
       ambito = v;
       pintar();
     });
-    c.appendChild(h("div.pagina-cabecera", h("div", h("h1.titulo-pagina", "Mis ventas"), h("p.subtitulo", "Tocá una venta para ver el detalle, reimprimir el ticket o anularla."))));
+    c.appendChild(h("div.pagina-cabecera", h("div",
+      h("a.volver", { href: "#/mi-caja" }, P.icono("volver"), "Volver a la caja"),
+      h("h1.titulo-pagina", "Mis ventas"), h("p.subtitulo", "Tocá una venta para ver el detalle, reimprimir el ticket o anularla."))));
     c.appendChild(selector);
     c.appendChild(zona);
     function pintar() {
-      tabla = P.tabla({
-        listado: "ventas", claveEstado: "mis-ventas-" + ambito, filtrosFijos: { ambito: ambito }, filtrosOcultos: ["boca", "caja", "usuario"],
-        columnasOcultas: ["boca"],
-        alClickFila: function (f) { P.verVenta(f.id, function () { tabla.recargar(); }); },
-        acciones: function (f, recargar) {
-          return [
-            P.btn("", { tipo: "texto", chico: true, icono: "imprimir", etiqueta: "Reimprimir ticket", onclick: function () { P.reimprimirVenta(f.id); } }),
-            f.estado !== "ANULADA" ? P.btn("", { tipo: "texto", chico: true, icono: "borrar", etiqueta: "Anular", onclick: function () { P.anularVenta(f, recargar); } }) : null,
-          ];
-        },
-        alError: function (e) { if (e.codigo === "SIN_AUTORIZACION") { ambito = "turno"; selector.fijar("turno"); pintar(); } },
+      var tabla = tablaVentasCaja("mis-ventas-" + ambito, { ambito: ambito }, function (e) {
+        if (e.codigo === "SIN_AUTORIZACION") { ambito = "turno"; selector.fijar("turno"); pintar(); }
       });
       P.reemplazar(zona, tabla.el);
     }

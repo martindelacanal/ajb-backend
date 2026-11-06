@@ -215,7 +215,7 @@ $texto = @(
   "",
   "La primera es con el nombre de la notebook: no cambia aunque cambie la IP. Si en alguna PC no abre, usa la de numeros.",
   "El nombre se puede cambiar desde el sistema: Sistema > Direcciones para las PCs > Cambiar el nombre en la red.",
-  "Para imprimir directo en esta u otra PC: configura la tiquetera como predeterminada en Windows. En Elegir caja > Configurar impresion directa en esta PC, descarga y ejecuta el acceso. Luego usa Sistema del Camping - Caja.",
+  "En esta notebook, la instalacion crea Sistema del Camping - Caja en el escritorio. En cada PC de la red, la preparacion con certificados-PCs tambien crea ese acceso. La tiquetera debe ser la predeterminada de Windows.",
   "Para HTTPS sin avisos del navegador, copia certificados-PCs a cada PC y ejecuta la herramienta de confianza una vez. Nunca copies datos\tls: contiene claves privadas.",
   "Detener-servidor.bat desactiva el arranque automatico. Reiniciar-servidor.bat vuelve a habilitarlo. Configurar-arranque.bat permite elegir el inicio manual.",
   "Una instalacion nueva debe conectarse una vez a Mi AJB para registrar el equipo; despues funciona sin internet. Si hay otro servidor activo, usa su direccion.",
@@ -235,4 +235,5 @@ foreach ($d in $direcciones) { Write-Host "     $d" -ForegroundColor White }
 Write-Host ""
 Write-Host "  (Quedo anotado en el escritorio: 'Sistema del Camping - direcciones.txt')" -ForegroundColor Gray
 Write-Host ""
+& (Join-Path $Destino 'herramientas\configurar-acceso-caja.ps1') -Direccion $url
 Start-Process "$url/"

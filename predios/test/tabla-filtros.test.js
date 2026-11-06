@@ -55,7 +55,7 @@ function pantalla() {
     get: async ruta => {
       const meta = /^\/listados\/([^/?]+)\/meta$/.exec(ruta);
       if (meta) return listados.meta({ usuario: { rol: "ADMIN" } }, meta[1]);
-      solicitudes.push(ruta); return { filas: [], total: 0, pagina: 1, tam: 25, paginas: 1 };
+      solicitudes.push(ruta); return { filas: [], total: 0, pagina: 1, tam: Number(new URL(ruta, "http://fixture").searchParams.get("tam")), paginas: 1 };
     },
     opciones: async () => [{ valor: "7", texto: "Opción de prueba" }],
     descargar: async ruta => { descargas.push(ruta); }, aviso() {}, error(e) { throw e; },
@@ -72,13 +72,25 @@ const resolver = () => new Promise(resolve => setImmediate(resolve));
 test("todas las secciones comparten buscador y exportación fuera del panel cerrado con controles accesibles únicos", async () => {
   const s = pantalla();
   const ids = new Set();
-  for (const listado of ["caja", "cierres", "compras", "productos", "proveedores", "usuarios", "afiliados", "ventas", "ventas_productos"]) {
-    const t = s.P.tabla({ listado }); await resolver();
+  for (const listado of Object.keys(listados.LISTADOS)) {
+    const sinEtiquetaBuscar = ["caja", "cierres", "usuarios"].includes(listado);
+    const t = s.P.tabla({ listado, sinEtiquetaBuscar }); await resolver();
     const barra = t.el.querySelector(".tabla-barra"), panel = t.el.querySelector(".tabla-filtros"), boton = t.el.querySelector(".tabla-boton-filtros");
     assert.equal(panel.hidden, true, listado);
     assert.equal(boton.getAttribute("aria-expanded"), "false", listado);
     assert.equal(boton.getAttribute("aria-controls"), panel.id, listado);
-    assert.ok(barra.contains(t.el.querySelector(".tabla-buscar")), listado);
+    const request = new URL(s.solicitudes.at(-1), "http://fixture");
+    assert.equal(request.searchParams.get("tam"), "10", listado);
+    assert.equal([...request.searchParams.keys()].some(k => k.startsWith("f_")), false, listado);
+    assert.equal(t.el.querySelector(".tabla-filtros-numero").hidden, true, listado);
+    if (listados.meta({ usuario: { rol: "ADMIN" } }, listado).buscador) {
+      const campo = t.el.querySelector(".tabla-buscar");
+      assert.ok(barra.contains(campo), listado);
+      if (sinEtiquetaBuscar) {
+        assert.equal(campo.querySelector(".campo-etiqueta"), null, listado);
+        assert.match(campo.querySelector("input").getAttribute("aria-label"), /^Buscar en /);
+      }
+    }
     assert.ok(barra.contains(t.el.querySelector(".tabla-exportar")), listado);
     assert.equal(panel.contains(t.el.querySelector(".tabla-exportar")), false, listado);
     assert.equal(ids.has(panel.id), false); ids.add(panel.id);
@@ -89,13 +101,13 @@ test("cerrar filtros conserva valores, aplicación, contador y exportación CSV;
   const s = pantalla();
   const t = s.P.tabla({ listado: "usuarios" }); await resolver();
   const panel = t.el.querySelector(".tabla-filtros"), boton = t.el.querySelector(".tabla-boton-filtros");
-  assert.equal(t.el.querySelector(".tabla-filtros-numero").textContent, "1");
+  assert.equal(t.el.querySelector(".tabla-filtros-numero").textContent, "0");
   const consultas = s.solicitudes.length;
   boton.disparar("click");
   assert.equal(panel.hidden, false);
   assert.equal(boton.getAttribute("aria-expanded"), "true");
   const rol = panel.querySelector("select"); rol.value = "ADMIN"; rol.disparar("change"); await resolver();
-  assert.equal(t.el.querySelector(".tabla-filtros-numero").textContent, "2");
+  assert.equal(t.el.querySelector(".tabla-filtros-numero").textContent, "1");
   boton.disparar("click");
   assert.equal(panel.hidden, true);
   assert.equal(s.solicitudes.length, consultas + 1, "plegar no dispara consultas ni modifica la búsqueda");
@@ -103,12 +115,37 @@ test("cerrar filtros conserva valores, aplicación, contador y exportación CSV;
   s.menus.at(-1)[0].accion(); await resolver();
   const csv = new URL(s.descargas[0], "http://fixture");
   assert.equal(csv.searchParams.get("f_rol"), "ADMIN");
-  assert.equal(csv.searchParams.get("f_activo"), "1");
+  assert.equal(csv.searchParams.has("f_activo"), false);
   assert.equal(csv.searchParams.get("formato"), "csv");
   const otra = s.P.tabla({ listado: "usuarios" }); await resolver();
   assert.equal(otra.el.querySelector(".tabla-filtros").hidden, true);
   assert.equal(otra.el.querySelector(".tabla-filtros").querySelector("select").value, "ADMIN");
   assert.equal(otra.parametros().f_rol, "ADMIN");
+});
+
+test("la cantidad de filas que se elige se conserva para ese listado al volver", async () => {
+  const s = pantalla();
+  const tabla = s.P.tabla({ listado: "usuarios" }); await resolver();
+  const tam = tabla.el.querySelector(".paginador").querySelector("select");
+  tam.value = "25"; tam.disparar("change"); await resolver();
+  s.P.tabla({ listado: "usuarios" }); await resolver();
+  assert.equal(new URL(s.solicitudes.at(-1), "http://fixture").searchParams.get("tam"), "25");
+  s.P.tabla({ listado: "stock" }); await resolver();
+  assert.equal(new URL(s.solicitudes.at(-1), "http://fixture").searchParams.get("tam"), "10");
+});
+
+test("los filtros recordados no cambian la caja fija ni introducen un cajero oculto al consultar o exportar", async () => {
+  const s = pantalla();
+  s.P.cache["tabla:ventas-caja-7"] = { filtros: { caja: "9", usuario: "2", estado: "ANULADA" } };
+  const t = s.P.tabla({ listado: "ventas", claveEstado: "ventas-caja-7", filtrosFijos: { f_caja: "7" }, filtrosOcultos: ["caja", "usuario"] });
+  await resolver();
+  t.el.querySelector(".tabla-exportar").disparar("click"); s.menus.at(-1)[0].accion(); await resolver();
+  for (const ruta of [s.solicitudes.at(-1), s.descargas.at(-1)]) {
+    const params = new URL(ruta, "http://fixture").searchParams;
+    assert.equal(params.get("f_caja"), "7");
+    assert.equal(params.get("f_estado"), "ANULADA");
+    assert.equal(params.has("f_usuario"), false);
+  }
 });
 
 test("los filtros programáticos se aplican plegados y Enter busca el texto actual sin perderlo al exportar", async () => {

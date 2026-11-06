@@ -34,7 +34,6 @@
     var almacen = (ses.puestos || []).some(function (p) { return p.es_almacen; });
     return [
       puesto.caja_id ? { ruta: "/vender", texto: "Vender", icono: "vender" } : null,
-      puesto.caja_id ? { ruta: "/mis-ventas", texto: "Mis ventas", icono: "lista" } : null,
       { ruta: "/solicitudes", texto: "Solicitudes", icono: "solicitud", contador: "solicitudes" },
       { ruta: "/stock", texto: "Stock", icono: "stock" },
       puesto.caja_id ? { ruta: "/mi-caja", texto: "Caja", icono: "caja" } : null,
@@ -44,6 +43,7 @@
 
   function activo(ruta) {
     var actual = P.ruta.actual();
+    if (actual === "/mis-ventas" || actual === "/mi-caja") return ruta === (P.esAdmin() ? "/caja" : "/mi-caja");
     return actual === ruta || actual.indexOf(ruta + "/") === 0 || (ruta === "/gestion" && /^\/(afiliados|productos)/.test(actual));
   }
 

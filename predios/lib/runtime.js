@@ -59,4 +59,12 @@ async function migrarRuntime(base, dirApp, log = () => {}) {
   return true;
 }
 
-module.exports = { leerRuntime, escribirRuntime, invocarControl, migrarRuntime };
+function prepararAccesoCaja(base, direccion) {
+  const script = path.join(base, "herramientas", "configurar-acceso-caja.ps1");
+  return new Promise((resolve, reject) => {
+    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script, "-Direccion", direccion],
+      { windowsHide: true, timeout: 30000 }, (error) => error ? reject(error) : resolve());
+  });
+}
+
+module.exports = { leerRuntime, escribirRuntime, invocarControl, migrarRuntime, prepararAccesoCaja };

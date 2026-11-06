@@ -8,7 +8,7 @@ const N = require("../negocio");
 const { emitirAviso } = require("../avisos");
 const { autorizacionDescuento } = require("../autorizacion-descuento");
 const { FORMAS_PAGO } = require("../listados");
-const { esAdmin, bocasDe, exigirPuesto, exigirBoca, autorizar, disponibleAfiliado } = require("./comun");
+const { esAdmin, bocasDe, exigirPuesto, exigirBoca, autorizar, disponibleAfiliado, turnoDeCaja } = require("./comun");
 
 const FORMAS = FORMAS_PAGO.map((f) => f.valor);
 const MOVEDORES_STOCK = ["VENTA_DIRECTA"];
@@ -323,7 +323,7 @@ async function anularVenta(ctx) {
     if (v.forma_pago === "EFECTIVO" && Number(v.total) > 0) {
       await N.insertar(t, ctx, "predio_caja_movimiento", {
         caja_id: v.caja_id, boca_id: v.boca_id, fecha: U.fechaHora(), concepto: "ANULACION_VENTA", tipo: "EGRESO", importe: Number(v.total),
-        observaciones: `Anulación de la venta N° ${id}`, venta_id: id, turno_id: ctx.sesion?.turno_id || null,
+        observaciones: `Anulación de la venta N° ${id}`, venta_id: id, turno_id: turnoDeCaja(ctx, v.caja_id),
         usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
       });
     }

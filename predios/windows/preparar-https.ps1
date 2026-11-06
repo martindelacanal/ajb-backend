@@ -138,26 +138,33 @@ $publicos = Join-Path $baseAbsoluta 'certificados-PCs'
 New-Item -ItemType Directory -Path $publicos -Force | Out-Null
 Copy-Item -LiteralPath $publica -Destination (Join-Path $publicos 'autoridad.cer') -Force
 Copy-Item -LiteralPath $scriptConfianza -Destination (Join-Path $publicos 'confiar-certificado.ps1') -Force
+foreach ($archivo in @('configurar-acceso-caja.ps1','crear-acceso-pc-caja.bat')) {
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot $archivo) -Destination (Join-Path $publicos $archivo) -Force
+}
 $accesoConfianza = @'
 @echo off
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0confiar-certificado.ps1" -Certificado "%~dp0autoridad.cer" -HuellaSha256 __HUELLA__
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0confiar-certificado.ps1" -Certificado "%~dp0autoridad.cer" -HuellaSha256 __HUELLA__ -DireccionCaja "__ORIGEN__"
 set "resultado=%ERRORLEVEL%"
-if not "%resultado%"=="0" echo No se configuro el certificado. Ejecuta este archivo como administrador y revisa el mensaje anterior.
+if not "%resultado%"=="0" echo La preparacion de esta PC no termino. Ejecuta este archivo como administrador y revisa el mensaje anterior.
+if "%resultado%"=="0" echo PC preparada. Para trabajar en la caja, abri Sistema del Camping - Caja en el escritorio.
 pause
 exit /b %resultado%
 '@
-$accesoConfianza.Replace('__HUELLA__', $huella) | Set-Content -LiteralPath (Join-Path $publicos 'CONFIAR-EN-ESTA-PC.bat') -Encoding ASCII
+$origenCaja = "https://$($env:COMPUTERNAME.ToLowerInvariant()):$Puerto/"
+$accesoConfianza.Replace('__HUELLA__', $huella).Replace('__ORIGEN__', $origenCaja) -replace '\r?\n', [Environment]::NewLine | Set-Content -LiteralPath (Join-Path $publicos 'CONFIAR-EN-ESTA-PC.bat') -Encoding ASCII
 $instrucciones = @"
 HTTPS del predio - confianza en cada PC de la red
 
-Copia esta carpeta completa a la PC de caja. La carpeta contiene solamente la raiz publica.
+Copia esta carpeta completa a la PC de caja. Contiene la raiz publica y las herramientas de preparacion.
 Verifica en la notebook servidor que la huella SHA-256 sea:
 $huella
 
 Clic derecho en CONFIAR-EN-ESTA-PC.bat > Ejecutar como administrador.
-La herramienta comprobara la huella antes de instalar la confianza.
+La herramienta comprobara la huella, instalara la confianza y dejara
+"Sistema del Camping - Caja" en el escritorio de todos los usuarios.
 
-Despues usa https://$($env:COMPUTERNAME.ToLowerInvariant()):$Puerto/
+Para vender, abri ese acceso con la tiquetera como impresora predeterminada de Windows.
+Para documentos A4, usa $origenCaja desde el navegador habitual.
 La notebook renueva su certificado sin cambiar esta raiz de confianza.
 No copies datos\tls ni archivos PFX a otras PCs.
 "@

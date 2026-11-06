@@ -45,3 +45,30 @@ test("salir de caja cierra sólo el turno propio y conserva sesión sin caja ni 
   assert.equal((await db.get("SELECT COUNT(*) n FROM predio_caja_movimiento")).n, 0);
   assert.equal((await llamar(ctx, "GET", "/sesion")).puesto, null);
 });
+
+test("administrar otra caja conserva el turno del puesto y separa los movimientos de cada caja", async t => {
+  const { db, ctx, cajas: [propia, otra], llamar } = await escenario(t);
+  const turno = await N.insertar(db, ctx, "predio_turno", {
+    usuario_id: 1, caja_id: propia.id, boca_id: propia.boca_id, inicio: "2026-11-05 09:00:00", estado: "ABIERTO",
+  });
+  const admin = { ...ctx, sesion: { caja_id: propia.id, boca_id: propia.boca_id, turno_id: turno } };
+  await llamar(admin, "POST", "/caja/apertura", { caja_id: propia.id, importe: 100 });
+  await llamar(admin, "POST", "/caja/apertura", { caja_id: otra.id, importe: 200 });
+  const detalle = await llamar({ ...admin, query: { caja_id: otra.id } }, "GET", "/caja/estado");
+  assert.equal(detalle.caja.id, otra.id);
+  assert.equal(detalle.apertura.importe, 200);
+  assert.equal(detalle.turno, null);
+
+  const venta = await N.insertar(db, ctx, "predio_venta", {
+    boca_id: otra.boca_id, caja_id: otra.id, fecha: "2026-11-05 10:00:00", forma_pago: "EFECTIVO", estado: "CONFIRMADA", total: 10,
+  });
+  await llamar(admin, "POST", `/ventas/${venta}/anular`, { motivo: "Error de carga" });
+  await llamar(admin, "POST", "/caja/cierre", { caja_id: otra.id, efectivo_contado: 185, queda_en_caja: 40 });
+  const movimientos = await db.all("SELECT caja_id, turno_id FROM predio_caja_movimiento WHERE caja_id = ?", [otra.id]);
+  assert.equal(movimientos.length, 4);
+  assert.ok(movimientos.every(m => m.turno_id === null));
+  const listado = await llamar({ ...admin, query: { f_caja: otra.id } }, "GET", "/listados/caja");
+  assert.equal(listado.total, 4);
+  assert.equal((await llamar(admin, "GET", "/caja/estado")).resumen.saldo_esperado, 100);
+  assert.deepEqual(await db.all("SELECT id, estado FROM predio_turno"), [{ id: turno, estado: "ABIERTO" }]);
+});

@@ -3,21 +3,23 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("node:path");
+const fs = require("node:fs");
+const os = require("node:os");
 const { execFileSync } = require("node:child_process");
 const WINDOWS = process.platform === "win32";
 const SCRIPTS = path.join(__dirname, "..", "windows");
 
-function powershell(codigo) {
+function powershell(codigo, entorno = {}) {
   const script = "$ProgressPreference = 'SilentlyContinue'\n" + codigo;
   return execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], {
-    encoding: "utf8", env: { ...process.env, AJB_HTTPS_SCRIPTS: SCRIPTS }, timeout: 30000,
+    encoding: "utf8", env: { ...process.env, AJB_HTTPS_SCRIPTS: SCRIPTS, ...entorno }, timeout: 30000,
   }).trim();
 }
 
 test("los scripts HTTPS son compatibles con el parser de Windows PowerShell 5.1", { skip: !WINDOWS }, () => {
   const salida = powershell(`
     $ErrorActionPreference = 'Stop'
-    foreach ($archivo in @('preparar-https.ps1', 'confiar-certificado.ps1')) {
+    foreach ($archivo in @('preparar-https.ps1', 'confiar-certificado.ps1', 'configurar-acceso-caja.ps1')) {
       $tokens = $null; $errores = $null
       [Management.Automation.Language.Parser]::ParseFile((Join-Path $env:AJB_HTTPS_SCRIPTS $archivo), [ref]$tokens, [ref]$errores) | Out-Null
       if ($errores.Count) { throw ($errores | Out-String) }
@@ -25,6 +27,37 @@ test("los scripts HTTPS son compatibles con el parser de Windows PowerShell 5.1"
     Write-Output 'AST_OK'
   `);
   assert.equal(salida, "AST_OK");
+});
+
+test("la preparación instala y actualiza el acceso compartido sin abrir el navegador del instalador", { skip: !WINDOWS }, t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ajb-acceso-caja-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const salida = powershell(`
+    $ErrorActionPreference = 'Stop'
+    $tokens=$null; $errores=$null
+    $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $env:AJB_HTTPS_SCRIPTS 'configurar-acceso-caja.ps1'), [ref]$tokens, [ref]$errores)
+    foreach ($funcion in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+      . ([ScriptBlock]::Create($funcion.Extent.Text))
+    }
+    $plantilla = Get-Content (Join-Path $env:AJB_HTTPS_SCRIPTS 'crear-acceso-pc-caja.bat') -Raw
+    $programa = Join-Path $env:AJB_ACCESO_FIXTURE 'programa'
+    $escritorio = (New-Item -Path (Join-Path $env:AJB_ACCESO_FIXTURE 'escritorio') -ItemType Directory).FullName
+    foreach ($direccion in @('http://localhost:8080','https://camping:8443','https://camping:8443')) {
+      Set-AjbAccesoCaja (Get-AjbLanzadorCaja $direccion $plantilla) $programa $escritorio
+    }
+    $resultado = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $escritorio 'Sistema del Camping - Caja.lnk'))
+    $rechazo = $false
+    try { Get-AjbLanzadorCaja 'https://camping%PATH%' $plantilla | Out-Null } catch { $rechazo = $true }
+    @{destino=$resultado.TargetPath; argumentos=$resultado.Arguments; rechazo=$rechazo} | ConvertTo-Json -Compress
+  `, { AJB_ACCESO_FIXTURE: dir });
+  const r = JSON.parse(salida);
+  assert.equal(r.destino, path.join(dir, "programa", "abrir-caja.bat"));
+  assert.equal(r.argumentos, "--abrir");
+  assert.equal(r.rechazo, true);
+  const bat = fs.readFileSync(r.destino, "ascii");
+  assert.ok(bat.includes('set "AJB_DIRECCION=https://camping:8443/"'));
+  assert.ok(bat.includes("--kiosk-printing --use-system-default-printer"));
+  assert.ok(bat.includes('--user-data-dir=%LOCALAPPDATA%\\AJB-Predio\\Caja\\%%~nN'));
 });
 
 test("SAN incluye DNS e IP como tipos distintos, descarta direcciones invalidas y rechaza inyecciones", { skip: !WINDOWS }, () => {

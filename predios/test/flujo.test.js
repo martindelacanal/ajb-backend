@@ -212,6 +212,7 @@ test("flujo completo del camping", async () => {
     assert.ok(meta.columnas.length, n);
     const pagina = await ok("GET", `/listados/${n}?q=a&orden=${meta.columnas[0].clave}&dir=desc`, { token: admin });
     assert.ok(Array.isArray(pagina.filas), n);
+    assert.equal(pagina.tam, 10, n);
     const csv = await api("GET", `/listados/${n}?formato=csv`, { token: admin, crudo: true });
     assert.equal(csv.status, 200, n);
     for (const g of meta.resumen) {
@@ -222,6 +223,20 @@ test("flujo completo del camping", async () => {
   await ok("GET", `/listados/afiliado_consumos?f_afiliado=${af.id}`, { token: admin });
   const ventasCajero = await ok("GET", "/listados/ventas", { token: cajero });
   assert.ok(ventasCajero.total >= 2);
+  assert.ok(ventasCajero.filas.some(v => v.estado === "ANULADA" && v.id === qr.id));
+  assert.equal((await api("GET", "/listados/ventas?ambito=caja", { token: cajero })).status, 403);
+  const otroTurno = await ok("GET", "/listados/ventas?ambito=turno", { token: admin });
+  assert.equal(otroTurno.total, 0, "el administrador no atendió ninguna venta en ese turno");
+  const unaCaja = await ok("GET", `/listados/ventas?f_caja=${cajaProv}&tam=25`, { token: admin });
+  assert.equal(unaCaja.tam, 25);
+  assert.ok(unaCaja.filas.some(v => v.id === qr.id));
+  await ok("POST", `/compras/${compra.id}/anular`, { token: admin, cuerpo: { motivo: "Factura anulada" } });
+  for (const lista of ["compras", "compras_productos"]) {
+    const todo = await ok("GET", "/listados/" + lista, { token: admin });
+    assert.ok(todo.filas.some(f => f.estado === "ANULADA"), lista);
+    const cargadas = await ok("GET", "/listados/" + lista + "?f_estado=CARGADA", { token: admin });
+    assert.equal(cargadas.filas.some(f => f.estado === "ANULADA"), false, lista);
+  }
   const est = await ok("GET", "/estadisticas", { token: admin });
   assert.ok(est.kpi.ventas >= 2);
   await ok("GET", "/inicio", { token: admin });

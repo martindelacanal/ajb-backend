@@ -182,7 +182,7 @@ L.productos = {
         { valor: "nuevo", texto: "Cargados en este sistema", sql: `COALESCE(p.creado_por, '') <> '${IMPORTADOR}'` },
       ],
     },
-    { clave: "activo", titulo: "Estado", tipo: "opciones", expr: "p.activo", opciones: [{ valor: "1", texto: "Activos" }, { valor: "0", texto: "Dados de baja" }], defecto: "1" },
+    { clave: "activo", titulo: "Estado", tipo: "opciones", expr: "p.activo", opciones: [{ valor: "1", texto: "Activos" }, { valor: "0", texto: "Dados de baja" }] },
   ],
   orden: { clave: "nombre", dir: "asc" },
   resumen: {
@@ -228,7 +228,6 @@ L.stock = {
         { valor: "sin", texto: "En cero", sql: "s.cantidad = 0" },
         { valor: "negativo", texto: "Negativo (revisar)", sql: "s.cantidad < 0" },
       ],
-      defecto: "con",
     },
   ],
   orden: { clave: "producto", dir: "asc" },
@@ -280,10 +279,13 @@ L.proveedores = {
         { valor: "nuevo", texto: "Cargados en este sistema", sql: `COALESCE(pr.creado_por, '') <> '${IMPORTADOR}'` },
       ],
     },
-    { clave: "activo", titulo: "Estado", tipo: "opciones", expr: "pr.activo", opciones: [{ valor: "1", texto: "Activos" }, { valor: "0", texto: "Dados de baja" }], defecto: "1" },
+    { clave: "activo", titulo: "Estado", tipo: "opciones", expr: "pr.activo", opciones: [{ valor: "1", texto: "Activos" }, { valor: "0", texto: "Dados de baja" }] },
   ],
   orden: { clave: "razon_social", dir: "asc" },
 };
+
+const columnaEstadoCompra = { clave: "estado", titulo: "Estado", expr: "c.estado", tipo: "opcion", opciones: [{ valor: "CARGADA", texto: "Cargada" }, { valor: "ANULADA", texto: "Anulada" }] };
+const filtroEstadoCompra = { clave: "estado", titulo: "Estado", tipo: "opciones", expr: "c.estado", opciones: [{ valor: "CARGADA", texto: "Cargadas" }, { valor: "ANULADA", texto: "Anuladas" }] };
 
 L.compras = {
   titulo: "Compras",
@@ -301,7 +303,7 @@ L.compras = {
     { clave: "fecha_remito", titulo: "Fecha remito", expr: "c.fecha_remito", tipo: "date", oculta: true },
     { clave: "items", titulo: "Productos", expr: "COALESCE(it.items, 0)", tipo: "int" },
     { clave: "total", titulo: "Total", expr: "c.total_items", tipo: "money" },
-    { clave: "estado", titulo: "Estado", expr: "c.estado", tipo: "opcion", opciones: [{ valor: "CARGADA", texto: "Cargada" }, { valor: "ANULADA", texto: "Anulada" }] },
+    columnaEstadoCompra,
     { clave: "creado_por", titulo: "Cargó", expr: "c.creado_por" },
     { clave: "fecha_creacion", titulo: "Fecha de carga", expr: "c.fecha_creacion", tipo: "dt" },
   ],
@@ -309,7 +311,7 @@ L.compras = {
     { clave: "proveedor", titulo: "Proveedor", tipo: "id", expr: "c.proveedor_id", fuente: "proveedores" },
     { clave: "desde", titulo: "Desde", tipo: "desde", expr: "c.fecha_factura" },
     { clave: "hasta", titulo: "Hasta", tipo: "hasta", expr: "c.fecha_factura" },
-    { clave: "estado", titulo: "Estado", tipo: "opciones", expr: "c.estado", opciones: [{ valor: "CARGADA", texto: "Cargadas" }, { valor: "ANULADA", texto: "Anuladas" }], defecto: "CARGADA" },
+    filtroEstadoCompra,
   ],
   orden: { clave: "id", dir: "desc" },
   totales: [{ clave: "total", expr: "SUM(c.total_items)" }, { clave: "items", expr: "SUM(COALESCE(it.items, 0))" }],
@@ -332,7 +334,7 @@ L.compras_productos = {
     JOIN predio_compra c ON c.predio_id = i.predio_id AND c.id = i.compra_id
     JOIN predio_proveedor pr ON pr.predio_id = c.predio_id AND pr.id = c.proveedor_id
     JOIN predio_producto p ON p.predio_id = i.predio_id AND p.id = i.producto_id`,
-  where: "i.predio_id = :pid AND c.estado = 'CARGADA'",
+  where: "i.predio_id = :pid",
   columnas: [
     { clave: "compra_id", titulo: "Compra", expr: "c.id", tipo: "int" },
     { clave: "fecha_factura", titulo: "Fecha", expr: "c.fecha_factura", tipo: "date" },
@@ -342,10 +344,12 @@ L.compras_productos = {
     { clave: "precio_unitario", titulo: "Unitario", expr: "i.precio_unitario", tipo: "money" },
     { clave: "precio_anterior", titulo: "Anterior", expr: "i.precio_anterior", tipo: "money" },
     { clave: "subtotal", titulo: "Total", expr: "i.subtotal", tipo: "money" },
+    columnaEstadoCompra,
   ],
   filtros: [
     { clave: "proveedor", titulo: "Proveedor", tipo: "id", expr: "c.proveedor_id", fuente: "proveedores" },
     { clave: "producto", titulo: "Producto", tipo: "id", expr: "i.producto_id", fuente: "productos" },
+    filtroEstadoCompra,
     { clave: "desde", titulo: "Desde", tipo: "desde", expr: "c.fecha_factura" },
     { clave: "hasta", titulo: "Hasta", tipo: "hasta", expr: "c.fecha_factura" },
   ],
@@ -522,10 +526,11 @@ L.ventas = {
     LEFT JOIN (SELECT venta_id, COUNT(*) AS items, SUM(cantidad) AS unidades FROM predio_venta_item WHERE predio_id = :pid GROUP BY venta_id) it ON it.venta_id = v.id`,
   where: "v.predio_id = :pid",
   alcance: (ctx, query) => {
-    if (esAdmin(ctx)) return null;
-    // El cajero ve las ventas de su sesión; con autorización, todas las de su caja.
+    const admin = esAdmin(ctx);
+    // Sólo el listado general del administrador abarca otras cajas.
+    if (admin && !query?.ambito) return null;
     const sesion = ctx.sesion || {};
-    if (query && query.ambito === "caja" && ctx.verVentasCaja) {
+    if (query?.ambito === "caja" && (admin || ctx.verVentasCaja)) {
       return { sql: "v.caja_id = ?", params: [sesion.caja_id || -1] };
     }
     return { sql: "v.turno_id = ?", params: [sesion.turno_id || -1] };
@@ -550,7 +555,7 @@ L.ventas = {
     { clave: "boca", titulo: "Boca", tipo: "id", expr: "v.boca_id", fuente: "bocas_venta" },
     { clave: "caja", titulo: "Caja", tipo: "id", expr: "v.caja_id", fuente: "cajas" },
     { clave: "forma_pago", titulo: "Forma de pago", tipo: "opciones", expr: "v.forma_pago", opciones: FORMAS_PAGO },
-    { clave: "estado", titulo: "Estado", tipo: "opciones", expr: "v.estado", opciones: [{ valor: "CONFIRMADA", texto: "Confirmadas" }, { valor: "ANULADA", texto: "Anuladas" }], defecto: "CONFIRMADA" },
+    { clave: "estado", titulo: "Estado", tipo: "opciones", expr: "v.estado", opciones: [{ valor: "CONFIRMADA", texto: "Confirmadas" }, { valor: "ANULADA", texto: "Anuladas" }] },
     {
       clave: "afiliado", titulo: "Comprador", tipo: "opciones",
       opciones: [{ valor: "si", texto: "Afiliados", sql: "v.afiliado_id IS NOT NULL" }, { valor: "no", texto: "No afiliados", sql: "v.afiliado_id IS NULL" }],
@@ -812,7 +817,7 @@ L.afiliado_consumos = {
   filtros: [
     { clave: "afiliado", titulo: "Afiliado", tipo: "id", expr: "v.afiliado_id", oculto: true },
     { clave: "forma_pago", titulo: "Forma de pago", tipo: "opciones", expr: "v.forma_pago", opciones: FORMAS_PAGO },
-    { clave: "estado", titulo: "Estado", tipo: "opciones", expr: "v.estado", opciones: [{ valor: "CONFIRMADA", texto: "Confirmadas" }, { valor: "ANULADA", texto: "Anuladas" }], defecto: "CONFIRMADA" },
+    { clave: "estado", titulo: "Estado", tipo: "opciones", expr: "v.estado", opciones: [{ valor: "CONFIRMADA", texto: "Confirmadas" }, { valor: "ANULADA", texto: "Anuladas" }] },
     {
       clave: "liquidada", titulo: "Liquidación", tipo: "opciones",
       opciones: [{ valor: "no", texto: "Sin liquidar", sql: "v.liquidacion_id IS NULL" }, { valor: "si", texto: "Liquidadas", sql: "v.liquidacion_id IS NOT NULL" }],
@@ -891,7 +896,7 @@ L.usuarios = {
   ],
   filtros: [
     { clave: "rol", titulo: "Rol", tipo: "opciones", expr: "u.rol", opciones: [{ valor: "ADMIN", texto: "Administradores" }, { valor: "CAJERO", texto: "Usuarios de boca" }] },
-    { clave: "activo", titulo: "Estado", tipo: "opciones", expr: "u.activo", opciones: [{ valor: "1", texto: "Activos" }, { valor: "0", texto: "Deshabilitados" }], defecto: "1" },
+    { clave: "activo", titulo: "Estado", tipo: "opciones", expr: "u.activo", opciones: [{ valor: "1", texto: "Activos" }, { valor: "0", texto: "Deshabilitados" }] },
   ],
   orden: { clave: "nombre", dir: "asc" },
 };
@@ -920,7 +925,7 @@ L.bocas = {
         { valor: "ambos", texto: "Origen y destino", sql: "b.es_origen = 1 AND b.es_destino = 1" },
       ],
     },
-    { clave: "activo", titulo: "Estado", tipo: "opciones", expr: "b.activo", opciones: [{ valor: "1", texto: "Activas" }, { valor: "0", texto: "Inactivas" }], defecto: "1" },
+    { clave: "activo", titulo: "Estado", tipo: "opciones", expr: "b.activo", opciones: [{ valor: "1", texto: "Activas" }, { valor: "0", texto: "Inactivas" }] },
   ],
   orden: { clave: "nombre", dir: "asc" },
 };
@@ -943,7 +948,7 @@ L.cajas = {
   ],
   filtros: [
     { clave: "boca", titulo: "Boca", tipo: "id", expr: "c.boca_id", fuente: "bocas" },
-    { clave: "activo", titulo: "Estado", tipo: "opciones", expr: "c.activo", opciones: [{ valor: "1", texto: "Activas" }, { valor: "0", texto: "Inactivas" }], defecto: "1" },
+    { clave: "activo", titulo: "Estado", tipo: "opciones", expr: "c.activo", opciones: [{ valor: "1", texto: "Activas" }, { valor: "0", texto: "Inactivas" }] },
   ],
   orden: { clave: "boca", dir: "asc" },
 };
@@ -1073,7 +1078,6 @@ function construirWhere(def, ctx, query, db) {
 
   for (const f of def.filtros || []) {
     let valor = query[`f_${f.clave}`];
-    if ((valor === undefined || valor === null) && f.defecto !== undefined) valor = f.defecto;
     if (valor === undefined || valor === null || valor === "" || valor === "todos") continue;
     valor = String(valor);
     if (f.tipo === "opciones") {
@@ -1158,7 +1162,7 @@ async function ejecutar(ctx, nombre, query = {}) {
     };
   }
 
-  const tam = Math.min(200, Math.max(5, Number(query.tam) || 25));
+  const tam = Math.min(200, Math.max(5, Number(query.tam) || 10));
   const pagina = Math.max(1, Number(query.pagina) || 1);
   const conteo = await db.get(`SELECT COUNT(*) AS n FROM ${fromSql} WHERE ${where}`, [...valoresFrom, ...valores]);
   const total = Number(conteo?.n || 0);
@@ -1280,7 +1284,7 @@ function meta(ctx, nombre) {
       opciones: c.opciones ? c.opciones.map((o) => ({ valor: o.valor, texto: o.texto })) : undefined,
     })),
     filtros: (def.filtros || []).filter((f) => !f.oculto).map((f) => ({
-      clave: f.clave, titulo: f.titulo, tipo: f.tipo, fuente: f.fuente, defecto: f.defecto,
+      clave: f.clave, titulo: f.titulo, tipo: f.tipo, fuente: f.fuente,
       opciones: f.opciones ? f.opciones.map((o) => ({ valor: o.valor, texto: o.texto })) : undefined,
     })),
     orden: def.orden,

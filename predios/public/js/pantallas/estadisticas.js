@@ -48,8 +48,7 @@
     botonPeriodo.setAttribute("aria-expanded", "false");
     filtrosPeriodo.setAttribute("role", "region");
     filtrosPeriodo.setAttribute("aria-labelledby", botonPeriodo.id);
-    c.appendChild(h("div.pagina-cabecera",
-      h("div", h("h1.titulo-pagina", "Estadísticas"), h("p.subtitulo", "Cómo vienen las ventas, las compras y el stock del predio.")), botonPeriodo));
+    c.appendChild(P.cabeceraConAcciones("Estadísticas", "Cómo vienen las ventas, las compras y el stock del predio.", botonPeriodo));
     c.appendChild(filtrosPeriodo);
     [desde, hasta, boca].forEach(function (el) { el.addEventListener("change", cargar); });
     var cifras = h("div.grilla.grilla-4", P.cargando());

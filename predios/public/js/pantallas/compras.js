@@ -44,9 +44,8 @@
   };
 
   P.ruta.registrar(/^\/compras$/, function (c) {
-    c.appendChild(h("div.pagina-cabecera",
-      h("div", h("h1.titulo-pagina", "Compras"), h("p.subtitulo", "Una compra por factura. Lo comprado entra al almacén y actualiza el precio de cada producto.")),
-      h("div.pagina-acciones", puedeComprar() ? P.btn("Cargar compra", { tipo: "primario", icono: "mas", onclick: function () { P.ruta.ir("/compras/nueva"); } }) : null)));
+    c.appendChild(P.cabeceraConAcciones("Compras", "Una compra por factura. Lo comprado entra al almacén y actualiza el precio de cada producto.",
+      puedeComprar() ? P.btn("Cargar compra", { tipo: "primario", icono: "mas", onclick: function () { P.ruta.ir("/compras/nueva"); } }) : null));
     var vista = P.cache["compras:vista"] || "compras";
     var zona = h("div", { style: { marginTop: "14px" } });
     c.appendChild(P.segmentado([{ valor: "compras", texto: "Compras" }, { valor: "productos", texto: "Compras por producto" }], vista, function (v) { vista = v; P.cache["compras:vista"] = v; pintar(); }));

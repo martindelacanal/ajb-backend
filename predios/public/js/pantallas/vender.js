@@ -42,12 +42,10 @@
         P.esAdmin() ? P.btn("Salir de caja", { tipo: "secundario", icono: "salir", onclick: function (ev) { P.ejecutar(ev.currentTarget, P.salirDeCaja).catch(function () {}); } }) : null),
       h("p.subtitulo", puesto.boca + " · " + puesto.caja, turno)));
     c.appendChild(h("nav.vender-acciones", { "aria-label": "Acciones de caja" },
-      P.btn("Mis ventas", { tipo: "suave", chico: true, icono: "lista", onclick: function () { P.ruta.ir("/mis-ventas"); } }),
       P.btn("Reimprimir último", { tipo: "suave", chico: true, icono: "imprimir", onclick: function () {
-        if (!ultimaVenta) { P.aviso("Todavía no hiciste ventas en esta caja desde esta PC. Buscalas en Mis ventas.", "error"); return; }
+        if (!ultimaVenta) { P.aviso("Todavía no hiciste ventas en esta caja desde esta PC. Buscalas en Caja > Mis ventas.", "error"); return; }
         P.reimprimirVenta(ultimaVenta);
       } }),
-      P.btn("Anular venta", { tipo: "suave", chico: true, icono: "borrar", onclick: function () { P.ruta.ir("/mis-ventas"); } }),
       P.btn("Stock", { tipo: "suave", chico: true, icono: "stock", onclick: function () { P.ruta.ir("/stock"); } }),
       P.btn("Caja", { tipo: "suave", chico: true, icono: "caja", onclick: function () { P.ruta.ir("/mi-caja"); } }),
         P.btn("Vaciar", { tipo: "texto", chico: true, icono: "borrar", onclick: function () {

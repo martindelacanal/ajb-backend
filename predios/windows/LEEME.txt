@@ -35,7 +35,9 @@ la direccion y la huella SHA-256. En cada PC de caja, una sola vez:
 1. Copia la carpeta certificados-PCs completa desde la notebook servidor.
 2. Comproba que la huella de LEEME.txt coincida con la de Sistema en la notebook.
 3. Clic derecho en CONFIAR-EN-ESTA-PC.bat > Ejecutar como administrador.
-4. Reabri el navegador y usa la direccion HTTPS que muestra Sistema.
+4. La preparación deja «Sistema del Camping - Caja» en el escritorio para todos
+   los usuarios. En PCs preparadas con un paquete anterior, administración puede
+   volver a ejecutar el paso 3 con la carpeta actualizada de la notebook.
 No copies datos/tls: contiene las claves privadas del servidor.
 
 UN SOLO SERVIDOR POR PREDIO
@@ -48,15 +50,16 @@ consulta para evitar que dos PCs modifiquen bases distintas del mismo predio.
 EN CADA PC DE LAS BOCAS (comedor, confitería, proveeduría, etc.)
 -----------------------------------------------------------------
 - Abrí el navegador (Chrome, Edge o Firefox) y entrá a la dirección del punto 4.
-- Para imprimir directo, elegí la tiquetera como impresora predeterminada en Windows.
-  En sus preferencias elegí el ancho del rollo que usa la caja (58 u 80 mm).
-  Desde Elegir caja > Configurar impresión directa en esta PC, descargá el acceso y
-  ejecutalo una vez con el usuario de caja. También sirve en la notebook servidor.
-  Podés hacerlo antes de empezar el turno o después de salir de la sesión anterior.
-  Se abre "Sistema del Camping - Caja". Ingresá y elegí tu boca y caja la primera vez.
-  Abrí siempre ese acceso del escritorio para imprimir los tickets sin elegir impresora.
-  Para documentos A4, entrá por el navegador habitual. Si hace falta usar un pendrive,
-  copiá herramientas\crear-acceso-pc-caja.bat del instalador y escribí la dirección del predio.
+- Para cobrar, usá «Sistema del Camping - Caja» con Chrome o Edge instalado.
+  Al abrirlo usa el perfil del operador y envía los tickets a la impresora predeterminada
+  de Windows. Administración debe dejar allí la tiquetera y configurar el ancho del rollo
+  (58 u 80 mm). Para documentos A4, entrá desde el navegador habitual.
+- La notebook servidor crea ese acceso al instalarse o actualizarse. En las demás PCs lo
+  crea administración al ejecutar la herramienta de la carpeta certificados-PCs. Si la red
+  sólo usa HTTP, administración puede copiar configurar-acceso-caja.ps1 y crear-acceso-pc-caja.bat
+  desde herramientas a una carpeta en el puesto y, desde esa carpeta, ejecutar en PowerShell
+  como administrador: .\configurar-acceso-caja.ps1 -Direccion http://camping:8080
+  Reemplazá la dirección del ejemplo por la de la notebook.
 - En Windows 8 o con navegadores viejos: instalá Chrome 109 o Firefox ESR 115
   (las últimas versiones que soportan Windows 7 y 8). Internet Explorer no sirve.
 
