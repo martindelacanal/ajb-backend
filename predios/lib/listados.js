@@ -133,7 +133,6 @@ L.productos = {
     { clave: "destino", titulo: "Destino", expr: "p.destino", tipo: "opcion", opciones: DESTINOS },
     { clave: "perecedero", titulo: "Perecedero", expr: "p.perecedero", tipo: "bool" },
     { clave: "fecha_caducidad", titulo: "Caducidad", expr: "p.fecha_caducidad", tipo: "date" },
-    { clave: "almacen", titulo: "En almacén", expr: "COALESCE(sa.cantidad, 0)", tipo: "qty" },
     { clave: "activo", titulo: "Activo", expr: "p.activo", tipo: "bool", oculta: true },
     { clave: "fecha_modificacion", titulo: "Modificado", expr: "p.fecha_modificacion", tipo: "dt", oculta: true },
   ],
@@ -176,7 +175,8 @@ L.productos = {
       ],
     },
     {
-      clave: "origen", titulo: "Origen", tipo: "opciones",
+      // Se conserva para las herramientas de importación y selección masiva, fuera de la tabla.
+      clave: "origen", titulo: "Origen", tipo: "opciones", oculto: true,
       opciones: [
         { valor: "importado", texto: "Del sistema anterior", sql: `p.creado_por = '${IMPORTADOR}'` },
         { valor: "nuevo", texto: "Cargados en este sistema", sql: `COALESCE(p.creado_por, '') <> '${IMPORTADOR}'` },
@@ -695,7 +695,7 @@ L.cierres = {
   where: "ci.predio_id = :pid",
   alcance: alcanceBocas("ci.boca_id"),
   columnas: [
-    { clave: "id", titulo: "ID cierre", expr: "ci.id", tipo: "int" },
+    { clave: "id", titulo: "ID", expr: "ci.id", tipo: "int" },
     { clave: "fecha", titulo: "Fecha", expr: "ci.fecha", tipo: "dt" },
     { clave: "boca", titulo: "Boca", expr: "b.nombre" },
     { clave: "caja", titulo: "Caja", expr: "c.nombre" },
@@ -706,6 +706,7 @@ L.cierres = {
     { clave: "efectivo_contado", titulo: "Contado", expr: "ci.efectivo_contado", tipo: "money" },
     { clave: "diferencia", titulo: "Diferencia", expr: "ci.diferencia", tipo: "money", signo: true },
     { clave: "retiro", titulo: "Retiro", expr: "ci.retiro", tipo: "money" },
+    { clave: "saldo", titulo: "Saldo", expr: "ci.queda_en_caja", tipo: "money" },
   ],
   filtros: [
     { clave: "boca", titulo: "Boca", tipo: "id", expr: "ci.boca_id", fuente: "bocas_venta" },
@@ -912,7 +913,6 @@ L.bocas = {
     { clave: "nombre", titulo: "Boca", expr: "b.nombre", buscar: true },
     { clave: "es_origen", titulo: "Origen", expr: "b.es_origen", tipo: "bool" },
     { clave: "es_destino", titulo: "Destino", expr: "b.es_destino", tipo: "bool" },
-    { clave: "es_almacen", titulo: "Almacén", expr: "b.es_almacen", tipo: "bool" },
     { clave: "cajas", titulo: "Cajas", expr: "COALESCE(c.cajas, 0)", tipo: "int" },
     { clave: "activo", titulo: "Activa", expr: "b.activo", tipo: "bool" },
   ],

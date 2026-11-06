@@ -45,6 +45,38 @@ async function listarAvisos(ctx) {
   });
 }
 
+function presentarAviso(a) {
+  let detalle = null;
+  try { detalle = a.detalle ? JSON.parse(a.detalle) : null; } catch (_e) { /* aviso anterior */ }
+  return {
+    id: a.id, tipo: a.tipo, titulo: a.titulo, mensaje: a.mensaje, fecha: a.fecha, detalle,
+    leido: !!a.leido_fecha, leido_fecha: a.leido_fecha || null, resuelto_fecha: a.resuelto_fecha || null,
+  };
+}
+
+// Conserva los avisos leídos y resueltos. La misma selección de destinatario se
+// aplica a los datos, la paginación y el contador; nunca depende del navegador.
+async function historialAvisos(ctx, opciones = ctx.query || {}) {
+  const d = await destinatarioSql(ctx);
+  const paginaPedida = Number(opciones.pagina);
+  const pagina = Number.isSafeInteger(paginaPedida) && paginaPedida > 0 ? Math.min(paginaPedida, 1000000) : 1;
+  const tam = [10, 20, 50].includes(Number(opciones.tam)) ? Number(opciones.tam) : 20;
+  const estado = ["no_leidos", "leidos"].includes(opciones.estado) ? opciones.estado : "todos";
+  const estadoSql = estado === "no_leidos" ? " AND l.id IS NULL" : estado === "leidos" ? " AND l.id IS NOT NULL" : "";
+  const base = `FROM predio_aviso a
+    LEFT JOIN predio_aviso_lectura l ON l.predio_id = a.predio_id AND l.aviso_id = a.id AND l.usuario_id = ?
+    WHERE a.predio_id = ? AND ${d.sql}${estadoSql}`;
+  const params = [ctx.usuario.id, ctx.pid, ...d.params];
+  const cuenta = await ctx.db.get(`SELECT COUNT(*) AS total,
+    COALESCE(SUM(CASE WHEN l.id IS NULL AND a.resuelto_fecha IS NULL THEN 1 ELSE 0 END), 0) AS no_leidas ${base}`, params);
+  const total = Number(cuenta.total);
+  const paginas = Math.max(1, Math.ceil(total / tam));
+  const actual = Math.min(pagina, paginas);
+  const filas = await ctx.db.all(`SELECT a.*, l.fecha AS leido_fecha ${base}
+    ORDER BY a.id DESC LIMIT ${tam} OFFSET ${(actual - 1) * tam}`, params);
+  return { filas: filas.map(presentarAviso), total, no_leidas: Number(cuenta.no_leidas), pagina: actual, tam, paginas };
+}
+
 async function leerAviso(ctx) {
   const id = U.id(ctx.params.id, "El aviso");
   const d = await destinatarioSql(ctx);
@@ -57,4 +89,4 @@ async function leerAviso(ctx) {
   });
 }
 
-module.exports = { emitirAviso, listarAvisos, leerAviso };
+module.exports = { emitirAviso, listarAvisos, historialAvisos, leerAviso };

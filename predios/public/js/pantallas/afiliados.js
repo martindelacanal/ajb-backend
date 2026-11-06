@@ -83,7 +83,7 @@
       ancho: "ancha",
       contenido: h("div.columna",
         h("div.grilla.grilla-2", P.campo("Límite actual", h("div.fila", { style: { flexWrap: "nowrap", gap: "6px" } }, op, monto)), P.campo("Ubicación", ubicacion)),
-        h("div.grilla.grilla-2", P.campo("Con estadía desde", desde), P.campo("Hasta", hasta)),
+        h("div.filtro-rango-fechas", { role: "group", "aria-label": "Fechas de estadía" }, P.campo("Con estadía desde", desde), P.campo("Hasta", hasta)),
         h("div.grilla.grilla-2", P.campo("Departamental", departamental), P.campo("Origen", origen)),
         P.campo("Nuevo límite", h("div.campo-con-prefijo.campo-grande", h("span", "$"), nuevo), { requerido: true }),
         vista),

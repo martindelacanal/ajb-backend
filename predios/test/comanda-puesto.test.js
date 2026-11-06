@@ -69,6 +69,13 @@ test("administrar otra caja conserva el turno del puesto y separa los movimiento
   assert.ok(movimientos.every(m => m.turno_id === null));
   const listado = await llamar({ ...admin, query: { f_caja: otra.id } }, "GET", "/listados/caja");
   assert.equal(listado.total, 4);
+  const cierres = await llamar({ ...admin, query: { f_caja: otra.id } }, "GET", "/listados/cierres");
+  assert.equal(cierres.filas[0].saldo, 40, "el saldo es el efectivo que quedó, después del retiro");
+  assert.equal(cierres.filas[0].efectivo_contado, 185);
+  assert.equal(cierres.filas[0].retiro, 145);
+  const metaCierres = await llamar(admin, "GET", "/listados/cierres/meta");
+  assert.equal(metaCierres.columnas[0].titulo, "ID");
+  assert.equal(metaCierres.columnas.find(c => c.clave === "saldo").titulo, "Saldo");
   assert.equal((await llamar(admin, "GET", "/caja/estado")).resumen.saldo_esperado, 100);
   assert.deepEqual(await db.all("SELECT id, estado FROM predio_turno"), [{ id: turno, estado: "ABIERTO" }]);
 });

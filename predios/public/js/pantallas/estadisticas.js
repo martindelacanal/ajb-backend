@@ -33,7 +33,7 @@
     function rango(d, hs) { desde.value = d; hasta.value = hs; cargar(); }
     var idPeriodo = "estadisticas-periodo-" + (++siguientePeriodo);
     var filtrosPeriodo = h("div.tabla-filtros.tabla-periodo-controles", { id: idPeriodo, hidden: true },
-      P.campo("Desde", desde), P.campo("Hasta", hasta), P.campo("Boca", boca),
+      h("div.filtro-rango-fechas", { role: "group", "aria-label": "Período" }, P.campo("Desde", desde), P.campo("Hasta", hasta)), P.campo("Boca", boca),
       h("div.campo", h("span.campo-etiqueta", "Período rápido"), h("div.fila", { style: { gap: "6px" } },
         P.btn("Hoy", { tipo: "suave", chico: true, onclick: function () { rango(P.hoy(), P.hoy()); } }),
         P.btn("7 días", { tipo: "suave", chico: true, onclick: function () { rango(P.sumarDias(P.hoy(), -6), P.hoy()); } }),

@@ -129,9 +129,12 @@
   function panelAvisos(ancla) {
     var a = P.estado.avisos || {};
     var items = [];
-    (a.notificaciones || []).forEach(function (n) {
-      items.push({ texto: n.titulo, icono: "alerta", accion: function () { verNotificacion(n); } });
+    (a.recientes || a.notificaciones || []).slice(0, 10).forEach(function (n) {
+      items.push({ texto: h("span.aviso-resumen" + (!n.leido && !n.resuelto_fecha ? ".aviso-no-leido" : ""),
+        h("strong", n.titulo), h("span.chico.texto-3", P.f.fechaHora(n.fecha) + " · " + (n.resuelto_fecha ? "Resuelta" : n.leido ? "Leída" : "Sin leer"))),
+        icono: n.leido || n.resuelto_fecha ? "check" : "alerta", accion: function () { verNotificacion(n); } });
     });
+    if (items.length) items.push("-");
     (a.permisos || []).forEach(function (p) {
       items.push({ texto: p.usuario_nombre + " pide autorización (" + (p.boca || "") + ")", icono: "llave", accion: function () { P.resolverPermiso(p); } });
     });
@@ -142,11 +145,27 @@
     if (a.solicitudes_recibir) items.push({ texto: a.solicitudes_recibir + " solicitud(es) para recibir", icono: "recibir", accion: function () { P.ruta.ir(P.esAdmin() ? "/gestion/solicitudes" : "/solicitudes"); } });
     if (a.vencimientos) items.push({ texto: a.vencimientos + " producto(s) vencidos o por vencer", icono: "reloj", accion: function () { P.cache["tabla:productos"] = { filtros: { vencimiento: "7" } }; P.ruta.ir("/gestion/productos"); } });
     if (a.stock_negativo) items.push({ texto: a.stock_negativo + " producto(s) con stock negativo en alguna boca", icono: "alerta", accion: function () { P.cache["tabla:stock"] = { filtros: { estado: "negativo" } }; P.ruta.ir("/gestion/stock"); } });
-    if (!items.length) items.push({ texto: "No hay avisos pendientes", icono: "check", accion: function () {} });
-    P.menuFlotante(ancla, items);
+    if (items[items.length - 1] === "-") items.pop();
+    if (!items.length) items.push({ texto: "Todavía no hay notificaciones", icono: "check", accion: function () {} });
+    items.push({ texto: "Ver historial de notificaciones", icono: "lista", accion: function () { P.ruta.ir("/notificaciones"); } });
+    var desplegable = P.menuFlotante(ancla, items);
+    var menu = document.querySelector(".menu-flotante");
+    if (menu) {
+      menu.classList.add("menu-avisos");
+      menu.lastElementChild.classList.add("menu-avisos-historial");
+      menu.setAttribute("aria-label", "Notificaciones recientes y avisos pendientes");
+      var r = ancla.getBoundingClientRect();
+      menu.style.left = Math.max(12, Math.min(window.innerWidth - menu.offsetWidth - 12, r.right - menu.offsetWidth)) + "px";
+      menu.style.top = (Math.max(12, Math.min(r.bottom + 6, window.innerHeight - menu.offsetHeight - 12)) + window.scrollY) + "px";
+      menu.addEventListener("keydown", function (ev) {
+        if (ev.key === "Escape") { ev.preventDefault(); desplegable.cerrar(); ancla.focus(); }
+      });
+      var primero = menu.querySelector("button");
+      if (primero) primero.focus();
+    }
   }
 
-  function verNotificacion(n) {
+  function verNotificacion(n, alLeer) {
     var d = n.detalle || {};
     var m = P.modal({
       titulo: n.titulo, subtitulo: P.f.fechaHora(n.fecha) + " · Hora de Argentina",
@@ -160,17 +179,21 @@
         d.agente ? h("p.texto-3.chico", "Navegador: " + d.agente) : null),
       acciones: [
         P.btn("Cerrar", { onclick: function () { m.cerrar(); } }),
-        P.btn("Marcar como leído", { tipo: "primario", onclick: function (ev) {
+        !n.leido ? P.btn("Marcar como leída", { tipo: "primario", onclick: function (ev) {
           P.ejecutar(ev.currentTarget, function () {
             return P.post("/avisos/" + n.id + "/leer", {}).then(function (r) {
               m.cerrar();
-              if (!r.encolado) consultarAvisos();
+              if (!r.encolado) {
+                consultarAvisos();
+                if (alLeer) alLeer();
+              }
             });
           });
-        } }),
+        } }) : null,
       ],
     });
   }
+  P.verNotificacion = verNotificacion;
 
   P.resolverPermiso = function (p) {
     var tipos = { SOLICITUD_PRODUCTO: "pedir productos", ANULAR_VENTA: "anular una venta", VER_VENTAS_CAJA: "ver todas las ventas de su caja" };
@@ -213,14 +236,14 @@
       var viejo = c.querySelector(".campana-numero");
       if (viejo) viejo.remove();
       var a = P.estado.avisos || {};
-      var total = (a.notificaciones || []).length + (a.permisos || []).length + (a.aperturas || []).length + (a.solicitudes_despachar || 0) + (a.solicitudes_recibir || 0);
+      var total = (typeof a.notificaciones_no_leidas === "number" ? a.notificaciones_no_leidas : (a.notificaciones || []).length) + (a.permisos || []).length + (a.aperturas || []).length + (a.solicitudes_despachar || 0) + (a.solicitudes_recibir || 0);
       if (total) c.appendChild(h("span.campana-numero", total > 99 ? "99+" : String(total)));
     }
   }
 
   function consultarAvisos() {
     if (!P.estado.sesion) return;
-    P.get("/avisos", { sinRedireccion: true }).then(function (a) {
+    return P.get("/avisos", { sinRedireccion: true }).then(function (a) {
       var antes = P.estado.avisos;
       P.estado.avisos = a;
       pintarContadores();
@@ -242,6 +265,7 @@
       if (P.alAvisos) P.alAvisos(a);
     }).catch(function () {});
   }
+  P.consultarAvisos = consultarAvisos;
 
   function consultarConexion() {
     if (P.modo === "remoto") {

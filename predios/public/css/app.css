@@ -371,9 +371,12 @@ input[type="password"]::-ms-reveal, input[type="password"]::-ms-clear { display:
 .tabla-barra > .btn { min-height: 40px; flex: 0 0 auto; }
 .tabla-barra .campo-control { min-height: 40px; padding-top: 7px; padding-bottom: 7px; }
 .tabla-barra .tabla-buscar { flex: 1 1 180px; min-width: 0; max-width: none; }
-.tabla-filtros { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px 16px; align-items: end; padding: 16px; border-bottom: 1px solid var(--linea); background: var(--papel); }
+.tabla-filtros { display: flex; flex-wrap: wrap; gap: 14px 16px; align-items: end; padding: 16px; border-bottom: 1px solid var(--linea); background: var(--papel); }
+.tabla-filtros > .campo { flex: 1 1 180px; }
+.filtro-rango-fechas { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 16px; min-width: 0; }
+.tabla-filtros > .filtro-rango-fechas { flex: 2 1 376px; }
 .tabla-filtros .campo-control { width: 100%; min-width: 0; }
-.tabla-filtros-acciones { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
+.tabla-filtros-acciones { flex: 1 1 100%; display: flex; flex-wrap: wrap; gap: 8px; }
 .tabla-filtros-numero { display: inline-flex; align-items: center; justify-content: center; min-width: 22px; min-height: 22px; padding: 0 5px; border-radius: 6px; background: var(--azul); color: var(--blanco); font-size: 12px; font-weight: 800; }
 .tabla-boton-filtros[aria-expanded="true"] { background: var(--cielo); }
 .tabla-exportar:first-child { margin-left: auto; }
@@ -598,6 +601,10 @@ table.tabla { width: 100%; border-collapse: separate; border-spacing: 0; font-si
   input[type="date"].campo-control, input[type="time"].campo-control { -webkit-appearance: none; appearance: none; display: block; min-width: 0; min-height: 42px; text-align: left; }
   input[type="date"]::-webkit-date-and-time-value { text-align: left; }
 }
+@media (max-width: 760px) {
+  .filtro-rango-fechas { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .tabla-filtros > .filtro-rango-fechas { flex-basis: 100%; }
+}
 @media (max-width: 600px) {
   .fila-campos > .campo, .filtros-fechas > .fecha, .filtros-fechas > .boca { max-width: none; }
   .filtros-fechas > .fecha { flex: 1 1 calc(50% - 6px); }
@@ -607,10 +614,11 @@ table.tabla { width: 100%; border-collapse: separate; border-spacing: 0; font-si
   .tabla-barra > .btn { padding: 8px 9px; font-size: 14px; }
   .tabla-barra > .btn > .icono { display: none; }
   .tabla-barra .tabla-buscar { flex: 1 1 0; }
-  .tabla-filtros { padding: 14px 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .tabla-filtros { padding: 14px 12px; gap: 12px; }
+  .tabla-filtros > .campo { flex-basis: calc(50% - 6px); }
   .tabla-pie { padding: 8px 12px; }
 }
-@media (max-width: 420px) { .tabla-filtros { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 420px) { .tabla-filtros > .campo { flex-basis: 100%; } }
 
 /* ---------------------------------------------------------------- impresión dentro de la app (no tickets) */
 @media print {

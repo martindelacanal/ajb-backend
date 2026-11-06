@@ -73,8 +73,7 @@ test("todas las secciones comparten buscador y exportación fuera del panel cerr
   const s = pantalla();
   const ids = new Set();
   for (const listado of Object.keys(listados.LISTADOS)) {
-    const sinEtiquetaBuscar = ["caja", "cierres", "usuarios"].includes(listado);
-    const t = s.P.tabla({ listado, sinEtiquetaBuscar }); await resolver();
+    const t = s.P.tabla({ listado }); await resolver();
     const barra = t.el.querySelector(".tabla-barra"), panel = t.el.querySelector(".tabla-filtros"), boton = t.el.querySelector(".tabla-boton-filtros");
     assert.equal(panel.hidden, true, listado);
     assert.equal(boton.getAttribute("aria-expanded"), "false", listado);
@@ -86,14 +85,52 @@ test("todas las secciones comparten buscador y exportación fuera del panel cerr
     if (listados.meta({ usuario: { rol: "ADMIN" } }, listado).buscador) {
       const campo = t.el.querySelector(".tabla-buscar");
       assert.ok(barra.contains(campo), listado);
-      if (sinEtiquetaBuscar) {
-        assert.equal(campo.querySelector(".campo-etiqueta"), null, listado);
-        assert.match(campo.querySelector("input").getAttribute("aria-label"), /^Buscar en /);
-      }
+      assert.equal(campo.querySelector(".campo-etiqueta"), null, listado);
+      assert.match(campo.querySelector("input").getAttribute("aria-label"), /^Buscar en /);
     }
     assert.ok(barra.contains(t.el.querySelector(".tabla-exportar")), listado);
     assert.equal(panel.contains(t.el.querySelector(".tabla-exportar")), false, listado);
     assert.equal(ids.has(panel.id), false); ids.add(panel.id);
+  }
+});
+
+test("cada rango de fechas es un grupo indivisible y conserva los dos extremos al consultar y exportar", async () => {
+  const s = pantalla();
+  for (const listado of Object.keys(listados.LISTADOS)) {
+    const meta = listados.meta({ usuario: { rol: "ADMIN" } }, listado);
+    const fechas = meta.filtros.filter(f => ["desde", "hasta", "personalizado"].includes(f.tipo));
+    if (!fechas.length) continue;
+    const t = s.P.tabla({ listado }); await resolver();
+    const grupos = t.el.querySelectorAll(".filtro-rango-fechas");
+    assert.equal(grupos.length, 1, listado);
+    assert.equal(grupos[0].getAttribute("role"), "group", listado);
+    const controles = grupos[0].querySelectorAll("input");
+    assert.equal(controles.length, 2, listado);
+    controles[0].value = "2026-11-01"; controles[0].disparar("change"); await resolver();
+    controles[1].value = "2026-11-06"; controles[1].disparar("change"); await resolver();
+    t.el.querySelector(".tabla-exportar").disparar("click"); s.menus.at(-1)[0].accion(); await resolver();
+    for (const ruta of [s.solicitudes.at(-1), s.descargas.at(-1)]) {
+      const params = new URL(ruta, "http://fixture").searchParams;
+      assert.equal(params.get("f_" + fechas[0].clave), "2026-11-01", listado);
+      assert.equal(params.get("f_" + fechas[1].clave), "2026-11-06", listado);
+    }
+  }
+});
+
+test("Origen ya no aparece ni se aplica desde preferencias antiguas en Productos y stock general", async () => {
+  const s = pantalla();
+  s.P.cache["tabla:productos"] = { filtros: { origen: "importado", destino: "VENTA_DIRECTA" } };
+  const t = s.P.tabla({ listado: "productos" }); await resolver();
+  const meta = listados.meta({ usuario: { rol: "ADMIN" } }, "productos");
+  assert.equal(meta.filtros.some(f => f.clave === "origen"), false);
+  assert.equal(meta.columnas.some(c => c.clave === "almacen"), false);
+  assert.equal(listados.meta({ usuario: { rol: "ADMIN" } }, "bocas").columnas.some(c => c.clave === "es_almacen"), false);
+  assert.equal(t.el.querySelector(".tabla-filtros-numero").textContent, "1");
+  t.el.querySelector(".tabla-exportar").disparar("click"); s.menus.at(-1)[0].accion(); await resolver();
+  for (const ruta of [s.solicitudes.at(-1), s.descargas.at(-1)]) {
+    const params = new URL(ruta, "http://fixture").searchParams;
+    assert.equal(params.has("f_origen"), false);
+    assert.equal(params.get("f_destino"), "VENTA_DIRECTA");
   }
 });
 

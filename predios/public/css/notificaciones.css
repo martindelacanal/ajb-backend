@@ -1,0 +1,19 @@
+.menu-avisos { width: 420px; max-width: calc(100vw - 24px); max-height: min(560px, calc(100vh - 24px)); overflow-y: auto; }
+.menu-avisos > button { align-items: flex-start; white-space: normal; }
+.menu-avisos > .menu-avisos-historial { position: sticky; bottom: 0; z-index: 1; background: var(--blanco); border-top: 1px solid var(--linea); border-radius: 0; }
+.menu-avisos > .menu-avisos-historial:hover { background: var(--cielo); }
+.aviso-resumen { display: flex; min-width: 0; flex-direction: column; gap: 4px; overflow-wrap: anywhere; }
+.aviso-resumen strong { font-weight: 600; }
+.aviso-no-leido strong { font-weight: 800; }
+.notificaciones-lista { list-style: none; padding: 0; margin: 0; }
+.notificaciones-lista > li + li { border-top: 1px solid var(--linea); }
+.notificacion-fila { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 20px; }
+.notificacion-texto { min-width: 0; overflow-wrap: anywhere; }
+.notificacion-texto h2 { font-size: 16px; }
+.notificacion-texto p { margin: 6px 0; }
+.notificaciones-pie { padding: 16px 20px; border-top: 1px solid var(--linea); }
+.notificaciones-filtros { margin-bottom: 16px; }
+@media (max-width: 700px) {
+  .notificacion-fila { align-items: flex-start; flex-direction: column; padding: 16px; gap: 12px; }
+  .notificaciones-pie { padding: 16px; }
+}

@@ -563,6 +563,8 @@
       var p = {};
       Object.keys(estado.filtros).forEach(function (k) {
         if ((opciones.filtrosOcultos || []).indexOf(k) >= 0) return;
+        // Una preferencia de una versión anterior no puede dejar filtros invisibles activos.
+        if (meta && !meta.filtros.some(function (f) { return f.clave === k; })) return;
         var v = estado.filtros[k];
         if (v !== undefined && v !== null && v !== "") p["f_" + k] = v;
       });
@@ -583,10 +585,11 @@
           t = setTimeout(cargar, 300);
         });
         buscar.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); clearTimeout(t); cargar(); } });
-        if (opciones.sinEtiquetaBuscar) buscar.setAttribute("aria-label", "Buscar en " + meta.titulo);
-        barra.appendChild(P.campo(opciones.sinEtiquetaBuscar ? null : "Buscar", buscar, { clase: "tabla-buscar" }));
+        buscar.setAttribute("aria-label", "Buscar en " + meta.titulo);
+        barra.appendChild(P.campo(null, buscar, { clase: "tabla-buscar" }));
       }
       var ocultos = opciones.filtrosOcultos || [];
+      var gruposFechas = {};
       meta.filtros.forEach(function (f) {
         if (ocultos.indexOf(f.clave) >= 0) return;
         var valor = estado.filtros[f.clave] || "";
@@ -616,7 +619,23 @@
           monto.addEventListener("input", function () { clearTimeout(tm); tm = setTimeout(aplicar, 400); });
           control = h("div.fila", { style: { gap: "6px", flexWrap: "nowrap" } }, op, monto);
         }
-        if (control) panelFiltros.appendChild(P.campo(f.titulo, control));
+        if (control) {
+          var destino = panelFiltros;
+          // El rango completo ocupa una sola posición al reordenarse los filtros.
+          var extremo = /(desde|hasta)$/.exec(f.clave);
+          if (extremo && (f.tipo === "desde" || f.tipo === "hasta" || f.tipo === "personalizado")) {
+            var base = f.clave.slice(0, -extremo[1].length);
+            var otraClave = base + (extremo[1] === "desde" ? "hasta" : "desde");
+            if (ocultos.indexOf(otraClave) < 0 && meta.filtros.some(function (otro) { return otro.clave === otraClave; })) {
+              if (!gruposFechas[base]) {
+                gruposFechas[base] = h("div.filtro-rango-fechas", { role: "group", "aria-label": "Rango de fechas" });
+                panelFiltros.appendChild(gruposFechas[base]);
+              }
+              destino = gruposFechas[base];
+            }
+          }
+          destino.appendChild(P.campo(f.titulo, control));
+        }
       });
       var extras = (opciones.barra || []).filter(Boolean);
       if (extras.length) panelFiltros.appendChild(h("div.tabla-filtros-acciones", extras));
@@ -766,6 +785,9 @@
 
     P.metaListado(nombre).then(function (m) {
       meta = m;
+      Object.keys(estado.filtros).forEach(function (clave) {
+        if (!meta.filtros.some(function (f) { return f.clave === clave; })) delete estado.filtros[clave];
+      });
       armarBarra();
       cargar();
     }).catch(function (e) { P.reemplazar(cuerpo, h("div", { style: { padding: "16px" } }, P.mensaje(e.message, "error"))); });
