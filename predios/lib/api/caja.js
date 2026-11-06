@@ -31,8 +31,23 @@ async function exigirAccesoCaja(t, ctx, cajaId) {
   return caja;
 }
 
+async function ultimoCierre(t, pid, cajaId) {
+  const cierre = await t.get(
+    `SELECT id, fecha FROM predio_cierre WHERE predio_id=? AND caja_id=? ORDER BY id DESC LIMIT 1`, [pid, cajaId]);
+  if (!cierre) return null;
+  const auditoria = await t.get(
+    `SELECT detalle FROM predio_auditoria WHERE predio_id=? AND entidad='caja' AND entidad_id=?
+     AND accion='Cierre de caja' ORDER BY id DESC LIMIT 1`, [pid, cajaId]);
+  let detalle;
+  try { detalle = JSON.parse(auditoria?.detalle || "null"); } catch (_e) { /* formato histórico */ }
+  if (detalle && Number(detalle.cierre_id) === Number(cierre.id) && Number.isSafeInteger(detalle.ultima_venta_id)) {
+    cierre.ultima_venta_id = detalle.ultima_venta_id;
+  }
+  return cierre;
+}
+
 async function resumenAbierto(t, ctx, caja) {
-  const ultimo = await t.get("SELECT id, fecha FROM predio_cierre WHERE predio_id = ? AND caja_id = ? ORDER BY id DESC LIMIT 1", [ctx.pid, caja.id]);
+  const ultimo = await ultimoCierre(t, ctx.pid, caja.id);
   const mov = await t.get(
     `SELECT COALESCE(SUM(CASE WHEN tipo = 'INGRESO' THEN importe ELSE 0 END), 0) AS ingresos,
             COALESCE(SUM(CASE WHEN tipo = 'EGRESO' THEN importe ELSE 0 END), 0) AS egresos,
@@ -41,13 +56,18 @@ async function resumenAbierto(t, ctx, caja) {
   const saldo = await saldoCaja(t, ctx, caja.id);
   const ingresos = U.redondear(Number(mov.ingresos), 2);
   const egresos = U.redondear(Number(mov.egresos), 2);
-  const desde = ultimo ? ultimo.fecha : "0000-00-00 00:00:00";
+  // Las fechas del predio tienen precisión de segundos. Las ventas posteriores
+  // a un cierre pueden compartir su fecha; el ID guardado sí distingue el corte.
+  const corte = ultimo && ultimo.ultima_venta_id === undefined ? "v.fecha>?" : "v.id>?";
+  const desde = ultimo ? ultimo.ultima_venta_id ?? ultimo.fecha : 0;
+  const parametros = [ctx.pid, caja.id, desde];
   const ventas = await t.all(
-    `SELECT COALESCE(p.forma,v.forma_pago) AS forma_pago, COUNT(*) AS cantidad, SUM(COALESCE(p.importe,v.total)) AS total FROM predio_venta v LEFT JOIN predio_venta_pago p ON p.predio_id=v.predio_id AND p.venta_id=v.id WHERE v.predio_id=? AND v.caja_id=? AND v.estado='CONFIRMADA' AND v.fecha>? GROUP BY COALESCE(p.forma,v.forma_pago)`,
-    [ctx.pid, caja.id, desde]);
-  const anuladas = await t.get(
-    "SELECT COUNT(*) AS n FROM predio_venta WHERE predio_id = ? AND caja_id = ? AND estado = 'ANULADA' AND fecha > ?",
-    [ctx.pid, caja.id, desde]);
+    `SELECT COALESCE(p.forma,v.forma_pago) AS forma_pago, COUNT(*) AS cantidad, SUM(COALESCE(p.importe,v.total)) AS total
+     FROM predio_venta v LEFT JOIN predio_venta_pago p ON p.predio_id=v.predio_id AND p.venta_id=v.id
+     WHERE v.predio_id=? AND v.caja_id=? AND ${corte} AND v.estado='CONFIRMADA' GROUP BY COALESCE(p.forma,v.forma_pago)`, parametros);
+  const cantidades = await t.get(
+    `SELECT COUNT(CASE WHEN v.estado='CONFIRMADA' THEN 1 END) AS confirmadas, COUNT(CASE WHEN v.estado='ANULADA' THEN 1 END) AS anuladas
+     FROM predio_venta v WHERE v.predio_id=? AND v.caja_id=? AND ${corte}`, parametros);
   const porForma = ventas.map((v) => ({ forma_pago: v.forma_pago, cantidad: Number(v.cantidad), total: U.redondear(Number(v.total), 2) }));
   return {
     ultimo_cierre: ultimo || null,
@@ -55,10 +75,10 @@ async function resumenAbierto(t, ctx, caja) {
     ingresos,
     egresos,
     saldo_esperado: saldo,
-    ventas_cantidad: Number((await t.get("SELECT COUNT(*) AS n FROM predio_venta WHERE predio_id=? AND caja_id=? AND estado=\'CONFIRMADA\' AND fecha>?",[ctx.pid,caja.id,desde])).n),
+    ventas_cantidad: Number(cantidades.confirmadas),
     ventas_total: U.redondear(porForma.reduce((s, v) => s + v.total, 0), 2),
     ventas_efectivo: U.redondear(porForma.filter((v) => v.forma_pago === "EFECTIVO").reduce((s, v) => s + v.total, 0), 2),
-    ventas_anuladas: Number(anuladas?.n || 0),
+    ventas_anuladas: Number(cantidades.anuladas),
     ventas_por_forma: porForma,
   };
 }
@@ -208,7 +228,8 @@ async function cerrar(ctx) {
       });
     }
     await t.run("UPDATE predio_caja_movimiento SET cierre_id = ? WHERE predio_id = ? AND caja_id = ? AND cierre_id IS NULL", [cierreId, ctx.pid, cajaId]);
-    await N.auditar(t, ctx, "Cierre de caja", "caja", cajaId, { cierre_id: cierreId, esperado: r.saldo_esperado, contado, diferencia, retiro, queda });
+    const ultimaVenta = await t.get("SELECT COALESCE(MAX(id),0) AS id FROM predio_venta WHERE predio_id=? AND caja_id=?", [ctx.pid, cajaId]);
+    await N.auditar(t, ctx, "Cierre de caja", "caja", cajaId, { cierre_id: cierreId, ultima_venta_id: Number(ultimaVenta.id), esperado: r.saldo_esperado, contado, diferencia, retiro, queda });
     return { id: cierreId, diferencia, retiro, mensaje: diferencia === 0 ? "Caja cerrada sin diferencias" : `Caja cerrada con ${diferencia > 0 ? "sobrante" : "faltante"} de ${U.pesos(Math.abs(diferencia))}` };
   });
 }
@@ -264,6 +285,7 @@ async function configurarComanda(ctx) {
 }
 
 module.exports = {
+  ultimoCierre,
   saldoCaja,
   rutas: [
     { m: "GET", p: "/caja/estado", h: estado },

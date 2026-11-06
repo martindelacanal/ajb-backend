@@ -139,10 +139,22 @@ function puedeVerVenta(ctx, v) {
   return bocasDe(ctx).includes(Number(v.boca_id));
 }
 
+function reciboVenta(ctx, puesto, body) {
+  if (body.operacion === undefined) return null;
+  if (!/^[a-zA-Z0-9_-]{16,64}$/.test(body.operacion)) throw U.error("El identificador de la venta no es válido.");
+  // El aviso de falta de stock puede requerir un segundo envío confirmado.
+  const { confirmar_sin_stock, ...pedido } = body;
+  return {
+    clave: "venta:" + U.sha256(body.operacion).slice(0, 58),
+    huella: U.sha256(JSON.stringify([ctx.usuario.id, puesto.caja_id, pedido])),
+  };
+}
+
 async function crearVenta(ctx) {
   const puesto = exigirPuesto(ctx);
   exigirBoca(ctx, puesto.boca_id);
   const b = ctx.body;
+  const recibo = reciboVenta(ctx, puesto, b);
   const items = Array.isArray(b.items) ? b.items : [];
   if (!items.length) throw U.error("Agregá al menos un producto a la venta");
   if (items.length > 200) throw U.error("Una venta puede tener hasta 200 renglones");
@@ -156,12 +168,21 @@ async function crearVenta(ctx) {
 
   const agrupados = new Map();
   for (const it of items) {
+    if (!it || typeof it !== "object") throw U.error("Revisá los productos de la venta.");
     const productoId = U.id(it.producto_id, "El producto");
     const cantidad = U.numero(it.cantidad, { min: 0.001, max: 99999, decimales: 3, campo: "La cantidad" });
     agrupados.set(productoId, U.redondear((agrupados.get(productoId) || 0) + cantidad, 3));
   }
 
   return ctx.db.tx(async (t) => {
+    if (recibo) {
+      const previa = await t.get("SELECT huella,respuesta FROM predio_recepcion_recibo WHERE predio_id=? AND clave=?" + t.forUpdate, [ctx.pid, recibo.clave]);
+      if (previa) {
+        if (previa.huella !== recibo.huella) throw U.error("El comprobante corresponde a otra venta.", 409);
+        const respuesta = JSON.parse(previa.respuesta);
+        return { ...respuesta, ticket: await datosTicket(t, ctx, respuesta.id) };
+      }
+    }
     const caja = await N.exigir(t, ctx, "predio_caja", puesto.caja_id, "La caja ya no existe");
     if (!Number(caja.activo)) throw U.error("La caja está deshabilitada", 409);
     if (Number(caja.boca_id) !== Number(puesto.boca_id)) throw U.error("Elegí nuevamente la boca y la caja", 409, { codigo: "SIN_PUESTO" });
@@ -202,15 +223,15 @@ async function crearVenta(ctx) {
     const total = U.redondear(lineas.reduce((s, l) => s + l.subtotal, 0), 2);
     if (total <= 0 && forma !== "EFECTIVO") throw U.error("El total de la venta tiene que ser mayor que cero");
 
-    const pagos = b.pagos === undefined ? [{forma, importe:total, huesped_id:b.huesped_id||null}] : b.pagos;
-    if (!Array.isArray(pagos) || pagos.length !== (forma==="MIXTO"?2:1) || new Set(pagos.map(p=>p.forma)).size !== pagos.length) throw U.error("Revisá los medios de pago.");
-    let suma=0;
-    for(const p of pagos){
-      if(!FORMAS.includes(p.forma)||p.forma==="MIXTO"||(pagos.length===1&&p.forma!==forma))throw U.error("El medio de pago no es válido.");
-      p.importe=U.numero(p.importe,{min:0.01,max:99999999,campo:"La parte del pago"});
-      suma+=Math.round(p.importe*100);
-    }
-    if(suma!==Math.round(total*100))throw U.error("Las partes del pago deben sumar el total de la venta.");
+    const partes = b.pagos === undefined ? [{ forma, importe: total, huesped_id: b.huesped_id || null }] : b.pagos;
+    if (!Array.isArray(partes) || partes.length !== (forma === "MIXTO" ? 2 : 1)) throw U.error("Revisá los medios de pago.");
+    const pagos = partes.map(p => {
+      if (!p || !FORMAS.includes(p.forma) || p.forma === "MIXTO" || (partes.length === 1 && p.forma !== forma)) throw U.error("El medio de pago no es válido.");
+      return { forma: p.forma, huesped_id: p.huesped_id || null, importe: U.numero(p.importe, { min: 0.01, max: 99999999, campo: "La parte del pago" }) };
+    });
+    if (new Set(pagos.map(p => p.forma)).size !== pagos.length) throw U.error("Elegí dos medios distintos.");
+    const centavos = pagos.reduce((suma, p) => suma + Math.round(p.importe * 100), 0);
+    if (centavos !== Math.round(total * 100)) throw U.error("Las partes del pago deben sumar el total de la venta.");
     const efectivo=pagos.find(p=>p.forma==="EFECTIVO")?.importe||0;
     const parteHaberes=pagos.find(p=>p.forma==="DESCUENTO");
     if(parteHaberes&&parteHaberes.huesped_id){
@@ -245,7 +266,7 @@ async function crearVenta(ctx) {
     let vuelto = null;
     if (efectivo) {
       recibido = b.recibido === undefined || b.recibido === null || b.recibido === "" ? efectivo : U.numero(b.recibido, { min: 0, max: 99999999, campo: "El efectivo recibido" });
-      if (recibido < efectivo) throw U.error(`El efectivo recibido (${U.pesos(recibido)}) no alcanza para el total (${U.pesos(total)})`);
+      if (recibido < efectivo) throw U.error(`El efectivo recibido (${U.pesos(recibido)}) no alcanza para la parte en efectivo (${U.pesos(efectivo)})`);
       vuelto = U.redondear(recibido - efectivo, 2);
     }
 
@@ -292,7 +313,9 @@ async function crearVenta(ctx) {
         detalle: JSON.stringify({ ...aviso.detalle, consumido_venta_id: ventaId, consumido_fecha: ahora }),
       });
     }
-    return { id: ventaId, total, vuelto, mensaje: `Venta N° ${ventaId} registrada`, ticket: await datosTicket(t, ctx, ventaId) };
+    const respuesta = { id: ventaId, total, vuelto, mensaje: `Venta N° ${ventaId} registrada` };
+    if (recibo) await N.insertar(t, ctx, "predio_recepcion_recibo", { ...recibo, respuesta: JSON.stringify(respuesta) });
+    return { ...respuesta, ticket: await datosTicket(t, ctx, ventaId) };
   });
 }
 
@@ -329,10 +352,10 @@ async function anularVenta(ctx) {
       if (Number(v.caja_id) !== Number(caja)) throw U.error("Sólo podés anular ventas de la caja en la que estás trabajando", 403);
     }
     if (v.liquidacion_id) throw U.error("La venta ya está incluida en una liquidación del afiliado: anulá primero la liquidación", 409);
-    const cierre = await t.get(
-      "SELECT id, fecha FROM predio_cierre WHERE predio_id = ? AND caja_id = ? AND fecha >= ? ORDER BY id DESC LIMIT 1",
-      [ctx.pid, v.caja_id, v.fecha]);
-    if (cierre) throw U.error(`La caja se cerró después de esta venta (cierre N° ${cierre.id}): ya no se puede anular`, 409);
+    const cierre = await require("./caja").ultimoCierre(t, ctx.pid, v.caja_id);
+    if (cierre && (cierre.ultima_venta_id !== undefined ? Number(id) <= cierre.ultima_venta_id : cierre.fecha >= v.fecha)) {
+      throw U.error(`La caja se cerró después de esta venta (cierre N° ${cierre.id}): ya no se puede anular`, 409);
+    }
     const autorizacion = await autorizar(t, ctx, "ANULAR_VENTA", {
       clave: b.clave, permisoId: b.permiso_id, referenciaId: id, detalle: `Venta N° ${id} por ${U.pesos(v.total)}`,
     });

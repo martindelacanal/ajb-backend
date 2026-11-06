@@ -56,6 +56,9 @@ const CONCEPTOS_CAJA = [
   { valor: "INGRESO_DINERO", texto: "Ingreso de dinero" },
   { valor: "RETIRO_DINERO", texto: "Retiro de dinero" },
   { valor: "COBRO_LIQUIDACION", texto: "Cobro de liquidación" },
+  { valor: "SALDO_ESTADIA", texto: "Anticipo o retiro de saldo de estadía" },
+  { valor: "LIQUIDACION_ESTADIA", texto: "Liquidación de consumos de estadía" },
+  { valor: "DIFERENCIA_RESERVA", texto: "Diferencia de alojamiento" },
   { valor: "OTROS", texto: "Otros" },
 ];
 const FORMAS_LIQUIDACION = [

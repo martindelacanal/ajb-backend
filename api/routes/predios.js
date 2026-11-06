@@ -643,16 +643,18 @@ function crearRouterSync() {
   }
 
   router.post("/recepcion", async (req, res) => {
-    let c;
     try {
-      if (req.predio.escritor !== "LOCAL") throw U.error("La instalación no es el escritor del predio", 409);
-      c = await pool().getConnection();
-      await c.beginTransaction();
-      const [[actor]] = await c.query("SELECT id,nombre,rol,gestionar_reservas,general_usuario_id FROM predio_usuario WHERE predio_id=? AND id=? AND activo=1", [req.predio.id, U.id(req.body.empleado_id)]);
-      if (!actor || (actor.rol !== "ADMIN" && !Number(actor.gestionar_reservas))) throw U.error("La cuenta no tiene permiso de recepción sincronizado.",403);
-      const r = await require("../services/recepcion").operar(c, req.predio, actor, req.body.accion, req.body.datos || {});
-      await c.commit(); res.json(r);
-    } catch(e) { if(c) await c.rollback(); responderError(res,e); } finally { if(c) c.release(); }
+      const resultado = await conAutoridadSync(req, async (conexion, predio) => {
+        if (predio.escritor !== "LOCAL") throw U.error("La instalación no es el escritor del predio", 409);
+        const [[actor]] = await conexion.query(
+          "SELECT id,nombre,rol,gestionar_reservas,general_usuario_id FROM predio_usuario WHERE predio_id=? AND id=? AND activo=1 FOR SHARE",
+          [predio.id, U.id(req.body.empleado_id)]
+        );
+        if (!actor || (actor.rol !== "ADMIN" && !Number(actor.gestionar_reservas))) throw U.error("La cuenta no tiene permiso de recepción sincronizado.", 403);
+        return require("../services/recepcion").operar(conexion, predio, actor, req.body.accion, req.body.datos || {});
+      });
+      res.json(resultado);
+    } catch (e) { responderError(res, e); }
   });
   router.get("/maestros", async (req, res) => {
     try {

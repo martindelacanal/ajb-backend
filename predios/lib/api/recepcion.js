@@ -37,27 +37,40 @@ async function turismo(t, ctx, accion, datos) {
   if (s.agente?.recepcion) return s.agente.recepcion(accion, datos, ctx.usuario);
   throw U.error("No hay conexión con el servicio de Turismo.", 503);
 }
+function esCierreDeSaldo(m) {
+  // Anular una planilla reabre la deuda, pero no cancela las cargas posteriores.
+  return m.concepto === "SALDAR_CONSUMOS" && !(m.medio === "HABERES" && Number(m.importe) < 0);
+}
 async function cuenta(t, ctx, id, lock = false) {
   const personas = await t.all("SELECT * FROM predio_huesped WHERE predio_id=? AND reserva_id=? ORDER BY id" + (lock ? t.forUpdate : ""), [ctx.pid, id]);
   const movimientos = await t.all("SELECT * FROM predio_estadia_mov WHERE predio_id=? AND reserva_id=? ORDER BY id DESC" + (lock ? t.forUpdate : ""), [ctx.pid, id]);
   let prepago = 0,
     consumos = 0,
     pendiente = 0;
+  // Los movimientos vienen del más reciente al más antiguo. Cada cierre
+  // cancela todo el crédito, incluidos los anticipos de ese período.
+  const ultimoCierre = movimientos.find(esCierreDeSaldo);
+  const desdeCierre = ultimoCierre ? Number(ultimoCierre.id) : 0;
+  let huboOperacionDeSaldo = false;
   for (const m of movimientos) {
     const n = Number(m.importe);
+    if (Number(m.id) > desdeCierre && ["CARGA", "RETIRO", "COMPRA", "ANULACION"].includes(m.concepto)) huboOperacionDeSaldo = true;
     if (["CARGA", "RETIRO"].includes(m.concepto) && m.medio !== "AL_SALIR") prepago += n;
     if (["COMPRA", "ANULACION"].includes(m.concepto)) consumos -= n;
     if (m.concepto === "SALDAR_CONSUMOS") prepago += n;
     if (m.concepto === "DIFERENCIAL") pendiente += n;
     if (m.concepto === "PAGO_RESERVA") pendiente -= n;
   }
+  const neto = U.redondear(consumos - prepago);
+  const saldo = U.redondear(personas.reduce((s, p) => s + Number(p.saldo), 0));
   return {
     personas,
     movimientos,
     consumos: U.redondear(consumos),
-    neto_consumos: U.redondear(consumos - prepago),
+    neto_consumos: neto,
     pendiente: U.redondear(pendiente),
-    saldo: U.redondear(personas.reduce((s, p) => s + Number(p.saldo), 0))
+    saldo,
+    cierre_pendiente: huboOperacionDeSaldo || saldo !== 0 || neto !== 0
   };
 }
 async function sincronizar(t, ctx, r) {
@@ -132,7 +145,7 @@ async function guardar(ctx) {
 }
 async function caja(t, ctx, b, n, id, concepto) {
   if (!n) return;
-  const cajaId = U.id(ctx.sesion?.caja_id || b.caja_id, "La caja que recibe o devuelve el efectivo");
+  const cajaId = U.id(b.caja_id || ctx.sesion?.caja_id, "La caja que recibe o devuelve el efectivo");
   const ca = await N.exigir(t, ctx, "predio_caja", cajaId);
   exigirBoca(ctx, ca.boca_id);
   if (!Number(ca.activo)) throw U.error("La caja está inactiva.");
@@ -151,20 +164,15 @@ async function caja(t, ctx, b, n, id, concepto) {
 }
 async function planilla(t, ctx, r, n) {
   if (!r.afiliado || n <= 0) throw U.error("El descuento de haberes requiere un titular afiliado y un monto a cobrar.");
-  let a = await t.get("SELECT * FROM predio_afiliado WHERE predio_id=? AND usuario_general_id=?", [ctx.pid, r.usuario_id]);
+  const buscar = () => t.get("SELECT id FROM predio_afiliado WHERE predio_id=? AND usuario_general_id=?", [ctx.pid, r.usuario_id]);
+  let a = await buscar();
   if (!a) {
-    const id = await N.insertar(t, ctx, "predio_afiliado", {
-      usuario_general_id: r.usuario_id,
-      dni: String(r.titular_dni),
-      legajo: r.titular_legajo,
-      nombre: r.titular_nombre,
-      origen: "SISTEMA",
-      habilitado_descuento: 1,
-      limite: 0
-    });
-    a = {
-      id
-    };
+    // La primera estadía puede llegar antes de sincronizar los maestros. Usar
+    // la misma unión por documento o legajo conserva la ficha manual y su límite.
+    await require("../maestros").aplicarMaestros(t, ctx, { afiliados: [{
+      usuario_id: r.usuario_id, documento: r.titular_dni, legajo: r.titular_legajo, nombre: r.titular_nombre
+    }] });
+    a = await buscar();
   }
   return N.insertar(t, ctx, "predio_liquidacion", {
     afiliado_id: a.id,
@@ -223,7 +231,11 @@ async function administrar(ctx) {
         U.opcion(modo, ["EFECTIVO", "TRANSFERENCIA", "AL_SALIR"], "El medio");
         if (modo === "AL_SALIR" && !r.afiliado) throw U.error("Los particulares deben pagar al cargar saldo.");
         if (accion === "RETIRO") {
-          const autorizado = a.movimientos.filter(m => ["CARGA", "RETIRO"].includes(m.concepto) && m.medio === modo).reduce((s, m) => s + Number(m.importe), 0);
+          let autorizado = 0;
+          for (const m of a.movimientos) {
+            if (esCierreDeSaldo(m)) break;
+            if (["CARGA", "RETIRO"].includes(m.concepto) && m.medio === modo) autorizado += Number(m.importe);
+          }
           if (n > U.redondear(autorizado) || modo !== "AL_SALIR" && n > Math.max(0, -a.neto_consumos)) throw U.error("La devolución supera el saldo abonado por ese medio.");
         }
         if (modo === "EFECTIVO") await caja(t, ctx, b, delta, id, "SALDO_ESTADIA");
@@ -235,7 +247,7 @@ async function administrar(ctx) {
     } else if (accion === "LIQUIDAR" || accion === "PAGO_RESERVA") {
       const n = accion === "LIQUIDAR" ? a.neto_consumos : a.pendiente;
       if (accion === "PAGO_RESERVA" && !n) throw U.error("No hay una diferencia pendiente.");
-      if (accion === "LIQUIDAR" && (!a.movimientos.some(x => ["CARGA", "COMPRA"].includes(x.concepto)) || !a.saldo && !n)) throw U.error("No hay consumos ni saldo para liquidar.");
+      if (accion === "LIQUIDAR" && !a.cierre_pendiente) throw U.error("No hay consumos ni saldo para liquidar.");
       if (Number(b.esperado) !== n) throw U.error("El importe cambió. Actualizá la cuenta antes de confirmar.", 409);
       U.opcion(modo, ["EFECTIVO", "TRANSFERENCIA", "HABERES"], "El medio");
       if (modo === "HABERES" && n) liq = await planilla(t, ctx, r, n);
@@ -258,12 +270,21 @@ async function administrar(ctx) {
   });
 }
 async function buscarSaldo(ctx) {
-  exigirPuesto(ctx);
+  const puesto = exigirPuesto(ctx);
+  exigirBoca(ctx, puesto.boca_id);
   const q = U.texto(ctx.query.q, {
     max: 30,
     requerido: true
   });
-  return ctx.db.all("SELECT h.id,h.reserva_id,h.dni,h.nombre,h.saldo,CASE WHEN a.habilitado_descuento=1 THEN COALESCE(a.limite,0)-(SELECT COALESCE(SUM(COALESCE(v.importe_haberes,v.total)),0) FROM predio_venta v WHERE v.predio_id=a.predio_id AND v.afiliado_id=a.id AND (v.forma_pago='DESCUENTO' OR v.importe_haberes>0) AND v.estado='CONFIRMADA' AND v.liquidacion_id IS NULL) ELSE 0 END AS disponible_haberes FROM predio_huesped h LEFT JOIN predio_afiliado a ON a.predio_id=h.predio_id AND a.dni=h.dni AND a.usuario_general_id IS NOT NULL WHERE h.predio_id=? AND h.entrada IS NOT NULL AND h.salida IS NULL AND (h.dni=? OR h.legajo=?) ORDER BY h.id LIMIT 10", [ctx.pid, q, q]);
+  const documento = /^[\d.\s-]+$/.test(q) ? q.replace(/[.\s-]/g, "") : q;
+  return ctx.db.all(`SELECT h.id,h.reserva_id,h.dni,h.nombre,h.saldo,
+     CASE WHEN a.habilitado_descuento=1 THEN COALESCE(a.limite,0) - (
+       SELECT COALESCE(SUM(COALESCE(v.importe_haberes,v.total)),0) FROM predio_venta v
+       WHERE v.predio_id=a.predio_id AND v.afiliado_id=a.id AND (v.forma_pago='DESCUENTO' OR v.importe_haberes>0)
+       AND v.estado='CONFIRMADA' AND v.liquidacion_id IS NULL) ELSE 0 END AS disponible_haberes
+    FROM predio_huesped h LEFT JOIN predio_afiliado a ON a.predio_id=h.predio_id AND a.dni=h.dni AND a.usuario_general_id IS NOT NULL
+    WHERE h.predio_id=? AND h.entrada IS NOT NULL AND h.salida IS NULL AND (h.dni=? OR h.legajo=?)
+    ORDER BY h.id LIMIT 10`, [ctx.pid, documento, q]);
 }
 async function aplicarVenta(t, ctx, huespedId, n, venta, reversa = false) {
   const h = await N.exigir(t, ctx, "predio_huesped", U.id(huespedId), "No encontramos al huésped", {

@@ -8,6 +8,8 @@
 .rec-tabla th,.rec-tabla td {padding:9px 12px;border-bottom:1px solid var(--linea);vertical-align:top;}
 .rec-tabla th {color:var(--texto-2);background:var(--papel);font-size:13px;}
 .rec-tabla a {color:var(--azul);font-weight:700;}
+.rec-etiqueta-movil {display:none;}
+.rec-valor {overflow-wrap:break-word;}
 .rec-resumen,.rec-cotizacion {padding:14px 16px;background:var(--cielo);border-radius:var(--radio-chico);}
 .rec-resumen {display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;}
 .rec-viajero {min-width:0;padding:12px;border:1px solid var(--borde);border-radius:var(--radio-chico);}
@@ -17,4 +19,16 @@
 .rec-evento summary {cursor:pointer;}
 .rec-evento[open] summary {margin-bottom:10px;}
 .rec-seccion [hidden],.rec-seccion[hidden],.zona-saldo[hidden] {display:none;}
-@media(max-width:600px){.rec-seccion{padding:14px}.rec-grid{grid-template-columns:1fr}.rec-tabla th,.rec-tabla td{padding:8px;}}
+@media(max-width:600px){
+  .rec-seccion {padding:14px;}
+  .rec-grid {grid-template-columns:minmax(0,1fr);}
+  .rec-tabla table,.rec-tabla tbody {display:block;}
+  .rec-tabla thead {position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);}
+  .rec-tabla tbody tr {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 12px;padding:12px 0;border-bottom:1px solid var(--linea);}
+  .rec-tabla td {min-width:0;padding:0;border:0;}
+  .rec-tabla td:first-child {grid-column:1 / -1;}
+  .rec-tabla td:last-child:nth-child(odd) {grid-column:1 / -1;}
+  .rec-etiqueta-movil {display:block;color:var(--texto-2);font-size:12px;font-weight:700;}
+  .rec-valor {overflow-wrap:anywhere;}
+  .rec-evento summary {padding:10px 0;}
+}

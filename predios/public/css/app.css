@@ -338,6 +338,13 @@ input[type="password"]::-ms-reveal, input[type="password"]::-ms-clear { display:
 .usuario-nombre { font-weight: 700; text-align: left; line-height: 1.15; }
 .usuario-nombre small { display: block; font-weight: 600; color: var(--texto-3); font-size: 12px; }
 @media (max-width: 760px) { .usuario-nombre, .conexion span { display: none; } }
+@media (max-width: 480px) {
+  .barra { gap: 6px; padding-right: 8px; padding-left: 8px; }
+  .barra .espacio { min-width: 0; }
+  .barra .puesto-chip { min-width: 0; padding-left: 8px; }
+  .barra .puesto-chip > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .barra .usuario-boton { padding: 4px; }
+}
 
 .menu-flotante { position: absolute; z-index: 1200; min-width: 240px; padding: 6px; background: var(--blanco); border: 1px solid var(--borde); border-radius: var(--radio); box-shadow: var(--sombra-flotante); animation: aparecer 140ms ease-out; }
 .menu-flotante button, .menu-flotante a { display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px 12px; border: 0; border-radius: var(--radio-chico); background: transparent; color: var(--tinta); font-weight: 600; text-align: left; text-decoration: none; cursor: pointer; }
@@ -642,4 +649,8 @@ table.tabla { width: 100%; border-collapse: separate; border-spacing: 0; font-si
   .riel, .barra, .cabecera-caja, .remoto, .avisos, .no-imprimir { display: none !important; }
   .estructura { display: block; }
   .pagina { padding: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .velo, .ventana, .aviso, .pagina, .items tr.nuevo { animation-name: none; }
 }

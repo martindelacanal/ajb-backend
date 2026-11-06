@@ -116,7 +116,7 @@
 
   function botonUsuario(oscuro) {
     var ses = P.estado.sesion;
-    var b = h("button.usuario-boton", { type: "button", "aria-haspopup": "menu" },
+    var b = h("button.usuario-boton", { type: "button", "aria-haspopup": "menu", "aria-label": "Menú de " + ses.usuario.nombre },
       h("span.avatar", P.iniciales(ses.usuario.nombre)),
       h("span.usuario-nombre", ses.usuario.nombre.replace(" (sistema general)", ""), h("small", ses.usuario.rol === "ADMIN" ? (ses.usuario.es_admin_general ? "Administración general" : "Administración") : "Usuario de boca")));
     b.addEventListener("click", function () { menuUsuario(b); });
@@ -353,7 +353,7 @@
     return h("div.estructura", riel, veloMenu, h("div.contenido",
       P.modo === "remoto" ? h("div.remoto#banda-remota") : null,
       h("header.barra", botonMenu,
-        puesto && puesto.caja_id ? h("span.puesto-chip", P.icono("caja"), h("span", puesto.boca + " · " + puesto.caja)) : null,
+        puesto && puesto.caja_id ? h("span.puesto-chip", { title: puesto.boca + " · " + puesto.caja }, P.icono("caja"), h("span", puesto.boca + " · " + puesto.caja)) : null,
         h("div.espacio"), chipConexion(), campana(), botonUsuario()),
       pagina));
   }

@@ -29,7 +29,8 @@
     var claveBorrador = "predio.venta." + puesto.caja_id;
     var estado = vacia();
     try { var b = JSON.parse(sessionStorage.getItem(claveBorrador) || "null"); if (b && b.items) estado = Object.assign(vacia(), b); } catch (e) { /* nada */ }
-    if (estado.forma === "DESCUENTO") estado.forma = "EFECTIVO";
+    if (estado.forma === "DESCUENTO" && !estado.huesped) estado.forma = "EFECTIVO";
+    if (estado.segunda === estado.forma) estado.segunda = null;
     estado.afiliado = null; estado.devolucion = false;
     var ultimaVenta = null;
     try { ultimaVenta = Number(sessionStorage.getItem("predio.ultima-venta." + puesto.caja_id)) || null; } catch (e) { /* nada */ }
@@ -218,7 +219,7 @@
             P.btn("", { tipo: "texto", chico: true, icono: "mas", etiqueta: "Sumar uno", onclick: function () { it.cantidad = P.redondear(it.cantidad + 1, 3); pintarTodo(); } }))),
           h("td", h("strong", it.producto.nombre), h("div.texto-3.chico", [it.producto.codigo, sinStock ? "Stock en la boca: " + P.f.numero(it.producto.stock_boca) : null].filter(Boolean).join(" · "))),
           h("td.der.dinero", P.f.pesos(it.producto.precio_venta)),
-          h("td.der.dinero.fuerte", P.f.pesos(it.producto.precio_venta * it.cantidad)),
+          h("td.der.dinero.fuerte", P.f.pesos(subtotal(it))),
           h("td.acciones", P.btn("", { tipo: "texto", chico: true, icono: "cerrar", etiqueta: "Quitar", onclick: function () { estado.items.splice(i, 1); pintarTodo(); combo.foco(); } })));
       });
       tablaItems.appendChild(h("div.tabla-desplazable", h("table.tabla.items",
@@ -227,8 +228,11 @@
       estado.resaltar = null;
     }
 
+    function subtotal(it) {
+      return P.redondear(it.producto.precio_venta * it.cantidad, 2);
+    }
     function total() {
-      return P.redondear(estado.items.reduce(function (s, it) { return s + it.producto.precio_venta * it.cantidad; }, 0), 2);
+      return P.redondear(estado.items.reduce(function (s, it) { return s + subtotal(it); }, 0), 2);
     }
 
     // ---------------------------------------------------------------- cuenta
@@ -272,14 +276,20 @@
     });
 
     function partes() {
-      var n=estado.segunda?P.redondear(P.numeroDe(estado.parte)||0,2):total();
+      var n = estado.segunda ? P.importeDe(estado.parte) : total();
       var a=[{forma:estado.forma,importe:n}];
       if(estado.segunda)a.push({forma:estado.segunda,importe:P.redondear(total()-n,2)});
       return a.map(function(p){if(p.forma==="SALDO"||p.forma==="DESCUENTO")p.huesped_id=estado.huesped&&estado.huesped.id;return p;});
     }
     function usaSaldo(){return [estado.forma,estado.segunda].some(function(f){return f==="SALDO"||f==="DESCUENTO";});}
     function pintarAfiliado() {
-      P.vaciar(zonaAfiliado); zonaAfiliado.hidden=!usaSaldo(); if(!usaSaldo())return;
+      P.vaciar(zonaAfiliado);
+      zonaAfiliado.hidden = !usaSaldo();
+      if (zonaAfiliado.hidden) {
+        estado.huesped = null;
+        buscarAfiliado.value = "";
+        return;
+      }
       if(!estado.huesped){zonaAfiliado.appendChild(P.campo("DNI o legajo del huésped",buscarAfiliado,{ayuda:"Solo personas con ingreso registrado y sin salida."}));
         zonaAfiliado.appendChild(P.btn("Buscar huésped",{onclick:buscarAf}));}
       else zonaAfiliado.appendChild(h("div.columna",h("strong",estado.huesped.nombre+" · T-"+estado.huesped.reserva_id),
@@ -293,7 +303,9 @@
           estado.forma = f.valor; if(estado.segunda===f.valor)estado.segunda=null;
           if (f.valor !== "DESCUENTO") estado.devolucion = false;
           pintarTodo();
-          if (f.valor === "EFECTIVO") recibido.focus(); else if(f.valor==="SALDO"&&!estado.huesped)buscarAfiliado.focus();
+          if (usaSaldo() && !estado.huesped) buscarAfiliado.focus();
+          else if (f.valor === "EFECTIVO") recibido.focus();
+          else zonaFormas.querySelector('[aria-pressed="true"]').focus();
         } }, P.icono(f.icono), f.texto);
       })));
     }
@@ -306,7 +318,15 @@
       dividir.input.id="dividir-pago";
       zonaPago.appendChild(dividir);
       if(estado.segunda){
-        var segundo=P.select(FORMAS.filter(function(f){return f.valor!==estado.forma;}),estado.segunda,{alCambiar:function(v){estado.segunda=v;pintarTodo();document.getElementById("segundo-pago").focus();}});segundo.id="segundo-pago";
+        var segundo = P.select(FORMAS.filter(function (f) { return f.valor !== estado.forma; }), estado.segunda, {
+          alCambiar: function (v) {
+            estado.segunda = v;
+            pintarTodo();
+            if (usaSaldo() && !estado.huesped) buscarAfiliado.focus();
+            else document.getElementById("segundo-pago").focus();
+          }
+        });
+        segundo.id = "segundo-pago";
         var parte=P.dinero({valor:estado.parte,placeholder:"0,00",id:"parte-pago"});
         parte.addEventListener("input",function(){estado.parte=parte.value;pintarTotales();guardarBorrador();});
         zonaPago.appendChild(h("div.cuenta-bloque",P.campo("Importe con "+FORMAS.find(function(f){return f.valor===estado.forma;}).texto,parte),P.campo("Segundo medio",segundo),h("p#resto-pago",{"aria-live":"polite"})));
@@ -322,10 +342,15 @@
       var v = document.getElementById("vuelto");
       var habilitado = estado.items.length > 0;
       var pagos=partes();var cash=pagos.find(function(p){return p.forma==="EFECTIVO";});
-      var resto=document.getElementById("resto-pago");if(resto)resto.textContent=pagos[1].importe<0?"El primer importe supera el total.":"Resto con el segundo medio: "+P.f.pesos(pagos[1].importe);
+      var resto = document.getElementById("resto-pago");
+      if (resto) {
+        var segundoMedio = FORMAS.find(function (f) { return f.valor === estado.segunda; }).texto;
+        resto.textContent = !Number.isFinite(pagos[0].importe) ? "Ingresá el primer importe para calcular el resto." :
+          pagos[1].importe < 0 ? "El primer importe supera el total." : "Resto con " + segundoMedio + ": " + P.f.pesos(pagos[1].importe);
+      }
       if(pagos.some(function(p){return !(p.importe>0)||(p.forma==="SALDO"&&(!estado.huesped||p.importe>Number(estado.huesped.saldo)));}))habilitado=false;
       var problema="";
-      if(estado.segunda&&pagos.some(function(p){return !(p.importe>0);}))problema="Indicá dos importes mayores que cero que sumen el total.";
+      if (estado.segunda && pagos.some(function (p) { return !(p.importe > 0); })) problema = "Ingresá un importe mayor que cero y menor que el total, con hasta dos decimales.";
       pagos.forEach(function(p){if(p.forma!=="SALDO"&&p.forma!=="DESCUENTO")return;
         var disponible=estado.huesped?Number(p.forma==="SALDO"?estado.huesped.saldo:estado.huesped.disponible_haberes||0):0;
         if(!estado.huesped)problema="Buscá el huésped para completar el cobro.";
@@ -334,9 +359,9 @@
       if (v && cash) {
         P.vaciar(v);
         v.className = "";
-        var r = P.numeroDe(estado.recibido);
-        if (estado.recibido && (!Number.isFinite(r)||!/^[0-9][0-9.,]*$/.test(estado.recibido.trim())))problema="Corregí el efectivo recibido: ingresá un importe numérico.";
-        else if (estado.recibido && !isNaN(r)) {
+        var r = P.importeDe(estado.recibido);
+        if (estado.recibido && !Number.isFinite(r)) problema = "Corregí el efectivo recibido: usá un importe con hasta dos decimales.";
+        else if (estado.recibido && Number.isFinite(cash.importe)) {
           if (r >= cash.importe) { v.className = "vuelto"; v.appendChild(h("span", "Vuelto")); v.appendChild(h("strong", P.f.pesos(r - cash.importe))); }
           else { v.className = "vuelto falta"; v.appendChild(h("span", "Falta")); v.appendChild(h("strong", P.f.pesos(cash.importe - r))); habilitado = false; }
         }
@@ -367,6 +392,18 @@
 
     // ---------------------------------------------------------------- cobrar
     var cobrando = false;
+    function identificarVenta(cuerpo) {
+      var firma = JSON.stringify(cuerpo);
+      if (!estado.intento || estado.intento.firma !== firma) {
+        var bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+        estado.intento = { firma: firma, clave: Array.prototype.map.call(bytes, function (n) {
+          return ("0" + n.toString(16)).slice(-2);
+        }).join("") };
+        guardarBorrador();
+      }
+      return estado.intento.clave;
+    }
     function cobrar() {
       if (cobrando || botonCobrar.disabled || !estado.items.length) return;
       cobrando = true;
@@ -377,10 +414,11 @@
         pagos: partes(),
         devolucion: estado.devolucion,
         afiliado_id: estado.afiliado ? estado.afiliado.id : null,
-        recibido: (estado.forma === "EFECTIVO" || estado.segunda === "EFECTIVO") && estado.recibido ? P.numeroDe(estado.recibido) : null,
+        recibido: (estado.forma === "EFECTIVO" || estado.segunda === "EFECTIVO") && estado.recibido ? P.importeDe(estado.recibido) : null,
         codigo_pago: estado.forma !== "EFECTIVO" && estado.forma !== "DESCUENTO" ? estado.codigo : null,
       };
       P.ejecutar(botonCobrar, function () {
+        cuerpo.operacion = identificarVenta(cuerpo);
         return confirmarStockVenta(function (confirmar) {
           return P.post("/ventas", Object.assign({}, cuerpo, { confirmar_sin_stock: confirmar }));
         }, "Vender igual").then(function (r) {
@@ -393,8 +431,8 @@
           ventaHecha(r);
         });
       }).catch(function (e) {
-        if(usaSaldo()){estado.huesped=null;pintarTodo();}
-      }).finally(function () { cobrando = false; });
+        if (usaSaldo() && e.status === 409) { estado.huesped = null; pintarTodo(); }
+      }).finally(function () { cobrando = false; pintarTotales(); });
     }
 
     function confirmarStockVenta(llamada) {

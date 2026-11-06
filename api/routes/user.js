@@ -155,6 +155,7 @@ const {
 const HISTORIAL_USUARIO_LEGIBLE = crearEnriquecimientoHistorial(
   CATALOGOS_HISTORIAL_USUARIO
 );
+const { fuenteHistorialReserva } = require("../services/historial-cuenta-predio");
 const HISTORIAL_RESERVA_LEGIBLE = crearEnriquecimientoHistorial(
   CATALOGOS_HISTORIAL_RESERVA
 );
@@ -9280,6 +9281,7 @@ async function bloquearYValidarDisponibilidadReserva(connection, {
   reservaIdExcluir = null,
   holdIdExcluir = null,
   omitirValidacionHolds = false,
+  ocupaciones = null,
 }) {
   const servicioIdNormalizado = normalizarIdPositivo(servicioId);
   const recursoIdNormalizado = normalizarIdPositivo(recursoId);
@@ -9319,7 +9321,7 @@ async function bloquearYValidarDisponibilidadReserva(connection, {
     params.push(reservaExcluirNormalizada);
   }
 
-  const [conflictos] = await connection.query(
+  const conflictos = ocupaciones ?? (await connection.query(
     `SELECT r.id
      FROM reserva r
      LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
@@ -9332,7 +9334,7 @@ async function bloquearYValidarDisponibilidadReserva(connection, {
      LIMIT 1
      FOR UPDATE`,
     [...params, ESTADO_RESERVA_INICIADA_ID, ESTADOS_RESERVA_BAJA_IDS]
-  );
+  ))[0];
   if (conflictos.length > 0) {
     throw crearErrorNegocio(
       "El recurso ya tiene una reserva para parte del rango seleccionado",
@@ -9450,6 +9452,7 @@ async function asignarNumeroParcelaCamping(connection, {
   fechaFin,
   reservaIdExcluir = null,
   holdIdExcluir = null,
+  ocupaciones = null,
 }) {
   const noches = obtenerNochesReserva(fechaInicio, fechaFin);
   if (noches.length === 0) {
@@ -9487,11 +9490,7 @@ async function asignarNumeroParcelaCamping(connection, {
 
   query += " ORDER BY numero_parcela ASC FOR UPDATE";
 
-  const [reservasSolapadas] = await connection.query(query, params);
-
-  if (reservasSolapadas.length >= parcelasDisponibles) {
-    throw crearErrorReservaCamping("No hay parcelas disponibles para el rango de fechas seleccionado", 409);
-  }
+  const reservasSolapadas = ocupaciones ?? (await connection.query(query, params))[0];
 
   const parcelasOcupadas = new Set();
   for (const reserva of reservasSolapadas) {
@@ -9520,7 +9519,7 @@ async function asignarNumeroParcelaCamping(connection, {
   throw crearErrorReservaCamping("No hay parcelas disponibles para el rango de fechas seleccionado", 409);
 }
 
-async function validarNumeroParcelaCampingExistente(connection, { reservaId, recursoId, fechaInicio, fechaFin, numeroParcela }) {
+async function validarNumeroParcelaCampingExistente(connection, { reservaId, recursoId, fechaInicio, fechaFin, numeroParcela, ocupaciones = null }) {
   if (!Number.isInteger(Number(numeroParcela)) || Number(numeroParcela) <= 0) {
     throw crearErrorReservaCamping("No hay parcelas disponibles para el rango de fechas seleccionado", 409);
   }
@@ -9537,7 +9536,7 @@ async function validarNumeroParcelaCampingExistente(connection, { reservaId, rec
     throw crearErrorReservaCamping("No hay parcelas disponibles para el rango de fechas seleccionado", 409);
   }
 
-  const [conflictosParcela] = await connection.query(
+  const conflictosParcela = ocupaciones ? ocupaciones.filter(o => Number(o.numero_parcela) === Number(numeroParcela)) : (await connection.query(
     `SELECT id
      FROM reserva
      WHERE id <> ?
@@ -9555,7 +9554,7 @@ async function validarNumeroParcelaCampingExistente(connection, { reservaId, rec
       fechaInicio,
       ESTADOS_RESERVA_BAJA_IDS
     ]
-  );
+  ))[0];
 
   if (conflictosParcela.length > 0) {
     throw crearErrorReservaCamping("No hay parcelas disponibles para el rango de fechas seleccionado", 409);
@@ -9657,7 +9656,9 @@ async function calcularAdicionalesReserva(connection, adicionales, recursoId, re
           connection,
           recursoId,
           regimenId,
-          personasNormalizadas,
+          opciones.recepcion
+            ? personasNormalizadas.filter(p => (!p.entrada || p.entrada <= noche) && (!p.salida || p.salida > noche))
+            : personasNormalizadas,
           noche,
           temporadaTarifaId
         )
@@ -14256,6 +14257,8 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
 
   const queryParams = [...querySearchParams];
   const soloAtipicas = filters.operacion_atipica === true ? "AND EXISTS (SELECT 1 FROM recepcion_reserva_evento e WHERE e.reserva_id = r.id)" : "";
+  const fechaFinVisible = require("../services/recepcion").fechaFinVisibleSql("re");
+  const joinRecepcion = "LEFT JOIN recepcion_reserva_evento re ON re.id=(SELECT MAX(ev.id) FROM recepcion_reserva_evento ev WHERE ev.reserva_id=r.id)";
   let query = `
     SELECT 
       r.id,
@@ -14269,7 +14272,7 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       u.nombre AS afiliado_nombre,
       u.apellido AS afiliado_apellido,
       DATE_FORMAT(r.fecha_inicio, '%d/%m/%Y') AS fecha_inicio,
-      DATE_FORMAT(IF(JSON_UNQUOTE(JSON_EXTRACT(re.actual,'$.dia_sin_noche'))='true' AND DATEDIFF(r.fecha_fin,r.fecha_inicio)=1,r.fecha_inicio,r.fecha_fin), '%d/%m/%Y') AS fecha_fin,
+      DATE_FORMAT(${fechaFinVisible}, '%d/%m/%Y') AS fecha_fin,
       COALESCE(r.observaciones, '') AS observaciones,
       DATE_FORMAT(r.fecha_creacion, '%d/%m/%Y') AS fecha_creacion,
       r.precio_total AS importe,
@@ -14284,11 +14287,11 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
     LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
     LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
     INNER JOIN usuario u ON r.usuario_id = u.id
-    LEFT JOIN recepcion_reserva_evento re ON re.id=(SELECT MAX(ev.id) FROM recepcion_reserva_evento ev WHERE ev.reserva_id=r.id)
+    ${joinRecepcion}
     WHERE er.nombre <> 'Pendiente_Aprobacion_Titular' ${soloAtipicas}
       ${queryBuscar}
       ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
-      ${toDate ? "AND r.fecha_fin <= ?" : ""}
+      ${toDate ? `AND ${fechaFinVisible} <= ?` : ""}
       ${estadoFiltro ? "AND er.nombre = ?" : ""}
       ${departamentalFiltro ? "AND u.departamental_id = ?" : ""}
       ${servicioFiltro ? "AND s.id = ?" : ""}
@@ -14338,10 +14341,11 @@ router.post("/tabla/reservas", verifyToken, async (req, res) => {
       LEFT JOIN convenio_hotel ch ON ch.id = r.convenio_hotel_id
       LEFT JOIN bloque_fecha bf ON bf.id = r.bloque_fecha_id
       INNER JOIN usuario u ON r.usuario_id = u.id
+      ${joinRecepcion}
       WHERE er.nombre <> 'Pendiente_Aprobacion_Titular' ${soloAtipicas}
         ${queryBuscar}
         ${fromDate ? "AND r.fecha_inicio >= ?" : ""}
-        ${toDate ? "AND r.fecha_fin <= ?" : ""}
+        ${toDate ? `AND ${fechaFinVisible} <= ?` : ""}
         ${estadoFiltro ? "AND er.nombre = ?" : ""}
         ${departamentalFiltro ? "AND u.departamental_id = ?" : ""}
         ${servicioFiltro ? "AND s.id = ?" : ""}
@@ -15601,7 +15605,7 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
         campo_modificado: "h.campo_modificado",
         valor_anterior: "h.valor_anterior",
         valor_nuevo: "h.valor_nuevo",
-        modificador_nombre: "CONCAT_WS(' ', um.nombre, um.apellido)",
+        modificador_nombre: "COALESCE(h.empleado_predio, CONCAT_WS(' ', um.nombre, um.apellido))",
         observaciones: "h.observaciones",
       };
       const orderByKey = Object.prototype.hasOwnProperty.call(columnasOrdenHistorialReserva, req.query.orderBy)
@@ -15652,7 +15656,7 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
         whereClause += whereClause ? " AND" : " WHERE";
         whereClause += ` (DATE_FORMAT(h.fecha_modificacion, '%d/%m/%Y %H:%i:%s') LIKE ?
           OR h.tipo_operacion LIKE ? OR h.campo_modificado LIKE ? OR h.valor_anterior LIKE ?
-          OR h.valor_nuevo LIKE ? OR CONCAT(um.nombre, ' ', um.apellido) LIKE ? OR h.observaciones LIKE ?
+          OR h.valor_nuevo LIKE ? OR COALESCE(h.empleado_predio, CONCAT_WS(' ', um.nombre, um.apellido)) LIKE ? OR h.observaciones LIKE ?
           OR ${HISTORIAL_RESERVA_LEGIBLE.valorAnteriorSql} LIKE ?
           OR ${HISTORIAL_RESERVA_LEGIBLE.valorNuevoSql} LIKE ?)`;
         params.push(...Array(9).fill(like));
@@ -15665,7 +15669,7 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
 
       const query = `
         SELECT
-          h.id,
+          h.id, h.predio_id,
           h.reserva_id,
           h.tipo_operacion,
           h.campo_modificado,
@@ -15674,15 +15678,15 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
           ${HISTORIAL_RESERVA_LEGIBLE.valorAnteriorSql} as valor_anterior_legible,
           ${HISTORIAL_RESERVA_LEGIBLE.valorNuevoSql} as valor_nuevo_legible,
           h.usuario_modificador_id,
-          CONCAT(um.nombre, ' ', um.apellido) as modificador_nombre,
+          COALESCE(h.empleado_predio, CONCAT_WS(' ', um.nombre, um.apellido)) as modificador_nombre,
           DATE_FORMAT(h.fecha_modificacion, '%d/%m/%Y %H:%i:%s') as fecha_modificacion,
           h.observaciones
-        FROM historial_reserva h
+        FROM ${fuenteHistorialReserva}
         ${joinsAlcanceDepartamental}
         LEFT JOIN usuario um ON h.usuario_modificador_id = um.id
         ${HISTORIAL_RESERVA_LEGIBLE.joins}
         ${whereClause}
-        ORDER BY ${orderBy} ${orderType}, h.id DESC
+        ORDER BY ${orderBy} ${orderType}, h.predio_id DESC, h.id DESC
         LIMIT ${start}, ${resultsPerPage}
       `;
 
@@ -15691,7 +15695,7 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
       // Consulta para el total de registros
       const countQuery = `
         SELECT COUNT(*) as total
-        FROM historial_reserva h
+        FROM ${fuenteHistorialReserva}
         ${joinsAlcanceDepartamental}
         LEFT JOIN usuario um ON h.usuario_modificador_id = um.id
         ${search ? HISTORIAL_RESERVA_LEGIBLE.joins : ""}
@@ -15703,7 +15707,7 @@ router.get("/tabla/historial-reserva/:id?", verifyToken, async (req, res) => {
       const numOfPages = Math.ceil(total / resultsPerPage);
 
       res.status(200).json({
-        results: rows,
+        results: rows.map(({ predio_id, ...fila }) => predio_id == null ? fila : { ...fila, id: `P-${predio_id}-${fila.id}` }),
         numOfPages,
         totalItems: total,
         page: page - 1,

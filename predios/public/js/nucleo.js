@@ -183,6 +183,16 @@
     if (t.indexOf(",") >= 0) t = t.replace(/\./g, "").replace(",", ".");
     return Number(t);
   };
+  // Dinero argentino: "1.000" son mil pesos. Aceptamos también el punto decimal
+  // del teclado numérico cuando tiene una o dos cifras, distinto de un grupo de miles.
+  P.importeDe = function (v) {
+    var t = String(v == null ? "" : v).trim();
+    if (/^[1-9]\d{0,2}(?:\.\d{3})+(?:,\d{1,2})?$/.test(t)) {
+      return Number(t.replace(/\./g, "").replace(",", "."));
+    }
+    if (/^(?:\d+(?:[.,]\d{1,2})?|[.,]\d{1,2})$/.test(t)) return Number(t.replace(",", "."));
+    return NaN;
+  };
   P.hoy = function () {
     var d = new Date(Date.now() - 3 * 3600 * 1000);
     return d.toISOString().slice(0, 10);
@@ -515,6 +525,20 @@
     return api;
   };
   document.addEventListener("keydown", function (ev) {
+    if (ev.key === "Tab" && abiertas.length) {
+      var dialogo = abiertas[abiertas.length - 1].ventana;
+      var controles = Array.prototype.filter.call(dialogo.querySelectorAll(
+        "button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]"
+      ), function (el) { return el.tabIndex >= 0 && el.getClientRects().length; });
+      if (controles.length) {
+        var destino = ev.shiftKey ? controles[controles.length - 1] : controles[0];
+        var extremo = ev.shiftKey ? controles[0] : controles[controles.length - 1];
+        if (!dialogo.contains(document.activeElement) || document.activeElement === extremo) {
+          ev.preventDefault();
+          destino.focus();
+        }
+      }
+    }
     if (ev.key === "Escape" && abiertas.length) {
       var ultima = abiertas[abiertas.length - 1];
       if (!document.querySelector(".combo-lista")) { ev.preventDefault(); ultima.cerrar(); }

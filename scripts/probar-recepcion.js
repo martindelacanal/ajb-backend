@@ -62,6 +62,13 @@ const {
       id: alta.id
     });
     assert.equal(d.historial.length, 1);
+    assert.match(d.historial[0].fecha, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, "Recepción muestra hora civil, igual que los movimientos de caja");
+    const dia = await call("listar", { q: String(alta.id), desde: U.hoy(), hasta: U.hoy() });
+    assert.equal(dia.filas[0].fecha_fin, U.hoy());
+    assert.equal((await call("listar", { q: String(alta.id), desde: U.sumarDias(U.hoy(), 1) })).cantidad, 0);
+    await assert.rejects(call("cotizar", { ...b, tipo: "PASA_EL_DIA", fecha_fin: U.sumarDias(U.hoy(), 1) }), /mismo día/);
+    const menor = { ...p, dni: "99874560", nombre: "Menor", fecha_nacimiento: U.sumarDias(U.hoy(), -3650) };
+    await assert.rejects(call("cotizar", { ...b, titular_dni: menor.dni, particular: menor, personas: [menor] }), /adulto/);
     const edit = {
       ...b,
       id: alta.id,
@@ -71,7 +78,9 @@ const {
       cantidad: 26,
       operacion: U.uuid()
     };
-    assert.equal((await call("guardar", edit)).diferencia, 150);
+    const propuesta = await call("cotizar", edit);
+    await assert.rejects(call("guardar", { ...edit, manual: 175, cotizacion_esperada: propuesta.cotizacion_esperada }), /importe cambió/);
+    assert.equal((await call("guardar", { ...edit, cotizacion_esperada: propuesta.cotizacion_esperada })).diferencia, 150);
     await assert.rejects(call("guardar", {
       ...edit,
       operacion: U.uuid()
@@ -125,6 +134,9 @@ const {
     const camp = await call("guardar", normal);
     assert.ok(camp.numero_parcela > 0);
     assert.equal(camp.precio_total, tarifa.total);
+    const despues = (await call("detalle", {id: camp.id})).reserva;
+    await assert.rejects(call("cotizar", { ...normal, id: camp.id, version: despues.version, personas: [normal.personas[0], {...comp, salida: null}] }), /salida registrada/);
+    await assert.rejects(call("cotizar", { ...normal, id: camp.id, version: despues.version, personas: [{...p, entrada: null}, comp] }), /check-in/);
     const deducida = await call("cotizar", {
       ...normal,
       id: camp.id,
@@ -135,6 +147,28 @@ const {
       motivo: "Falta de agua caliente"
     });
     assert.equal(deducida.diferencia, -tarifa.total);
+    const cabanas = o.servicios.find(s => s.codigo === "MIRAMAR_CABANAS");
+    const visita = { ...b, servicio_id: cabanas.id, fecha_inicio: ini, fecha_fin: fin, personas: [{ ...p, entrada: ini }] };
+    const libres = [];
+    for (const rec of o.recursos.filter(x => x.servicio_id === cabanas.id)) {
+      try { await call("cotizar", { ...visita, recurso_id: rec.id }); libres.push(rec.id); }
+      catch (e) { if (e.status !== 409) throw e; }
+      if (libres.length === 2) break;
+    }
+    assert.equal(libres.length, 2, "Se requieren dos recursos libres en la base local");
+    const moved = await call("guardar", { ...visita, recurso_id: libres[0], operacion: U.uuid() });
+    const traslado = U.sumarDias(fin, -1);
+    await call("guardar", { ...visita, operacion: U.uuid(), id: moved.id, version: (await call("detalle", {id:moved.id})).reserva.version, recurso_id: libres[1], traslado });
+    const antesTraslado = { ...visita, fecha_inicio: ini, fecha_fin: traslado };
+    await assert.rejects(call("cotizar", { ...antesTraslado, recurso_id:libres[0] }), /ya tiene una reserva/);
+    await call("cotizar", { ...antesTraslado, recurso_id:libres[1] });
+    const despuesTraslado = { ...visita, fecha_inicio: traslado, personas:[{...p, entrada:traslado}] };
+    await call("cotizar", { ...despuesTraslado, recurso_id:libres[0] });
+    await assert.rejects(call("cotizar", { ...despuesTraslado, recurso_id:libres[1] }), /ya tiene una reserva/);
+    const anteriorAlIngreso = U.sumarDias(ini, -1);
+    await call("guardar", { ...visita, recurso_id: libres[0], operacion: U.uuid(), fecha_inicio: anteriorAlIngreso, fecha_fin: ini, personas:[{...p, entrada: anteriorAlIngreso}] });
+    await assert.rejects(call("cotizar", { ...visita, id: moved.id, version:(await call("detalle", {id:moved.id})).reserva.version, recurso_id: libres[1], fecha_inicio: anteriorAlIngreso }), /ya tiene una reserva/);
+    console.log("OK responsable adulto, fecha visible sin noche, importe revisado, permanencia del check-in/out y ocupación de ambos recursos tras un traslado");
     console.log("OK tarifa vigente por noche, prorrateo individual, parcela, justificación y diferencial a devolver");
     console.log("OK alta aprobada, particular sin acceso, cotización reversible, edición auditada, concurrencia, reintento, alcance y filtro");
   } finally {

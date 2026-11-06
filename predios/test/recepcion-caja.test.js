@@ -129,8 +129,17 @@ test("saldo personal, reparto, venta mixta y reversión conservan stock, caja y 
     }],
     recibido: 25
   };
-  const v = await call("POST", "/ventas", venta);
+  const intento = { ...venta, operacion: U.uuid() };
+  const v = await call("POST", "/ventas", intento);
+  assert.deepEqual(await call("POST", "/ventas", { ...intento, confirmar_sin_stock: true }), v);
+  await assert.rejects(call("POST", "/ventas", { ...intento, recibido: 30 }), e => e.status === 409);
   assert.equal(v.vuelto, 5);
+  const { resumen } = await call("GET", "/caja/estado");
+  assert.equal(resumen.ventas_cantidad, 1);
+  assert.equal(resumen.ventas_total, 50);
+  assert.equal(resumen.ventas_efectivo, 20);
+  assert.equal(resumen.saldo_esperado, 120);
+  assert.equal((await call("GET", "/saldos/presentes", {}, { q: "99.911.223" }))[0].id, b.id);
   assert.equal((await cuenta()).saldo, 70);
   assert.equal((await db.get("SELECT importe FROM predio_caja_movimiento WHERE venta_id=?", [v.id])).importe, 20);
   await assert.rejects(call("POST", "/ventas", venta), /saldo no alcanza/);
@@ -148,13 +157,25 @@ test("saldo personal, reparto, venta mixta y reversión conservan stock, caja y 
     q: r.personas[1].dni
   }), []);
   await assert.rejects(call("POST", "/ventas", venta), /presente/);
-  await mover({
-    accion: "LIQUIDAR",
-    medio: "EFECTIVO",
-    esperado: -100
-  });
+  const devolucion = { accion: "LIQUIDAR", medio: "EFECTIVO", esperado: -100 };
+  const dobles = await Promise.allSettled([mover(devolucion), mover(devolucion)]);
+  assert.deepEqual(dobles.map(x => x.status).sort(), ["fulfilled", "rejected"]);
+  const devuelto = await db.get("SELECT COUNT(*) AS movimientos, SUM(importe) AS importe FROM predio_caja_movimiento WHERE concepto='LIQUIDACION_ESTADIA' AND tipo='EGRESO'");
+  assert.deepEqual({ ...devuelto }, { movimientos: 1, importe: 100 });
   assert.equal((await cuenta()).saldo, 0);
   assert.equal((await cuenta()).neto_consumos, 0);
+  assert.equal((await cuenta()).cierre_pendiente, false);
+  // El anticipo en efectivo ya fue devuelto. Una carga nueva por transferencia
+  // no habilita un segundo retiro contra ese anticipo anterior.
+  await mover({ accion: "CARGA", medio: "TRANSFERENCIA", huesped_id: a.id, importe: 50 });
+  await assert.rejects(mover({ accion: "RETIRO", medio: "EFECTIVO", huesped_id: a.id, importe: 50 }), /por ese medio/);
+  const consumido = await call("POST", "/ventas", { items: venta.items, forma_pago: "SALDO", huesped_id: a.id });
+  assert.equal((await cuenta()).neto_consumos, 0);
+  assert.equal((await cuenta()).saldo, 0);
+  assert.equal((await cuenta()).cierre_pendiente, true);
+  await mover({ accion: "LIQUIDAR", medio: "EFECTIVO", esperado: 0 });
+  await assert.rejects(mover({ accion: "LIQUIDAR", medio: "EFECTIVO", esperado: 0 }), /No hay consumos/);
+  await assert.rejects(call("POST", "/ventas/" + consumido.id + "/anular", { motivo: "Cerrada" }), /liquidó/);
   // La planilla no liquida la parte en efectivo de una venta combinada.
   r.afiliado = 1;
   r.personas[0].legajo = "L-23";
@@ -197,18 +218,49 @@ test("saldo personal, reparto, venta mixta y reversión conservan stock, caja y 
   await mover(carga);
   await mover(carga);
   assert.equal((await cuenta()).saldo, 80);
+  await mover({ accion: "CARGA", medio: "TRANSFERENCIA", huesped_id: a.id, importe: 10 });
   await call("POST", "/ventas", {
     items: venta.items,
     forma_pago: "SALDO",
     huesped_id: a.id
   });
-  const planilla = await mover({
-    accion: "LIQUIDAR",
-    medio: "HABERES",
-    esperado: 50
-  });
+  // Ficha manual aún sin enlazar por la sincronización de Turismo.
+  await db.tx(tx => N.actualizar(tx, ctx, "predio_afiliado", afiliado, { usuario_general_id: null, origen: "MANUAL" }));
+  const pedidoPlanilla = { operacion: U.uuid(), accion: "LIQUIDAR", medio: "HABERES", esperado: 40 };
+  // Dos pestañas intentan saldar la misma cuenta y la primera reenvía su
+  // petición al perder la respuesta. Sólo corresponde emitir una planilla.
+  const [primera, reenvio, otra] = await Promise.allSettled([
+    mover(pedidoPlanilla), mover(pedidoPlanilla), mover({ ...pedidoPlanilla, operacion: U.uuid() }),
+  ]);
+  assert.equal(primera.status, "fulfilled");
+  assert.deepEqual(reenvio, primera);
+  assert.equal(otra.status, "rejected");
+  assert.match(otra.reason.message, /No hay consumos|importe cambió/);
+  const planilla = primera.value;
+  assert.equal((await db.get("SELECT COUNT(*) AS n FROM predio_estadia_mov WHERE concepto='SALDAR_CONSUMOS' AND medio='HABERES'")).n, 1);
   assert.ok(planilla.liquidacion_id);
-  assert.equal((await call("GET", "/recepcion/315/planilla/" + planilla.liquidacion_id)).liquidacion.total, 50);
+  const impresa = await call("GET", "/recepcion/315/planilla/" + planilla.liquidacion_id);
+  assert.equal(impresa.liquidacion.total, 40);
+  assert.equal(impresa.afiliado.id, afiliado);
+  assert.equal(impresa.afiliado.limite, 30);
+  assert.equal(impresa.estadia.reserva_id, r.id);
+  assert.match(impresa.estadia.lineas[1].concepto, /Ticket/);
+  assert.deepEqual(impresa.estadia.lineas.map(m => m.importe), [-10, 50]);
   assert.equal((await cuenta()).neto_consumos, 0);
   assert.equal((await db.get("SELECT SUM(CASE WHEN tipo='INGRESO' THEN importe ELSE -importe END) AS n FROM predio_caja_movimiento")).n, 0);
+
+  // Un cobro en el mismo segundo que el cierre pertenece al período nuevo.
+  const mismaHora = U.fechaHora();
+  t.mock.method(U, "fechaHora", () => mismaHora);
+  await call("POST", "/caja/cierre", { caja_id: caja.id, efectivo_contado: 0 });
+  const siguiente = await call("POST", "/ventas", {
+    items: venta.items, forma_pago: "MIXTO",
+    pagos: [{ forma: "EFECTIVO", importe: 20 }, { forma: "QR", importe: 30 }],
+  });
+  const abierta = (await call("GET", "/caja/estado")).resumen;
+  assert.equal(abierta.ventas_cantidad, 1);
+  assert.equal(abierta.ventas_total, 50);
+  assert.equal(abierta.ventas_efectivo, 20);
+  await call("POST", "/ventas/" + siguiente.id + "/anular", { motivo: "Anulación de la nueva caja" });
+  assert.equal((await call("GET", "/caja/estado")).resumen.saldo_esperado, 0);
 });

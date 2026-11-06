@@ -235,6 +235,31 @@ async function crearLiquidacion(ctx) {
 }
 
 async function verLiquidacion(ctx) { exigirAdmin(ctx); return datosLiquidacion(ctx); }
+async function detallePlanillaEstadia(db, pid, liquidacionId) {
+  const cierre = await db.get(
+    "SELECT id, reserva_id, concepto, fecha, importe FROM predio_estadia_mov WHERE predio_id=? AND liquidacion_id=?",
+    [pid, liquidacionId]);
+  if (!cierre) return null;
+  if (cierre.concepto === "PAGO_RESERVA") return { reserva_id: cierre.reserva_id, lineas: [
+    { concepto: "Diferencia de alojamiento", fecha: cierre.fecha, importe: Number(cierre.importe) },
+  ] };
+  // La planilla sólo descuenta las compras abonadas con saldo, menos los
+  // anticipos ya cobrados. Un reparto entre pasajeros no altera ese total.
+  const movimientos = await db.all(
+    `SELECT concepto, fecha, medio, importe, venta_id FROM predio_estadia_mov
+     WHERE predio_id=? AND reserva_id=? AND id<? AND id>(
+       SELECT COALESCE(MAX(id),0) FROM predio_estadia_mov WHERE predio_id=? AND reserva_id=? AND id<?
+       AND concepto='SALDAR_CONSUMOS' AND NOT (medio='HABERES' AND importe<0))
+     AND (concepto IN ('COMPRA','ANULACION','SALDAR_CONSUMOS') OR (concepto IN ('CARGA','RETIRO') AND medio<>'AL_SALIR'))
+     ORDER BY id`, [pid, cierre.reserva_id, cierre.id, pid, cierre.reserva_id, cierre.id]);
+  const conceptos = { COMPRA: "Compra", ANULACION: "Anulación de compra", CARGA: "Anticipo abonado", RETIRO: "Devolución de anticipo", SALDAR_CONSUMOS: "Planilla anterior anulada" };
+  return { reserva_id: cierre.reserva_id, lineas: movimientos.map(m => ({
+    concepto: conceptos[m.concepto] + (m.venta_id ? " · Ticket N° " + m.venta_id : ""),
+    fecha: m.fecha,
+    importe: -Number(m.importe),
+  })) };
+}
+
 async function datosLiquidacion(ctx) {
   const id = U.id(ctx.params.id);
   const db = ctx.db;
@@ -247,7 +272,8 @@ async function datosLiquidacion(ctx) {
     `SELECT v.id, v.fecha, COALESCE(v.importe_haberes,v.total) AS total, b.nombre AS boca FROM predio_venta v JOIN predio_boca b ON b.predio_id = v.predio_id AND b.id = v.boca_id
      WHERE v.predio_id = ? AND v.liquidacion_id = ? ORDER BY v.fecha`, [ctx.pid, id]);
   const config = await N.leerConfig(db, ctx);
-  return { liquidacion: l, afiliado: a, ventas, empresa: { nombre_predio: config.nombre_predio, razon_social: config.razon_social, cuit: config.cuit, direccion: config.direccion, texto_autorizacion: config.texto_autorizacion } };
+  const estadia = await detallePlanillaEstadia(db, ctx.pid, id);
+  return { liquidacion: l, afiliado: a, ventas, estadia, empresa: { nombre_predio: config.nombre_predio, razon_social: config.razon_social, cuit: config.cuit, direccion: config.direccion, texto_autorizacion: config.texto_autorizacion } };
 }
 
 async function pagarLiquidacion(ctx) {

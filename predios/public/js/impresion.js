@@ -59,6 +59,7 @@
     var l = datos.liquidacion;
     var a = datos.afiliado || {};
     var e = datos.empresa || {};
+    var estadia = datos.estadia;
     var esHaberes = l.forma_pago === "DESCUENTO_HABERES";
     var nodo = h("div",
       h("div.cab",
@@ -70,15 +71,18 @@
         h("div", h("span", "DNI"), h("strong", documento(a.dni) || "—")),
         h("div", h("span", "Legajo"), h("strong", a.legajo || "—")),
         h("div", h("span", "Departamental"), h("strong", a.departamental || "—")),
-        h("div", h("span", "Período de consumos"), h("strong", P.f.fecha(l.desde) + " al " + P.f.fecha(l.hasta))),
-        h("div", h("span", "Consumos"), h("strong", String(l.ventas_cantidad || (datos.ventas || []).length)))),
-      h("h2", "Detalle de consumos con descuento de haberes"),
-      h("table", h("thead", h("tr", h("th", "Ticket"), h("th", "Fecha"), h("th", "Boca"), h("th.num", "Importe"))),
+        estadia ? h("div", h("span", "Reserva"), h("strong", "T-" + estadia.reserva_id)) : h("div", h("span", "Período de consumos"), h("strong", P.f.fecha(l.desde) + " al " + P.f.fecha(l.hasta))),
+        estadia ? null : h("div", h("span", "Consumos"), h("strong", String(l.ventas_cantidad || (datos.ventas || []).length)))),
+      h("h2", estadia ? "Detalle del importe de la estadía" : "Detalle de consumos con descuento de haberes"),
+      estadia ? h("table", h("thead", h("tr", h("th", "Movimiento"), h("th", "Fecha"), h("th.num", "Importe"))),
+        h("tbody", estadia.lineas.map(function (m) {
+          return h("tr", h("td", m.concepto), h("td", P.f.fechaHora(m.fecha)), h("td.num", P.f.pesos(m.importe)));
+        }))) : h("table", h("thead", h("tr", h("th", "Ticket"), h("th", "Fecha"), h("th", "Boca"), h("th.num", "Importe"))),
         h("tbody", (datos.ventas || []).map(function (v) {
           return h("tr", h("td", "N° " + v.id), h("td", P.f.fechaHora(v.fecha)), h("td", v.boca), h("td.num", P.f.pesos(v.total)));
         }))),
       h("div.totales",
-        h("div", h("span", "Total consumido"), h("strong", P.f.pesos(l.total_consumos))),
+        estadia ? null : h("div", h("span", "Total consumido"), h("strong", P.f.pesos(l.total_consumos))),
         Number(l.porcentaje_descuento) ? h("div", h("span", "Descuento (" + P.f.pct(l.porcentaje_descuento) + ")"), h("strong", "− " + P.f.pesos(Number(l.total_consumos) - Number(l.total)))) : null,
         h("div.final", h("span", "Total a pagar"), h("span", P.f.pesos(l.total))),
         h("div", h("span", "Forma de pago"), h("strong", FORMAS[l.forma_pago] || l.forma_pago)),

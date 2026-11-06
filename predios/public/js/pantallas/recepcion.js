@@ -72,8 +72,8 @@
         scope: "col"
       }, s);
     }))), h("tbody", filas.map(function (row) {
-      return h("tr", row.map(function (v) {
-        return h("td", v);
+      return h("tr", row.map(function (v, i) {
+        return h("td", h("span.rec-etiqueta-movil", { "aria-hidden": "true" }, cols[i]), h("div.rec-valor", v));
       }));
     }))));
   }
@@ -173,7 +173,7 @@
       viajeros = (r.personas || []).map(function (p) {
         return Object.assign({}, p);
       }),
-      extras = (r.adicionales || []).map(function (a) {
+      extras = (r.adicionales_vigentes || r.adicionales || []).map(function (a) {
         return Object.assign({}, a);
       });
     var familia = [],
@@ -187,7 +187,7 @@
       rec = sel([], null),
       reg = sel(lista(o.regimenes), r.regimen_id || 3, "Sin régimen");
     var inicio = input(r.fecha_inicio || hoy, "date"),
-      fin = input(r.fecha_fin || hoy, "date"),
+      fin = input(r.fecha_fin || P.sumarDias(hoy, 1), "date"),
       entidad = input(r.entidad),
       cantidad = input(r.cantidad || 1, "number"),
       traslado = input(hoy, "date");
@@ -200,9 +200,7 @@
       color = input(veh.color),
       patente = input(veh.patente),
       sector = input(veh.sector);
-    var manual = input(r.manual == null ? "" : r.manual, "number");
-    manual.min = "0";
-    manual.step = "0.01";
+    var manual = P.dinero({ valor: r.manual == null ? "" : P.f.numero(r.manual) });
     var motivo = input(""),
       obs = input(r.observaciones),
       base = h("div.columna"),
@@ -288,13 +286,22 @@
         parentesco.onchange = function () {
           p.parentesco_id = Number(parentesco.value);
         };
-        return h("fieldset.rec-viajero", h("legend", "Pasajero " + (i + 1) + (p.apellido ? " · " + p.apellido : "")), grid(campo("dni", "text", "DNI"), campo("nombre", "text", "Nombre"), campo("apellido", "text", "Apellido"), campo("fecha_nacimiento", "date", "Nacimiento"), P.campo("Vínculo", parentesco)), grid(campo("entrada", "date", "Ingreso efectivo"), campo("salida", "date", "Salida efectiva")), h("div.fila", btn("Ingresó hoy", function () {
-          p.entrada = hoy;
-          pintarPersonas();
+        var entrada = campo("entrada", "date", "Ingreso efectivo"),
+          salida = campo("salida", "date", "Salida efectiva"),
+          yaIngreso = (r.personas || []).some(function (anterior) { return anterior.entrada && String(anterior.dni) === String(p.dni); });
+        function marcarHoy(key, etiqueta) {
+          p[key] = hoy;
+          var control = etiqueta.querySelector("input");
+          control.value = hoy;
+          control.focus();
+        }
+        return h("fieldset.rec-viajero", h("legend", "Pasajero " + (i + 1) + (p.apellido ? " · " + p.apellido : "")), grid(campo("dni", "text", "DNI"), campo("nombre", "text", "Nombre"), campo("apellido", "text", "Apellido"), campo("fecha_nacimiento", "date", "Nacimiento"), P.campo("Vínculo", parentesco)), grid(entrada, salida), h("div.fila", btn("Ingresó hoy", function () {
+          if (p.salida && p.salida < hoy) throw Error("El ingreso debe ser anterior o igual a la salida.");
+          marcarHoy("entrada", entrada);
         }, "texto"), btn("Salió hoy", function () {
-          p.salida = hoy;
-          pintarPersonas();
-        }, "texto"), btn("Quitar pasajero", function () {
+          if (!p.entrada) { entrada.querySelector("input").focus(); throw Error("Registrá primero la fecha de ingreso."); }
+          marcarHoy("salida", salida);
+        }, "texto"), yaIngreso ? null : btn("Quitar pasajero", function () {
           viajeros.splice(i, 1);
           pintarPersonas();
         }, "texto")));
@@ -309,6 +316,7 @@
           parentesco_id: 5
         });
         pintarPersonas();
+        grupoViaje.querySelectorAll("fieldset")[viajeros.length - 1].querySelector("input").focus();
       })));
     }
     function buscarTitular(q, editar) {
@@ -363,6 +371,11 @@
     };
     function cuerpo() {
       if (!r.id && !titular) throw Error("Buscá o registrá al titular antes de continuar.");
+      var precio = manual.value.trim() ? P.importeDe(manual.value) : null;
+      if (precio === null && tipo.value !== "GENERAL" || precio !== null && !Number.isFinite(precio)) {
+        manual.focus();
+        throw Error("Indicá el precio acordado en pesos, con hasta dos decimales. Para gratuidad ingresá 0.");
+      }
       return {
         operacion: opId,
         id: r.id,
@@ -391,7 +404,7 @@
           });
         }),
         adicionales: tipo.value === "GENERAL" ? extras : [],
-        manual: manual.value,
+        manual: precio,
         motivo: motivo.value,
         observaciones: obs.value
       };
@@ -405,7 +418,7 @@
             P.vaciar(pre);
             throw Error("Cambiaste el formulario. Revisá el importe de nuevo.");
           }
-          return P.post("/recepcion/guardar", b).then(function (res) {
+          return P.post("/recepcion/guardar", Object.assign({}, b, { cotizacion_esperada: x.cotizacion_esperada })).then(function (res) {
             if (res.encolado) {
               ir();
               return;
@@ -426,8 +439,12 @@
       contingente.hidden = tipo.value !== "CONTINGENTE";
       gExtra.hidden = tipo.value !== "GENERAL";
       manual.required = tipo.value !== "GENERAL";
+      if (tipo.value === "PASA_EL_DIA") fin.value = inicio.value;
+      else if (tipo.value === "GENERAL" && inicio.value && fin.value <= inicio.value) fin.value = P.sumarDias(inicio.value, 1);
+      fin.readOnly = tipo.value === "PASA_EL_DIA";
     }
     tipo.onchange = modalidad;
+    inicio.onchange = modalidad;
     serv.onchange = function () {
       extras = [];
       recursos(null);
@@ -448,7 +465,7 @@
     base.appendChild(grupo("Vehículo", "Si llegan sin auto, dejá los cuatro campos vacíos.", grid(P.campo("Marca", marca), P.campo("Color", color), P.campo("Patente", patente), P.campo("Sector de estacionamiento", sector))));
     base.appendChild(gExtra);
     base.appendChild(grupo("Importe y observaciones", null, h("div.columna", grid(P.campo("Precio acordado ($)", manual, {
-      ayuda: "En una reserva general, dejalo vacío para usar la tarifa. Cero indica gratuidad."
+      ayuda: "Ingresá el precio para Pasa el día, Contingente y Federación. En General, dejalo vacío para usar la tarifa. Cero indica gratuidad."
     }), P.campo("Motivo del cambio o de la salida", motivo), P.campo("Observaciones de la reserva", obs)), guardar, pre)));
     recursos(r.recurso_id);
     pintarPersonas();
@@ -478,19 +495,67 @@
     LIQUIDAR: "Saldar consumos y cerrar saldo",
     PAGO_RESERVA: "Saldar diferencia de reserva"
   };
+  function accionesCuenta(r, a, cargar) {
+    var presentes = a.personas.filter(function (p) { return p.entrada && !p.salida; });
+    var conSaldo = a.personas.filter(function (p) { return Number(p.saldo) > 0; });
+    var puedeRepartir = conSaldo.some(function (p) { return presentes.some(function (otro) { return otro.id !== p.id; }); });
+    var inactivo = {
+      CARGA: !presentes.length && "Registrá el ingreso de un huésped para cargarle saldo.",
+      RETIRO: !conSaldo.length && "No hay saldo disponible para reducir.",
+      REPARTIR: !puedeRepartir && "Necesitás una persona con saldo y otro integrante presente que lo reciba.",
+      LIQUIDAR: a.cierre_pendiente === false && "La cuenta está al día.",
+      PAGO_RESERVA: !Number(a.pendiente) && "La reserva no tiene diferencias pendientes."
+    };
+    return h("div", !presentes.length && !a.movimientos.length ? h("p.texto-2", inactivo.CARGA) : null,
+      a.cierre_pendiente === false && a.movimientos.some(function (m) { return m.concepto === "SALDAR_CONSUMOS"; }) ? h("p.fuerte", "Cuenta de consumos saldada") : null,
+      h("div.fila", Object.keys(ACC).map(function (k) {
+        var boton = btn(ACC[k], function () { operarCuenta(r, a, k, cargar); });
+        if (inactivo[k]) { boton.disabled = true; boton.title = inactivo[k]; }
+        return boton;
+      })));
+  }
   function operarCuenta(r, a, accion, refrescar) {
     var presentes = a.personas.filter(function (p) {
       return p.entrada && !p.salida;
     });
-    var origen = sel(lista((accion === "CARGA" ? presentes : a.personas).map(function (p) {
+    var repartir = accion === "REPARTIR";
+    var posibles = accion === "CARGA" ? presentes : a.personas.filter(function (p) {
+      return Number(p.saldo) > 0 && (!repartir || presentes.some(function (d) { return d.id !== p.id; }));
+    });
+    var origen = sel(lista(posibles.map(function (p) {
       return {
         id: p.id,
         nombre: p.nombre + " · " + pesos(p.saldo)
       };
     })), null, "Elegí una persona");
-    var dest = sel(lista(presentes), null, "Elegí quién lo recibe"),
+    if (posibles.length === 1) origen.value = posibles[0].id;
+    var dest = sel([], null, "Elegí quién lo recibe"),
       imp = P.dinero({}),
-      nota = input("");
+      nota = input(""),
+      vistaReparto = h("p.texto-2", { "aria-live": "polite", hidden: true });
+    function persona(control) {
+      return a.personas.find(function (p) { return String(p.id) === control.value; });
+    }
+    function mostrarReparto() {
+      var de = persona(origen), hacia = persona(dest), importe = P.importeDe(imp.value);
+      vistaReparto.hidden = !de || !hacia || !(importe > 0);
+      if (!vistaReparto.hidden) vistaReparto.textContent = importe > Number(de.saldo) ?
+        "El importe supera el saldo disponible." :
+        "Después del reparto: " + de.nombre + ", " + pesos(Number(de.saldo) - importe) + " · " + hacia.nombre + ", " + pesos(Number(hacia.saldo) + importe) + ".";
+    }
+    function destinos() {
+      var opciones = presentes.filter(function (p) { return String(p.id) !== origen.value; });
+      P.vaciar(dest);
+      dest.appendChild(h("option", { value: "" }, "Elegí quién lo recibe"));
+      opciones.forEach(function (p) { dest.appendChild(h("option", { value: p.id }, p.nombre + " · " + pesos(p.saldo))); });
+      if (opciones.length === 1) dest.value = opciones[0].id;
+      mostrarReparto();
+    }
+    if (repartir) {
+      origen.onchange = destinos;
+      dest.onchange = imp.oninput = mostrarReparto;
+      destinos();
+    }
     var met = {
         EFECTIVO: MEDIOS.EFECTIVO,
         TRANSFERENCIA: MEDIOS.TRANSFERENCIA
@@ -503,13 +568,15 @@
     var medio = sel(opciones(met)),
       caja = sel([], null, "Elegí una caja"),
       campoCaja = P.campo("Caja de efectivo", caja);
-    P.opciones("cajas").then(function (xs) {
+    if (!repartir && (!liquidar || n)) P.opciones("cajas").then(function (xs) {
       xs.forEach(function (x) {
         caja.appendChild(h("option", {
           value: x.valor
         }, x.texto));
       });
-      if (P.puesto() && P.puesto().caja_id) caja.value = P.puesto().caja_id;
+      var asignada = P.puesto() && P.puesto().caja_id;
+      if (asignada && xs.some(function (x) { return String(x.valor) === String(asignada); })) caja.value = asignada;
+      else if (xs.length === 1) caja.value = xs[0].valor;
     }).catch(P.error);
     function actualizar() {
       campoCaja.hidden = medio.value !== "EFECTIVO" || accion === "REPARTIR" || liquidar && Number(n) === 0;
@@ -519,10 +586,18 @@
     var key = nuevaClave();
     var m = P.modal({
       titulo: ACC[accion],
-      contenido: h("div.columna", liquidar ? h("div.rec-resumen", n < 0 ? "A devolver" : n > 0 ? "A cobrar" : "Sin diferencia de dinero", h("strong", pesos(Math.abs(n)))) : grid(P.campo(accion === "REPARTIR" ? "Desde" : "Persona", origen), P.campo("Importe ($)", imp)), accion === "REPARTIR" ? P.campo("Hacia", dest) : P.campo("Medio", medio), campoCaja, P.campo("Observación", nota), accion === "LIQUIDAR" ? P.mensaje("Se cancelarán los saldos disponibles de todos los integrantes. Solo se liquida lo consumido, descontando los anticipos.", "info") : null),
+      contenido: h("div.columna", liquidar ? h("div.rec-resumen", n < 0 ? "A devolver" : n > 0 ? "A cobrar" : "Sin diferencia de dinero", h("strong", pesos(Math.abs(n)))) : grid(P.campo(repartir ? "Desde" : "Persona", origen), repartir ? P.campo("Hacia", dest) : null, P.campo("Importe ($)", imp)), repartir ? vistaReparto : liquidar && !n ? null : P.campo("Medio", medio), campoCaja, P.campo("Observación", nota), accion === "LIQUIDAR" ? P.mensaje("Se cancelarán los saldos disponibles de todos los integrantes. Solo se liquida lo consumido, descontando los anticipos.", "info") : null),
       acciones: [btn("Volver", function () {
         m.cerrar();
       }), btn("Confirmar", function () {
+        var importe = P.importeDe(imp.value);
+        if (!liquidar) {
+          if (!persona(origen)) { origen.focus(); throw Error("Elegí la persona."); }
+          if (repartir && !persona(dest)) { dest.focus(); throw Error("Elegí quién recibe el saldo."); }
+          if (!(importe > 0)) { imp.focus(); throw Error("Ingresá un importe mayor que cero, con hasta dos decimales."); }
+          if (accion !== "CARGA" && importe > Number(persona(origen).saldo)) { imp.focus(); throw Error("El saldo disponible no alcanza."); }
+        }
+        if (!campoCaja.hidden && !caja.value) { caja.focus(); throw Error("Elegí la caja donde se registra el efectivo."); }
         return P.post("/recepcion/" + r.id + "/cuenta", {
           operacion: key,
           accion: accion,
@@ -530,7 +605,7 @@
           caja_id: caja.value,
           huesped_id: origen.value,
           destino_id: dest.value,
-          importe: imp.value ? P.numeroDe(imp.value) : null,
+          importe: liquidar ? null : importe,
           esperado: n,
           detalle: nota.value
         }).then(function (x) {
@@ -569,18 +644,15 @@
           ir(id + "/editar");
         }, "primario"))), grupo("Datos de la estadía", null, h("div.columna", grid(P.dato("Servicio", r.servicio), P.dato("Recurso", texto(r.recurso) + (r.numero_parcela ? " · Parcela " + r.numero_parcela : "")), P.dato("Estadía", fecha(r.fecha_inicio) + " – " + fecha(r.fecha_fin)), P.dato("Estado", r.estado), P.dato("Tipo", TIPOS[r.tipo]), P.dato("Total de personas", r.cantidad), r.entidad ? P.dato("Entidad", r.entidad) : null, P.dato("Precio final", pesos(r.precio_total))), vh.patente ? espacio([vh.marca, vh.color, vh.patente, "Sector " + vh.sector].join(" · ")) : null, r.observaciones ? h("p", r.observaciones) : null)), grupo("Pasajeros", null, tabla(["Nombre", "DNI", "Ingreso", "Salida", "Estadía", "Saldo"], pasajeros)), r.adicionales.length ? grupo("Adicionales", null, tabla(["Concepto", "Cantidad", "Subtotal"], r.adicionales.map(function (x) {
           return [x.nombre, x.cantidad, pesos(x.subtotal)];
-        }))) : null, grupo("Cuenta de la estadía", "El saldo disponible se utiliza en caja con el DNI o legajo de cada huésped presente.", h("div.columna", grid(P.dato("Saldo para compras", pesos(a.saldo)), P.dato("Consumos", pesos(a.consumos)), P.dato(a.neto_consumos < 0 ? "Anticipo sin consumir" : "Consumos por saldar", pesos(Math.abs(a.neto_consumos))), P.dato(a.pendiente < 0 ? "Reserva: a devolver" : "Reserva: a cobrar", pesos(Math.abs(a.pendiente)))), h("div.fila", Object.keys(ACC).map(function (k) {
-          return btn(ACC[k], function () {
-            operarCuenta(r, a, k, cargar);
-          });
-        })), a.movimientos.length ? tabla(["Fecha", "Movimiento", "Medio", "Importe", "Empleado / detalle"], a.movimientos.map(function (m) {
+        }))) : null, grupo("Cuenta de la estadía", "El saldo disponible se utiliza en caja con el DNI o legajo de cada huésped presente.", h("div.columna", grid(P.dato("Saldo para compras", pesos(a.saldo)), P.dato("Consumos", pesos(a.consumos)), P.dato(a.neto_consumos < 0 ? "Anticipo sin consumir" : "Consumos por saldar", pesos(Math.abs(a.neto_consumos))), P.dato(a.pendiente < 0 ? "Reserva: a devolver" : "Reserva: a cobrar", pesos(Math.abs(a.pendiente)))), accionesCuenta(r, a, cargar), a.movimientos.length ? tabla(["Fecha", "Movimiento", "Medio", "Importe", "Empleado / detalle"], a.movimientos.map(function (m) {
+          var quien = a.personas.find(function (p) { return Number(p.id) === Number(m.huesped_id); });
           return [P.f.fechaHora(m.fecha), ACC[m.concepto] || {
             SALDAR_CONSUMOS: "Liquidación de consumos",
             REPARTO: "Reparto",
             DIFERENCIAL: "Diferencia de precio",
             COMPRA: "Compra",
             ANULACION: "Anulación"
-          }[m.concepto] || m.concepto, MEDIOS[m.medio] || m.medio || "—", pesos(m.importe), h("div", m.usuario_nombre + (m.detalle ? " · " + m.detalle : ""), m.liquidacion_id ? btn("Imprimir planilla", function () {
+          }[m.concepto] || m.concepto, MEDIOS[m.medio] || m.medio || "—", pesos(m.importe), h("div", [m.usuario_nombre, quien && quien.nombre, m.detalle].filter(Boolean).join(" · "), m.liquidacion_id ? btn("Imprimir planilla", function () {
             return P.get("/recepcion/" + id + "/planilla/" + m.liquidacion_id).then(P.imprimirLiquidacion);
           }, "texto") : null)];
         })) : null)), grupo("Historial de recepción", "Cada operación conserva el empleado, la fecha y los valores anteriores y nuevos.", timeline.length ? h("div.columna", timeline) : espacio("Todavía no hay modificaciones desde el predio.")));
