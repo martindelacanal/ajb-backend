@@ -77,7 +77,7 @@
       items.push({ texto: P.esAdmin() ? "Trabajar en una caja" : "Cambiar de boca o caja", icono: "caja", accion: function () { P.ruta.ir("/puesto"); } });
       if (P.esAdmin() && P.puesto() && P.puesto().caja_id) items.push({ texto: "Salir de caja y volver a administración", icono: "salir", accion: function () { P.salirDeCaja().catch(P.error); } });
       if (P.puesto() && P.puesto().caja_id) items.push({ texto: "Ver saldo de apertura", icono: "efectivo", accion: function () { P.verificarApertura(true); } });
-      if (!ses.usuario.es_admin_general) items.push({ texto: "Cambiar mi contraseña", icono: "llave", accion: cambiarClave });
+      if (!ses.usuario.es_admin_general) items.push({ texto: "Cambiar mi contraseña", icono: "candado", accion: cambiarClave });
       items.push("-");
       items.push({ texto: "Cerrar sesión", icono: "salir", accion: salir });
     } else {

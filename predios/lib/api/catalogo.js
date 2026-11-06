@@ -8,6 +8,7 @@ const N = require("../negocio");
 const { DESTINOS } = require("../listados");
 const { gtinValido, proximidadCodigo } = require("../codigo-barras");
 const { resolverRevisionProducto } = require("../precios");
+const { revisarProducto: revisarStockMinimoProducto, bloquearStockProducto } = require("../stock-minimo");
 const { exigirAdmin, esAdmin, bocasDe, exigirPuesto, exigirBoca } = require("./comun");
 
 const DESTINOS_VALIDOS = DESTINOS.map((d) => d.valor);
@@ -298,6 +299,7 @@ async function editarProducto(ctx) {
   return ctx.db.tx(async (t) => {
     if (datos.codigo !== undefined || datos.activo === 1) await bloquearCodigos(t, ctx);
     const antes = await N.exigir(t, ctx, "predio_producto", id, "No encontramos el producto", { bloquear: true });
+    if (datos.stock_minimo !== undefined || datos.activo !== undefined) await bloquearStockProducto(t, ctx, id);
     const compra = datos.precio_compra !== undefined ? datos.precio_compra : Number(antes.precio_compra || 0);
     const margen = datos.margen !== undefined ? datos.margen : Number(antes.margen || 0);
     if (ctx.body.precio_venta_manual !== undefined && ctx.body.precio_venta_manual !== null && ctx.body.precio_venta_manual !== "") {
@@ -337,6 +339,7 @@ async function editarProducto(ctx) {
         }
       }
     }
+    if (datos.stock_minimo !== undefined || datos.activo !== undefined) await revisarStockMinimoProducto(t, ctx, id);
     if (Object.keys(cambios).length) await N.auditar(t, ctx, "Modificación de producto", "producto", id, cambios);
     return { id, mensaje: "Producto actualizado", cambios };
   });

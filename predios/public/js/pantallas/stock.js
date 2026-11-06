@@ -127,7 +127,7 @@
         alElegir: function (o) { elegido = o.dato; disp.textContent = "Stock en la boca: " + P.f.numero(o.dato.stock_boca); cantidad.focus(); },
       });
       var cantidad = P.input({ inputmode: "decimal", valor: "1" });
-      var motivo = P.segmentado(MOTIVOS, "VENCIMIENTO");
+      var motivo = P.select(MOTIVOS, "VENCIMIENTO");
       var obs = P.input({ max: 250, placeholder: "Ej.: botella rota en el traslado, vino picado…" });
       var m = P.modal({
         titulo: "Bajar stock",
@@ -135,7 +135,7 @@
         contenido: h("div.columna", P.campo("Boca", boca), P.campo("Producto", h("div", combo.el, disp)), P.campo("Cantidad", cantidad), P.campo("Motivo", motivo), P.campo("Observaciones", obs)),
         acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn("Dar de baja", { tipo: "peligro-lleno", icono: "baja", onclick: function (ev) {
           if (!elegido) { P.aviso("Elegí el producto", "error"); combo.foco(); return; }
-          var cuerpo = { boca_id: Number(boca.value), producto_id: elegido.id, cantidad: P.numeroDe(cantidad.value), motivo: motivo.valor(), observaciones: obs.value };
+          var cuerpo = { boca_id: Number(boca.value), producto_id: elegido.id, cantidad: P.numeroDe(cantidad.value), motivo: motivo.value, observaciones: obs.value };
           P.ejecutar(ev.currentTarget, function () {
             return P.conConfirmacionStock(function (confirmar) { return P.post("/bajas", Object.assign({}, cuerpo, { confirmar_sin_stock: confirmar })); }, "Bajar igual").then(function (r) {
               if (!r.encolado) P.aviso(r.mensaje, "ok");

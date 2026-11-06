@@ -65,3 +65,16 @@ test("si falla la entrega se propaga el error para revertir la réplica y reinte
   const db = conexion({ fallarEntrega: true });
   await assert.rejects(entregarAvisos(db, predio, [{ ...aviso, general_usuario_id: 7 }]), /Entrega interrumpida/);
 });
+
+test("stock mínimo se entrega a los administradores y las cuentas de boca quedan privadas", async () => {
+  const db = conexion({ admins: [{ id: 7 }, { id: 9 }] });
+  await entregarAvisos(db, predio, [{ ...aviso, tipo: "STOCK_MINIMO" }]);
+  assert.deepEqual(db.inserts.map((p) => p[0]), [7, 9]);
+  assert.ok(db.inserts.every((p) => p[1] === "PREDIO_STOCK_MINIMO"));
+  const local = conexion();
+  await entregarAvisos(local, predio, [{ ...aviso, tipo: "STOCK_MINIMO", usuario_id: 8 }]);
+  assert.equal(local.inserts.length, 0);
+  const resuelto = conexion();
+  await entregarAvisos(resuelto, predio, [{ ...aviso, tipo: "STOCK_MINIMO", resuelto_fecha: "2026-11-06 10:00:00" }]);
+  assert.equal(resuelto.inserts.length, 0);
+});

@@ -119,51 +119,58 @@
       margen.style.textAlign = "right";
       var venta = P.dinero({ soloLectura: true });
       var manual = P.check("Fijar el precio de venta a mano", false, "Si no, se calcula: compra + margen.");
-      var revisionPrecio = P.check("Confirmar que revisé el precio", false, "Actualiza la fecha de revisión aunque el importe siga igual.");
+      var ayudaVenta = h("span", "Calculado automáticamente");
+      var precioIntervenido = false;
       var destino = P.select(DESTINOS, p.destino || "VENTA_DIRECTA");
       var ayudaDestino = h("span.campo-ayuda", AYUDA_DESTINO[destino.value]);
       destino.addEventListener("change", function () { ayudaDestino.textContent = AYUDA_DESTINO[destino.value]; });
       var cantidad = P.input({ inputmode: "decimal", valor: editar ? P.f.numero(stockAlmacenDe(detalle)) : "0" });
       cantidad.style.textAlign = "right";
-      var perecedero = P.check("Es perecedero", Number(p.perecedero) === 1, null, function (v) { zonaVence.hidden = !v; });
+      var perecedero = P.check("Es perecedero", Number(p.perecedero) === 1, null, function (v) {
+        zonaVence.hidden = !v;
+        filaCaducidad.classList.toggle("con-fecha", v);
+      });
       var vence = P.input({ tipo: "date", valor: p.fecha_caducidad || "" });
       var zonaVence = P.campo("Fecha de caducidad (opcional)", vence);
       zonaVence.hidden = Number(p.perecedero) !== 1;
+      var filaCaducidad = h("div.grilla.grilla-2.producto-caducidad" + (Number(p.perecedero) === 1 ? ".con-fecha" : ""), perecedero, zonaVence);
       var minimo = P.input({ inputmode: "decimal", valor: p.stock_minimo ? P.f.numero(p.stock_minimo) : "", placeholder: "Opcional" });
       var activo = P.check("Producto activo", editar ? Number(p.activo) === 1 : true, "Los dados de baja no aparecen para vender ni comprar.");
 
       function calcular() {
-        if (manual.input.checked) { venta.readOnly = false; return; }
-        venta.readOnly = true;
+        venta.readOnly = !manual.input.checked;
+        ayudaVenta.textContent = manual.input.checked ? "Precio definido a mano" : "Calculado automáticamente";
+        if (manual.input.checked) return;
         var c = P.numeroDe(compra.value), mg = P.numeroDe(margen.value);
         venta.value = isNaN(c) ? "" : P.f.numero(P.redondear(c * (1 + (isNaN(mg) ? 0 : mg) / 100)));
       }
-      [compra, margen].forEach(function (i) { i.addEventListener("input", calcular); });
-      manual.input.addEventListener("change", function () { calcular(); if (manual.input.checked) venta.focus(); });
+      [compra, margen].forEach(function (i) { i.addEventListener("input", function () { precioIntervenido = true; calcular(); }); });
+      manual.input.addEventListener("change", function () { precioIntervenido = true; calcular(); if (manual.input.checked) venta.focus(); });
       if (editar && p.precio_venta !== undefined) {
         var calc = P.redondear(Number(p.precio_compra || 0) * (1 + Number(p.margen || 0) / 100));
-        if (Math.abs(calc - Number(p.precio_venta)) > 0.01) { manual.input.checked = true; venta.readOnly = false; venta.value = P.f.numero(p.precio_venta); }
-        else calcular();
+        venta.value = P.f.numero(p.precio_venta);
+        if (Math.abs(calc - Number(p.precio_venta)) > 0.01) ayudaVenta.textContent = "Precio guardado. Se recalcula al cambiar la compra o el margen.";
       } else calcular();
 
       var formulario = h("div.columna",
         h("div.grilla.grilla-2", P.campo("Nombre", nombre, { requerido: true }), P.campo("Código de barras o único", codigo)),
-        h("div.grilla.grilla-3",
-          P.campo("Precio de compra", h("div.campo-con-prefijo", h("span", "$"), compra)),
-          P.campo("Margen de utilidad (%)", margen),
-          P.campo("Precio de venta", h("div.campo-con-prefijo", h("span", "$"), venta), { ayuda: "Calculado automáticamente" })),
-        manual,
-        editar ? revisionPrecio : null,
         h("div.grilla.grilla-2", P.campo("Destino del producto", h("div", destino, ayudaDestino)),
           P.campo(editar ? "Cantidad en almacén (ajuste)" : "Cantidad en almacén", cantidad, { ayuda: editar ? "Si la cambiás, queda registrado como ajuste manual." : "El almacén recibe los productos: ahí empieza su recorrido." })),
-        h("div.grilla.grilla-2", h("div.columna", perecedero, zonaVence), P.campo("Stock mínimo (para avisos)", minimo)),
+        h("div.grilla.grilla-2",
+          P.campo("Precio de compra", h("div.campo-con-prefijo", h("span", "$"), compra)),
+          P.campo("Margen de utilidad (%)", margen)),
+        h("div.grilla.grilla-2.producto-venta", manual,
+          P.campo("Precio de venta", h("div.campo-con-prefijo", h("span", "$"), venta), { ayuda: ayudaVenta })),
+        filaCaducidad,
+        P.campo("Stock mínimo para avisos", minimo, { ayuda: "Avisa al personal de la boca y a administración cuando el stock queda por debajo de esta cantidad. Con 0, no se generan avisos de stock mínimo." }),
         editar ? activo : null);
 
       var contenido = formulario;
       if (detalle) {
         var stockLista = h("ul.lista-simple", detalle.stock.map(function (s) { return h("li", h("span", s.boca), h("strong.numero", P.f.numero(s.cantidad))); }));
         var precios = h("ul.lista-simple", detalle.precios.map(function (x) {
-          return h("li", h("div", h("strong", P.f.fechaHora(x.fecha)), h("div.texto-3.chico", (({ ALTA: "Alta", EDICION: "Edición", COMPRA: "Compra N° " + x.referencia_id, IMPORTACION: "Último precio en el sistema anterior" })[x.origen] || x.origen) + " · " + (x.usuario_nombre || ""))),
+          var actor = /sistema (anterior|actual)/i.test(x.usuario_nombre || "") ? "" : x.usuario_nombre;
+          return h("li", h("div", h("strong", P.f.fechaHora(x.fecha)), h("div.texto-3.chico", (({ ALTA: "Alta", EDICION: "Edición", COMPRA: "Compra N° " + x.referencia_id, IMPORTACION: "Precio registrado" })[x.origen] || x.origen) + (actor ? " · " + actor : ""))),
             h("div", { style: { textAlign: "right" } }, h("div", "Compra " + P.f.pesos(x.precio_compra) + " · " + P.f.pct(x.margen)), h("strong", "Venta " + P.f.pesos(x.precio_venta))));
         }));
         var solapa = P.segmentado([{ valor: "datos", texto: "Datos" }, { valor: "stock", texto: "Stock por boca" }, { valor: "precios", texto: "Historial de precios" }], "datos", function (v) {
@@ -171,8 +178,10 @@
         });
         stockLista.hidden = true;
         precios.hidden = true;
+        var creacion = P.f.fechaHora(p.fecha_creacion);
+        var modificacion = P.f.fechaHora(p.fecha_modificacion);
         contenido = h("div.columna", solapa, formulario, stockLista, precios,
-          h("p.texto-3.chico", { style: { margin: 0 } }, "Creado " + P.f.fechaHora(p.fecha_creacion) + " por " + (p.creado_por || "—") + " · Modificado " + P.f.fechaHora(p.fecha_modificacion) + " por " + (p.modificado_por || "—")));
+          h("p.texto-3.chico", { style: { margin: 0 } }, "Creado el " + (creacion || "—") + (modificacion && modificacion !== creacion ? " · Modificado el " + modificacion : "")));
       }
       var m = P.modal({
         titulo: editar ? p.nombre : "Nuevo producto", subtitulo: editar ? "ID " + p.id + (p.codigo ? " · Código " + p.codigo : "") : null,
@@ -184,9 +193,13 @@
             destino: destino.value, perecedero: perecedero.input.checked, fecha_caducidad: perecedero.input.checked ? vence.value || null : null,
             stock_minimo: P.numeroDe(minimo.value) || 0, cantidad_almacen: P.numeroDe(cantidad.value) || 0,
             precio_venta_manual: manual.input.checked ? P.numeroDe(venta.value) : null,
-            confirmar_revision_precio: revisionPrecio.input.checked,
           };
-          if (editar) { cuerpo.activo = activo.input.checked; if (P.numeroDe(cantidad.value) === stockAlmacenDe(detalle)) delete cuerpo.cantidad_almacen; }
+          if (editar) {
+            cuerpo.activo = activo.input.checked;
+            if (P.numeroDe(cantidad.value) === stockAlmacenDe(detalle)) delete cuerpo.cantidad_almacen;
+            // Guardar nombre, stock u otros datos no debe cambiar un precio ya fijado.
+            if (!precioIntervenido) { delete cuerpo.precio_compra; delete cuerpo.margen; delete cuerpo.precio_venta_manual; }
+          }
           if (!cuerpo.nombre.trim()) { nombre.classList.add("invalido"); nombre.focus(); return; }
           P.ejecutar(ev.currentTarget, function () {
             return (editar ? P.put("/productos/" + p.id, cuerpo) : P.post("/productos", cuerpo)).then(function (r) {

@@ -61,6 +61,7 @@ async function ejecutarComoAdminGeneral(res, predio, usuario, { metodo, ruta, cu
       general_usuario_id: Number(usuario.id), documento: String(usuario.documento || "") },
     sesion: {}, query: { ...(query || {}) }, body: cuerpo && typeof cuerpo === "object" ? cuerpo : {},
   };
+  base.alAvisosStock = base.alAvisosPrecios;
   const encontrada = apiPredio.buscarRuta(metodo, ruta);
   if (!encontrada) throw U.error("No encontramos esa operación", 404);
   if (encontrada.ruta.soloLocal) throw U.error("Esta operación se hace desde las PCs del camping", 409);

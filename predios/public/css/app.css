@@ -96,6 +96,17 @@ h1, h2, h3 { margin: 0; line-height: 1.2; }
 @media (max-width: 1100px) { .grilla-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .grilla-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 700px) { .grilla-2, .grilla-3, .grilla-4 { grid-template-columns: minmax(0, 1fr); } }
 
+/* Datos del producto: las opciones se alinean con sus importes y fechas. */
+.producto-venta > .check { margin-top: 26px; }
+.producto-caducidad > .check { align-self: center; min-height: 42px; align-items: center; }
+.producto-caducidad.con-fecha > .check { grid-column: 2; grid-row: 1; margin-top: 26px; align-self: start; }
+.producto-caducidad.con-fecha > .campo { grid-column: 1; grid-row: 1; }
+@media (max-width: 700px) {
+  .producto-venta > .check { margin-top: 0; }
+  .producto-caducidad.con-fecha > .check,
+  .producto-caducidad.con-fecha > .campo { grid-column: auto; grid-row: auto; margin-top: 0; }
+}
+
 /* ---------------------------------------------------------------- botones */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 8px;

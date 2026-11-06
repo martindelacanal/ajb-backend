@@ -144,6 +144,7 @@ async function moverStock(t, ctx, { bocaId, productoId, cantidad, tipo, referenc
     usuario_id: ctx.usuario?.id || null,
     usuario_nombre: nombreActor(ctx),
   });
+  await require("./stock-minimo").revisarPar(t, ctx, bocaId, productoId);
   return saldo;
 }
 
