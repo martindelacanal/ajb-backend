@@ -5,6 +5,7 @@
   if (window.__SIN_SOPORTE) return;
   var P = window.P;
   var h = P.h;
+  var siguientePeriodo = 0;
 
   var LISTADOS = [
     { valor: "ventas", texto: "Ventas" },
@@ -30,15 +31,26 @@
     var boca = P.select([], estado.boca, { vacio: "Todas las bocas" });
     P.opciones("bocas_venta").then(function (ops) { ops.forEach(function (o) { var op = h("option", { value: o.valor }, o.texto); if (String(o.valor) === String(estado.boca)) op.selected = true; boca.appendChild(op); }); });
     function rango(d, hs) { desde.value = d; hasta.value = hs; cargar(); }
+    var idPeriodo = "estadisticas-periodo-" + (++siguientePeriodo);
+    var filtrosPeriodo = h("div.tabla-filtros.tabla-periodo-controles", { id: idPeriodo, hidden: true },
+      P.campo("Desde", desde), P.campo("Hasta", hasta), P.campo("Boca", boca),
+      h("div.campo", h("span.campo-etiqueta", "Período rápido"), h("div.fila", { style: { gap: "6px" } },
+        P.btn("Hoy", { tipo: "suave", chico: true, onclick: function () { rango(P.hoy(), P.hoy()); } }),
+        P.btn("7 días", { tipo: "suave", chico: true, onclick: function () { rango(P.sumarDias(P.hoy(), -6), P.hoy()); } }),
+        P.btn("30 días", { tipo: "suave", chico: true, onclick: function () { rango(P.sumarDias(P.hoy(), -29), P.hoy()); } }),
+        P.btn("Temporada", { tipo: "suave", chico: true, onclick: function () { var t = temporadaActual(); rango(t.desde, t.hasta); } }))));
+    var botonPeriodo = P.btn("Período y boca", { tipo: "secundario", icono: "filtro", onclick: function () {
+      filtrosPeriodo.hidden = !filtrosPeriodo.hidden;
+      botonPeriodo.setAttribute("aria-expanded", String(!filtrosPeriodo.hidden));
+    } });
+    botonPeriodo.id = idPeriodo + "-boton";
+    botonPeriodo.setAttribute("aria-controls", idPeriodo);
+    botonPeriodo.setAttribute("aria-expanded", "false");
+    filtrosPeriodo.setAttribute("role", "region");
+    filtrosPeriodo.setAttribute("aria-labelledby", botonPeriodo.id);
     c.appendChild(h("div.pagina-cabecera",
-      h("div", h("h1.titulo-pagina", "Estadísticas"), h("p.subtitulo", "Cómo vienen las ventas, las compras y el stock del predio.")),
-      h("div.fila-campos.filtros-fechas",
-        P.campo("Desde", desde, { clase: "fecha" }), P.campo("Hasta", hasta, { clase: "fecha" }), P.campo("Boca", boca, { clase: "boca" }),
-        h("div.campo", h("span.campo-etiqueta", "Rápido"), h("div.fila", { style: { gap: "4px" } },
-          P.btn("Hoy", { tipo: "suave", chico: true, onclick: function () { rango(P.hoy(), P.hoy()); } }),
-          P.btn("7 días", { tipo: "suave", chico: true, onclick: function () { rango(P.sumarDias(P.hoy(), -6), P.hoy()); } }),
-          P.btn("30 días", { tipo: "suave", chico: true, onclick: function () { rango(P.sumarDias(P.hoy(), -29), P.hoy()); } }),
-          P.btn("Temporada", { tipo: "suave", chico: true, onclick: function () { var t = temporadaActual(); rango(t.desde, t.hasta); } }))))));
+      h("div", h("h1.titulo-pagina", "Estadísticas"), h("p.subtitulo", "Cómo vienen las ventas, las compras y el stock del predio.")), botonPeriodo));
+    c.appendChild(filtrosPeriodo);
     [desde, hasta, boca].forEach(function (el) { el.addEventListener("change", cargar); });
     var cifras = h("div.grilla.grilla-4", P.cargando());
     var graficos = h("div");
@@ -74,6 +86,7 @@
     }
 
     function cargar() {
+      botonPeriodo.title = "Del " + P.f.fecha(desde.value) + " al " + P.f.fecha(hasta.value);
       estado = { desde: desde.value, hasta: hasta.value, boca: boca.value };
       P.cache["estadisticas"] = estado;
       ["est-ventas", "est-compras", "est-almacen", "est-ventas_productos", "est-solicitudes", "est-bajas"].forEach(function (k) { delete P.cache["tabla:" + k]; });

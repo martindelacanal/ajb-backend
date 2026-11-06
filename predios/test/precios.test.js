@@ -111,7 +111,7 @@ test("el diagnóstico exacto explica sin precio y el buscador excluye todos los 
   await mover(sinPrecio.id, 2); await mover(cercano.id, 2);
   const actor = { usuario: { ...ctx.usuario, id: 2, rol: "CAJERO", bocas: [boca.id] }, sesion: { boca_id: boca.id, caja_id: caja.id } };
   const busqueda = await llamar("GET", "/productos/buscar", {}, { venta: "1" }, actor);
-  assert.deepEqual(new Set(busqueda.map((p) => p.id)), new Set([cercano.id, servicio.id]));
+  assert.deepEqual(new Set(busqueda.map((p) => p.id)), new Set([cercano.id]));
   assert.ok(!busqueda.some((p) => p.id === servicioCero.id));
   assert.deepEqual(await llamar("GET", "/productos/buscar", {}, { venta: "1", q: "7790895067556" }, actor), []);
   const consulta = await llamar("GET", "/productos/consultar-codigo", {}, { codigo: "7790895067556" }, actor);

@@ -115,7 +115,6 @@
         h("h1.lg-titulo#lg-titulo", "Todavía no está listo"),
         h("p.lg-bajada", "El sistema todavía no está configurado: terminá la configuración inicial en la notebook servidor."));
     } else tarjeta = formularioIngreso(nombre);
-    var version = estado.version ? h("p.lg-version", "Versión " + String(estado.version).split("+")[0]) : null;
     P.reemplazar(app, h("main.lg",
       h("header.lg-cabecera", h("div.lg-cabecera-interior",
         h("div.lg-marca",
@@ -124,7 +123,7 @@
         chipConexion(estado))),
       h("div.lg-escenario",
         h("div.lg-interior",
-          h("section.lg-tarjeta", { "aria-labelledby": "lg-titulo" }, tarjeta, version),
+          h("section.lg-tarjeta", { "aria-labelledby": "lg-titulo" }, tarjeta),
           galeria(nombre)),
         olas())));
     var primero = app.querySelector(".lg-input");

@@ -24,7 +24,7 @@
     var habilitado = P.check("Puede comprar con descuento de haberes", base.habilitado_descuento === undefined ? true : Number(base.habilitado_descuento) === 1);
     var obs = P.input({ valor: base.observaciones, max: 250, placeholder: "Opcional" });
     var m = P.modal({
-      titulo: editar ? base.nombre : "Agregar afiliado",
+      titulo: editar ? base.nombre : "Nuevo afiliado",
       subtitulo: sistema ? "Sus datos vienen del sistema general: acá sólo cambia el límite." : (editar ? "Cargado a mano." : "Para quien todavía no aparece por sincronización. Cuando llegue del sistema general se une solo por DNI o legajo."),
       ancho: "ancha",
       contenido: h("div.columna",
@@ -122,12 +122,12 @@
       },
       tituloVacio: "No hay afiliados con estos filtros", textoVacio: "Los afiliados con reserva en el camping o en las cabañas llegan solos del sistema general.",
     });
-    c.appendChild(h("div.fila", { style: { marginBottom: "14px" } },
-      P.btn("Agregar afiliado", { tipo: "primario", icono: "mas", onclick: function () { formAfiliado({}, function () { t.recargar(); }); } }),
+    c.appendChild(h("div.gestion-acciones",
+      h("div.gestion-acciones-grupo",
       P.btn("Modificar límites", { tipo: "secundario", icono: "descuento", onclick: function () { limitesMasivos(function () { t.recargar(); }); } }),
       P.btn("Liquidaciones y deudas", { tipo: "secundario", icono: "planilla", onclick: function () { P.ruta.ir("/gestion/liquidaciones"); } }),
-      h("div.espacio"),
-      P.btn("Historial de límites", { tipo: "texto", icono: "historial", onclick: function () { P.ruta.ir("/gestion/limites"); } })));
+      P.btn("Historial de límites", { tipo: "secundario", icono: "historial", onclick: function () { P.ruta.ir("/gestion/limites"); } })),
+      h("div.gestion-accion-nueva", P.btn("Nuevo afiliado", { tipo: "primario", icono: "mas", onclick: function () { formAfiliado({}, function () { t.recargar(); }); } }))));
     c.appendChild(t.el);
   }, { admin: true, titulo: "Afiliados" });
 

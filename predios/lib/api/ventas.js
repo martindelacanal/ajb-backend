@@ -65,14 +65,38 @@ async function avisarSinStock(ctx) {
     let stock = null;
     if (productoId) {
       producto = await N.exigir(t, ctx, "predio_producto", productoId, "No encontramos el producto");
-      if (!Number(producto.activo) || producto.destino !== "VENTA_DIRECTA") throw U.error("Este producto no corresponde a una venta sin stock", 409);
+      if (!Number(producto.activo) || producto.destino === "USO_INTERNO") throw U.error("Este producto no se puede vender", 409, { codigo: "PRODUCTO_NO_VENDIBLE" });
       stock = await N.stockActual(t, ctx, puesto.boca_id, productoId);
       if (stock >= cantidad) throw U.error("El producto ya tiene stock suficiente. Volvé a buscarlo en la lista de ventas.", 409, { codigo: "STOCK_DISPONIBLE" });
     }
     const id = await avisarFaltante(t, ctx, { producto, busqueda, cantidad, stock });
     const config = await N.leerConfig(t, ctx);
-    return { id, puede_vender: !!producto && config.vender_sin_stock !== "0", mensaje: "El aviso quedó registrado para el administrador. Si no hay internet, se enviará al sistema general al sincronizar." };
+    return { id, puede_vender: !!producto && Number(producto.precio_venta || 0) > 0 && config.vender_sin_stock !== "0", mensaje: "El aviso quedó registrado para el administrador. Si no hay internet, se enviará al sistema general al sincronizar." };
   });
+}
+
+async function avisosAceptados(t, ctx, cantidades, pedidos) {
+  const salida = new Map();
+  if (!Array.isArray(pedidos)) return salida;
+  if (pedidos.length > 200) throw U.error("La venta incluye demasiados avisos de stock");
+  const candidatos = pedidos.map((p) => ({ id: Number(p?.id), productoId: Number(p?.producto_id) }))
+    .filter((p) => Number.isSafeInteger(p.id) && p.id > 0 && cantidades.has(p.productoId))
+    .sort((a, b) => a.id - b.id);
+  const vistos = new Set();
+  for (const p of candidatos) {
+    if (vistos.has(p.id)) continue;
+    vistos.add(p.id);
+    const aviso = await t.get(`SELECT id, tipo, detalle FROM predio_aviso WHERE predio_id = ? AND id = ?${t.forUpdate}`, [ctx.pid, p.id]);
+    if (!aviso || aviso.tipo !== "VENTA_SIN_STOCK") continue;
+    let d;
+    try { d = JSON.parse(aviso.detalle || "null"); } catch (_e) { continue; }
+    if (!d || d.venta_id || d.consumido_venta_id || Number(d.usuario_id) !== Number(ctx.usuario.id)
+      || Number(d.boca_id) !== Number(ctx.sesion.boca_id) || Number(d.caja_id) !== Number(ctx.sesion.caja_id)
+      || Number(d.producto_id) !== p.productoId || !Number.isFinite(Number(d.cantidad))
+      || Number(d.cantidad) < cantidades.get(p.productoId)) continue;
+    if (!salida.has(p.productoId)) salida.set(p.productoId, { id: aviso.id, detalle: d });
+  }
+  return salida;
 }
 
 async function datosTicket(db, ctx, ventaId) {
@@ -153,7 +177,7 @@ async function crearVenta(ctx) {
     for (const productoId of [...agrupados.keys()].sort((a, b) => a - b)) {
       const p = await N.exigir(t, ctx, "predio_producto", productoId, "Uno de los productos no existe");
       productos.set(productoId, p);
-      if (MOVEDORES_STOCK.includes(p.destino)) stocks.set(productoId, await stockParaVenta(t, ctx, caja.boca_id, productoId));
+      if (p.destino !== "USO_INTERNO") stocks.set(productoId, await stockParaVenta(t, ctx, caja.boca_id, productoId));
     }
     for (const [productoId, cantidad] of agrupados) {
       const p = productos.get(productoId);
@@ -161,18 +185,20 @@ async function crearVenta(ctx) {
       if (p.destino === "USO_INTERNO") throw U.error(`«${p.nombre}» es de uso interno y no se vende`);
       const precio = U.redondear(Number(p.precio_venta || 0), 2);
       if (precio <= 0) throw U.error(`«${p.nombre}» no tiene precio de venta: pedile al administrador que lo cargue`, 409, { codigo: "SIN_PRECIO" });
-      if (MOVEDORES_STOCK.includes(p.destino)) {
-        const stock = stocks.get(productoId);
-        if (stock < cantidad) faltantes.push({ producto_id: productoId, producto: p.nombre, pedido: cantidad, disponible: stock });
+      const stock = stocks.get(productoId);
+      if (MOVEDORES_STOCK.includes(p.destino) ? stock < cantidad : stock <= 0) {
+        faltantes.push({ producto_id: productoId, producto: p.nombre, pedido: cantidad, disponible: stock });
       }
       lineas.push({ producto: p, cantidad, precio, subtotal: U.redondear(precio * cantidad, 2) });
     }
+    const avisosPrevios = await avisosAceptados(t, ctx, agrupados, b.avisos_sin_stock);
+    const sinAviso = faltantes.filter((f) => !avisosPrevios.has(f.producto_id));
     if (faltantes.length) {
       if (config.vender_sin_stock === "0") {
         throw U.error(`No hay stock suficiente de «${faltantes[0].producto}» en esta boca`, 409, { codigo: "SIN_STOCK", faltantes });
       }
-      if (b.confirmar_sin_stock !== true && b.confirmar_sin_stock !== 1) {
-        throw U.error("Hay productos que figuran sin stock suficiente en esta boca", 409, { codigo: "STOCK_INSUFICIENTE", faltantes });
+      if (sinAviso.length && b.confirmar_sin_stock !== true && b.confirmar_sin_stock !== 1) {
+        throw U.error("Hay productos que figuran sin stock suficiente en esta boca", 409, { codigo: "STOCK_INSUFICIENTE", faltantes: sinAviso });
       }
     }
     const total = U.redondear(lineas.reduce((s, l) => s + l.subtotal, 0), 2);
@@ -230,8 +256,13 @@ async function crearVenta(ctx) {
       });
     }
     if (faltantes.length) {
-      await N.auditar(t, ctx, "Venta sin stock suficiente", "venta", ventaId, { faltantes });
-      await avisarFaltante(t, ctx, { ventaId, faltantes });
+      await N.auditar(t, ctx, "Venta sin stock suficiente", "venta", ventaId, { faltantes, avisos_aceptados: [...avisosPrevios.values()].map((a) => a.id) });
+      if (sinAviso.length) await avisarFaltante(t, ctx, { ventaId, faltantes: sinAviso });
+    }
+    for (const aviso of avisosPrevios.values()) {
+      await N.actualizar(t, ctx, "predio_aviso", aviso.id, {
+        detalle: JSON.stringify({ ...aviso.detalle, consumido_venta_id: ventaId, consumido_fecha: ahora }),
+      });
     }
     return { id: ventaId, total, vuelto, mensaje: `Venta N° ${ventaId} registrada`, ticket: await datosTicket(t, ctx, ventaId) };
   });

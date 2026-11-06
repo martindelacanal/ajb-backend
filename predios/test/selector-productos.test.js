@@ -160,7 +160,7 @@ test("volver del popup no deja un cierre de blur pendiente que quite la nueva li
   assert.equal(s.elegidos.length, 0);
 });
 
-test("ventas excluye físicos sin stock y todo producto sin precio, incluso al escribir", async () => {
+test("ventas excluye todo producto sin stock o sin precio, incluso compuestos al escribir", async () => {
   const s = pantalla();
   s.P.get = async () => [
     { id: 1, nombre: "Sin precio", precio_venta: 0, destino: "VENTA_DIRECTA", stock_boca: 20 },
@@ -173,6 +173,6 @@ test("ventas excluye físicos sin stock y todo producto sin precio, incluso al e
   ];
   await enter(s.crear({ venta: true }), "producto");
   const opciones = s.documento.body.querySelectorAll(".combo-opcion");
-  assert.equal(opciones.length, 2);
+  assert.equal(opciones.length, 1);
   assert.equal(s.elegidos.length, 0);
 });

@@ -383,7 +383,7 @@
       buscar: function (texto) {
         return P.get("/productos/buscar" + P.qs({ q: texto, boca_id: opciones.bocaId ? opciones.bocaId() : null, venta: opciones.venta ? 1 : null })).then(function (r) {
           return r.filter(function (p) {
-            return !opciones.venta || (Number(p.precio_venta) > 0 && p.destino !== "USO_INTERNO" && (p.destino !== "VENTA_DIRECTA" || Number(p.stock_boca) > 0));
+            return !opciones.venta || (Number(p.precio_venta) > 0 && p.destino !== "USO_INTERNO" && Number(p.stock_boca) > 0);
           }).map(function (p) {
             return {
               valor: p.id, texto: p.nombre, codigo: p.codigo, exacto: p.exacto, dato: p, busqueda: texto,
@@ -415,6 +415,7 @@
 
   // Columnas de nombres largos (productos, proveedores): no se parten en muchos renglones.
   var COLUMNAS_ANCHAS = ["nombre", "producto", "razon_social", "proveedor"];
+  var siguienteTabla = 0;
 
   P.tabla = function (opciones) {
     var nombre = opciones.listado;
@@ -429,8 +430,13 @@
       filtros: Object.assign({}, guardado.filtros || opciones.filtrosIniciales || {}),
     };
     var meta = null;
+    var filtrosAbiertos = false;
+    var idFiltros = "tabla-filtros-" + (++siguienteTabla);
+    var botonFiltros = null;
+    var cantidadFiltros = null;
     var raiz = h("div.hoja.tabla-caja");
     var barra = h("div.tabla-barra");
+    var panelFiltros = h("div.tabla-filtros", { id: idFiltros, role: "region", "aria-labelledby": idFiltros + "-boton", hidden: true });
     var cuerpo = h("div.tabla-desplazable");
     var pie = h("div.tabla-pie");
     // Barra lateral propia + paginador: flotan abajo de la pantalla mientras se recorre una tabla
@@ -439,6 +445,7 @@
     desliz.hidden = true;
     var flotante = h("div.tabla-flotante", desliz, pie);
     raiz.appendChild(barra);
+    raiz.appendChild(panelFiltros);
     raiz.appendChild(cuerpo);
     raiz.appendChild(flotante);
     cuerpo.addEventListener("scroll", function () { if (desliz.scrollLeft !== cuerpo.scrollLeft) desliz.scrollLeft = cuerpo.scrollLeft; });
@@ -563,13 +570,16 @@
 
     function armarBarra() {
       P.vaciar(barra);
+      P.vaciar(panelFiltros);
       if (meta.buscador && opciones.buscador !== false) {
         var buscar = P.input({ tipo: "search", valor: estado.q, placeholder: opciones.placeholderBuscar || "Buscar…" });
         var t = null;
         buscar.addEventListener("input", function () {
           clearTimeout(t);
-          t = setTimeout(function () { estado.q = buscar.value.trim(); estado.pagina = 1; cargar(); }, 300);
+          estado.q = buscar.value.trim(); estado.pagina = 1;
+          t = setTimeout(cargar, 300);
         });
+        buscar.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); clearTimeout(t); cargar(); } });
         barra.appendChild(P.campo("Buscar", buscar, { clase: "tabla-buscar" }));
       }
       var ocultos = opciones.filtrosOcultos || [];
@@ -602,12 +612,25 @@
           monto.addEventListener("input", function () { clearTimeout(tm); tm = setTimeout(aplicar, 400); });
           control = h("div.fila", { style: { gap: "6px", flexWrap: "nowrap" } }, op, monto);
         }
-        if (control) barra.appendChild(P.campo(f.titulo, control));
+        if (control) panelFiltros.appendChild(P.campo(f.titulo, control));
       });
-      barra.appendChild(h("div.espacio"));
-      (opciones.barra || []).forEach(function (b) { if (b) barra.appendChild(b); });
+      var extras = (opciones.barra || []).filter(Boolean);
+      if (extras.length) panelFiltros.appendChild(h("div.tabla-filtros-acciones", extras));
+      if (panelFiltros.childNodes.length) {
+        cantidadFiltros = h("span.tabla-filtros-numero", { "aria-hidden": "true", hidden: true });
+        botonFiltros = P.btn("Filtros", { tipo: "secundario", icono: "filtro", onclick: function () {
+          filtrosAbiertos = !filtrosAbiertos;
+          actualizarFiltros();
+        } });
+        botonFiltros.id = idFiltros + "-boton";
+        botonFiltros.classList.add("tabla-boton-filtros");
+        botonFiltros.setAttribute("aria-controls", idFiltros);
+        botonFiltros.appendChild(cantidadFiltros);
+        barra.appendChild(botonFiltros);
+      } else { botonFiltros = null; cantidadFiltros = null; filtrosAbiertos = false; }
       if (opciones.exportar !== false) {
-        var boton = P.btn("Exportar", { tipo: "secundario", icono: "planilla", chico: true });
+        var boton = P.btn("Exportar", { tipo: "secundario", icono: "planilla" });
+        boton.classList.add("tabla-exportar");
         boton.addEventListener("click", function () {
           var items = [{ texto: "CSV completo (lo filtrado)", icono: "descargar", accion: function () { exportar({ formato: "csv", modo: "completo" }); } }];
           if (meta.resumen.length) {
@@ -618,8 +641,24 @@
           }
           P.menuFlotante(boton, items);
         });
-        barra.appendChild(h("div.campo", h("span.campo-etiqueta", " "), boton));
+        barra.appendChild(boton);
       }
+      actualizarFiltros();
+    }
+
+    function actualizarFiltros() {
+      panelFiltros.hidden = !filtrosAbiertos;
+      if (!botonFiltros || !meta) return;
+      var ocultos = opciones.filtrosOcultos || [];
+      var activos = meta.filtros.filter(function (f) {
+        if (ocultos.indexOf(f.clave) >= 0) return false;
+        var valor = f.clave in estado.filtros ? estado.filtros[f.clave] : f.defecto;
+        return valor !== undefined && valor !== null && valor !== "" && valor !== "todos";
+      }).length;
+      cantidadFiltros.textContent = String(activos);
+      cantidadFiltros.hidden = !activos;
+      botonFiltros.setAttribute("aria-expanded", String(filtrosAbiertos));
+      botonFiltros.setAttribute("aria-label", (filtrosAbiertos ? "Ocultar filtros" : "Mostrar filtros") + (activos ? ", " + activos + " activo" + (activos === 1 ? "" : "s") : ""));
     }
 
     function exportar(extra) {
@@ -696,6 +735,7 @@
 
     function cargar() {
       guardar();
+      actualizarFiltros();
       if (sel) {
         var nueva = firmaConsulta();
         if (firma !== null && nueva !== firma) limpiarSeleccion();

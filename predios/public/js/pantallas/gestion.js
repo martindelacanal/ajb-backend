@@ -223,21 +223,20 @@
           return vencido ? P.chip(P.f.fecha(v), "ANULADA") : pronto ? P.chip(P.f.fecha(v), "PENDIENTE") : P.f.fecha(v);
         },
       },
-      barra: [P.btn("Precios para revisar", { tipo: "secundario", chico: true, icono: "reloj", onclick: function () { tabla.fijarFiltro("revision_precio", "pendiente"); } })],
     });
-    c.appendChild(h("div.fila", { style: { marginBottom: "14px" } },
-      P.btn("Nuevo producto", { tipo: "primario", icono: "mas", onclick: function () { P.formProducto({}, function () { tabla.recargar(); }); } }),
+    c.appendChild(h("div.gestion-acciones",
+      h("div.gestion-acciones-grupo",
       P.btn("Administrar solicitudes", { tipo: "secundario", icono: "solicitud", onclick: function () { P.ruta.ir("/gestion/solicitudes"); } }),
       P.btn("Traspasos entre bocas", { tipo: "secundario", icono: "traspaso", onclick: function () { P.formSolicitud("traspaso", function () { tabla.recargar(); }); } }),
       P.btn("Bajar stock", { tipo: "secundario", icono: "baja", onclick: function () { P.formBaja(function () { tabla.recargar(); }); } }),
-      h("div.espacio"),
-      P.btn("Más", { tipo: "texto", icono: "lista", onclick: function (ev) {
+      P.btn("Más", { tipo: "secundario", icono: "lista", onclick: function (ev) {
         P.menuFlotante(ev.currentTarget, [
           { texto: "Stock por boca", icono: "stock", accion: function () { P.ruta.ir("/gestion/stock"); } },
           { texto: "Movimientos de stock", icono: "historial", accion: function () { P.ruta.ir("/gestion/movimientos"); } },
           { texto: "Bajas registradas", icono: "baja", accion: function () { P.ruta.ir("/gestion/bajas"); } },
         ]);
-      } })));
+      } })),
+      h("div.gestion-accion-nueva", P.btn("Nuevo producto", { tipo: "primario", icono: "mas", onclick: function () { P.formProducto({}, function () { tabla.recargar(); }); } }))));
     c.appendChild(tabla.el);
   }, { admin: true, titulo: "Productos y stock" });
 
@@ -250,8 +249,8 @@
   P.ruta.registrar(/^\/gestion\/solicitudes$/, function (c) {
     var v = null;
     subpagina(c, "Solicitudes", "Todas las solicitudes entre bocas. Como administrador podés despachar y recibir cualquiera.", [
-      P.btn("Nueva solicitud", { tipo: "secundario", icono: "mas", onclick: function () { P.formSolicitud("pedido", function () { v.recargar(); }); } }),
       P.btn("Traspaso directo", { tipo: "primario", icono: "traspaso", onclick: function () { P.formSolicitud("traspaso", function () { v.recargar(); }); } }),
+      P.btn("Nueva solicitud", { tipo: "secundario", icono: "mas", onclick: function () { P.formSolicitud("pedido", function () { v.recargar(); }); } }),
     ]);
     v = P.vistaSolicitudes(c, { admin: true });
   }, { admin: true, titulo: "Solicitudes" });
@@ -319,8 +318,9 @@
       alClickFila: function (f) { P.formProveedor({ id: f.id }, function () { t.recargar(); }, function () { t.recargar(); }); },
       seleccion: seleccionEliminar("proveedores"),
     });
-    c.appendChild(h("div.fila", { style: { marginBottom: "14px" } }, P.btn("Nuevo proveedor", { tipo: "primario", icono: "mas", onclick: function () { P.formProveedor({}, function () { t.recargar(); }); } }),
-      P.btn("Compras por proveedor", { tipo: "texto", icono: "estadisticas", onclick: function () { P.cache["compras:vista"] = "compras"; P.ruta.ir("/compras"); } })));
+    c.appendChild(h("div.gestion-acciones",
+      h("div.gestion-acciones-grupo", P.btn("Compras por proveedor", { tipo: "secundario", icono: "estadisticas", onclick: function () { P.cache["compras:vista"] = "compras"; P.ruta.ir("/compras"); } })),
+      h("div.gestion-accion-nueva", P.btn("Nuevo proveedor", { tipo: "primario", icono: "mas", onclick: function () { P.formProveedor({}, function () { t.recargar(); }); } }))));
     c.appendChild(t.el);
   }, { admin: true, titulo: "Proveedores" });
 

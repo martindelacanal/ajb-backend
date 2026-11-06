@@ -44,7 +44,7 @@ test("la búsqueda de ventas respeta boca, stock y coincidencias aproximadas sin
   await mover(truncado.id, 3);
   await mover(interna.id, 9);
   const lista = await llamar(cajero, "GET", "/productos/buscar", {}, { venta: "1" });
-  assert.deepEqual(new Set(lista.map((p) => p.id)), new Set([truncado.id, servicio.id]));
+  assert.deepEqual(new Set(lista.map((p) => p.id)), new Set([truncado.id]));
   const leido = await llamar(cajero, "GET", "/productos/buscar", {}, { q: "7790895000430", venta: "1" });
   assert.equal(leido[0].id, truncado.id);
   assert.equal(leido[0].exacto, false);

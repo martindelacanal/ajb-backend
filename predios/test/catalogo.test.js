@@ -116,7 +116,7 @@ test("importa el catálogo y elimina de a uno, varios o por filtro", async () =>
   const sinPrecioVenta = await api("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: milanesa.id, cantidad: 1 }], forma_pago: "QR" } });
   assert.equal(sinPrecioVenta.status, 409);
   assert.equal(sinPrecioVenta.json.codigo, "SIN_PRECIO");
-  await ok("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: desayuno.id, cantidad: 1 }], forma_pago: "QR" } });
+  await ok("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: desayuno.id, cantidad: 1 }], forma_pago: "QR", confirmar_sin_stock: true } });
 
   // Un cajero no puede eliminar.
   assert.equal((await api("POST", "/productos/eliminar", { token: cajero, cuerpo: { ids: [coca.id] } })).status, 403);

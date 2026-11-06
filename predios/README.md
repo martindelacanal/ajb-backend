@@ -142,8 +142,11 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
   incluso cuando se busca por nombre o código. Los agotados y los productos sin precio
   no se agregan al desplegable; un escaneo exacto permite informar el motivo.
   El aviso de falta de precio aparece al escanear ese producto.
-  «¿No aparece el producto?» reúne la consulta y el envío del aviso en un solo diálogo,
-  sin una segunda confirmación ni un desplegable de agotados.
+  «¿No aparece el producto?» permite buscar en todo el catálogo, incluidos los agotados,
+  elegir un producto y enviar el aviso en un solo diálogo. La búsqueda habitual de
+  ventas exige stock positivo también para productos compuestos y alquileres.
+  El aviso aceptado se verifica al cobrar para no repetir la confirmación del mismo
+  producto y cantidad; se consume con esa venta y no puede reutilizarse en otra.
   Los servicios, las ventas compuestas y los alquileres conservan su tratamiento sin
   descuento de unidades. El aviso informa al administrador sin modificar existencias;
   la configuración que prohíbe vender sin stock sigue vigente.

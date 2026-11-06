@@ -88,15 +88,16 @@ async function buscarProductos(ctx) {
   const q = String(ctx.query.q || "").trim().slice(0, 80);
   let bocaId = Number(ctx.query.boca_id) || null;
   const soloVenta = ctx.query.venta === "1";
+  const catalogoAviso = ctx.query.contexto === "aviso";
   const sinStock = soloVenta && ctx.query.sin_stock === "1";
-  if (soloVenta) {
+  if (soloVenta || catalogoAviso) {
     const puesto = exigirPuesto(ctx);
     if (bocaId && bocaId !== Number(puesto.boca_id)) throw U.error("La búsqueda de ventas corresponde a la boca de tu caja", 403);
     bocaId = Number(puesto.boca_id);
     exigirBoca(ctx, bocaId);
     // Los productos agotados no forman un catálogo alternativo de ventas.
     if (sinStock) return [];
-    if (q && /^\d{1,60}$/.test(q)) {
+    if (soloVenta && q && /^\d{1,60}$/.test(q)) {
       const puntual = await consultarCodigo({ ...ctx, query: { codigo: q } });
       // Un código exacto no vendible debe explicar su problema; no sugerir otro
       // producto de código parecido como si el escaneo no hubiera encontrado nada.
@@ -108,7 +109,7 @@ async function buscarProductos(ctx) {
   let where = "p.predio_id = ? AND p.activo = 1";
   if (soloVenta) {
     where += " AND p.destino <> 'USO_INTERNO' AND COALESCE(p.precio_venta, 0) > 0";
-    where += " AND (p.destino <> 'VENTA_DIRECTA' OR COALESCE(s.cantidad, 0) > 0)";
+    where += " AND COALESCE(s.cantidad, 0) > 0";
   }
   const baseWhere = where;
   let orden = "p.nombre";
@@ -152,6 +153,7 @@ async function buscarProductos(ctx) {
     exacto: !!q && f.codigo === q,
     sugerido: !!q && f.codigo !== q && proximidadCodigo(f.codigo, q) !== null,
     coincidencia: !!q && f.codigo === q ? "EXACTA" : (proximidadCodigo(f.codigo, q) !== null ? "CODIGO_APROXIMADO" : "TEXTO"),
+    estado_venta: catalogoAviso ? (f.destino === "USO_INTERNO" ? "USO_INTERNO" : Number(f.precio_venta || 0) <= 0 ? "SIN_PRECIO" : Number(f.stock_boca || 0) <= 0 ? "SIN_STOCK" : "DISPONIBLE") : undefined,
   }));
 }
 
@@ -168,7 +170,7 @@ async function consultarCodigo(ctx) {
   const p = filas[0];
   p.precio_venta = Number(p.precio_venta || 0);
   p.stock_boca = Number(p.stock_boca || 0);
-  return { producto: p, estado: p.precio_venta <= 0 ? "SIN_PRECIO" : (p.destino === "VENTA_DIRECTA" && p.stock_boca <= 0 ? "SIN_STOCK" : "DISPONIBLE") };
+  return { producto: p, estado: p.precio_venta <= 0 ? "SIN_PRECIO" : (p.stock_boca <= 0 ? "SIN_STOCK" : "DISPONIBLE") };
 }
 
 // Serializa todas las altas/ediciones de códigos del catálogo en los dos motores.
