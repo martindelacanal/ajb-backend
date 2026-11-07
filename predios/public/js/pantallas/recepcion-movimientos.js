@@ -3,11 +3,9 @@
   "use strict";
 
   if (window.__SIN_SOPORTE) return;
-  var P = window.P, h = P.h, R = P.recepcion, pesos = P.f.pesos, fecha = P.f.fecha;
-  var MEDIOS = R.MEDIOS, CONCEPTOS = R.CONCEPTOS, MODALIDAD = R.MODALIDAD, opciones = R.opciones, lista = R.lista, sel = R.sel, input = R.input,
-    texto = R.texto, btn = R.btn, grid = R.grid, tabla = R.tabla, get = R.get, cabecera = R.cabecera, nuevaClave = R.nuevaClave, opSelect = R.opSelect,
-    detalleArticulo = R.detalleArticulo, periodo = R.periodo;
-  function espacio(v) { return h("span", v); }
+  var P = window.P, h = P.h, R = P.recepcion, pesos = P.f.pesos;
+  var MEDIOS = R.MEDIOS, CONCEPTOS = R.CONCEPTOS, opciones = R.opciones, texto = R.texto, grid = R.grid, tabla = R.tabla,
+    get = R.get, cabecera = R.cabecera;
 
   var ORIGEN_MOV = { RECEPCION: "Recepción", TURISMO: "Turismo", CUENTA: "Cuenta de estadía" };
   var CONCEPTO_CUENTA = {
@@ -37,73 +35,91 @@
     });
   }
 
+  function comparar(a, b) {
+    return String(a).localeCompare(String(b), "es", { numeric: true, sensitivity: "base" });
+  }
+  function itemsDe(xs) {
+    return (xs || []).map(function (x) { return { valor: String(x.id), texto: x.nombre }; });
+  }
+  // El catálogo incluye servicios, recursos y adicionales que ya no se ofrecen. Los filtros son
+  // independientes: con más de un servicio, cada recurso lleva el nombre de su servicio adelante.
+  function metaMovimientos(catalogo) {
+    var servicios = catalogo.servicios || [], nombreServicio = {};
+    servicios.forEach(function (s) { nombreServicio[s.id] = s.nombre; });
+    var conServicio = servicios.length > 1;
+    var recursos = (catalogo.recursos || []).map(function (r) {
+      return { valor: String(r.id), servicio: nombreServicio[r.servicio_id] || "", nombre: r.nombre };
+    }).sort(function (a, b) {
+      return comparar(a.servicio, b.servicio) || comparar(a.nombre, b.nombre);
+    }).map(function (r) {
+      return { valor: r.valor, texto: conServicio && r.servicio ? r.servicio + " · " + r.nombre : r.nombre };
+    });
+    return {
+      titulo: "Movimientos de reservas y estadías",
+      buscador: true,
+      orden: { clave: "fecha", dir: "desc" },
+      columnas: [
+        { clave: "fecha", titulo: "Fecha", tipo: "dt" },
+        { clave: "reserva_id", titulo: "Reserva" },
+        { clave: "titular", titulo: "Titular" },
+        { clave: "servicio", titulo: "Servicio" },
+        { clave: "recurso", titulo: "Recurso" },
+        { clave: "adicionales", titulo: "Adicionales" },
+        { clave: "concepto", titulo: "Movimiento" },
+        { clave: "origen", titulo: "Origen", tipo: "opcion", opciones: opciones(ORIGEN_MOV) },
+        { clave: "actor", titulo: "Registró" },
+        { clave: "importe", titulo: "Importe", tipo: "money" }
+      ],
+      filtros: [
+        { clave: "desde", titulo: "Desde", tipo: "desde" },
+        { clave: "hasta", titulo: "Hasta", tipo: "hasta" },
+        { clave: "servicio", titulo: "Servicio", tipo: "opciones", opciones: itemsDe(servicios) },
+        { clave: "recurso", titulo: "Recurso", tipo: "opciones", opciones: recursos },
+        { clave: "adicional", titulo: "Adicional", tipo: "opciones", opciones: itemsDe(catalogo.adicionales) },
+        { clave: "origen", titulo: "Origen", tipo: "opciones", opciones: opciones(ORIGEN_MOV) }
+      ]
+    };
+  }
+
   P.ruta.registrar(/^\/recepcion\/movimientos$/, function (c) {
-    var clave = "tabla:recepcion-movimientos",
-      guardado = P.cache[clave] || {},
-      aplicados = guardado.filtros || {},
-      q = P.input({ tipo: "search", max: 80, valor: aplicados.q, placeholder: "Reserva, titular o empleado…" }),
-      desde = input(aplicados.desde, "date"), hasta = input(aplicados.hasta, "date"),
-      serv = sel([], "", "Todos"), recurso = sel([], "", "Todos"), adicional = sel([], "", "Todos"),
-      origen = sel(opciones(ORIGEN_MOV), aplicados.origen, "Todos"),
-      out = h("div.columna", { "aria-live": "polite" }),
-      catalogo, seq = 0;
-    function cargarRecursos(valor) {
-      if (!catalogo) return;
-      opSelect(recurso, lista(catalogo.recursos.filter(function (r) {
-        return !serv.value || String(r.servicio_id) === serv.value;
-      })), valor, "Todos");
-    }
-    function cargar(pag) {
-      var turno = ++seq;
-      out.setAttribute("aria-busy", "true");
-      P.reemplazar(out, P.cargando("Cargando movimientos…"));
-      return get("movimientos", Object.assign({}, aplicados, { pagina: pag, filtros: catalogo ? "" : "1" })).then(function (d) {
-        if (turno !== seq || !c.isConnected) return;
-        if (d.filtros) {
-          catalogo = d.filtros;
-          opSelect(serv, lista(catalogo.servicios), aplicados.servicio_id, "Todos");
-          cargarRecursos(aplicados.recurso_id);
-          opSelect(adicional, lista(catalogo.adicionales), aplicados.adicional_id, "Todos");
-        }
-        P.cache[clave] = { filtros: aplicados, pagina: d.pagina };
-        P.reemplazar(out, d.filas.length ? tabla(
-          ["Fecha", "Reserva / titular", "Servicio / recurso", "Adicionales", "Movimiento", "Registró", "Importe", "Detalle"],
-          d.filas.map(function (f) {
-            return [P.f.fechaHora(f.fecha), h("a", { href: "#/recepcion/" + f.reserva_id },
-              P.textoTabla("T-" + f.reserva_id + " · " + f.titular)),
-              [f.servicio, f.recurso].filter(Boolean).join(" · "), texto(f.adicionales),
-              conceptoMovimiento(f), texto(f.actor), f.importe == null ? "—" : pesos(f.importe),
-              P.btn("Ver", { chico: true, tipo: "texto", titulo: "Ver detalle del movimiento", onclick: function () { verMovimiento(f); } })];
-          })) : P.mensaje("No hay movimientos con esos filtros.", "info"),
-          d.pagina > 1 || d.siguiente ? h("div.fila",
-            P.btn("Anterior", { deshabilitado: d.pagina <= 1, onclick: function () { cargar(d.pagina - 1); } }),
-            espacio("Página " + d.pagina),
-            P.btn("Siguiente", { deshabilitado: !d.siguiente, onclick: function () { cargar(d.pagina + 1); } })) : null);
-      }).catch(function (e) {
-        if (turno === seq && c.isConnected) P.reemplazar(out, P.mensaje(e.message || "No se pudieron cargar los movimientos.", "error"));
-      }).finally(function () {
-        if (turno === seq) out.removeAttribute("aria-busy");
-      });
-    }
-    P.alSalir(function () { seq++; });
-    serv.onchange = function () { cargarRecursos(recurso.value); };
+    // Al recargar por una actualización se recupera la tabla como estaba (búsqueda, filtros, orden y página).
+    var claveTabla = "recepcion-movimientos";
+    var previo = P.continuidad.datosPantalla();
+    if (previo && previo.tabla) P.cache["tabla:" + claveTabla] = previo.tabla;
+    P.continuidad.guardarPantalla(function () { return { tabla: P.cache["tabla:" + claveTabla] }; });
     c.appendChild(cabecera("Movimientos de reservas y estadías", {
       volver: ["Reservas y estadías", "/recepcion"],
       subtitulo: "Historial de Turismo, operaciones de recepción y movimientos de cuenta."
     }));
-    c.appendChild(h("form.hoja.rec-listado-filtros", {
-      onsubmit: function (e) {
-        e.preventDefault();
-        aplicados = { q: q.value, desde: desde.value, hasta: hasta.value, servicio_id: serv.value,
-          recurso_id: recurso.value, adicional_id: adicional.value, origen: origen.value };
-        cargar(1);
+    var t = P.tabla({
+      claveEstado: claveTabla,
+      placeholderBuscar: "Buscar por reserva, titular o empleado…",
+      tituloVacio: "No hay movimientos con esos filtros",
+      textoVacio: "Acá aparecen los cambios de Turismo, los ingresos, salidas y cambios de recepción y los movimientos de cuenta.",
+      iconoVacio: "historial",
+      alClickFila: verMovimiento,
+      celdas: {
+        // La reserva sigue siendo un enlace a su ficha; el resto de la fila abre el detalle.
+        reserva_id: function (v) { return h("a.rec-codigo.rec-enlace", { href: "#/recepcion/" + v, title: "Abrir la reserva T-" + v }, "T-" + v); },
+        concepto: function (_v, f) { return conceptoMovimiento(f); }
+      },
+      fuente: {
+        meta: function () {
+          return get("movimientos", { filtros: "1", solo_filtros: "1" }).then(function (r) { return metaMovimientos(r.filtros || {}); });
+        },
+        cargar: function (p) {
+          return get("movimientos", {
+            q: p.q, desde: p.f_desde, hasta: p.f_hasta, servicio_id: p.f_servicio, recurso_id: p.f_recurso,
+            adicional_id: p.f_adicional, origen: p.f_origen, orden: p.orden, dir: p.dir, pagina: p.pagina, tam: p.tam
+          }).then(function (r) {
+            // Un Turismo anterior pagina de a 40 y sólo informa si hay una página siguiente.
+            var tam = Number(r.tam) || 40, pagina = Number(r.pagina) || 1;
+            var total = r.total != null ? Number(r.total) : (pagina - 1) * tam + r.filas.length + (r.siguiente ? 1 : 0);
+            return { filas: r.filas, total: total, pagina: pagina, tam: tam, paginas: Number(r.paginas) || Math.max(1, Math.ceil(total / tam)) };
+          });
+        }
       }
-    }, h("div.tabla-barra", P.campo("Buscar", q, { clase: "tabla-buscar" })),
-    h("div.tabla-filtros",
-      h("div.filtro-rango-fechas", { role: "group", "aria-label": "Fecha del movimiento" }, P.campo("Desde", desde), P.campo("Hasta", hasta)),
-      P.campo("Servicio", serv), P.campo("Recurso", recurso), P.campo("Adicional", adicional), P.campo("Origen", origen),
-      h("div.tabla-filtros-acciones", P.btn("Filtrar", { icono: "filtro", submit: true })))));
-    c.appendChild(out);
-    return cargar(guardado.pagina || 1);
+    });
+    c.appendChild(t.el);
   }, { titulo: "Movimientos de reservas y estadías" });
 })();

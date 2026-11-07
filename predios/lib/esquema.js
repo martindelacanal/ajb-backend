@@ -391,7 +391,8 @@ const TABLAS = {
   },
   predio_estadia_mov: {
     columnas: { reserva_id: "int!", huesped_id: "int", venta_id: "int", liquidacion_id: "int", fecha: "dt!", concepto: "str:40!", medio: "str:20", importe: "money!", detalle: "str:255", usuario_id: "int", usuario_nombre: "str:120",
-      adicional_id: "int", anula_mov_id: "int" },
+      // comprobante: número del cobro de artículos (id del primer PAGO_ADICIONAL del cobro); ver recepcion-articulos.js.
+      adicional_id: "int", anula_mov_id: "int", comprobante: "int" },
     indices: [["reserva_id", "id"], ["venta_id"]],
   },
   // Devolución de un artículo alquilado (un renglón por reserva y adicional; deshacer la marca la anula).

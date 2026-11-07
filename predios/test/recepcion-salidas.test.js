@@ -34,12 +34,14 @@ test("la deuda pasa a quienes quedan, los cobros se imputan una vez y el último
         return { cotizacion_esperada: "tarifa", diferencia: datos.extra || 0,
           diferenciales: datos.extra ? [{ dni: a, importe: datos.extra }] : [],
           salida: { personas: elegibles.filter(p => seleccion.has(p.dni)),
-            presentes: elegibles.filter(p => !seleccion.has(p.dni)), elegibles, vehiculo_pendiente: vehiculo } };
+            presentes: elegibles.filter(p => !seleccion.has(p.dni)), elegibles,
+            vehiculos_pendientes: vehiculo ? [{ patente: "AB123CD", marca: "Fiat", color: "Gris", sector: null }] : [],
+            vehiculo_pendiente: vehiculo } };
       }
       assert.equal(accion, "guardar");
       if (!datos.id) return { ...r, evento_id: evento };
       personas.filter(p => seleccion.has(p.dni)).forEach(p => { p.salida = U.hoy(); });
-      if (datos._salida_plan.vehiculo === "SALE") vehiculo = false;
+      if ((datos._salida_plan.vehiculos_salen || []).includes("AB123CD")) vehiculo = false;
       const cambio = { ...r, evento_id: ++evento, diferencia: datos.extra || 0,
         diferenciales: datos.extra ? [{ dni: a, importe: datos.extra }] : [], plan_salida: datos._salida_plan };
       confirmaciones.set(datos.operacion, cambio);
@@ -64,7 +66,8 @@ test("la deuda pasa a quienes quedan, los cobros se imputan una vez y el último
   const primera = await revisar([a], 10);
   assert.deepEqual([primera.salida.alojamiento, primera.salida.consumos, primera.salida.total], [110, 30, 140]);
   await assert.rejects(guardar({ ...primera.body, salida: { accion: "TRASLADAR" } }), /vehículo/);
-  const traspaso = { ...primera.body, salida: { accion: "TRASLADAR", vehiculo: "SALE" } };
+  await assert.rejects(guardar({ ...primera.body, salida: { accion: "TRASLADAR", vehiculos_salen: ["ZZ999ZZ"] } }), /cambió la lista/);
+  const traspaso = { ...primera.body, salida: { accion: "TRASLADAR", vehiculos_salen: ["AB123CD"] } };
   cortarRespuesta = true;
   await assert.rejects(guardar(traspaso), /Sin conexión/);
   cortarRespuesta = false;

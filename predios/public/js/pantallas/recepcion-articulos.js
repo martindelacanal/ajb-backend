@@ -1,13 +1,11 @@
-/* Recepción: alquileres y compras de una reserva (tabla, pagos, devoluciones). */
+/* Recepción: alquileres y compras de una reserva (tabla, cobros con comprobante, devoluciones). */
 (function () {
   "use strict";
 
   if (window.__SIN_SOPORTE) return;
   var P = window.P, h = P.h, R = P.recepcion, pesos = P.f.pesos, fecha = P.f.fecha;
-  var MEDIOS = R.MEDIOS, CONCEPTOS = R.CONCEPTOS, MODALIDAD = R.MODALIDAD, opciones = R.opciones, lista = R.lista, sel = R.sel, input = R.input,
-    texto = R.texto, btn = R.btn, grid = R.grid, tabla = R.tabla, get = R.get, cabecera = R.cabecera, nuevaClave = R.nuevaClave, opSelect = R.opSelect,
-    detalleArticulo = R.detalleArticulo, periodo = R.periodo;
-  function espacio(v) { return h("span", v); }
+  var MEDIOS = R.MEDIOS, MODALIDAD = R.MODALIDAD, opciones = R.opciones, sel = R.sel, input = R.input,
+    btn = R.btn, tabla = R.tabla, nuevaClave = R.nuevaClave, detalleArticulo = R.detalleArticulo, periodo = R.periodo;
 
   function selectorCaja(caja) {
     P.opciones("cajas").then(function (xs) {
@@ -24,28 +22,14 @@
     var key = nuevaClave();
     var nota = input("");
     var cuerpoModal, titulo, datos = {};
-    if (accion === "PAGAR") {
-      var imp = P.dinero({ valor: P.f.numero(linea.adeudado) });
-      var medio = sel(opciones({ EFECTIVO: MEDIOS.EFECTIVO, TRANSFERENCIA: MEDIOS.TRANSFERENCIA }), "EFECTIVO");
-      var caja = sel([], null, "Elegí una caja"), campoCaja = P.campo("Caja de efectivo", caja);
-      selectorCaja(caja);
-      medio.onchange = function () { campoCaja.hidden = medio.value !== "EFECTIVO"; };
-      titulo = "Registrar pago · " + linea.nombre;
-      cuerpoModal = h("div.columna", h("div.rec-resumen", "Falta pagar", h("strong", pesos(linea.adeudado))),
-        h("div.rec-grid", P.campo("Importe ($)", imp), P.campo("Medio", medio), campoCaja), P.campo("Observación", nota));
-      datos = function () {
-        var importe = P.importeDe(imp.value);
-        if (!(importe > 0) || importe > Number(linea.adeudado) + 0.001) { imp.focus(); throw Error("Ingresá un importe mayor que cero y que no supere lo que falta pagar."); }
-        if (medio.value === "EFECTIVO" && !caja.value) { caja.focus(); throw Error(P.esAdmin() ? "Elegí la caja donde se registra el efectivo." : "Ingresá a tu caja para registrar el efectivo de recepción."); }
-        return { importe: importe, medio: medio.value, caja_id: caja.value };
-      };
-    } else if (accion === "ANULAR_PAGO") {
+    if (accion === "ANULAR_PAGO") {
       var caja2 = sel([], null, "Elegí una caja"), campoCaja2 = P.campo("Caja que devuelve el efectivo", caja2);
       campoCaja2.hidden = pago.medio !== "EFECTIVO";
       if (pago.medio === "EFECTIVO") selectorCaja(caja2);
       titulo = "Anular pago · " + linea.nombre;
       cuerpoModal = h("div.columna", h("div.rec-resumen", "Pago del " + P.f.fechaHora(pago.fecha) + " · " + (MEDIOS[pago.medio] || pago.medio), h("strong", pesos(pago.importe))),
-        P.mensaje(pago.medio === "EFECTIVO" ? "Se registra la devolución del efectivo en la caja elegida." : "El importe vuelve a quedar pendiente de pago.", "info"), campoCaja2, P.campo("Motivo", nota));
+        P.mensaje((pago.medio === "EFECTIVO" ? "Se registra la devolución del efectivo en la caja elegida." : "El importe vuelve a quedar pendiente de pago.") +
+          " El comprobante N° " + Number(pago.comprobante || pago.id) + " se reimprime con el pago anulado.", "info"), campoCaja2, P.campo("Motivo", nota));
       datos = function () {
         if (!campoCaja2.hidden && !caja2.value) { caja2.focus(); throw Error("Elegí la caja que devuelve el efectivo."); }
         return { movimiento_id: pago.id, caja_id: caja2.value };
@@ -75,6 +59,141 @@
     });
   }
 
+  // ------------------------------------------------------------------ cobro de artículos con comprobante
+
+  function adeudados(lineas) {
+    return lineas.filter(function (l) { return Number(l.adeudado) > 0; });
+  }
+  function imprimirComprobante(r, numero) {
+    return P.get("/recepcion/" + r.id + "/articulos/comprobante/" + numero).then(function (d) {
+      return P.imprimirComprobanteArticulos(d, { reimpresion: true });
+    });
+  }
+
+  /* La persona paga en el momento uno o varios artículos: un solo cobro y un solo comprobante.
+     `solo`: el artículo desde cuyo menú se abrió («Registrar pago»): se cobra sólo ese. */
+  function cobrarArticulos(r, lineas, refrescar, solo) {
+    var key = nuevaClave();
+    var pendientes = solo ? [solo] : adeudados(lineas);
+    var unico = pendientes.length === 1;
+    var filas = pendientes.map(function (l) {
+      var imp = P.dinero({ valor: P.f.numero(l.adeudado) });
+      imp.setAttribute("aria-label", "Importe a cobrar de " + l.nombre);
+      var marca = P.check(l.nombre, true, [MODALIDAD[l.modalidad], detalleArticulo(l), periodo(l)].filter(Boolean).join(" · "), actualizar);
+      // Con un solo artículo no hay nada que elegir: la casilla queda marcada y oculta.
+      if (unico) { marca.input.disabled = true; marca.input.style.display = "none"; }
+      var fila = { linea: l, marca: marca.input, imp: imp };
+      imp.addEventListener("input", actualizar);
+      fila.nodo = h("div.rec-cobro-item" + (unico ? ".unico" : ""), marca,
+        h("div.rec-cobro-importe", h("span.rec-cobro-debe", "Debe " + pesos(l.adeudado)), imp));
+      return fila;
+    });
+    var total = h("strong", pesos(0)), cantidad = h("span");
+    var medio = sel(opciones({ EFECTIVO: MEDIOS.EFECTIVO, TRANSFERENCIA: MEDIOS.TRANSFERENCIA }), "EFECTIVO");
+    var caja = sel([], null, "Elegí una caja"), campoCaja = P.campo("Caja de efectivo", caja);
+    var nota = input("");
+    selectorCaja(caja);
+    medio.onchange = function () { campoCaja.hidden = medio.value !== "EFECTIVO"; };
+
+    function importeDe(f) { return P.importeDe(f.imp.value); }
+    function valido(f) { var n = importeDe(f); return n > 0 && n <= Number(f.linea.adeudado) + 0.001; }
+    function actualizar() {
+      var suma = 0, n = 0;
+      filas.forEach(function (f) {
+        f.imp.disabled = !f.marca.checked;
+        f.nodo.classList.toggle("elegido", f.marca.checked);
+        f.imp.classList.toggle("invalido", f.marca.checked && !valido(f));
+        if (f.marca.checked && valido(f)) { suma += importeDe(f); n++; }
+      });
+      total.textContent = pesos(P.redondear(suma));
+      cantidad.textContent = n === 1 ? "1 artículo" : n + " artículos";
+    }
+    actualizar();
+
+    var m = P.modal({
+      titulo: solo ? "Registrar pago · " + solo.nombre : "Cobrar artículos",
+      subtitulo: "Reserva T-" + r.id + " · " + r.titular_nombre,
+      contenido: h("div.columna",
+        filas.length > 1 ? h("p.texto-3.chico.rec-cobro-ayuda", "Marcá lo que se paga ahora. Podés cobrar una parte de cada artículo.") : null,
+        h("div.rec-cobro-lista", filas.map(function (f) { return f.nodo; })),
+        h("div.rec-resumen.rec-cobro-total", h("span", "Total a cobrar · ", cantidad), total),
+        h("div.rec-grid", P.campo("Medio", medio), campoCaja), P.campo("Observación", nota)),
+      acciones: [btn("Volver", function () { m.cerrar(); }), btn("Cobrar", function () {
+        var elegidas = filas.filter(function (f) { return f.marca.checked; });
+        if (!elegidas.length) throw Error("Marcá al menos un artículo para cobrar.");
+        elegidas.forEach(function (f) {
+          if (!valido(f)) { f.imp.focus(); throw Error("Revisá el importe de " + f.linea.nombre + ": tiene que ser mayor que cero y no superar lo que falta pagar (" + pesos(f.linea.adeudado) + ")."); }
+        });
+        if (medio.value === "EFECTIVO" && !caja.value) { caja.focus(); throw Error(P.esAdmin() ? "Elegí la caja donde se registra el efectivo." : "Ingresá a tu caja para registrar el efectivo de recepción."); }
+        return P.post("/recepcion/" + r.id + "/articulos/cobrar", {
+          operacion: key,
+          items: elegidas.map(function (f) { return { adicional_id: f.linea.adicional_id, importe: importeDe(f) }; }),
+          medio: medio.value,
+          caja_id: medio.value === "EFECTIVO" ? caja.value : null,
+          detalle: nota.value
+        }).then(function (x) {
+          // En cola (sistema general con el predio sin conexión): el comprobante aparece en la lista cuando se aplica.
+          if (x.encolado || !x.datos) {
+            m.cerrar();
+            if (!x.encolado) P.aviso(x.mensaje, "ok");
+            return refrescar();
+          }
+          cobroHecho(m, x);
+          return refrescar();
+        });
+      }, "primario", { icono: "efectivo" })]
+    });
+  }
+
+  // La ventana queda abierta con el comprobante listo para imprimir (original y duplicado).
+  function cobroHecho(m, x) {
+    var d = x.datos, impreso = false;
+    var imprimir = P.btn("Imprimir comprobante", { tipo: "primario", icono: "imprimir", onclick: function (e) {
+      P.ejecutar(e.currentTarget, function () {
+        var reimpresion = impreso;
+        impreso = true;
+        return P.imprimirComprobanteArticulos(d, { reimpresion: reimpresion });
+      }).catch(function () {});
+    } });
+    var titulo = m.ventana.querySelector(".ventana-cabecera h2");
+    if (titulo) titulo.textContent = "Cobro registrado";
+    P.reemplazar(m.cuerpo, h("div.columna",
+      P.mensaje(x.mensaje, "ok"),
+      h("div.rec-resumen.rec-cobro-total", h("span", "Cobrado · " + (MEDIOS[d.medio] || d.medio)), h("strong", pesos(d.total))),
+      h("ul.rec-cobro-hecho", d.items.map(function (it) {
+        return h("li", h("span", it.nombre), h("strong", pesos(it.importe)));
+      })),
+      h("p.texto-3.chico", "El comprobante sale con original para el huésped y duplicado para el predio. No es válido como factura.")));
+    P.reemplazar(m.pie, P.btn("Listo", { tipo: "secundario", onclick: function () { m.cerrar(); } }), imprimir);
+    setTimeout(function () { imprimir.focus(); }, 30);
+  }
+
+  // Comprobantes emitidos en la reserva, agrupados por número (un pago anterior sin número usa su id).
+  function comprobantesDe(a, lineas) {
+    var nombres = {}, anulados = {}, porNumero = {}, salida = [];
+    lineas.forEach(function (l) { nombres[String(l.adicional_id)] = l.nombre; });
+    a.movimientos.forEach(function (mv) { if (mv.anula_mov_id) anulados[String(mv.anula_mov_id)] = true; });
+    a.movimientos.forEach(function (mv) {
+      if (mv.concepto !== "PAGO_ADICIONAL" || !(Number(mv.importe) > 0) || mv.anula_mov_id) return;
+      var n = Number(mv.comprobante || mv.id), c = porNumero[n];
+      if (!c) { c = porNumero[n] = { numero: n, fecha: mv.fecha, medio: mv.medio, articulos: [], total: 0, anulado: 0 }; salida.push(c); }
+      if (String(mv.fecha) < String(c.fecha)) c.fecha = mv.fecha;
+      c.articulos.unshift(nombres[String(mv.adicional_id)] || String(mv.detalle || "Artículo").split(" · ")[0]);
+      c.total = P.redondear(c.total + Number(mv.importe));
+      if (anulados[String(mv.id)]) c.anulado = P.redondear(c.anulado + Number(mv.importe));
+    });
+    return salida.sort(function (x, y) { return y.numero - x.numero; });
+  }
+  function listaComprobantes(r, comprobantes) {
+    return h("details.rec-movimientos.rec-comprobantes", { open: comprobantes.length <= 5 ? "" : null },
+      h("summary", "Comprobantes de pago (" + comprobantes.length + ")"),
+      tabla(["N°", "Fecha", "Artículos", "Importe", "Medio", "Estado", ""], comprobantes.map(function (c) {
+        var estado = !c.anulado ? P.chip("Vigente", "OK") : c.anulado >= c.total ? P.chip("Anulado", "ANULADA") : P.chip("Anulado en parte", "PENDIENTE");
+        return [h("strong.rec-codigo", "N° " + c.numero), P.f.fechaHora(c.fecha), c.articulos.join(", "), pesos(c.total), MEDIOS[c.medio] || c.medio || "—", estado,
+          btn("Imprimir", function () { return imprimirComprobante(r, c.numero); }, "texto", { chico: true, icono: "imprimir", etiqueta: "Imprimir comprobante N° " + c.numero })];
+      }), ".rec-tabla-comprobantes"));
+  }
+
   function chipsArticulo(l) {
     var chips = [];
     if (l.modalidad !== "VENTA" && l.fecha_desde) {
@@ -95,9 +214,12 @@
         return m.concepto === "PAGO_ADICIONAL" && Number(m.adicional_id) === Number(l.adicional_id) && Number(m.importe) > 0 && (a.pagos_anulados || []).indexOf(Number(m.id)) < 0;
       });
     };
-    return tabla(["Artículo", "Detalle", "Importe", "Pagado", "Estado", ""], lineas.map(function (l) {
+    var deuda = adeudados(lineas);
+    var falta = P.redondear(deuda.reduce(function (s, l) { return s + Number(l.adeudado); }, 0));
+    var comprobantes = comprobantesDe(a, lineas);
+    var articulos = tabla(["Artículo", "Detalle", "Importe", "Pagado", "Estado", ""], lineas.map(function (l) {
       var items = [];
-      if (Number(l.adeudado)) items.push({ texto: "Registrar pago", icono: "efectivo", accion: function () { operarArticulo(r, a, l, "PAGAR", cargar); } });
+      if (Number(l.adeudado)) items.push({ texto: "Registrar pago", icono: "efectivo", accion: function () { cobrarArticulos(r, lineas, cargar, l); } });
       pagosDe(l).forEach(function (pg) {
         items.push({ texto: "Anular pago de " + pesos(pg.importe) + " (" + P.f.fecha(pg.fecha) + ")", icono: "cerrar", accion: function () { operarArticulo(r, a, l, "ANULAR_PAGO", cargar, pg); } });
       });
@@ -110,6 +232,12 @@
       return [h("div", h("strong", l.nombre), h("div.texto-3.chico", MODALIDAD[l.modalidad] || "")),
         detalleArticulo(l) + " · " + periodo(l), pesos(l.subtotal), pesos(l.pagado), chipsArticulo(l), menu || ""];
     }), ".rec-tabla-articulos");
+    return h("div.columna.rec-articulos-cobro",
+      deuda.length ? h("div.rec-cobro-barra",
+        h("p.rec-cobro-falta", "Falta pagar ", h("strong", pesos(falta)), " en " + (deuda.length === 1 ? "1 artículo" : deuda.length + " artículos")),
+        btn("Cobrar artículos", function () { cobrarArticulos(r, lineas, cargar); }, "primario", { chico: true, icono: "efectivo" })) : null,
+      articulos,
+      comprobantes.length ? listaComprobantes(r, comprobantes) : null);
   }
   P.recepcion.tablaArticulos = tablaArticulos;
 })();
