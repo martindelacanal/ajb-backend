@@ -142,6 +142,9 @@
     if (P.esAdmin() && P.estado.estadiasVencidas) items.push({
       texto: P.textoEstadiasVencidas(), icono: "reloj", accion: function () { P.ruta.ir("/recepcion?ocupacion=VENCIDA"); }
     });
+    if (P.esAdmin() && P.estado.adicionalesPendientes) items.push({
+      texto: P.textoAdicionalesPendientes(), icono: "tag", accion: function () { P.ruta.ir("/recepcion/adicionales/pendientes"); }
+    });
     (a.recientes || a.notificaciones || []).slice(0, 10).forEach(function (n) {
       items.push({ texto: h("span.aviso-resumen" + (!n.leido && !n.resuelto_fecha ? ".aviso-no-leido" : ""),
         h("strong", n.titulo), h("span.chico.texto-3", P.f.fechaHora(n.fecha) + " · " + (n.resuelto_fecha ? "Resuelta" : n.leido ? "Leída" : "Sin leer"))),
@@ -252,7 +255,7 @@
       if (viejo) viejo.remove();
       var a = P.estado.avisos || {};
       var total = (typeof a.notificaciones_no_leidas === "number" ? a.notificaciones_no_leidas : (a.notificaciones || []).length) + (a.permisos || []).length + (a.aperturas || []).length + (a.solicitudes_despachar || 0) + (a.solicitudes_recibir || 0);
-      if (P.esAdmin()) total += P.estado.estadiasVencidas || 0;
+      if (P.esAdmin()) total += (P.estado.estadiasVencidas || 0) + (P.estado.adicionalesPendientes || 0);
       if (total) c.appendChild(h("span.campana-numero", total > 99 ? "99+" : String(total)));
     }
   }
@@ -260,21 +263,32 @@
     var n = P.estado.estadiasVencidas;
     return n === 1 ? "1 estadía vencida sin salida" : n + " estadías vencidas sin salida";
   };
-  P.actualizarEstadiasVencidas = function (cantidad) {
+  P.textoAdicionalesPendientes = function (cantidad) {
+    var n = cantidad === undefined ? P.estado.adicionalesPendientes : Number(cantidad);
+    return n === 1 ? "1 artículo alquilado vencido o sin pagar" : n + " artículos alquilados vencidos o sin pagar";
+  };
+  // Un valor undefined conserva el último conocido (cada pantalla actualiza lo que consultó).
+  P.actualizarEstadiasVencidas = function (cantidad, adicionales) {
     if (!P.esAdmin()) return;
-    P.estado.estadiasVencidas = Number(cantidad) || 0;
+    if (cantidad !== undefined) P.estado.estadiasVencidas = Number(cantidad) || 0;
+    if (adicionales !== undefined) P.estado.adicionalesPendientes = Number(adicionales) || 0;
     pintarContadores();
     var zona = document.getElementById("inicio-estadias-vencidas");
     if (zona) {
       zona.hidden = !P.estado.estadiasVencidas;
       zona.querySelector("strong").textContent = P.textoEstadiasVencidas();
     }
+    var zonaArticulos = document.getElementById("inicio-adicionales-pendientes");
+    if (zonaArticulos) {
+      zonaArticulos.hidden = !P.estado.adicionalesPendientes;
+      zonaArticulos.querySelector("strong").textContent = P.textoAdicionalesPendientes();
+    }
   };
   function consultarEstadiasVencidas() {
     var sesion = P.estado.sesion;
     if (!P.esAdmin()) return;
     return P.get("/recepcion/vencidas", { sinRedireccion: true }).then(function (r) {
-      if (sesion === P.estado.sesion) P.actualizarEstadiasVencidas(r.cantidad);
+      if (sesion === P.estado.sesion) P.actualizarEstadiasVencidas(r.cantidad, r.adicionales || 0);
     }).catch(function () {});
   }
 
@@ -503,6 +517,7 @@
   P.alIngresar = function (r, claveDeIngreso) {
     P.estado.avisos = null;
     P.estado.estadiasVencidas = 0;
+    P.estado.adicionalesPendientes = 0;
     ultimoAvisoVisto = 0;
     P.estado.sesion = r;
     if (r.usuario.debe_cambiar_clave) {

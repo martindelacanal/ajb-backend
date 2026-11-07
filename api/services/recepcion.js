@@ -3,9 +3,10 @@
 // La reserva, sus tarifas, su historial y el recibo de reintento se confirman juntos en Turismo.
 const U = require("../../predios/lib/util");
 const { recursoUnico, MENSAJE_RECURSO_UNICO } = require("./reserva-recurso-unico");
-const { crearAdicional, seleccionArticulos, cotizarAlquileres } = require("./recepcion-alquileres");
+const { seleccionArticulos, cotizarAlquileres } = require("./recepcion-alquileres");
 const VEHICULOS = require("./recepcion-vehiculos");
 const { repartir } = require("../../predios/lib/cuenta-estadia");
+const Catalogo = require("./recepcion-catalogo");
 const {
   serviciosDe
 } = require("./predios-central");
@@ -45,14 +46,16 @@ async function opciones(c, codigos) {
   const servicios = await todos(c, "SELECT s.id,s.nombre,s.codigo,s.modelo_tarifa,ts.codigo AS tipo_codigo FROM servicio s JOIN tipo_servicio ts ON ts.id=s.tipo_servicio_id WHERE s.activo=1 AND s.estado_aprobacion='APROBADO' AND s.codigo IN (?) ORDER BY s.nombre", [codigos]);
   const ids = servicios.map(s => s.id);
   const recursos = ids.length ? await todos(c, "SELECT id,nombre,servicio_id FROM recurso WHERE activo=1 AND servicio_id IN (?) ORDER BY orden,nombre", [ids]) : [];
-  const adicionales = ids.length ? await todos(c, `SELECT DISTINCT a.id,a.nombre,ta.recurso_id,ta.regimen_id,ta.precio,
+  const adicionales = ids.length ? await todos(c, `SELECT DISTINCT a.id,a.nombre,COALESCE(a.modalidad,'ALQUILER') AS modalidad,ta.recurso_id,ta.regimen_id,ta.precio,
     ta.fecha_inicio AS fecha_desde,ta.fecha_fin AS fecha_hasta FROM tarifa_adicional ta
     JOIN adicional a ON a.id=ta.adicional_id JOIN recurso r ON r.id=ta.recurso_id
     WHERE ta.activo=1 AND r.activo=1 AND r.servicio_id IN (?) ORDER BY nombre,fecha_desde DESC`, [ids]) : [];
+  const servicioRegimenes = ids.length ? await todos(c, "SELECT servicio_id,regimen_id FROM servicio_regimen WHERE servicio_id IN (?) ORDER BY regimen_id", [ids]) : [];
   return {
     servicios,
     recursos,
     adicionales,
+    servicio_regimenes: servicioRegimenes,
     regimenes: await todos(c, "SELECT id,nombre FROM regimen"),
     parentescos: await todos(c, "SELECT id,nombre FROM parentesco")
   };
@@ -93,8 +96,8 @@ async function detalle(c, codigos, id, lock = false) {
     p.salida = prev?.salida || null;
     p.salida_prevista = prev?.salida_prevista || null;
   }
-  const adicionales = await todos(c, `SELECT adicional_id,cantidad,nombre_adicional AS nombre,dias,subtotal
-    FROM reserva_adicional WHERE reserva_id=? ORDER BY id`, [id]);
+  const adicionales = await todos(c, `SELECT ra.adicional_id,ra.cantidad,ra.nombre_adicional AS nombre,ra.dias,ra.subtotal,COALESCE(a.modalidad,'ALQUILER') AS modalidad
+    FROM reserva_adicional ra LEFT JOIN adicional a ON a.id=ra.adicional_id WHERE ra.reserva_id=? ORDER BY ra.id`, [id]);
   if (ext.alquileres?.length && Number(ext.servicio_id) === Number(r.servicio_id)) {
     // Turismo también puede editar la reserva: los días facturados vienen de sus renglones vigentes.
     const periodos = await todos(c, `SELECT a.adicional_id,MIN(d.fecha) AS fecha_desde,MAX(d.fecha) AS fecha_hasta
@@ -106,6 +109,9 @@ async function detalle(c, codigos, id, lock = false) {
       if (alquiler && periodo) Object.assign(a, periodo, { recurso_tarifa_id: alquiler.recurso_tarifa_id, regimen_tarifa_id: alquiler.regimen_tarifa_id });
     }
   }
+  // Lo que cada adicional ya costaba en Turismo antes del primer cambio del predio (se pagó allá).
+  const base = lock ? new Map() : (await Catalogo.basesDeTurismo(c, [id])).get(Number(id)) || new Map();
+  for (const a of adicionales) a.base_turismo = base.get(Number(a.adicional_id)) || 0;
   const tramos = Array.isArray(ext.tramos) && Number(ext.tramos.at(-1)?.recurso_id) === Number(r.recurso_id) ? ext.tramos : [];
   const seleccion = tramos.at(-1)?.adicionales;
   const datos = {
@@ -194,6 +200,18 @@ async function contarVencidas(c, codigos, pid, hoy) {
     JOIN estado_reserva er ON er.id=r.estado_reserva_id ${ultimoEventoSql}
     WHERE s.codigo IN (?) AND ${condicionVencida}`, [codigos, pid, hoy, hoy, pid]);
 }
+// Columnas ordenables de la tabla de reservas y estadías.
+const ORDEN_LISTADO = {
+  id: ["r.id"],
+  titular: ["u.apellido", "u.nombre"],
+  fecha_inicio: ["r.fecha_inicio"],
+  fecha_fin: ["fecha_fin"],
+  servicio: ["s.nombre"],
+  recurso: ["rec.nombre"],
+  tipo: ["tipo"],
+  estado: ["er.nombre"],
+  importe: ["r.precio_total"]
+};
 async function listar(c, codigos, b) {
   const cond = ["s.codigo IN (?)"],
     p = [codigos];
@@ -240,9 +258,12 @@ async function listar(c, codigos, b) {
     min: 1,
     max: 999999
   });
-  const filas = await todos(c, `SELECT r.id,r.fecha_inicio,${fechaFinVisibleSql("e")} AS fecha_fin,r.precio_total,s.nombre AS servicio,r.recurso_id,rec.nombre AS recurso,er.nombre AS estado,CONCAT_WS(', ',u.apellido,u.nombre) AS titular,JSON_UNQUOTE(JSON_EXTRACT(e.actual,'$.tipo')) AS tipo,(${condicionVencida}) AS vencida,
+  const tam = U.entero(b.tam || 40, { min: 1, max: 200, campo: "La cantidad por página" });
+  const dir = String(b.dir || "").toLowerCase() === "asc" ? "ASC" : "DESC";
+  const orden = ORDEN_LISTADO[b.orden] ? ORDEN_LISTADO[b.orden].map(x => x + " " + dir).join(",") + ",r.id " + dir : "r.fecha_inicio DESC,r.id DESC";
+  const filas = await todos(c, `SELECT r.id,r.fecha_inicio,${fechaFinVisibleSql("e")} AS fecha_fin,r.precio_total,s.nombre AS servicio,r.recurso_id,rec.nombre AS recurso,er.nombre AS estado,CONCAT_WS(', ',u.apellido,u.nombre) AS titular,COALESCE(JSON_UNQUOTE(JSON_EXTRACT(e.actual,'$.tipo')),'GENERAL') AS tipo,(${condicionVencida}) AS vencida,
     CASE WHEN e.predio_id=? THEN JSON_EXTRACT(e.actual,'$.personas') END AS pasajeros_evento${from}
-    ORDER BY r.fecha_inicio DESC,r.id DESC LIMIT 40 OFFSET ${(pagina - 1) * 40}`, [pid, hoy, hoy, pid, pid, ...p]);
+    ORDER BY ${orden} LIMIT ${tam} OFFSET ${(pagina - 1) * tam}`, [pid, hoy, hoy, pid, pid, ...p]);
   await cargarRecursos(c, filas);
   const vencidas = [];
   for (const r of filas) {
@@ -258,11 +279,16 @@ async function listar(c, codigos, b) {
       [pid, vencidas.map(r => r.id)]);
     for (const r of vencidas) r.huespedes_pendientes = presentes.filter(p => Number(p.reserva_id) === Number(r.id)).map(p => p.nombre);
   }
+  const totales = await uno(c, "SELECT COUNT(*) AS cantidad,COALESCE(SUM(COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(e.actual,\'$.cantidad\')) AS UNSIGNED),(SELECT COUNT(*) FROM reserva_familiar rf WHERE rf.reserva_id=r.id))),0) AS viajeros,COALESCE(SUM(r.precio_total),0) AS importe" + from, p);
+  const total = Number(totales.cantidad);
   return {
     filas,
     pagina,
+    tam,
+    total,
+    paginas: Math.max(1, Math.ceil(total / tam)),
     vencidas: Number((await contarVencidas(c, codigos, pid, hoy)).cantidad),
-    ...(await uno(c, "SELECT COUNT(*) AS cantidad,COALESCE(SUM(COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(e.actual,\'$.cantidad\')) AS UNSIGNED),(SELECT COUNT(*) FROM reserva_familiar rf WHERE rf.reserva_id=r.id))),0) AS viajeros,COALESCE(SUM(r.precio_total),0) AS importe" + from, p))
+    ...totales
   };
 }
 // Turismo guarda el recurso actual en la cabecera. Para fechas pasadas,
@@ -670,6 +696,13 @@ async function guardar(c, predio, actor, b, codigos, previa) {
   }
   const extrasAnteriores = Number(anterior?.servicio_id) === Number(servicio.id) ? anterior.adicionales_vigentes : [];
   const ad = seleccionArticulos(b.adicionales ?? [], { inicio, fin, tipo, personas, recursoId, regimenId, anteriores: extrasAnteriores });
+  if (ad.length) {
+    const ventas = new Set((await todos(c, "SELECT id FROM adicional WHERE id IN (?) AND modalidad='VENTA'", [ad.map(a => a.adicional_id)])).map(x => Number(x.id)));
+    for (const a of ad) {
+      if (!ventas.has(a.adicional_id)) continue;
+      if (!a.fecha_desde || a.fecha_hasta !== a.fecha_desde) throw U.error("Una compra se registra en un solo día: indicá la fecha de la compra.");
+    }
+  }
   if (tramos.length) tramos.at(-1).adicionales = ad.filter(a => !a.fecha_desde);
   const conservarPrecios = ad.filter(a => a.fecha_desde && extrasAnteriores.some(p => p.fecha_desde && Number(p.adicional_id) === a.adicional_id)).map(a => a.adicional_id);
   const preciosPrevios = conservarPrecios.length ? await todos(c, `SELECT ra.adicional_id,ra.nombre_adicional,d.fecha,d.precio_unitario,
@@ -872,7 +905,12 @@ async function operar(c, predio, actor, accion, b) {
       if (actor.rol !== "ADMIN") throw U.error("Solo un administrador puede consultar las estadísticas de estadías.", 403);
       return require("./recepcion-estadisticas").estadisticas(c, codigos, predio.id, b);
     }
-    if (accion === "crearAdicional") return crearAdicional(c, codigos, actor, b);
+    if (accion === "crearAdicional") return Catalogo.crearAdicionalSimple(c, predio, codigos, actor, b);
+    if (accion === "catalogo") return Catalogo.catalogo(c, predio, codigos);
+    if (accion === "adicional") return Catalogo.adicional(c, predio, codigos, b.id);
+    if (accion === "guardarAdicional") return Catalogo.guardarAdicional(c, predio, codigos, actor, b);
+    if (accion === "resumenEstadias") return Catalogo.estadisticas(c, predio, codigos, b);
+    if (accion === "alquileres") return Catalogo.alquileres(c, predio, codigos, b);
     if (accion === "familia") return familia(c, b.q, predio.id);
     if (accion === "vencidas") return contarVencidas(c, codigos, predio.id, U.hoy());
     if (accion === "movimientos") return require("./recepcion-movimientos").listarMovimientos(c, codigos, predio.id, b, resumenCambios);

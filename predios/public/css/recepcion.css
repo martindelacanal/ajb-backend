@@ -1,56 +1,160 @@
-.rec-listado-filtros {margin-bottom:18px;overflow:hidden;}
-.pagina > .rec-seccion, .pagina > .rec-resumen {margin-bottom:18px;}
-.rec-seccion {margin: 0 0 18px;padding: 20px;}
-.rec-seccion > h2,.rec-cotizacion h3 {margin:0 0 10px;font-size:19px;color:var(--azul-hondo);}
-.rec-grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;align-items:start;}
-.rec-seccion > .fila {margin-top:12px;}
-.rec-tabla {max-width:100%;overflow-x:auto;}
-.rec-tabla table {width:100%;border-collapse:collapse;text-align:left;}
-.rec-tabla th,.rec-tabla td {padding:9px 12px;border-bottom:1px solid var(--linea);vertical-align:top;}
-.rec-tabla th {color:var(--texto-2);background:var(--papel);font-size:13px;white-space:nowrap;}
-.rec-tabla a {color:var(--azul);font-weight:700;}
-.rec-etiqueta-movil {display:none;}
-.rec-valor {overflow-wrap:break-word;}
-.rec-resumen,.rec-cotizacion {padding:14px 16px;background:var(--cielo);border-radius:var(--radio-chico);}
-.rec-resumen {display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;}
-.rec-viajero {min-width:0;padding:12px;border:1px solid var(--borde);border-radius:var(--radio-chico);}
-.rec-viajero legend,.rec-evento summary {font-weight:700;color:var(--azul-hondo);}
-.rec-viajero .rec-grid + .rec-grid,.rec-cotizacion button {margin-top:12px;}
-.rec-evento {padding:10px 0;border-bottom:1px solid var(--linea);}
-.rec-evento summary {cursor:pointer;}
-.rec-evento[open] summary {margin-bottom:10px;}
-.rec-seccion [hidden],.rec-seccion[hidden],.zona-saldo[hidden] {display:none;}
-@media(max-width:600px){
-  .rec-seccion {padding:14px;}
-  .rec-grid {grid-template-columns:minmax(0,1fr);}
-  .rec-tabla table,.rec-tabla tbody {display:block;}
-  .rec-tabla thead {position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);}
-  .rec-tabla tbody tr {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 12px;padding:12px 0;border-bottom:1px solid var(--linea);}
-  .rec-tabla td {min-width:0;padding:0;border:0;}
-  .rec-tabla td:first-child {grid-column:1 / -1;}
-  .rec-tabla td:last-child:nth-child(odd) {grid-column:1 / -1;}
-  .rec-etiqueta-movil {display:block;color:var(--texto-2);font-size:12px;font-weight:700;}
-  .rec-valor {overflow-wrap:anywhere;}
-  .rec-tabla .tabla-texto-largo {min-width:0;}
-  .rec-evento summary {padding:10px 0;}
+/* Recepción: reservas, estadías, artículos y catálogo de adicionales. Grid y flex con gap (Chrome 84+ / Firefox 63+). */
+
+/* ---------------------------------------------------------------- cabecera y avisos */
+.rec-cabecera .volver { margin-bottom: 6px; }
+.rec-acciones { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end; }
+.rec-acciones > .btn { flex: 0 0 auto; }
+.rec-subtitulo { display: inline-flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+.rec-avisos { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+.rec-avisos:empty { display: none; }
+.rec-avisos .mensaje > div { flex: 1; min-width: 0; }
+.rec-codigo { font-weight: 800; color: var(--tinta); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rec-celda-estado { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.rec-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+#inicio-estadias-vencidas, #inicio-adicionales-pendientes { margin-bottom: 14px; }
+
+/* ---------------------------------------------------------------- secciones */
+.pagina > .rec-seccion, .pagina > .rec-resumen, .rec-formulario > .rec-seccion { margin-bottom: 16px; }
+.rec-formulario { display: block; }
+.rec-seccion { margin: 0 0 16px; padding: 20px; }
+.rec-seccion-cabecera { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.rec-seccion h2, .rec-revision h3 { margin: 0; font-size: 18px; color: var(--azul-hondo); }
+.rec-seccion-cabecera + .columna, .rec-seccion-cabecera + .rec-tabla, .rec-seccion-cabecera + .rec-precios, .rec-seccion-cabecera + .rec-grid { margin-top: 12px; }
+.rec-ayuda { margin: 2px 0 14px; max-width: 78ch; }
+.rec-seccion [hidden], .rec-seccion[hidden], .zona-saldo[hidden], .rec-seccion .columna > div:empty { display: none; }
+
+/* Grillas de campos: todas las etiquetas en una línea y los controles a la misma altura. */
+.rec-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px 16px; align-items: start; }
+.rec-grid .campo-etiqueta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rec-grid .campo-control { width: 100%; }
+.rec-grid-articulo { grid-template-columns: minmax(220px, 1fr) minmax(260px, 1.4fr); }
+.rec-grid-fechas { grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); margin-top: 12px; align-items: end; }
+.rec-cifras { margin: 10px 0 12px; }
+
+/* Fila "campo + botón": el botón queda alineado con el control, no con la etiqueta. */
+.rec-agregar { display: flex; flex-wrap: wrap; gap: 10px 12px; align-items: flex-end; margin-top: 4px; }
+.rec-agregar > .btn { flex: 0 0 auto; min-height: 40px; }
+.rec-agregar > .campo { flex: 0 1 260px; }
+.rec-agregar > .rec-campo-ancho { flex: 1 1 260px; max-width: 440px; }
+.rec-pie-acciones { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; align-items: center; margin-top: 16px; }
+.rec-pie-acciones > .btn { flex: 0 0 auto; }
+.rec-pie-izquierda { justify-content: flex-start; margin-top: 12px; }
+.rec-pie-editor { margin: 4px 0 24px; }
+.rec-botonera { display: flex; flex-wrap: wrap; gap: 8px; }
+.rec-botonera > .btn { flex: 0 0 auto; }
+.columna > .btn, .rec-seccion .columna > .btn { align-self: flex-start; }
+
+.rec-titular { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-height: 40px; }
+.rec-titular .icono { color: var(--azul); }
+
+/* ---------------------------------------------------------------- pasajeros */
+.rec-viajero { min-width: 0; margin: 0; padding: 14px 16px 16px; border: 1px solid var(--borde); border-radius: var(--radio-chico); }
+.rec-viajero legend { padding: 0 6px; font-weight: 800; color: var(--azul-hondo); }
+.rec-botones-fecha { grid-column: span 2; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-height: 40px; }
+
+/* ---------------------------------------------------------------- artículos de la reserva */
+.rec-articulos { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+.rec-articulo { display: grid; grid-template-columns: minmax(180px, 1.4fr) 110px minmax(150px, 1fr) minmax(150px, 1fr) minmax(170px, 1fr); gap: 10px 14px;
+  align-items: end; padding: 12px 14px; border: 1px solid var(--borde); border-radius: var(--radio-chico); background: var(--blanco); }
+.rec-articulo-nombre { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; align-self: center; min-width: 0; }
+.rec-articulo-nombre strong { overflow-wrap: anywhere; }
+.rec-articulo-pie { grid-column: -2 / -1; display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 40px; }
+.rec-articulo .campo-control { width: 100%; }
+
+/* ---------------------------------------------------------------- revisión y liquidación */
+.rec-revision { margin-top: 16px; padding: 16px 18px; border: 1px solid var(--borde); border-radius: var(--radio); background: var(--papel); }
+.rec-revision > .mensaje, .rec-revision > .rec-tabla, .rec-revision > p { margin-top: 12px; }
+.rec-liquidacion { max-width: 100%; overflow-x: auto; border: 1px solid var(--borde); border-radius: var(--radio-chico); background: var(--blanco); }
+.rec-liquidacion table { width: 100%; border-collapse: collapse; }
+.rec-liquidacion th, .rec-liquidacion td { padding: 9px 12px; border-bottom: 1px solid var(--linea); text-align: left; vertical-align: top; }
+.rec-liquidacion thead th { background: var(--papel); color: var(--texto-2); font-size: 12px; font-weight: 800; letter-spacing: .03em; text-transform: uppercase; }
+.rec-liquidacion tbody th { font-weight: 600; color: var(--tinta); }
+.rec-liq-detalle { display: block; margin-top: 2px; color: var(--texto-3); font-size: 13px; font-weight: 400; }
+.rec-liquidacion .der { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rec-liquidacion tr.rec-liq-subtotal th, .rec-liquidacion tr.rec-liq-subtotal td { font-weight: 800; color: var(--tinta); background: #fbfdff; }
+.rec-liquidacion tfoot th, .rec-liquidacion tfoot td { padding: 12px; border-bottom: 0; font-size: 17px; font-weight: 800; color: var(--azul); background: var(--cielo); }
+
+/* ---------------------------------------------------------------- tablas internas */
+.rec-tabla { max-width: 100%; overflow-x: auto; }
+.rec-tabla table { width: 100%; border-collapse: collapse; text-align: left; }
+.rec-tabla th, .rec-tabla td { padding: 9px 12px; border-bottom: 1px solid var(--linea); vertical-align: middle; }
+.rec-tabla th { color: var(--texto-2); background: var(--papel); font-size: 12px; font-weight: 800; letter-spacing: .03em; white-space: nowrap; }
+.rec-tabla .der { text-align: right; font-variant-numeric: tabular-nums; }
+.rec-tabla td.der .rec-valor { white-space: nowrap; }
+.rec-tabla tbody tr:last-child td { border-bottom: 0; }
+.rec-tabla-articulos td:last-child { width: 44px; text-align: right; }
+.rec-etiqueta-movil { display: none; }
+.rec-valor { overflow-wrap: break-word; }
+.rec-cotizacion { padding: 14px 16px; background: var(--cielo); border-radius: var(--radio-chico); }
+.rec-cotizacion h3 { margin: 0 0 10px; font-size: 18px; color: var(--azul-hondo); }
+.rec-resumen { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; padding: 14px 16px; background: var(--cielo); border-radius: var(--radio-chico); }
+
+.rec-datos { grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
+.rec-observaciones { margin: 0; padding-top: 12px; border-top: 1px solid var(--linea); }
+
+/* ---------------------------------------------------------------- desplegables: movimientos e historial */
+.rec-movimientos > summary, .rec-historial > summary { cursor: pointer; font-weight: 800; color: var(--azul-hondo); }
+.rec-movimientos > summary { padding: 6px 0; }
+.rec-movimientos[open] > summary { margin-bottom: 8px; }
+.rec-historial > summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; list-style: none; }
+.rec-historial > summary::-webkit-details-marker { display: none; }
+.rec-historial > summary::before { content: "▸"; color: var(--texto-3); }
+.rec-historial[open] > summary::before { content: "▾"; }
+.rec-historial[open] > summary { margin-bottom: 12px; }
+.rec-historial > summary h2 { display: inline; }
+.rec-evento { padding: 10px 0; border-bottom: 1px solid var(--linea); }
+.rec-evento summary { cursor: pointer; font-weight: 700; color: var(--azul-hondo); }
+.rec-evento[open] summary { margin-bottom: 10px; }
+
+/* ---------------------------------------------------------------- editor de precios del catálogo */
+.rec-precios { display: flex; flex-direction: column; gap: 8px; }
+.rec-precio-fila { display: grid; grid-template-columns: minmax(150px, 1.2fr) minmax(150px, 1.2fr) minmax(140px, 1fr) minmax(140px, 1fr) minmax(150px, 1fr) 44px; gap: 10px; align-items: center; }
+.rec-precios.con-regimen .rec-precio-fila { grid-template-columns: minmax(150px, 1.2fr) minmax(150px, 1.2fr) minmax(120px, 1fr) minmax(140px, 1fr) minmax(140px, 1fr) minmax(150px, 1fr) 44px; }
+.rec-precio-encabezado { padding: 0 2px; color: var(--texto-2); font-size: 12px; font-weight: 800; letter-spacing: .03em; }
+.rec-precio-celda { display: block; min-width: 0; }
+.rec-precio-celda .campo-control { width: 100%; }
+.rec-precio-quitar { display: flex; justify-content: flex-end; }
+.rec-precio-fila[data-fila] { padding: 8px 0; border-top: 1px solid var(--linea); }
+
+@media (max-width: 1100px) {
+  .rec-articulo { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .rec-articulo-nombre { grid-column: 1 / -1; }
+  .rec-articulo-pie { grid-column: 1 / -1; }
 }
-.vehiculo-video {
-  display: block;
-  width: 100%;
-  max-height: 300px;
-  background: #111;
-  border-radius: 8px;
-  object-fit: contain;
+@media (max-width: 900px) {
+  .rec-precio-encabezado { display: none; }
+  .rec-precio-fila, .rec-precios.con-regimen .rec-precio-fila { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 12px 0; }
+  .rec-precio-celda .rec-etiqueta-movil { display: block; margin-bottom: 4px; color: var(--texto-2); font-size: 12px; font-weight: 700; }
+  .rec-precio-quitar { grid-column: 1 / -1; }
 }
+@media (max-width: 600px) {
+  .rec-seccion { padding: 14px; }
+  .rec-grid, .rec-grid-articulo, .rec-grid-fechas { grid-template-columns: minmax(0, 1fr); }
+  .rec-botones-fecha { grid-column: auto; }
+  .rec-acciones { justify-content: flex-start; }
+  .rec-agregar > .campo, .rec-agregar > .rec-campo-ancho { flex: 1 1 100%; max-width: none; }
+  .rec-articulo { grid-template-columns: minmax(0, 1fr); }
+  .rec-precio-fila, .rec-precios.con-regimen .rec-precio-fila { grid-template-columns: minmax(0, 1fr); }
+  .rec-tabla table, .rec-tabla tbody { display: block; }
+  .rec-tabla thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
+  .rec-tabla tbody tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; padding: 12px 0; border-bottom: 1px solid var(--linea); }
+  .rec-tabla td { min-width: 0; padding: 0; border: 0; }
+  .rec-tabla td.der { text-align: left; }
+  .rec-tabla td:first-child { grid-column: 1 / -1; }
+  .rec-tabla td:last-child:nth-child(odd) { grid-column: 1 / -1; }
+  .rec-etiqueta-movil { display: block; color: var(--texto-2); font-size: 12px; font-weight: 700; }
+  .rec-valor { overflow-wrap: anywhere; }
+  .rec-tabla .tabla-texto-largo { min-width: 0; }
+  .rec-liquidacion th, .rec-liquidacion td { padding: 9px 10px; }
+  .rec-liquidacion tfoot th, .rec-liquidacion tfoot td { font-size: 15.5px; }
+  .rec-evento summary { padding: 10px 0; }
+}
+
+/* ---------------------------------------------------------------- vehículos (Seguridad) */
+.vehiculo-video { display: block; width: 100%; max-height: 300px; background: #111; border-radius: 8px; object-fit: contain; }
 .vehiculo-video[hidden] { display: none; }
 .vehiculo-resumen { gap: 8px; }
 .vehiculo-resumen h3 { margin: 0; }
 .vehiculo-detalle { list-style: none; margin: 0; padding: 0; }
-.vehiculo-detalle li {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 0;
-  border-bottom: 1px solid var(--borde);
-}
+.vehiculo-detalle li { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--borde); }

@@ -134,6 +134,8 @@ const { obtenerCargaReserva, obtenerCondicionesReserva } = require("../services/
 const { avisarCancelacionAPedido, textoAvisoCancelacionAfiliadoStaff } = require("../services/reservas-cancelacion-avisos");
 const { obtenerMejorDescuentoAdicionalesDia } = require("../services/descuento-adicionales");
 const { validarRangosEdadTemporada } = require("../services/temporadas-edades");
+// Precios de adicionales por reglas (temporadas, bloques y catálogo del predio): el motor.
+const preciosAdicionales = require("../services/adicionales-precios");
 const {
   actualizarDatosUsuario,
   autorizarEdicionUsuario,
@@ -2803,9 +2805,11 @@ router.get("/adicionales", verifyToken, async (req, res) => {
   try {
     const cabecera = JSON.parse(req.data.data);
     if (["admin", "afiliado", "departamental"].includes(cabecera.rol) && tieneAreaTurismo(cabecera)) {
-      const [rows] = await mysqlConnection
-        .promise()
-        .query("SELECT id, nombre FROM adicional ORDER BY nombre ASC");
+      // Catálogo de los editores de temporadas: sólo lo que se cobra por día (sin ventas del predio).
+      const [rows] = await consultarAdicionalesPorDia(
+        mysqlConnection.promise(),
+        (porDia) => `SELECT a.id, a.nombre FROM adicional a WHERE 1 = 1 ${porDia} ORDER BY a.nombre ASC`
+      );
       res.status(200).json(rows);
     } else {
       res.status(401).json("No autorizado");
@@ -4034,6 +4038,12 @@ router.post("/admin/bloques", verifyToken, async (req, res) => {
       return res.status(400).json("Debe cargar tarifas para los recursos del bloque");
     }
 
+    // Con reglas (tarifas.adicionales_reglas), los adicionales van a nivel bloque y no por tramo.
+    const reglasAdicionales = leerReglasAdicionalesPayload(tarifas);
+    if (reglasAdicionales) {
+      quitarAdicionalesPorTramo(tarifas.configuracion_servicios);
+    }
+
     connection = await mysqlConnection.promise().getConnection();
     await connection.beginTransaction();
 
@@ -4100,6 +4110,11 @@ router.post("/admin/bloques", verifyToken, async (req, res) => {
       origen: "BLOQUE",
       usuario_id: cabecera.id
     });
+    await guardarReglasAdicionalesBloque(connection, {
+      temporadaId: temporada.temporadaId,
+      reglas: reglasAdicionales,
+      usuarioId: cabecera.id,
+    });
 
     const [bloqueResult] = await connection.query(
       `INSERT INTO bloque_fecha (sorteo_id, servicio_id, temporada_tarifa_id, nombre, modalidad, fecha_inicio, fecha_fin, estado)
@@ -4135,7 +4150,7 @@ router.post("/admin/bloques", verifyToken, async (req, res) => {
     }
     registrarErrorRuta(error);
     if (error?.statusCode) {
-      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+      return res.status(error.statusCode).json(cuerpoErrorNegocio(error));
     }
     res.status(500).json("Error al crear bloque");
   } finally {
@@ -4240,6 +4255,11 @@ router.put("/admin/bloques/:id", verifyToken, async (req, res) => {
     }
     let temporadaTarifaId = bloques[0].temporada_tarifa_id || null;
     if (tarifas && Array.isArray(tarifas.configuracion_servicios) && tarifas.configuracion_servicios.length > 0) {
+      // Con reglas (tarifas.adicionales_reglas), los adicionales van a nivel bloque y no por tramo.
+      const reglasAdicionales = leerReglasAdicionalesPayload(tarifas);
+      if (reglasAdicionales) {
+        quitarAdicionalesPorTramo(tarifas.configuracion_servicios);
+      }
       const errorCoberturaTarifas = validarCoberturaTarifasBloque(tarifas.configuracion_servicios, {
         fechaInicio: fecha_inicio,
         fechaFin: fecha_fin,
@@ -4268,15 +4288,21 @@ router.put("/admin/bloques/:id", verifyToken, async (req, res) => {
         usuario_id: cabecera.id
       });
       temporadaTarifaId = temporada.temporadaId;
+      await guardarReglasAdicionalesBloque(connection, {
+        temporadaId: temporada.temporadaId,
+        reglas: reglasAdicionales,
+        usuarioId: cabecera.id,
+      });
 
       if (temporadaAnteriorId) {
         // La temporada anterior ya no se borra (el borrado arrastraba su historial): sus
         // tarifas y adicionales quedan dados de baja como REEMPLAZADO, con lote, y la fila de
-        // temporada_tarifa queda sin precios vigentes.
+        // temporada_tarifa queda sin precios vigentes (ni reglas de adicionales).
         const baja = await darDeBajaTarifasTemporada(connection, {
           temporadaId: temporadaAnteriorId,
           usuarioId: cabecera.id,
         });
+        await darDeBajaReglasAdicionalesTemporada(connection, temporadaAnteriorId);
         await guardarHistorialTemporada(
           connection,
           temporadaAnteriorId,
@@ -4325,7 +4351,7 @@ router.put("/admin/bloques/:id", verifyToken, async (req, res) => {
     }
     registrarErrorRuta(error);
     if (error?.statusCode) {
-      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+      return res.status(error.statusCode).json(cuerpoErrorNegocio(error));
     }
     res.status(500).json("Error al actualizar bloque");
   } finally {
@@ -6367,11 +6393,11 @@ router.post("/reserva/adicionales", verifyToken, async (req, res) => {
       }
 
       const filtroTemporada = temporadaTarifaIdFiltro ? "AND ta.temporada_tarifa_id = ?" : "";
-      const [adicionales] = await mysqlConnection
-        .promise()
-        .query(
-          `
-            SELECT 
+      // Los de VENTA (p. ej. una bolsa de carbón) se cobran por unidad en el predio: no se ofrecen online.
+      const [adicionales] = await consultarAdicionalesPorDia(
+        mysqlConnection.promise(),
+        (porDia) => `
+            SELECT
               ta.id as tarifa_adicional_id,
               ta.adicional_id,
               a.nombre,
@@ -6385,11 +6411,12 @@ router.post("/reserva/adicionales", verifyToken, async (req, res) => {
               AND ta.fecha_inicio <= ?
               AND ta.fecha_fin >= ?
               AND ta.activo = 1
+              ${porDia}
               ${filtroTemporada}
             ORDER BY ta.fecha_inicio ASC
           `,
-          [recurso_id, regimen_id, fechaFinSolicitud, fechaInicioSolicitud, ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])]
-        );
+        [recurso_id, regimen_id, fechaFinSolicitud, fechaInicioSolicitud, ...(temporadaTarifaIdFiltro ? [temporadaTarifaIdFiltro] : [])]
+      );
 
         res.status(200).json(adicionales);
     } else {
@@ -16344,6 +16371,242 @@ function resumenHistorialPreciosAdicionales(lote, cambios) {
   };
 }
 
+// Precios que el upsert pisó: filas de la temporada (ya escritas) con la misma clave que una
+// anterior y otro precio. anteriores: adicionalesTemporadaPorClave leído antes del upsert.
+function adicionalesConPrecioPisado(anteriores, filas) {
+  const cambios = [];
+  for (const fila of filas) {
+    const anterior = anteriores.get(claveTarifaAdicional({
+      recursoId: fila.recurso_id,
+      regimenId: fila.regimen_id,
+      adicionalId: fila.adicional_id,
+      fechaInicio: fila.fecha_inicio,
+      fechaFin: fila.fecha_fin,
+    }));
+    // En centavos: precio es DECIMAL(12,2)
+    if (anterior && Math.round(Number(anterior.precio) * 100) !== Math.round(Number(fila.precio) * 100)) {
+      cambios.push({
+        id: anterior.id,
+        adicional_id: anterior.adicional_id,
+        recurso_id: anterior.recurso_id,
+        regimen_id: anterior.regimen_id,
+        fecha_inicio: formatearFechaSQL(anterior.fecha_inicio),
+        fecha_fin: formatearFechaSQL(anterior.fecha_fin),
+        precio_anterior: Number(anterior.precio),
+        precio_nuevo: Number(fila.precio),
+      });
+    }
+  }
+  return cambios;
+}
+
+// --- Precios de adicionales por reglas -------------------------------------------
+// Los editores de temporadas (baja y bloques de alta) mandan adicionales_reglas: el precio por
+// día de cada adicional con su alcance (todos los servicios, un servicio o un recurso; un
+// régimen o todos) y sus fechas. Con reglas, los adicionales por tramo de
+// configuracion_servicios se ignoran y, después de insertar las tarifas (en la misma
+// transacción), el motor (services/adicionales-precios.js) da de baja lo anterior y genera las
+// filas de tarifa_adicional que leen las cotizaciones. Sin adicionales_reglas (un cliente
+// viejo) sigue valiendo lo cargado por tramo.
+
+// historial_temporada.valor_nuevo es TEXT (64 KB): cada regla ocupa ~150 bytes.
+const MAXIMO_REGLAS_HISTORIAL_TEMPORADA = 250;
+const CAMPOS_REGLA_ADICIONAL = ["adicional_id", "servicio_id", "recurso_id", "regimen_id", "fecha_inicio", "fecha_fin", "precio"];
+
+/**
+ * adicionales_reglas de un cuerpo: null si no vino (cliente viejo: valen los adicionales por
+ * tramo), la lista si vino (vacía = la temporada queda sin adicionales).
+ */
+function leerReglasAdicionalesPayload(cuerpo) {
+  if (!cuerpo || typeof cuerpo !== "object") return null;
+  const reglas = cuerpo.adicionales_reglas;
+  if (reglas === undefined || reglas === null) return null;
+  if (!Array.isArray(reglas)) {
+    throw crearErrorNegocio("Revisá los precios de los adicionales: no llegaron como una lista.", 400, "ADICIONALES_REGLAS_INVALIDAS");
+  }
+  return reglas;
+}
+
+/** Con reglas, los adicionales por tramo no se validan ni se insertan. */
+function quitarAdicionalesPorTramo(configuracionServicios) {
+  const lista = (valor) => (Array.isArray(valor) ? valor : []);
+  for (const servicio of lista(configuracionServicios)) {
+    for (const regimen of lista(servicio?.regimenes)) {
+      for (const recurso of lista(regimen?.recursos)) {
+        for (const fecha of lista(recurso?.fechas)) {
+          if (fecha && typeof fecha === "object") fecha.adicionales = [];
+        }
+      }
+    }
+  }
+}
+
+/** Los errores del motor (status 400/409 con mensaje para mostrar) pasan como errores de negocio. */
+function errorNegocioPreciosAdicionales(error) {
+  if (!error || error.statusCode || !Number.isInteger(error.status) || error.status < 400 || error.status >= 500) {
+    return error;
+  }
+  const negocio = crearErrorNegocio(
+    error.message,
+    error.status,
+    error.status === 409 ? "ADICIONALES_PRECIOS_CONFLICTO" : "ADICIONALES_PRECIOS_INVALIDOS"
+  );
+  if (Array.isArray(error.conflictos)) negocio.conflictos = error.conflictos.slice(0, 50);
+  return negocio;
+}
+
+/** Cuerpo de un error de negocio: { message, codigo } y, si el motor los informó, los choques. */
+function cuerpoErrorNegocio(error) {
+  return {
+    message: error.message,
+    codigo: error.codigo || null,
+    ...(Array.isArray(error.conflictos) ? { conflictos: error.conflictos } : {}),
+  };
+}
+
+/** Los adicionales de las reglas existen y se alquilan por día (los de VENTA se cobran una vez, en el predio). */
+async function validarAdicionalesDeReglas(connection, reglas) {
+  const ids = Array.from(new Set(reglas.map((regla) => Number(regla.adicional_id))));
+  if (ids.length === 0) return;
+  const [filas] = await connection.query("SELECT id, nombre, modalidad FROM adicional WHERE id IN (?)", [ids]);
+  if (filas.length !== ids.length) {
+    throw crearErrorNegocio("Hay precios de un adicional que no existe. Recargá la pantalla y revisalos.", 400, "ADICIONALES_PRECIOS_INVALIDOS");
+  }
+  const deVenta = filas.find((fila) => String(fila.modalidad || "").toUpperCase() === "VENTA");
+  if (deVenta) {
+    throw crearErrorNegocio(
+      `«${deVenta.nombre}» se vende por unidad en el predio: no lleva precio por día en una temporada. Quitalo de los adicionales.`,
+      400,
+      "ADICIONALES_PRECIOS_INVALIDOS"
+    );
+  }
+}
+
+/** valor_nuevo del historial: cuántas reglas y filas quedaron, y las reglas (hasta 250). */
+function resumenHistorialReglasAdicionales({ reglas, filas }) {
+  const incluidas = reglas.slice(0, MAXIMO_REGLAS_HISTORIAL_TEMPORADA)
+    .map((regla) => Object.fromEntries(CAMPOS_REGLA_ADICIONAL.map((campo) => [campo, regla[campo] ?? null])));
+  return {
+    reglas: reglas.length,
+    filas,
+    detalle: incluidas,
+    ...(reglas.length > incluidas.length ? { reglas_omitidas: reglas.length - incluidas.length } : {}),
+  };
+}
+
+/**
+ * Reemplaza los precios de adicionales de la temporada por las reglas (tarifas ya insertadas,
+ * misma transacción). Devuelve { reglas, filas } para el historial.
+ */
+async function guardarReglasAdicionalesTemporada(connection, { temporadaId, reglas, usuarioId = null }) {
+  const ambito = { temporada_tarifa_id: Number(temporadaId) };
+  try {
+    const destinos = await preciosAdicionales.destinosDeAmbito(connection, ambito, { bloquear: true });
+    const normalizadas = preciosAdicionales.normalizarReglas(reglas, { destinos });
+    await validarAdicionalesDeReglas(connection, normalizadas);
+    const resultado = await preciosAdicionales.materializar(connection, ambito, null, normalizadas, {
+      destinos,
+      actorId: usuarioId || null,
+    });
+    return { reglas: normalizadas, filas: Number(resultado?.filas || 0) };
+  } catch (error) {
+    throw errorNegocioPreciosAdicionales(error);
+  }
+}
+
+/**
+ * Bloque de temporada alta: cada guardado crea su temporada (origen BLOQUE). Con reglas, se
+ * materializan en esa temporada nueva y quedan en su historial. Sin reglas, nada (valen las por tramo).
+ */
+async function guardarReglasAdicionalesBloque(connection, { temporadaId, reglas, usuarioId }) {
+  if (!reglas) return null;
+  const guardado = await guardarReglasAdicionalesTemporada(connection, { temporadaId, reglas, usuarioId });
+  if (usuarioId) {
+    await guardarHistorialTemporada(
+      connection,
+      temporadaId,
+      usuarioId,
+      "CREATE",
+      "adicionales_reglas",
+      null,
+      JSON.stringify(resumenHistorialReglasAdicionales(guardado))
+    );
+  }
+  return guardado;
+}
+
+// Antes de la migración de precios por reglas no existen adicional_precio ni
+// tarifa_adicional.adicional_precio_id: lo que sólo ordena las reglas no frena el guardado.
+function esEsquemaReglasAusente(error) {
+  return error?.code === "ER_NO_SUCH_TABLE" || error?.code === "ER_BAD_FIELD_ERROR";
+}
+
+/**
+ * Guardado por tramo (cliente viejo): las reglas que hubiera quedan de baja y las filas vuelven a
+ * ser sueltas (sin regla). Así GET /temporada/:id las vuelve a agrupar desde lo guardado.
+ */
+async function soltarReglasAdicionalesTemporada(connection, temporadaId) {
+  try {
+    await connection.query(
+      "UPDATE adicional_precio SET activo = 0, fecha_baja = NOW() WHERE temporada_tarifa_id = ? AND activo = 1",
+      [temporadaId]
+    );
+    await connection.query(
+      "UPDATE tarifa_adicional SET adicional_precio_id = NULL WHERE temporada_tarifa_id = ? AND activo = 1 AND adicional_precio_id IS NOT NULL",
+      [temporadaId]
+    );
+  } catch (error) {
+    if (!esEsquemaReglasAusente(error)) throw error;
+  }
+}
+
+/** La temporada anterior de un bloque, reemplazada entera: sus reglas también quedan de baja. */
+async function darDeBajaReglasAdicionalesTemporada(connection, temporadaId) {
+  try {
+    await connection.query(
+      "UPDATE adicional_precio SET activo = 0, fecha_baja = NOW() WHERE temporada_tarifa_id = ? AND activo = 1",
+      [temporadaId]
+    );
+  } catch (error) {
+    if (!esEsquemaReglasAusente(error)) throw error;
+  }
+}
+
+/** Filas vigentes de tarifa_adicional de la temporada (para el historial de precios pisados). */
+async function adicionalesVigentesTemporada(connection, temporadaId) {
+  const [filas] = await connection.query(
+    `SELECT id, recurso_id, regimen_id, adicional_id, fecha_inicio, fecha_fin, precio
+       FROM tarifa_adicional
+      WHERE temporada_tarifa_id = ? AND activo = 1`,
+    [temporadaId]
+  );
+  return filas;
+}
+
+/** Reglas del editor (guardadas o inferidas de lo cargado por tramo); null antes de la migración. */
+async function reglasAdicionalesParaEditor(connection, temporadaId) {
+  try {
+    return await preciosAdicionales.reglasDeAmbito(connection, { temporada_tarifa_id: Number(temporadaId) });
+  } catch (error) {
+    if (esEsquemaReglasAusente(error)) return null;
+    throw error;
+  }
+}
+
+/**
+ * Listados de adicionales (editores de temporadas y reservas online): sin los de VENTA, que se
+ * cobran por unidad en el predio. armarSql recibe la condición (sobre el alias «a» de adicional)
+ * para sumarla con AND. Antes de la migración (sin adicional.modalidad) van todos.
+ */
+async function consultarAdicionalesPorDia(db, armarSql, params = []) {
+  try {
+    return await db.query(armarSql("AND COALESCE(a.modalidad, 'ALQUILER') <> 'VENTA'"), params);
+  } catch (error) {
+    if (error?.code !== "ER_BAD_FIELD_ERROR") throw error;
+    return db.query(armarSql(""), params);
+  }
+}
+
 function normalizarBanderaPorcentaje(valor) {
   if (valor === undefined || valor === null) {
     return false;
@@ -17078,6 +17341,12 @@ router.post("/temporada", verifyToken, async (req, res) => {
         return res.status(400).json("Faltan campos requeridos");
       }
 
+      // Con reglas, los precios de adicionales van a nivel temporada: los de cada tramo no cuentan.
+      const reglasAdicionales = leerReglasAdicionalesPayload(req.body);
+      if (reglasAdicionales) {
+        quitarAdicionalesPorTramo(configuracion_servicios);
+      }
+
       const errorConfiguracion = validarConfiguracionTemporada({
         nombreCampania: nombre_campania,
         fechaInicio: fecha_inicio,
@@ -17320,6 +17589,24 @@ router.post("/temporada", verifyToken, async (req, res) => {
           }
         }
 
+        // 3. Precios de adicionales por reglas: con las tarifas ya insertadas (los recortan a sus días)
+        if (reglasAdicionales) {
+          const guardadoReglas = await guardarReglasAdicionalesTemporada(connection, {
+            temporadaId,
+            reglas: reglasAdicionales,
+            usuarioId: cabecera.id,
+          });
+          await guardarHistorialTemporada(
+            connection,
+            temporadaId,
+            cabecera.id,
+            'CREATE',
+            'adicionales_reglas',
+            null,
+            JSON.stringify(resumenHistorialReglasAdicionales(guardadoReglas))
+          );
+        }
+
         // Confirmar transacción
         await connection.commit();
 
@@ -17346,7 +17633,7 @@ router.post("/temporada", verifyToken, async (req, res) => {
   } catch (error) {
     registrarErrorRuta(error);
     if (error?.statusCode) {
-      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+      return res.status(error.statusCode).json(cuerpoErrorNegocio(error));
     }
     res.status(500).json("Error al crear la temporada");
   }
@@ -17621,6 +17908,10 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
         // Con reservas sus precios no se pueden reemplazar: el editor lo avisa al abrirla.
         const tieneReservas = await temporadaUsadaEnReservas(connection, id);
 
+        // Precios de adicionales como reglas (las guardadas y, agrupadas, las que se cargaron por
+        // tramo). Los editores nuevos usan esto; los adicionales de cada fecha quedan para los viejos.
+        const adicionalesReglas = await reglasAdicionalesParaEditor(connection, id);
+
         // 4. Construir respuesta final
         const response = {
           nombre_campania: temporada.nombre,
@@ -17628,7 +17919,8 @@ router.get("/temporada/:id", verifyToken, async (req, res) => {
           fecha_fin: temporada.fecha_fin,
           configuracion_servicios: Array.from(serviciosMap.values()),
           porcentajes_tipo_persona: porcentajesTipoPersona,
-          tiene_reservas: tieneReservas
+          tiene_reservas: tieneReservas,
+          ...(adicionalesReglas ? { adicionales_reglas: adicionalesReglas } : {})
         };
 
         connection.release();
@@ -17662,6 +17954,11 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
         return res.status(400).json("Faltan campos requeridos");
       }
 
+      // Con reglas, los precios de adicionales van a nivel temporada: los de cada tramo no cuentan.
+      const reglasAdicionales = leerReglasAdicionalesPayload(req.body);
+      if (reglasAdicionales) {
+        quitarAdicionalesPorTramo(configuracion_servicios);
+      }
 
       const errorConfiguracion = validarConfiguracionTemporada({
         nombreCampania: nombre_campania,
@@ -17999,6 +18296,32 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
           }
         }
 
+        if (reglasAdicionales) {
+          // 5. Precios de adicionales por reglas, con las tarifas nuevas ya insertadas. Lo vigente
+          //    ya quedó de baja arriba (mismo lote): el motor da de baja las reglas anteriores y,
+          //    con el upsert de la clave única, reactiva las filas que vuelven con su precio nuevo.
+          const guardadoReglas = await guardarReglasAdicionalesTemporada(connection, {
+            temporadaId: id,
+            reglas: reglasAdicionales,
+            usuarioId: cabecera.id,
+          });
+          await guardarHistorialTemporada(
+            connection,
+            id,
+            cabecera.id,
+            'UPDATE',
+            'adicionales_reglas',
+            null,
+            JSON.stringify(resumenHistorialReglasAdicionales(guardadoReglas))
+          );
+          adicionalesConOtroPrecio.push(
+            ...adicionalesConPrecioPisado(adicionalesAnteriores, await adicionalesVigentesTemporada(connection, id))
+          );
+        } else {
+          // Guardado por tramo: si la temporada tenía reglas, dejan de valer (las filas son las de recién).
+          await soltarReglasAdicionalesTemporada(connection, id);
+        }
+
         if (adicionalesPorTemporada.length > 0) {
           await guardarHistorialTemporada(
             connection,
@@ -18048,7 +18371,7 @@ router.put("/temporada/:id", verifyToken, async (req, res) => {
   } catch (error) {
     registrarErrorRuta(error);
     if (error?.statusCode) {
-      return res.status(error.statusCode).json({ message: error.message, codigo: error.codigo || null });
+      return res.status(error.statusCode).json(cuerpoErrorNegocio(error));
     }
     res.status(500).json("Error al actualizar la temporada");
   }
@@ -19602,6 +19925,12 @@ function verifyToken(req, res, next) {
 
 router.__test = Object.freeze({
   darDeBajaTarifasTemporada,
+  leerReglasAdicionalesPayload,
+  quitarAdicionalesPorTramo,
+  errorNegocioPreciosAdicionales,
+  cuerpoErrorNegocio,
+  resumenHistorialReglasAdicionales,
+  adicionalesConPrecioPisado,
 });
 
 // Recepción utiliza las mismas reglas y bloqueos que el formulario de Turismo.

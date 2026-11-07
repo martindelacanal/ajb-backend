@@ -456,16 +456,78 @@
   var COLUMNAS_ANCHAS = ["nombre", "producto", "razon_social", "proveedor"];
   var siguienteTabla = 0;
 
+  // Fuente de datos en memoria para P.tabla: búsqueda, filtros, orden y páginas en el navegador.
+  // opciones: { meta, filas: function () -> Promise|array, buscar: function (fila) -> texto,
+  //             filtros: { clave: function (fila, valor) -> bool }, valor: { clave: function (fila) -> valor para ordenar } }
+  function normalizarTexto(t) { return String(t == null ? "" : t).normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase(); }
+  P.normalizarTexto = normalizarTexto;
+  P.cumpleMonto = function (valor, filtro) {
+    var m = /^(eq|gte|lte):(.*)$/.exec(filtro || "");
+    if (!m || m[2] === "") return true;
+    var n = Number(m[2]), v = Number(valor);
+    if (!isFinite(n)) return true;
+    if (valor === null || valor === undefined || !isFinite(v)) return false;
+    return m[1] === "eq" ? Math.abs(v - n) < 0.005 : m[1] === "gte" ? v >= n : v <= n;
+  };
+  P.fuenteLocal = function (opciones) {
+    return {
+      meta: opciones.meta,
+      cargar: function (p) {
+        return Promise.resolve(typeof opciones.filas === "function" ? opciones.filas() : opciones.filas).then(function (todas) {
+          var lista = (todas || []).slice();
+          var meta = typeof opciones.meta === "function" ? opciones.meta() : opciones.meta;
+          if (p.q) {
+            var palabras = normalizarTexto(p.q).split(/\s+/).filter(Boolean);
+            lista = lista.filter(function (f) {
+              var texto = normalizarTexto(opciones.buscar ? opciones.buscar(f) : meta.columnas.map(function (c) { return f[c.clave]; }).join(" "));
+              return palabras.every(function (w) { return texto.indexOf(w) >= 0; });
+            });
+          }
+          Object.keys(p).forEach(function (k) {
+            if (k.indexOf("f_") !== 0) return;
+            var clave = k.slice(2), valor = p[k];
+            var fn = opciones.filtros && opciones.filtros[clave];
+            lista = lista.filter(function (f) { return fn ? fn(f, valor) : String(f[clave]) === String(valor); });
+          });
+          var orden = p.orden || (meta.orden && meta.orden.clave);
+          if (orden) {
+            var dir = (p.orden ? p.dir : meta.orden && meta.orden.dir) === "desc" ? -1 : 1;
+            var col = meta.columnas.filter(function (c) { return c.clave === orden; })[0] || {};
+            var numerica = ["money", "qty", "pct", "int"].indexOf(col.tipo) >= 0;
+            var leer = (opciones.valor && opciones.valor[orden]) || function (f) { return f[orden]; };
+            lista.sort(function (a, b) {
+              var x = leer(a), y = leer(b);
+              var vx = x === null || x === undefined || x === "", vy = y === null || y === undefined || y === "";
+              if (vx || vy) return vx === vy ? 0 : vx ? 1 : -1;
+              if (numerica) return (Number(x) - Number(y)) * dir;
+              return String(x).localeCompare(String(y), "es", { numeric: true, sensitivity: "base" }) * dir;
+            });
+          }
+          var tam = Number(p.tam) || 10, total = lista.length;
+          var paginas = Math.max(1, Math.ceil(total / tam));
+          var pagina = Math.min(Math.max(1, Number(p.pagina) || 1), paginas);
+          return { filas: lista.slice((pagina - 1) * tam, pagina * tam), total: total, pagina: pagina, paginas: paginas, tam: tam };
+        });
+      },
+    };
+  };
+
   P.textoTabla = function (valor) {
     if (typeof valor !== "string" || !valor) return valor;
     var largo = valor.length > 24;
     return h("span.tabla-texto" + (largo ? ".tabla-texto-largo" : ""), { title: valor }, valor);
   };
 
+  // P.tabla({ listado }) lee un listado del servidor. Con { fuente: { meta, cargar(params) } } (por ejemplo
+  // P.fuenteLocal o una consulta a Turismo), o con { consultar, cargarMeta }, usa otra fuente con el mismo
+  // buscador, filtros, orden y paginador.
   P.tabla = function (opciones) {
-    var nombre = opciones.listado;
-    var consultar = opciones.consultar || function (p) { return P.get("/listados/" + nombre + P.qs(p)); };
-    var cargarMeta = opciones.cargarMeta || function () { return P.metaListado(nombre); };
+    var fuente = opciones.fuente || null;
+    var nombre = opciones.listado || opciones.claveEstado;
+    var consultar = opciones.consultar || (fuente ? function (p) { return Promise.resolve(fuente.cargar(p)); }
+      : function (p) { return P.get("/listados/" + nombre + P.qs(p)); });
+    var cargarMeta = opciones.cargarMeta || (fuente ? function () { return Promise.resolve(typeof fuente.meta === "function" ? fuente.meta() : fuente.meta); }
+      : function () { return P.metaListado(nombre); });
     var claveEstado = "tabla:" + (opciones.claveEstado || nombre);
     var guardado = P.cache[claveEstado] || {};
     var estado = {
@@ -605,7 +667,7 @@
       Object.keys(estado.filtros).forEach(function (k) {
         if ((opciones.filtrosOcultos || []).indexOf(k) >= 0) return;
         // Una preferencia de una versión anterior no puede dejar filtros invisibles activos.
-        if (meta && !meta.filtros.some(function (f) { return f.clave === k; })) return;
+        if (meta && !(meta.filtros || []).some(function (f) { return f.clave === k; })) return;
         var v = estado.filtros[k];
         if (v !== undefined && v !== null && v !== "") p["f_" + k] = v;
       });
@@ -631,7 +693,7 @@
       }
       var ocultos = opciones.filtrosOcultos || [];
       var gruposFechas = {};
-      meta.filtros.forEach(function (f) {
+      (meta.filtros || []).forEach(function (f) {
         if (ocultos.indexOf(f.clave) >= 0) return;
         var valor = estado.filtros[f.clave] || "";
         var control;
@@ -692,7 +754,7 @@
         botonFiltros.appendChild(cantidadFiltros);
         barra.appendChild(botonFiltros);
       } else { botonFiltros = null; cantidadFiltros = null; filtrosAbiertos = false; }
-      if (opciones.exportar !== false) {
+      if (opciones.exportar !== false && !fuente) {
         var boton = P.btn("Exportar", { tipo: "secundario", icono: "planilla" });
         boton.classList.add("tabla-exportar");
         boton.addEventListener("click", function () {
@@ -714,7 +776,7 @@
       panelFiltros.hidden = !filtrosAbiertos;
       if (!botonFiltros || !meta) return;
       var ocultos = opciones.filtrosOcultos || [];
-      var activos = meta.filtros.filter(function (f) {
+      var activos = (meta.filtros || []).filter(function (f) {
         if (ocultos.indexOf(f.clave) >= 0) return false;
         var valor = estado.filtros[f.clave];
         return valor !== undefined && valor !== null && valor !== "" && valor !== "todos";
@@ -829,7 +891,7 @@
     function recargar() { return cargar(); }
 
     cargarMeta().then(function (m) {
-      meta = m;
+      meta = Object.assign({ filtros: [], resumen: [], columnas: [] }, m);
       Object.keys(estado.filtros).forEach(function (clave) {
         if (!meta.filtros.some(function (f) { return f.clave === clave; })) delete estado.filtros[clave];
       });

@@ -390,8 +390,14 @@ const TABLAS = {
     unicos: [["reserva_id", "dni"]], indices: [["dni"], ["legajo"]],
   },
   predio_estadia_mov: {
-    columnas: { reserva_id: "int!", huesped_id: "int", venta_id: "int", liquidacion_id: "int", fecha: "dt!", concepto: "str:40!", medio: "str:20", importe: "money!", detalle: "str:255", usuario_id: "int", usuario_nombre: "str:120" },
+    columnas: { reserva_id: "int!", huesped_id: "int", venta_id: "int", liquidacion_id: "int", fecha: "dt!", concepto: "str:40!", medio: "str:20", importe: "money!", detalle: "str:255", usuario_id: "int", usuario_nombre: "str:120",
+      adicional_id: "int", anula_mov_id: "int" },
     indices: [["reserva_id", "id"], ["venta_id"]],
+  },
+  // Devolución de un artículo alquilado (un renglón por reserva y adicional; deshacer la marca la anula).
+  predio_adicional_devolucion: {
+    columnas: { reserva_id: "int!", adicional_id: "int!", fecha: "date!", detalle: "str:255", anulada: "bool", usuario_id: "int", usuario_nombre: "str:120", registrada: "dt" },
+    unicos: [["reserva_id", "adicional_id"]],
   },
   predio_venta_pago: {
     columnas: { venta_id: "int!", forma: "str:20!", importe: "money!", huesped_id: "int" }, indices: [["venta_id"]],

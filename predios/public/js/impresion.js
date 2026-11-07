@@ -98,6 +98,48 @@
     return imprimirHtml(nodo, ESTILO_A4, "Liquidacion " + l.id);
   };
 
+  // Comprobante de la estadía (no fiscal), con original para el huésped y duplicado para el predio.
+  // datos: { reserva, empresa, predio, total, adicionales, cuenta, detalleAlojamiento, manual }
+  var ESTILO_COMPROBANTE = ESTILO_A4 + ".copia { page-break-after: always; break-after: page; } .copia:last-child { page-break-after: auto; break-after: auto; }" +
+    ".tipo-copia { display: inline-block; margin-top: 6px; padding: 3px 10px; border: 1.5px solid #0d5482; border-radius: 6px; font-weight: 800; letter-spacing: .08em; color: #0d5482; }" +
+    ".no-fiscal { margin-top: 4px; font-size: 11px; font-weight: 700; color: #5d7690; text-transform: uppercase; letter-spacing: .04em; }" +
+    ".rec-liq-detalle { display: block; font-size: 11px; color: #5d7690; font-weight: 400; } .der { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; } tr.rec-liq-subtotal td, tr.rec-liq-subtotal th { font-weight: 800; border-top: 1px solid #bcd9ec; } tfoot td, tfoot th { padding: 9px 6px; font-size: 15px; font-weight: 800; color: #0d5482; border-top: 2px solid #0d5482; }" +
+    "tbody th[scope=row] { text-align: left; font-weight: 600; font-size: 12.5px; text-transform: none; letter-spacing: 0; color: #12344d; border-bottom: 1px solid #e6f1f9; }" +
+    ".pendiente { margin-top: 14px; padding: 10px 12px; border: 1px solid #f0c27a; border-radius: 8px; background: #fff8ea; }";
+  P.imprimirComprobanteEstadia = function (datos) {
+    var r = datos.reserva, e = datos.empresa || {}, a = datos.cuenta || { movimientos: [] };
+    var emitido = P.f.fechaHora(new Date(Date.now() - 3 * 3600 * 1000).toISOString().replace("T", " "));
+    var tabla = P.recepcion.liquidacion(datos).querySelector("table");
+    var sinDevolver = (datos.adicionales || []).filter(function (l) { return l.modalidad !== "VENTA" && l.fecha_desde && !l.devuelto; });
+    var personas = (r.personas || []).map(function (p) { return p.apellido + ", " + p.nombre; }).join(" · ");
+    var ingresaron = (r.personas || []).filter(function (p) { return p.entrada; });
+    var salidaReal = ingresaron.length && ingresaron.every(function (p) { return p.salida; }) ? ingresaron.map(function (p) { return p.salida; }).sort().pop() : null;
+    function copia(tipo) {
+      return h("div.copia",
+        h("div.cab",
+          h("div", h("h1", e.razon_social || "Asociación Judicial Bonaerense"), h("div.gris", e.nombre_predio || datos.predio || ""), e.direccion ? h("div.gris", e.direccion) : null,
+            e.cuit ? h("div.gris", "CUIT " + e.cuit) : null),
+          h("div.der", h("h1", "Comprobante de estadía"), h("div", h("strong", "Reserva T-" + r.id)), h("div.gris", "Emitido el " + emitido),
+            h("div.no-fiscal", "Documento no válido como factura"), h("div.tipo-copia", tipo))),
+        h("h2", "Titular y estadía"),
+        h("div.datos",
+          h("div", h("span", "Titular"), h("strong", r.titular_nombre || "")),
+          h("div", h("span", "DNI"), h("strong", documento(r.titular_dni) || "—")),
+          h("div", h("span", "Servicio"), h("strong", r.servicio || "")),
+          h("div", h("span", "Recurso"), h("strong", (r.recursos || []).map(function (x) { return x.nombre; }).join(", ") || r.recurso || "—")),
+          h("div", h("span", "Ingreso"), h("strong", P.f.fecha(r.fecha_inicio))),
+          h("div", h("span", salidaReal ? "Salida" : "Salida prevista"), h("strong", P.f.fecha(salidaReal || r.fecha_fin)))),
+        personas ? h("p", h("span.gris", "Pasajeros: "), personas) : null,
+        h("h2", "Detalle"),
+        tabla.cloneNode(true),
+        sinDevolver.length ? h("div.pendiente", h("strong", "Artículos sin devolver: "), sinDevolver.map(function (l) { return l.nombre + " (" + l.cantidad + ")"; }).join(", ")) : null,
+        h("div.firmas", h("div", "Firma del huésped"), h("div", "Aclaración"), h("div", "Firma y sello del predio")),
+        h("div.pie", (tipo === "ORIGINAL" ? "Original para el huésped. " : "Duplicado para el predio. ") +
+          "Comprobante interno de la estadía; los importes de la reserva original se verifican en Mi AJB."));
+    }
+    return imprimirHtml(h("div", copia("ORIGINAL"), copia("DUPLICADO")), ESTILO_COMPROBANTE, "Comprobante T-" + r.id);
+  };
+
   P.imprimirCompra = function (datos) {
     var c = datos.compra;
     var temporal = c.estado === "TEMPORAL" || c.estado === "DESCARTADA";

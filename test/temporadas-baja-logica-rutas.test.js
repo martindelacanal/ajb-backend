@@ -84,6 +84,11 @@ async function query(sql, params = []) {
   if (/SELECT tipo_persona_id, porcentaje FROM temporada_tipo_persona_porcentaje/.test(sql)) return [[]];
   if (/SELECT id, temporada_tarifa_id FROM bloque_fecha WHERE id = \? FOR UPDATE/.test(sql)) return [[escenario.bloque]];
   if (/SELECT id FROM reserva\s+WHERE bloque_fecha_id/.test(sql)) return [[]];
+  // bloqueSuperponeReserva (services/ocupacion-recursos-predio.js): sin reservas en esas fechas.
+  if (/FROM reserva r JOIN estado_reserva er/.test(sql)) return [[]];
+  // GET /temporada/:id: reglas de adicionales (services/adicionales-precios.js), sin guardadas ni sueltas.
+  if (/FROM adicional_precio ap WHERE ap\.temporada_tarifa_id = \?/.test(sql)) return [[]];
+  if (/FROM tarifa_adicional ta WHERE ta\.temporada_tarifa_id = \? AND ta\.activo = 1 AND ta\.adicional_precio_id IS NULL/.test(sql)) return [[]];
   if (/SELECT id FROM recurso WHERE id IN \([^)]*\) AND servicio_id = \? FOR UPDATE/.test(sql)) return [[{ id: 5 }]];
   if (/FROM bloque_fecha_recurso bfr/.test(sql)) return [[]];
   if (/INSERT INTO temporada_tarifa/.test(sql)) return [{ insertId: 8 }];

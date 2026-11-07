@@ -20,6 +20,8 @@ async function query(sql, params = []) {
   if (/SELECT id FROM recurso WHERE id IN/.test(sql)) return [[{ id: 1 }]];
   if (/SELECT id, temporada_tarifa_id FROM bloque_fecha WHERE/.test(sql)) return [[{ id: 1, temporada_tarifa_id: 1 }]];
   if (/SELECT id FROM reserva\s+WHERE bloque_fecha_id/.test(sql)) return [[]];
+  // bloqueSuperponeReserva (services/ocupacion-recursos-predio.js): sin reservas en esas fechas.
+  if (/FROM reserva r JOIN estado_reserva er/.test(sql)) return [[]];
   if (/FROM bloque_fecha_recurso bfr/.test(sql) || /FROM tarifa t/.test(sql)) return [[]];
   if (/^SELECT id FROM flujo_descuento_escalonado WHERE/.test(sql)) return [[{ id: 1 }]];
   if (/INSERT INTO flujo_descuento_escalonado_regla/.test(sql)) {

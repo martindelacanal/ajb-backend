@@ -19,6 +19,9 @@
     c.appendChild(h("div#inicio-estadias-vencidas", { hidden: !P.estado.estadiasVencidas },
       P.mensaje(h("div.fila", h("strong", P.textoEstadiasVencidas()),
         P.btn("Ver estadías", { tipo: "secundario", chico: true, onclick: function () { P.ruta.ir("/recepcion?ocupacion=VENCIDA"); } })), "aviso")));
+    c.appendChild(h("div#inicio-adicionales-pendientes", { hidden: !P.estado.adicionalesPendientes },
+      P.mensaje(h("div.fila", h("strong", P.textoAdicionalesPendientes()),
+        P.btn("Ver artículos", { tipo: "secundario", chico: true, onclick: function () { P.ruta.ir("/recepcion/adicionales/pendientes"); } })), "aviso")));
     var cifras = h("div.grilla.inicio-cifras");
     var cuerpo = h("div.grilla.inicio-cuerpo");
     c.appendChild(cifras);

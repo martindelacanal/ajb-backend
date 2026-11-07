@@ -18,6 +18,8 @@ function resumirCuenta(personas, movimientos) {
     if (m.concepto === "CIERRE_SALIDA" && p && !p.cierre) p.cierre = Number(m.id);
   }
   let prepago = 0, consumos = 0, pendiente = 0, huboOperacionDeSaldo = false;
+  // Pagos de artículos alquilados o comprados: descuentan la deuda de la reserva (ver recepcion.js).
+  const pagosAdicionales = {};
   for (let i = movimientos.length - 1; i >= 0; i--) {
     const m = movimientos[i];
     const importe = Number(m.importe), id = Number(m.id), p = porId.get(Number(m.huesped_id));
@@ -29,6 +31,10 @@ function resumirCuenta(personas, movimientos) {
     if (compra) consumos -= importe;
     if (m.concepto === "DIFERENCIAL") pendiente += importe;
     if (m.concepto === "PAGO_RESERVA") pendiente -= importe;
+    if (m.concepto === "PAGO_ADICIONAL") {
+      pendiente -= importe;
+      pagosAdicionales[String(m.adicional_id)] = U.redondear((pagosAdicionales[String(m.adicional_id)] || 0) + importe);
+    }
     if (!p) continue;
     if (id > cierreAlojamiento) {
       if (["DIFERENCIAL", "TRASPASO_ALOJAMIENTO"].includes(m.concepto)) p.alojamiento += importe;
@@ -63,6 +69,8 @@ function resumirCuenta(personas, movimientos) {
     pendiente: U.redondear(pendiente),
     saldo,
     cierre_pendiente: huboOperacionDeSaldo || saldo !== 0 || neto !== 0,
+    pagos_adicionales: pagosAdicionales,
+    pagos_anulados: movimientos.filter(m => m.anula_mov_id).map(m => Number(m.anula_mov_id)),
     saldos_individuales: Object.fromEntries(personas.map(p => [String(p.dni), porId.get(Number(p.id))]))
   };
 }
