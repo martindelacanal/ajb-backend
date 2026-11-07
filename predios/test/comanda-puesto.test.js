@@ -32,12 +32,15 @@ test("la comanda se conserva por caja y sólo su operador o un administrador pue
   assert.equal(respuesta.imprimir_comanda, false);
 });
 
-test("salir o cambiar de puesto exige cerrar la caja, incluso al administrador", async t => {
+test("salir o cambiar de puesto con ventas en el turno exige cerrar la caja, incluso al administrador", async t => {
   const { db, ctx, cajas: [caja, otra], llamar } = await escenario(t);
   await db.run("INSERT INTO predio_sesion(token_hash,usuario_id,creada) VALUES ('sesion',1,'2026-11-05')");
   const admin = { ...ctx, sesion: { token_hash: "sesion" } };
   const ingreso = await llamar(admin, "POST", "/sesion/puesto", { boca_id: caja.boca_id, caja_id: caja.id });
   Object.assign(admin.sesion, ingreso.puesto);
+  await N.insertar(db, ctx, "predio_venta", {
+    boca_id: caja.boca_id, caja_id: caja.id, turno_id: ingreso.puesto.turno_id, fecha: U.fechaHora(), forma_pago: "QR", estado: "CONFIRMADA", total: 10,
+  });
   for (const ruta of ["/sesion/salir-puesto", "/logout", "/sesion/puesto"]) {
     await assert.rejects(llamar(admin, "POST", ruta, { boca_id: otra.boca_id, caja_id: otra.id }), { codigo: "TURNO_ABIERTO" });
   }
@@ -150,4 +153,27 @@ test("dos usuarios compiten por una caja, el titular retoma su turno y el relevo
   const siguiente = await llamar(actores[otro], "POST", "/sesion/puesto", puesto);
   assert.notEqual(siguiente.puesto.turno_id, turno);
   await llamar(await autenticar(reingreso.token), "POST", "/logout");
+});
+
+test("un turno sin ventas ni movimientos se libera al salir o al cambiar de caja, sin cierre", async t => {
+  const { db, ctx, cajas: [caja, otra], llamar } = await escenario(t);
+  const usuario = await N.insertar(db, ctx, "predio_usuario", { usuario: "ana", nombre: "Ana", rol: "CAJERO", activo: 1 });
+  await N.insertar(db, ctx, "predio_usuario_boca", { usuario_id: usuario, boca_id: caja.boca_id });
+  if (otra.boca_id !== caja.boca_id) await N.insertar(db, ctx, "predio_usuario_boca", { usuario_id: usuario, boca_id: otra.boca_id });
+  await db.run("INSERT INTO predio_sesion(token_hash,usuario_id,creada) VALUES ('ana',?,'2026-11-07')", [usuario]);
+  const ana = { ...ctx, usuario: { id: usuario, rol: "CAJERO", nombre: "Ana", bocas: [caja.boca_id, otra.boca_id] }, sesion: { token_hash: "ana" } };
+  // Entra sola a la caja (por ejemplo, al recargar después de su cierre temporal) y se va sin vender.
+  const primera = await llamar(ana, "POST", "/sesion/puesto", { boca_id: caja.boca_id, caja_id: caja.id });
+  Object.assign(ana.sesion, primera.puesto);
+  const segunda = await llamar(ana, "POST", "/sesion/puesto", { boca_id: otra.boca_id, caja_id: otra.id });
+  assert.notEqual(segunda.puesto.turno_id, primera.puesto.turno_id);
+  assert.equal((await db.get("SELECT estado FROM predio_turno WHERE id=?", [primera.puesto.turno_id])).estado, "CERRADO");
+  Object.assign(ana.sesion, segunda.puesto);
+  await llamar(ana, "POST", "/logout");
+  assert.equal((await db.get("SELECT estado FROM predio_turno WHERE id=?", [segunda.puesto.turno_id])).estado, "CERRADO");
+  assert.equal((await db.get("SELECT COUNT(*) AS n FROM predio_cierre")).n, 0, "no hace falta un cierre");
+  const auditoria = await db.all("SELECT accion FROM predio_auditoria WHERE accion = 'Turno sin movimientos liberado'");
+  assert.equal(auditoria.length, 2);
+  // La caja quedó libre para otro.
+  assert.equal(await require("../lib/turnos-caja").turnoAbierto(db, 1, caja.id), undefined);
 });

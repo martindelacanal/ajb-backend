@@ -10,6 +10,7 @@
   var pagina = null;
   var ultimoPermisoVisto = 0;
   var ultimoAvisoVisto = 0;
+  var aperturaAvisada = null;
 
   P.alSalir = function (fn) { limpiezas.push(fn); };
   P.intervalo = function (fn, ms) { var t = setInterval(fn, ms); limpiezas.push(function () { clearInterval(t); }); return t; };
@@ -199,6 +200,7 @@
         d.agente ? h("p.texto-3.chico", "Navegador: " + d.agente) : null),
       acciones: [
         P.btn("Cerrar", { onclick: function () { m.cerrar(); } }),
+        n.tipo === "CIERRE_TEMPORAL" && d.caja_id && P.esAdmin() ? P.btn("Cargar cambio", { tipo: "suave", icono: "efectivo", onclick: function () { m.cerrar(); P.cargarApertura(d.caja_id); } }) : null,
         n.tipo === "CIERRE_TEMPORAL" && d.cierre_id && P.esAdmin() ? P.btn("Ver el cierre", { tipo: "secundario", icono: "caja", onclick: function () { m.cerrar(); P.verCierre(d.cierre_id); } }) : null,
         !n.leido ? P.btn("Marcar como leída", { tipo: "primario", onclick: function (ev) {
           P.ejecutar(ev.currentTarget, function () {
@@ -325,6 +327,14 @@
           P.aviso(p.usuario_nombre + accion + ". Tocá la campana para responder.", "cola", 8000);
         }
         ultimoPermisoVisto = Math.max(ultimoPermisoVisto, max);
+      }
+      if (!P.esAdmin() && a.apertura && a.apertura.verificacion === "PENDIENTE" && P.puesto() && P.puesto().caja_id) {
+        var clave = a.apertura.id + ":" + a.apertura.importe;
+        if (clave !== aperturaAvisada && !P.hayVentana() && P.verificarApertura) {
+          aperturaAvisada = clave;
+          P.aviso("El administrador cargó el saldo de apertura: contá el cambio y confirmalo.", "info", 8000);
+          P.verificarApertura(false);
+        }
       }
       if (P.alAvisos) P.alAvisos(a);
     }).catch(function () {});

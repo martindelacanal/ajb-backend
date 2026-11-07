@@ -15,13 +15,19 @@
   ];
 
   // ------------------------------------------------------------------ saldo de apertura (cajero)
+  var aperturaEnPantalla = null;
   P.verificarApertura = function (forzar) {
     var puesto = P.puesto();
     if (!puesto || !puesto.caja_id) return Promise.resolve();
     return P.get("/caja/estado").then(function (r) {
       var a = r.apertura;
       if (!a) {
-        if (forzar) P.modal({ titulo: "Saldo de apertura", contenido: P.mensaje("El administrador todavía no cargó el saldo de apertura de esta jornada para " + puesto.caja + ". Podés empezar a vender igual.", "aviso") });
+        var sinCambio = !(Number(r.resumen.saldo_esperado) > 0);
+        var texto = sinCambio
+          ? puesto.caja + " arranca sin cambio. Si lo necesitás, pedile al administrador que cargue el saldo de apertura: puede hacerlo a distancia y te va a aparecer acá para confirmarlo."
+          : "El administrador todavía no cargó el saldo de apertura de esta jornada para " + puesto.caja + ". Podés empezar a vender igual.";
+        if (forzar) P.modal({ titulo: "Saldo de apertura", contenido: P.mensaje(texto, "aviso") });
+        else if (sinCambio) P.aviso(texto, "info", 10000);
         return;
       }
       if (a.verificacion !== "PENDIENTE" && !forzar) return;
@@ -32,6 +38,9 @@
             : P.mensaje("Se informó que no coincide. Comunicate con el administrador.", "error")) });
         return;
       }
+      // El pedido puede llegar a la vez al entrar a la caja y por el aviso del administrador.
+      if (aperturaEnPantalla === a.id) return;
+      aperturaEnPantalla = a.id;
       var encontrado = P.dinero({ placeholder: "¿Cuánto encontraste? (opcional)" });
       var nota = P.input({ placeholder: "Comentario (opcional)", max: 200 });
       var zonaNo = h("div.columna", { hidden: true }, P.campo("Efectivo que hay en la caja", h("div.campo-con-prefijo", h("span", "$"), encontrado)), P.campo("Comentario", nota),
@@ -40,6 +49,7 @@
         titulo: "Saldo de apertura de la caja",
         subtitulo: "Contá el efectivo de " + puesto.caja + " y confirmá si coincide con lo que cargó el administrador.",
         modalFijo: true,
+        alCerrar: function () { aperturaEnPantalla = null; },
         contenido: h("div.columna", importe, zonaNo),
         acciones: [
           P.btn("No coincide", { tipo: "peligro", onclick: function (ev) {
@@ -125,7 +135,7 @@
         h("div.cierre-bolsas",
           h("div.cierre-bolsa", h("span", "Bolsa 1 · Recaudación"), h("strong.dinero", P.f.pesos(c.efectivo_ventas))),
           h("div.cierre-bolsa", h("span", "Bolsa 2 · Cambio"), h("strong.dinero", P.f.pesos(c.efectivo_cambio)))),
-        P.mensaje("Guardá cada bolsa con su ticket. Un administrador las va a recibir y hacer el cierre definitivo. La caja quedó libre: quien sigue abre su propio turno, sin mezclar nada con el tuyo.", "ok")),
+        P.mensaje("Guardá cada bolsa con su ticket. Un administrador las va a recibir y hacer el cierre definitivo. La caja quedó libre y en $ 0: quien sigue abre su propio turno, sin mezclar nada con el tuyo, y el administrador le carga el cambio (puede hacerlo a distancia).", "ok")),
       acciones: [
         P.btn("Reimprimir tickets", { tipo: "suave", icono: "imprimir", onclick: function () { P.imprimirCierre(d, { bolsas: true }).catch(P.error); } }),
         P.btn("Elegir otra caja", { tipo: "secundario", onclick: function () { m.cerrar(); P.ruta.ir("/puesto"); } }),
@@ -318,7 +328,7 @@
     return h("section.hoja.hoja-cuerpo.cierres-temporales",
       h("div.fila-separada",
         h("div", h("h2.seccion-titulo", "Cierres temporales por recibir"),
-          h("p.texto-3.chico", { style: { margin: "2px 0 0" } }, "Cada uno tiene dos bolsas con su ticket: recaudación y cambio. Recibilas y cerralos de a uno.")),
+          h("p.texto-3.chico", { style: { margin: "2px 0 0" } }, "Cada uno tiene dos bolsas con su ticket: recaudación y cambio. Recibilas y cerralos de a uno. Si alguien sigue en esa caja y necesita cambio, cargáselo desde acá.")),
         P.chip(temporales.length + (temporales.length === 1 ? " pendiente" : " pendientes"), "PENDIENTE")),
       h("ul.lista-simple", temporales.map(function (c) {
         return h("li",
@@ -328,7 +338,9 @@
           h("div.cierre-temporal-montos",
             h("span.texto-3.chico", "Recaudación"), h("strong.dinero", P.f.pesos(c.efectivo_ventas)),
             h("span.texto-3.chico", "Cambio"), h("strong.dinero", P.f.pesos(c.efectivo_cambio))),
-          P.btn("Recibir y cerrar", { tipo: "primario", chico: true, icono: "check", onclick: function () { P.recibirTemporal(c, alTerminar); } }));
+          h("div.fila.cierre-temporal-acciones",
+            P.btn("Cargar cambio", { tipo: "suave", chico: true, icono: "efectivo", onclick: function () { P.cargarApertura(c.caja_id, alTerminar); } }),
+            P.btn("Recibir y cerrar", { tipo: "primario", chico: true, icono: "check", onclick: function () { P.recibirTemporal(c, alTerminar); } })));
       })));
   }
 
@@ -396,6 +408,13 @@
     P.continuidad.registrarVentana("caja-apertura", reabrir(modalApertura));
     P.continuidad.registrarVentana("caja-ajuste", reabrir(modalAjuste));
   }
+  P.cargarApertura = function (cajaId, alTerminar) {
+    return P.opciones("cajas", true).then(function (cajas) {
+      var elegida = cajas.filter(function (c) { return String(c.valor) === String(cajaId); });
+      return modalApertura(elegida.length ? elegida : cajas, cajaId, alTerminar);
+    }).catch(P.error);
+  };
+
   function modalApertura(cajas, cajaId, alTerminar, previo) {
     var caja = P.select(cajas, previo ? previo.seleccion : cajaId);
     var fecha = P.input({ tipo: "date", valor: previo ? previo.fecha : P.hoy() });
@@ -404,7 +423,7 @@
     var m = P.modal({
       reanudar: { id: "caja-apertura", datos: function () { return { cajaId: cajaId, seleccion: caja.value, fecha: fecha.value }; } },
       titulo: "Saldo de apertura",
-      subtitulo: "El efectivo con el que arranca la caja. El cajero lo va a ver y confirmar.",
+      subtitulo: "El efectivo de cambio con el que arranca la caja. No cambia lo que ya se cobró: si alguien está atendiendo, lo ve y lo confirma al momento.",
       contenido: h("div.columna", P.campo("Caja", caja), P.campo("Día", fecha), P.campo("Importe", h("div.campo-con-prefijo.campo-grande", h("span", "$"), importe), { requerido: true }), P.campo("Observación", obs)),
       acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn("Guardar", { tipo: "primario", onclick: function (ev) {
         P.ejecutar(ev.currentTarget, function () {

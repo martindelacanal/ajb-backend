@@ -176,9 +176,16 @@ async function cargarApertura(ctx) {
       throw U.error("Esta caja tiene un turno abierto del " + turno.inicio.slice(0, 10) + ". Cerralo antes de cargar la apertura de otra jornada.", 409);
     }
     const existente = await t.get("SELECT * FROM predio_apertura WHERE predio_id = ? AND caja_id = ? AND fecha = ?", [ctx.pid, cajaId, fecha]);
-    const saldo = await saldoCaja(t, ctx, cajaId);
-    // El movimiento lleva la caja exactamente al saldo declarado.
-    const diferencia = U.redondear(importe - saldo, 2);
+    // Después de un cierre (por ejemplo, uno temporal) la apertura del día ya no vale:
+    // cargarla otra vez es una apertura nueva para quien sigue, no una corrección.
+    const vigente = existente ? !!(await aperturaVigente(t, ctx.pid, cajaId, fecha, "a.id")) : false;
+    // La apertura fija el fondo de cambio del período abierto: lo que quedó del último
+    // cierre más los saldos de apertura ya cargados. No absorbe las ventas ni los ajustes
+    // del turno, así el administrador puede cargarla a distancia aunque ya estén cobrando.
+    const fondo = await t.get(
+      `SELECT COALESCE(SUM(CASE WHEN tipo = 'INGRESO' THEN importe ELSE -importe END), 0) AS s FROM predio_caja_movimiento
+       WHERE predio_id = ? AND caja_id = ? AND (cierre_id IS NOT NULL OR concepto = 'SALDO_APERTURA')`, [ctx.pid, cajaId]);
+    const diferencia = U.redondear(importe - Number(fondo?.s || 0), 2);
     let movimientoId = null;
     if (diferencia !== 0) {
       movimientoId = await N.insertar(t, ctx, "predio_caja_movimiento", {
@@ -192,15 +199,17 @@ async function cargarApertura(ctx) {
     if (existente) {
       id = existente.id;
       await N.actualizar(t, ctx, "predio_apertura", id, {
-        importe, verificacion: "PENDIENTE", verificado_por: null, verificado_fecha: null, observacion, movimiento_id: movimientoId || existente.movimiento_id,
+        importe, verificacion: "PENDIENTE", verificado_por: null, verificado_fecha: null, observacion,
+        movimiento_id: movimientoId || (vigente ? existente.movimiento_id : null),
       });
     } else {
       id = await N.insertar(t, ctx, "predio_apertura", { caja_id: cajaId, fecha, importe, verificacion: "PENDIENTE", observacion, movimiento_id: movimientoId });
     }
-    await N.auditar(t, ctx, existente ? "Corrección del saldo de apertura" : "Saldo de apertura", "caja", cajaId, {
-      fecha, importe, anterior: existente ? Number(existente.importe) : undefined,
+    await N.auditar(t, ctx, vigente ? "Corrección del saldo de apertura" : "Saldo de apertura", "caja", cajaId, {
+      fecha, importe, anterior: vigente ? Number(existente.importe) : undefined, turno_id: turno?.id || null,
     });
-    return { id, mensaje: `Saldo de apertura de ${caja.nombre}: ${U.pesos(importe)}` };
+    const quien = turno ? `${turno.usuario_nombre} lo confirma al contar la caja` : "Quien abra la caja lo confirma al empezar";
+    return { id, mensaje: `Saldo de apertura de ${caja.nombre}: ${U.pesos(importe)}. ${quien}.` };
   });
 }
 
@@ -420,7 +429,7 @@ async function cerrarTemporal(ctx) {
     await emitirAviso(t, ctx, {
       tipo: "CIERRE_TEMPORAL",
       titulo: `Cierre temporal N° ${c.cierreId} · ${boca?.nombre || "Caja"} · ${caja.nombre}`,
-      mensaje: `${N.nombreActor(ctx)} cerró la caja en forma temporal (${textoDiferencia(c.diferencia)}). Dejó la bolsa de recaudación con ${U.pesos(enVentas)} y la de cambio con ${U.pesos(enCambio)}. Falta que un administrador reciba las bolsas y haga el cierre definitivo.`,
+      mensaje: `${N.nombreActor(ctx)} cerró la caja en forma temporal (${textoDiferencia(c.diferencia)}). Dejó la bolsa de recaudación con ${U.pesos(enVentas)} y la de cambio con ${U.pesos(enCambio)}. Falta que un administrador reciba las bolsas y haga el cierre definitivo. La caja quedó en $ 0: si quien sigue necesita cambio, cargale el saldo de apertura (también a distancia).`,
       detalle: { cierre_id: c.cierreId, caja_id: cajaId, efectivo_ventas: enVentas, efectivo_cambio: enCambio },
     });
     return {

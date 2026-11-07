@@ -169,3 +169,32 @@ test("los retiros salen primero de la recaudación y el resto del cambio", () =>
   assert.equal(ef.esperado_ventas, 0);
   assert.equal(ef.esperado_cambio, 450);
 });
+
+test("después de un temporal, el administrador carga el cambio a distancia sin absorber lo que ya se cobró", async (t) => {
+  const { db, admin, caja, post, get, turnoDe, vender } = await escenario(t);
+  await post(admin, "/caja/apertura", { caja_id: caja.id, importe: 1000 });
+  const ana = await turnoDe(2, "Ana");
+  await vender(ana, 2, "EFECTIVO");
+  const previa = await get(ana, "/caja/cierre/previa");
+  await post(ana, "/caja/cierre/temporal", { efectivo_ventas: 200, efectivo_cambio: 1000, revision: previa.revision, turno_id: previa.turno.id, ultimo_cierre_id: null });
+
+  // Beto arranca en cero y vende antes de que llegue el cambio.
+  const beto = await turnoDe(3, "Beto");
+  assert.equal((await get(beto, "/caja/estado")).apertura, null);
+  await vender(beto, 1, "EFECTIVO");
+  const carga = await post({ ...admin, origen: "REMOTO" }, "/caja/apertura", { caja_id: caja.id, importe: 500 });
+  assert.match(carga.mensaje, /Beto lo confirma/);
+  const estado = await get(beto, "/caja/estado");
+  assert.equal(estado.apertura.importe, 500);
+  assert.equal(estado.apertura.verificacion, "PENDIENTE");
+  assert.equal(estado.resumen.saldo_esperado, 600, "los $100 de la venta siguen en la caja");
+  assert.equal(estado.resumen.efectivo.saldo_inicial, 500);
+  assert.equal(estado.resumen.efectivo.ventas, 100);
+  assert.equal((await get(beto, "/avisos")).apertura.verificacion, "PENDIENTE");
+  const auditoria = await db.all("SELECT accion FROM predio_auditoria WHERE accion LIKE '%saldo de apertura%' OR accion = 'Saldo de apertura' ORDER BY id");
+  assert.deepEqual(auditoria.map((a) => a.accion), ["Saldo de apertura", "Saldo de apertura"], "la del relevo es una apertura nueva, no una corrección");
+  // Si la corrige mientras sigue el turno, sí es una corrección y ajusta sólo el cambio.
+  await post(admin, "/caja/apertura", { caja_id: caja.id, importe: 800 });
+  assert.equal((await get(beto, "/caja/estado")).resumen.saldo_esperado, 900);
+  assert.equal((await db.get("SELECT accion FROM predio_auditoria WHERE accion LIKE 'Corrección%' ORDER BY id DESC LIMIT 1")).accion, "Corrección del saldo de apertura");
+});
