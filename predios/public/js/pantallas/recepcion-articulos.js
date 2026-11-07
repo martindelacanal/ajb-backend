@@ -29,7 +29,7 @@
       titulo = "Anular pago · " + linea.nombre;
       cuerpoModal = h("div.columna", h("div.rec-resumen", "Pago del " + P.f.fechaHora(pago.fecha) + " · " + (MEDIOS[pago.medio] || pago.medio), h("strong", pesos(pago.importe))),
         P.mensaje((pago.medio === "EFECTIVO" ? "Se registra la devolución del efectivo en la caja elegida." : "El importe vuelve a quedar pendiente de pago.") +
-          " El comprobante N° " + Number(pago.comprobante || pago.id) + " se reimprime con el pago anulado.", "info"), campoCaja2, P.campo("Motivo", nota));
+          (pago.comprobante ? " Se emite una nota de crédito sobre su recibo, para imprimir y que firme el titular." : ""), "info"), campoCaja2, P.campo("Motivo", nota));
       datos = function () {
         if (!campoCaja2.hidden && !caja2.value) { caja2.focus(); throw Error("Elegí la caja que devuelve el efectivo."); }
         return { movimiento_id: pago.id, caja_id: caja2.value };
@@ -51,7 +51,8 @@
           .then(function (x) {
             m.cerrar();
             if (!x.encolado) {
-              P.aviso(x.mensaje, "ok");
+              if (x.comprobante) P.contable.emitido(x);
+              else P.aviso(x.mensaje, "ok");
               return refrescar();
             }
           });
@@ -64,13 +65,7 @@
   function adeudados(lineas) {
     return lineas.filter(function (l) { return Number(l.adeudado) > 0; });
   }
-  function imprimirComprobante(r, numero) {
-    return P.get("/recepcion/" + r.id + "/articulos/comprobante/" + numero).then(function (d) {
-      return P.imprimirComprobanteArticulos(d, { reimpresion: true });
-    });
-  }
-
-  /* La persona paga en el momento uno o varios artículos: un solo cobro y un solo comprobante.
+  /* La persona paga en el momento uno o varios artículos: un solo cobro y un solo recibo.
      `solo`: el artículo desde cuyo menú se abrió («Registrar pago»): se cobra sólo ese. */
   function cobrarArticulos(r, lineas, refrescar, solo) {
     var key = nuevaClave();
@@ -145,14 +140,14 @@
     });
   }
 
-  // La ventana queda abierta con el comprobante listo para imprimir (original y duplicado).
+  // La ventana queda abierta con el recibo listo para imprimir (original y duplicado).
   function cobroHecho(m, x) {
     var d = x.datos, impreso = false;
-    var imprimir = P.btn("Imprimir comprobante", { tipo: "primario", icono: "imprimir", onclick: function (e) {
+    var imprimir = P.btn("Imprimir recibo", { tipo: "primario", icono: "imprimir", onclick: function (e) {
       P.ejecutar(e.currentTarget, function () {
         var reimpresion = impreso;
         impreso = true;
-        return P.imprimirComprobanteArticulos(d, { reimpresion: reimpresion });
+        return P.imprimirComprobante(d, { reimpresion: reimpresion });
       }).catch(function () {});
     } });
     var titulo = m.ventana.querySelector(".ventana-cabecera h2");
@@ -160,38 +155,12 @@
     P.reemplazar(m.cuerpo, h("div.columna",
       P.mensaje(x.mensaje, "ok"),
       h("div.rec-resumen.rec-cobro-total", h("span", "Cobrado · " + (MEDIOS[d.medio] || d.medio)), h("strong", pesos(d.total))),
-      h("ul.rec-cobro-hecho", d.items.map(function (it) {
-        return h("li", h("span", it.nombre), h("strong", pesos(it.importe)));
+      h("ul.rec-cobro-hecho", d.renglones.map(function (it) {
+        return h("li", h("span", it.texto), h("strong", pesos(it.importe)));
       })),
-      h("p.texto-3.chico", "El comprobante sale con original para el huésped y duplicado para el predio. No es válido como factura.")));
+      h("p.texto-3.chico", "Recibo " + d.codigo + ": sale en una hoja con el original para el titular y el duplicado para el predio. No es válido como factura.")));
     P.reemplazar(m.pie, P.btn("Listo", { tipo: "secundario", onclick: function () { m.cerrar(); } }), imprimir);
     setTimeout(function () { imprimir.focus(); }, 30);
-  }
-
-  // Comprobantes emitidos en la reserva, agrupados por número (un pago anterior sin número usa su id).
-  function comprobantesDe(a, lineas) {
-    var nombres = {}, anulados = {}, porNumero = {}, salida = [];
-    lineas.forEach(function (l) { nombres[String(l.adicional_id)] = l.nombre; });
-    a.movimientos.forEach(function (mv) { if (mv.anula_mov_id) anulados[String(mv.anula_mov_id)] = true; });
-    a.movimientos.forEach(function (mv) {
-      if (mv.concepto !== "PAGO_ADICIONAL" || !(Number(mv.importe) > 0) || mv.anula_mov_id) return;
-      var n = Number(mv.comprobante || mv.id), c = porNumero[n];
-      if (!c) { c = porNumero[n] = { numero: n, fecha: mv.fecha, medio: mv.medio, articulos: [], total: 0, anulado: 0 }; salida.push(c); }
-      if (String(mv.fecha) < String(c.fecha)) c.fecha = mv.fecha;
-      c.articulos.unshift(nombres[String(mv.adicional_id)] || String(mv.detalle || "Artículo").split(" · ")[0]);
-      c.total = P.redondear(c.total + Number(mv.importe));
-      if (anulados[String(mv.id)]) c.anulado = P.redondear(c.anulado + Number(mv.importe));
-    });
-    return salida.sort(function (x, y) { return y.numero - x.numero; });
-  }
-  function listaComprobantes(r, comprobantes) {
-    return h("details.rec-movimientos.rec-comprobantes", { open: comprobantes.length <= 5 ? "" : null },
-      h("summary", "Comprobantes de pago (" + comprobantes.length + ")"),
-      tabla(["N°", "Fecha", "Artículos", "Importe", "Medio", "Estado", ""], comprobantes.map(function (c) {
-        var estado = !c.anulado ? P.chip("Vigente", "OK") : c.anulado >= c.total ? P.chip("Anulado", "ANULADA") : P.chip("Anulado en parte", "PENDIENTE");
-        return [h("strong.rec-codigo", "N° " + c.numero), P.f.fechaHora(c.fecha), c.articulos.join(", "), pesos(c.total), MEDIOS[c.medio] || c.medio || "—", estado,
-          btn("Imprimir", function () { return imprimirComprobante(r, c.numero); }, "texto", { chico: true, icono: "imprimir", etiqueta: "Imprimir comprobante N° " + c.numero })];
-      }), ".rec-tabla-comprobantes"));
   }
 
   function chipsArticulo(l) {
@@ -216,7 +185,6 @@
     };
     var deuda = adeudados(lineas);
     var falta = P.redondear(deuda.reduce(function (s, l) { return s + Number(l.adeudado); }, 0));
-    var comprobantes = comprobantesDe(a, lineas);
     var articulos = tabla(["Artículo", "Detalle", "Importe", "Pagado", "Estado", ""], lineas.map(function (l) {
       var items = [];
       if (Number(l.adeudado)) items.push({ texto: "Registrar pago", icono: "efectivo", accion: function () { cobrarArticulos(r, lineas, cargar, l); } });
@@ -236,8 +204,7 @@
       deuda.length ? h("div.rec-cobro-barra",
         h("p.rec-cobro-falta", "Falta pagar ", h("strong", pesos(falta)), " en " + (deuda.length === 1 ? "1 artículo" : deuda.length + " artículos")),
         btn("Cobrar artículos", function () { cobrarArticulos(r, lineas, cargar); }, "primario", { chico: true, icono: "efectivo" })) : null,
-      articulos,
-      comprobantes.length ? listaComprobantes(r, comprobantes) : null);
+      articulos);
   }
   P.recepcion.tablaArticulos = tablaArticulos;
 })();

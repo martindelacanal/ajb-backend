@@ -624,7 +624,8 @@ async function guardarUsuario(ctx) {
 
 // ------------------------------------------------------------------ configuración
 
-const CLAVES_CONFIG = ["nombre_predio", "razon_social", "cuit", "direccion", "leyenda_ticket", "texto_autorizacion", "minutos_permiso"];
+const CLAVES_CONFIG = ["nombre_predio", "razon_social", "cuit", "direccion", "leyenda_ticket", "texto_autorizacion", "minutos_permiso",
+  "iibb", "inicio_actividades", "condicion_iva", "domicilio_legal", "telefono", "correo", "leyenda_comprobante"];
 
 async function verConfig(ctx) {
   const config = await N.leerConfig(ctx.db, ctx);

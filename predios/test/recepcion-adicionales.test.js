@@ -90,11 +90,11 @@ test("devolución, pago, anulación y avisos de artículos vencidos se registran
   const otraVez = detalle.adicionales.find(a => a.adicional_id === 1);
   assert.deepEqual([otraVez.pagado, otraVez.adeudado, otraVez.devuelto, otraVez.sin_devolver], [0, 6000, null, true]);
   assert.equal(detalle.cuenta.pendiente, 15000);
-  const saldoCaja = await db.get("SELECT SUM(CASE WHEN tipo='INGRESO' THEN importe ELSE -importe END) AS neto FROM predio_caja_movimiento WHERE concepto='ADICIONAL_ESTADIA'");
+  const saldoCaja = await db.get("SELECT SUM(CASE WHEN tipo='INGRESO' THEN importe ELSE -importe END) AS neto FROM predio_caja_movimiento WHERE concepto IN ('ADICIONAL_ESTADIA','NOTA_CREDITO')");
   assert.equal(Number(saldoCaja.neto), 0);
 });
 
-test("cobro de varios artículos con un solo comprobante, reintento idempotente y reimpresión con anulaciones", async t => {
+test("cobro de varios artículos con un solo recibo, reintento idempotente y anulación de pagos con nota de crédito", async t => {
   const db = crearSqlite(":memory:", { predioId: 1 });
   asegurarEsquema(db);
   t.after(() => db.cerrar());
@@ -114,9 +114,9 @@ test("cobro de varios artículos con un solo comprobante, reintento idempotente 
   await db.run("INSERT INTO predio_estadia_mov (predio_id,id,reserva_id,fecha,concepto,importe) VALUES (1,1,?,?,'DIFERENCIAL',15000)", [r.id, U.fechaHora()]);
   const call = (m, p, body = {}, query = {}) => api.ejecutar({ ...ctx, body, query }, m, p);
   const cobrar = body => call("POST", "/recepcion/410/articulos/cobrar", body);
-  const ver = numero => call("GET", "/recepcion/410/articulos/comprobante/" + numero);
+  const ver = id => call("GET", "/contable/comprobantes/" + id);
   const pagos = () => db.all("SELECT id, adicional_id, importe, medio, comprobante FROM predio_estadia_mov WHERE concepto='PAGO_ADICIONAL' ORDER BY id");
-  const enCaja = () => db.all("SELECT tipo, importe FROM predio_caja_movimiento WHERE concepto='ADICIONAL_ESTADIA' ORDER BY id");
+  const enCaja = () => db.all("SELECT tipo, importe, concepto, recibo FROM predio_caja_movimiento WHERE concepto IN ('ADICIONAL_ESTADIA','NOTA_CREDITO') ORDER BY id");
 
   // Validaciones: nada queda registrado si un ítem no corresponde.
   await assert.rejects(cobrar({ operacion: U.uuid(), medio: "EFECTIVO", caja_id: caja.id, items: [{ adicional_id: 1, importe: 6000.01 }] }), /supera lo que falta pagar de Sombrilla/);
@@ -128,26 +128,28 @@ test("cobro de varios artículos con un solo comprobante, reintento idempotente 
   await assert.rejects(cobrar({ operacion: U.uuid(), medio: "HABERES", items: [{ adicional_id: 1, importe: 100 }] }), /El medio/);
   assert.equal((await pagos()).length, 0);
   assert.equal((await enCaja()).length, 0);
+  assert.equal((await db.get("SELECT COUNT(*) AS n FROM predio_comprobante")).n, 0);
 
-  // Dos artículos, un comprobante y un solo ingreso de efectivo por el total.
+  // Dos artículos, un recibo y un solo ingreso de efectivo por el total, enlazado al recibo.
   const body = { operacion: U.uuid(), medio: "EFECTIVO", caja_id: caja.id, detalle: "Paga en recepción",
     items: [{ adicional_id: 1, importe: 6000 }, { adicional_id: 2, importe: 4000 }] };
   const cobro = await cobrar(body);
   assert.equal(cobro.total, 10000);
-  assert.match(cobro.mensaje, new RegExp("Cobro de 2 artículos registrado · Comprobante N° " + cobro.comprobante));
+  assert.deepEqual([cobro.comprobante.tipo, cobro.comprobante.numero, cobro.comprobante.codigo], ["RECIBO", 1, "R-00000001"]);
+  assert.match(cobro.mensaje, /^Cobro de 2 artículos registrado · Recibo R-00000001$/);
   const movs = await pagos();
   assert.deepEqual(movs.map(m => [m.adicional_id, Number(m.importe), m.medio, m.comprobante]),
-    [[1, 6000, "EFECTIVO", cobro.comprobante], [2, 4000, "EFECTIVO", cobro.comprobante]]);
-  assert.equal(movs[0].id, cobro.comprobante, "el número es el id del primer pago del cobro");
-  assert.deepEqual((await enCaja()).map(c => [c.tipo, Number(c.importe)]), [["INGRESO", 10000]]);
+    [[1, 6000, "EFECTIVO", cobro.comprobante.id], [2, 4000, "EFECTIVO", cobro.comprobante.id]]);
+  assert.deepEqual((await enCaja()).map(c => [c.tipo, Number(c.importe), c.recibo]), [["INGRESO", 10000, "R-00000001"]]);
   const d = cobro.datos;
-  assert.deepEqual(d.items.map(i => [i.nombre, i.modalidad, i.cantidad, i.importe, i.anulado]),
-    [["Sombrilla", "ALQUILER", 2, 6000, false], ["Carbón", "VENTA", 3, 4000, false]]);
-  assert.deepEqual([d.numero, d.estado, d.medio, d.empleado, d.observacion, d.total, d.vigente], [cobro.comprobante, "VIGENTE", "EFECTIVO", "Recepción", "Paga en recepción", 10000, 10000]);
-  assert.deepEqual([d.reserva.id, d.reserva.titular_nombre, d.reserva.titular_dni], [410, "Demo, Ana", "99800100"]);
-  assert.equal(d.empresa.razon_social, "Asociación Judicial Bonaerense");
+  assert.deepEqual(d.renglones.map(i => [i.texto, i.rubro, i.articulo.modalidad, i.articulo.cantidad, i.importe]),
+    [["Sombrilla", "ARTICULO", "ALQUILER", 2, 6000], ["Carbón", "ARTICULO", "VENTA", 3, 4000]]);
+  assert.deepEqual([d.codigo, d.estado, d.medio, d.usuario_nombre, d.observacion, d.total], ["R-00000001", "EMITIDO", "EFECTIVO", "Recepción", "Paga en recepción", 10000]);
+  assert.deepEqual([d.estadia.reserva_id, d.cliente.nombre, d.cliente.dni, d.cliente.condicion_iva], [410, "Demo, Ana", "99800100", "Consumidor final"]);
+  assert.deepEqual([d.emisor.razon_social, d.emisor.cuit], ["Asociación Judicial Bonaerense", "30-57416579-9"]);
+  assert.deepEqual(d.saldo, { reserva: 5000, consumos: 0, total: 5000 });
 
-  // Reintento con la misma operación: misma respuesta, sin duplicar pagos ni efectivo.
+  // Reintento con la misma operación: misma respuesta, sin duplicar pagos, efectivo ni recibo.
   assert.deepEqual(await cobrar(body), cobro);
   assert.equal((await pagos()).length, 2);
   assert.equal((await enCaja()).length, 1);
@@ -157,38 +159,35 @@ test("cobro de varios artículos con un solo comprobante, reintento idempotente 
   const porId = id => detalle.adicionales.find(a => a.adicional_id === id);
   assert.deepEqual([porId(1).adeudado, porId(2).pagado, porId(2).adeudado], [0, 4000, 5000]);
   assert.equal(detalle.cuenta.pendiente, 5000);
+  assert.deepEqual(detalle.comprobantes.map(c => [c.codigo, c.total, c.estado]), [["R-00000001", 10000, "EMITIDO"]]);
 
-  // «Registrar pago» de un solo artículo usa el mismo cobro: comprobante propio y la transferencia no pasa por la caja.
+  // «Registrar pago» de un solo artículo: recibo propio y la transferencia no pasa por la caja.
   const segundo = await cobrar({ operacion: U.uuid(), medio: "TRANSFERENCIA", items: [{ adicional_id: 2, importe: 5000 }] });
-  assert.ok(segundo.comprobante > cobro.comprobante);
-  assert.match(segundo.mensaje, /^Pago de Carbón registrado · Comprobante N° /);
+  assert.equal(segundo.comprobante.codigo, "R-00000002");
+  assert.match(segundo.mensaje, /^Pago de Carbón registrado · Recibo R-00000002$/);
   assert.equal((await enCaja()).length, 1);
   detalle = await call("GET", "/recepcion/detalle", {}, { id: r.id });
   assert.equal(detalle.cuenta.pendiente, 0);
 
-  // Reimpresión: mismos datos; al anular un pago, el comprobante lo detalla.
-  const reimpreso = await ver(cobro.comprobante);
-  assert.deepEqual(reimpreso, d);
-  await call("POST", "/recepcion/410/adicional", { operacion: U.uuid(), accion: "ANULAR_PAGO", adicional_id: 1, movimiento_id: movs[0].id, caja_id: caja.id, detalle: "Se cobró de más" });
-  let anulado = await ver(cobro.comprobante);
-  assert.deepEqual([anulado.estado, anulado.total, anulado.anulado, anulado.vigente], ["ANULADO_PARCIAL", 10000, 6000, 4000]);
-  const sombrilla = anulado.items.find(i => i.adicional_id === 1);
-  assert.deepEqual([sombrilla.anulado, sombrilla.anulacion.motivo, sombrilla.anulacion.usuario_nombre], [true, "Se cobró de más", "Recepción"]);
-  assert.equal(anulado.items.find(i => i.adicional_id === 2).anulado, false);
-  await call("POST", "/recepcion/410/adicional", { operacion: U.uuid(), accion: "ANULAR_PAGO", adicional_id: 2, movimiento_id: movs[1].id, caja_id: caja.id });
-  anulado = await ver(cobro.comprobante);
-  assert.deepEqual([anulado.estado, anulado.vigente], ["ANULADO", 0]);
-  assert.equal(anulado.items.find(i => i.adicional_id === 2).anulacion.motivo, null);
-  assert.equal((await ver(segundo.comprobante)).estado, "VIGENTE");
-  assert.deepEqual((await enCaja()).map(c => [c.tipo, Number(c.importe)]), [["INGRESO", 10000], ["EGRESO", 6000], ["EGRESO", 4000]]);
+  // La reimpresión trae los mismos datos. Anular el pago de un artículo con recibo emite una nota de crédito sobre ese recibo.
+  const reimpreso = await ver(cobro.comprobante.id);
+  assert.deepEqual([reimpreso.codigo, reimpreso.total, reimpreso.disponible, reimpreso.renglones.length], ["R-00000001", 10000, 10000, 2]);
+  const anula = await call("POST", "/recepcion/410/adicional", { operacion: U.uuid(), accion: "ANULAR_PAGO", adicional_id: 1, movimiento_id: movs[0].id, caja_id: caja.id, detalle: "Se cobró de más" });
+  assert.match(anula.mensaje, /^Pago de Sombrilla anulado · Nota de crédito NC-00000001$/);
+  let recibo = await ver(cobro.comprobante.id);
+  assert.deepEqual([recibo.estado, recibo.devuelto, recibo.disponible], ["EMITIDO", 6000, 4000]);
+  assert.deepEqual(recibo.notas_credito.map(n => [n.codigo, n.total, n.motivo]), [["NC-00000001", 6000, "Se cobró de más"]]);
+  const nc = await ver(anula.comprobante.id);
+  assert.deepEqual([nc.tipo, nc.origen.codigo, nc.renglones[0].texto, nc.renglones[0].origen_mov_id, nc.total, nc.medio],
+    ["NOTA_CREDITO", "R-00000001", "Devolución · Sombrilla", movs[0].id, 6000, "EFECTIVO"]);
+  await assert.rejects(call("POST", "/recepcion/410/adicional", { operacion: U.uuid(), accion: "ANULAR_PAGO", adicional_id: 1, movimiento_id: movs[0].id, caja_id: caja.id }), /ya fue anulado/);
+  assert.deepEqual((await enCaja()).map(c => [c.tipo, Number(c.importe), c.concepto, c.recibo]),
+    [["INGRESO", 10000, "ADICIONAL_ESTADIA", "R-00000001"], ["EGRESO", 6000, "NOTA_CREDITO", "NC-00000001"]]);
+  detalle = await call("GET", "/recepcion/detalle", {}, { id: r.id });
+  assert.deepEqual([porId(1).pagado, porId(1).adeudado], [0, 6000]);
 
-  // Un número que no es un pago de artículo de la reserva no se imprime.
-  await assert.rejects(ver(1), /No encontramos ese comprobante/);
-  await assert.rejects(ver(99999), /No encontramos ese comprobante/);
-  // Un pago individual anterior a los comprobantes (sin número) se reimprime con su propio id.
-  await call("POST", "/recepcion/410/adicional", { operacion: U.uuid(), accion: "PAGAR", adicional_id: 1, medio: "TRANSFERENCIA", importe: 1000 });
-  const viejo = (await pagos()).pop();
-  assert.equal(viejo.comprobante, null);
-  const legado = await ver(viejo.id);
-  assert.deepEqual([legado.numero, legado.total, legado.items.length, legado.items[0].nombre], [viejo.id, 1000, 1, "Sombrilla"]);
+  // Un pago anterior a los comprobantes (sin recibo) se sigue anulando como antes.
+  await db.run("INSERT INTO predio_estadia_mov (predio_id,id,reserva_id,fecha,concepto,medio,importe,adicional_id) VALUES (1,900,?,?,'PAGO_ADICIONAL','TRANSFERENCIA',1000,1)", [r.id, U.fechaHora()]);
+  const legado = await call("POST", "/recepcion/410/adicional", { operacion: U.uuid(), accion: "ANULAR_PAGO", adicional_id: 1, movimiento_id: 900 });
+  assert.deepEqual([legado.mensaje, legado.comprobante], ["Pago de Sombrilla anulado", null]);
 });

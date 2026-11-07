@@ -72,6 +72,7 @@ const CONCEPTOS_CAJA = [
   { valor: "DIFERENCIA_RESERVA", texto: "Diferencia de alojamiento" },
   { valor: "LIQUIDACION_SALIDA", texto: "Liquidación al registrar salida" },
   { valor: "ADICIONAL_ESTADIA", texto: "Pago de alquileres y adicionales de estadía" },
+  { valor: "NOTA_CREDITO", texto: "Devolución con nota de crédito" },
   { valor: "OTROS", texto: "Otros" },
 ];
 const FORMAS_LIQUIDACION = [
@@ -666,6 +667,77 @@ L.ventas = {
   },
 };
 
+// Recibos y notas de crédito de la recepción (lib/comprobantes.js). El importe de una nota de crédito
+// va en negativo para que el total del filtro sea lo cobrado neto.
+const TIPOS_COMPROBANTE = [{ valor: "RECIBO", texto: "Recibo" }, { valor: "NOTA_CREDITO", texto: "Nota de crédito" }];
+const ESTADOS_COMPROBANTE = [{ valor: "EMITIDO", texto: "Vigente" }, { valor: "ANULADO", texto: "Anulado" }];
+const OPERACIONES_COMPROBANTE = [
+  { valor: "DIFERENCIA_RESERVA", texto: "Diferencia de la reserva" },
+  { valor: "ARTICULOS", texto: "Alquileres y compras" },
+  { valor: "SALDO", texto: "Saldo para consumos" },
+  { valor: "LIQUIDACION", texto: "Liquidación de consumos" },
+  { valor: "SALIDA", texto: "Cuenta al salir" },
+  { valor: "NOTA_CREDITO", texto: "Corrección de un recibo" },
+  { valor: "ANULACION", texto: "Anulación de un recibo" },
+];
+const MEDIOS_COMPROBANTE = [{ valor: "EFECTIVO", texto: "Efectivo" }, { valor: "TRANSFERENCIA", texto: "Transferencia" }];
+
+L.comprobantes = {
+  roles: ["ADMIN"],
+  titulo: "Comprobantes",
+  from: `predio_comprobante c
+    LEFT JOIN predio_comprobante o ON o.predio_id = c.predio_id AND o.id = c.origen_id`,
+  where: "c.predio_id = :pid",
+  // «R-00000025», «nc 3» o «T-114» buscan ese comprobante o esa reserva.
+  busquedaExacta: (q) => {
+    const c = /^(R|NC)[\s-]*0*(\d{1,9})$/i.exec(q);
+    if (c) return { sql: "c.tipo = ? AND c.numero = ?", params: [c[1].toUpperCase() === "R" ? "RECIBO" : "NOTA_CREDITO", Number(c[2])] };
+    const t = /^T[\s-]*0*(\d{1,9})$/i.exec(q);
+    return t ? { sql: "c.reserva_id = ?", params: [Number(t[1])] } : null;
+  },
+  columnas: [
+    { clave: "numero", titulo: "Número", expr: "c.numero", tipo: "int", buscar: true },
+    { clave: "tipo", titulo: "Tipo", expr: "c.tipo", tipo: "opcion", opciones: TIPOS_COMPROBANTE },
+    { clave: "fecha", titulo: "Fecha", expr: "c.fecha", tipo: "dt" },
+    { clave: "reserva_id", titulo: "Reserva", expr: "c.reserva_id", tipo: "int", buscar: true },
+    { clave: "titular", titulo: "Titular", expr: "c.titular", buscar: true },
+    { clave: "dni", titulo: "DNI", expr: "c.dni", buscar: true, oculta: true },
+    { clave: "operacion", titulo: "Concepto", expr: "c.operacion", tipo: "opcion", opciones: OPERACIONES_COMPROBANTE },
+    { clave: "medio", titulo: "Medio", expr: "c.medio", tipo: "opcion", opciones: MEDIOS_COMPROBANTE },
+    { clave: "importe", titulo: "Importe", expr: "CASE WHEN c.tipo = 'NOTA_CREDITO' THEN -c.total ELSE c.total END", tipo: "money", signo: true },
+    { clave: "estado", titulo: "Estado", expr: "c.estado", tipo: "opcion", opciones: ESTADOS_COMPROBANTE },
+    { clave: "origen_numero", titulo: "Corrige al recibo", expr: "o.numero", tipo: "int", oculta: true },
+    { clave: "usuario_nombre", titulo: "Emitió", expr: "c.usuario_nombre", buscar: true },
+    { clave: "motivo", titulo: "Motivo", expr: "COALESCE(c.anulado_motivo, c.motivo)", buscar: true, oculta: true },
+    { clave: "id", titulo: "ID", expr: "c.id", tipo: "int", oculta: true },
+  ],
+  filtros: [
+    { clave: "tipo", titulo: "Tipo", tipo: "opciones", expr: "c.tipo", opciones: TIPOS_COMPROBANTE },
+    { clave: "estado", titulo: "Estado", tipo: "opciones", expr: "c.estado", opciones: ESTADOS_COMPROBANTE },
+    { clave: "operacion", titulo: "Concepto", tipo: "opciones", expr: "c.operacion", opciones: OPERACIONES_COMPROBANTE },
+    { clave: "medio", titulo: "Medio", tipo: "opciones", expr: "c.medio", opciones: MEDIOS_COMPROBANTE },
+    { clave: "reserva", titulo: "Reserva", tipo: "id", expr: "c.reserva_id", oculto: true },
+    { clave: "desde", titulo: "Desde", tipo: "desde", expr: "c.fecha" },
+    { clave: "hasta", titulo: "Hasta", tipo: "hasta", expr: "c.fecha" },
+  ],
+  orden: { clave: "fecha", dir: "desc" },
+  // Neto: todo lo cobrado menos lo devuelto con notas de crédito vigentes (una anulada se reintegró).
+  totales: [{ clave: "importe", expr: "SUM(CASE WHEN c.tipo = 'RECIBO' THEN c.total WHEN c.estado = 'EMITIDO' THEN -c.total ELSE 0 END)" }],
+  resumen: {
+    grupos: [
+      { clave: "tipo", titulo: "Tipo", expr: "c.tipo", opciones: TIPOS_COMPROBANTE },
+      { clave: "medio", titulo: "Medio", expr: "c.medio", opciones: MEDIOS_COMPROBANTE },
+      { clave: "dia", titulo: "Día", expr: "SUBSTR(c.fecha, 1, 10)" },
+      { clave: "usuario", titulo: "Emitió", expr: "c.usuario_nombre" },
+    ],
+    medidas: [
+      { titulo: "Comprobantes", expr: "COUNT(*)", tipo: "int" },
+      { titulo: "Cobrado", expr: "SUM(CASE WHEN c.tipo = 'RECIBO' THEN c.total ELSE 0 END)", tipo: "money" },
+      { titulo: "Devuelto", expr: "SUM(CASE WHEN c.tipo = 'NOTA_CREDITO' AND c.estado = 'EMITIDO' THEN c.total ELSE 0 END)", tipo: "money" },
+    ],
+  },
+};
+
 L.ventas_productos = {
   roles: ["ADMIN"],
   titulo: "Ventas por producto",
@@ -1197,7 +1269,12 @@ function construirWhere(def, ctx, query, db) {
   }
 
   const q = String(query.q || "").trim().slice(0, 80);
-  if (q) {
+  // Un código exacto (p. ej. «R-00000025» en comprobantes) reemplaza la búsqueda por palabras.
+  const exacta = q && def.busquedaExacta ? def.busquedaExacta(q) : null;
+  if (exacta) {
+    partes.push(exacta.sql);
+    valores.push(...exacta.params);
+  } else if (q) {
     const buscables = def.columnas.filter((c) => c.buscar);
     if (buscables.length) {
       const palabras = q.split(/\s+/).slice(0, 5);

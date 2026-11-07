@@ -142,7 +142,8 @@
     CIERRE_SALIDA: "Cierre de cuenta por salida",
     PAGO_SALIDA_CONSUMOS: "Consumos liquidados al salir",
     TRASPASO_ALOJAMIENTO: "Traslado de deuda de alojamiento",
-    TRASPASO_CONSUMOS: "Traslado de deuda de consumos"
+    TRASPASO_CONSUMOS: "Traslado de deuda de consumos",
+    NC_CONSUMOS: "Devolución sobre consumos"
   };
 
   // Liquidación: lo que se usó, lo que se pagó y lo que queda por cobrar o devolver.
@@ -176,7 +177,7 @@
     fila("Total de la estadía", null, total, ".rec-liq-subtotal");
     if (Math.abs(turismo) >= 0.01) fila(turismo > 0 ? "Importe de la reserva en Turismo" : "Ajuste de la reserva", "Se paga y se verifica en Mi AJB", -turismo);
     pagos.slice().reverse().forEach(function (m) {
-      fila((Number(m.importe) < 0 ? "Anulación · " : "") + (m.concepto === "PAGO_ADICIONAL" ? "Pago de artículo" : "Pago en el predio"),
+      fila((Number(m.importe) < 0 ? "Devolución · " : "") + (m.concepto === "PAGO_ADICIONAL" ? "Pago de artículo" : "Pago en el predio"),
         [P.f.fechaHora(m.fecha), MEDIOS[m.medio] || m.medio, m.detalle].filter(Boolean).join(" · "), -Number(m.importe));
     });
     fila(pendiente < 0 ? "Reserva: a devolver" : "Reserva: por cobrar", null, Math.abs(pendiente), ".rec-liq-subtotal");
@@ -828,7 +829,7 @@
           var ingresoNuevo = b.personas.some(function (p) {
             return p.entrada && !(r.personas || []).some(function (a) { return String(a.dni) === String(p.dni) && a.entrada; });
           });
-          P.ruta.ir("/recepcion/" + res.id + (checkout ? "?salida=1" : ingresoNuevo ? "?ingreso=1" : ""));
+          P.ruta.ir("/recepcion/" + res.id + (checkout ? "?salida=1" + (res.comprobante ? "&comprobante=" + res.comprobante.id : "") : ingresoNuevo ? "?ingreso=1" : ""));
         });
       }, "primario", { icono: "check" });
       var saldo = Object.assign({}, cuenta || {}, x.cuenta || {});
@@ -1099,7 +1100,8 @@
         }).then(function (x) {
           m.cerrar();
           if (!x.encolado) {
-            P.aviso(x.mensaje + (x.liquidacion_id ? " · Planilla N° " + x.liquidacion_id : ""), "ok");
+            if (x.comprobante) P.contable.emitido(x);
+            else P.aviso(x.mensaje + (x.liquidacion_id ? " · Planilla N° " + x.liquidacion_id : ""), "ok");
             return refrescar();
           }
         });
@@ -1220,6 +1222,7 @@
     var id = param[0];
     var recienSalida = P.ruta.query().salida === "1";
     var recienIngreso = P.ruta.query().ingreso === "1";
+    var comprobanteSalida = recienSalida ? Number(P.ruta.query().comprobante) || null : null;
     function cargar() {
       return get("detalle", { id: id }).then(function (d) {
         if (!c.isConnected) return;
@@ -1243,7 +1246,7 @@
         var salidaReal = salieron ? r.personas.map(function (p) { return p.salida || ""; }).sort().pop() : null;
         var datosLiq = { total: r.precio_total, adicionales: lineas, cuenta: a, manual: r.manual,
           detalleAlojamiento: [nombresRecursos(r) || r.servicio, fecha(r.fecha_inicio) + " al " + fecha(salidaReal || r.fecha_fin), (r.cantidad || r.personas.length) + " personas"].join(" · ") };
-        var imprimir = P.btn("Imprimir comprobante", { tipo: salieron ? "primario" : "secundario", icono: "imprimir", onclick: function (e) {
+        var imprimir = P.btn("Imprimir liquidación", { tipo: salieron ? "primario" : "secundario", icono: "imprimir", onclick: function (e) {
           P.ejecutar(e.currentTarget, function () { return P.imprimirComprobanteEstadia(Object.assign({ reserva: r, empresa: d.empresa, predio: (P.estado.sesion.predio || {}).nombre }, datosLiq)); }).catch(function () {});
         } });
         var acciones = [
@@ -1262,7 +1265,9 @@
           }),
           recienIngreso && !salieron ? P.mensaje(h("div.fila-separada", h("span", "Ingreso registrado. Imprimí el QR de la reserva para el parabrisas o la carpa: Seguridad lo escanea para ver vehículos, personas y deuda."),
             btn("Imprimir QR", function () { return P.elegirEtiquetasQR(r); }, "primario", { chico: true, icono: "qr" })), "ok") : null,
-          recienSalida ? P.mensaje(liq.total ? "Salida registrada. Revisá la liquidación, cobrá o devolvé lo pendiente e imprimí el comprobante." : "Salida registrada. La cuenta está saldada: podés imprimir el comprobante.", "ok") : null,
+          recienSalida ? P.mensaje(h("div.fila-separada", h("span", comprobanteSalida ? "Salida registrada. El cobro de la salida quedó en su comprobante: imprimilo para el titular." :
+            liq.total ? "Salida registrada. Revisá la liquidación, cobrá o devolvé lo pendiente e imprimí la liquidación." : "Salida registrada. La cuenta está saldada: podés imprimir la liquidación."),
+            comprobanteSalida ? btn("Imprimir comprobante", function () { return P.contable.imprimir(comprobanteSalida, false); }, "primario", { chico: true, icono: "imprimir" }) : null), "ok") : null,
           vencida(r) ? P.mensaje("Quedan huéspedes con su fecha prevista vencida y sin salida registrada.", "aviso") : null,
           vencidos.length ? P.mensaje("Artículos sin devolver: " + vencidos.map(function (l) { return l.nombre + atraso(l); }).join(", ") + ". Registralo desde el menú de cada artículo.", "aviso") : null,
           grupo("Estadía", null, h("div.columna",
@@ -1288,6 +1293,7 @@
                     return P.get("/recepcion/" + id + "/planilla/" + m.liquidacion_id).then(P.imprimirLiquidacion);
                   }, "texto", { chico: true, icono: "imprimir" }) : null)];
               }))) : null), "#rec-cuenta"),
+          (d.comprobantes || []).length ? grupo("Comprobantes", "Recibos de lo cobrado y notas de crédito de lo devuelto. No son facturas.", P.contable.listaReserva(d.comprobantes)) : null,
           h("details.hoja.rec-seccion.rec-historial", h("summary", h("h2", "Historial de recepción"), h("span.texto-3.chico", eventos.length ? eventos.length + (eventos.length === 1 ? " cambio" : " cambios") : "Sin cambios desde el predio")),
             eventos.length ? h("div.columna", h("p.texto-3.chico", "Cada operación conserva el empleado, la fecha y los valores anteriores y nuevos."), eventos) : null));
         if (recienSalida) {

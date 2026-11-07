@@ -391,9 +391,23 @@ const TABLAS = {
   },
   predio_estadia_mov: {
     columnas: { reserva_id: "int!", huesped_id: "int", venta_id: "int", liquidacion_id: "int", fecha: "dt!", concepto: "str:40!", medio: "str:20", importe: "money!", detalle: "str:255", usuario_id: "int", usuario_nombre: "str:120",
-      // comprobante: número del cobro de artículos (id del primer PAGO_ADICIONAL del cobro); ver recepcion-articulos.js.
+      // comprobante: id del recibo o nota de crédito (predio_comprobante) que documenta el movimiento.
       adicional_id: "int", anula_mov_id: "int", comprobante: "int" },
     indices: [["reserva_id", "id"], ["venta_id"]],
+  },
+  // Comprobantes de la recepción (no fiscales): RECIBO por cada cobro y NOTA_CREDITO por cada devolución.
+  // `numero` es correlativo por tipo; `datos` es la instantánea JSON (titular, estadía, renglones, emisor y saldo).
+  // Una nota de crédito que corrige un recibo lo indica en `origen_id`; anular un recibo emite la nota de crédito
+  // por lo que quedaba vigente y la guarda en `anulado_nc_id`. Ver lib/comprobantes.js y lib/api/contable.js.
+  predio_comprobante: {
+    columnas: {
+      tipo: "str:12!", numero: "int!", fecha: "dt!", reserva_id: "int", origen_id: "int", operacion: "str:30",
+      medio: "str:20", total: "money!", titular: "str:160", dni: "str:12", estado: "str:12!", motivo: "str:255",
+      datos: "text!", usuario_id: "int", usuario_nombre: "str:120",
+      anulado_fecha: "dt", anulado_por: "str:120", anulado_motivo: "str:255", anulado_nc_id: "int",
+    },
+    unicos: [["tipo", "numero"]],
+    indices: [["reserva_id"], ["origen_id"], ["fecha"]],
   },
   // Devolución de un artículo alquilado (un renglón por reserva y adicional; deshacer la marca la anula).
   predio_adicional_devolucion: {

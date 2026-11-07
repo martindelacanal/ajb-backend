@@ -119,7 +119,7 @@
         h("div.cab",
           h("div", h("h1", e.razon_social || "Asociación Judicial Bonaerense"), h("div.gris", e.nombre_predio || datos.predio || ""), e.direccion ? h("div.gris", e.direccion) : null,
             e.cuit ? h("div.gris", "CUIT " + e.cuit) : null),
-          h("div.der", h("h1", "Comprobante de estadía"), h("div", h("strong", "Reserva T-" + r.id)), h("div.gris", "Emitido el " + emitido),
+          h("div.der", h("h1", "Liquidación de la estadía"), h("div", h("strong", "Reserva T-" + r.id)), h("div.gris", "Emitido el " + emitido),
             h("div.no-fiscal", "Documento no válido como factura"), h("div.tipo-copia", tipo))),
         h("h2", "Titular y estadía"),
         h("div.datos",
@@ -135,70 +135,134 @@
         sinDevolver.length ? h("div.pendiente", h("strong", "Artículos sin devolver: "), sinDevolver.map(function (l) { return l.nombre + " (" + l.cantidad + ")"; }).join(", ")) : null,
         h("div.firmas", h("div", "Firma del huésped"), h("div", "Aclaración"), h("div", "Firma y sello del predio")),
         h("div.pie", (tipo === "ORIGINAL" ? "Original para el huésped. " : "Duplicado para el predio. ") +
-          "Comprobante interno de la estadía; los importes de la reserva original se verifican en Mi AJB."));
+          "Liquidación interna de la estadía; cada pago tiene su recibo numerado. Los importes de la reserva original se verifican en Mi AJB."));
     }
-    return imprimirHtml(h("div", copia("ORIGINAL"), copia("DUPLICADO")), ESTILO_COMPROBANTE, "Comprobante T-" + r.id);
+    return imprimirHtml(h("div", copia("ORIGINAL"), copia("DUPLICADO")), ESTILO_COMPROBANTE, "Liquidacion T-" + r.id);
   };
 
-  // Comprobante de un cobro de artículos alquilados o comprados (no fiscal), con original y duplicado.
-  // Si después se anuló algún pago, sale marcado ANULADO (o ANULADO EN PARTE) con la anulación detallada.
-  // datos: respuesta de GET /recepcion/:id/articulos/comprobante/:numero (o `datos` del cobro recién hecho).
-  // opciones: { reimpresion: true } agrega la fecha y hora de la reimpresión.
-  var ESTILO_ARTICULOS = ESTILO_COMPROBANTE +
-    ".sello-anulado { display: inline-block; margin: 6px 0 0 6px; padding: 3px 10px; border: 2px solid #b3261e; border-radius: 6px; font-weight: 800; letter-spacing: .1em; color: #b3261e; }" +
-    ".item-tipo { display: block; font-size: 11px; color: #5d7690; } tr.anulado td { color: #7b8ea3; } tr.anulado td.tachado { text-decoration: line-through; }" +
-    "tr.nota-anulacion td { padding-top: 0; font-size: 11px; color: #b3261e; } .observacion { margin-top: 12px; }";
-  P.imprimirComprobanteArticulos = function (datos, opciones) {
+  // ------------------------------------------------------------------ recibos y notas de crédito
+
+  // Importe en letras para el «Son pesos…» del comprobante (hasta 99.999.999,99).
+  var UNIDADES = ["cero", "uno", "dos", "tres", "cuatro", "cinco", "seis", "siete", "ocho", "nueve", "diez", "once", "doce", "trece", "catorce",
+    "quince", "dieciséis", "diecisiete", "dieciocho", "diecinueve", "veinte", "veintiuno", "veintidós", "veintitrés", "veinticuatro",
+    "veinticinco", "veintiséis", "veintisiete", "veintiocho", "veintinueve"];
+  var DECENAS = ["", "", "", "treinta", "cuarenta", "cincuenta", "sesenta", "setenta", "ochenta", "noventa"];
+  var CENTENAS = ["", "ciento", "doscientos", "trescientos", "cuatrocientos", "quinientos", "seiscientos", "setecientos", "ochocientos", "novecientos"];
+  function menorMil(n, apocope) {
+    if (!n) return "";
+    if (n === 100) return "cien";
+    var c = Math.floor(n / 100), r = n % 100, partes = [];
+    if (c) partes.push(CENTENAS[c]);
+    if (r) {
+      var t = r < 30 ? UNIDADES[r] : DECENAS[Math.floor(r / 10)] + (r % 10 ? " y " + UNIDADES[r % 10] : "");
+      // «veintiún mil», «treinta y un mil»: delante de «mil» y «millones» va la forma corta.
+      if (apocope) t = t.replace(/veintiuno$/, "veintiún").replace(/uno$/, "un");
+      partes.push(t);
+    }
+    return partes.join(" ");
+  }
+  function enLetras(importe) {
+    var centavos = Math.round(Math.abs(Number(importe) || 0) * 100);
+    var n = Math.floor(centavos / 100), resto = centavos % 100;
+    var millones = Math.floor(n / 1000000), miles = Math.floor((n % 1000000) / 1000), unidades = n % 1000, partes = [];
+    if (millones) partes.push(millones === 1 ? "un millón" : menorMil(millones, true) + " millones");
+    if (miles) partes.push(miles === 1 ? "mil" : menorMil(miles, true) + " mil");
+    if (unidades) partes.push(menorMil(unidades, false));
+    return (partes.length ? partes.join(" ") : "cero") + " con " + ("0" + resto).slice(-2) + "/100";
+  }
+  P.enLetras = enLetras;
+
+  // Original y duplicado entran en una A4 con línea de corte (como el talonario); si hay muchos renglones, el duplicado pasa a otra hoja.
+  var ESTILO_RECIBO = "@page { size: A4; margin: 8mm 10mm; } * { box-sizing: border-box; } body { margin: 0; font-family: 'Segoe UI', Arial, sans-serif; font-size: 10px; color: #12344d; }" +
+    ".copia { position: relative; border: 1.3px solid #0d5482; border-radius: 9px; padding: 7px 10px 6px; break-inside: avoid; page-break-inside: avoid; overflow: hidden; }" +
+    ".corte { margin: 4mm 0; border-top: 1px dashed #7b8ea3; text-align: center; line-height: 0; } .corte span { background: #fff; padding: 0 8px; font-size: 8px; color: #7b8ea3; letter-spacing: .08em; }" +
+    ".cab { display: grid; grid-template-columns: 1.35fr 1fr; gap: 10px; align-items: stretch; }" +
+    ".emisor h1 { margin: 0; font-size: 13px; letter-spacing: .03em; text-transform: uppercase; color: #0d5482; } .emisor div { line-height: 1.3; color: #36556f; }" +
+    ".emisor .predio { margin-top: 3px; font-size: 11.5px; font-weight: 800; color: #12344d; } .emisor .iva { margin-top: 2px; font-weight: 700; text-transform: uppercase; font-size: 8.5px; letter-spacing: .05em; }" +
+    ".doc { border: 1.3px solid #0d5482; border-radius: 7px; padding: 5px 9px; line-height: 1.3; } .doc .tipo { font-size: 14px; font-weight: 800; letter-spacing: .08em; color: #0d5482; }" +
+    ".doc .numero { font-size: 14.5px; font-weight: 800; font-variant-numeric: tabular-nums; letter-spacing: .02em; } .doc .no-fiscal { font-size: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: #5d7690; }" +
+    ".copia-tipo { display: inline-block; margin-top: 3px; padding: 0 8px; border: 1.3px solid #0d5482; border-radius: 5px; font-size: 8.5px; font-weight: 800; letter-spacing: .1em; color: #0d5482; }" +
+    ".cliente { margin-top: 6px; display: grid; grid-template-columns: 1.7fr 1fr 1fr 1.2fr; gap: 2px 10px; padding: 5px 9px; border: 1px solid #bcd9ec; border-radius: 7px; }" +
+    ".cliente span { display: block; font-size: 8px; text-transform: uppercase; letter-spacing: .05em; color: #5d7690; } .cliente strong { font-size: 10.5px; }" +
+    ".estadia, .corrige, .observacion { margin-top: 4px; line-height: 1.35; } .estadia b, .corrige b, .observacion b { color: #36556f; }" +
+    ".corrige { padding: 3px 8px; border-left: 3px solid #0d5482; background: #f3f8fc; }" +
+    "table { width: 100%; border-collapse: collapse; margin-top: 5px; } th { text-align: left; font-size: 8px; text-transform: uppercase; letter-spacing: .05em; color: #36556f; border-bottom: 1.3px solid #0d5482; padding: 2px 6px; }" +
+    "td { padding: 3px 6px; border-bottom: 1px solid #e6f1f9; vertical-align: top; } .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; } td small { display: block; color: #5d7690; font-size: 8.5px; }" +
+    "tfoot td { border-bottom: 0; border-top: 1.6px solid #0d5482; font-size: 12.5px; font-weight: 800; color: #0d5482; padding-top: 4px; }" +
+    ".letras { margin-top: 3px; font-style: italic; } .saldo { margin-top: 2px; color: #36556f; }" +
+    ".firmas { display: grid; grid-template-columns: 1fr 1fr; gap: 34px; margin-top: 22px; } .firmas div { border-top: 1px solid #12344d; padding-top: 2px; text-align: center; font-size: 8.5px; color: #36556f; }" +
+    ".pie { margin-top: 5px; display: flex; justify-content: space-between; gap: 12px; font-size: 8px; color: #5d7690; } .pie .leyenda { font-weight: 700; }" +
+    ".sello { position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%) rotate(-14deg); padding: 2px 20px; border: 4px solid rgba(179, 38, 30, .28); border-radius: 12px;" +
+    " font-size: 44px; font-weight: 900; letter-spacing: .14em; color: rgba(179, 38, 30, .28); white-space: nowrap; }";
+
+  function dato(etiqueta, valor) { return h("div", h("span", etiqueta), h("strong", valor === null || valor === undefined || valor === "" ? "—" : valor)); }
+
+  /**
+   * Recibo o nota de crédito (no fiscal) con original para el titular y duplicado para el predio, uno debajo
+   * del otro con línea de corte (si no entran, el duplicado sale en otra hoja).
+   * c: GET /contable/comprobantes/:id o `datos` de la operación recién hecha. opciones: { reimpresion }
+   */
+  P.imprimirComprobante = function (c, opciones) {
     opciones = opciones || {};
-    var e = datos.empresa || {}, r = datos.reserva || {}, R = P.recepcion;
+    var e = c.emisor || {}, cl = c.cliente || {}, es = c.estadia || {}, nc = c.tipo === "NOTA_CREDITO";
     var ahora = P.f.fechaHora(new Date(Date.now() - 3 * 3600 * 1000).toISOString().replace("T", " "));
-    var medio = FORMAS[datos.medio] || datos.medio || "—";
-    var sello = datos.estado === "ANULADO" ? "ANULADO" : datos.estado === "ANULADO_PARCIAL" ? "ANULADO EN PARTE" : null;
-    var filas = [];
-    (datos.items || []).forEach(function (it) {
-      var conLinea = !!it.modalidad;
-      filas.push(h("tr" + (it.anulado ? ".anulado" : ""),
-        h("td.tachado", it.nombre, conLinea ? h("span.item-tipo", it.modalidad === "VENTA" ? "Compra" : "Alquiler") : null),
-        h("td", conLinea ? R.detalleArticulo(it) : "—"),
-        h("td", conLinea ? R.periodo(it) : "—"),
-        h("td.num.tachado", P.f.pesos(it.importe))));
-      if (it.anulado) {
-        var an = it.anulacion || {};
-        filas.push(h("tr.nota-anulacion", h("td", { colspan: "4" }, "Pago anulado" + (an.fecha ? " el " + P.f.fechaHora(an.fecha) : "") +
-          (an.usuario_nombre ? " por " + an.usuario_nombre : "") + (an.motivo ? ". Motivo: " + an.motivo : "") + ".")));
-      }
-    });
+    var medio = FORMAS[c.medio] || c.medio || "—";
+    var recurso = [es.recurso, es.numero_parcela ? (/parcela/i.test(es.recurso || "") ? "N° " : "Parcela ") + es.numero_parcela : null].filter(Boolean).join(" ");
+    var estadia = [es.servicio, recurso || null, es.ubicacion ? "Ubicación: " + es.ubicacion : null,
+      es.fecha_inicio ? "del " + P.f.fecha(es.fecha_inicio) + " al " + P.f.fecha(es.fecha_fin) : null,
+      es.personas ? es.personas + (es.personas === 1 ? " persona" : " personas") : null].filter(Boolean).join(" · ");
+    var vehiculos = (es.vehiculos || []).map(function (v) { return v.patente + (v.sector ? " (sector " + v.sector + ")" : ""); }).join(", ");
+    var saldo = c.saldo ? Number(c.saldo.total) : null;
+    var devoluciones = (c.notas_credito || []).filter(function (n) { return n.estado === "EMITIDO"; });
+    var sello = c.estado === "ANULADO" ? (nc ? "ANULADA" : "ANULADO") : null;
+    function renglon(l) {
+      var a = l.articulo;
+      var extra = a ? [a.modalidad === "VENTA" ? "Compra" : "Alquiler", P.recepcion ? P.recepcion.detalleArticulo(a) : null, a.fecha_desde && P.recepcion ? P.recepcion.periodo(a) : null].filter(Boolean).join(" · ") : l.detalle;
+      return h("tr", h("td", l.texto, extra ? h("small", extra) : null), h("td.num", P.f.pesos(l.importe)));
+    }
     function copia(tipo) {
       return h("div.copia",
+        sello ? h("div.sello", sello) : null,
         h("div.cab",
-          h("div", h("h1", e.razon_social || "Asociación Judicial Bonaerense"), h("div.gris", e.nombre_predio || datos.predio || ""), e.direccion ? h("div.gris", e.direccion) : null,
-            e.cuit ? h("div.gris", "CUIT " + e.cuit) : null),
-          h("div.der", h("h1", "Comprobante de pago"), h("div", h("strong", "N° " + datos.numero + " · Reserva T-" + r.id)),
-            h("div.gris", "Cobrado el " + P.f.fechaHora(datos.fecha)), opciones.reimpresion ? h("div.gris", "Reimpreso el " + ahora) : null,
-            h("div.no-fiscal", "Comprobante de pago — no válido como factura"),
-            h("div", h("span.tipo-copia", tipo), sello ? h("span.sello-anulado", sello) : null))),
-        h("h2", "Titular"),
-        h("div.datos",
-          h("div", h("span", "Titular"), h("strong", r.titular_nombre || "")),
-          h("div", h("span", "DNI"), h("strong", documento(r.titular_dni) || "—")),
-          h("div", h("span", "Reserva"), h("strong", "T-" + r.id)),
-          h("div", h("span", "Estadía"), h("strong", [r.servicio, r.recurso].filter(Boolean).join(" · ") || "—")),
-          h("div", h("span", "Medio de pago"), h("strong", medio)),
-          h("div", h("span", "Atendió"), h("strong", datos.empleado || "—"))),
-        h("h2", "Artículos pagados"),
-        h("table", h("thead", h("tr", h("th", "Artículo"), h("th", "Cantidad"), h("th", "Período"), h("th.num", "Importe"))),
-          h("tbody", filas.map(function (f) { return f.cloneNode(true); }))),
-        h("div.totales",
-          h("div" + (datos.anulado ? "" : ".final"), h("span", "Total cobrado"), h("span", P.f.pesos(datos.total))),
-          datos.anulado ? h("div", h("span", "Pagos anulados"), h("strong", "− " + P.f.pesos(datos.anulado))) : null,
-          datos.anulado ? h("div.final", h("span", "Total vigente"), h("span", P.f.pesos(datos.vigente))) : null,
-          h("div", h("span", "Medio de pago"), h("strong", medio))),
-        datos.observacion ? h("p.observacion", h("span.gris", "Observación: "), datos.observacion) : null,
-        h("div.firmas", h("div", "Firma del huésped"), h("div", "Aclaración"), h("div", "Firma y sello del predio")),
-        h("div.pie", (tipo === "ORIGINAL" ? "Original para el huésped. " : "Duplicado para el predio. ") +
-          "Comprobante interno del pago de artículos alquilados o comprados en el predio; no es una factura."));
+          h("div.emisor",
+            h("h1", e.razon_social || "Asociación Judicial Bonaerense"),
+            e.domicilio_legal ? h("div", e.domicilio_legal) : null,
+            e.telefono || e.correo ? h("div", [e.telefono ? "Tel. " + e.telefono : null, e.correo].filter(Boolean).join(" · ")) : null,
+            h("div.predio", e.nombre_predio || ""),
+            e.direccion ? h("div", e.direccion) : null,
+            e.condicion_iva ? h("div.iva", e.condicion_iva) : null),
+          h("div.doc",
+            h("div.tipo", nc ? "NOTA DE CRÉDITO" : "RECIBO"),
+            h("div.numero", "N° " + c.codigo),
+            h("div", "Fecha: " + P.f.fechaHora(c.fecha)),
+            e.cuit ? h("div", "CUIT: " + e.cuit) : null,
+            e.iibb ? h("div", "Ingresos Brutos (Conv. Multilateral): " + e.iibb) : null,
+            e.inicio_actividades ? h("div", "Inicio de actividades: " + e.inicio_actividades) : null,
+            h("div.no-fiscal", "Comprobante no válido como factura"),
+            h("div.copia-tipo", tipo))),
+        h("div.cliente",
+          dato("Señor/a", cl.nombre ? cl.nombre + (cl.afiliado ? " (afiliado)" : " (particular)") : null), dato("DNI", documento(cl.dni) || null), dato("Legajo", cl.legajo),
+          dato("Condición frente al IVA", cl.condicion_iva || "Consumidor final"),
+          dato("Domicilio", cl.domicilio), dato(cl.afiliado ? "Departamental" : "Localidad", cl.departamental),
+          dato(nc ? "Se devuelve en" : "Forma de pago", medio), dato("Reserva", es.reserva_id ? "T-" + es.reserva_id : null)),
+        estadia || vehiculos ? h("div.estadia", estadia ? [h("b", "Estadía: "), estadia] : null, vehiculos ? [estadia ? " · " : null, h("b", "Vehículos: "), vehiculos] : null) : null,
+        nc && (c.origen || c.motivo) ? h("div.corrige", c.origen ? [h("b", "Corrige al recibo "), c.origen.codigo + " del " + P.f.fecha(c.origen.fecha) + " por " + P.f.pesos(c.origen.total) + ". "] : null,
+          c.motivo ? [h("b", "Motivo: "), c.motivo] : null) : null,
+        h("table", h("thead", h("tr", h("th", nc ? "Concepto devuelto" : "Concepto"), h("th.num", "Importe"))),
+          h("tbody", (c.renglones || []).map(renglon)),
+          h("tfoot", h("tr", h("td", nc ? "Total devuelto" : "Total recibido"), h("td.num", P.f.pesos(c.total))))),
+        h("div.letras", (nc ? "Se devuelve la suma de pesos " : "Recibimos la suma de pesos ") + enLetras(c.total) + "."),
+        saldo == null ? null : h("div.saldo", "Saldo de la estadía después de este comprobante: " +
+          (Math.abs(saldo) < 0.005 ? "saldada." : saldo > 0 ? P.f.pesos(saldo) + " por cobrar." : P.f.pesos(-saldo) + " a favor del titular.")),
+        devoluciones.length ? h("div.saldo", "Devoluciones de este recibo: " + devoluciones.map(function (n) { return n.codigo + " por " + P.f.pesos(n.total); }).join(", ") + ".") : null,
+        c.observacion ? h("div.observacion", h("b", "Observación: "), c.observacion) : null,
+        h("div.firmas", nc ? [h("div", "Recibí conforme la devolución · Firma y aclaración del titular"), h("div", "Firma y sello por el predio")]
+          : [h("div", "Firma y aclaración de quien recibe por el predio"), h("div", "Sello del predio")]),
+        h("div.pie", h("span.leyenda", e.leyenda_comprobante || "Documento no válido como factura."),
+          h("span", (tipo === "ORIGINAL" ? "Original para el titular" : "Duplicado para el predio") + (c.usuario_nombre ? " · Emitió " + c.usuario_nombre : "") +
+            (opciones.reimpresion ? " · Reimpreso el " + ahora : ""))));
     }
-    return imprimirHtml(h("div", copia("ORIGINAL"), copia("DUPLICADO")), ESTILO_ARTICULOS, "Comprobante " + datos.numero + " T-" + r.id);
+    return imprimirHtml(h("div", copia("ORIGINAL"), h("div.corte", h("span", "✂ CORTAR AQUÍ")), copia("DUPLICADO")), ESTILO_RECIBO, c.nombre + " " + c.codigo);
   };
 
   P.imprimirCompra = function (datos) {

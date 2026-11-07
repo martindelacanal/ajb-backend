@@ -82,9 +82,10 @@ async function familia(c, q, pid, soloDni = false) {
 async function detalle(c, codigos, id, lock = false) {
   const r = await uno(c, `SELECT r.id,r.usuario_id,r.servicio_id,r.recurso_id,r.regimen_id,r.fecha_inicio,r.fecha_fin,r.precio_total,r.observaciones,r.numero_parcela,r.bloque_fecha_id,r.sorteo_id,r.estado_reserva_id,er.nombre AS estado,s.nombre AS servicio,rec.nombre AS recurso,
     u.documento AS titular_dni,CONCAT_WS(', ',u.apellido,u.nombre) AS titular_nombre,u.legajo AS titular_legajo,(u.rol_id=2 AND u.habilitado='Y') AS afiliado,
+    dep.nombre AS titular_departamental,u.direccion AS titular_direccion,
     (ts.codigo='CUPO_NUMERADO') AS es_parcela
     FROM reserva r JOIN servicio s ON s.id=r.servicio_id JOIN tipo_servicio ts ON ts.id=s.tipo_servicio_id
-    JOIN usuario u ON u.id=r.usuario_id LEFT JOIN recurso rec ON rec.id=r.recurso_id
+    JOIN usuario u ON u.id=r.usuario_id LEFT JOIN departamental dep ON dep.id=u.departamental_id LEFT JOIN recurso rec ON rec.id=r.recurso_id
     JOIN estado_reserva er ON er.id=r.estado_reserva_id WHERE r.id=? AND s.codigo IN (?)${lock ? " FOR UPDATE OF r" : ""}`, [id, codigos]);
   if (!r) throw U.error("No se encontró esa reserva entre los servicios asignados al predio.", 404);
   await cargarRecursos(c, [r], lock);

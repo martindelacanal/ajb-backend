@@ -79,7 +79,7 @@ test("Seguridad inicia sesión con alcance de predio y no puede ejecutar ni enco
     assert.equal(sesion.usuario.rol, "SEGURIDAD");
     assert.deepEqual(sesion.usuario.bocas, []);
     assert.equal(sesion.remoto, undefined);
-    for (const ruta of ["recepcion/detalle?id=42", "estado-remoto", "listados/ventas", "avisos"]) {
+    for (const ruta of ["recepcion/detalle?id=42", "estado-remoto", "listados/ventas", "avisos", "listados/comprobantes", "contable/comprobantes/1"]) {
       assert.equal((await pedir(s, token, prefijo + ruta)).status, 403, ruta);
     }
     for (const ruta of ["usuarios", "recepcion/guardar", "recepcion/vehiculos/42/salida"]) {

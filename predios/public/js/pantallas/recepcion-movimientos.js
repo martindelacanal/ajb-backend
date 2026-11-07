@@ -13,7 +13,8 @@
     COMPRA: "Compra", ANULACION: "Anulación de compra", SALDAR_CONSUMOS: "Liquidación de consumos",
     PAGO_RESERVA: "Pago de diferencia", DIFERENCIAL: "Diferencia de precio",
     CIERRE_SALIDA: "Cierre de cuenta por salida", PAGO_SALIDA_CONSUMOS: "Consumos liquidados al salir",
-    TRASPASO_ALOJAMIENTO: "Traslado de deuda de alojamiento", TRASPASO_CONSUMOS: "Traslado de deuda de consumos"
+    TRASPASO_ALOJAMIENTO: "Traslado de deuda de alojamiento", TRASPASO_CONSUMOS: "Traslado de deuda de consumos",
+    NC_CONSUMOS: "Devolución sobre consumos"
   };
   function conceptoMovimiento(f) {
     return f.origen === "CUENTA" ? CONCEPTO_CUENTA[f.concepto] || CONCEPTOS[f.concepto] || f.concepto : f.concepto;

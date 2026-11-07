@@ -70,7 +70,9 @@ function resumirCuenta(personas, movimientos) {
     saldo,
     cierre_pendiente: huboOperacionDeSaldo || saldo !== 0 || neto !== 0,
     pagos_adicionales: pagosAdicionales,
-    pagos_anulados: movimientos.filter(m => m.anula_mov_id).map(m => Number(m.anula_mov_id)),
+    // Una anulación que a su vez se anuló (nota de crédito anulada) deja el pago vigente otra vez.
+    pagos_anulados: movimientos.filter(m => m.anula_mov_id && !movimientos.some(x => Number(x.anula_mov_id) === Number(m.id)))
+      .map(m => Number(m.anula_mov_id)),
     saldos_individuales: Object.fromEntries(personas.map(p => [String(p.dni), porId.get(Number(p.id))]))
   };
 }
