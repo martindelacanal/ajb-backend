@@ -345,7 +345,7 @@ async function verPlanilla(ctx) {
     }
   });
 }
-const rutas = ["opciones", "listar", "familia", "detalle", "vencidas"].map(accion => ({
+const rutas = ["opciones", "listar", "familia", "detalle", "vencidas", "movimientos"].map(accion => ({
   m: "GET",
   p: "/recepcion/" + accion,
   h: async ctx => {
@@ -394,5 +394,6 @@ module.exports = {
   huespedParaDevolucion,
   cuenta,
   permiso,
+  turismo,
   aplicarConfirmacion
 };

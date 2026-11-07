@@ -30,8 +30,13 @@ function exigirPuesto(ctx) {
 const fallosClave = new Map();
 const VENTANA_CLAVE_MS = 10 * 60 * 1000;
 
+function claveIntentos(ctx) {
+  const generalId = ctx.usuario?.general_usuario_id;
+  return `${ctx.pid}:${generalId ? "general-" + generalId : ctx.usuario?.id || ctx.ip || "anon"}`;
+}
+
 function controlarIntentosClave(ctx) {
-  const k = `${ctx.pid}:${ctx.usuario?.id || ctx.ip || "anon"}`;
+  const k = claveIntentos(ctx);
   const e = fallosClave.get(k);
   if (e && Date.now() - e.inicio < VENTANA_CLAVE_MS && e.n >= 5) {
     throw error("Demasiados intentos con la clave. Esperá unos minutos o pedí la autorización a distancia.", 429, { codigo: "CLAVE_BLOQUEADA" });
@@ -39,14 +44,17 @@ function controlarIntentosClave(ctx) {
 }
 
 function registrarFalloClave(ctx, tipo, referenciaId) {
-  const k = `${ctx.pid}:${ctx.usuario?.id || ctx.ip || "anon"}`;
+  const k = claveIntentos(ctx);
   const e = fallosClave.get(k);
   if (!e || Date.now() - e.inicio >= VENTANA_CLAVE_MS) fallosClave.set(k, { inicio: Date.now(), n: 1 });
   else e.n++;
   if (fallosClave.size > 2000) fallosClave.delete(fallosClave.keys().next().value);
   // La auditoría del intento fallido va fuera de la transacción (que se revierte).
-  ctx.db.tx((t) => auditar(t, { ...ctx, db: t }, "Clave del día incorrecta", "permiso", null, { tipo, referencia_id: referenciaId || null }))
-    .catch(() => {});
+  const detalle = { tipo, referencia_id: referenciaId || null };
+  const db = ctx.dbAuditoria || ctx.db;
+  const registro = ctx.auditarFalloClave ? ctx.auditarFalloClave(detalle)
+    : db.tx((t) => auditar(t, { ...ctx, db: t }, "Clave del día incorrecta", "permiso", null, detalle));
+  registro.catch(() => {});
 }
 
 function claveCorrecta(clave) {
@@ -54,11 +62,11 @@ function claveCorrecta(clave) {
   return limpia.length > 0 && igualesSeguros(limpia, claveDelDia());
 }
 
-function validarClave(ctx, clave, tipo, referenciaId) {
+function validarClave(ctx, clave, tipo, referenciaId, mensaje = "La clave no es correcta. Pedile al administrador que la escriba.") {
   controlarIntentosClave(ctx);
   if (!claveCorrecta(clave)) {
     registrarFalloClave(ctx, tipo, referenciaId);
-    throw error("La clave no es correcta. Pedile al administrador que la escriba.", 403, { codigo: "CLAVE_INCORRECTA" });
+    throw error(mensaje, 403, { codigo: "CLAVE_INCORRECTA" });
   }
 }
 

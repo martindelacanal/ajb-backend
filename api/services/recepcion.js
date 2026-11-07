@@ -741,9 +741,14 @@ async function operar(c, predio, actor, accion, b) {
   if (!codigos.length) throw U.error("Este predio no tiene servicios asignados.", 403);
   try {
     if (accion === "opciones") return opciones(c, codigos);
+    if (accion === "estadisticas") {
+      if (actor.rol !== "ADMIN") throw U.error("Solo un administrador puede consultar las estadísticas de estadías.", 403);
+      return require("./recepcion-estadisticas").estadisticas(c, codigos, predio.id, b);
+    }
     if (accion === "crearAdicional") return crearAdicional(c, codigos, actor, b);
     if (accion === "familia") return familia(c, b.q, predio.id);
     if (accion === "vencidas") return contarVencidas(c, codigos, predio.id, U.hoy());
+    if (accion === "movimientos") return require("./recepcion-movimientos").listarMovimientos(c, codigos, predio.id, b, resumenCambios);
     if (accion === "listar") return listar(c, codigos, {
       ...b,
       predioId: predio.id

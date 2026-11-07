@@ -456,6 +456,12 @@
   var COLUMNAS_ANCHAS = ["nombre", "producto", "razon_social", "proveedor"];
   var siguienteTabla = 0;
 
+  P.textoTabla = function (valor) {
+    if (typeof valor !== "string" || !valor) return valor;
+    var largo = valor.length > 24;
+    return h("span.tabla-texto" + (largo ? ".tabla-texto-largo" : ""), { title: valor }, valor);
+  };
+
   P.tabla = function (opciones) {
     var nombre = opciones.listado;
     var claveEstado = "tabla:" + (opciones.claveEstado || nombre);
@@ -759,7 +765,10 @@
           }, sel ? celdaSeleccion(f) : null, cols.map(function (c) {
             var especial = opciones.celdas && opciones.celdas[c.clave];
             var contenido = especial ? especial(f[c.clave], f) : P.formatoCelda(c, f[c.clave]);
-            return h("td" + (ALINEA_DERECHA.indexOf(c.tipo) >= 0 ? ".der" : "") + (COLUMNAS_ANCHAS.indexOf(c.clave) >= 0 ? ".col-ancha" : "") + (c.tipo === "opcion" || c.tipo === "dt" || c.tipo === "date" || ALINEA_DERECHA.indexOf(c.tipo) >= 0 ? ".sin-corte" : ""), contenido);
+            var derecha = ALINEA_DERECHA.indexOf(c.tipo) >= 0;
+            var sinCorte = derecha || c.tipo === "opcion" || c.tipo === "dt" || c.tipo === "date";
+            return h("td" + (derecha ? ".der" : "") + (COLUMNAS_ANCHAS.indexOf(c.clave) >= 0 ? ".col-ancha" : "") + (sinCorte ? ".sin-corte" : ""),
+              sinCorte ? contenido : P.textoTabla(contenido));
           }));
           if (opciones.acciones) tr.appendChild(h("td.acciones", opciones.acciones(f, recargar)));
           return tr;

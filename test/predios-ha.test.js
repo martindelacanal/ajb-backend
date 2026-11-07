@@ -252,6 +252,7 @@ test("HTTP: sólo nodos con capacidad exacta reciben actores PREDIO; el filtro p
   insertar.run(22, JSON.stringify({ general_id: 1, capacidad: "precios-boca-v1" }));
   insertar.run(23, JSON.stringify({ general_id: 1, capacidad: "stock-predio-v2" }));
   insertar.run(24, JSON.stringify({ general_id: 1, capacidad: "operacion-predio-v2" }));
+  insertar.run(25, JSON.stringify({ general_id: 1, capacidad: "cierre-clave-dia-v1" }));
   const headers = { Authorization: `Bearer ${TOKEN}`, "X-Predio-Instancia": INSTANCIA, "X-Predio-Equipo": B, "X-Predio-HA": cabecera, "X-Predio-Capacidades": "cuentas-predio-v10" };
   const viejo = await fetch(url + "/comandos", { headers }); assert.equal(viejo.status, 200);
   assert.deepEqual((await viejo.json()).comandos.map(c => c.id), [77]);
@@ -266,4 +267,7 @@ test("HTTP: sólo nodos con capacidad exacta reciben actores PREDIO; el filtro p
   assert.deepEqual((await conStock.json()).comandos.map(c => c.id), [23]);
   const conOperacion = await fetch(url + "/comandos", { headers: { ...headers, "X-Predio-Capacidades": "stock-predio-v2,operacion-predio-v2" } });
   assert.deepEqual((await conOperacion.json()).comandos.map(c => c.id), [24]);
+  assert.equal(s.db.prepare("SELECT estado FROM predio_comando WHERE id=25").get().estado, "PENDIENTE");
+  const conCierre = await fetch(url + "/comandos", { headers: { ...headers, "X-Predio-Capacidades": "operacion-predio-v2,cierre-clave-dia-v1" } });
+  assert.deepEqual((await conCierre.json()).comandos.map(c => c.id), [25]);
 });

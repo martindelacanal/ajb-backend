@@ -620,7 +620,8 @@ async function guardarUsuario(ctx) {
 const CLAVES_CONFIG = ["nombre_predio", "razon_social", "cuit", "direccion", "leyenda_ticket", "texto_autorizacion", "minutos_permiso"];
 
 async function verConfig(ctx) {
-  return { config: await N.leerConfig(ctx.db, ctx) };
+  const config = await N.leerConfig(ctx.db, ctx);
+  return esAdmin(ctx) ? { config, clave_del_dia: U.claveDelDia() } : { config };
 }
 
 async function guardarConfigApi(ctx) {

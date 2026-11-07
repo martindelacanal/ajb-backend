@@ -73,7 +73,7 @@
       }, s);
     }))), h("tbody", filas.map(function (row) {
       return h("tr", row.map(function (v, i) {
-        return h("td", h("span.rec-etiqueta-movil", { "aria-hidden": "true" }, cols[i]), h("div.rec-valor", v));
+        return h("td", h("span.rec-etiqueta-movil", { "aria-hidden": "true" }, cols[i]), h("div.rec-valor", P.textoTabla(v)));
       }));
     }))));
   }
@@ -155,8 +155,8 @@
         P.reemplazar(out, h("div.rec-resumen", h("strong", r.cantidad + (Number(r.cantidad) === 1 ? " reserva" : " reservas")), espacio((r.viajeros || 0) + " personas"), espacio("Importe de la selección: " + pesos(r.importe))), r.filas.length ? tabla(["Reserva / titular", "Estadía", "Servicio / recurso", "Tipo", "Estado", "Importe"], r.filas.map(function (x) {
           return [h("div", h("a", {
             href: "#/recepcion/" + x.id
-          }, "T-" + x.id + " · " + x.titular)), fecha(x.fecha_inicio) + " – " + fecha(x.fecha_fin), [x.servicio, nombresRecursos(x)].filter(Boolean).join(" · "), TIPOS[x.tipo || "GENERAL"],
-            Number(x.vencida) ? h("div.columna", P.chip("Vencida sin salida", "VENCIDO"), h("span.chico", (x.huespedes_pendientes || []).join(", "))) : x.estado, pesos(x.precio_total)];
+          }, P.textoTabla("T-" + x.id + " · " + x.titular))), fecha(x.fecha_inicio) + " – " + fecha(x.fecha_fin), [x.servicio, nombresRecursos(x)].filter(Boolean).join(" · "), TIPOS[x.tipo || "GENERAL"],
+            Number(x.vencida) ? h("div.columna", P.chip("Vencida sin salida", "VENCIDO"), h("span.chico", P.textoTabla((x.huespedes_pendientes || []).join(", ")))) : x.estado, pesos(x.precio_total)];
         })) : P.mensaje("No hay reservas con esos filtros. Podés cambiar las fechas o crear una reserva.", "info"), h("div.fila", ant, espacio("Página " + pag), sig));
       });
     }
@@ -170,6 +170,7 @@
     P.alSalir(function () { clearTimeout(espera); seq++; });
     c.appendChild(cab(soloVencidas ? "Estadías vencidas sin salida" : "Reservas y estadías", null,
       [soloVencidas ? btn("Todas las reservas", function () { ir(); }) : null,
+        P.btn("Movimientos", { icono: "historial", onclick: function () { ir("movimientos"); } }),
         P.esAdmin() ? btn("Catálogo de adicionales", function () { ir("adicionales"); }) : null,
         P.btn("Crear reserva", { tipo: "primario", icono: "mas", onclick: function () { ir("nueva"); } })]));
     c.appendChild(aviso);
@@ -229,6 +230,102 @@
   }, {
     titulo: "Reservas y estadías"
   });
+  var ORIGEN_MOV = { RECEPCION: "Recepción", TURISMO: "Turismo", CUENTA: "Cuenta de estadía" };
+  var CONCEPTO_CUENTA = {
+    CARGA: "Carga de saldo", RETIRO: "Retiro de saldo", REPARTO: "Reparto de saldo",
+    COMPRA: "Compra", ANULACION: "Anulación de compra", SALDAR_CONSUMOS: "Liquidación de consumos",
+    PAGO_RESERVA: "Pago de diferencia", DIFERENCIAL: "Diferencia de precio"
+  };
+  function conceptoMovimiento(f) {
+    return f.origen === "CUENTA" ? CONCEPTO_CUENTA[f.concepto] || f.concepto : f.concepto;
+  }
+  function verMovimiento(f) {
+    P.modal({
+      titulo: conceptoMovimiento(f),
+      subtitulo: "Reserva T-" + f.reserva_id + " · " + P.f.fechaHora(f.fecha),
+      ancho: "ancha",
+      contenido: h("div.columna", grid(P.dato("Origen", ORIGEN_MOV[f.origen]), P.dato("Registró", texto(f.actor)),
+        P.dato("Servicio", texto(f.servicio)), P.dato("Recurso", texto(f.recurso)),
+        f.adicionales ? P.dato("Adicionales", f.adicionales) : null,
+        f.importe == null ? null : P.dato("Importe", pesos(f.importe)),
+        f.medio ? P.dato("Medio", MEDIOS[f.medio] || f.medio) : null),
+      f.detalle ? h("p", f.detalle) : null,
+      f.cambios && f.cambios.length ? tabla(["Campo", "Antes", "Después"], f.cambios.map(function (cambio) {
+        return cambio.map(function (v) { return h("span", texto(v)); });
+      })) : null)
+    });
+  }
+
+  P.ruta.registrar(/^\/recepcion\/movimientos$/, function (c) {
+    var clave = "tabla:recepcion-movimientos",
+      guardado = P.cache[clave] || {},
+      aplicados = guardado.filtros || {},
+      q = P.input({ tipo: "search", max: 80, valor: aplicados.q, placeholder: "Reserva, titular o empleado…" }),
+      desde = input(aplicados.desde, "date"), hasta = input(aplicados.hasta, "date"),
+      serv = sel([], "", "Todos"), recurso = sel([], "", "Todos"), adicional = sel([], "", "Todos"),
+      origen = sel(opciones(ORIGEN_MOV), aplicados.origen, "Todos"),
+      out = h("div.columna", { "aria-live": "polite" }),
+      catalogo, seq = 0;
+    function cargarRecursos(valor) {
+      if (!catalogo) return;
+      opSelect(recurso, lista(catalogo.recursos.filter(function (r) {
+        return !serv.value || String(r.servicio_id) === serv.value;
+      })), valor, "Todos");
+    }
+    function cargar(pag) {
+      var turno = ++seq;
+      out.setAttribute("aria-busy", "true");
+      P.reemplazar(out, P.cargando("Cargando movimientos…"));
+      return get("movimientos", Object.assign({}, aplicados, { pagina: pag, filtros: catalogo ? "" : "1" })).then(function (d) {
+        if (turno !== seq || !c.isConnected) return;
+        if (d.filtros) {
+          catalogo = d.filtros;
+          opSelect(serv, lista(catalogo.servicios), aplicados.servicio_id, "Todos");
+          cargarRecursos(aplicados.recurso_id);
+          opSelect(adicional, lista(catalogo.adicionales), aplicados.adicional_id, "Todos");
+        }
+        P.cache[clave] = { filtros: aplicados, pagina: d.pagina };
+        P.reemplazar(out, d.filas.length ? tabla(
+          ["Fecha", "Reserva / titular", "Servicio / recurso", "Adicionales", "Movimiento", "Registró", "Importe", "Detalle"],
+          d.filas.map(function (f) {
+            return [P.f.fechaHora(f.fecha), h("a", { href: "#/recepcion/" + f.reserva_id },
+              P.textoTabla("T-" + f.reserva_id + " · " + f.titular)),
+              [f.servicio, f.recurso].filter(Boolean).join(" · "), texto(f.adicionales),
+              conceptoMovimiento(f), texto(f.actor), f.importe == null ? "—" : pesos(f.importe),
+              P.btn("Ver", { chico: true, tipo: "texto", titulo: "Ver detalle del movimiento", onclick: function () { verMovimiento(f); } })];
+          })) : P.mensaje("No hay movimientos con esos filtros.", "info"),
+          d.pagina > 1 || d.siguiente ? h("div.fila",
+            P.btn("Anterior", { deshabilitado: d.pagina <= 1, onclick: function () { cargar(d.pagina - 1); } }),
+            espacio("Página " + d.pagina),
+            P.btn("Siguiente", { deshabilitado: !d.siguiente, onclick: function () { cargar(d.pagina + 1); } })) : null);
+      }).catch(function (e) {
+        if (turno === seq && c.isConnected) P.reemplazar(out, P.mensaje(e.message || "No se pudieron cargar los movimientos.", "error"));
+      }).finally(function () {
+        if (turno === seq) out.removeAttribute("aria-busy");
+      });
+    }
+    P.alSalir(function () { seq++; });
+    serv.onchange = function () { cargarRecursos(recurso.value); };
+    c.appendChild(cab("Movimientos de reservas y estadías",
+      "Historial de Turismo, operaciones de recepción y movimientos de cuenta.", P.btn("Reservas y estadías", {
+        icono: "volver", onclick: function () { ir(); }
+      })));
+    c.appendChild(h("form.hoja.rec-listado-filtros", {
+      onsubmit: function (e) {
+        e.preventDefault();
+        aplicados = { q: q.value, desde: desde.value, hasta: hasta.value, servicio_id: serv.value,
+          recurso_id: recurso.value, adicional_id: adicional.value, origen: origen.value };
+        cargar(1);
+      }
+    }, h("div.tabla-barra", P.campo("Buscar", q, { clase: "tabla-buscar" })),
+    h("div.tabla-filtros",
+      h("div.filtro-rango-fechas", { role: "group", "aria-label": "Fecha del movimiento" }, P.campo("Desde", desde), P.campo("Hasta", hasta)),
+      P.campo("Servicio", serv), P.campo("Recurso", recurso), P.campo("Adicional", adicional), P.campo("Origen", origen),
+      h("div.tabla-filtros-acciones", P.btn("Filtrar", { icono: "filtro", submit: true })))));
+    c.appendChild(out);
+    return cargar(guardado.pagina || 1);
+  }, { titulo: "Movimientos de reservas y estadías" });
+
   function opSelect(el, items, value, vacio) {
     P.vaciar(el);
     el.appendChild(h("option", { value: "" }, vacio));
@@ -910,7 +1007,7 @@
             DIFERENCIAL: "Diferencia de precio",
             COMPRA: "Compra",
             ANULACION: "Anulación"
-          }[m.concepto] || m.concepto, MEDIOS[m.medio] || m.medio || "—", pesos(m.importe), h("div", [m.usuario_nombre, quien && quien.nombre, m.detalle].filter(Boolean).join(" · "), m.liquidacion_id ? btn("Imprimir planilla", function () {
+          }[m.concepto] || m.concepto, MEDIOS[m.medio] || m.medio || "—", pesos(m.importe), h("div", P.textoTabla([m.usuario_nombre, quien && quien.nombre, m.detalle].filter(Boolean).join(" · ")), m.liquidacion_id ? btn("Imprimir planilla", function () {
             return P.get("/recepcion/" + id + "/planilla/" + m.liquidacion_id).then(P.imprimirLiquidacion);
           }, "texto") : null)];
         })) : null)), grupo("Historial de recepción", "Cada operación conserva el empleado, la fecha y los valores anteriores y nuevos.", timeline.length ? h("div.columna", timeline) : espacio("Todavía no hay modificaciones desde el predio.")));
