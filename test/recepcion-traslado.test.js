@@ -36,7 +36,7 @@ test("un traslado conserva los adicionales del tramo anterior y aplica el precio
   assert.deepEqual(extras.items.map(a => [a.adicional_id, a.dias, a.subtotal]), [[4, 4, 90], [9, 2, 22]]);
 });
 
-test("una persona reserva dos cabañas y recibe un solo cargo por sus adicionales", async () => {
+test("una reserva cotiza una cabaña y conserva el cargo de sus adicionales", async () => {
   const dias = ["2026-11-01", "2026-11-02"];
   const precios = { 11: 18000, 12: 22000 };
   const turismo = {
@@ -48,16 +48,16 @@ test("una persona reserva dos cabañas y recibe un solo cargo por sus adicionale
   const r = await cotizar(null, turismo, {
     tipo: "GENERAL", servicio: { modelo_tarifa: "PRECIO_UNICO" },
     inicio: dias[0], fin: "2026-11-03", personas: [{ dni: "10555000" }], adicionales: [{ adicional_id: 6, cantidad: 1 }], recursoId: 11,
-    recursos: [{ id: 11, cupo_maximo: 2 }, { id: 12, cupo_maximo: 3 }], tramos: []
+    recursos: [{ id: 11, cupo_maximo: 2 }], tramos: []
   });
-  assert.equal(r.total, 80000);
+  assert.equal(r.total, 36000);
   assert.equal(r.extras.total, 2000);
   assert.equal(r.personas.length, 1);
-  assert.equal(r.personas[0].tarifa_individual, 80000);
-  assert.deepEqual(r.personas[0].tarifas_por_fecha.map(n => n.recurso_id), [11, 11, 12, 12]);
+  assert.equal(r.personas[0].tarifa_individual, 36000);
+  assert.deepEqual(r.personas[0].tarifas_por_fecha.map(n => n.recurso_id), [11, 11]);
 });
 
-test("las tarifas por persona reparten el grupo según el cupo y respetan la salida efectiva", async () => {
+test("las tarifas por persona del recurso respetan la salida efectiva de cada viajero", async () => {
   const turismo = {
     calcularTarifaBaseReserva: async (_c, { recursoId, personas }) => ({
       personas: personas.map(p => ({ ...p, tarifas_por_fecha: ["2026-11-01", "2026-11-02"].map(fecha => (
@@ -69,8 +69,14 @@ test("las tarifas por persona reparten el grupo según el cupo y respetan la sal
   const r = await cotizar(null, turismo, {
     tipo: "GENERAL", servicio: {}, inicio: "2026-11-01", fin: "2026-11-03",
     personas: [{ dni: "1" }, { dni: "2", salida: "2026-11-02" }, { dni: "3" }],
-    adicionales: [], recursoId: 1, recursos: [{ id: 1, cupo_maximo: 1 }, { id: 2, cupo_maximo: 2 }], tramos: []
+    adicionales: [], recursoId: 1, recursos: [{ id: 1, cupo_maximo: 3 }], tramos: []
   });
-  assert.equal(r.total, 54000);
-  assert.deepEqual(r.personas.map(p => p.tarifa_individual), [24000, 10000, 20000]);
+  assert.equal(r.total, 60000);
+  assert.deepEqual(r.personas.map(p => p.tarifa_individual), [24000, 12000, 24000]);
+});
+
+test("cotizar rechaza varios recursos antes de calcular tarifas o alquileres", async () => {
+  await assert.rejects(cotizar(null, {}, {
+    recursos: [{ id: 11 }, { id: 12 }]
+  }), /Cada reserva admite un solo recurso/);
 });

@@ -295,9 +295,8 @@
       extras = (r.adicionales_vigentes || r.adicionales || []).map(function (a) {
         return Object.assign({}, a, { porDia: !!(a.fecha_desde || a.fecha_hasta) });
       });
-    var secundarios = (r.recursos || []).map(function (x) { return Number(x.id); }).filter(function (id) { return id !== Number(r.recurso_id); });
     var iniciada = viajeros.some(function (p) { return p.entrada; });
-    var recursosFijos = !!r.bloque_fecha_id || iniciada && secundarios.length > 0;
+    var recursosFijos = !!r.bloque_fecha_id;
     var familia = [],
       titular = r.id ? {
         dni: r.titular_dni
@@ -333,7 +332,6 @@
       obs = input(r.observaciones),
       base = h("div.columna"),
       grupoViaje = h("div.columna"),
-      otrosRecursos = h("div.columna"),
       cargos = h("div.columna"),
       part = h("div.columna"),
       estadoTit = h("div", {
@@ -344,25 +342,6 @@
       });
     var selectFamilia = sel([], null, "Elegí una persona"),
       selectExtra = sel([], null, "Elegí un adicional");
-    function pintarRecursosExtra() {
-      var servicio = o.servicios.find(function (s) { return String(s.id) === serv.value; });
-      var disponibles = o.recursos.filter(function (x) {
-        return String(x.servicio_id) === serv.value && String(x.id) !== rec.value;
-      });
-      otrosRecursos.hidden = !rec.value || !disponibles.length || !servicio || servicio.tipo_codigo === "CUPO_NUMERADO" || r.bloque_fecha_id || iniciada && !secundarios.length;
-      if (otrosRecursos.hidden) { P.vaciar(otrosRecursos); return; }
-      var select = sel(lista(disponibles.filter(function (x) { return secundarios.indexOf(Number(x.id)) < 0; })), null, "Elegí otro recurso");
-      var filas = secundarios.map(function (id) {
-        var x = disponibles.find(function (rec) { return Number(rec.id) === id; }) || (r.recursos || []).find(function (rec) { return Number(rec.id) === id; });
-        return h("div.fila", h("strong", x ? x.nombre : "Recurso " + id),
-          recursosFijos ? null : btn("Quitar", function () { secundarios = secundarios.filter(function (v) { return v !== id; }); pintarRecursosExtra(); }, "texto"));
-      });
-      P.reemplazar(otrosRecursos, filas, !recursosFijos && select.options.length > 1 ? h("div.fila",
-        P.campo("Otros recursos de la misma reserva", select), btn("Agregar recurso", function () {
-          if (!select.value) { select.focus(); throw Error("Elegí el recurso que querés agregar."); }
-          secundarios.push(Number(select.value)); pintarRecursosExtra();
-        })) : null);
-    }
     function inicioAlquiler() {
       return inicio.value && hoy < inicio.value ? inicio.value : fin.value && hoy > fin.value ? fin.value : hoy;
     }
@@ -401,7 +380,7 @@
         if (!x) { selectExtra.focus(); throw Error("Elegí el artículo que querés alquilar."); }
         extras.push({ adicional_id: x.valor, nombre: x.nombre, cantidad: 1, fecha_desde: inicioAlquiler(), fecha_hasta: inicioAlquiler(), porDia: true });
         pintarAdicionales();
-      })) : h("span.texto-2", !rec.value || !reg.value ? "Elegí un recurso principal y un régimen para ver los artículos." :
+      })) : h("span.texto-2", !rec.value || !reg.value ? "Elegí un recurso y un régimen para ver los artículos." :
           extras.length ? "No hay más artículos disponibles para esta selección." : "No hay artículos disponibles para esta selección."),
         P.esAdmin() && rec.value && reg.value ? btn("Crear adicional en el catálogo", function () {
           crearAdicional(o, { servicio_id: serv.value, recurso_id: rec.value, regimen_id: reg.value, fecha_desde: inicioAlquiler() }, function (x) {
@@ -417,7 +396,6 @@
       opSelect(rec, lista(o.recursos.filter(function (x) {
         return String(x.servicio_id) === serv.value;
       })), v, "Sin recurso");
-      pintarRecursosExtra();
       pintarAdicionales();
     }
     function pintarPersonas() {
@@ -557,7 +535,6 @@
         tipo: tipo.value,
         servicio_id: serv.value,
         recurso_id: rec.value,
-        recursos_ids: rec.value ? [Number(rec.value)].concat(secundarios) : [],
         regimen_id: reg.value,
         fecha_inicio: inicio.value,
         fecha_fin: fin.value,
@@ -627,12 +604,9 @@
     inicio.onchange = modalidad;
     fin.onchange = pintarAdicionales;
     serv.onchange = function () {
-      secundarios = [];
       recursos(null);
     };
     rec.onchange = function () {
-      secundarios = secundarios.filter(function (id) { return rec.value && id !== Number(rec.value); });
-      pintarRecursosExtra();
       pintarAdicionales();
     };
     reg.onchange = pintarAdicionales;
@@ -649,8 +623,8 @@
     base.appendChild(grupo("Titular", "Puede ser distinto de quienes viajan.", h("div.columna", r.id ? h("span", "DNI " + r.titular_dni) : h("div.fila", P.campo("DNI o legajo", dni), btn("Buscar titular", function () {
       return buscarTitular(dni.value.trim());
     })), estadoTit, part)));
-    base.appendChild(grupo("Estadía", null, h("div.columna", grid(P.campo("Tipo de reserva", tipo), P.campo("Servicio", serv), P.campo("Recurso principal", rec), P.campo("Régimen", reg)),
-      otrosRecursos, grid(P.campo("Desde", inicio), P.campo("Salida prevista", fin), iniciada && !recursosFijos ? P.campo("Fecha efectiva del traslado", traslado) : null), contingente)));
+    base.appendChild(grupo("Estadía", "Cada reserva tiene un recurso. Para otro recurso, creá otra reserva y asignale las personas que lo usarán.", h("div.columna", grid(P.campo("Tipo de reserva", tipo), P.campo("Servicio", serv), P.campo("Recurso", rec), P.campo("Régimen", reg)),
+      grid(P.campo("Desde", inicio), P.campo("Salida prevista", fin), iniciada && !recursosFijos ? P.campo("Fecha efectiva del traslado", traslado) : null), contingente)));
     base.appendChild(grupo("Personas que viajan", "Registrá el ingreso y la salida de cada persona con la fecha real. Dejá la salida vacía mientras esté en el predio.", grupoViaje));
     base.appendChild(grupo("Vehículo", "Si llegan sin auto, dejá los cuatro campos vacíos.", grid(P.campo("Marca", marca), P.campo("Color", color), P.campo("Patente", patente), P.campo("Sector de estacionamiento", sector))));
     base.appendChild(gExtra);

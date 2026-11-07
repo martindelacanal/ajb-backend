@@ -33,11 +33,13 @@ test("servicios y recursos visibles conservan nombres castellanos exactos", () =
   assert.deepEqual(catalogo.SERVICIOS.map((item) => item.nombre), [
     "Parador de la Montaña",
     "Hotel Solís",
-    "Miramar Cabañas",
+    "Cabañas",
     "Camping",
   ]);
   const parador = servicio("PARADOR_MONTANA");
   assert.equal(parador.lugar, "Córdoba");
+  assert.equal(servicio("MIRAMAR_CABANAS").lugar, "Miramar");
+  assert.equal(servicio("MIRAMAR_CAMPING").lugar, "Miramar");
   assert.ok(parador.recursos.some((item) => item.nombre === "Habitación 1 A"));
   assert.ok(parador.recursos.some((item) => item.nombre === "Cabaña 28"));
   assert.ok(parador.recursos.some((item) => item.descripcion.includes("Detrás del cuerpo")));

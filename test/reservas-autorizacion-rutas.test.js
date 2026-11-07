@@ -251,7 +251,7 @@ test("la edición no puede alterar una reserva ya aprobada por el titular, ni si
   }
 });
 
-test("el editor general conserva los días alquilados y las unidades asignadas en recepción", async () => {
+test("el editor general protege los alquileres y las reservas múltiples anteriores", async () => {
   for (const campo of ["cantidad_alquileres_predio", "varios_recursos"]) {
     setDatabaseHandler(async (sql) => {
       if (/FROM reserva r[\s\S]+FOR UPDATE/.test(sql)) return [[{
@@ -261,7 +261,7 @@ test("el editor general conserva los días alquilados y las unidades asignadas e
     });
     const response = await request("/api/reserva/77", { method: "PUT", token: tokenFor(), body: bodyEdicion() });
     assert.equal(response.status, 409);
-    assert.match(JSON.stringify(response.body), /recepción del predio/);
+    assert.match(JSON.stringify(response.body), campo === "cantidad_alquileres_predio" ? /recepción del predio/ : /reservas individuales/);
     assert.deepEqual(transactionCalls, ["begin", "rollback"]);
   }
 });
@@ -1602,4 +1602,16 @@ test("cancelar el sorteo tampoco deja pendiente la aprobación del titular", asy
   const cierre = databaseCalls.find(({ sql }) => /UPDATE reserva_aprobacion_titular SET decision = 'CANCELADA'/.test(sql));
   assert.deepEqual(cierre.params, [[30]]);
   assert.ok(databaseCalls.some(({ sql, params }) => /INSERT INTO notificacion/.test(sql) && params.includes("Reserva T-30: Cancelada")));
+});
+
+
+test("alta y edición general rechazan varios recursos antes de abrir una transacción", async () => {
+  for (const [method, path] of [["POST", "/api/reserva"], ["PUT", "/api/reserva/77"]]) {
+    setDatabaseHandler(async () => { throw new Error("No debería consultar la reserva"); });
+    const r = await request(path, { method, token: tokenFor(), body: bodyEdicion({ recursos_ids: [2, 3] }) });
+    assert.equal(r.status, 400);
+    assert.equal(r.body.codigo, "RECURSO_UNICO_POR_RESERVA");
+    assert.match(r.body.message, /otra reserva/);
+    assert.deepEqual(transactionCalls, []);
+  }
 });
