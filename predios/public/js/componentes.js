@@ -458,6 +458,8 @@
 
   P.tabla = function (opciones) {
     var nombre = opciones.listado;
+    var consultar = opciones.consultar || function (p) { return P.get("/listados/" + nombre + P.qs(p)); };
+    var cargarMeta = opciones.cargarMeta || function () { return P.metaListado(nombre); };
     var claveEstado = "tabla:" + (opciones.claveEstado || nombre);
     var guardado = P.cache[claveEstado] || {};
     var estado = {
@@ -803,8 +805,9 @@
       }
       var n = ++pedido;
       cuerpo.style.opacity = ".55";
-      return P.get("/listados/" + nombre + P.qs(Object.assign(parametros(), { pagina: estado.pagina, tam: estado.tam }))).then(function (datos) {
+      return consultar(Object.assign(parametros(), { pagina: estado.pagina, tam: estado.tam })).then(function (datos) {
         if (n !== pedido) return;
+        if (estado.pagina !== datos.pagina) { estado.pagina = datos.pagina; guardar(); }
         cuerpo.style.opacity = "";
         pintar(datos);
       }).catch(function (e) {
@@ -816,7 +819,7 @@
     }
     function recargar() { return cargar(); }
 
-    P.metaListado(nombre).then(function (m) {
+    cargarMeta().then(function (m) {
       meta = m;
       Object.keys(estado.filtros).forEach(function (clave) {
         if (!meta.filtros.some(function (f) { return f.clave === clave; })) delete estado.filtros[clave];

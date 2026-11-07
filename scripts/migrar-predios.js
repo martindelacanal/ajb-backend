@@ -29,6 +29,7 @@ const USUARIO_RUNTIME = "miajb_runtime";
 
 const DDL_CENTRALES = {
   recepcion_reserva_recurso: require("./migrar-recepcion-recursos").DDL_RECURSOS,
+  recepcion_vehiculo: require("./migrar-recepcion-vehiculos").DDL_VEHICULOS,
   predio_inventario_envio: require("./migrar-predios-operacion").DDL_ENVIOS,
   recepcion_particular: `CREATE TABLE IF NOT EXISTS recepcion_particular (usuario_id INT NOT NULL PRIMARY KEY, predio_id INT NOT NULL, creado DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB`,
   recepcion_reserva_evento: `CREATE TABLE IF NOT EXISTS recepcion_reserva_evento (

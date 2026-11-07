@@ -67,6 +67,30 @@ function pedir(s, token, ruta, cuerpo) {
   return fetch(s.url + ruta, { method: cuerpo === undefined ? "GET" : "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, ...(cuerpo === undefined ? {} : { body: JSON.stringify(cuerpo) }) });
 }
 
+test("Seguridad inicia sesión con alcance de predio y no puede ejecutar ni encolar operaciones administrativas", async t => {
+  for (const escritor of ["CENTRAL", "LOCAL"]) {
+    const s = await escenario(t, { escritor });
+    await s.db.run("UPDATE predio_usuario SET rol='SEGURIDAD', gestionar_reservas=1 WHERE predio_id=1 AND id=7");
+    const { token, data } = await ingresar(s);
+    assert.equal(data.rol, "predio_seguridad");
+    const prefijo = "/app/MIRAMAR/api/";
+    const sesion = await (await pedir(s, token, prefijo + "sesion")).json();
+    assert.equal(sesion.usuario.rol, "SEGURIDAD");
+    assert.deepEqual(sesion.usuario.bocas, []);
+    assert.equal(sesion.remoto, undefined);
+    for (const ruta of ["recepcion/detalle?id=42", "estado-remoto", "listados/ventas", "avisos"]) {
+      assert.equal((await pedir(s, token, prefijo + ruta)).status, 403, ruta);
+    }
+    for (const ruta of ["usuarios", "recepcion/guardar", "recepcion/vehiculos/42/salida"]) {
+      assert.equal((await pedir(s, token, prefijo + ruta, {})).status, 403, ruta);
+    }
+    assert.equal((await pedir(s, token, "/app/PARADOR/api/sesion")).status, 403);
+    assert.equal(s.db.conexion.prepare("SELECT COUNT(*) n FROM predio_comando").get().n, 0);
+    const cambio = await pedir(s, token, prefijo + "sesion/clave", { actual: "clave-fixture", nueva: "Seguridad-z9" });
+    assert.equal(cambio.status, escritor === "CENTRAL" ? 200 : 202, await cambio.text());
+  }
+});
+
 test("la clave temporal remota sólo habilita su cambio, directo o por orden sin secretos en claro", async t => {
   for (const escritor of ["CENTRAL", "LOCAL"]) {
     const s = await escenario(t, { escritor });
@@ -137,11 +161,16 @@ test("los comandos de anulación, caja y liquidación esperan una notebook con l
     const orden = await s.db.get("SELECT actor FROM predio_comando WHERE ruta=?", [ruta]);
     assert.equal(JSON.parse(orden.actor).capacidad, "operacion-predio-v2", ruta);
   }
-  for (const [ruta, datos] of [["/recepcion/adicionales", {}], ["/recepcion/guardar", { cuenta_esperada: { pendiente: 10, neto_consumos: 0 } }]]) {
+  for (const [ruta, datos, capacidad] of [
+    ["/recepcion/adicionales", {}, "recepcion-alquileres-v1"],
+    ["/recepcion/guardar", { cuenta_esperada: { pendiente: 10, neto_consumos: 0 } }, "recepcion-salidas-v1"],
+    ["/recepcion/vehiculos/1/salida", { patente: "AB012CD" }, "recepcion-salidas-v1"],
+    ["/recepcion/1/vehiculo/qr", { patente: "AB012CD" }, "recepcion-salidas-v1"]
+  ]) {
     const r = await pedir(s, token, "/app/MIRAMAR/api" + ruta, datos);
     assert.equal(r.status, 202);
     const orden = await s.db.get("SELECT actor FROM predio_comando WHERE ruta=?", [ruta]);
-    assert.equal(JSON.parse(orden.actor).capacidad, "recepcion-alquileres-v1", ruta);
+    assert.equal(JSON.parse(orden.actor).capacidad, capacidad, ruta);
   }
 });
 

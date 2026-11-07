@@ -11,6 +11,7 @@ const { turnoAbierto, turnoUsuario, exigirCierre } = require("../turnos-caja");
 const clavesUsuario = require("../claves-usuario");
 
 async function bocasUsuario(db, ctx, usuario) {
+  if (usuario.rol === "SEGURIDAD") return [];
   if (usuario.rol === "ADMIN") {
     const filas = await db.all("SELECT id FROM predio_boca WHERE predio_id = ? AND activo = 1", [ctx.pid]);
     return filas.map((f) => Number(f.id));
@@ -43,14 +44,14 @@ async function crearSesion(ctx, usuario, recordar) {
   const ahora = U.fechaHora();
   const puesto = await ctx.db.tx(async (t) => {
     const vigente = await N.obtener(t, ctx, "predio_usuario", usuario.id);
-    if (!Number(vigente?.activo) || vigente.password_hash !== usuario.password_hash) throw U.error("Tu cuenta cambió. Volvé a ingresar.", 401);
+    if (!Number(vigente?.activo) || vigente.password_hash !== usuario.password_hash || vigente.rol !== usuario.rol) throw U.error("Tu cuenta cambió. Volvé a ingresar.", 401);
     await t.run(
       `INSERT INTO predio_sesion (token_hash, usuario_id, recordar, creada, vence, ultimo_uso, ip, agente)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [U.sha256(token), usuario.id, recordar ? 1 : 0, ahora,
         recordar ? null : U.fechaHora(new Date(Date.now() + 12 * 3600 * 1000)), ahora,
         String(ctx.ip || "").slice(0, 45), String(ctx.agenteHttp || "").slice(0, 200)]);
-    const turno = await turnoUsuario(t, ctx.pid, usuario.id);
+    const turno = usuario.rol === "SEGURIDAD" ? null : await turnoUsuario(t, ctx.pid, usuario.id);
     // Un ingreso nuevo recupera el turno aunque haya vencido el token anterior.
     // Quitar el puesto al token anterior evita cobrar desde dos equipos.
     if (turno && (await turnoAbierto(t, ctx.pid, turno.caja_id))?.id === turno.id) {
@@ -171,9 +172,10 @@ async function armarSesion(ctx, usuario, sesion) {
 }
 
 function identidadUsuario(u) {
+  const seguridad = u.rol === "SEGURIDAD";
   return { id: Number(u.id), usuario: u.usuario, nombre: u.nombre, rol: u.rol, es_admin_general: !!Number(u.es_admin_general),
-    gestionar_reservas: !!Number(u.gestionar_reservas), puede_cerrar_caja: !!Number(u.puede_cerrar_caja),
-    puede_anular_ticket: !!Number(u.puede_anular_ticket), debe_cambiar_clave: !!Number(u.debe_cambiar_clave) };
+    gestionar_reservas: !seguridad && !!Number(u.gestionar_reservas), puede_cerrar_caja: !seguridad && !!Number(u.puede_cerrar_caja),
+    puede_anular_ticket: !seguridad && !!Number(u.puede_anular_ticket), debe_cambiar_clave: !!Number(u.debe_cambiar_clave) };
 }
 
 async function verSesion(ctx) {
@@ -318,13 +320,13 @@ module.exports = {
   autenticar,
   asegurarUsuarioGeneral,
   rutas: [
-    { m: "GET", p: "/estado-publico", h: estadoPublico, publica: true, soloLocal: true },
+    { m: "GET", p: "/estado-publico", h: estadoPublico, publica: true, soloLocal: true, seguridad: true },
     { m: "POST", p: "/primer-uso", h: primerUso, publica: true, soloLocal: true },
     { m: "POST", p: "/login", h: login, publica: true, soloLocal: true },
-    { m: "POST", p: "/logout", h: logout, soloLocal: true },
-    { m: "GET", p: "/sesion", h: verSesion, soloLocal: true },
+    { m: "POST", p: "/logout", h: logout, soloLocal: true, seguridad: true },
+    { m: "GET", p: "/sesion", h: verSesion, soloLocal: true, seguridad: true },
     { m: "POST", p: "/sesion/puesto", h: elegirPuesto, soloLocal: true },
     { m: "POST", p: "/sesion/salir-puesto", h: salirPuesto, soloLocal: true },
-    { m: "POST", p: "/sesion/clave", h: cambiarClave, escritura: true },
+    { m: "POST", p: "/sesion/clave", h: cambiarClave, escritura: true, seguridad: true },
   ],
 };

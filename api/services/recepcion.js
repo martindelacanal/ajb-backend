@@ -4,6 +4,8 @@
 const U = require("../../predios/lib/util");
 const { recursoUnico, MENSAJE_RECURSO_UNICO } = require("./reserva-recurso-unico");
 const { crearAdicional, seleccionArticulos, cotizarAlquileres } = require("./recepcion-alquileres");
+const VEHICULOS = require("./recepcion-vehiculos");
+const { repartir } = require("../../predios/lib/cuenta-estadia");
 const {
   serviciosDe
 } = require("./predios-central");
@@ -89,6 +91,7 @@ async function detalle(c, codigos, id, lock = false) {
     const prev = (ext.personas || []).find(x => String(x.dni) === String(p.dni));
     p.entrada = prev?.entrada || null;
     p.salida = prev?.salida || null;
+    p.salida_prevista = prev?.salida_prevista || null;
   }
   const adicionales = await todos(c, `SELECT adicional_id,cantidad,nombre_adicional AS nombre,dias,subtotal
     FROM reserva_adicional WHERE reserva_id=? ORDER BY id`, [id]);
@@ -107,12 +110,14 @@ async function detalle(c, codigos, id, lock = false) {
   const seleccion = tramos.at(-1)?.adicionales;
   const datos = {
     ...r,
+    fecha_fin_acordada: ext.fecha_fin_acordada || r.fecha_fin,
     tipo: ext.tipo || "GENERAL",
     entidad: ext.entidad || null,
     cantidad: ext.cantidad || personas.length,
     vehiculo: ext.vehiculo || {},
     manual: ext.manual ?? null,
     automatico: ext.automatico ?? r.precio_total,
+    cuotas_alojamiento: ext.cuotas_alojamiento || null,
     tramos,
     personas,
     adicionales,
@@ -150,7 +155,7 @@ function resumenCambios(a, b) {
     if ((a?.vehiculo?.[k] || "") !== (b.vehiculo[k] || "")) cambios.push([k, a?.vehiculo?.[k], b.vehiculo[k]]);
   }
   const mapa = (xs, fn) => new Map((xs || []).map(x => [String(fn(x)), x]));
-  for (const [key, id, describe] of [["personas", "dni", p => nombre(p) + " · DNI " + p.dni + " · " + (p.entrada || "sin ingreso") + " / " + (p.salida || "sin salida") + " · $" + Number(p.precio || 0)], ["adicionales", "adicional_id", p => p.nombre + " × " + p.cantidad + (p.fecha_desde ? " · " + p.fecha_desde + " a " + p.fecha_hasta : "") + " · $" + Number(p.subtotal)]]) {
+  for (const [key, id, describe] of [["personas", "dni", p => nombre(p) + " · DNI " + p.dni + " · " + (p.entrada || "sin ingreso") + " / " + (p.salida || "sin salida") + (p.salida_prevista ? " · Prevista " + p.salida_prevista : "") + " · $" + Number(p.precio || 0)], ["adicionales", "adicional_id", p => p.nombre + " × " + p.cantidad + (p.fecha_desde ? " · " + p.fecha_desde + " a " + p.fecha_hasta : "") + " · $" + Number(p.subtotal)]]) {
     const ant = mapa(a?.[key], p => p[id]),
       sig = mapa(b[key], p => p[id]);
     for (const k of new Set([...ant.keys(), ...sig.keys()])) {
@@ -158,6 +163,12 @@ function resumenCambios(a, b) {
         y = sig.has(k) ? describe(sig.get(k)) : null;
       if (x !== y) cambios.push([key === "personas" ? "Pasajero" : "Adicional", x, y]);
     }
+  }
+  if (b.plan_salida) {
+    if (b.plan_salida.vehiculo) cambios.push(["Vehículo", null, b.plan_salida.vehiculo === "SALE" ? "Salida registrada" : "Permanece en el predio"]);
+    if (b.plan_salida.accion) cambios.push(["Cuenta de la salida", null,
+      (b.plan_salida.accion === "TRASLADAR" ? "Trasladada a quienes permanecen" : "Saldada") +
+      " · Alojamiento $" + b.plan_salida.alojamiento + " · Consumos $" + b.plan_salida.consumos]);
   }
   if (a && Number(a.recurso_id) !== Number(b.recurso_id) && b.tramos.length) {
     const desde = b.tramos.at(-1).desde;
@@ -169,18 +180,19 @@ function resumenCambios(a, b) {
 // La fecha prevista es inclusiva para esta alerta: quien sale hoy aún está en plazo.
 // El evento central se confirma antes de replicar los huéspedes de la notebook.
 // Así una salida recién guardada retira el aviso incluso entre sincronizaciones.
-const condicionVencida = `er.nombre IN ('Iniciada','Verificada','Aprobada','Adjudicada') AND ${fechaFinVisibleSql("e")} < ?
+const condicionVencida = `er.nombre IN ('Iniciada','Verificada','Aprobada','Adjudicada')
   AND CASE WHEN e.predio_id=? AND JSON_TYPE(JSON_EXTRACT(e.actual,'$.personas'))='ARRAY' THEN EXISTS(
     SELECT 1 FROM JSON_TABLE(COALESCE(e.actual,'{}'), '$.personas[*]' COLUMNS(
-      entrada VARCHAR(10) PATH '$.entrada', salida VARCHAR(10) PATH '$.salida')) p
-      WHERE p.entrada IS NOT NULL AND p.salida IS NULL)
-    ELSE EXISTS (SELECT 1 FROM predio_huesped hp WHERE hp.reserva_id=r.id AND hp.predio_id=?
+      entrada VARCHAR(10) PATH '$.entrada', salida VARCHAR(10) PATH '$.salida',
+      salida_prevista VARCHAR(10) PATH '$.salida_prevista')) p
+      WHERE p.entrada IS NOT NULL AND p.salida IS NULL AND COALESCE(p.salida_prevista,${fechaFinVisibleSql("e")}) < ?)
+    ELSE ${fechaFinVisibleSql("e")} < ? AND EXISTS (SELECT 1 FROM predio_huesped hp WHERE hp.reserva_id=r.id AND hp.predio_id=?
       AND hp.entrada IS NOT NULL AND hp.salida IS NULL) END`;
 const ultimoEventoSql = " LEFT JOIN recepcion_reserva_evento e ON e.id=(SELECT MAX(ev.id) FROM recepcion_reserva_evento ev WHERE ev.reserva_id=r.id)";
 async function contarVencidas(c, codigos, pid, hoy) {
   return uno(c, `SELECT COUNT(*) AS cantidad FROM reserva r JOIN servicio s ON s.id=r.servicio_id
     JOIN estado_reserva er ON er.id=r.estado_reserva_id ${ultimoEventoSql}
-    WHERE s.codigo IN (?) AND ${condicionVencida}`, [codigos, hoy, pid, pid]);
+    WHERE s.codigo IN (?) AND ${condicionVencida}`, [codigos, pid, hoy, hoy, pid]);
 }
 async function listar(c, codigos, b) {
   const cond = ["s.codigo IN (?)"],
@@ -188,7 +200,7 @@ async function listar(c, codigos, b) {
   const hoy = U.hoy(), pid = U.id(b.predioId);
   if (b.ocupacion === "VENCIDA") {
     cond.push(condicionVencida);
-    p.push(hoy, pid, pid);
+    p.push(pid, hoy, hoy, pid);
   }
   if (b.ocupacion === "PRESENTE" || b.ocupacion === "SALIDA") {
     const modo = b.ocupacion === "PRESENTE" ? "hp.salida IS NULL" : "hp.salida IS NOT NULL";
@@ -230,14 +242,14 @@ async function listar(c, codigos, b) {
   });
   const filas = await todos(c, `SELECT r.id,r.fecha_inicio,${fechaFinVisibleSql("e")} AS fecha_fin,r.precio_total,s.nombre AS servicio,r.recurso_id,rec.nombre AS recurso,er.nombre AS estado,CONCAT_WS(', ',u.apellido,u.nombre) AS titular,JSON_UNQUOTE(JSON_EXTRACT(e.actual,'$.tipo')) AS tipo,(${condicionVencida}) AS vencida,
     CASE WHEN e.predio_id=? THEN JSON_EXTRACT(e.actual,'$.personas') END AS pasajeros_evento${from}
-    ORDER BY r.fecha_inicio DESC,r.id DESC LIMIT 40 OFFSET ${(pagina - 1) * 40}`, [hoy, pid, pid, pid, ...p]);
+    ORDER BY r.fecha_inicio DESC,r.id DESC LIMIT 40 OFFSET ${(pagina - 1) * 40}`, [pid, hoy, hoy, pid, pid, ...p]);
   await cargarRecursos(c, filas);
   const vencidas = [];
   for (const r of filas) {
     const pasajeros = typeof r.pasajeros_evento === "string" ? JSON.parse(r.pasajeros_evento) : r.pasajeros_evento;
     delete r.pasajeros_evento;
     if (!Number(r.vencida)) continue;
-    if (Array.isArray(pasajeros)) r.huespedes_pendientes = pasajeros.filter(p => p.entrada && !p.salida).map(nombre);
+    if (Array.isArray(pasajeros)) r.huespedes_pendientes = pasajeros.filter(p => p.entrada && !p.salida && (p.salida_prevista || r.fecha_fin) < hoy).map(nombre);
     else vencidas.push(r);
   }
   if (vencidas.length) {
@@ -323,6 +335,7 @@ async function cotizar(c, T, {
     ...p,
     tarifa_individual: 0,
     tarifa_original_individual: 0,
+    peso_alojamiento: 0,
     tarifas_por_fecha: []
   }));
   const alquileres = adicionales.filter(a => a.fecha_desde);
@@ -357,7 +370,18 @@ async function cotizar(c, T, {
       const p = pasajeros.find(x => String(x.dni) === String(row.dni));
       for (const noche of row.tarifas_por_fecha) {
         const porNochePersonal = servicio.unidad_cobro !== "POR_ESTADIA" && (noche.por_persona ?? !fijo);
-        if (porNochePersonal && (noche.fecha < (p.entrada || inicio) || noche.fecha >= (p.salida || fin))) continue;
+        if (porNochePersonal && (noche.fecha < (p.entrada || inicio) || noche.fecha >= (p.salida || p.salida_prevista || fin))) continue;
+        if (porNochePersonal) {
+          p.peso_alojamiento += Number(noche.precio);
+        } else {
+          // El costo del recurso se conserva. Entre huéspedes se asigna a
+          // quienes ocupan esa noche, incluida una prórroga de una sola persona.
+          const ocupantes = pasajeros.filter(h => noche.fecha >= (h.entrada || inicio) &&
+            noche.fecha < (h.salida || h.salida_prevista || fin));
+          const grupo = ocupantes.length ? ocupantes : pasajeros;
+          const cuotas = repartir(Number(noche.precio), grupo.map(() => 1));
+          grupo.forEach((h, i) => { h.peso_alojamiento += cuotas[i]; });
+        }
         p.tarifas_por_fecha.push({ ...noche, recurso_id: seg.recurso_id });
         p.tarifa_individual = U.redondear(p.tarifa_individual + Number(noche.precio));
         p.tarifa_original_individual = U.redondear(p.tarifa_original_individual + Number(noche.precio_original ?? noche.precio));
@@ -387,6 +411,68 @@ async function cotizar(c, T, {
     extras: { total: U.redondear(items.reduce((s, item) => s + item.subtotal, 0)), alquileres: totalAlquileres, items }
   };
 }
+
+function prepararFechas(b, anterior, tipo, inicio, finSolicitado) {
+  const viajeros = b.personas;
+  if (!Array.isArray(viajeros) || !viajeros.length || viajeros.length > 100) throw U.error("Indicá entre uno y cien pasajeros identificados.");
+  const periodoFijo = tipo === "PASA_EL_DIA" || anterior?.bloque_fecha_id;
+  const conservaAcuerdo = !periodoFijo && anterior?.fecha_fin === finSolicitado && anterior.fecha_fin_acordada >= inicio;
+  const finAcordado = conservaAcuerdo ? anterior.fecha_fin_acordada : finSolicitado;
+  const fechas = viajeros.map(p => {
+    const previo = anterior?.personas.find(x => String(x.dni) === String(p.dni));
+    const entrada = U.fecha(p.entrada), salida = U.fecha(p.salida);
+    const prevista = p.salida_prevista === undefined ? previo?.salida_prevista || null : U.fecha(p.salida_prevista);
+    if (previo?.salida && prevista !== (previo.salida_prevista || null)) {
+      throw U.error("La fecha prevista no puede cambiar después de registrar la salida.");
+    }
+    if (prevista && (prevista < (entrada || inicio) || periodoFijo && prevista > finSolicitado)) {
+      throw U.error("Revisá la salida prevista de " + nombre(p) + ": debe corresponder al período de su estadía.");
+    }
+    return { entrada, salida, salida_prevista: prevista };
+  });
+  const fin = periodoFijo ? finSolicitado : [finAcordado, ...fechas.flatMap(p => [p.salida || "", p.salida_prevista || ""])].sort().at(-1);
+  if (fin > finAcordado) {
+    for (const p of fechas) {
+      if (!p.salida_prevista && (!p.entrada || p.entrada <= finAcordado)) p.salida_prevista = finAcordado;
+    }
+  }
+  return { fechas, fin, finAcordado };
+}
+
+function diferencialesPorPersona(anterior, personas, total, manual, tarifaFija) {
+  const previas = anterior?.personas || [];
+  const cuotasPrevias = repartir(Number(anterior?.precio_total || 0), previas.map(p => manual || tarifaFija ? 1 : Number(p.precio ?? 0)));
+  const anteriores = new Map(previas.map((p, i) => [String(p.dni), p.salida ? null : (anterior.cuotas_alojamiento?.[p.dni] ?? cuotasPrevias[i])]));
+  const actuales = repartir(total, personas.map(p => manual ? 1 : p.peso_alojamiento));
+  const cuotas = Object.fromEntries(personas.map((p, i) => [String(p.dni), actuales[i]]));
+  const items = personas.flatMap(p => {
+    const dni = String(p.dni), anterior = anteriores.get(dni);
+    const importe = U.redondear(cuotas[dni] - (anterior || 0));
+    return anterior === null || !importe ? [] : [{ dni, importe }];
+  });
+  const remanente = U.redondear(total - Number(anterior?.precio_total || 0) - items.reduce((s, p) => s + p.importe, 0));
+  if (remanente) items.push({ dni: null, importe: remanente });
+  return { items, cuotas };
+}
+
+function validarPlanSalida(salida, plan) {
+  const error = () => U.error("Revisá y confirmá la liquidación para registrar la salida.", 409);
+  const coincide = campo => Array.isArray(plan?.[campo]) && plan[campo].length === salida[campo].length &&
+    salida[campo].every((p, i) => plan[campo][i]?.dni === p.dni);
+  if (!coincide("personas") || !coincide("presentes")) throw error();
+  const haySaldo = plan.alojamiento || plan.consumos;
+  for (const rubro of ["alojamiento", "consumos"]) {
+    if (!plan.personas.every(p => Number.isFinite(p[rubro])) ||
+      U.redondear(plan.personas.reduce((s, p) => s + p[rubro], 0)) !== plan[rubro]) throw error();
+  }
+  if (U.redondear(plan.alojamiento + plan.consumos) !== plan.total) throw error();
+  if (haySaldo || plan.accion) U.opcion(plan.accion, salida.presentes.length ? ["COBRAR", "TRASLADAR"] : ["COBRAR"], "La liquidación");
+  if (plan.accion === "COBRAR" && plan.total) U.opcion(plan.medio, ["EFECTIVO", "TRANSFERENCIA"], "El medio de pago");
+  if (plan.medio === "EFECTIVO" && (!plan.caja?.caja_id || !plan.caja?.boca_id || !plan.caja?.fecha)) throw error();
+  if (salida.vehiculo_pendiente) U.opcion(plan.vehiculo, salida.presentes.length ? ["SALE", "PERMANECE"] : ["SALE"], "La salida del vehículo");
+  else if (plan.vehiculo) throw error();
+}
+
 async function guardar(c, predio, actor, b, codigos, previa) {
   const recursoId = recursoUnico(b, (b.tipo || "GENERAL") === "GENERAL");
   const T = require("../routes/user").negocioRecepcion;
@@ -402,6 +488,7 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     headers: {},
     get: () => null
   };
+  const { _salida_plan: planSalida, ...solicitud } = b;
   const operacion = String(b.operacion || ""),
     huella = firma({
       actor: actor.id,
@@ -425,7 +512,9 @@ async function guardar(c, predio, actor, b, codigos, previa) {
   if (!servicio) throw U.error("El servicio no está asignado a este predio.", 403);
   const tipo = U.opcion(b.tipo || "GENERAL", tipos),
     inicio = fecha(b.fecha_inicio),
-    fin = fecha(b.fecha_fin);
+    finSolicitado = fecha(b.fecha_fin);
+  if (finSolicitado < inicio) throw U.error("La fecha de salida debe ser igual o posterior al ingreso.");
+  const { fechas, fin, finAcordado } = prepararFechas(b, anterior, tipo, inicio, finSolicitado);
   if (fin < inicio || tipo === "GENERAL" && fin === inicio || fin > U.sumarDias(inicio, 366)) throw U.error("Revisá las fechas de la estadía (hasta un año).");
   if (tipo === "PASA_EL_DIA" && fin !== inicio) throw U.error("En Pasa el día, el ingreso y la salida deben ser el mismo día.");
   const hasta = fin === inicio ? U.sumarDias(inicio, 1) : fin;
@@ -518,7 +607,6 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     }
   }
   const viajeros = b.personas;
-  if (!Array.isArray(viajeros) || !viajeros.length || viajeros.length > 100) throw U.error("Indicá entre uno y cien pasajeros identificados.");
   const grupo = await T.obtenerUsuarioPrincipalFamilia(c, titular.id);
   const existentesParticular = Number(titular.afiliado) ? null : new Set((await todos(c, "SELECT documento FROM usuario WHERE documento IN (?)", [viajeros.map(p => String(p.dni))])).map(x => String(x.documento)));
   const personas = await T.crearOBuscarUsuariosReserva(c, viajeros.map(p => ({
@@ -538,13 +626,9 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     const a = personas[i],
       p = viajeros[i];
     if (existentesParticular && !existentesParticular.has(String(a.dni))) await c.query("UPDATE usuario SET habilitado=\'N\',modulo_turismo=0,modulo_coseguro=0,modulo_olimpiadas=0 WHERE id=? AND password IS NULL AND rol_id=4", [a.usuario_id]);
-    a.entrada = U.fecha(p.entrada);
-    a.salida = U.fecha(p.salida);
+    Object.assign(a, fechas[i]);
     if (a.entrada && (a.entrada < inicio || a.entrada > fin || a.entrada > U.hoy())) throw U.error("Revisá el ingreso de " + nombre(a) + ": debe estar dentro de la estadía y no ser futuro.");
     if (a.salida && (!a.entrada || a.salida < a.entrada || a.salida > U.hoy())) throw U.error("Revisá la salida de " + nombre(a) + ": debe seguir al ingreso y no ser futura.");
-    // Los bloques y las visitas de un día tienen un período de cobro fijo;
-    // registrar cuándo salió el huésped sigue siendo posible si se demoró.
-    if (a.salida && a.salida > fin && tipo !== "PASA_EL_DIA" && !anterior?.bloque_fecha_id) throw U.error("Extendé la estadía hasta la salida efectiva de " + nombre(a) + " para calcular las noches adicionales.");
   }
   for (const previo of anterior?.personas || []) {
     const actual = personas.find(p => String(p.dni) === String(previo.dni));
@@ -564,7 +648,26 @@ async function guardar(c, predio, actor, b, codigos, previa) {
   for (const k of ["marca", "color", "patente", "sector"]) vehiculo[k] = U.texto(b.vehiculo?.[k], {
     max: 50
   });
+  if (vehiculo.patente) {
+    vehiculo.patente = anterior?.vehiculo?.patente?.toUpperCase() === vehiculo.patente.toUpperCase()
+      ? anterior.vehiculo.patente : vehiculo.patente.toUpperCase();
+  }
   if (Object.values(vehiculo).some(Boolean) && Object.values(vehiculo).some(v => !v)) throw U.error("Completá marca, color, patente y sector, o dejalos vacíos si no hay vehículo.");
+  const nuevasSalidas = personas.filter(p => p.salida && !anterior?.personas.some(a => String(a.dni) === String(p.dni) && a.salida));
+  const presentes = personas.filter(p => p.entrada && !p.salida);
+  let salida = null;
+  if (nuevasSalidas.length) {
+    const antesDeSalir = { ...anterior, vehiculo, personas: [...nuevasSalidas.map(p => ({ ...p, salida: null })), ...presentes] };
+    const estadoAnterior = anterior && await VEHICULOS.estadoVehiculo(c, predio, anterior, { bloquear: true });
+    if (estadoAnterior?.presente && String(anterior.vehiculo.patente).trim().toUpperCase() !== String(vehiculo.patente || "").trim().toUpperCase()) {
+      throw U.error("Registrá primero la salida del vehículo que estaba en el predio.");
+    }
+    const estadoVehiculo = anterior?.id && vehiculo.patente ? await VEHICULOS.estadoVehiculo(c, predio, antesDeSalir, { bloquear: true }) : { presente: Boolean(vehiculo.patente) };
+    const ref = p => ({ dni: String(p.dni), nombre: nombre(p) });
+    salida = { personas: nuevasSalidas.map(ref), presentes: presentes.map(ref),
+      elegibles: personas.filter(p => !p.salida || nuevasSalidas.includes(p)).map(ref),
+      vehiculo_pendiente: estadoVehiculo.presente };
+  }
   const extrasAnteriores = Number(anterior?.servicio_id) === Number(servicio.id) ? anterior.adicionales_vigentes : [];
   const ad = seleccionArticulos(b.adicionales ?? [], { inicio, fin, tipo, personas, recursoId, regimenId, anteriores: extrasAnteriores });
   if (tramos.length) tramos.at(-1).adicionales = ad.filter(a => !a.fecha_desde);
@@ -608,10 +711,14 @@ async function guardar(c, predio, actor, b, codigos, previa) {
   const total = manual === null ? automatico : U.redondear(manual + cot.extras.alquileres);
   if (tipo === "GENERAL" && manual !== null && total !== automatico && !motivo && (anterior?.manual == null || Number(anterior.manual) !== manual)) throw U.error("Justificá el cambio de precio en la observación.");
   const diferencia = U.redondear(total - Number(anterior?.precio_total || 0));
+  const tarifaFija = servicio.modelo_tarifa === "PRECIO_UNICO" ||
+    ["POR_ESTADIA", "POR_RECURSO_NOCHE", "POR_RECURSO_DIA"].includes(servicio.unidad_cobro);
+  const { items: diferenciales, cuotas: cuotasAlojamiento } = diferencialesPorPersona(anterior, cot.personas, total, manual !== null, tarifaFija);
   const cotizacion = {
     automatico,
     total,
     diferencia,
+    fecha_fin: fin,
     personas: cot.personas.map(p => ({
       dni: p.dni,
       nombre: nombre(p),
@@ -626,9 +733,17 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     }),
     descuentos: descuentos.total_descuento
   };
+  if (salida) {
+    cotizacion.salida = salida;
+    cotizacion.diferenciales = diferenciales;
+  }
   const huellaCotizacion = firma(cotizacion);
   if (!previa && b.cotizacion_esperada != null && b.cotizacion_esperada !== huellaCotizacion) {
     throw U.error("El importe cambió desde la revisión. Volvé a revisar la cotización antes de guardar.", 409);
+  }
+  if (!previa && salida) {
+    if (b.cotizacion_esperada !== huellaCotizacion) throw U.error("Revisá la cotización antes de registrar la salida.", 409);
+    validarPlanSalida(salida, planSalida);
   }
   let id = anterior?.id,
     parcela = null;
@@ -696,6 +811,7 @@ async function guardar(c, predio, actor, b, codigos, previa) {
   const actual = await detalle(c, codigos, id);
   Object.assign(actual, {
     fecha_fin: fin,
+    fecha_fin_acordada: finAcordado,
     dia_sin_noche: fin === inicio,
     tipo,
     cantidad,
@@ -704,7 +820,9 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     tramos,
     manual,
     automatico,
-    diferencia
+    diferencia,
+    diferenciales,
+    cuotas_alojamiento: cuotasAlojamiento
   });
   actual.alquileres = ad.filter(a => a.fecha_desde);
   for (const a of actual.adicionales) {
@@ -717,10 +835,18 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     const a = personas.find(x => String(x.dni) === String(p.dni));
     p.entrada = a.entrada;
     p.salida = a.salida;
+    p.salida_prevista = a.salida_prevista;
+  }
+  await VEHICULOS.limpiarCambioVehiculo(c, predio, anterior, actual);
+  if (salida) {
+    actual.plan_salida = planSalida;
+    if (planSalida.vehiculo === "SALE") {
+      await VEHICULOS.registrarSalida(c, predio, actor, actual, nuevasSalidas.map(p => p.salida).sort().at(-1));
+    }
   }
   const cambios = resumenCambios(anterior, actual);
   actual.cambios = cambios;
-  actual.huella_local = U.sha256(JSON.stringify([actor.id, b]));
+  actual.huella_local = U.sha256(JSON.stringify([actor.id, solicitud]));
   const nota = ("Operación atípica · " + predio.nombre + " · " + actor.nombre + (motivo ? " · " + motivo : "")).slice(0, 500);
   actual.historial_ids = [];
   for (const [campo, antes, despues] of cambios.length ? cambios : [["Recepción", null, "Actualización"]]) {
@@ -736,6 +862,7 @@ async function guardar(c, predio, actor, b, codigos, previa) {
   return actual;
 }
 async function operar(c, predio, actor, accion, b) {
+  if (VEHICULOS.acciones.has(accion)) return VEHICULOS.operar(c, predio, actor, accion, b);
   if (!actor || actor.rol !== "ADMIN" && !Number(actor.gestionar_reservas)) throw U.error("No tenés permiso de recepción.", 403);
   const codigos = serviciosDe(predio);
   if (!codigos.length) throw U.error("Este predio no tiene servicios asignados.", 403);
@@ -750,6 +877,8 @@ async function operar(c, predio, actor, accion, b) {
     });
     if (accion === "detalle") {
       const r = await detalle(c, codigos, U.id(b.id));
+      const vehiculo = await VEHICULOS.estadoVehiculo(c, predio, r);
+      Object.assign(r.vehiculo, { en_predio: vehiculo.presente, salida: vehiculo.salida });
       const eventos = await todos(c, "SELECT DATE_FORMAT(fecha,'%Y-%m-%d %H:%i:%s') AS fecha,actor,anterior,actual,motivo FROM recepcion_reserva_evento WHERE reserva_id=? ORDER BY id DESC", [r.id]);
       return {
         reserva: r,
@@ -760,6 +889,15 @@ async function operar(c, predio, actor, accion, b) {
           cambios: resumenCambios(JSON.parse(e.anterior), JSON.parse(e.actual))
         }))
       };
+    }
+    if (accion === "confirmacion") {
+      const operacion = String(b.operacion || "");
+      if (!/^[a-zA-Z0-9_-]{16,64}$/.test(operacion)) throw U.error("Falta identificar la operación.");
+      const recibo = await uno(c, "SELECT id,actual FROM recepcion_reserva_evento WHERE predio_id=? AND operacion=?", [predio.id, operacion]);
+      if (!recibo) return null;
+      const actual = JSON.parse(recibo.actual);
+      if (actual.huella_local !== U.sha256(JSON.stringify([actor.id, b]))) throw U.error("El comprobante corresponde a otro cambio.", 409);
+      return { ...actual, evento_id: Number(recibo.id) };
     }
     if (accion === "cotizar") {
       await c.query("SAVEPOINT recepcion_previa");

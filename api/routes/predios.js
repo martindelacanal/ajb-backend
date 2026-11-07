@@ -19,6 +19,7 @@ const { verificarTokenConAutorizacionActual } = require("../security/autorizacio
 const { obtenerOrigenesPermitidos } = require("../security/http-config");
 const { crearNotificacion } = require("../services/notificaciones");
 const C = require("../services/predios-central");
+const recepcionVehiculos = require("../services/recepcion-vehiculos");
 const propietario = require("../services/predios-propietario");
 const { validarAutorizacionHa } = require("../services/predios-ha");
 const { entregarAvisos } = require("../services/predios-avisos");
@@ -108,12 +109,16 @@ function prepararOrden(actor, ruta, cuerpo, cuenta, predioId, respuestaPrivada) 
   // Solo esta frontera autenticada puede atestiguar un hash. Los secretos
   // introducidos en el formulario nunca se guardan en la cola ni el pendrive.
   const datos = { ...cuerpo };
-  if (/^\/(?:usuarios|altas|productos|permisos|caja)(?:\/|$)/.test(ruta) || ruta === "/sesion/clave" ||
+  const cuentaSeguridad = (ruta === "/sesion/clave" && cuenta?.rol === "SEGURIDAD") ||
+    (/^\/usuarios(?:\/\d+)?$/.test(ruta) && datos.rol === "SEGURIDAD");
+  if (cuentaSeguridad || /^\/recepcion\/(?:guardar|vehiculos\/\d+\/salida|\d+\/vehiculo\/qr)\/?$/.test(ruta)) {
+    actor.capacidad = "recepcion-salidas-v1";
+  } else if (/^\/(?:usuarios|altas|productos|permisos|caja)(?:\/|$)/.test(ruta) || ruta === "/sesion/clave" ||
     /^\/(?:ventas\/\d+\/anular|afiliados\/\d+\/liquidaciones|recepcion\/\d+\/cuenta)$/.test(ruta)) {
     actor.capacidad = "operacion-predio-v2";
   } else if (/^\/(?:compras|ventas|traspasos|solicitudes|bajas)(?:\/|$)/.test(ruta)) actor.capacidad = "stock-predio-v2";
   else if (/^\/bocas(?:\/|$)/.test(ruta)) actor.capacidad = "precios-boca-v1";
-  else if (ruta === "/recepcion/adicionales" || ruta === "/recepcion/guardar" && datos.cuenta_esperada) actor.capacidad = "recepcion-alquileres-v1";
+  else if (ruta === "/recepcion/adicionales") actor.capacidad = "recepcion-alquileres-v1";
   if (/^\/usuarios(?:\/\d+)?$/.test(ruta) && datos.password) {
     clavesUsuario.validarNueva(datos.password, String(datos.usuario || "").trim().toLowerCase());
     actor.hash_clave_validada = U.hashPassword(datos.password);
@@ -177,11 +182,16 @@ function tokenBearer(req) {
   return token;
 }
 
+function rolCuentaPredio(cuenta) {
+  return cuenta.rol === "predio_seguridad" ? "SEGURIDAD" : "ADMIN";
+}
+
 async function contextoCuentaPredio(db, predio, cuenta, ip = null) {
-  const bocas = (await db.all("SELECT id FROM predio_boca WHERE predio_id = ? AND activo = 1", [predio.id])).map(b => Number(b.id));
+  const rol = rolCuentaPredio(cuenta);
+  const bocas = rol === "ADMIN" ? (await db.all("SELECT id FROM predio_boca WHERE predio_id = ? AND activo = 1", [predio.id])).map(b => Number(b.id)) : [];
   const base = { db, pid: predio.id, modo: "central", origen: "REMOTO", ip, servicios: {},
     revisarPreciosCentral: predio.escritor === "CENTRAL",
-    usuario: { id: Number(cuenta.id), usuario: cuenta.usuario, nombre: cuenta.nombre, rol: "ADMIN", bocas, es_admin_general: false, debe_cambiar_clave: !!Number(cuenta.debe_cambiar_clave) }, sesion: {} };
+    usuario: { id: Number(cuenta.id), usuario: cuenta.usuario, nombre: cuenta.nombre, rol, bocas, es_admin_general: false, debe_cambiar_clave: !!Number(cuenta.debe_cambiar_clave) }, sesion: {} };
   base.alAvisosPrecios = (t, filas) => entregarAvisos({ query: async (sql, params) => {
     if (/^\s*SELECT/i.test(sql)) return [await t.all(sql, params)];
     const r = await t.run(sql, params); return [{ insertId: r.insertId }];
@@ -191,9 +201,10 @@ async function contextoCuentaPredio(db, predio, cuenta, ip = null) {
   return base;
 }
 
-async function ejecutarComoAdminPredio(res, predio, cuenta, token, { metodo, ruta, cuerpo, query, ip }) {
+async function ejecutarComoCuentaPredio(res, predio, cuenta, token, { metodo, ruta, cuerpo, query, ip }) {
   const encontrada = apiPredio.buscarRuta(metodo, ruta);
   if (!encontrada) throw U.error("No encontramos esa operación", 404);
+  apiPredio.exigirPermisoSeguridad({ rol: rolCuentaPredio(cuenta) }, encontrada.ruta);
   if (encontrada.ruta.soloLocal) throw U.error("Esta operación se hace desde las PCs del camping", 409);
   if (!encontrada.ruta.escritura) {
     const db = crearMysql(pool(), { predioId: predio.id });
@@ -218,9 +229,10 @@ async function ejecutarComoAdminPredio(res, predio, cuenta, token, { metodo, rut
     // token viejo no puede tomar el hash nuevo después de un cambio de clave.
     const vigente = await autenticarCuentaPredio({ db: conexion, token, jwtSecret: process.env.JWT_SECRET });
     if (!actual || !Number(actual.activo) || Number(vigente.predio_id) !== Number(actual.id) || Number(vigente.id) !== Number(cuenta.id)
-      || !usuario || usuario.rol !== "ADMIN" || Number(usuario.activo) !== 1 || Number(usuario.es_admin_general) === 1) throw U.error("Tu cuenta ya no tiene acceso a este predio", 401, { codigo: "SIN_SESION" });
+      || !usuario || usuario.rol !== rolCuentaPredio(vigente) || Number(usuario.activo) !== 1 || Number(usuario.es_admin_general) === 1) throw U.error("Tu cuenta ya no tiene acceso a este predio", 401, { codigo: "SIN_SESION" });
     const p = C.normalizar(actual);
     clavesUsuario.exigirCambio(vigente, metodo, ruta);
+    apiPredio.exigirPermisoSeguridad(usuario, encontrada.ruta);
     if (p.escritor === "CENTRAL") {
       // Todo el negocio comparte la transacción que bloqueó la identidad; no
       // crea un usuario del sistema general ni abre transacciones anidadas.
@@ -439,12 +451,13 @@ function crearRouterAdmin() {
       const serializadas = comandos.map((c) => ({ id: c.id, tipo: c.tipo, metodo: c.metodo, ruta: c.ruta, cuerpo: JSON.parse(c.cuerpo || "null"), query: JSON.parse(c.query || "null"), actor: JSON.parse(c.actor || "null") }));
       const datos = {
         tipo: "predio-paquete", predio_id: p.id, predio_codigo: p.codigo, generado: U.fechaHora(),
-        maestros: await C.armarMaestros(pool(), p),
+        maestros: await C.armarMaestros(pool(), p, { admiteSalidas: false }),
         comandos: serializadas.filter(c => !c.actor?.capacidad),
         comandos_precios: serializadas.filter(c => c.actor?.capacidad === "precios-boca-v1"),
         comandos_stock: serializadas.filter(c => c.actor?.capacidad === "stock-predio-v2"),
         comandos_operacion: serializadas.filter(c => c.actor?.capacidad === "operacion-predio-v2"),
         comandos_recepcion: serializadas.filter(c => c.actor?.capacidad === "recepcion-alquileres-v1"),
+        comandos_recepcion_salidas: serializadas.filter(c => c.actor?.capacidad === "recepcion-salidas-v1"),
       };
       if (req.query.codigo === "1") {
         const paquete = C.paqueteCodigo();
@@ -666,9 +679,11 @@ function crearRouterSync() {
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'stock-predio-v2')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'operacion-predio-v2')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'recepcion-alquileres-v1')
+             AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'recepcion-salidas-v1')
            ORDER BY id LIMIT 20`, [p.id, capacidades.includes("cuentas-predio-v1") ? 1 : 0,
              capacidades.includes("precios-boca-v1") ? 1 : 0, capacidades.includes("stock-predio-v2") ? 1 : 0,
-             capacidades.includes("operacion-predio-v2") ? 1 : 0, capacidades.includes("recepcion-alquileres-v1") ? 1 : 0]);
+             capacidades.includes("operacion-predio-v2") ? 1 : 0, capacidades.includes("recepcion-alquileres-v1") ? 1 : 0,
+             capacidades.includes("recepcion-salidas-v1") ? 1 : 0]);
         if (filas.length) {
           await conexion.query(`UPDATE predio_comando SET estado = 'ENTREGADO', entregado_en = NOW(), intentos = intentos + 1 WHERE id IN (?)`, [filas.map(c => c.id)]);
         }
@@ -712,11 +727,19 @@ function crearRouterSync() {
       const resultado = await conAutoridadSync(req, async (conexion, predio) => {
         if (predio.escritor !== "LOCAL") throw U.error("La instalación no es el escritor del predio", 409);
         const [[actor]] = await conexion.query(
-          "SELECT id,nombre,rol,gestionar_reservas,general_usuario_id FROM predio_usuario WHERE predio_id=? AND id=? AND activo=1 FOR SHARE",
+          "SELECT id,nombre,rol,gestionar_reservas,general_usuario_id,debe_cambiar_clave FROM predio_usuario WHERE predio_id=? AND id=? AND activo=1 FOR SHARE",
           [predio.id, U.id(req.body.empleado_id)]
         );
-        if (!actor || (actor.rol !== "ADMIN" && !Number(actor.gestionar_reservas))) throw U.error("La cuenta no tiene permiso de recepción sincronizado.", 403);
+        const { accion } = req.body;
+        const vehiculos = recepcionVehiculos.acciones.has(accion);
+        const autorizado = vehiculos ? recepcionVehiculos.permitir(actor, accion)
+          : actor?.rol === "ADMIN" || actor?.rol === "CAJERO" && Number(actor.gestionar_reservas);
+        if (!autorizado) throw U.error("La cuenta no tiene permiso de recepción sincronizado.", 403);
+        clavesUsuario.exigirCambio(actor, "POST", "/recepcion");
         const capacidades = String(req.headers["x-predio-capacidades"] || "").split(",");
+        if (!capacidades.includes("recepcion-salidas-v1") && (vehiculos || ["guardar", "confirmacion"].includes(accion))) {
+          throw U.error("Actualizá el sistema local del predio para gestionar salidas y vehículos.", 409);
+        }
         if (!capacidades.includes("recepcion-alquileres-v1") && ["cotizar", "guardar"].includes(req.body.accion) && req.body.datos?.id) {
           const [[ultimo]] = await conexion.query(`SELECT JSON_LENGTH(e.actual, '$.alquileres') AS alquileres
             FROM recepcion_reserva_evento e WHERE e.reserva_id=? AND e.predio_id=? ORDER BY e.id DESC LIMIT 1`,
@@ -730,7 +753,8 @@ function crearRouterSync() {
   });
   router.get("/maestros", async (req, res) => {
     try {
-      res.json(await C.armarMaestros(pool(), req.predio));
+      const capacidades = String(req.headers["x-predio-capacidades"] || "").split(",");
+      res.json(await C.armarMaestros(pool(), req.predio, { admiteSalidas: capacidades.includes("recepcion-salidas-v1") }));
     } catch (e) { responderError(res, e); }
   });
 
@@ -844,19 +868,24 @@ function crearRouterApp() {
         sesion: {}, query: { ...req.query }, body: req.body && typeof req.body === "object" ? req.body : {},
       };
       if (metodo === "GET" && ruta === "/sesion") {
-        if (base.usuario.debe_cambiar_clave) return res.json({ usuario: { ...base.usuario, bocas: [] }, puestos: [], puesto: null, predio: { nombre: predio.nombre } });
+        if (base.usuario.debe_cambiar_clave || base.usuario.rol === "SEGURIDAD") {
+          return res.json({ usuario: { ...base.usuario, bocas: [] }, puestos: [], puesto: null, predio: { nombre: predio.nombre } });
+        }
         const config = await db.all("SELECT clave, valor FROM predio_config WHERE predio_id = ?", [predio.id]);
         const nombrePredio = config.find((c) => c.clave === "nombre_predio")?.valor || predio.nombre;
         return res.json({
           usuario: base.usuario, puestos: [], puesto: null, predio: { nombre: nombrePredio }, remoto: await estadoRemoto(predio),
         });
       }
-      if (metodo === "GET" && ruta === "/estado-remoto") return res.json(await estadoRemoto(predio));
+      if (metodo === "GET" && ruta === "/estado-remoto") {
+        apiPredio.exigirPermisoSeguridad(base.usuario);
+        return res.json(await estadoRemoto(predio));
+      }
       if (metodo === "POST" && ruta === "/logout") {
         if (cuentaPredio) await cerrarSesionPredio({ db: pool(), token, jwtSecret: process.env.JWT_SECRET });
         return res.json({ ok: true });
       }
-      if (cuentaPredio) return await ejecutarComoAdminPredio(res, predio, usuario, token, { metodo, ruta, cuerpo: req.body && typeof req.body === "object" ? req.body : {}, query: { ...req.query }, ip: req.ip });
+      if (cuentaPredio) return await ejecutarComoCuentaPredio(res, predio, usuario, token, { metodo, ruta, cuerpo: req.body && typeof req.body === "object" ? req.body : {}, query: { ...req.query }, ip: req.ip });
       return await ejecutarComoAdminGeneral(res, predio, usuario, { metodo, ruta, cuerpo: base.body, query: base.query });
     } catch (e) { responderError(res, e); }
   });
@@ -878,6 +907,7 @@ function crearRouterApp() {
     const ext = path.extname(archivo).toLowerCase();
     res.type(TIPOS_ESTATICOS[ext] || "application/octet-stream");
     if (archivo.endsWith("index.html")) {
+      res.setHeader("Permissions-Policy", "camera=(self), microphone=(), geolocation=()");
       const html = fs.readFileSync(archivo, "utf8")
         .replace("<html", `<html data-modo="remoto" data-api="${req.baseUrl}/${codigo}/api" data-predio="${codigo}"`)
         .replace(/__VERSION__/g, encodeURIComponent(C.paqueteCodigo().version));

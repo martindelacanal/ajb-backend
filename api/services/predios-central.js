@@ -228,7 +228,7 @@ async function importarExportacion(pool, predio, datos, { forzar = false, usuari
 
 // ------------------------------------------------------------------ afiliados con reservas
 
-async function armarMaestros(db, predio) {
+async function armarMaestros(db, predio, { admiteSalidas = true } = {}) {
   const hoy = U.hoy();
   const desde = U.sumarDias(hoy, -120);
   const hasta = U.sumarDias(hoy, 400);
@@ -271,6 +271,12 @@ async function armarMaestros(db, predio) {
       personas: 1 + Number(r.acompaniantes || 0),
     });
   }
+  // Una versión anterior asienta las diferencias como deuda genérica. No se le
+  // entregan eventos de la nueva cuenta ni eventos posteriores que adelanten la revisión.
+  const eventosCompatibles = admiteSalidas ? "" : `AND NOT EXISTS (
+    SELECT 1 FROM recepcion_reserva_evento nuevo WHERE nuevo.predio_id=e.predio_id AND nuevo.id<=e.id
+      AND (JSON_TYPE(JSON_EXTRACT(IF(JSON_VALID(nuevo.actual),nuevo.actual,'{}'),'$.plan_salida'))='OBJECT'
+        OR JSON_LENGTH(JSON_EXTRACT(IF(JSON_VALID(nuevo.actual),nuevo.actual,'{}'),'$.diferenciales'))>0))`;
   return {
     // Si se cortó la red después del COMMIT de Turismo, la notebook recupera
     // cada confirmación en orden. La misma clave evita duplicar cargos o saldos.
@@ -278,6 +284,7 @@ async function armarMaestros(db, predio) {
       `SELECT e.id,e.operacion,e.empleado_id,e.actor,e.motivo,e.actual FROM recepcion_reserva_evento e
        JOIN reserva r ON r.id=e.reserva_id JOIN servicio s ON s.id=r.servicio_id
        WHERE e.predio_id=? AND s.codigo IN (?) AND NOT EXISTS (SELECT 1 FROM predio_recepcion_recibo p WHERE p.predio_id=e.predio_id AND p.clave=e.operacion)
+       ${eventosCompatibles}
        ORDER BY e.id LIMIT 100`,[predio.id,servicios]))[0] : [],
     generado: U.fechaHora(),
     ventana_desde: desde,

@@ -32,10 +32,10 @@ function datosTarifa(recursoId, precio, unidad, porPersona) {
   } };
 }
 
-async function cotizacion(recursoId, precio, unidad, porPersona) {
+async function cotizacion(recursoId, precio, unidad, porPersona, personas = [persona]) {
   return cotizar(datosTarifa(recursoId, precio, unidad, porPersona), turismo, {
     tipo: "GENERAL", servicio: { modelo_tarifa: "TEMPORADAS", unidad_cobro: unidad },
-    recursoId, regimenId: 3, personas: [persona], inicio: "2026-11-05", fin: "2026-11-10",
+    recursoId, regimenId: 3, personas, inicio: "2026-11-05", fin: "2026-11-10",
     adicionales: [], tramos: []
   });
 }
@@ -56,4 +56,16 @@ test("una tarifa efectivamente por persona sigue recortando las noches a su sali
   assert.equal(r.total, 36000);
   assert.equal(r.personas[0].tarifas_por_fecha.length, 2);
   assert.ok(r.personas[0].tarifas_por_fecha.every(t => t.por_persona === true));
+});
+
+test("el período previsto es individual y una noche adicional compartida se asigna a quien permanece", async () => {
+  const personas = [
+    { ...persona, salida: null, salida_prevista: "2026-11-07" },
+    { ...persona, dni: "99067311", salida: "2026-11-09", salida_prevista: "2026-11-07" }
+  ];
+  const personal = await cotizacion(86, 18000, "POR_PERSONA_NOCHE", "Y", personas);
+  assert.deepEqual(personal.personas.map(p => p.tarifa_individual), [36000, 72000]);
+  const compartida = await cotizacion(86, 18000, "POR_RECURSO_NOCHE", "N", personas);
+  assert.equal(compartida.total, 90000);
+  assert.deepEqual(compartida.personas.map(p => p.peso_alojamiento), [27000, 63000]);
 });

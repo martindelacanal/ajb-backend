@@ -13,6 +13,7 @@ const { DESTINOS } = require("../listados");
 const { gtinValido, proximidadCodigo } = require("../codigo-barras");
 const { resolverRevisionProducto } = require("../precios");
 const { revisarProducto: revisarStockMinimoProducto, bloquearStockProducto } = require("../stock-minimo");
+const { turnoUsuario } = require("../turnos-caja");
 const { exigirAdmin, esAdmin, bocasDe, exigirPuesto, exigirBoca } = require("./comun");
 
 const DESTINOS_VALIDOS = DESTINOS.map((d) => d.valor);
@@ -569,14 +570,15 @@ async function guardarUsuario(ctx) {
   const datos = {
     usuario: U.texto(b.usuario, { max: 60, min: 3, campo: "El usuario", requerido: true }).toLowerCase().replace(/\s+/g, ""),
     nombre: U.texto(b.nombre, { max: 120, campo: "El nombre", requerido: true }),
-    rol: U.opcion(b.rol || "CAJERO", ["ADMIN", "CAJERO"], "El rol"),
+    rol: U.opcion(b.rol || "CAJERO", ["ADMIN", "CAJERO", "SEGURIDAD"], "El rol"),
   };
   if (!/^[a-z0-9._-]+$/.test(datos.usuario)) throw U.error("El usuario sólo puede tener letras, números, punto, guion o guion bajo");
-  if (b.gestionar_reservas !== undefined) datos.gestionar_reservas = U.bool(b.gestionar_reservas);
-  if (b.puede_cerrar_caja !== undefined) datos.puede_cerrar_caja = U.bool(b.puede_cerrar_caja);
-  if (b.puede_anular_ticket !== undefined) datos.puede_anular_ticket = U.bool(b.puede_anular_ticket);
+  const seguridad = datos.rol === "SEGURIDAD";
+  for (const permiso of ["gestionar_reservas", "puede_cerrar_caja", "puede_anular_ticket"]) {
+    if (seguridad || b[permiso] !== undefined) datos[permiso] = seguridad ? 0 : U.bool(b[permiso]);
+  }
   if (b.activo !== undefined) datos.activo = U.bool(b.activo);
-  const bocas = Array.isArray(b.bocas) ? [...new Set(b.bocas.map((x) => U.id(x, "La boca")))] : [];
+  const bocas = !seguridad && Array.isArray(b.bocas) ? [...new Set(b.bocas.map((x) => U.id(x, "La boca")))] : [];
   if (datos.rol === "CAJERO" && !bocas.length) throw U.error("Asigná al menos una boca al usuario");
   const password = b.password ? String(b.password) : "";
   if (!ctx.hashClaveValidada && (password || !id)) clavesUsuario.validarNueva(password, datos.usuario);
@@ -589,11 +591,16 @@ async function guardarUsuario(ctx) {
     if (dup) throw U.error("Ese nombre de usuario ya existe", 409);
     let usuarioId = id;
     if (id) {
-      const antes = await N.exigir(t, ctx, "predio_usuario", id, "No encontramos el usuario");
+      const antes = await N.exigir(t, ctx, "predio_usuario", id, "No encontramos el usuario", { bloquear: true });
       if (Number(antes.es_admin_general) === 1) throw U.error("Los administradores del sistema general se gestionan desde el sistema general", 409);
       if (Number(ctx.usuario.id) === id && datos.activo === 0) throw U.error("No podés deshabilitar tu propio usuario", 409);
+      if (seguridad && antes.rol !== datos.rol && await turnoUsuario(t, ctx.pid, id)) {
+        throw U.error("Cerrá el turno de caja del usuario antes de asignarle el rol de Seguridad.", 409);
+      }
       await N.actualizar(t, ctx, "predio_usuario", id, datos);
-      if (datos.password_hash && t.dialecto === "sqlite") await t.run("DELETE FROM predio_sesion WHERE usuario_id = ?", [id]);
+      if (t.dialecto === "sqlite" && (datos.password_hash || (seguridad || antes.rol === "SEGURIDAD") && antes.rol !== datos.rol)) {
+        await t.run("DELETE FROM predio_sesion WHERE usuario_id = ?", [id]);
+      }
       const cambios = N.diferencias(antes, await N.obtener(t, ctx, "predio_usuario", id));
       if (datos.password_hash) cambios.password = "cambiada";
       await N.auditar(t, ctx, "Modificación de usuario", "usuario", id, cambios);

@@ -54,6 +54,29 @@ test("cambiar ADMIN a CAJERO y volver a ADMIN revoca órdenes anteriores aunque 
   }
   await assert.rejects(s.db.tx(tx => resolverActorRemoto({ db: tx, pid: 1, actor: s.actor })), e => e.status === 403);
 });
+test("Seguridad no hereda permisos de caja y sólo acepta órdenes para cambiar su propia clave", async t => {
+  const { db, ctx } = await escenario(t);
+  const { id } = await api.ejecutar({ ...ctx, body: {
+    usuario: "seguridad", nombre: "Guardia", rol: "SEGURIDAD", password: "Guardia-2026",
+    gestionar_reservas: true, puede_cerrar_caja: true, puede_anular_ticket: true, bocas: [1],
+  } }, "POST", "/usuarios");
+  const login = await api.ejecutar({ ...ctx, usuario: null, body: { usuario: "seguridad", password: "Guardia-2026" } }, "POST", "/login");
+  assert.equal(login.usuario.rol, "SEGURIDAD");
+  assert.equal(login.usuario.gestionar_reservas, false);
+  assert.equal(login.usuario.puede_cerrar_caja, false);
+  assert.equal(login.usuario.puede_anular_ticket, false);
+  assert.equal(login.puesto, null);
+  assert.equal((await db.get("SELECT COUNT(*) AS n FROM predio_usuario_boca WHERE predio_id=1 AND usuario_id=?", [id])).n, 0);
+  const fila = await db.get("SELECT password_hash FROM predio_usuario WHERE predio_id=1 AND id=?", [id]);
+  const revision = await db.get("SELECT MAX(id) AS id FROM predio_auditoria WHERE predio_id=1 AND entidad='usuario' AND entidad_id=?", [id]);
+  const actor = { tipo: "PREDIO", predio_id: 1, predio_usuario_id: id, credencial_sha256: U.sha256(fila.password_hash), cuenta_revision: revision.id };
+  const usuario = await resolverActorRemoto({ db, pid: 1, actor });
+  assert.deepEqual(usuario.bocas, []);
+  await api.ejecutar({ ...ctx, usuario, hashClaveValidada: U.hashPassword("Nueva-Guardia-2026") }, "POST", "/sesion/clave");
+  const actual = { ...usuario, debe_cambiar_clave: false };
+  await assert.rejects(api.ejecutar({ ...ctx, usuario: actual }, "POST", "/productos"), e => e.status === 403);
+  await assert.rejects(api.ejecutar({ ...ctx, usuario: actual }, "GET", "/listados/ventas"), e => e.status === 403);
+});
 test("se conserva el acceso general válido y se rechazan actores sin identidad o con tipo desconocido", async t => {
   const s = await escenario(t);
   const usuario = await s.db.tx(tx => resolverActorRemoto({ db: tx, pid: 1, actor: { general_id: 15, documento: "22222222", nombre: "Admin general" } }));

@@ -17,7 +17,9 @@
     EFECTIVO: "Efectivo",
     TRANSFERENCIA: "Transferencia",
     AL_SALIR: "A saldar al salir",
-    HABERES: "Planilla de descuento de haberes"
+    HABERES: "Planilla de descuento de haberes",
+    CEDIDO: "Trasladado",
+    RECIBIDO: "Recibido"
   };
   function opciones(obj) {
     return Object.keys(obj).map(function (k) {
@@ -97,7 +99,8 @@
     return (r.recursos || []).map(function (x) { return x.nombre; }).join(", ") || r.recurso || "";
   }
   function vencida(r) {
-    return r.fecha_fin < P.hoy() && (r.personas || []).some(function (p) { return p.entrada && !p.salida; });
+    var hoy = P.hoy();
+    return (r.personas || []).some(function (p) { return p.entrada && !p.salida && (p.salida_prevista || r.fecha_fin) < hoy; });
   }
   function cobroFinal(pendiente, consumos) {
     var neto = Math.round((Number(pendiente) + Number(consumos)) * 100) / 100;
@@ -106,6 +109,62 @@
         P.dato(consumos < 0 ? "Anticipo a devolver" : "Consumos por cobrar", pesos(Math.abs(consumos))),
         P.dato(neto < 0 ? "Total a devolver en el predio" : "Total a cobrar en el predio", pesos(Math.abs(neto)))),
       h("p.chico", "Si la reserva se creó en Turismo, verificá allí el pago original. Este saldo incluye las diferencias de la reserva y los consumos registrados por el predio."));
+  }
+  function liquidacionSalida(salida, borrador) {
+    var total = Number(salida.total);
+    var hayMovimientos = total !== 0 || Number(salida.alojamiento) !== 0 || Number(salida.consumos) !== 0;
+    var puedeTrasladar = total > 0 && salida.presentes.length > 0;
+    var resolver = sel([{ valor: "COBRAR", texto: total < 0 ? "Devolver ahora" : "Cobrar ahora" }]
+      .concat(puedeTrasladar ? [{ valor: "TRASLADAR", texto: "Dejar pendiente para quienes siguen" }] : []),
+    borrador.accion || (puedeTrasladar ? "" : "COBRAR"), puedeTrasladar ? "Elegí qué hacer con el importe" : null);
+    var medio = sel(opciones({ EFECTIVO: MEDIOS.EFECTIVO, TRANSFERENCIA: MEDIOS.TRANSFERENCIA }), borrador.medio, "Elegí un medio");
+    var caja = sel([], null, "Elegí una caja");
+    var campoMedio = P.campo("Medio de pago", medio), campoCaja = P.campo("Caja de efectivo", caja);
+    var vehiculo = sel([{ valor: "SALE", texto: "Sale del predio" }]
+      .concat(salida.presentes.length ? [{ valor: "PERMANECE", texto: "Permanece en el predio" }] : []),
+    borrador.vehiculo || (salida.presentes.length ? "" : "SALE"), salida.presentes.length ? "Elegí una opción" : null);
+    var cajasCargadas = false;
+    function actualizar() {
+      campoMedio.hidden = !total || resolver.value !== "COBRAR";
+      campoCaja.hidden = campoMedio.hidden || medio.value !== "EFECTIVO";
+      if (campoCaja.hidden || cajasCargadas) return;
+      cajasCargadas = true;
+      P.opciones("cajas").then(function (xs) {
+        var asignada = P.puesto() && P.puesto().caja_id;
+        if (!P.esAdmin()) xs = xs.filter(function (x) { return asignada && String(x.valor) === String(asignada); });
+        var preferida = borrador.caja_id || asignada || (xs.length === 1 ? xs[0].valor : "");
+        opSelect(caja, xs, preferida, "Elegí una caja");
+        borrador.caja_id = caja.value;
+      }).catch(function (e) { cajasCargadas = false; P.error(e); });
+    }
+    resolver.onchange = function () { borrador.accion = resolver.value; actualizar(); };
+    medio.onchange = function () { borrador.medio = medio.value; actualizar(); };
+    caja.onchange = function () { borrador.caja_id = caja.value; };
+    vehiculo.onchange = function () { borrador.vehiculo = vehiculo.value; };
+    actualizar();
+    return {
+      vista: h("div.rec-cotizacion.columna",
+        h("h3", "Liquidación de salida"),
+        h("ul.vehiculo-detalle", salida.personas.map(function (p) {
+          return h("li", h("div", h("strong", p.nombre),
+            h("div.chico.texto-2", "Alojamiento " + pesos(p.alojamiento) + " · Consumos " + pesos(p.consumos)),
+            Number(p.trasladado) ? h("div.chico.texto-2", "Incluye " + pesos(p.trasladado) + " de salidas anteriores") : null),
+          h("strong.sin-corte", pesos(p.total)));
+        })),
+        h("p.fuerte", total < 0 ? "Total a devolver: " + pesos(-total) : total > 0 ? "Total a cobrar: " + pesos(total) : "Sin diferencia de dinero"),
+        puedeTrasladar ? P.campo("Qué hacer con la deuda", resolver) : null,
+        puedeTrasladar ? h("p.chico.texto-2", "Si la dejás pendiente, el importe quedará para " + salida.presentes.map(function (p) { return p.nombre; }).join(", ") + ".") : null,
+        grid(campoMedio, campoCaja, salida.vehiculo_pendiente ? P.campo("Salida del vehículo", vehiculo) : null)),
+      datos: function () {
+        var accion = hayMovimientos ? resolver.value : undefined;
+        if (hayMovimientos && !accion) { resolver.focus(); throw Error("Elegí si se cobra ahora o se traslada la deuda."); }
+        if (!campoMedio.hidden && !medio.value) { medio.focus(); throw Error("Elegí cómo se registra el pago."); }
+        if (!campoCaja.hidden && !caja.value) { caja.focus(); throw Error(P.esAdmin() ? "Elegí una caja para registrar el efectivo." : "Ingresá a tu caja para registrar el efectivo de recepción."); }
+        if (salida.vehiculo_pendiente && !vehiculo.value) { vehiculo.focus(); throw Error("Indicá si el vehículo se va o permanece en el predio."); }
+        return { accion: accion, medio: campoMedio.hidden ? undefined : medio.value, caja_id: campoCaja.hidden ? undefined : caja.value,
+          vehiculo: salida.vehiculo_pendiente ? vehiculo.value : undefined };
+      }
+    };
   }
   P.ruta.registrar(/^\/recepcion$/, function (c) {
     var soloVencidas = P.ruta.query().ocupacion === "VENCIDA";
@@ -331,6 +390,8 @@
       });
     var iniciada = (r.personas || []).some(function (p) { return p.entrada; });
     var recursosFijos = !!r.bloque_fecha_id;
+    var checkout = accion === "salida", editarFechas = accion === "fechas";
+    var ajustesSalida = previo && previo.ajustesSalida || {};
     var familia = previo ? previo.familia : [],
       titular = previo ? previo.titular : r.id ? {
         dni: r.titular_dni
@@ -350,10 +411,7 @@
       entidad = input(r.entidad),
       cantidad = input(r.cantidad || 1, "number"),
       traslado = input(hoy, "date");
-    if (!previo && accion === "salida") {
-      viajeros.forEach(function (p) { if (p.entrada && !p.salida) p.salida = hoy; });
-      if (fin.value < hoy && r.tipo !== "PASA_EL_DIA" && !r.bloque_fecha_id) fin.value = hoy;
-    } else if (!previo && accion === "extender") {
+    if (!previo && accion === "extender") {
       fin.value = P.sumarDias(fin.value < hoy ? hoy : fin.value, 1);
     }
     var dni = input(r.titular_dni),
@@ -443,6 +501,37 @@
       pintarAdicionales();
     }
     function pintarPersonas() {
+      if (checkout || editarFechas) {
+        var seleccionables = viajeros.filter(function (p) {
+          var anterior = r.personas.find(function (v) { return String(v.dni) === String(p.dni); });
+          return anterior && !anterior.salida && (!checkout || anterior.entrada);
+        });
+        P.reemplazar(grupoViaje, seleccionables.length ? seleccionables.map(function (p) {
+          var nombre = p.apellido + ", " + p.nombre;
+          if (editarFechas) {
+            var prevista = input(p.salida_prevista, "date");
+            prevista.min = p.entrada || inicio.value;
+            prevista.oninput = function () { p.salida_prevista = prevista.value; };
+            return h("fieldset.rec-viajero", h("legend", nombre),
+              P.campo("Salida prevista individual", prevista, { ayuda: "Si queda vacía, se usa " + fecha(fin.value) + ", la fecha de la reserva." }));
+          }
+          var elegido = P.check("Registrar salida de " + nombre, !!p.salida);
+          var efectiva = input(p.salida || hoy, "date");
+          efectiva.min = p.entrada;
+          efectiva.max = hoy;
+          efectiva.required = true;
+          efectiva.disabled = !elegido.input.checked;
+          efectiva.oninput = function () { p.salida = efectiva.value; };
+          elegido.input.onchange = function () {
+            efectiva.disabled = !elegido.input.checked;
+            p.salida = elegido.input.checked ? efectiva.value || hoy : "";
+            if (elegido.input.checked) { efectiva.value = p.salida; efectiva.focus(); }
+          };
+          return h("fieldset.rec-viajero", h("legend", nombre), grid(elegido,
+            P.campo("Fecha efectiva de salida", efectiva, { ayuda: "Salida prevista: " + fecha(p.salida_prevista || fin.value) })));
+        }) : P.mensaje(checkout ? "No quedan huéspedes presentes." : "No quedan fechas de salida por modificar.", "info"));
+        return;
+      }
       opSelect(selectFamilia, familia.filter(function (x) {
         return !viajeros.some(function (v) {
           return String(v.dni) === String(x.dni);
@@ -469,14 +558,17 @@
         };
         var entrada = campo("entrada", "date", "Ingreso efectivo"),
           salida = campo("salida", "date", "Salida efectiva"),
+          prevista = campo("salida_prevista", "date", "Salida prevista individual (opcional)"),
+          yaSalio = (r.personas || []).some(function (anterior) { return anterior.salida && String(anterior.dni) === String(p.dni); }),
           yaIngreso = (r.personas || []).some(function (anterior) { return anterior.entrada && String(anterior.dni) === String(p.dni); });
+        prevista.querySelector("input").readOnly = yaSalio;
         function marcarHoy(key, etiqueta) {
           p[key] = hoy;
           var control = etiqueta.querySelector("input");
           control.value = hoy;
           control.focus();
         }
-        return h("fieldset.rec-viajero", h("legend", "Pasajero " + (i + 1) + (p.apellido ? " · " + p.apellido : "")), grid(campo("dni", "text", "DNI"), campo("nombre", "text", "Nombre"), campo("apellido", "text", "Apellido"), campo("fecha_nacimiento", "date", "Nacimiento"), P.campo("Vínculo", parentesco)), grid(entrada, salida), h("div.fila", btn("Ingresó hoy", function () {
+        return h("fieldset.rec-viajero", h("legend", "Pasajero " + (i + 1) + (p.apellido ? " · " + p.apellido : "")), grid(campo("dni", "text", "DNI"), campo("nombre", "text", "Nombre"), campo("apellido", "text", "Apellido"), campo("fecha_nacimiento", "date", "Nacimiento"), P.campo("Vínculo", parentesco)), grid(entrada, prevista, salida), h("div.fila", btn("Ingresó hoy", function () {
           if (p.salida && p.salida < hoy) throw Error("El ingreso debe ser anterior o igual a la salida.");
           marcarHoy("entrada", entrada);
         }, "texto"), btn("Salió hoy", function () {
@@ -554,7 +646,11 @@
     };
     function cuerpo() {
       if (!r.id && !titular) throw Error("Buscá o registrá al titular antes de continuar.");
-      if (accion === "salida" && !viajeros.some(function (p) {
+      if (checkout) {
+        var invalida = Array.from(grupoViaje.querySelectorAll('input[type="date"]:not(:disabled)')).find(function (control) { return !control.checkValidity(); });
+        if (invalida) { invalida.reportValidity(); throw Error("Revisá la fecha efectiva de salida."); }
+      }
+      if (checkout && !viajeros.some(function (p) {
         return p.salida && r.personas.some(function (anterior) { return String(anterior.dni) === String(p.dni) && !anterior.salida; });
       })) throw Error("Indicá la fecha efectiva de al menos una salida.");
       var precio = manual.value.trim() ? P.importeDe(manual.value) : null;
@@ -607,14 +703,17 @@
     }
     function pintarCotizacion(b, x, enfocar) {
       cotizacion = { cuerpo: b, resultado: x };
-      var confirmar = btn(accion === "salida" ? "Confirmar salida" : r.id ? "Guardar cambios" : "Crear reserva aprobada", function () {
+      var liquidacion = x.salida ? liquidacionSalida(x.salida, ajustesSalida) : null;
+      var confirmar = btn(x.salida ? "Confirmar salida" : r.id ? "Guardar cambios" : "Crear reserva aprobada", function () {
         var nuevo = cuerpo();
         if (JSON.stringify(nuevo) !== JSON.stringify(b)) {
           cotizacion = null;
           P.vaciar(pre);
           throw Error("Cambiaste el formulario. Revisá el importe de nuevo.");
         }
-        return P.post("/recepcion/guardar", Object.assign({}, b, { cotizacion_esperada: x.cotizacion_esperada, cuenta_esperada: x.cuenta })).then(function (res) {
+        return P.post("/recepcion/guardar", Object.assign({}, b, {
+          cotizacion_esperada: x.cotizacion_esperada, cuenta_esperada: x.cuenta, salida: liquidacion ? liquidacion.datos() : undefined
+        })).then(function (res) {
           if (res.encolado) {
             ir();
             return;
@@ -626,18 +725,20 @@
       var saldo = x.cuenta || cuenta;
       P.reemplazar(pre, h("div.columna", h("div.rec-cotizacion", h("h3", "Revisión del importe"),
         grid(P.dato("Precio final de la reserva", pesos(x.total)), P.dato("Incluye adicionales", pesos(x.adicionales || 0)),
-          r.id ? P.dato(x.diferencia < 0 ? "Disminución del precio" : "Aumento del precio", pesos(Math.abs(x.diferencia))) : null), x.personas.map(function (p) {
+          r.id ? P.dato(x.diferencia < 0 ? "Disminución del precio" : "Aumento del precio", pesos(Math.abs(x.diferencia))) : null,
+          x.fecha_fin && x.fecha_fin !== b.fecha_fin ? P.dato("Nueva fecha de fin de la reserva", fecha(x.fecha_fin)) : null), x.personas.map(function (p) {
         return h("div", p.nombre + " · " + pesos(p.precio));
       })), x.detalle_alquileres && x.detalle_alquileres.length ? tabla(
         ["Artículo", "Unidades", "Primer día", "Último día", "Días cobrados", "Subtotal"], x.detalle_alquileres.map(function (a) {
           return [a.nombre, a.cantidad, fecha(a.fecha_desde), fecha(a.fecha_hasta), a.dias, pesos(a.subtotal)];
         })) : null,
-        saldo ? cobroFinal(Number(saldo.pendiente) + Number(x.diferencia), Number(saldo.neto_consumos)) : null, confirmar));
+        liquidacion ? liquidacion.vista : saldo ? cobroFinal(Number(saldo.pendiente) + Number(x.diferencia), Number(saldo.neto_consumos)) : null, confirmar));
       if (enfocar) confirmar.focus();
     }
     var guardar = btn("Revisar importe", function () {
       var b = cuerpo();
       return P.post("/recepcion/cotizar", b).then(function (x) {
+        ajustesSalida = {};
         pintarCotizacion(b, x, true);
       });
     }, "primario");
@@ -664,26 +765,31 @@
     };
     reg.onchange = pintarAdicionales;
     rec.disabled = serv.disabled = recursosFijos;
-    var tituloEdicion = accion === "salida" ? "Registrar salida · T-" : accion === "extender" ? "Extender estadía · T-" : "Editar T-";
-    c.appendChild(cab(r.id ? tituloEdicion + r.id : "Nueva reserva", accion === "salida" ?
-      "Revisá la fecha de salida de los huéspedes, los días de alquiler y el total antes de confirmar." :
+    var tituloEdicion = checkout ? "Registrar salida · T-" : editarFechas ? "Modificar días por persona · T-" : accion === "extender" ? "Extender estadía · T-" : "Editar T-";
+    c.appendChild(cab(r.id ? tituloEdicion + r.id : "Nueva reserva", checkout ?
+      "Elegí quién sale. Al revisar el importe vas a ver el saldo y qué hacer con el vehículo." : editarFechas ?
+      "Elegí una fecha de salida para cada persona que tenga días distintos a los de la reserva." :
       r.id ? "Revisá el importe antes de guardar los cambios." : "La reserva queda aprobada al confirmarla.", btn("Volver", function () {
       ir(r.id);
     })));
-    if (accion === "salida" && vencida(r) && (r.tipo === "PASA_EL_DIA" || r.bloque_fecha_id)) c.appendChild(
+    if (checkout && vencida(r) && (r.tipo === "PASA_EL_DIA" || r.bloque_fecha_id)) c.appendChild(
       P.mensaje("La salida tardía de esta reserva conserva las fechas y el precio de alojamiento acordados.", "info"));
     c.appendChild(base);
-    base.appendChild(grupo("Titular", "Puede ser distinto de quienes viajan.", h("div.columna", r.id ? h("span", "DNI " + r.titular_dni) : h("div.fila", P.campo("DNI o legajo", dni), btn("Buscar titular", function () {
-      return buscarTitular(dni.value.trim());
-    })), estadoTit, part)));
-    base.appendChild(grupo("Estadía", "Cada reserva tiene un recurso. Para otro recurso, creá otra reserva y asignale las personas que lo usarán.", h("div.columna", grid(P.campo("Tipo de reserva", tipo), P.campo("Servicio", serv), P.campo("Recurso", rec), P.campo("Régimen", reg)),
-      grid(P.campo("Desde", inicio), P.campo("Salida prevista", fin), iniciada && !recursosFijos ? P.campo("Fecha efectiva del traslado", traslado) : null), contingente)));
-    base.appendChild(grupo("Personas que viajan", "Registrá el ingreso y la salida de cada persona con la fecha real. Dejá la salida vacía mientras esté en el predio.", grupoViaje));
-    base.appendChild(grupo("Vehículo", "Si llegan sin auto, dejá los cuatro campos vacíos.", grid(P.campo("Marca", marca), P.campo("Color", color), P.campo("Patente", patente), P.campo("Sector de estacionamiento", sector))));
-    base.appendChild(gExtra);
-    base.appendChild(grupo("Importe y observaciones", null, h("div.columna", grid(P.campo("Precio acordado sin alquileres por día ($)", manual, {
+    if (!checkout && !editarFechas) {
+      base.appendChild(grupo("Titular", "Puede ser distinto de quienes viajan.", h("div.columna", r.id ? h("span", "DNI " + r.titular_dni) : h("div.fila", P.campo("DNI o legajo", dni), btn("Buscar titular", function () {
+        return buscarTitular(dni.value.trim());
+      })), estadoTit, part)));
+      base.appendChild(grupo("Estadía", "Cada reserva tiene un recurso. Para otro recurso, creá otra reserva y asignale las personas que lo usarán.", h("div.columna", grid(P.campo("Tipo de reserva", tipo), P.campo("Servicio", serv), P.campo("Recurso", rec), P.campo("Régimen", reg)),
+        grid(P.campo("Desde", inicio), P.campo("Salida prevista de la reserva", fin), iniciada && !recursosFijos ? P.campo("Fecha efectiva del traslado", traslado) : null), contingente)));
+    }
+    base.appendChild(grupo(checkout ? "Personas presentes" : "Personas que viajan", checkout || editarFechas ? null :
+      "Registrá el ingreso y la salida de cada persona con la fecha real. Si la salida prevista individual queda vacía, se usa la fecha de la reserva.", grupoViaje));
+    if (!checkout && !editarFechas) base.appendChild(grupo("Vehículo", "Si llegan sin auto, dejá los cuatro campos vacíos.", grid(P.campo("Marca", marca), P.campo("Color", color), P.campo("Patente", patente), P.campo("Sector de estacionamiento", sector))));
+    if (checkout && veh.en_predio) base.appendChild(grupo("Vehículo en el predio", null, h("div.rec-grid", P.dato("Patente", veh.patente), P.dato("Estacionamiento", texto(veh.sector)))));
+    if (!editarFechas) base.appendChild(gExtra);
+    base.appendChild(grupo("Importe y observaciones", null, h("div.columna", grid(!checkout && !editarFechas ? P.campo("Precio acordado sin alquileres por día ($)", manual, {
       ayuda: "En General, dejalo vacío para usar la tarifa. En las otras modalidades es obligatorio. Cero indica gratuidad del alojamiento."
-    }), P.campo("Motivo del cambio o de la salida", motivo), P.campo("Observaciones de la reserva", obs)), guardar, pre)));
+    }) : null, P.campo("Motivo del cambio o de la salida", motivo), !checkout && !editarFechas ? P.campo("Observaciones de la reserva", obs) : null), guardar, pre)));
     if (previo) {
       Object.keys(campos).forEach(function (clave) { campos[clave].value = previo.campos[clave]; });
       if (titularMostrado) mostrarTitular(titularMostrado);
@@ -698,16 +804,16 @@
       Object.keys(campos).forEach(function (clave) { valores[clave] = campos[clave].value; });
       return { campos: valores, recurso: rec.value, familiarElegido: selectFamilia.value, adicionalElegido: selectExtra.value,
         familia: familia, titular: titular, particular: particular, titularMostrado: titularMostrado, particularSinFicha: particularSinFicha,
-        viajeros: viajeros, extras: extras, cotizacion: cotizacion, opId: opId, versionInicial: versionInicial };
+        viajeros: viajeros, extras: extras, cotizacion: cotizacion, ajustesSalida: ajustesSalida, opId: opId, versionInicial: versionInicial };
     });
     if (previo) {
       selectFamilia.value = previo.familiarElegido;
       selectExtra.value = previo.adicionalElegido;
-      if (cotizacion) pintarCotizacion(cotizacion.cuerpo, cotizacion.resultado, false);
+      if (cotizacion && (!checkout || cotizacion.resultado.salida)) pintarCotizacion(cotizacion.cuerpo, cotizacion.resultado, false);
       return;
     }
     if (accion === "extender") fin.focus();
-    if (r.id) return buscarTitular(String(r.titular_dni), true);
+    if (r.id && !checkout && !editarFechas) return buscarTitular(String(r.titular_dni), true);
   }
   P.ruta.registrar(/^\/recepcion\/nueva$/, function (c) {
     return get("opciones").then(function (o) {
@@ -875,7 +981,9 @@
           var s = a.personas.find(function (x) {
             return String(x.dni) === String(p.dni);
           });
-          return [p.apellido + ", " + p.nombre, String(p.dni), p.entrada ? fecha(p.entrada) : "Sin ingreso", p.salida ? fecha(p.salida) : p.entrada ? "En el predio" : "—", pesos(p.precio), pesos(s ? s.saldo : 0)];
+          return [p.apellido + ", " + p.nombre, String(p.dni), p.entrada ? fecha(p.entrada) : "Sin ingreso",
+            fecha(p.salida_prevista || r.fecha_fin), p.salida ? fecha(p.salida) : p.entrada ? "En el predio" : "—",
+            pesos(p.precio), pesos(s ? s.saldo : 0)];
         });
         var vh = r.vehiculo || {},
           timeline = d.historial.map(function (e) {
@@ -886,16 +994,23 @@
         var presentes = r.personas.some(function (p) { return p.entrada && !p.salida; });
         var acciones = [btn("Todas las reservas", function () { ir(); }),
           btn("Editar reserva e ingresos", function () { ir(id + "/editar"); }, presentes ? "secundario" : "primario"),
-          presentes && r.tipo !== "PASA_EL_DIA" && !r.bloque_fecha_id ? btn("Extender estadía", function () { ir(id + "/editar?accion=extender"); }) : null,
+          r.tipo !== "PASA_EL_DIA" && r.personas.some(function (p) { return !p.salida; }) ?
+            btn("Modificar días por persona", function () { ir(id + "/editar?accion=fechas"); }) : null,
           presentes ? btn("Registrar salida", function () { ir(id + "/editar?accion=salida"); }, "primario") : null];
         P.reemplazar(c, cab("Reserva T-" + r.id, r.titular_nombre + " · DNI " + r.titular_dni, acciones),
-          vencida(r) ? P.mensaje("La estadía venció el " + fecha(r.fecha_fin) + " y quedan huéspedes sin salida.", "aviso") : null,
+          vencida(r) ? P.mensaje("Quedan huéspedes con su fecha prevista vencida y sin salida registrada.", "aviso") : null,
           grupo("Datos de la estadía", null, h("div.columna",
             grid(P.dato("Servicio", r.servicio), P.dato("Recursos", texto(nombresRecursos(r)) + (r.numero_parcela ? " · Parcela " + r.numero_parcela : "")),
               P.dato("Estadía", fecha(r.fecha_inicio) + " – " + fecha(r.fecha_fin)), P.dato("Estado", r.estado), P.dato("Tipo", TIPOS[r.tipo]),
               P.dato("Total de personas", r.cantidad), r.entidad ? P.dato("Entidad", r.entidad) : null, P.dato("Precio final", pesos(r.precio_total))),
-            vh.patente ? espacio([vh.marca, vh.color, vh.patente, "Sector " + vh.sector].join(" · ")) : null, r.observaciones ? h("p", r.observaciones) : null)),
-          grupo("Pasajeros", null, tabla(["Nombre", "DNI", "Ingreso", "Salida", "Estadía", "Saldo"], pasajeros)),
+            r.observaciones ? h("p", r.observaciones) : null)),
+          vh.patente ? grupo("Vehículo", null, h("div.columna",
+            grid(P.dato("Patente", vh.patente), P.dato("Marca y color", texto([vh.marca, vh.color].filter(Boolean).join(" · "))),
+              P.dato("Estacionamiento", texto(vh.sector)), P.dato("Estado", vh.salida ? "Salió el " + fecha(vh.salida) : vh.en_predio ? "En el predio" : "Sin ingreso")),
+            !vh.salida ? h("div.fila", P.btn("Imprimir etiqueta QR", { icono: "imprimir", onclick: function (e) {
+              P.ejecutar(e.currentTarget, function () { return P.imprimirQRVehiculo(r); }).catch(function () {});
+            } })) : null)) : null,
+          grupo("Pasajeros", null, tabla(["Nombre", "DNI", "Ingreso", "Salida prevista", "Salida efectiva", "Estadía", "Saldo"], pasajeros)),
           r.adicionales.length ? grupo("Alquileres y adicionales", null, tabla(["Artículo", "Unidades", "Período de uso", "Días", "Subtotal"], r.adicionales.map(function (x) {
             return [x.nombre, x.cantidad, x.fecha_desde && x.fecha_hasta ? fecha(x.fecha_desde) + " – " + fecha(x.fecha_hasta) : "Toda la estadía",
               x.dias == null ? "—" : x.dias, pesos(x.subtotal)];
@@ -906,6 +1021,10 @@
           var quien = a.personas.find(function (p) { return Number(p.id) === Number(m.huesped_id); });
           return [P.f.fechaHora(m.fecha), ACC[m.concepto] || {
             SALDAR_CONSUMOS: "Liquidación de consumos",
+            CIERRE_SALIDA: "Cierre de cuenta por salida",
+            PAGO_SALIDA_CONSUMOS: "Consumos liquidados al salir",
+            TRASPASO_ALOJAMIENTO: "Traslado de deuda de alojamiento",
+            TRASPASO_CONSUMOS: "Traslado de deuda de consumos",
             REPARTO: "Reparto",
             DIFERENCIAL: "Diferencia de precio",
             COMPRA: "Compra",

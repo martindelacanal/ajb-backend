@@ -1,5 +1,6 @@
 "use strict";
 const { verificarOperador, turnoAbierto } = require("../turnos-caja");
+const { esCierreDeSaldo, resumirCuenta, repartir } = require("../cuenta-estadia");
 
 const U = require("../util"),
   N = require("../negocio");
@@ -38,41 +39,10 @@ async function turismo(t, ctx, accion, datos) {
   if (s.agente?.recepcion) return s.agente.recepcion(accion, datos, ctx.usuario);
   throw U.error("No hay conexión con el servicio de Turismo.", 503);
 }
-function esCierreDeSaldo(m) {
-  // Anular una planilla reabre la deuda, pero no cancela las cargas posteriores.
-  return m.concepto === "SALDAR_CONSUMOS" && !(m.medio === "HABERES" && Number(m.importe) < 0);
-}
 async function cuenta(t, ctx, id, lock = false) {
   const personas = await t.all("SELECT * FROM predio_huesped WHERE predio_id=? AND reserva_id=? ORDER BY id" + (lock ? t.forUpdate : ""), [ctx.pid, id]);
   const movimientos = await t.all("SELECT * FROM predio_estadia_mov WHERE predio_id=? AND reserva_id=? ORDER BY id DESC" + (lock ? t.forUpdate : ""), [ctx.pid, id]);
-  let prepago = 0,
-    consumos = 0,
-    pendiente = 0;
-  // Los movimientos vienen del más reciente al más antiguo. Cada cierre
-  // cancela todo el crédito, incluidos los anticipos de ese período.
-  const ultimoCierre = movimientos.find(esCierreDeSaldo);
-  const desdeCierre = ultimoCierre ? Number(ultimoCierre.id) : 0;
-  let huboOperacionDeSaldo = false;
-  for (const m of movimientos) {
-    const n = Number(m.importe);
-    if (Number(m.id) > desdeCierre && ["CARGA", "RETIRO", "COMPRA", "ANULACION"].includes(m.concepto)) huboOperacionDeSaldo = true;
-    if (["CARGA", "RETIRO"].includes(m.concepto) && m.medio !== "AL_SALIR") prepago += n;
-    if (["COMPRA", "ANULACION"].includes(m.concepto)) consumos -= n;
-    if (m.concepto === "SALDAR_CONSUMOS") prepago += n;
-    if (m.concepto === "DIFERENCIAL") pendiente += n;
-    if (m.concepto === "PAGO_RESERVA") pendiente -= n;
-  }
-  const neto = U.redondear(consumos - prepago);
-  const saldo = U.redondear(personas.reduce((s, p) => s + Number(p.saldo), 0));
-  return {
-    personas,
-    movimientos,
-    consumos: U.redondear(consumos),
-    neto_consumos: neto,
-    pendiente: U.redondear(pendiente),
-    saldo,
-    cierre_pendiente: huboOperacionDeSaldo || saldo !== 0 || neto !== 0
-  };
+  return resumirCuenta(personas, movimientos);
 }
 async function sincronizar(t, ctx, r) {
   const prev = await cuenta(t, ctx, r.id, true);
@@ -104,7 +74,15 @@ async function aplicarConfirmacion(t, ctx, r, key, huella, motivo) {
   const previo = await t.get("SELECT respuesta FROM predio_recepcion_recibo WHERE predio_id=? AND clave=?" + t.forUpdate, [ctx.pid, key]);
   if (previo) return JSON.parse(previo.respuesta);
   await sincronizar(t, ctx, r);
-  if (Number(r.diferencia)) await movimiento(t, ctx, r.id, "DIFERENCIAL", r.diferencia, null, "Variación del importe de la reserva");
+  const diferenciales = r.diferenciales || (Number(r.diferencia) ? [{ importe: r.diferencia }] : []);
+  if (diferenciales.length || r.plan_salida) {
+    const { personas } = await cuenta(t, ctx, r.id, true);
+    for (const d of diferenciales) {
+      const p = personas.find(p => String(p.dni) === String(d.dni));
+      await movimiento(t, ctx, r.id, "DIFERENCIAL", d.importe, null, "Variación del importe de la reserva", p?.id);
+    }
+    if (r.plan_salida) await aplicarSalida(t, ctx, r.id, r.plan_salida, personas);
+  }
   await N.auditar(t, ctx, "Operación atípica", "reserva", r.id, {
     operacion: key,
     total: r.precio_total,
@@ -131,6 +109,7 @@ async function aplicarConfirmacion(t, ctx, r, key, huella, motivo) {
 async function guardar(ctx) {
   permiso(ctx);
   const b = ctx.body;
+  if (Object.hasOwn(b, "_salida_plan")) throw U.error("La liquidación se calcula al confirmar la salida.");
   return ctx.db.tx(async t => {
     const key = String(b.operacion || "");
     if (!/^[a-zA-Z0-9_-]{16,64}$/.test(key)) throw U.error("Identificador de operación inválido.");
@@ -140,17 +119,28 @@ async function guardar(ctx) {
       if (recibo.huella !== huella) throw U.error("El comprobante corresponde a otra operación.", 409);
       return JSON.parse(recibo.respuesta);
     }
+    const salidaSolicitada = b.cuenta_esperada?.revision_salida || b.salida;
+    const recuperada = salidaSolicitada ? await turismo(t, ctx, "confirmacion", b) : null;
+    if (recuperada) return aplicarConfirmacion(t, ctx, recuperada, key, huella, b.motivo);
     if (b.id && b.cuenta_esperada) {
       const a = await cuenta(t, ctx, U.id(b.id), true);
       if (a.pendiente !== b.cuenta_esperada.pendiente || a.neto_consumos !== b.cuenta_esperada.neto_consumos)
         throw U.error("Cambió la cuenta de la estadía. Revisá el total antes de confirmar.", 409);
     }
-    const r = await turismo(t, ctx, "guardar", b);
+    let datos = b;
+    if (salidaSolicitada) {
+      const { salida, cuenta: esperada } = await revisarSalida(t, ctx, b, true);
+      if (!salida || esperada.revision_salida !== b.cuenta_esperada?.revision_salida) {
+        throw U.error("Cambió la liquidación de salida. Volvé a revisar la cuenta antes de confirmar.", 409);
+      }
+      const plan = await prepararSalida(t, ctx, b, salida);
+      datos = { ...b, _salida_plan: plan };
+    }
+    const r = await turismo(t, ctx, "guardar", datos);
     return aplicarConfirmacion(t, ctx, r, key, huella, b.motivo);
   });
 }
-async function caja(t, ctx, b, n, id, concepto) {
-  if (!n) return;
+async function prepararCaja(t, ctx, b) {
   const cajaId = U.id(b.caja_id || ctx.sesion?.caja_id, "La caja que recibe o devuelve el efectivo");
   const ca = await N.exigir(t, ctx, "predio_caja", cajaId, "No encontramos la caja", { bloquear: true });
   if (ctx.usuario.rol !== "ADMIN" || Number(ctx.sesion?.caja_id) === cajaId) {
@@ -161,19 +151,127 @@ async function caja(t, ctx, b, n, id, concepto) {
   }
   exigirBoca(ctx, ca.boca_id);
   if (!Number(ca.activo)) throw U.error("La caja está inactiva.");
+  return { caja_id: cajaId, boca_id: ca.boca_id, turno_id: turnoDeCaja(ctx, cajaId), fecha: U.fechaHora() };
+}
+async function registrarCaja(t, ctx, datos, n, id, concepto) {
+  if (!n) return;
   await N.insertar(t, ctx, "predio_caja_movimiento", {
-    caja_id: cajaId,
-    boca_id: ca.boca_id,
-    fecha: U.fechaHora(),
+    ...datos,
     concepto,
     tipo: n < 0 ? "EGRESO" : "INGRESO",
     importe: Math.abs(n),
     observaciones: "Reserva T-" + id,
-    turno_id: turnoDeCaja(ctx, cajaId),
     usuario_id: ctx.usuario.id,
     usuario_nombre: N.nombreActor(ctx)
   });
 }
+async function caja(t, ctx, b, n, id, concepto) {
+  if (n) await registrarCaja(t, ctx, await prepararCaja(t, ctx, b), n, id, concepto);
+}
+
+function liquidacionDeSalida(a, cotizacion) {
+  const { personas, presentes, elegibles, vehiculo_pendiente } = cotizacion.salida;
+  const candidatos = presentes.length ? elegibles : personas;
+  const porDni = new Map(candidatos.map(p => [p.dni, {
+    ...p, alojamiento: 0, consumos: 0, trasladado: 0, ...a.saldos_individuales[p.dni]
+  }]));
+  const diferencias = cotizacion.diferenciales || [];
+  for (const { dni, importe } of diferencias) {
+    const p = porDni.get(dni);
+    if (p) p.alojamiento += importe;
+  }
+  const pendientes = {
+    alojamiento: U.redondear(a.pendiente + cotizacion.diferencia),
+    consumos: a.neto_consumos
+  };
+  const fila = [...porDni.values()];
+  for (const rubro of Object.keys(pendientes)) {
+    const remanente = U.redondear(pendientes[rubro] - fila.reduce((s, p) => s + p[rubro], 0));
+    const cuotas = repartir(remanente, fila.map(() => 1));
+    fila.forEach((p, i) => { p[rubro] = U.redondear(p[rubro] + cuotas[i]); });
+  }
+  const salidas = personas.map(({ dni }) => {
+    const { nombre, alojamiento, consumos, trasladado } = porDni.get(dni);
+    return { dni, nombre, alojamiento, consumos, trasladado: U.redondear(trasladado), total: U.redondear(alojamiento + consumos) };
+  });
+  const alojamiento = U.redondear(salidas.reduce((s, p) => s + p.alojamiento, 0));
+  const consumos = U.redondear(salidas.reduce((s, p) => s + p.consumos, 0));
+  return { personas: salidas, presentes, alojamiento, consumos, total: U.redondear(alojamiento + consumos), vehiculo_pendiente };
+}
+
+async function revisarSalida(t, ctx, b, bloquear = false) {
+  const cotizacion = await turismo(t, ctx, "cotizar", b);
+  const a = b.id ? await cuenta(t, ctx, U.id(b.id), bloquear) : resumirCuenta([], []);
+  const esperada = { pendiente: a.pendiente, neto_consumos: a.neto_consumos };
+  if (!cotizacion.salida) return { ...cotizacion, cuenta: esperada };
+  const salida = liquidacionDeSalida(a, cotizacion);
+  esperada.revision_salida = U.sha256(JSON.stringify([cotizacion.cotizacion_esperada, salida,
+    Number(a.movimientos[0]?.id || 0), a.personas.map(p => [Number(p.id), Number(p.saldo), p.entrada, p.salida])]));
+  return { ...cotizacion, salida, cuenta: esperada };
+}
+
+async function verificarAnulaciones(t, ctx, id, a, seleccion = null) {
+  const ultimo = Number(a.movimientos.find(esCierreDeSaldo)?.id || 0);
+  const ids = seleccion ? a.personas.filter(p => seleccion.has(String(p.dni))).map(p => p.id) : [];
+  if (seleccion && !ids.length) return;
+  const alcance = seleccion ? ` AND m.huesped_id IN (${t.lista(ids.length)})` : "";
+  // Una compra ya liquidada por huésped no debe bloquear la salida de los demás.
+  const pendiente = await t.get(`SELECT m.venta_id FROM predio_estadia_mov m
+    JOIN predio_permiso p ON p.predio_id=m.predio_id AND p.referencia_id=m.venta_id
+    WHERE m.predio_id=? AND m.reserva_id=? AND m.id>? AND m.concepto='COMPRA'
+    AND p.tipo='ANULAR_VENTA' AND p.estado='PENDIENTE'${alcance}
+    AND NOT EXISTS (SELECT 1 FROM predio_estadia_mov cierre WHERE cierre.predio_id=m.predio_id
+      AND cierre.reserva_id=m.reserva_id AND cierre.huesped_id=m.huesped_id
+      AND cierre.id>m.id AND cierre.concepto='CIERRE_SALIDA')
+    LIMIT 1${t.forUpdate}`, [ctx.pid, id, ultimo, ...ids]);
+  if (pendiente) throw U.error(`Resolvé la anulación pendiente del ticket N° ${pendiente.venta_id} antes de liquidar la estadía.`, 409);
+}
+
+async function prepararSalida(t, ctx, b, salida) {
+  const eleccion = b.salida || {};
+  const { alojamiento, consumos, total, personas, presentes, vehiculo_pendiente } = salida;
+  const accion = eleccion.accion || alojamiento || consumos
+    ? U.opcion(eleccion.accion, presentes.length ? ["COBRAR", "TRASLADAR"] : ["COBRAR"], "La liquidación")
+    : null;
+  const medio = accion === "COBRAR" && total ? U.opcion(eleccion.medio, ["EFECTIVO", "TRANSFERENCIA"], "El medio de pago") : null;
+  const vehiculo = vehiculo_pendiente
+    ? U.opcion(eleccion.vehiculo, presentes.length ? ["SALE", "PERMANECE"] : ["SALE"], "La salida del vehículo")
+    : null;
+  const id = U.id(b.id, "La reserva", false);
+  if (id) await verificarAnulaciones(t, ctx, id, await cuenta(t, ctx, id, true), presentes.length ? new Set(personas.map(p => p.dni)) : null);
+  const caja = medio === "EFECTIVO" ? await prepararCaja(t, ctx, eleccion) : null;
+  return { personas, presentes, alojamiento, consumos, total, accion, medio, caja, vehiculo };
+}
+
+async function aplicarSalida(t, ctx, id, plan, personas) {
+  const porDni = new Map(personas.map(p => [String(p.dni), p]));
+  const traslada = plan.accion === "TRASLADAR";
+  if (plan.caja) await registrarCaja(t, ctx, plan.caja, plan.total, id, "LIQUIDACION_SALIDA");
+  for (const p of plan.personas) {
+    const h = porDni.get(p.dni);
+    if (p.alojamiento) await movimiento(t, ctx, id, traslada ? "TRASPASO_ALOJAMIENTO" : "PAGO_RESERVA",
+      traslada ? -p.alojamiento : p.alojamiento, traslada ? "CEDIDO" : plan.medio, "Salida de " + h.nombre, h.id);
+    if (p.consumos) await movimiento(t, ctx, id, traslada ? "TRASPASO_CONSUMOS" : "PAGO_SALIDA_CONSUMOS",
+      traslada ? -p.consumos : p.consumos, traslada ? "CEDIDO" : plan.medio, "Salida de " + h.nombre, h.id);
+    await movimiento(t, ctx, id, "CIERRE_SALIDA", 0, null, "Cuenta al registrar la salida", h.id);
+  }
+  if (traslada) {
+    const pesos = plan.presentes.map(() => 1);
+    const alojamiento = repartir(plan.alojamiento, pesos), consumos = repartir(plan.consumos, pesos);
+    for (let i = 0; i < plan.presentes.length; i++) {
+      const h = porDni.get(plan.presentes[i].dni);
+      if (alojamiento[i]) await movimiento(t, ctx, id, "TRASPASO_ALOJAMIENTO", alojamiento[i], "RECIBIDO", "Traslado de alojamiento de quienes salieron", h.id);
+      if (consumos[i]) await movimiento(t, ctx, id, "TRASPASO_CONSUMOS", consumos[i], "RECIBIDO", "Traslado de consumos de quienes salieron", h.id);
+    }
+  }
+  for (const h of personas) {
+    if (Number(h.saldo) && (!plan.presentes.length || plan.personas.some(p => p.dni === String(h.dni)))) {
+      await N.actualizar(t, ctx, "predio_huesped", h.id, { saldo: 0 });
+    }
+  }
+  if (!plan.presentes.length) await movimiento(t, ctx, id, "SALDAR_CONSUMOS", 0, null, "Cierre de la estadía");
+}
+
 async function planilla(t, ctx, r, n) {
   if (!r.afiliado || n <= 0) throw U.error("El descuento de haberes requiere un titular afiliado y un monto a cobrar.");
   const buscar = () => t.get("SELECT id FROM predio_afiliado WHERE predio_id=? AND usuario_general_id=?", [ctx.pid, r.usuario_id]);
@@ -261,14 +359,7 @@ async function administrar(ctx) {
       if (accion === "PAGO_RESERVA" && !n) throw U.error("No hay una diferencia pendiente.");
       if (accion === "LIQUIDAR" && !a.cierre_pendiente) throw U.error("No hay consumos ni saldo para liquidar.");
       if (Number(b.esperado) !== n) throw U.error("El importe cambió. Actualizá la cuenta antes de confirmar.", 409);
-      if (accion === "LIQUIDAR") {
-        const ultimo = a.movimientos.find(esCierreDeSaldo);
-        const pendiente = await t.get(`SELECT m.venta_id FROM predio_estadia_mov m
-          JOIN predio_permiso p ON p.predio_id=m.predio_id AND p.referencia_id=m.venta_id
-          WHERE m.predio_id=? AND m.reserva_id=? AND m.id>? AND m.concepto='COMPRA'
-          AND p.tipo='ANULAR_VENTA' AND p.estado='PENDIENTE' LIMIT 1${t.forUpdate}`, [ctx.pid, id, ultimo?.id || 0]);
-        if (pendiente) throw U.error(`Resolvé la anulación pendiente del ticket N° ${pendiente.venta_id} antes de liquidar la estadía.`, 409);
-      }
+      if (accion === "LIQUIDAR") await verificarAnulaciones(t, ctx, id, a);
       U.opcion(modo, ["EFECTIVO", "TRANSFERENCIA", "HABERES"], "El medio");
       if (modo === "HABERES" && n) liq = await planilla(t, ctx, r, n);
       if (modo === "EFECTIVO") await caja(t, ctx, b, n, id, accion === "LIQUIDAR" ? "LIQUIDACION_ESTADIA" : "DIFERENCIA_RESERVA");
@@ -314,7 +405,8 @@ async function huespedParaDevolucion(t, ctx, huespedId, venta) {
     AND venta_id=? AND huesped_id=? AND concepto='COMPRA' ORDER BY id LIMIT 1${t.forUpdate}`, [ctx.pid, h.reserva_id, venta, h.id]);
   if (!compra) throw U.error("No se encontró el débito del ticket en la cuenta del huésped.", 409);
   const cierre = await t.get(`SELECT id FROM predio_estadia_mov WHERE predio_id=? AND reserva_id=? AND id>?
-    AND concepto='SALDAR_CONSUMOS' AND (COALESCE(medio,'')<>'HABERES' OR importe>=0) LIMIT 1${t.forUpdate}`, [ctx.pid, h.reserva_id, compra.id]);
+    AND ((concepto='SALDAR_CONSUMOS' AND (COALESCE(medio,'')<>'HABERES' OR importe>=0))
+      OR (concepto='CIERRE_SALIDA' AND huesped_id=?)) LIMIT 1${t.forUpdate}`, [ctx.pid, h.reserva_id, compra.id, h.id]);
   if (cierre) throw U.error("La estadía ya liquidó esta compra; no se puede anular desde la caja.", 409);
   return h;
 }
@@ -367,11 +459,7 @@ rutas.push({
 }, {
   m: "POST",
   p: "/recepcion/cotizar",
-  h: ctx => ctx.db.tx(async t => {
-    const resultado = await turismo(t, ctx, "cotizar", ctx.body);
-    const { pendiente, neto_consumos } = ctx.body.id ? await cuenta(t, ctx, U.id(ctx.body.id)) : { pendiente: 0, neto_consumos: 0 };
-    return { ...resultado, cuenta: { pendiente, neto_consumos } };
-  })
+  h: ctx => ctx.db.tx(t => revisarSalida(t, ctx, ctx.body))
 }, {
   m: "POST",
   p: "/recepcion/guardar",
