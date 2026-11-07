@@ -396,7 +396,7 @@ async function habilitarVerCaja(ctx) {
   exigirPuesto(ctx);
   if (esAdmin(ctx)) return { ok: true };
   return ctx.db.tx(async (t) => {
-    const r = await autorizar(t, ctx, "VER_VENTAS_CAJA", { clave: ctx.body.clave, permisoId: ctx.body.permiso_id, referenciaId: ctx.sesion.caja_id });
+    const r = await autorizar(t, ctx, "VER_VENTAS_CAJA", { permisoId: ctx.body.permiso_id, referenciaId: ctx.sesion.caja_id });
     return { ok: true, permiso_id: r.permisoId };
   });
 }

@@ -64,6 +64,7 @@ const CONCEPTOS_CAJA = [
   { valor: "VENTA", texto: "Venta en efectivo" },
   { valor: "ANULACION_VENTA", texto: "Anulación de venta" },
   { valor: "CIERRE_CAJA", texto: "Cierre de caja" },
+  { valor: "CIERRE_TEMPORAL", texto: "Cierre temporal (bolsas en custodia)" },
   { valor: "INGRESO_DINERO", texto: "Ingreso de dinero" },
   { valor: "RETIRO_DINERO", texto: "Retiro de dinero" },
   { valor: "COBRO_LIQUIDACION", texto: "Cobro de liquidación" },
@@ -95,6 +96,12 @@ const TIPOS_PERMISO = [
 ];
 
 const SI_NO = [{ valor: "1", texto: "Sí" }, { valor: "0", texto: "No" }];
+
+const TIPOS_CIERRE = [
+  { valor: "DEFINITIVO", texto: "Definitivo" },
+  { valor: "PENDIENTE", texto: "Temporal · falta el definitivo" },
+  { valor: "TEMPORAL_CERRADO", texto: "Temporal · cerrado" },
+];
 
 // Autor de lo que vino del sistema anterior (creado_por): permite filtrarlo para revisarlo.
 const IMPORTADOR = "Sistema anterior (importación)";
@@ -814,8 +821,8 @@ L.caja = {
     {
       clave: "vista", titulo: "Ver", tipo: "opciones",
       opciones: [
-        { valor: "movimientos", texto: "Movimientos (sin cierres)", sql: "m.concepto <> 'CIERRE_CAJA'" },
-        { valor: "cierres", texto: "Sólo cierres de caja", sql: "m.concepto = 'CIERRE_CAJA'" },
+        { valor: "movimientos", texto: "Movimientos (sin cierres)", sql: "m.concepto NOT IN ('CIERRE_CAJA', 'CIERRE_TEMPORAL')" },
+        { valor: "cierres", texto: "Sólo cierres de caja", sql: "m.concepto IN ('CIERRE_CAJA', 'CIERRE_TEMPORAL')" },
         { valor: "ajustes", texto: "Sólo ajustes manuales", sql: "m.concepto IN ('INGRESO_DINERO', 'RETIRO_DINERO', 'OTROS', 'SALDO_APERTURA')" },
         { valor: "abiertos", texto: "Sin cerrar", sql: "m.cierre_id IS NULL" },
       ],
@@ -856,6 +863,9 @@ L.cierres = {
     { clave: "boca", titulo: "Boca", expr: "b.nombre" },
     { clave: "caja", titulo: "Caja", expr: "c.nombre" },
     { clave: "usuario_nombre", titulo: "Cerró", expr: "ci.usuario_nombre", buscar: true },
+    { clave: "tipo", titulo: "Tipo", expr: "CASE WHEN ci.tipo = 'TEMPORAL' AND ci.estado = 'PENDIENTE' THEN 'PENDIENTE' WHEN ci.tipo = 'TEMPORAL' THEN 'TEMPORAL_CERRADO' ELSE 'DEFINITIVO' END",
+      tipo: "opcion", opciones: TIPOS_CIERRE },
+    { clave: "definitivo_usuario_nombre", titulo: "Cierre definitivo", expr: "ci.definitivo_usuario_nombre", buscar: true },
     { clave: "ventas_cantidad", titulo: "Ventas", expr: "ci.ventas_cantidad", tipo: "int" },
     { clave: "ventas_total", titulo: "Vendido", expr: "ci.ventas_total", tipo: "money" },
     { clave: "saldo_esperado", titulo: "Efectivo esperado", expr: "ci.saldo_esperado", tipo: "money" },
@@ -870,6 +880,14 @@ L.cierres = {
     {
       clave: "diferencia", titulo: "Diferencias", tipo: "opciones",
       opciones: [{ valor: "con", texto: "Con diferencia", sql: "ci.diferencia <> 0" }, { valor: "sin", texto: "Sin diferencia", sql: "ci.diferencia = 0" }],
+    },
+    {
+      clave: "tipo", titulo: "Tipo", tipo: "opciones",
+      opciones: [
+        { valor: "PENDIENTE", texto: "Temporales sin cierre definitivo", sql: "ci.tipo = 'TEMPORAL' AND ci.estado = 'PENDIENTE'" },
+        { valor: "TEMPORAL", texto: "Temporales ya cerrados", sql: "ci.tipo = 'TEMPORAL' AND ci.estado = 'CERRADO'" },
+        { valor: "DEFINITIVO", texto: "Definitivos", sql: "COALESCE(ci.tipo, 'DEFINITIVO') = 'DEFINITIVO'" },
+      ],
     },
     { clave: "desde", titulo: "Desde", tipo: "desde", expr: "ci.fecha" },
     { clave: "hasta", titulo: "Hasta", tipo: "hasta", expr: "ci.fecha" },
@@ -1160,7 +1178,7 @@ L.permisos = {
       { valor: "PENDIENTE", texto: "Pendiente" }, { valor: "APROBADO", texto: "Aprobado" }, { valor: "RECHAZADO", texto: "Rechazado" },
       { valor: "USADO", texto: "Usado" }, { valor: "VENCIDO", texto: "Vencido" },
     ] },
-    { clave: "metodo", titulo: "Cómo", expr: "x.metodo", tipo: "opcion", opciones: [{ valor: "REMOTO", texto: "Desde la cuenta del admin" }, { valor: "CLAVE", texto: "Clave del día" }] },
+    { clave: "metodo", titulo: "Cómo", expr: "x.metodo", tipo: "opcion", opciones: [{ valor: "REMOTO", texto: "Desde la cuenta del admin" }, { valor: "PRESENCIAL", texto: "Con la contraseña del admin en esa PC" }, { valor: "CLAVE", texto: "Clave del día (sistema anterior)" }] },
     { clave: "resuelto_por", titulo: "Resolvió", expr: "x.resuelto_por" },
   ],
   filtros: [

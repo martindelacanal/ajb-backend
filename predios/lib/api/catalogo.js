@@ -629,7 +629,7 @@ const CLAVES_CONFIG = ["nombre_predio", "razon_social", "cuit", "direccion", "le
 
 async function verConfig(ctx) {
   const config = await N.leerConfig(ctx.db, ctx);
-  return esAdmin(ctx) ? { config, clave_del_dia: U.claveDelDia() } : { config };
+  return { config };
 }
 
 async function guardarConfigApi(ctx) {

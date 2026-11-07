@@ -150,3 +150,42 @@ test("el cierre respeta el ancho de la caja y conserva importes, observaciones y
   assert.match(cierre, /FIRMA DEL CAJERO: _/);
   assert.match(cierre, /FIRMA DE QUIEN RECIBE: _/);
 });
+
+test("el cierre temporal imprime el resumen marcado y un ticket por bolsa, en papeles separados", async () => {
+  for (const ancho of [58, 80]) {
+    const s = impresora();
+    s.P.f.fechaHora = () => "05/11/2026 08:00";
+    const datos = { ancho, empresa: ticket.empresa,
+      cierre: { id: 7, tipo: "TEMPORAL", estado: "PENDIENTE", boca: "Proveeduria", caja: "Caja 1", fecha: ticket.venta.fecha, usuario_nombre: "Ana",
+        turno_inicio: "2026-11-05 08:00:00", saldo_inicial: 1000, ingresos: 500, egresos: 50, saldo_esperado: 1450,
+        efectivo_contado: 1440, diferencia: -10, retiro: 1440, queda_en_caja: 0, esperado_ventas: 250, esperado_cambio: 1200,
+        efectivo_ventas: 240, efectivo_cambio: 1200, ventas_cantidad: 2, ventas_total: 400 },
+      efectivo: { saldo_inicial: 1000, agregados: 200, cambio: 1200, ventas: 300, anulaciones: 0, otros_cobros: 0, cobros: 300, retiros: 50, esperado_ventas: 250, esperado_cambio: 1200 },
+      ventas_por_forma: [{ forma_pago: "EFECTIVO", cantidad: 1, total: 300 }, { forma_pago: "QR", cantidad: 1, total: 100 }] };
+    await s.P.imprimirCierre(datos, { bolsas: true });
+    const [resumen, ventas, cambio] = partes(s.trabajos[0]);
+    verificarPapel([resumen, ventas, cambio], ancho === 58 ? 32 : 40);
+    assert.equal(s.trabajos[0].body.hijos[0].hijos.length, 3);
+    assert.match(resumen, /\*\*\* CIERRE TEMPORAL \*\*\*/);
+    assert.match(resumen, /FALTA EL CIERRE DEFINITIVO/);
+    assert.match(resumen, /TOTAL CAMBIO +\$ 1\.200,00/);
+    assert.match(resumen, /TOTAL VENTAS Y COBROS +\$ 300,00/);
+    assert.match(resumen, /FALTANTE +\$ 10,00/);
+    assert.match(ventas, /BOLSA 1 DE 2/);
+    assert.match(ventas, /RECAUDACION/);
+    assert.match(ventas, /CERRO: ANA/);
+    assert.match(ventas, /TURNO DESDE: 05\/11\/2026 08:00/);
+    assert.match(ventas, /ESPERADO EN LA BOLSA +\$ 250,00/);
+    assert.match(ventas, /EN ESTA BOLSA\n +\$ 240,00/);
+    assert.match(cambio, /BOLSA 2 DE 2/);
+    assert.match(cambio, /SALDO INICIAL +\$ 1\.000,00/);
+    assert.match(cambio, /SIN DIFERENCIA/);
+    // Sólo las bolsas: el primer papel no fuerza un corte antes.
+    const s2 = impresora();
+    s2.P.f.fechaHora = () => "05/11/2026 08:00";
+    await s2.P.imprimirCierre(datos, { resumen: false, bolsas: true });
+    assert.equal(s2.trabajos[0].body.hijos[0].hijos.length, 2);
+    assert.equal(s2.trabajos[0].body.hijos[0].hijos[0].nombre, "pre.cierre");
+    assert.equal(s2.trabajos[0].body.hijos[0].hijos[1].nombre, "pre.cierre.corte");
+  }
+});

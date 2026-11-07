@@ -1,16 +1,43 @@
 "use strict";
 
 // Caja: saldo de apertura (lo carga el administrador y lo confirma el cajero),
-// ajustes manuales, cierre de caja y estado del día. El saldo de cada caja es la suma
+// ajustes manuales, cierres de caja y estado del día. El saldo de cada caja es la suma
 // de sus movimientos: ingresos menos egresos.
+//
+// Dos clases de cierre:
+//  - Definitivo: lo hace siempre un administrador, desde su cuenta o escribiendo su
+//    usuario y su contraseña en la PC del cajero. Cuenta el efectivo y decide cuánto
+//    queda en la caja para el próximo turno.
+//  - Temporal: lo hace el cajero cuando se va y no hay un administrador. Todo el efectivo
+//    va a dos bolsas (recaudación y cambio), cada una con su ticket; la caja queda en
+//    cero y libre para el próximo cajero, que empieza de cero sin heredar nada del
+//    anterior. Cuando llega, el administrador recibe las bolsas y cierra cada cierre
+//    temporal en forma definitiva, sin tocar la caja que siguió trabajando.
 
 const U = require("../util");
 const N = require("../negocio");
-const { exigirAdmin, esAdmin, bocasDe, turnoDeCaja, validarClave } = require("./comun");
+const { exigirAdmin, esAdmin, bocasDe, turnoDeCaja } = require("./comun");
+const { verificarAdministrador } = require("./sesion");
+const { emitirAviso } = require("../avisos");
 
 const { turnoAbierto, verificarOperador } = require("../turnos-caja");
 
 const CONCEPTOS_AJUSTE = ["CIERRE_CAJA", "INGRESO_DINERO", "RETIRO_DINERO", "OTROS"];
+const ACCIONES_CIERRE = ["Cierre de caja", "Cierre temporal de caja"];
+
+// Un saldo de apertura deja de describir la caja cuando hay un cierre posterior: el
+// cajero que sigue no hereda lo que cargó o confirmó el anterior. Las fechas tienen
+// precisión de segundos; si el movimiento de la apertura ya entró en un cierre, ese
+// cierre la consumió aunque haya ocurrido en el mismo segundo.
+const APERTURA_VIGENTE = `NOT EXISTS (SELECT 1 FROM predio_cierre ci WHERE ci.predio_id = a.predio_id AND ci.caja_id = a.caja_id
+  AND ci.fecha > COALESCE(a.fecha_modificacion, a.fecha_creacion))
+  AND NOT EXISTS (SELECT 1 FROM predio_caja_movimiento am JOIN predio_cierre ac ON ac.predio_id = am.predio_id AND ac.id = am.cierre_id
+  WHERE am.predio_id = a.predio_id AND am.id = a.movimiento_id AND ac.fecha >= COALESCE(a.fecha_modificacion, a.fecha_creacion))`;
+
+function aperturaVigente(db, pid, cajaId, jornada, columnas = "a.*") {
+  return db.get(`SELECT ${columnas} FROM predio_apertura a WHERE a.predio_id = ? AND a.caja_id = ? AND a.fecha = ? AND ${APERTURA_VIGENTE}`,
+    [pid, cajaId, jornada]);
+}
 
 async function saldoCaja(t, ctx, cajaId) {
   const f = await t.get(
@@ -39,13 +66,39 @@ async function ultimoCierre(t, pid, cajaId) {
   if (!cierre) return null;
   const auditoria = await t.get(
     `SELECT detalle FROM predio_auditoria WHERE predio_id=? AND entidad='caja' AND entidad_id=?
-     AND accion='Cierre de caja' ORDER BY id DESC LIMIT 1`, [pid, cajaId]);
+     AND accion IN (?, ?) ORDER BY id DESC LIMIT 1`, [pid, cajaId, ...ACCIONES_CIERRE]);
   let detalle;
   try { detalle = JSON.parse(auditoria?.detalle || "null"); } catch (_e) { /* formato histórico */ }
   if (detalle && Number(detalle.cierre_id) === Number(cierre.id) && Number.isSafeInteger(detalle.ultima_venta_id)) {
     cierre.ultima_venta_id = detalle.ultima_venta_id;
   }
   return cierre;
+}
+
+// Separa el efectivo esperado en las dos bolsas del cierre: el cambio (saldo inicial y
+// el dinero que se agregó durante la jornada) y la recaudación (ventas y demás cobros
+// en efectivo). Los retiros del día salen primero de la recaudación.
+function separarEfectivo(arrastre, esperado, conceptos) {
+  const r = (n) => U.redondear(n, 2);
+  const suma = (concepto, tipo) => conceptos
+    .filter((c) => c.concepto === concepto && c.tipo === tipo).reduce((s, c) => s + Number(c.total || 0), 0);
+  const neto = (concepto) => suma(concepto, "INGRESO") - suma(concepto, "EGRESO");
+  const saldoInicial = r(arrastre + neto("SALDO_APERTURA"));
+  const agregados = r(neto("INGRESO_DINERO") + suma("OTROS", "INGRESO"));
+  const ventas = r(neto("VENTA"));
+  const anulaciones = r(-neto("ANULACION_VENTA"));
+  const retiros = r(-neto("RETIRO_DINERO") - neto("CIERRE_CAJA") - neto("CIERRE_TEMPORAL") + suma("OTROS", "EGRESO"));
+  const cambio = r(saldoInicial + agregados);
+  // Lo demás (recepción, liquidaciones de afiliados, notas de crédito…) también es
+  // efectivo cobrado o devuelto en el turno.
+  const otrosCobros = r(esperado - cambio - (ventas - anulaciones) + retiros);
+  const cobros = r(ventas - anulaciones + otrosCobros);
+  let enVentas = Math.max(0, r(cobros - retiros));
+  if (enVentas > esperado) enVentas = Math.max(0, esperado);
+  return {
+    saldo_inicial: saldoInicial, agregados, cambio, ventas, anulaciones, otros_cobros: otrosCobros, cobros, retiros,
+    esperado_ventas: r(enVentas), esperado_cambio: r(esperado - enVentas),
+  };
 }
 
 async function resumenAbierto(t, ctx, caja) {
@@ -55,9 +108,13 @@ async function resumenAbierto(t, ctx, caja) {
             COALESCE(SUM(CASE WHEN tipo = 'EGRESO' THEN importe ELSE 0 END), 0) AS egresos,
             COUNT(*) AS cantidad
      FROM predio_caja_movimiento WHERE predio_id = ? AND caja_id = ? AND cierre_id IS NULL`, [ctx.pid, caja.id]);
+  const conceptos = await t.all(
+    `SELECT concepto, tipo, COALESCE(SUM(importe), 0) AS total FROM predio_caja_movimiento
+     WHERE predio_id = ? AND caja_id = ? AND cierre_id IS NULL GROUP BY concepto, tipo`, [ctx.pid, caja.id]);
   const saldo = await saldoCaja(t, ctx, caja.id);
   const ingresos = U.redondear(Number(mov.ingresos), 2);
   const egresos = U.redondear(Number(mov.egresos), 2);
+  const saldoInicial = U.redondear(saldo - ingresos + egresos, 2);
   // Las fechas del predio tienen precisión de segundos. Las ventas posteriores
   // a un cierre pueden compartir su fecha; el ID guardado sí distingue el corte.
   const corte = ultimo && ultimo.ultima_venta_id === undefined ? "v.fecha>?" : "v.id>?";
@@ -73,10 +130,11 @@ async function resumenAbierto(t, ctx, caja) {
   const porForma = ventas.map((v) => ({ forma_pago: v.forma_pago, cantidad: Number(v.cantidad), total: U.redondear(Number(v.total), 2) }));
   return {
     ultimo_cierre: ultimo || null,
-    saldo_inicial: U.redondear(saldo - ingresos + egresos, 2),
+    saldo_inicial: saldoInicial,
     ingresos,
     egresos,
     saldo_esperado: saldo,
+    efectivo: separarEfectivo(saldoInicial, saldo, conceptos),
     ventas_cantidad: Number(cantidades.confirmadas),
     ventas_total: U.redondear(porForma.reduce((s, v) => s + v.total, 0), 2),
     ventas_efectivo: U.redondear(porForma.filter((v) => v.forma_pago === "EFECTIVO").reduce((s, v) => s + v.total, 0), 2),
@@ -92,7 +150,7 @@ async function estado(ctx) {
   const boca = await N.obtener(db, ctx, "predio_boca", caja.boca_id);
   const responsable = await turnoAbierto(db, ctx.pid, cajaId);
   const jornada = responsable ? responsable.inicio.slice(0, 10) : U.hoy();
-  const apertura = await db.get("SELECT * FROM predio_apertura WHERE predio_id = ? AND caja_id = ? AND fecha = ?", [ctx.pid, cajaId, jornada]);
+  const apertura = await aperturaVigente(db, ctx.pid, cajaId, jornada);
   const resumen = await resumenAbierto(db, ctx, caja);
   let turno = null;
   const turnoId = turnoDeCaja(ctx, cajaId);
@@ -200,12 +258,21 @@ function revisionResumen(r) {
   return U.sha256(JSON.stringify([r.saldo_esperado, r.ingresos, r.egresos, r.ventas_cantidad, r.ventas_anuladas, formas]));
 }
 
+function esOperador(ctx, cajaId, turno) {
+  return !!turno && Number(ctx.sesion?.caja_id) === Number(cajaId) && Number(turno.id) === Number(ctx.sesion?.turno_id);
+}
+
 async function previaCierre(ctx) {
   const cajaId = cajaDelPedido(ctx, ctx.query.caja_id);
   const caja = await exigirAccesoCaja(ctx.db, ctx, cajaId);
   const turno = await turnoAbierto(ctx.db, ctx.pid, cajaId);
   const resumen = await resumenAbierto(ctx.db, ctx, caja);
-  return { caja, turno, resumen, revision: revisionResumen(resumen) };
+  return {
+    caja, turno, resumen, revision: revisionResumen(resumen),
+    // El cierre temporal lo hace quien atiende la caja; el definitivo, un administrador.
+    puede_temporal: esOperador(ctx, cajaId, turno),
+    definitivo_pide_admin: !esAdmin(ctx),
+  };
 }
 
 function comprobarCorte(ctx, turno, ultimo) {
@@ -217,24 +284,74 @@ function comprobarCorte(ctx, turno, ultimo) {
   }
 }
 
-function validarClaveCierre(ctx, cajaId) {
-  if (!String(ctx.body.clave ?? "").trim()) {
-    throw U.error("Ingresá la clave del día de Sistema > Configuración.", 403, { codigo: "CLAVE_CIERRE_REQUERIDA" });
+function comprobarRevision(ctx, r) {
+  if (ctx.body.revision && ctx.body.revision !== revisionResumen(r)) {
+    throw U.error("Los movimientos de caja cambiaron. Revisá nuevamente el detalle antes de cerrar.", 409);
   }
-  validarClave(ctx, ctx.body.clave, "CERRAR_CAJA", cajaId, "La clave del día es incorrecta. Revisala en Sistema > Configuración.");
 }
 
-function autorizarCierre(ctx, cajaId) {
-  if (!esAdmin(ctx)) {
-    if (Number(ctx.usuario.puede_cerrar_caja) !== 1) {
-      throw U.error("Pedile a un administrador que cierre la caja desde su cuenta.", 403, { codigo: "SIN_AUTORIZACION" });
-    }
-    return { metodo: "PERMISO_DE_USUARIO" };
+async function exigirSinAnulacionesPendientes(t, ctx, cajaId, anterior) {
+  const corte = anterior && anterior.ultima_venta_id === undefined ? "v.fecha>?" : "v.id>?";
+  const pendiente = await t.get(`SELECT p.id FROM predio_permiso p JOIN predio_venta v ON v.predio_id=p.predio_id AND v.id=p.referencia_id
+    WHERE p.predio_id=? AND v.caja_id=? AND p.tipo='ANULAR_VENTA' AND p.estado='PENDIENTE' AND v.estado='CONFIRMADA' AND ${corte} LIMIT 1`,
+  [ctx.pid, cajaId, anterior?.ultima_venta_id ?? anterior?.fecha ?? 0]);
+  if (pendiente) {
+    throw U.error("Hay ventas pendientes de anulación. Un administrador debe confirmarlas o rechazarlas antes de cerrar la caja (puede hacerlo a distancia desde su cuenta).", 409, { codigo: "ANULACIONES_PENDIENTES" });
   }
-  if (ctx.origen !== "REMOTO" || ctx.claveDiaCierreValidada !== true) validarClaveCierre(ctx, cajaId);
-  return { metodo: "CLAVE_DEL_DIA", admin_id: ctx.usuario.id, administrador: N.nombreActor(ctx) };
 }
 
+// Asienta un cierre: lo registra, ajusta la diferencia, saca de la caja lo que se lleva,
+// cierra los movimientos y el turno y libera el puesto.
+async function asentarCierre(t, ctx, { caja, turno, r, contado, queda, observaciones, temporal, autorizacion, datos }) {
+  const cajaId = Number(caja.id);
+  const diferencia = U.redondear(contado - r.saldo_esperado, 2);
+  const turnoId = turno?.id || null;
+  const retiro = U.redondear(contado - queda, 2);
+  const ahora = U.fechaHora();
+  const cierreId = await N.insertar(t, ctx, "predio_cierre", {
+    caja_id: cajaId, boca_id: caja.boca_id, fecha: ahora, usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
+    saldo_inicial: r.saldo_inicial, ingresos: r.ingresos, egresos: r.egresos, ventas_cantidad: r.ventas_cantidad,
+    ventas_total: r.ventas_total, ventas_efectivo: r.ventas_efectivo, ventas_detalle: JSON.stringify(r.ventas_por_forma),
+    saldo_esperado: r.saldo_esperado, efectivo_contado: contado, diferencia, retiro, queda_en_caja: queda, observaciones,
+    tipo: temporal ? "TEMPORAL" : "DEFINITIVO", estado: temporal ? "PENDIENTE" : "CERRADO",
+    turno_id: turnoId, turno_inicio: turno?.inicio || null, turno_usuario_nombre: turno?.usuario_nombre || null,
+    esperado_ventas: r.efectivo.esperado_ventas, esperado_cambio: r.efectivo.esperado_cambio, efectivo_detalle: JSON.stringify(r.efectivo),
+    autorizacion: autorizacion.metodo,
+    ...datos(ahora),
+  });
+  if (diferencia !== 0) {
+    await N.insertar(t, ctx, "predio_caja_movimiento", {
+      caja_id: cajaId, boca_id: caja.boca_id, fecha: ahora, concepto: "OTROS", tipo: diferencia > 0 ? "INGRESO" : "EGRESO",
+      importe: Math.abs(diferencia), observaciones: `${diferencia > 0 ? "Sobrante" : "Faltante"} en el cierre${temporal ? " temporal" : ""} N° ${cierreId}`,
+      cierre_id: cierreId, turno_id: turnoId, usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
+    });
+  }
+  if (retiro > 0) {
+    await N.insertar(t, ctx, "predio_caja_movimiento", {
+      caja_id: cajaId, boca_id: caja.boca_id, fecha: ahora, concepto: temporal ? "CIERRE_TEMPORAL" : "CIERRE_CAJA", tipo: "EGRESO", importe: retiro,
+      observaciones: temporal ? `Bolsas de recaudación y de cambio en custodia · cierre temporal N° ${cierreId}` : `Retiro de la recaudación · cierre N° ${cierreId}`,
+      cierre_id: cierreId, turno_id: turnoId, usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
+    });
+  }
+  await t.run("UPDATE predio_caja_movimiento SET cierre_id = ? WHERE predio_id = ? AND caja_id = ? AND cierre_id IS NULL", [cierreId, ctx.pid, cajaId]);
+  const ultimaVenta = await t.get("SELECT COALESCE(MAX(id),0) AS id FROM predio_venta WHERE predio_id=? AND caja_id=?", [ctx.pid, cajaId]);
+  // Las instalaciones anteriores podían tener turnos superpuestos en una caja.
+  // Un único cierre contable libera todos sus turnos y tokens asociados.
+  await t.run("UPDATE predio_turno SET fin=?, estado='CERRADO' WHERE predio_id=? AND caja_id=? AND estado='ABIERTO'", [ahora, ctx.pid, cajaId]);
+  if (t.dialecto === "sqlite") await t.run("UPDATE predio_sesion SET boca_id=NULL, caja_id=NULL, turno_id=NULL WHERE caja_id=?", [cajaId]);
+  await N.auditar(t, ctx, temporal ? "Cierre temporal de caja" : "Cierre de caja", "caja", cajaId, {
+    cierre_id: cierreId, turno_id: turnoId, inicio_turno: turno?.inicio || null, autorizacion, ultima_venta_id: Number(ultimaVenta.id),
+    esperado: r.saldo_esperado, contado, diferencia, retiro, queda,
+    ...(temporal ? { esperado_ventas: r.efectivo.esperado_ventas, esperado_cambio: r.efectivo.esperado_cambio } : {}),
+  });
+  return { cierreId, diferencia, retiro, ahora };
+}
+
+function textoDiferencia(diferencia) {
+  return diferencia === 0 ? "sin diferencias" : `con ${diferencia > 0 ? "sobrante" : "faltante"} de ${U.pesos(Math.abs(diferencia))}`;
+}
+
+// Cierre definitivo de una caja abierta. Siempre lo hace un administrador.
 async function cerrar(ctx) {
   const b = ctx.body;
   const cajaId = cajaDelPedido(ctx, b.caja_id);
@@ -242,78 +359,136 @@ async function cerrar(ctx) {
   const queda = U.numero(b.queda_en_caja ?? 0, { min: 0, max: 99999999, campo: "Lo que queda en la caja" });
   const observaciones = U.texto(b.observaciones, { max: 255 });
   if (queda > contado) throw U.error("Lo que queda en la caja no puede ser más que lo contado");
+  let presente = null;
+  if (!esAdmin(ctx)) {
+    if (!String(b.admin_usuario ?? "").trim() && !String(b.admin_password ?? "")) {
+      throw U.error("El cierre definitivo lo hace un administrador. Si no está, hacé un cierre temporal: guardás el efectivo en dos bolsas y el administrador lo cierra cuando llega.", 403, { codigo: "CIERRE_SOLO_ADMIN" });
+    }
+    presente = await verificarAdministrador(ctx, b.admin_usuario, b.admin_password);
+  }
   return ctx.db.tx(async (t) => {
     const caja = await exigirAccesoCaja(t, ctx, cajaId, true);
     const turno = await turnoAbierto(t, ctx.pid, cajaId);
     if (!esAdmin(ctx)) {
-      if (!turno || Number(ctx.sesion?.caja_id) !== cajaId || Number(turno.id) !== Number(ctx.sesion.turno_id)) {
-        throw U.error("Cerrá el turno en el que estás trabajando.", 403);
-      }
+      if (!esOperador(ctx, cajaId, turno)) throw U.error("Cerrá el turno en el que estás trabajando.", 403);
       await verificarOperador(t, ctx, cajaId);
     }
     const r = await resumenAbierto(t, ctx, caja);
     comprobarCorte(ctx, turno, r.ultimo_cierre);
-    if (b.revision && b.revision !== revisionResumen(r)) {
-      throw U.error("Los movimientos de caja cambiaron. Revisá nuevamente el detalle antes de cerrar.", 409);
-    }
-    const autorizacion = autorizarCierre(ctx, cajaId);
-    const anterior = r.ultimo_cierre;
-    const corte = anterior && anterior.ultima_venta_id === undefined ? "v.fecha>?" : "v.id>?";
-    const pendiente = await t.get(`SELECT p.id FROM predio_permiso p JOIN predio_venta v ON v.predio_id=p.predio_id AND v.id=p.referencia_id
-      WHERE p.predio_id=? AND v.caja_id=? AND p.tipo='ANULAR_VENTA' AND p.estado='PENDIENTE' AND v.estado='CONFIRMADA' AND ${corte} LIMIT 1`,
-      [ctx.pid, cajaId, anterior?.ultima_venta_id ?? anterior?.fecha ?? 0]);
-    if (pendiente) throw U.error("Hay ventas pendientes de anulación. Un administrador debe confirmarlas o rechazarlas antes de cerrar la caja.", 409, { codigo: "ANULACIONES_PENDIENTES" });
-    const diferencia = U.redondear(contado - r.saldo_esperado, 2);
-    const turnoId = turno?.id || null;
-    const retiro = U.redondear(contado - queda, 2);
-    const ahora = U.fechaHora();
-    const cierreId = await N.insertar(t, ctx, "predio_cierre", {
-      caja_id: cajaId, boca_id: caja.boca_id, fecha: ahora, usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
-      saldo_inicial: r.saldo_inicial, ingresos: r.ingresos, egresos: r.egresos, ventas_cantidad: r.ventas_cantidad,
-      ventas_total: r.ventas_total, ventas_efectivo: r.ventas_efectivo, ventas_detalle: JSON.stringify(r.ventas_por_forma),
-      saldo_esperado: r.saldo_esperado, efectivo_contado: contado, diferencia, retiro, queda_en_caja: queda, observaciones,
+    comprobarRevision(ctx, r);
+    await exigirSinAnulacionesPendientes(t, ctx, cajaId, r.ultimo_cierre);
+    const admin = presente || { id: ctx.usuario.id, nombre: N.nombreActor(ctx) };
+    const autorizacion = presente
+      ? { metodo: "ADMIN_PRESENTE", admin_id: presente.id, administrador: presente.nombre, admin_usuario: presente.usuario }
+      : { metodo: "ADMIN", admin_id: ctx.usuario.id, administrador: N.nombreActor(ctx) };
+    const c = await asentarCierre(t, ctx, {
+      caja, turno, r, contado, queda, observaciones, temporal: false, autorizacion,
+      datos: (ahora) => ({ definitivo_fecha: ahora, definitivo_usuario_id: admin.id || null, definitivo_usuario_nombre: admin.nombre }),
     });
-    if (diferencia !== 0) {
-      await N.insertar(t, ctx, "predio_caja_movimiento", {
-        caja_id: cajaId, boca_id: caja.boca_id, fecha: ahora, concepto: "OTROS", tipo: diferencia > 0 ? "INGRESO" : "EGRESO",
-        importe: Math.abs(diferencia), observaciones: `${diferencia > 0 ? "Sobrante" : "Faltante"} en el cierre N° ${cierreId}`,
-        cierre_id: cierreId, turno_id: turnoId, usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
-      });
-    }
-    if (retiro > 0) {
-      await N.insertar(t, ctx, "predio_caja_movimiento", {
-        caja_id: cajaId, boca_id: caja.boca_id, fecha: ahora, concepto: "CIERRE_CAJA", tipo: "EGRESO", importe: retiro,
-        observaciones: `Retiro de la recaudación · cierre N° ${cierreId}`, cierre_id: cierreId,
-        turno_id: turnoId, usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
-      });
-    }
-    await t.run("UPDATE predio_caja_movimiento SET cierre_id = ? WHERE predio_id = ? AND caja_id = ? AND cierre_id IS NULL", [cierreId, ctx.pid, cajaId]);
-    const ultimaVenta = await t.get("SELECT COALESCE(MAX(id),0) AS id FROM predio_venta WHERE predio_id=? AND caja_id=?", [ctx.pid, cajaId]);
-    // Las instalaciones anteriores podían tener turnos superpuestos en una caja.
-    // Un único cierre contable libera todos sus turnos y tokens asociados.
-    await t.run("UPDATE predio_turno SET fin=?, estado='CERRADO' WHERE predio_id=? AND caja_id=? AND estado='ABIERTO'", [ahora, ctx.pid, cajaId]);
-    if (t.dialecto === "sqlite") await t.run("UPDATE predio_sesion SET boca_id=NULL, caja_id=NULL, turno_id=NULL WHERE caja_id=?", [cajaId]);
-    await N.auditar(t, ctx, "Cierre de caja", "caja", cajaId, { cierre_id: cierreId, turno_id: turnoId, inicio_turno: turno?.inicio || null, autorizacion, ultima_venta_id: Number(ultimaVenta.id), esperado: r.saldo_esperado, contado, diferencia, retiro, queda });
-    return { id: cierreId, diferencia, retiro, mensaje: diferencia === 0 ? "Caja cerrada sin diferencias" : `Caja cerrada con ${diferencia > 0 ? "sobrante" : "faltante"} de ${U.pesos(Math.abs(diferencia))}` };
+    return {
+      id: c.cierreId, tipo: "DEFINITIVO", diferencia: c.diferencia, retiro: c.retiro,
+      mensaje: c.diferencia === 0 ? "Caja cerrada sin diferencias" : `Caja cerrada ${textoDiferencia(c.diferencia)}`,
+    };
   });
+}
+
+// Cierre temporal: el cajero se va y no hay un administrador. El efectivo queda en dos
+// bolsas con su ticket hasta que un administrador las recibe y hace el cierre definitivo.
+async function cerrarTemporal(ctx) {
+  const b = ctx.body;
+  const cajaId = cajaDelPedido(ctx, b.caja_id);
+  const enVentas = U.numero(b.efectivo_ventas, { min: 0, max: 99999999, campo: "El efectivo de la bolsa de recaudación" });
+  const enCambio = U.numero(b.efectivo_cambio, { min: 0, max: 99999999, campo: "El efectivo de la bolsa de cambio" });
+  const observaciones = U.texto(b.observaciones, { max: 255 });
+  return ctx.db.tx(async (t) => {
+    const caja = await exigirAccesoCaja(t, ctx, cajaId, true);
+    const turno = await turnoAbierto(t, ctx.pid, cajaId);
+    if (!esOperador(ctx, cajaId, turno)) throw U.error("El cierre temporal lo hace quien está atendiendo la caja, desde su turno.", 403, { codigo: "SIN_TURNO" });
+    await verificarOperador(t, ctx, cajaId);
+    const r = await resumenAbierto(t, ctx, caja);
+    comprobarCorte(ctx, turno, r.ultimo_cierre);
+    comprobarRevision(ctx, r);
+    await exigirSinAnulacionesPendientes(t, ctx, cajaId, r.ultimo_cierre);
+    const contado = U.redondear(enVentas + enCambio, 2);
+    const autorizacion = { metodo: "TEMPORAL", cajero_id: ctx.usuario.id, cajero: N.nombreActor(ctx) };
+    // Todo el efectivo se va en las bolsas: la caja queda en cero para el próximo cajero.
+    const c = await asentarCierre(t, ctx, {
+      caja, turno, r, contado, queda: 0, observaciones, temporal: true, autorizacion,
+      datos: () => ({ efectivo_ventas: enVentas, efectivo_cambio: enCambio }),
+    });
+    const boca = await N.obtener(t, ctx, "predio_boca", caja.boca_id);
+    await emitirAviso(t, ctx, {
+      tipo: "CIERRE_TEMPORAL",
+      titulo: `Cierre temporal N° ${c.cierreId} · ${boca?.nombre || "Caja"} · ${caja.nombre}`,
+      mensaje: `${N.nombreActor(ctx)} cerró la caja en forma temporal (${textoDiferencia(c.diferencia)}). Dejó la bolsa de recaudación con ${U.pesos(enVentas)} y la de cambio con ${U.pesos(enCambio)}. Falta que un administrador reciba las bolsas y haga el cierre definitivo.`,
+      detalle: { cierre_id: c.cierreId, caja_id: cajaId, efectivo_ventas: enVentas, efectivo_cambio: enCambio },
+    });
+    return {
+      id: c.cierreId, tipo: "TEMPORAL", diferencia: c.diferencia, retiro: c.retiro,
+      mensaje: `Cierre temporal N° ${c.cierreId} registrado ${textoDiferencia(c.diferencia)}. Guardá cada bolsa con su ticket.`,
+    };
+  });
+}
+
+// El administrador recibe las bolsas de un cierre temporal y lo cierra en forma definitiva.
+// No toca los movimientos de la caja: el efectivo ya había salido al hacer el temporal.
+async function definitivoDeTemporal(ctx) {
+  exigirAdmin(ctx);
+  const id = U.id(ctx.params.id, "El cierre");
+  const recVentas = U.numero(ctx.body.recibido_ventas, { min: 0, max: 99999999, campo: "Lo que hay en la bolsa de recaudación" });
+  const recCambio = U.numero(ctx.body.recibido_cambio, { min: 0, max: 99999999, campo: "Lo que hay en la bolsa de cambio" });
+  const observaciones = U.texto(ctx.body.observaciones, { max: 255 });
+  return ctx.db.tx(async (t) => {
+    const c = await N.exigir(t, ctx, "predio_cierre", id, "No encontramos el cierre", { bloquear: true });
+    if (c.tipo !== "TEMPORAL") throw U.error("Ese cierre ya es definitivo.", 409);
+    if (c.estado !== "PENDIENTE") {
+      throw U.error(`Ese cierre temporal ya lo cerró ${c.definitivo_usuario_nombre || "un administrador"}${c.definitivo_fecha ? ` el ${c.definitivo_fecha}` : ""}.`, 409, { codigo: "CIERRE_YA_DEFINITIVO" });
+    }
+    const declarado = U.redondear(Number(c.efectivo_ventas || 0) + Number(c.efectivo_cambio || 0), 2);
+    const recibido = U.redondear(recVentas + recCambio, 2);
+    const diferencia = U.redondear(recibido - declarado, 2);
+    const ahora = U.fechaHora();
+    await N.actualizar(t, ctx, "predio_cierre", id, {
+      estado: "CERRADO", definitivo_fecha: ahora, definitivo_usuario_id: ctx.usuario.id || null, definitivo_usuario_nombre: N.nombreActor(ctx),
+      recibido_ventas: recVentas, recibido_cambio: recCambio, diferencia_recepcion: diferencia, observaciones_definitivo: observaciones,
+    });
+    await N.auditar(t, ctx, "Cierre definitivo de cierre temporal", "caja", c.caja_id, {
+      cierre_id: id, declarado, recibido, recibido_ventas: recVentas, recibido_cambio: recCambio, diferencia, observaciones,
+    });
+    return {
+      id, diferencia_recepcion: diferencia,
+      mensaje: diferencia === 0 ? `Cierre N° ${id} cerrado en forma definitiva: las bolsas coinciden con lo declarado`
+        : `Cierre N° ${id} cerrado en forma definitiva con ${diferencia > 0 ? "sobrante" : "faltante"} de ${U.pesos(Math.abs(diferencia))} respecto de lo declarado`,
+    };
+  });
+}
+
+const SQL_CIERRE = `SELECT ci.*, ca.nombre AS caja, ca.ancho_ticket, b.nombre AS boca FROM predio_cierre ci
+  JOIN predio_caja ca ON ca.predio_id = ci.predio_id AND ca.id = ci.caja_id
+  JOIN predio_boca b ON b.predio_id = ci.predio_id AND b.id = ci.boca_id`;
+
+function leerJson(texto, base) {
+  try { return JSON.parse(texto || "null") ?? base; } catch (_e) { return base; }
 }
 
 async function detalleCierre(ctx) {
   const id = U.id(ctx.params.id);
-  const c = await ctx.db.get(
-    `SELECT ci.*, ca.nombre AS caja, ca.ancho_ticket, b.nombre AS boca FROM predio_cierre ci
-     JOIN predio_caja ca ON ca.predio_id = ci.predio_id AND ca.id = ci.caja_id
-     JOIN predio_boca b ON b.predio_id = ci.predio_id AND b.id = ci.boca_id
-     WHERE ci.predio_id = ? AND ci.id = ?`, [ctx.pid, id]);
+  const c = await ctx.db.get(`${SQL_CIERRE} WHERE ci.predio_id = ? AND ci.id = ?`, [ctx.pid, id]);
   if (!c) throw U.error("No encontramos el cierre", 404);
   if (!esAdmin(ctx) && !bocasDe(ctx).includes(Number(c.boca_id))) throw U.error("No tenés acceso a este cierre", 403);
-  let detalle = [];
-  try { detalle = JSON.parse(c.ventas_detalle || "[]"); } catch (_e) { detalle = []; }
   const config = await N.leerConfig(ctx.db, ctx);
   return {
-    cierre: c, ancho: Number(c.ancho_ticket) === 58 ? 58 : 80, ventas_por_forma: detalle,
+    cierre: { ...c, tipo: c.tipo || "DEFINITIVO", estado: c.estado || "CERRADO" },
+    ancho: Number(c.ancho_ticket) === 58 ? 58 : 80, ventas_por_forma: leerJson(c.ventas_detalle, []), efectivo: leerJson(c.efectivo_detalle, null),
     empresa: { nombre_predio: config.nombre_predio, razon_social: config.razon_social },
   };
+}
+
+// Cierres temporales que esperan que un administrador reciba las bolsas.
+async function temporalesPendientes(ctx) {
+  exigirAdmin(ctx);
+  const filas = await ctx.db.all(`${SQL_CIERRE} WHERE ci.predio_id = ? AND ci.tipo = 'TEMPORAL' AND ci.estado = 'PENDIENTE' ORDER BY ci.id`, [ctx.pid]);
+  return { cierres: filas.map((c) => ({ ...c, efectivo: leerJson(c.efectivo_detalle, null) })) };
 }
 
 // Resumen de todas las cajas para el administrador.
@@ -323,15 +498,20 @@ async function panelCajas(ctx) {
     `SELECT c.id, c.nombre, c.boca_id, b.nombre AS boca FROM predio_caja c
      JOIN predio_boca b ON b.predio_id = c.predio_id AND b.id = c.boca_id
      WHERE c.predio_id = ? AND c.activo = 1 ORDER BY b.nombre, c.nombre`, [ctx.pid]);
+  const temporales = (await temporalesPendientes(ctx)).cierres;
   const salida = [];
   for (const c of cajas) {
     const r = await resumenAbierto(ctx.db, ctx, c);
     const turno = await turnoAbierto(ctx.db, ctx.pid, c.id);
     const jornada = turno ? turno.inicio.slice(0, 10) : U.hoy();
-    const apertura = await ctx.db.get("SELECT id, importe, verificacion, verificado_por FROM predio_apertura WHERE predio_id = ? AND caja_id = ? AND fecha = ?", [ctx.pid, c.id, jornada]);
-    salida.push({ ...c, saldo: r.saldo_esperado, ventas_cantidad: r.ventas_cantidad, ventas_total: r.ventas_total, ultimo_cierre: r.ultimo_cierre, apertura: apertura || null, turno: turno || null });
+    const apertura = await aperturaVigente(ctx.db, ctx.pid, c.id, jornada, "a.id, a.importe, a.verificacion, a.verificado_por");
+    salida.push({
+      ...c, saldo: r.saldo_esperado, ventas_cantidad: r.ventas_cantidad, ventas_total: r.ventas_total, ultimo_cierre: r.ultimo_cierre,
+      apertura: apertura || null, turno: turno || null,
+      temporales_pendientes: temporales.filter((x) => Number(x.caja_id) === Number(c.id)).length,
+    });
   }
-  return { cajas: salida };
+  return { cajas: salida, temporales };
 }
 
 async function configurarComanda(ctx) {
@@ -352,7 +532,8 @@ async function configurarComanda(ctx) {
 module.exports = {
   ultimoCierre,
   saldoCaja,
-  validarClaveCierre,
+  separarEfectivo,
+  APERTURA_VIGENTE,
   rutas: [
     { m: "GET", p: "/caja/estado", h: estado },
     { m: "GET", p: "/caja/panel", h: panelCajas, roles: ["ADMIN"] },
@@ -362,6 +543,9 @@ module.exports = {
     { m: "POST", p: "/caja/ajuste", h: ajuste, escritura: true, roles: ["ADMIN"] },
     { m: "GET", p: "/caja/cierre/previa", h: previaCierre },
     { m: "POST", p: "/caja/cierre", h: cerrar, escritura: true },
+    { m: "POST", p: "/caja/cierre/temporal", h: cerrarTemporal, escritura: true, soloLocal: true },
+    { m: "GET", p: "/caja/temporales", h: temporalesPendientes, roles: ["ADMIN"] },
     { m: "GET", p: "/caja/cierres/:id", h: detalleCierre },
+    { m: "POST", p: "/caja/cierres/:id/definitivo", h: definitivoDeTemporal, escritura: true, roles: ["ADMIN"] },
   ],
 };

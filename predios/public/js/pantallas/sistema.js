@@ -362,10 +362,6 @@
           Object.keys(campos).forEach(function (k) { cuerpo[k] = campos[k].value; });
           P.ejecutar(ev.currentTarget, function () { return P.put("/config", cuerpo).then(function (x) { if (!x.encolado) P.aviso(x.mensaje, "ok"); }); }).catch(function () {});
         } }))));
-      c.appendChild(h("div.hoja.hoja-cuerpo", { style: { marginTop: "16px" } },
-        h("h2.seccion-titulo", "Clave del día"),
-        h("strong.cifra-valor", r.clave_del_dia),
-        h("p.texto-3", { style: { marginBottom: 0 } }, "Usá esta clave para cerrar una caja desde tu cuenta. También podés escribirla en la PC de un usuario de boca para autorizar un pedido de productos o el acceso a todas las ventas de su caja.")));
     });
   }, { admin: true, titulo: "Configuración" });
 

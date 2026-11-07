@@ -41,8 +41,8 @@ test("sólo la confirmación autorizada devuelve stock y efectivo una vez por ve
   assert.equal((await db.get("SELECT estado FROM predio_venta WHERE id=?", [venta])).estado, "CONFIRMADA");
   assert.equal((await db.get("SELECT COUNT(*) AS n FROM predio_caja_movimiento WHERE tipo='EGRESO'")).n, 0);
   assert.equal(await N.stockActual(db, admin, caja.boca_id, producto.id), 0);
-  const encargadoCierre = { ...cajero, usuario: { ...cajero.usuario, puede_cerrar_caja: 1 } };
-  await assert.rejects(post(encargadoCierre, "/caja/cierre", { efectivo_contado: 0 }), { codigo: "ANULACIONES_PENDIENTES" });
+  const cierreTemporal = { efectivo_ventas: 0, efectivo_cambio: 0 };
+  await assert.rejects(post(cajero, "/caja/cierre/temporal", cierreTemporal), { codigo: "ANULACIONES_PENDIENTES" });
   await assert.rejects(post(cajero, ruta, { motivo, permiso_id: primero.id }), { status: 403 });
   await assert.rejects(post(cajero, "/permisos/" + primero.id + "/resolver", { aprobar: true }), { status: 403 });
   await post(admin, "/permisos/" + primero.id + "/resolver", { aprobar: false });
@@ -76,6 +76,6 @@ test("sólo la confirmación autorizada devuelve stock y efectivo una vez por ve
   const posterior = await db.tx(tx => N.insertar(tx, cajero, "predio_venta", {
     ...cajero.sesion, usuario_id: 2, estado: "CONFIRMADA", forma_pago: "EFECTIVO", total: 30, fecha: "2026-11-05 13:00:00",
   }));
-  await post(encargadoCierre, "/caja/cierre", { efectivo_contado: 0 });
+  await post(cajero, "/caja/cierre/temporal", cierreTemporal);
   await assert.rejects(post(admin, "/ventas/" + posterior + "/anular", { motivo }), /caja se cerró/);
 });

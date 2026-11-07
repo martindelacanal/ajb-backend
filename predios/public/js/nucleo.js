@@ -602,7 +602,33 @@
     });
   };
 
-  // ------------------------------------------------------------------ autorizaciones (clave del día o aprobación a distancia)
+  // ------------------------------------------------------------------ autorizaciones (administrador en la PC o a distancia)
+  // Usuario y contraseña del administrador que está en esta PC: los mismos con los que
+  // entra al sistema (o su DNI y su contraseña de Mi AJB, si es del sistema general).
+  P.camposAdmin = function () {
+    var usuario = P.input({ max: 60, placeholder: "Usuario o DNI", autocomplete: "off" });
+    var clave = P.inputClave({ max: 120, placeholder: "Contraseña", autocomplete: "new-password" });
+    var error = P.h("div.campo-error", { hidden: true, role: "alert" });
+    return {
+      el: P.h("div.columna.campos-admin",
+        P.h("div.grilla.grilla-2", P.campo("Usuario del administrador", usuario), P.campo("Contraseña", clave)), error),
+      usuario: usuario,
+      clave: clave.input,
+      datos: function () { return { admin_usuario: usuario.value.trim(), admin_password: clave.input.value }; },
+      completo: function () {
+        if (!usuario.value.trim()) { usuario.focus(); return false; }
+        if (!clave.input.value) { clave.input.focus(); return false; }
+        return true;
+      },
+      mostrarError: function (mensaje) {
+        error.hidden = !mensaje;
+        error.textContent = mensaje || "";
+        if (mensaje) clave.input.select();
+      },
+      limpiar: function () { clave.input.value = ""; },
+    };
+  };
+
   P.autorizar = function (tipo, opciones) {
     opciones = opciones || {};
     if (P.esAdmin()) return Promise.resolve({});
@@ -614,23 +640,24 @@
     return new Promise(function (resolver, rechazar) {
       var resuelto = false;
       var sondeo = null;
-      var clave = P.h("input.campo-control", { type: "password", inputmode: "numeric", autocomplete: "off", placeholder: "Clave del administrador", style: { fontSize: "20px", letterSpacing: ".2em", textAlign: "center" } });
-      var errorClave = P.h("div.campo-error", { hidden: true });
+      var admin = P.camposAdmin();
       var zonaRemota = P.h("div");
+      var botonAca;
       function terminar(valor) {
         resuelto = true;
         if (sondeo) clearInterval(sondeo);
+        admin.limpiar();
         m.cerrar();
         resolver(valor);
       }
-      function probar() {
-        var v = clave.value.trim();
-        if (!v) { clave.focus(); return; }
-        P.post("/permisos/probar-clave", { clave: v }).then(function () { terminar({ clave: v }); }).catch(function (e) {
-          errorClave.hidden = false;
-          errorClave.textContent = e.message;
-          clave.select();
-        });
+      function aprobarAca() {
+        if (!admin.completo()) return;
+        admin.mostrarError("");
+        botonAca.disabled = true;
+        P.post("/permisos/presencial", Object.assign({ tipo: tipo, referencia_id: opciones.referencia_id, detalle: opciones.detalle }, admin.datos()))
+          .then(function (r) { P.aviso(r.mensaje, "ok"); terminar({ permiso_id: r.permiso_id }); })
+          .catch(function (e) { admin.mostrarError(e.message); })
+          .finally(function () { botonAca.disabled = false; });
       }
       function pedirRemoto(boton) {
         P.ejecutar(boton, function () {
@@ -651,24 +678,27 @@
         });
       }
       P.reemplazar(zonaRemota, P.btn("Pedir permiso al administrador a distancia", { tipo: "suave", icono: "mensaje", onclick: function (ev) { pedirRemoto(ev.currentTarget); } }));
+      botonAca = P.btn("Aprobar acá", { tipo: "primario", icono: "llave", onclick: aprobarAca });
       var m = P.modal({
         titulo: "Autorización del administrador",
         subtitulo: textos[tipo] || opciones.texto,
         contenido: P.h("div.columna",
-          P.h("div.campo", P.h("span.campo-etiqueta", "Si el administrador está acá, que escriba la clave del día"), clave, errorClave),
+          P.h("p", { style: { margin: 0 } }, "Si el administrador está acá, que escriba su usuario y su contraseña."),
+          admin.el,
           P.h("div.fila", P.h("div.espacio", { style: { height: "1px", background: "var(--linea)" } }), P.h("span.texto-3.chico", "o"), P.h("div.espacio", { style: { height: "1px", background: "var(--linea)" } })),
           zonaRemota),
-        alCerrar: function () { if (sondeo) clearInterval(sondeo); if (!resuelto) rechazar(ErrorApi("Autorización cancelada", -1)); },
-        acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn("Usar la clave", { tipo: "primario", icono: "llave", onclick: probar })],
+        alCerrar: function () { admin.limpiar(); if (sondeo) clearInterval(sondeo); if (!resuelto) rechazar(ErrorApi("Autorización cancelada", -1)); },
+        acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), botonAca],
       });
-      clave.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); probar(); } });
+      admin.clave.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); aprobarAca(); } });
+      setTimeout(function () { admin.usuario.focus(); }, 0);
     });
   };
 
   // Llama a la API agregando la autorización cuando el servidor la pide.
   P.conAutorizacion = function (tipo, opciones, llamada) {
     return llamada({}).catch(function (e) {
-      if (e.codigo !== "SIN_AUTORIZACION" && e.codigo !== "CLAVE_INCORRECTA") throw e;
+      if (e.codigo !== "SIN_AUTORIZACION") throw e;
       return P.autorizar(tipo, opciones).then(function (aut) { return llamada(aut); });
     });
   };

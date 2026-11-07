@@ -9,11 +9,13 @@ const { listarAvisos, historialAvisos, leerAviso } = require("../avisos");
 const { revisarPreciosVencidos } = require("../precios");
 const { revisarStockMinimo } = require("../stock-minimo");
 const { TIPOS_PERMISO, textoDe } = require("../listados");
-const { exigirAdmin, esAdmin, bocasDe, validarClave, exigirPuesto } = require("./comun");
+const { exigirAdmin, esAdmin, bocasDe, exigirPuesto } = require("./comun");
+const { verificarAdministrador } = require("./sesion");
 const { anularVenta, solicitarAnulacion } = require("./ventas");
 const { turismo } = require("./recepcion");
 
 const TIPOS = TIPOS_PERMISO.map((t) => t.valor);
+const { APERTURA_VIGENTE } = require("./caja");
 
 async function pedir(ctx) {
   if (esAdmin(ctx)) throw U.error("Como administrador no necesitás pedir autorización");
@@ -73,10 +75,28 @@ async function resolver(ctx) {
   });
 }
 
-// Valida la clave del día sin consumir nada (para abrir pantallas protegidas en esa PC).
-async function probarClave(ctx) {
-  validarClave(ctx, ctx.body.clave, "PRUEBA", null);
-  return { ok: true };
+// El administrador está en la PC del usuario de boca: escribe su usuario y su contraseña
+// y queda aprobado en el momento, igual que si lo aprobara a distancia.
+async function aprobarPresencial(ctx) {
+  if (esAdmin(ctx)) throw U.error("Como administrador no necesitás pedir autorización");
+  const tipo = U.opcion(ctx.body.tipo, TIPOS.filter((t) => t !== "ANULAR_VENTA"), "El tipo de autorización");
+  const referenciaId = ctx.body.referencia_id ? U.id(ctx.body.referencia_id, "La referencia") : (tipo === "VER_VENTAS_CAJA" ? ctx.sesion?.caja_id || null : null);
+  const detalle = U.texto(ctx.body.detalle, { max: 255 });
+  const admin = await verificarAdministrador(ctx, ctx.body.admin_usuario, ctx.body.admin_password);
+  return ctx.db.tx(async (t) => {
+    const config = await N.leerConfig(t, ctx);
+    const ahora = new Date();
+    const id = await N.insertar(t, ctx, "predio_permiso", {
+      tipo, estado: "APROBADO", usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
+      boca_id: ctx.sesion?.boca_id || null, caja_id: ctx.sesion?.caja_id || null, referencia_id: referenciaId, detalle,
+      fecha_solicitud: U.fechaHora(ahora), resuelto_por: admin.nombre, resuelto_fecha: U.fechaHora(ahora), metodo: "PRESENCIAL",
+      vence: U.fechaHora(new Date(ahora.getTime() + Number(config.minutos_permiso || 30) * 60000)),
+    });
+    await N.auditar(t, ctx, "Autorizado con la contraseña del administrador", "permiso", id, {
+      tipo, referencia_id: referenciaId, administrador: admin.nombre, admin_id: admin.id, admin_usuario: admin.usuario,
+    });
+    return { id, permiso_id: id, mensaje: `Aprobado por ${admin.nombre}` };
+  });
 }
 
 async function avisos(ctx) {
@@ -85,7 +105,7 @@ async function avisos(ctx) {
   const db = ctx.db;
   const pid = ctx.pid;
   const hoy = U.hoy();
-  const salida = { permisos: [], solicitudes_despachar: 0, solicitudes_recibir: 0, aperturas: [], vencimientos: 0, stock_negativo: 0, mis_permisos: [] };
+  const salida = { permisos: [], solicitudes_despachar: 0, solicitudes_recibir: 0, aperturas: [], cierres_temporales: 0, vencimientos: 0, stock_negativo: 0, mis_permisos: [] };
   if (ctx.sesion?.token_hash) salida.turno_id = ctx.sesion.turno_id || null;
   salida.notificaciones = await listarAvisos(ctx);
   const historial = await historialAvisos(ctx, { pagina: 1, tam: 10 });
@@ -107,7 +127,9 @@ async function avisos(ctx) {
        FROM predio_apertura a JOIN predio_caja c ON c.predio_id = a.predio_id AND c.id = a.caja_id
        JOIN predio_boca b ON b.predio_id = c.predio_id AND b.id = c.boca_id
        WHERE a.predio_id = ? AND a.fecha = COALESCE((SELECT SUBSTR(t.inicio,1,10) FROM predio_turno t
-          WHERE t.predio_id=a.predio_id AND t.caja_id=a.caja_id AND t.estado='ABIERTO' ORDER BY t.id DESC LIMIT 1), ?) AND a.verificacion = 'NO_COINCIDE'`, [pid, hoy]);
+          WHERE t.predio_id=a.predio_id AND t.caja_id=a.caja_id AND t.estado='ABIERTO' ORDER BY t.id DESC LIMIT 1), ?) AND a.verificacion = 'NO_COINCIDE' AND ${APERTURA_VIGENTE}`, [pid, hoy]);
+    const temporales = await db.get("SELECT COUNT(*) AS n FROM predio_cierre WHERE predio_id = ? AND tipo = 'TEMPORAL' AND estado = 'PENDIENTE'", [pid]);
+    salida.cierres_temporales = Number(temporales.n);
     const v = await db.get(
       `SELECT COUNT(*) AS n FROM predio_producto p WHERE p.predio_id = ? AND ${require("../vencimientos").condicionVencimiento(db.dialecto, "?")}`,
       [pid, hoy]);
@@ -129,12 +151,13 @@ async function avisos(ctx) {
        ORDER BY id DESC LIMIT 10`, [pid, ctx.usuario.id, U.fechaHora(new Date(Date.now() - 2 * 3600000))]);
     if (ctx.sesion?.caja_id) {
       salida.apertura = await db.get(
-        `SELECT id, importe, verificacion FROM predio_apertura WHERE predio_id=? AND caja_id=?
-         AND fecha=COALESCE((SELECT SUBSTR(inicio,1,10) FROM predio_turno WHERE predio_id=? AND id=? AND estado='ABIERTO'), ?)`,
+        `SELECT a.id, a.importe, a.verificacion FROM predio_apertura a WHERE a.predio_id=? AND a.caja_id=?
+         AND a.fecha=COALESCE((SELECT SUBSTR(t.inicio,1,10) FROM predio_turno t WHERE t.predio_id=? AND t.id=? AND t.estado='ABIERTO'), ?)
+         AND ${APERTURA_VIGENTE}`,
         [pid, ctx.sesion.caja_id, pid, ctx.sesion.turno_id || -1, hoy]) || null;
     }
   }
-  salida.total = salida.notificaciones_no_leidas + salida.permisos.length + salida.aperturas.length + salida.solicitudes_despachar + salida.solicitudes_recibir;
+  salida.total = salida.notificaciones_no_leidas + salida.permisos.length + salida.aperturas.length + salida.cierres_temporales + salida.solicitudes_despachar + salida.solicitudes_recibir;
   return salida;
 }
 
@@ -243,7 +266,7 @@ module.exports = {
     { m: "POST", p: "/permisos", h: pedir, escritura: true },
     { m: "GET", p: "/permisos/:id", h: verPermiso },
     { m: "POST", p: "/permisos/:id/resolver", h: resolver, escritura: true, roles: ["ADMIN"] },
-    { m: "POST", p: "/permisos/probar-clave", h: probarClave, soloLocal: true },
+    { m: "POST", p: "/permisos/presencial", h: aprobarPresencial, escritura: true, soloLocal: true },
     { m: "GET", p: "/avisos", h: avisos },
     { m: "GET", p: "/avisos/historial", h: historialAvisos },
     { m: "POST", p: "/avisos/:id/leer", h: leerAviso, escritura: true },

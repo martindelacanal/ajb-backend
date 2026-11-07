@@ -41,11 +41,9 @@ test("salir o cambiar de puesto exige cerrar la caja, incluso al administrador",
   for (const ruta of ["/sesion/salir-puesto", "/logout", "/sesion/puesto"]) {
     await assert.rejects(llamar(admin, "POST", ruta, { boca_id: otra.boca_id, caja_id: otra.id }), { codigo: "TURNO_ABIERTO" });
   }
-  await assert.rejects(llamar(admin, "POST", "/caja/cierre", { efectivo_contado: 0 }), { codigo: "CLAVE_CIERRE_REQUERIDA" });
-  await assert.rejects(llamar(admin, "POST", "/caja/cierre", { efectivo_contado: 0, clave: "00000000" }), { codigo: "CLAVE_INCORRECTA" });
-  const { clave_del_dia: clave } = await llamar(admin, "GET", "/config");
-  assert.equal(clave, U.claveDelDia());
-  const cierre = { caja_id: caja.id, efectivo_contado: 0, clave, turno_id: ingreso.puesto.turno_id, ultimo_cierre_id: null };
+  // Ya no hay clave del día: el administrador cierra con su propia cuenta.
+  assert.equal((await llamar(admin, "GET", "/config")).clave_del_dia, undefined);
+  const cierre = { caja_id: caja.id, efectivo_contado: 0, turno_id: ingreso.puesto.turno_id, ultimo_cierre_id: null };
   await llamar(admin, "POST", "/caja/cierre", cierre);
   assert.equal((await db.get("SELECT estado FROM predio_turno WHERE id=?", [ingreso.puesto.turno_id])).estado, "CERRADO");
   assert.equal((await db.get("SELECT turno_id FROM predio_sesion WHERE token_hash='sesion'")).turno_id, null);
@@ -71,7 +69,7 @@ test("administrar otra caja conserva el turno del puesto y separa los movimiento
     boca_id: otra.boca_id, caja_id: otra.id, fecha: "2026-11-05 10:00:00", forma_pago: "EFECTIVO", estado: "CONFIRMADA", total: 10,
   });
   await llamar(admin, "POST", `/ventas/${venta}/anular`, { motivo: "Error de carga" });
-  await llamar(admin, "POST", "/caja/cierre", { caja_id: otra.id, clave: U.claveDelDia(), efectivo_contado: 185, queda_en_caja: 40 });
+  await llamar(admin, "POST", "/caja/cierre", { caja_id: otra.id, efectivo_contado: 185, queda_en_caja: 40 });
   const movimientos = await db.all("SELECT caja_id, turno_id FROM predio_caja_movimiento WHERE caja_id = ?", [otra.id]);
   assert.equal(movimientos.length, 4);
   assert.ok(movimientos.every(m => m.turno_id === null));
@@ -127,20 +125,27 @@ test("dos usuarios compiten por una caja, el titular retoma su turno y el relevo
   const reingreso = await login(usuarios[i]);
   assert.equal(reingreso.puesto.turno_id, turno);
   assert.equal((await autenticar(sesiones[i].token)).sesion.turno_id, null);
-  await assert.rejects(llamar(primero, "POST", "/caja/cierre", { efectivo_contado: 15 }), { codigo: "SIN_PUESTO" });
+  await assert.rejects(llamar(primero, "POST", "/caja/cierre/temporal", { efectivo_ventas: 15, efectivo_cambio: 0 }), { codigo: "SIN_PUESTO" });
   const responsable = await autenticar(reingreso.token);
   const estado = await llamar(responsable, "GET", "/caja/estado");
   assert.equal(estado.apertura.fecha, "2026-11-05");
   assert.equal(estado.resumen.ventas_cantidad, 2);
   assert.equal(estado.resumen.ventas_total, 50);
   assert.equal((await llamar(responsable, "GET", "/config")).clave_del_dia, undefined);
-  await assert.rejects(llamar(responsable, "POST", "/caja/cierre", { efectivo_contado: 15, clave: U.claveDelDia() }), { status: 403 });
+  // El cierre definitivo es del administrador, aunque el usuario tenga el permiso anterior.
   await db.run("UPDATE predio_usuario SET puede_cerrar_caja=1 WHERE id=?", [responsable.usuario.id]);
   const delegado = await autenticar(reingreso.token);
+  await assert.rejects(llamar(delegado, "POST", "/caja/cierre", { efectivo_contado: 15 }), { codigo: "CIERRE_SOLO_ADMIN" });
+  // Con el administrador en la PC: escribe su usuario y su contraseña.
+  await db.run("UPDATE predio_usuario SET password_hash=? WHERE usuario='admin'", [U.hashPassword("Admin-presente1")]);
+  await assert.rejects(llamar(delegado, "POST", "/caja/cierre", { efectivo_contado: 15, admin_usuario: "admin", admin_password: "otra" }), { codigo: "ADMIN_INCORRECTO" });
+  await assert.rejects(llamar(delegado, "POST", "/caja/cierre", { efectivo_contado: 15, admin_usuario: usuarios[otro], admin_password: clave }), { codigo: "ADMIN_INCORRECTO" });
   const original = U.fechaHora;
   t.mock.method(U, "fechaHora", fecha => fecha ? original(fecha) : madrugada);
-  const cierre = await llamar(delegado, "POST", "/caja/cierre", { efectivo_contado: 15, queda_en_caja: 15 });
+  const cierre = await llamar(delegado, "POST", "/caja/cierre", { efectivo_contado: 15, queda_en_caja: 15, admin_usuario: " ADMIN ", admin_password: "Admin-presente1" });
   assert.equal(cierre.diferencia, 0);
+  const asentado = await db.get("SELECT tipo, estado, usuario_nombre, definitivo_usuario_nombre, autorizacion FROM predio_cierre WHERE id=?", [cierre.id]);
+  assert.deepEqual({ ...asentado }, { tipo: "DEFINITIVO", estado: "CERRADO", usuario_nombre: usuarios[i], definitivo_usuario_nombre: "Admin", autorizacion: "ADMIN_PRESENTE" });
   assert.equal((await db.get("SELECT fin FROM predio_turno WHERE id=?", [turno])).fin, madrugada);
   const siguiente = await llamar(actores[otro], "POST", "/sesion/puesto", puesto);
   assert.notEqual(siguiente.puesto.turno_id, turno);

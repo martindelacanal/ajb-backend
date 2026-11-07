@@ -146,6 +146,73 @@ async function verificarAdminGeneral(ctx, documento, password) {
   return null;
 }
 
+// ------------------------------------------------------------------ administrador presente
+// En la PC de un usuario de boca, el administrador escribe su usuario (o su DNI, si es
+// del sistema general) y su contraseña para aprobar algo en el momento: el cierre
+// definitivo de la caja, un pedido de productos o ver todas las ventas de la caja.
+// Los fallos se cuentan en memoria (5 cada 10 minutos por PC y por cuenta) porque la
+// petición puede correr dentro de una transacción que se revierte al fallar.
+const fallosAdmin = new Map();
+const VENTANA_ADMIN_MS = 10 * 60 * 1000;
+const MAX_FALLOS_ADMIN = 5;
+
+function clavesFalloAdmin(ctx, identificador) {
+  return [`ip:${ctx.pid}:${ctx.ip || "sin-ip"}`, `cuenta:${ctx.pid}:${U.sha256(identificador)}`];
+}
+
+function controlarFallosAdmin(claves) {
+  const ahora = Date.now();
+  for (const k of claves) {
+    const e = fallosAdmin.get(k);
+    if (e && ahora - e.inicio < VENTANA_ADMIN_MS && e.n >= MAX_FALLOS_ADMIN) {
+      throw U.error("Demasiados intentos con la contraseña del administrador. Esperá unos minutos o pedí la autorización a distancia.", 429, { codigo: "ADMIN_BLOQUEADO" });
+    }
+  }
+}
+
+function registrarFalloAdmin(ctx, claves, identificador, motivo) {
+  const ahora = Date.now();
+  for (const k of claves) {
+    const e = fallosAdmin.get(k);
+    if (!e || ahora - e.inicio >= VENTANA_ADMIN_MS) fallosAdmin.set(k, { inicio: ahora, n: 1 });
+    else e.n++;
+  }
+  while (fallosAdmin.size > 2000) fallosAdmin.delete(fallosAdmin.keys().next().value);
+  // La auditoría va fuera de la transacción de la petición (que se revierte).
+  const db = ctx.dbAuditoria || ctx.db;
+  const detalle = { motivo, usuario: identificador.slice(0, 60), ip: String(ctx.ip || "").slice(0, 45), caja_id: ctx.sesion?.caja_id || null };
+  Promise.resolve().then(() => db.tx((t) => N.auditar(t, { ...ctx, db: t }, "Contraseña del administrador incorrecta", "permiso", null, detalle))).catch(() => {});
+}
+
+async function verificarAdministrador(ctx, usuario, password) {
+  const identificador = String(usuario || "").trim().toLowerCase();
+  const clave = String(password || "");
+  if (!identificador || !clave) throw U.error("Escribí el usuario y la contraseña del administrador", 403, { codigo: "ADMIN_REQUERIDO" });
+  const claves = clavesFalloAdmin(ctx, identificador.slice(0, 60));
+  controlarFallosAdmin(claves);
+  let admin = null;
+  const propio = await ctx.db.get("SELECT * FROM predio_usuario WHERE predio_id = ? AND usuario = ? AND es_admin_general = 0", [ctx.pid, identificador]);
+  if (propio && propio.rol === "ADMIN" && Number(propio.activo) === 1 && U.verificarPassword(clave, propio.password_hash)) {
+    admin = { id: Number(propio.id), nombre: propio.nombre || propio.usuario, usuario: propio.usuario };
+  } else if (!propio) {
+    const dni = identificador.replace(/[.\s]/g, "");
+    const documento = /^\d{6,9}$/.test(dni) ? String(Number(dni)) : null;
+    const general = documento ? await verificarAdminGeneral(ctx, documento, clave) : null;
+    if (general) {
+      const fila = await ctx.db.get(
+        "SELECT id, nombre FROM predio_usuario WHERE predio_id = ? AND es_admin_general = 1 AND (general_usuario_id = ? OR documento = ?) LIMIT 1",
+        [ctx.pid, general.id, documento]);
+      admin = { id: fila ? Number(fila.id) : null, nombre: fila?.nombre || general.nombre || `DNI ${documento}`, usuario: `dni${documento}`, general_usuario_id: Number(general.id) || null };
+    }
+  }
+  if (!admin) {
+    registrarFalloAdmin(ctx, claves, identificador, propio && propio.rol !== "ADMIN" ? "NO_ES_ADMINISTRADOR" : "CREDENCIALES");
+    throw U.error("El usuario o la contraseña del administrador no son correctos", 403, { codigo: "ADMIN_INCORRECTO" });
+  }
+  fallosAdmin.delete(claves[1]);
+  return admin;
+}
+
 async function armarSesion(ctx, usuario, sesion) {
   const identidad = identidadUsuario(usuario);
   if (identidad.debe_cambiar_clave) return { usuario: identidad, puesto: null, puestos: [], predio: {} };
@@ -319,6 +386,7 @@ async function autenticar(ctx, token) {
 module.exports = {
   autenticar,
   asegurarUsuarioGeneral,
+  verificarAdministrador,
   rutas: [
     { m: "GET", p: "/estado-publico", h: estadoPublico, publica: true, soloLocal: true, seguridad: true },
     { m: "POST", p: "/primer-uso", h: primerUso, publica: true, soloLocal: true },

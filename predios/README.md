@@ -180,9 +180,19 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
 - Cada caja tiene un responsable hasta el cierre. Si se interrumpe la conexión,
   al volver a ingresar recupera su turno. El panel de cajas muestra quién atiende.
   Un turno que cruza la medianoche conserva su apertura y se cierra a la hora real.
-- Administración genera en la caja un código de cierre de un uso, válido durante
-  cinco minutos. En Usuarios puede delegar «Cerrar caja» y «Anular tickets» por
-  separado. El cajero con permiso de cierre puede cerrar su propio turno.
+- El **cierre definitivo** lo hace siempre un administrador: desde su cuenta o, en la PC
+  del cajero, escribiendo su usuario (o DNI, si es del sistema general) y su contraseña.
+  Cinco intentos fallidos bloquean la aprobación en esa PC durante diez minutos.
+- Si el cajero se va y no hay un administrador, hace un **cierre temporal**: separa el
+  efectivo en dos bolsas (recaudación = ventas y cobros; cambio = saldo inicial y
+  agregados) y se imprimen el resumen marcado «CIERRE TEMPORAL» y un ticket para cada
+  bolsa. La caja queda en cero (movimiento «Cierre temporal») y libre; el siguiente
+  cajero abre su propio turno sin heredar la apertura ni los números del anterior.
+  El administrador ve los temporales pendientes en Caja, en Inicio y en la campana;
+  cuenta cada bolsa y lo cierra en forma definitiva sin tocar la caja que sigue
+  trabajando. Los retiros del día se descuentan primero de la recaudación.
+- En Usuarios se delega «Anular tickets». El permiso histórico «Cerrar caja» ya no
+  habilita el cierre definitivo.
 - Sin permiso de anulación, el cajero solicita anular el ticket e indica el motivo.
   El administrador puede abrir la solicitud desde la campana o filtrar las ventas
   pendientes de anulación. La confirmación revierte el movimiento de la venta.
@@ -302,4 +312,6 @@ disponible. Recuperar el archivo no instala servicios ni habilita otro escritor.
   unidades y la compuesta descuenta porciones o su insumo. El alquiler comprueba disponibilidad
   y conserva las unidades para el siguiente alquiler.
 - Disponible de un afiliado = límite − consumos con descuento todavía sin liquidar.
-- Clave del día (autorizaciones en la PC de caja): día + mes + año sin ceros, p. ej. 5/11/2026 → `5112026`.
+- Ya no hay clave del día: las autorizaciones en la PC de caja (pedir productos, ver todas
+  las ventas de la caja) las aprueba el administrador con su usuario y su contraseña, o a
+  distancia desde su cuenta.

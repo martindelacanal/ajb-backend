@@ -1,5 +1,6 @@
 /* Caja: saldo de apertura (lo carga el administrador y lo confirma el cajero), ajustes,
-   cierre de caja y movimientos. */
+   cierres y movimientos. El cajero que se va sin un administrador hace un cierre temporal
+   (dos bolsas con su ticket); el cierre definitivo lo hace siempre un administrador. */
 (function () {
   "use strict";
   if (window.__SIN_SOPORTE) return;
@@ -61,76 +62,275 @@
   };
 
   // ------------------------------------------------------------------ cierre de caja
+  // El efectivo esperado se separa en dos: el cambio (saldo inicial y lo que se agregó
+  // durante la jornada) y lo cobrado (ventas y demás cobros en efectivo).
+  function filaImporte(texto, importe, clase) {
+    var n = Number(importe) || 0;
+    return h("div" + (clase ? "." + clase : ""), h("span", texto), h("strong.dinero", (n < 0 ? "− " : "") + P.f.pesos(Math.abs(n))));
+  }
+
+  function aEntrada(n) { return String(P.redondear(n)).replace(".", ","); }
+
+  P.resumenEfectivoCierre = function (ef) {
+    if (!ef) return null;
+    return h("div.cierre-efectivo",
+      h("div.cierre-grupo",
+        filaImporte("Efectivo de cambio", ef.cambio, "cierre-grupo-titulo"),
+        filaImporte("Saldo inicial", ef.saldo_inicial),
+        filaImporte("Agregados durante la jornada", ef.agregados)),
+      h("div.cierre-grupo",
+        filaImporte("Efectivo de ventas y cobros", ef.cobros, "cierre-grupo-titulo"),
+        filaImporte("Ventas en efectivo", ef.ventas),
+        Number(ef.anulaciones) ? filaImporte("Anulaciones", -ef.anulaciones) : null,
+        Number(ef.otros_cobros) ? filaImporte("Otros cobros y devoluciones", ef.otros_cobros) : null),
+      Number(ef.retiros) ? h("div.cierre-grupo", filaImporte("Retiros durante la jornada", -ef.retiros)) : null);
+  };
+
+  function resumenVentas(s, ventasPorForma) {
+    return [
+      h("hr.cierre-separador"),
+      h("div", h("span", "Ventas"), h("strong", s.ventas_cantidad + " · " + P.f.pesos(s.ventas_total))),
+      (ventasPorForma || []).map(function (v) { return h("div.texto-3.chico", h("span", (P.FORMAS[v.forma_pago] || v.forma_pago) + " (" + v.cantidad + ")"), h("span.dinero", P.f.pesos(v.total))); }),
+      s.ventas_anuladas ? h("div.texto-3.chico", h("span", "Ventas anuladas"), h("span", String(s.ventas_anuladas))) : null,
+    ];
+  }
+
+  // Muestra la diferencia entre lo contado y lo esperado.
+  function pintarDiferencia(el, contado, esperado, prefijo) {
+    P.vaciar(el);
+    el.className = "";
+    if (isNaN(contado)) return;
+    var d = P.redondear(contado - esperado);
+    el.className = "vuelto vuelto-chico" + (d < 0 ? " falta" : "");
+    var texto = d === 0 ? "Sin diferencia" : d > 0 ? "Sobrante" : "Faltante";
+    el.appendChild(h("span", prefijo ? prefijo + ": " + texto.toLowerCase() : texto));
+    el.appendChild(h("strong", P.f.pesos(Math.abs(d))));
+  }
+
+  function liberarPuesto(cajaId) {
+    if (P.puesto() && Number(P.puesto().caja_id) === Number(cajaId)) {
+      P.estado.sesion.puesto = null;
+      P.repintarMarco();
+      P.ruta.ir(P.esAdmin() ? "/caja" : "/puesto");
+    }
+  }
+
+  function cierreTemporalListo(d) {
+    var c = d.cierre;
+    var m = P.modal({
+      titulo: "Caja cerrada en forma temporal",
+      subtitulo: "Cierre temporal N° " + c.id + " · " + c.boca + " · " + c.caja,
+      modalFijo: true,
+      contenido: h("div.columna",
+        h("div.cierre-bolsas",
+          h("div.cierre-bolsa", h("span", "Bolsa 1 · Recaudación"), h("strong.dinero", P.f.pesos(c.efectivo_ventas))),
+          h("div.cierre-bolsa", h("span", "Bolsa 2 · Cambio"), h("strong.dinero", P.f.pesos(c.efectivo_cambio)))),
+        P.mensaje("Guardá cada bolsa con su ticket. Un administrador las va a recibir y hacer el cierre definitivo. La caja quedó libre: quien sigue abre su propio turno, sin mezclar nada con el tuyo.", "ok")),
+      acciones: [
+        P.btn("Reimprimir tickets", { tipo: "suave", icono: "imprimir", onclick: function () { P.imprimirCierre(d, { bolsas: true }).catch(P.error); } }),
+        P.btn("Elegir otra caja", { tipo: "secundario", onclick: function () { m.cerrar(); P.ruta.ir("/puesto"); } }),
+        P.btn("Cerrar sesión", { tipo: "primario", icono: "salir", onclick: function () { m.cerrar(); if (P.salir) P.salir(); } }),
+      ],
+    });
+  }
+
   P.cerrarCaja = function (cajaId, alTerminar) {
     var esAdmin = P.esAdmin();
-    if (!esAdmin && !Number(P.estado.sesion.usuario.puede_cerrar_caja)) {
-      P.aviso("Pedile a un administrador que cierre la caja desde su cuenta.", "info");
-      return Promise.resolve();
-    }
     return P.get("/caja/cierre/previa" + P.qs({ caja_id: cajaId })).then(function (r) {
+      if (!esAdmin && !r.puede_temporal) { P.aviso("La caja la cierra quien la está atendiendo, desde su turno.", "info"); return; }
       var s = r.resumen;
+      var ef = s.efectivo;
+      var modo = esAdmin ? "DEFINITIVO" : "TEMPORAL";
+      var obs = P.input({ max: 250, placeholder: "Opcional" });
+      var corte = { caja_id: r.caja.id, revision: r.revision, turno_id: r.turno ? r.turno.id : null, ultimo_cierre_id: s.ultimo_cierre ? s.ultimo_cierre.id : null };
+
+      // Cierre temporal: dos bolsas.
+      var bolsaVentas = P.dinero({ placeholder: "Contá la bolsa" });
+      var bolsaCambio = P.dinero({ placeholder: "Contá la bolsa" });
+      var difVentas = h("div"), difCambio = h("div"), difTotal = h("div");
+      function calcularTemporal() {
+        var v = P.numeroDe(bolsaVentas.value), c = P.numeroDe(bolsaCambio.value);
+        pintarDiferencia(difVentas, v, ef.esperado_ventas);
+        pintarDiferencia(difCambio, c, ef.esperado_cambio);
+        pintarDiferencia(difTotal, isNaN(v) || isNaN(c) ? NaN : v + c, s.saldo_esperado, "En total");
+      }
+      bolsaVentas.addEventListener("input", calcularTemporal);
+      bolsaCambio.addEventListener("input", calcularTemporal);
+      var zonaTemporal = h("div.columna",
+        P.mensaje("Separá el efectivo en dos bolsas: lo cobrado y el cambio. Se imprime un ticket para cada bolsa y el resumen del cierre. El cierre definitivo lo hace un administrador cuando las recibe.", "info"),
+        P.campo("Bolsa 1 · Recaudación (ventas y cobros)", h("div.campo-con-prefijo.campo-grande", h("span", "$"), bolsaVentas),
+          { requerido: true, ayuda: "El sistema espera " + P.f.pesos(ef.esperado_ventas) + (Number(ef.retiros) ? ", ya descontados los retiros." : ".") }),
+        difVentas,
+        P.campo("Bolsa 2 · Cambio (saldo inicial y agregados)", h("div.campo-con-prefijo.campo-grande", h("span", "$"), bolsaCambio),
+          { requerido: true, ayuda: "El sistema espera " + P.f.pesos(ef.esperado_cambio) + "." }),
+        difCambio, difTotal);
+
+      // Cierre definitivo: lo hace un administrador.
       var contado = P.dinero({ placeholder: "Contá el efectivo" });
       var queda = P.dinero({ valor: "0", placeholder: "0" });
-      var obs = P.input({ max: 250, placeholder: "Opcional" });
-      var clave = esAdmin ? P.inputClave({ inputmode: "numeric", max: 8, autocomplete: "off" }) : null;
       var diferencia = h("div");
-      function calcular() {
-        var c = P.numeroDe(contado.value);
-        P.vaciar(diferencia);
-        if (isNaN(c)) return;
-        var d = P.redondear(c - s.saldo_esperado);
-        diferencia.className = "vuelto" + (d < 0 ? " falta" : "");
-        diferencia.appendChild(h("span", d === 0 ? "Sin diferencia" : d > 0 ? "Sobrante" : "Faltante"));
-        diferencia.appendChild(h("strong", P.f.pesos(Math.abs(d))));
+      var admin = esAdmin ? null : P.camposAdmin();
+      contado.addEventListener("input", function () { pintarDiferencia(diferencia, P.numeroDe(contado.value), s.saldo_esperado); });
+      var zonaDefinitiva = h("div.columna",
+        P.campo("Efectivo contado", h("div.campo-con-prefijo.campo-grande", h("span", "$"), contado), { requerido: true }),
+        diferencia,
+        P.campo("Queda en caja para el próximo turno", h("div.campo-con-prefijo", h("span", "$"), queda), { ayuda: "Lo demás se registra como retiro de la recaudación." }),
+        Number(ef.esperado_cambio) > 0 ? h("div", P.btn("Dejar el cambio en la caja (" + P.f.pesos(ef.esperado_cambio) + ")", { tipo: "texto", chico: true, onclick: function () { queda.value = aEntrada(ef.esperado_cambio); } })) : null,
+        admin ? h("div.columna", P.mensaje("El cierre definitivo lo hace un administrador: que escriba acá su usuario y su contraseña.", "info"), admin.el) : null);
+
+      var botonTemporal = P.btn("Cerrar temporalmente e imprimir", { tipo: "primario", icono: "imprimir", onclick: enviarTemporal });
+      var botonDefinitivo = P.btn("Cerrar caja e imprimir", { tipo: "primario", icono: "imprimir", onclick: enviarDefinitivo });
+      function pintarModo() {
+        zonaTemporal.hidden = modo !== "TEMPORAL";
+        botonTemporal.hidden = modo !== "TEMPORAL";
+        zonaDefinitiva.hidden = modo !== "DEFINITIVO";
+        botonDefinitivo.hidden = modo !== "DEFINITIVO";
       }
-      contado.addEventListener("input", calcular);
+      var selector = esAdmin ? null : P.segmentado([
+        { valor: "TEMPORAL", texto: "Cierre temporal" },
+        { valor: "DEFINITIVO", texto: "Definitivo con el administrador" },
+      ], modo, function (v) { modo = v; pintarModo(); });
+      if (selector) selector.setAttribute("data-sin-reanudar", "");
+
+      function enviarTemporal(ev) {
+        var v = P.numeroDe(bolsaVentas.value), c = P.numeroDe(bolsaCambio.value);
+        if (isNaN(v)) { bolsaVentas.classList.add("invalido"); bolsaVentas.focus(); return; }
+        if (isNaN(c)) { bolsaCambio.classList.add("invalido"); bolsaCambio.focus(); return; }
+        P.ejecutar(ev.currentTarget, function () {
+          return P.post("/caja/cierre/temporal", Object.assign({ efectivo_ventas: v, efectivo_cambio: c, observaciones: obs.value }, corte)).then(function (x) {
+            m.cerrar();
+            liberarPuesto(r.caja.id);
+            if (alTerminar) alTerminar(x);
+            return P.get("/caja/cierres/" + x.id).then(function (d) {
+              cierreTemporalListo(d);
+              P.imprimirCierre(d, { bolsas: true }).catch(P.error);
+            });
+          });
+        }).catch(function () {});
+      }
+
+      function enviarDefinitivo(ev) {
+        var c = P.numeroDe(contado.value);
+        if (isNaN(c)) { contado.classList.add("invalido"); contado.focus(); return; }
+        if (admin && !admin.completo()) return;
+        if (admin) admin.mostrarError("");
+        var boton = ev.currentTarget;
+        boton.disabled = true;
+        P.post("/caja/cierre", Object.assign({ efectivo_contado: c, queda_en_caja: P.numeroDe(queda.value) || 0, observaciones: obs.value }, corte, admin ? admin.datos() : {}))
+          .then(function (x) {
+            if (admin) admin.limpiar();
+            m.cerrar();
+            if (x.encolado) return;
+            P.aviso(x.mensaje, x.diferencia === 0 ? "ok" : "error", 8000);
+            if (x.id) P.get("/caja/cierres/" + x.id).then(function (d) { return P.imprimirCierre(d); }).catch(P.error);
+            liberarPuesto(r.caja.id);
+            if (alTerminar) alTerminar(x);
+          })
+          .catch(function (e) {
+            if (admin && /^ADMIN_/.test(e.codigo || "")) admin.mostrarError(e.message);
+            else P.error(e);
+          })
+          .finally(function () { boton.disabled = false; });
+      }
+
       var m = P.modal({
         titulo: "Cerrar caja · " + r.caja.nombre,
         subtitulo: s.ultimo_cierre ? "Desde el cierre N° " + s.ultimo_cierre.id + " (" + P.f.fechaHora(s.ultimo_cierre.fecha) + ")" : "Primer cierre de esta caja",
         ancho: "ancha",
         contenido: h("div.grilla.grilla-2",
-          h("div.resumen-cuentas",
-            h("div", h("span", "Saldo inicial"), h("strong.dinero", P.f.pesos(s.saldo_inicial))),
-            h("div", h("span", "Ingresos (ventas en efectivo y otros)"), h("strong.dinero", P.f.pesos(s.ingresos))),
-            h("div", h("span", "Egresos"), h("strong.dinero", "− " + P.f.pesos(s.egresos))),
-            h("div.fuerte", h("span", "Efectivo esperado"), h("span.dinero", P.f.pesos(s.saldo_esperado))),
-            h("hr", { style: { border: 0, borderTop: "1px solid var(--borde)", width: "100%" } }),
-            h("div", h("span", "Ventas"), h("strong", s.ventas_cantidad + " · " + P.f.pesos(s.ventas_total))),
-            s.ventas_por_forma.map(function (v) { return h("div.texto-3.chico", h("span", (P.FORMAS[v.forma_pago] || v.forma_pago) + " (" + v.cantidad + ")"), h("span.dinero", P.f.pesos(v.total))); }),
-            s.ventas_anuladas ? h("div.texto-3.chico", h("span", "Ventas anuladas"), h("span", String(s.ventas_anuladas))) : null),
-          h("div.columna",
-            P.campo("Efectivo contado", h("div.campo-con-prefijo.campo-grande", h("span", "$"), contado), { requerido: true }),
-            diferencia,
-            P.campo("Queda en caja para el próximo turno", h("div.campo-con-prefijo", h("span", "$"), queda), { ayuda: "Lo demás se registra como retiro de la recaudación." }),
-            P.campo("Observaciones", obs),
-            clave ? P.campo("Clave del día", clave, { requerido: true, ayuda: "La encontrás en Sistema > Configuración." }) : null)),
-        acciones: [
-          P.btn("Cancelar", { onclick: function () { m.cerrar(); } }),
-          P.btn("Cerrar caja e imprimir", { tipo: "primario", icono: "imprimir", onclick: function (ev) {
-            var c = P.numeroDe(contado.value);
-            if (isNaN(c)) { contado.classList.add("invalido"); contado.focus(); return; }
-            if (clave && !/^\d{6,8}$/.test(clave.input.value.trim())) { P.aviso("Ingresá la clave del día de Sistema > Configuración.", "error"); clave.input.focus(); return; }
-            P.ejecutar(ev.currentTarget, function () {
-              return P.post("/caja/cierre", { caja_id: r.caja.id, efectivo_contado: c, queda_en_caja: P.numeroDe(queda.value) || 0,
-                revision: r.revision, turno_id: r.turno ? r.turno.id : null, ultimo_cierre_id: s.ultimo_cierre ? s.ultimo_cierre.id : null,
-                observaciones: obs.value, clave: clave ? clave.input.value.trim() : undefined }).then(function (x) {
-                m.cerrar();
-                if (x.encolado) return;
-                P.aviso(x.mensaje, x.diferencia === 0 ? "ok" : "error", 8000);
-                if (x.id) P.get("/caja/cierres/" + x.id).then(P.imprimirCierre).catch(P.error);
-                if (P.puesto() && Number(P.puesto().caja_id) === Number(r.caja.id)) {
-                  P.estado.sesion.puesto = null;
-                  P.repintarMarco();
-                  P.ruta.ir(P.esAdmin() ? "/caja" : "/puesto");
-                }
-                if (alTerminar) alTerminar(x);
-              });
-            });
-          } }),
-        ],
+          h("div.resumen-cuentas.cierre-resumen",
+            P.resumenEfectivoCierre(ef),
+            h("div.fuerte", h("span", "Efectivo esperado en la caja"), h("span.dinero", P.f.pesos(s.saldo_esperado))),
+            resumenVentas(s, s.ventas_por_forma)),
+          h("div.columna", selector, zonaTemporal, zonaDefinitiva, P.campo("Observaciones", obs))),
+        alCerrar: function () { if (admin) admin.limpiar(); },
+        acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), botonTemporal, botonDefinitivo],
       });
+      pintarModo();
     }).catch(P.error);
   };
+
+  // El administrador recibe las bolsas de un cierre temporal y lo cierra en forma definitiva.
+  P.recibirTemporal = function (c, alTerminar) {
+    var recVentas = P.dinero({ placeholder: "Contá la bolsa" });
+    var recCambio = P.dinero({ placeholder: "Contá la bolsa" });
+    var difVentas = h("div"), difCambio = h("div");
+    var obs = P.input({ max: 250, placeholder: "Opcional" });
+    function calcular() {
+      pintarDiferencia(difVentas, P.numeroDe(recVentas.value), Number(c.efectivo_ventas), "Frente a lo declarado");
+      pintarDiferencia(difCambio, P.numeroDe(recCambio.value), Number(c.efectivo_cambio), "Frente a lo declarado");
+    }
+    recVentas.addEventListener("input", calcular);
+    recCambio.addEventListener("input", calcular);
+    function imprimir(opciones) {
+      return P.get("/caja/cierres/" + c.id).then(function (d) { return P.imprimirCierre(d, opciones); }).catch(P.error);
+    }
+    var m = P.modal({
+      titulo: "Cierre definitivo · temporal N° " + c.id,
+      subtitulo: c.boca + " · " + c.caja + " · lo cerró " + c.usuario_nombre + " el " + P.f.fechaHora(c.fecha),
+      ancho: "ancha",
+      contenido: h("div.grilla.grilla-2",
+        h("div.resumen-cuentas.cierre-resumen",
+          c.turno_inicio ? h("div.texto-3.chico", h("span", "Turno desde"), h("span", P.f.fechaHora(c.turno_inicio))) : null,
+          P.resumenEfectivoCierre(c.efectivo),
+          h("div.fuerte", h("span", "Efectivo esperado"), h("span.dinero", P.f.pesos(c.saldo_esperado))),
+          h("hr.cierre-separador"),
+          filaImporte("Declaró en la bolsa 1 · Recaudación", c.efectivo_ventas),
+          filaImporte("Declaró en la bolsa 2 · Cambio", c.efectivo_cambio),
+          filaImporte(Number(c.diferencia) === 0 ? "Sin diferencia al cerrar" : Number(c.diferencia) > 0 ? "Sobrante al cerrar" : "Faltante al cerrar", c.diferencia),
+          c.observaciones ? h("p.texto-3.chico", { style: { margin: 0 } }, "Observaciones: " + c.observaciones) : null),
+        h("div.columna",
+          P.mensaje("Contá cada bolsa y anotá lo que encontraste. La caja no se toca: puede seguir trabajando.", "info"),
+          P.campo("Bolsa 1 · Recaudación recibida", h("div.campo-con-prefijo.campo-grande", h("span", "$"), recVentas), { requerido: true, ayuda: "Declarado: " + P.f.pesos(c.efectivo_ventas) + "." }),
+          difVentas,
+          P.campo("Bolsa 2 · Cambio recibido", h("div.campo-con-prefijo.campo-grande", h("span", "$"), recCambio), { requerido: true, ayuda: "Declarado: " + P.f.pesos(c.efectivo_cambio) + "." }),
+          difCambio,
+          h("div", P.btn("Coinciden con lo declarado", { tipo: "texto", chico: true, icono: "check", onclick: function () {
+            recVentas.value = aEntrada(c.efectivo_ventas); recCambio.value = aEntrada(c.efectivo_cambio); calcular();
+          } })),
+          P.campo("Observaciones", obs),
+          h("p.texto-3.chico", { style: { margin: 0 } }, "Si el cambio vuelve a una caja, cargalo después como saldo de apertura."))),
+      acciones: [
+        P.btn("Cancelar", { onclick: function () { m.cerrar(); } }),
+        P.btn("Reimprimir tickets", { tipo: "suave", icono: "imprimir", onclick: function () { imprimir({ bolsas: true }); } }),
+        P.btn("Cerrar definitivamente e imprimir", { tipo: "primario", icono: "check", onclick: function (ev) {
+          var v = P.numeroDe(recVentas.value), k = P.numeroDe(recCambio.value);
+          if (isNaN(v)) { recVentas.classList.add("invalido"); recVentas.focus(); return; }
+          if (isNaN(k)) { recCambio.classList.add("invalido"); recCambio.focus(); return; }
+          P.ejecutar(ev.currentTarget, function () {
+            return P.post("/caja/cierres/" + c.id + "/definitivo", { recibido_ventas: v, recibido_cambio: k, observaciones: obs.value }).then(function (x) {
+              m.cerrar();
+              if (alTerminar) alTerminar(x);
+              if (x.encolado) return;
+              P.aviso(x.mensaje, x.diferencia_recepcion === 0 ? "ok" : "error", 8000);
+              imprimir();
+            });
+          }).catch(function () {});
+        } }),
+      ],
+    });
+    return m;
+  };
+
+  // Lista de cierres temporales que esperan las bolsas (panel de caja del administrador).
+  function seccionTemporales(temporales, alTerminar) {
+    if (!temporales.length) return null;
+    return h("section.hoja.hoja-cuerpo.cierres-temporales",
+      h("div.fila-separada",
+        h("div", h("h2.seccion-titulo", "Cierres temporales por recibir"),
+          h("p.texto-3.chico", { style: { margin: "2px 0 0" } }, "Cada uno tiene dos bolsas con su ticket: recaudación y cambio. Recibilas y cerralos de a uno.")),
+        P.chip(temporales.length + (temporales.length === 1 ? " pendiente" : " pendientes"), "PENDIENTE")),
+      h("ul.lista-simple", temporales.map(function (c) {
+        return h("li",
+          h("div",
+            h("strong", "N° " + c.id + " · " + c.boca + " · " + c.caja),
+            h("div.texto-3.chico", c.usuario_nombre + " · " + P.f.fechaHora(c.fecha) + (Number(c.diferencia) ? " · " + (Number(c.diferencia) > 0 ? "sobrante " : "faltante ") + P.f.pesos(Math.abs(c.diferencia)) : ""))),
+          h("div.cierre-temporal-montos",
+            h("span.texto-3.chico", "Recaudación"), h("strong.dinero", P.f.pesos(c.efectivo_ventas)),
+            h("span.texto-3.chico", "Cambio"), h("strong.dinero", P.f.pesos(c.efectivo_cambio))),
+          P.btn("Recibir y cerrar", { tipo: "primario", chico: true, icono: "check", onclick: function () { P.recibirTemporal(c, alTerminar); } }));
+      })));
+  }
 
   // El mismo detalle se abre desde el puesto o desde el panel, sin cambiar de turno.
   function detalleCaja(c, cajaId, desdePanel) {
@@ -253,24 +453,51 @@
     return m;
   }
 
-  P.verCierre = function (id) {
+  P.verCierre = function (id, alCambiar) {
     P.get("/caja/cierres/" + id).then(function (d) {
       var ci = d.cierre;
-      P.modal({
-        titulo: "Cierre N° " + ci.id, subtitulo: ci.boca + " · " + ci.caja + " · " + P.f.fechaHora(ci.fecha) + " · " + ci.usuario_nombre,
-        contenido: h("div.resumen-cuentas",
-          h("div", h("span", "Saldo inicial"), h("strong", P.f.pesos(ci.saldo_inicial))),
-          h("div", h("span", "Ingresos"), h("strong", P.f.pesos(ci.ingresos))),
-          h("div", h("span", "Egresos"), h("strong", P.f.pesos(ci.egresos))),
-          h("div.fuerte", h("span", "Efectivo esperado"), h("span", P.f.pesos(ci.saldo_esperado))),
-          h("div", h("span", "Contado"), h("strong", P.f.pesos(ci.efectivo_contado))),
-          h("div", h("span", "Diferencia"), h("strong" + (Number(ci.diferencia) < 0 ? ".negativo" : ""), P.f.pesos(ci.diferencia))),
-          h("div", h("span", "Retiro"), h("strong", P.f.pesos(ci.retiro))),
-          h("div", h("span", "Queda en caja"), h("strong", P.f.pesos(ci.queda_en_caja))),
-          h("div", h("span", "Ventas"), h("strong", ci.ventas_cantidad + " · " + P.f.pesos(ci.ventas_total))),
-          d.ventas_por_forma.map(function (v) { return h("div.texto-3.chico", h("span", (P.FORMAS[v.forma_pago] || v.forma_pago) + " (" + v.cantidad + ")"), h("span", P.f.pesos(v.total))); }),
-          ci.observaciones ? h("div.texto-3", ci.observaciones) : null),
-        acciones: [P.btn("Imprimir", { tipo: "primario", icono: "imprimir", onclick: function () { P.imprimirCierre(d).catch(P.error); } })],
+      var temporal = ci.tipo === "TEMPORAL";
+      var pendiente = temporal && ci.estado === "PENDIENTE";
+      var estado = pendiente ? P.chip("Temporal · falta el cierre definitivo", "PENDIENTE")
+        : temporal ? P.chip("Temporal · cerrado por " + (ci.definitivo_usuario_nombre || "un administrador"), "CORRECTO")
+          : P.chip("Definitivo" + (ci.definitivo_usuario_nombre && ci.definitivo_usuario_nombre !== ci.usuario_nombre ? " · autorizó " + ci.definitivo_usuario_nombre : ""), "CORRECTO");
+      var m = P.modal({
+        titulo: (temporal ? "Cierre temporal N° " : "Cierre N° ") + ci.id,
+        subtitulo: ci.boca + " · " + ci.caja + " · " + P.f.fechaHora(ci.fecha) + " · " + ci.usuario_nombre,
+        contenido: h("div.columna",
+          h("div", estado),
+          h("div.resumen-cuentas.cierre-resumen",
+            ci.turno_inicio ? h("div.texto-3.chico", h("span", "Turno desde"), h("span", P.f.fechaHora(ci.turno_inicio))) : null,
+            d.efectivo ? P.resumenEfectivoCierre(d.efectivo) : [
+              h("div", h("span", "Saldo inicial"), h("strong", P.f.pesos(ci.saldo_inicial))),
+              h("div", h("span", "Ingresos"), h("strong", P.f.pesos(ci.ingresos))),
+              h("div", h("span", "Egresos"), h("strong", P.f.pesos(ci.egresos)))],
+            h("div.fuerte", h("span", "Efectivo esperado"), h("span", P.f.pesos(ci.saldo_esperado))),
+            temporal ? [
+              filaImporte("Bolsa 1 · Recaudación (declarado)", ci.efectivo_ventas),
+              filaImporte("Bolsa 2 · Cambio (declarado)", ci.efectivo_cambio),
+            ] : h("div", h("span", "Contado"), h("strong", P.f.pesos(ci.efectivo_contado))),
+            h("div", h("span", "Diferencia"), h("strong" + (Number(ci.diferencia) < 0 ? ".negativo" : ""), P.f.pesos(ci.diferencia))),
+            temporal ? null : h("div", h("span", "Retiro"), h("strong", P.f.pesos(ci.retiro))),
+            h("div", h("span", "Queda en caja"), h("strong", P.f.pesos(ci.queda_en_caja))),
+            temporal && !pendiente ? [
+              h("hr.cierre-separador"),
+              h("div.texto-3.chico", h("span", "Cierre definitivo"), h("span", (ci.definitivo_usuario_nombre || "") + " · " + P.f.fechaHora(ci.definitivo_fecha))),
+              filaImporte("Bolsa 1 · Recaudación (recibido)", ci.recibido_ventas),
+              filaImporte("Bolsa 2 · Cambio (recibido)", ci.recibido_cambio),
+              filaImporte("Diferencia frente a lo declarado", ci.diferencia_recepcion),
+              ci.observaciones_definitivo ? h("div.texto-3", ci.observaciones_definitivo) : null,
+            ] : null,
+            resumenVentas(ci, d.ventas_por_forma),
+            ci.observaciones ? h("div.texto-3", ci.observaciones) : null)),
+        acciones: [
+          temporal ? P.btn("Tickets de las bolsas", { tipo: "suave", icono: "imprimir", onclick: function () { P.imprimirCierre(d, { resumen: false, bolsas: true }).catch(P.error); } }) : null,
+          P.btn("Imprimir resumen", { tipo: pendiente && P.esAdmin() ? "secundario" : "primario", icono: "imprimir", onclick: function () { P.imprimirCierre(d).catch(P.error); } }),
+          pendiente && P.esAdmin() ? P.btn("Hacer el cierre definitivo", { tipo: "primario", icono: "check", onclick: function () {
+            m.cerrar();
+            P.recibirTemporal(Object.assign({}, ci, { efectivo: d.efectivo }), alCambiar);
+          } }) : null,
+        ],
       });
     }).catch(P.error);
   };
@@ -282,6 +509,8 @@
       P.btn("Saldo de apertura", { tipo: "secundario", icono: "efectivo", onclick: function () { modalApertura(cajasOp, null, refrescar); } }),
       P.btn("Ajuste de caja", { tipo: "primario", icono: "transferencia", onclick: function () { modalAjuste(cajasOp, null, refrescar); } }),
     ]));
+    var zonaTemporales = h("div");
+    c.appendChild(zonaTemporales);
     var tarjetas = h("div.grilla", { style: { gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))" } }, P.cargando());
     c.appendChild(tarjetas);
     var zonaTabla = h("div", { style: { marginTop: "18px" } });
@@ -291,8 +520,8 @@
     var tabla = null;
     function pintarTabla() {
       tabla = vista === "movimientos"
-        ? P.tabla({ listado: "caja", sinEtiquetaBuscar: true, alClickFila: function (f) { if (f.cierre_id) P.verCierre(f.cierre_id); } })
-        : P.tabla({ listado: "cierres", sinEtiquetaBuscar: true, alClickFila: function (f) { P.verCierre(f.id); } });
+        ? P.tabla({ listado: "caja", sinEtiquetaBuscar: true, alClickFila: function (f) { if (f.cierre_id) P.verCierre(f.cierre_id, refrescar); } })
+        : P.tabla({ listado: "cierres", sinEtiquetaBuscar: true, alClickFila: function (f) { P.verCierre(f.id, refrescar); } });
       P.reemplazar(zonaTabla, tabla.el);
     }
     function cargarTarjetas() {
@@ -300,6 +529,7 @@
         if (!c.isConnected) return;
         cajasOp = r[1];
         registrarFormulariosCaja(function () { return cajasOp; }, refrescar);
+        P.reemplazar(zonaTemporales, seccionTemporales(r[0].temporales || [], refrescar));
         if (!r[0].cajas.length) { P.reemplazar(tarjetas, P.vacio("caja", "No hay cajas", "Creá las cajas de cada boca en Gestión > Bocas y cajas.")); return; }
         P.reemplazar(tarjetas, r[0].cajas.map(function (cj) {
           var ap = cj.apertura;
@@ -311,6 +541,7 @@
             h("div.texto-3.chico", P.f.entero(cj.ventas_cantidad) + (cj.ventas_cantidad === 1 ? " venta" : " ventas")),
             h("div.texto-3.chico", P.f.pesos(cj.ventas_total) + " desde el último cierre"),
             h("div.texto-3.chico", cj.turno ? "Atiende " + cj.turno.usuario_nombre + " desde " + P.f.fechaHora(cj.turno.inicio) : "Disponible"),
+            cj.temporales_pendientes ? h("div", { style: { marginTop: "6px" } }, P.chip(cj.temporales_pendientes + (cj.temporales_pendientes === 1 ? " cierre temporal por recibir" : " cierres temporales por recibir"), "PENDIENTE")) : null,
             h("div.fila", { style: { marginTop: "12px", gap: "6px" } },
               P.btn("Apertura", { tipo: "suave", chico: true, onclick: function () { modalApertura(cajaElegida, cj.id, refrescar); } }),
               P.btn("Ajuste", { tipo: "suave", chico: true, onclick: function () { modalAjuste(cajaElegida, cj.id, refrescar); } }),

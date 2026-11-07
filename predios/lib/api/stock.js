@@ -89,9 +89,7 @@ async function crearSolicitud(ctx) {
     if (faltantes.length && !b.confirmar_sin_stock) {
       throw U.error("Hay productos con menos stock que lo pedido", 409, { codigo: "STOCK_INSUFICIENTE", faltantes });
     }
-    const autorizacion = await autorizar(t, ctx, "SOLICITUD_PRODUCTO", {
-      clave: b.clave, permisoId: b.permiso_id, detalle: `${lineas.length} producto(s)`,
-    });
+    const autorizacion = await autorizar(t, ctx, "SOLICITUD_PRODUCTO", { permisoId: b.permiso_id });
     const ahora = U.fechaHora();
     const ids = [];
     let lote = null;
