@@ -136,8 +136,9 @@ async function anularNotaCredito(t, ctx, fila, { motivo, cuerpo }) {
       }
       movId = await R().movimiento(t, ctx, reservaId, "CARGA", importe, m.medio, nota, m.huesped_id);
     } else {
+      // El reintegro de un artículo apunta al movimiento que revierte: no se ofrece ni se acepta como un pago nuevo.
       movId = await R().movimiento(t, ctx, reservaId, m.concepto, importe, m.medio, (m.concepto === "PAGO_ADICIONAL" ? String(m.detalle || "").split(" · ")[0] + " · " : "") + nota,
-        m.huesped_id, null, null, m.concepto === "PAGO_ADICIONAL" ? { adicional_id: m.adicional_id, anula_mov_id: m.anula_mov_id ? m.id : null } : {});
+        m.huesped_id, null, null, m.concepto === "PAGO_ADICIONAL" ? { adicional_id: m.adicional_id, anula_mov_id: m.id } : {});
     }
     await N.actualizar(t, ctx, "predio_estadia_mov", movId, { comprobante: nc.id });
   }

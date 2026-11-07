@@ -180,7 +180,7 @@
   function tablaArticulos(r, a, lineas, cargar) {
     var pagosDe = function (l) {
       return a.movimientos.filter(function (m) {
-        return m.concepto === "PAGO_ADICIONAL" && Number(m.adicional_id) === Number(l.adicional_id) && Number(m.importe) > 0 && (a.pagos_anulados || []).indexOf(Number(m.id)) < 0;
+        return m.concepto === "PAGO_ADICIONAL" && Number(m.adicional_id) === Number(l.adicional_id) && Number(m.importe) > 0 && !m.anula_mov_id && (a.pagos_anulados || []).indexOf(Number(m.id)) < 0;
       });
     };
     var deuda = adeudados(lineas);

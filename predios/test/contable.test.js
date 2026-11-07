@@ -178,3 +178,25 @@ test("saldo para consumos: recibo al cargar, nota de crédito al devolver y lím
   const alSalir = await mover({ accion: "CARGA", medio: "AL_SALIR", importe: 1000 });
   assert.equal(alSalir.comprobante, null);
 });
+
+test("anular la nota de crédito de un artículo no deja un segundo pago para devolver", async t => {
+  const r = reserva(520);
+  r.diferencia = 6000;
+  r.diferenciales = [{ importe: 6000 }];
+  r.adicionales = [{ adicional_id: 1, nombre: "Sombrilla", modalidad: "ALQUILER", cantidad: 1, dias: 2, subtotal: 6000, base_turismo: 0, fecha_desde: hoy, fecha_hasta: U.sumarDias(hoy, 1) }];
+  const { db, caja, call } = await preparar(t, r);
+  await call("POST", "/recepcion/guardar", { operacion: U.uuid() });
+  const articulo = datos => call("POST", "/recepcion/520/adicional", { operacion: U.uuid(), adicional_id: 1, caja_id: caja.id, ...datos });
+  await articulo({ accion: "PAGAR", medio: "EFECTIVO", importe: 6000 });
+  const pago = await db.get("SELECT id FROM predio_estadia_mov WHERE concepto='PAGO_ADICIONAL' AND importe > 0");
+  const anula = await articulo({ accion: "ANULAR_PAGO", movimiento_id: pago.id, detalle: "Se cobró de más" });
+  await call("POST", "/contable/comprobantes/" + anula.comprobante.id + "/anular", { operacion: U.uuid(), caja_id: caja.id, motivo: "No se devolvió" });
+  const reintegro = await db.get("SELECT id, anula_mov_id FROM predio_estadia_mov WHERE concepto='PAGO_ADICIONAL' AND importe > 0 AND id <> ?", [pago.id]);
+  assert.ok(reintegro.anula_mov_id, "el reintegro queda marcado como reversión");
+  await assert.rejects(articulo({ accion: "ANULAR_PAGO", movimiento_id: reintegro.id }), /No encontramos ese pago/);
+  // El pago original vuelve a poder anularse una sola vez.
+  await articulo({ accion: "ANULAR_PAGO", movimiento_id: pago.id });
+  await assert.rejects(articulo({ accion: "ANULAR_PAGO", movimiento_id: pago.id }), /ya fue anulado/);
+  const neto = await db.get("SELECT SUM(importe) AS s FROM predio_estadia_mov WHERE concepto='PAGO_ADICIONAL'");
+  assert.equal(Number(neto.s), 0, "lo devuelto nunca supera lo pagado");
+});

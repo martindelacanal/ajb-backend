@@ -179,10 +179,13 @@ async function operarAdicional(ctx) {
       mensaje = "Pago de " + linea.nombre + " registrado · " + C.NOMBRE[comprobante.tipo] + " " + comprobante.codigo;
     } else if (b.accion === "ANULAR_PAGO") {
       const pago = a.movimientos.find(m => Number(m.id) === Number(b.movimiento_id));
-      if (!pago || pago.concepto !== "PAGO_ADICIONAL" || Number(pago.adicional_id) !== adicionalId || Number(pago.importe) <= 0) throw U.error("No encontramos ese pago del artículo.", 404);
+      // Sólo un pago original: el reintegro de una nota de crédito anulada (lleva anula_mov_id) no es un pago nuevo.
+      if (!pago || pago.concepto !== "PAGO_ADICIONAL" || Number(pago.adicional_id) !== adicionalId || Number(pago.importe) <= 0 || pago.anula_mov_id) throw U.error("No encontramos ese pago del artículo.", 404);
       if (a.pagos_anulados.includes(Number(pago.id))) throw U.error("Ese pago ya fue anulado.", 409);
       // Un pago con recibo se devuelve con una nota de crédito sobre ese recibo (queda en Contable).
-      const recibo = pago.comprobante ? await t.get("SELECT * FROM predio_comprobante WHERE predio_id=? AND id=? AND tipo='RECIBO'", [ctx.pid, pago.comprobante]) : null;
+      const documento = pago.comprobante ? await t.get("SELECT * FROM predio_comprobante WHERE predio_id=? AND id=?" + t.forUpdate, [ctx.pid, pago.comprobante]) : null;
+      if (documento && documento.tipo !== "RECIBO") throw U.error("No encontramos ese pago del artículo.", 404);
+      const recibo = documento;
       if (recibo) {
         comprobante = await require("./contable").devolverRenglones(t, ctx, recibo, [{ movimiento_id: pago.id, importe: null }],
           { medio: pago.medio, motivo: nota || "Anulación del pago de " + linea.nombre, cuerpo: b });
