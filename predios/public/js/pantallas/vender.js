@@ -26,16 +26,23 @@
       return;
     }
     var claveBorrador = "predio.venta." + puesto.caja_id;
+    var datosPrevios = P.continuidad.datosPantalla();
+    if (datosPrevios && datosPrevios.caja !== puesto.caja_id) datosPrevios = null;
     var estado = vacia();
-    try { var b = JSON.parse(sessionStorage.getItem(claveBorrador) || "null"); if (b && b.items) estado = Object.assign(vacia(), b); } catch (e) { /* nada */ }
+    if (datosPrevios && datosPrevios.venta) estado = Object.assign(estado, datosPrevios.venta);
+    else {
+      try { var b = JSON.parse(sessionStorage.getItem(claveBorrador) || "null"); if (b && b.items) estado = Object.assign(estado, b); } catch (e) { /* nada */ }
+    }
     if (estado.forma === "DESCUENTO" || estado.segunda === "DESCUENTO") {
       if (estado.forma === "DESCUENTO") estado.forma = "SALDO";
       if (estado.segunda === "DESCUENTO") estado.segunda = "SALDO";
       estado.huesped = null;
     }
     if (estado.segunda === estado.forma) estado.segunda = null;
-    var ultimaVenta = null;
-    try { ultimaVenta = Number(sessionStorage.getItem("predio.ultima-venta." + puesto.caja_id)) || null; } catch (e) { /* nada */ }
+    var ultimaVenta = datosPrevios ? datosPrevios.ultimaVenta : null;
+    if (!ultimaVenta) {
+      try { ultimaVenta = Number(sessionStorage.getItem("predio.ultima-venta." + puesto.caja_id)) || null; } catch (e) { /* nada */ }
+    }
 
     function guardarBorrador() {
       try { sessionStorage.setItem(claveBorrador, JSON.stringify(estado)); } catch (e) { /* sin almacenamiento */ }
@@ -66,13 +73,14 @@
       alEnterSinCoincidencia: function (texto) { if (texto) buscarProductoAusente(texto); },
     });
     var tablaItems = h("div.vender-items");
+    var camposCantidad = [];
     var izquierda = h("div.columna",
       h("div.hoja.vender-buscador", combo.el,
         h("div.vender-ayuda",
           P.btn("¿No aparece el producto?", { tipo: "texto", chico: true, icono: "buscar", onclick: function () { buscarProductoAusente(combo.input.value.trim()); } }))),
       h("div.hoja", tablaItems));
 
-    function buscarProductoAusente(texto) {
+    function buscarProductoAusente(texto, anterior) {
       combo.limpiar();
       var avisosPrevios = document.getElementById("avisos");
       if (avisosPrevios) P.vaciar(avisosPrevios);
@@ -164,14 +172,26 @@
       var m = P.modal({
         titulo: "Producto que no aparece",
         subtitulo: puesto.boca + " · " + puesto.caja,
+        reanudar: { id: "venta-producto-ausente", campos: false, datos: function () {
+          return { caja: puesto.caja_id, texto: buscador.input.value, consulta: consulta, busqueda: busquedaResuelta };
+        } },
         contenido: h("div.columna",
           P.campo("Producto o código de barras", buscador.el), informacion),
         acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), enviar],
         alCerrar: function () { pedidoConsulta++; buscador.limpiar(); combo.foco(); },
       });
-      pintarConsulta();
-      consultar().catch(function (e) { P.reemplazar(informacion, P.mensaje(e.message, "error")); });
+      if (anterior) {
+        if (anterior.consulta.producto) fijarProducto(anterior.consulta.producto, anterior.busqueda);
+        else { consulta = anterior.consulta; busquedaResuelta = anterior.busqueda; pintarConsulta(); }
+      } else {
+        pintarConsulta();
+        consultar().catch(function (e) { P.reemplazar(informacion, P.mensaje(e.message, "error")); });
+      }
+      return m;
     }
+    P.continuidad.registrarVentana("venta-producto-ausente", function (datos) {
+      if (datos.caja === puesto.caja_id) return buscarProductoAusente(datos.texto, datos);
+    });
 
     function agregar(p) {
       if (!p) return;
@@ -187,6 +207,7 @@
 
     function pintarItems() {
       P.vaciar(tablaItems);
+      camposCantidad = [];
       if (!estado.items.length) {
         tablaItems.appendChild(h("div.items-vacio",
           ilustracionVacia(),
@@ -196,6 +217,7 @@
       }
       var filas = estado.items.map(function (it, i) {
         var cant = h("input.campo-control", { value: P.f.numero(it.cantidad), inputmode: "decimal", "aria-label": "Cantidad de " + it.producto.nombre });
+        camposCantidad[i] = cant;
         cant.addEventListener("change", function () {
           var n = P.numeroDe(cant.value);
           if (!(n > 0)) { cant.value = P.f.numero(it.cantidad); return; }
@@ -272,6 +294,7 @@
         if (P.estado.sesion.puesto) P.estado.sesion.puesto.imprimir_comanda = puesto.imprimir_comanda;
       }).catch(function (e) { comanda.input.checked = anterior; P.error(e); }).finally(function () { comanda.input.disabled = false; });
     });
+    comanda.input.setAttribute("data-sin-reanudar", "");
 
     function partes() {
       var n = estado.segunda ? P.importeDe(estado.parte) : total();
@@ -386,6 +409,21 @@
 
     c.appendChild(h("div.vender", izquierda, cuenta));
     pintarTodo();
+    if (datosPrevios) {
+      combo.input.value = datosPrevios.producto;
+      if (usaSaldo() && !estado.huesped) buscarHuesped.input.value = datosPrevios.huesped;
+    }
+    P.continuidad.guardarPantalla(function () {
+      var items = estado.items.map(function (it, i) {
+        var valor = camposCantidad[i].value;
+        if (valor === P.f.numero(it.cantidad)) return it;
+        var cantidad = P.redondear(P.numeroDe(valor), 3);
+        if (!(cantidad > 0)) throw new Error("Cantidad en edición");
+        return Object.assign({}, it, { cantidad: cantidad });
+      });
+      return { caja: puesto.caja_id, producto: combo.input.value, huesped: buscarHuesped.input.value,
+        venta: Object.assign({}, estado, { items: items }), ultimaVenta: ultimaVenta };
+    });
 
     // ---------------------------------------------------------------- cobrar
     var cobrando = false;
@@ -455,19 +493,27 @@
     function ventaHecha(r) {
       var auto = !!(puesto.impresion_automatica === undefined ? 1 : Number(puesto.impresion_automatica));
       if (auto) P.imprimirVenta(r.id).catch(P.error);
+      mostrarVentaHecha({ caja: puesto.caja_id, id: r.id, total: r.total, vuelto: r.vuelto, auto: auto });
+    }
+    function mostrarVentaHecha(r) {
       var m = P.modal({
         titulo: "Venta N° " + r.id + " registrada",
+        reanudar: { id: "venta-registrada", datos: r },
         contenido: h("div.columna",
           h("div.total", h("span", "Total"), h("strong", P.f.pesos(r.total))),
           r.vuelto ? h("div.vuelto", h("span", "Vuelto"), h("strong", P.f.pesos(r.vuelto))) : null,
-          auto ? h("p.texto-3.chico", { style: { margin: 0 } }, "El ticket se está imprimiendo.") : null),
+          r.auto ? h("p.texto-3.chico", { style: { margin: 0 } }, "El ticket se está imprimiendo.") : null),
         acciones: [
-          P.btn(auto ? "Imprimir otra copia" : "Imprimir ticket", { tipo: "secundario", icono: "imprimir", onclick: function () { P.imprimirVenta(r.id).catch(P.error); } }),
+          P.btn(r.auto ? "Imprimir otra copia" : "Imprimir ticket", { tipo: "secundario", icono: "imprimir", onclick: function () { P.imprimirVenta(r.id).catch(P.error); } }),
           P.btn("Nueva venta", { tipo: "primario", tecla: "Enter", onclick: function () { m.cerrar(); } }),
         ],
         alCerrar: function () { setTimeout(function () { combo.foco(); }, 50); },
       });
+      return m;
     }
+    P.continuidad.registrarVentana("venta-registrada", function (datos) {
+      if (datos.caja === puesto.caja_id && datos.id === ultimaVenta) return mostrarVentaHecha(datos);
+    });
 
     // ---------------------------------------------------------------- teclado
     function teclas(ev) {

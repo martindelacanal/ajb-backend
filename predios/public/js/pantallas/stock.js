@@ -324,6 +324,7 @@
       ambito = v;
       pintar();
     });
+    if (!P.esAdmin()) selector.setAttribute("data-sin-reanudar", "");
     c.appendChild(h("div.pagina-cabecera", h("div",
       h("a.volver", { href: "#/mi-caja" }, P.icono("volver"), "Volver a la caja"),
       h("h1.titulo-pagina", "Mis ventas"), h("p.subtitulo", "Tocá una venta para ver el detalle, reimprimir el ticket o gestionar su anulación."))));

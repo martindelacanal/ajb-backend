@@ -125,11 +125,11 @@
     return b;
   }
 
-  P.formProducto = function (base, alGuardar, alEliminar) {
+  P.formProducto = function (base, alGuardar, alEliminar, reanudar) {
     base = base || {};
     var editar = !!base.id;
     var cargar = editar ? P.get("/productos/" + base.id) : P.opciones("bocas", true);
-    cargar.then(function (datos) {
+    return cargar.then(function (datos) {
       var detalle = editar ? datos : null;
       var p = detalle ? detalle.producto : base;
       var bocas = detalle ? detalle.margenes_boca : datos.map(function (b) {
@@ -287,7 +287,7 @@
       }
       var m = P.modal({
         titulo: editar ? p.nombre : "Nuevo producto", subtitulo: editar ? "ID " + p.id + (p.codigo ? " · Código " + p.codigo : "") : null,
-        ancho: "ancha", contenido: contenido,
+        ancho: "ancha", contenido: contenido, reanudar: reanudar,
         acciones: [editar && alEliminar ? botonEliminar("productos", p.id, function () { return m; }, alEliminar) : null,
           P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn(editar ? "Guardar cambios" : "Crear producto", { tipo: "primario", icono: "check", onclick: function (ev) {
           if (!porcentajeValido(porcentajeOpcional(margen))) { mostrarPanel("datos"); marcarMargenInvalido(margen); return; }
@@ -340,6 +340,7 @@
           }).catch(function () {});
         } })],
       });
+      return m;
     }).catch(P.error);
   };
   function stockAlmacenDe(detalle) {
@@ -350,9 +351,13 @@
 
   P.ruta.registrar(/^\/gestion\/productos$/, function (c) {
     P.solapasGestion(c, "/gestion/productos");
+    function recargar() { tabla.recargar(); }
+    function abrirProducto(base) {
+      return P.formProducto(base, recargar, base.id ? recargar : null, { id: "gestion-producto", datos: base });
+    }
     var tabla = P.tabla({
       listado: "productos",
-      alClickFila: function (f) { P.formProducto({ id: f.id }, function () { tabla.recargar(); }, function () { tabla.recargar(); }); },
+      alClickFila: function (f) { abrirProducto({ id: f.id }); },
       placeholderBuscar: "Nombre o código",
       seleccion: seleccionEliminar("productos"),
       celdas: {
@@ -379,8 +384,9 @@
           { texto: "Bajas registradas", icono: "baja", accion: function () { P.ruta.ir("/gestion/bajas"); } },
         ]);
       } })),
-      h("div.gestion-accion-nueva", P.btn("Nuevo producto", { tipo: "primario", icono: "mas", onclick: function () { P.formProducto({}, function () { tabla.recargar(); }); } }))));
+      h("div.gestion-accion-nueva", P.btn("Nuevo producto", { tipo: "primario", icono: "mas", onclick: function () { abrirProducto({}); } }))));
     c.appendChild(tabla.el);
+    P.continuidad.registrarVentana("gestion-producto", abrirProducto);
   }, { admin: true, titulo: "Productos y stock" });
 
   function subpagina(c, titulo, subtitulo, acciones) {
@@ -418,10 +424,10 @@
   }, { admin: true, titulo: "Bajas" });
 
   // ------------------------------------------------------------------ proveedores
-  P.formProveedor = function (base, alGuardar, alEliminar) {
+  P.formProveedor = function (base, alGuardar, alEliminar, reanudar) {
     base = base || {};
     var editar = !!base.id;
-    (editar ? P.get("/proveedores/" + base.id).then(function (r) { return r.proveedor; }) : Promise.resolve(base)).then(function (p) {
+    return (editar ? P.get("/proveedores/" + base.id).then(function (r) { return r.proveedor; }) : Promise.resolve(base)).then(function (p) {
       var codigo = P.input({ valor: p.codigo, max: 30, placeholder: editar ? "" : "Se asigna solo si lo dejás vacío" });
       var razon = P.input({ valor: p.razon_social, max: 160 });
       var cuit = P.input({ valor: p.cuit, max: 13, placeholder: "20-12345678-9", inputmode: "numeric" });
@@ -432,7 +438,7 @@
       var obs = h("textarea.campo-control", { maxlength: 2000 }, p.observaciones || "");
       var activo = P.check("Proveedor activo", editar ? Number(p.activo) === 1 : true);
       var m = P.modal({
-        titulo: editar ? p.razon_social : "Nuevo proveedor", ancho: "ancha",
+        titulo: editar ? p.razon_social : "Nuevo proveedor", ancho: "ancha", reanudar: reanudar,
         contenido: h("div.columna",
           h("div.grilla.grilla-3", P.campo("Código", codigo), P.campo("Razón social", razon, { requerido: true }), P.campo("CUIT", cuit)),
           h("div.grilla.grilla-3", P.campo("Teléfono", tel), P.campo("Correo", mail), P.campo("Contacto", contacto)),
@@ -451,20 +457,26 @@
           }).catch(function () {});
         } })],
       });
+      return m;
     }).catch(P.error);
   };
 
   P.ruta.registrar(/^\/gestion\/proveedores$/, function (c) {
     P.solapasGestion(c, "/gestion/proveedores");
+    function recargar() { t.recargar(); }
+    function abrirProveedor(base) {
+      return P.formProveedor(base, recargar, base.id ? recargar : null, { id: "gestion-proveedor", datos: base });
+    }
     var t = P.tabla({
       listado: "proveedores",
-      alClickFila: function (f) { P.formProveedor({ id: f.id }, function () { t.recargar(); }, function () { t.recargar(); }); },
+      alClickFila: function (f) { abrirProveedor({ id: f.id }); },
       seleccion: seleccionEliminar("proveedores"),
     });
     c.appendChild(h("div.gestion-acciones",
       h("div.gestion-acciones-grupo", P.btn("Compras por proveedor", { tipo: "suave", chico: true, icono: "estadisticas", onclick: function () { P.cache["compras:vista"] = "compras"; P.ruta.ir("/compras"); } })),
-      h("div.gestion-accion-nueva", P.btn("Nuevo proveedor", { tipo: "primario", icono: "mas", onclick: function () { P.formProveedor({}, function () { t.recargar(); }); } }))));
+      h("div.gestion-accion-nueva", P.btn("Nuevo proveedor", { tipo: "primario", icono: "mas", onclick: function () { abrirProveedor({}); } }))));
     c.appendChild(t.el);
+    P.continuidad.registrarVentana("gestion-proveedor", abrirProveedor);
   }, { admin: true, titulo: "Proveedores" });
 
   // ------------------------------------------------------------------ bocas y cajas
@@ -482,6 +494,7 @@
     var activo = P.check("Boca activa", editar ? Number(base.activo) === 1 : true);
     var m = P.modal({
       titulo: editar ? base.nombre : "Nueva boca de expendio",
+      reanudar: { id: "gestion-boca", datos: { id: base.id } },
       contenido: h("div.columna", P.campo("Nombre", nombre, { requerido: true }),
         P.campo("Sentido", sentido, { ayuda: "Origen: entrega productos (tiene stock). Destino: recibe o consume productos." }),
         almacen, P.campo("Margen de venta de la boca (%)", margen, { ayuda: "Se aplica al costo de referencia de cada producto. Podés definir un margen especial en su ficha." }),
@@ -496,11 +509,12 @@
         }).catch(function () {});
       } })],
     });
+    return m;
   }
   function formCaja(base, alGuardar) {
     base = base || {};
     var editar = !!base.id;
-    P.opciones("bocas", true).then(function (bocas) {
+    return P.opciones("bocas", true).then(function (bocas) {
       var boca = P.select(bocas, base.boca_id, { vacio: "Elegí la boca" });
       var nombre = P.input({ valor: base.nombre || "Caja 1", max: 80 });
       var ancho = P.segmentado([{ valor: 80, texto: "80 mm" }, { valor: 58, texto: "58 mm" }], base.ancho_ticket || 80);
@@ -508,6 +522,7 @@
       var activo = P.check("Caja activa", editar ? Number(base.activo) === 1 : true);
       var m = P.modal({
         titulo: editar ? "Editar caja" : "Nueva caja",
+        reanudar: { id: "gestion-caja", datos: { id: base.id } },
         contenido: h("div.columna", P.campo("Boca", boca, { requerido: true }), P.campo("Nombre", nombre, { requerido: true }),
           P.campo("Ancho del papel de la tiquetera", ancho), auto, editar ? activo : null),
         acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn("Guardar", { tipo: "primario", onclick: function (ev) {
@@ -518,40 +533,51 @@
           }).catch(function () {});
         } })],
       });
+      return m;
     }).catch(P.error);
   }
 
   P.ruta.registrar(/^\/gestion\/bocas$/, function (c) {
     P.solapasGestion(c, "/gestion/bocas");
+    function abrirBoca(datos) {
+      var cargar = datos.id ? P.get("/bocas/" + datos.id).then(function (r) { return r.boca; }) : Promise.resolve({});
+      return cargar.then(function (boca) { return formBoca(boca, function () { tBocas.recargar(); }); }).catch(P.error);
+    }
+    function abrirCaja(datos) {
+      var cargar = datos.id ? P.get("/cajas/" + datos.id).then(function (r) { return r.caja; }) : Promise.resolve({});
+      return cargar.then(function (caja) { return formCaja(caja, function () { tCajas.recargar(); }); }).catch(P.error);
+    }
     var tBocas = P.tabla({
       listado: "bocas",
       celdas: { margen_venta: function (valor) { return valor == null ? "General" : P.f.pct(valor); } },
-      alClickFila: function (f) { P.get("/bocas/" + f.id).then(function (r) { formBoca(r.boca, function () { tBocas.recargar(); }); }).catch(P.error); },
+      alClickFila: function (f) { abrirBoca({ id: f.id }); },
     });
     var tCajas = P.tabla({
       listado: "cajas",
-      alClickFila: function (f) { P.get("/cajas/" + f.id).then(function (r) { formCaja(r.caja, function () { tCajas.recargar(); }); }).catch(P.error); },
+      alClickFila: function (f) { abrirCaja({ id: f.id }); },
     });
     c.appendChild(h("div.fila-separada", { style: { marginBottom: "12px" } }, h("h2.seccion-titulo", "Bocas de expendio"),
-      P.btn("Nueva boca", { tipo: "primario", icono: "mas", onclick: function () { formBoca({}, function () { tBocas.recargar(); }); } })));
+      P.btn("Nueva boca", { tipo: "primario", icono: "mas", onclick: function () { abrirBoca({}); } })));
     c.appendChild(tBocas.el);
     c.appendChild(h("div.fila-separada", { style: { margin: "26px 0 12px" } }, h("h2.seccion-titulo", "Cajas"),
-      P.btn("Nueva caja", { tipo: "primario", icono: "mas", onclick: function () { formCaja({}, function () { tCajas.recargar(); }); } })));
+      P.btn("Nueva caja", { tipo: "primario", icono: "mas", onclick: function () { abrirCaja({}); } })));
     c.appendChild(h("p.texto-3", { style: { marginTop: "-6px" } }, "Cada boca puede tener varias cajas. Al ingresar, el usuario elige en qué caja trabaja."));
     c.appendChild(tCajas.el);
+    P.continuidad.registrarVentana("gestion-boca", abrirBoca);
+    P.continuidad.registrarVentana("gestion-caja", abrirCaja);
   }, { admin: true, titulo: "Bocas y cajas" });
 
   // ------------------------------------------------------------------ usuarios
   function formUsuario(base, alGuardar) {
     base = base || {};
     var editar = !!base.id;
-    Promise.all([P.opciones("bocas", true), editar ? P.get("/usuarios/" + base.id) : Promise.resolve(null)]).then(function (r) {
+    var reanudar = { id: "gestion-usuario", datos: { id: base.id } };
+    return Promise.all([P.opciones("bocas", true), editar ? P.get("/usuarios/" + base.id) : Promise.resolve(null)]).then(function (r) {
       var bocas = r[0];
       var u = r[1] ? r[1].usuario : {};
       var asignadas = r[1] ? r[1].bocas : [];
       if (Number(u.es_admin_general)) {
-        P.modal({ titulo: u.nombre, contenido: P.mensaje("Es un administrador del sistema general: entra con su DNI y su contraseña de Mi AJB y se gestiona desde ahí.") });
-        return;
+        return P.modal({ titulo: u.nombre, reanudar: reanudar, contenido: P.mensaje("Es un administrador del sistema general: entra con su DNI y su contraseña de Mi AJB y se gestiona desde ahí.") });
       }
       var usuario = P.input({ valor: u.usuario, max: 60, placeholder: "Ej.: maria.comedor" });
       var nombre = P.input({ valor: u.nombre, max: 120 });
@@ -566,7 +592,7 @@
       zonaBocas.hidden = permisos.hidden = (u.rol || "CAJERO") === "ADMIN";
       var activo = P.check("Usuario habilitado", editar ? Number(u.activo) === 1 : true);
       var m = P.modal({
-        titulo: editar ? u.nombre : "Nuevo usuario", ancho: "ancha",
+        titulo: editar ? u.nombre : "Nuevo usuario", ancho: "ancha", reanudar: reanudar,
         contenido: h("div.columna",
           h("div.grilla.grilla-2", P.campo("Nombre y apellido", nombre, { requerido: true }), P.campo("Usuario (para ingresar)", usuario, { requerido: true })),
           P.campo("Rol", rol, { ayuda: "El administrador del camping ve todo el predio pero no entra al sistema general." }),
@@ -587,13 +613,16 @@
           }).catch(function () {});
         } })],
       });
+      return m;
     }).catch(P.error);
   }
 
   P.ruta.registrar(/^\/usuarios$/, function (c) {
-    var t = P.tabla({ listado: "usuarios", sinEtiquetaBuscar: true, alClickFila: function (f) { formUsuario({ id: f.id }, function () { t.recargar(); }); } });
+    function abrirUsuario(base) { return formUsuario(base, function () { t.recargar(); }); }
+    var t = P.tabla({ listado: "usuarios", sinEtiquetaBuscar: true, alClickFila: function (f) { abrirUsuario({ id: f.id }); } });
     c.appendChild(P.cabeceraConAcciones("Usuarios", null,
-      P.btn("Nuevo usuario", { tipo: "primario", icono: "mas", onclick: function () { formUsuario({}, function () { t.recargar(); }); } })));
+      P.btn("Nuevo usuario", { tipo: "primario", icono: "mas", onclick: function () { abrirUsuario({}); } })));
     c.appendChild(t.el);
+    P.continuidad.registrarVentana("gestion-usuario", abrirUsuario);
   }, { admin: true, titulo: "Usuarios" });
 })();

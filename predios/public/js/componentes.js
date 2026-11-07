@@ -73,17 +73,26 @@
   };
   P.segmentado = function (opciones, valor, alCambiar) {
     var cont = h("div.segmentado", { role: "group" });
+    function elegir(v) {
+      valor = v;
+      pintar();
+      if (alCambiar) alCambiar(v);
+    }
     function pintar() {
       P.vaciar(cont);
       opciones.forEach(function (o) {
         cont.appendChild(h("button", { type: "button", "aria-pressed": String(String(o.valor) === String(valor)), onclick: function () {
-          valor = o.valor; pintar(); if (alCambiar) alCambiar(valor);
+          if (P.continuidad) P.continuidad.campoEditado(cont);
+          elegir(o.valor);
         } }, o.texto));
       });
     }
     pintar();
     cont.valor = function () { return valor; };
     cont.fijar = function (v) { valor = v; pintar(); };
+    cont.restaurarSegmento = function (v) {
+      if (valor !== v && opciones.some(function (o) { return o.valor === v; })) elegir(v);
+    };
     return cont;
   };
   P.mensaje = function (texto, tipo, icono) {
@@ -200,7 +209,7 @@
     }
     function normalizar(t) { return String(t || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().trim(); }
 
-    function buscar(texto) {
+    function buscar(texto, soloListar) {
       var n = ++pedido;
       input.setAttribute("aria-busy", "true");
       var promesa = opciones.buscar ? opciones.buscar(texto) : opciones.fuente ? P.opciones(opciones.fuente).then(function (ops) { opciones.opciones = ops; delete opciones.fuente; return fuenteLocal(texto); }) : fuenteLocal(texto);
@@ -208,7 +217,7 @@
         if (n === pedido && !seleccionando) {
           input.setAttribute("aria-busy", "false");
           resultados = r || []; indice = -1;
-          if (opciones.elegirExactoAlEscribir && texto && input.value.trim() === texto && document.activeElement === input &&
+          if (!soloListar && opciones.elegirExactoAlEscribir && texto && input.value.trim() === texto && document.activeElement === input &&
             resultados.length === 1 && resultados[0].exacto && !resultados[0].requiereEleccion) elegir(resultados[0]);
           else pintar(texto);
         }
@@ -296,6 +305,7 @@
         if (permitido === false) return;
         actual = o;
         input.value = opciones.limpiarAlElegir ? "" : o.texto;
+        if (P.continuidad) P.continuidad.campoEditado(input);
         if (opciones.alElegir) opciones.alElegir(o);
         if (opciones.limpiarAlElegir) { actual = null; input.focus(); }
       }).catch(P.error).finally(function () { seleccionando = false; });
@@ -311,7 +321,10 @@
       clearTimeout(temporizador);
       temporizador = setTimeout(function () { if (!seleccionando) buscar(input.value.trim()).catch(P.error); }, opciones.buscar ? 160 : 40);
     });
-    input.addEventListener("focus", function () { if (!seleccionando && opciones.abrirAlEnfocar !== false) buscar(actual ? "" : input.value.trim()).catch(P.error); });
+    var restaurandoFoco = false;
+    input.addEventListener("focus", function () {
+      if (!restaurandoFoco && !seleccionando && opciones.abrirAlEnfocar !== false) buscar(actual ? "" : input.value.trim()).catch(P.error);
+    });
     input.addEventListener("blur", function () {
       setTimeout(function () {
         if (document.activeElement === input) return;
@@ -344,6 +357,22 @@
         }).catch(P.error);
       }
     });
+
+    input.capturarCombo = function () {
+      return { valor: actual ? actual.valor : null, texto: input.value };
+    };
+    input.restaurarCombo = function (dato) {
+      cerrarLista();
+      if (!actual || actual.valor !== dato.valor) {
+        actual = dato.valor === null ? null : { valor: dato.valor, texto: dato.texto };
+      }
+      input.value = actual ? actual.texto : dato.texto;
+    };
+    input.restaurarFocoCombo = function (abierto) {
+      restaurandoFoco = true;
+      try { input.focus({ preventScroll: true }); } finally { restaurandoFoco = false; }
+      if (abierto) buscar(actual ? "" : input.value.trim(), true).catch(function () {});
+    };
 
     return {
       el: cont,

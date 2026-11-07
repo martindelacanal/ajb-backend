@@ -277,7 +277,6 @@
                 P.ejecutar(ev.currentTarget, function () {
                   return P.post("/sistema/actualizar").then(function (r) {
                     P.aviso(r.mensaje, "ok", 9000);
-                    if (r.reiniciando) setTimeout(function () { location.reload(); }, 9000);
                   });
                 }).catch(function () {});
               } }))),

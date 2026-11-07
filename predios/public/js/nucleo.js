@@ -369,7 +369,14 @@
     } };
   }
 
+  var trabajoEnCurso = 0;
+  P.hayTrabajoEnCurso = function () { return trabajoEnCurso > 0; };
+
   P.api = function (metodo, ruta, cuerpo, opciones) {
+    var escritura = metodo !== "GET" && metodo !== "HEAD";
+    if (escritura && P.continuidad && P.continuidad.aplicandoCampos()) {
+      return Promise.reject(ErrorApi("La operación requiere confirmación", -1));
+    }
     opciones = opciones || {};
     var cabeceras = {};
     var token = P.sesion.token();
@@ -384,6 +391,7 @@
       try { operacion = prepararPeticion(metodo, ruta, body, token); } catch (e) { return Promise.reject(e); }
       cabeceras["X-AJB-Operacion"] = operacion.id;
     }
+    if (escritura) trabajoEnCurso++;
     return fetch(P.apiBase + ruta, { method: metodo, headers: cabeceras, body: body, cache: "no-store" })
       .catch(function () {
         throw ErrorApi(P.modo === "local"
@@ -427,7 +435,7 @@
           }
           return datos;
         });
-      });
+      }).finally(function () { if (escritura) trabajoEnCurso--; });
   };
   P.get = function (ruta, opciones) { return P.api("GET", ruta, null, opciones); };
   P.post = function (ruta, cuerpo, opciones) { return P.api("POST", ruta, cuerpo || {}, opciones); };
@@ -509,6 +517,7 @@
     document.body.appendChild(velo);
     var api = {
       velo: velo, cuerpo: cuerpo, pie: pie, ventana: ventana,
+      reanudar: opciones.reanudar,
       cerrar: function (valor) {
         if (!velo.parentNode) return;
         velo.remove();
@@ -545,6 +554,7 @@
     }
   });
   P.hayVentana = function () { return abiertas.length > 0; };
+  P.ventanasAbiertas = function () { return abiertas.slice(); };
 
   P.confirmar = function (texto, opciones) {
     opciones = opciones || {};
@@ -585,7 +595,11 @@
   // Ejecuta una acción mostrando errores; si el servidor pide confirmar (stock), pregunta y reintenta.
   P.ejecutar = function (boton, trabajo) {
     if (boton) boton.disabled = true;
-    return Promise.resolve().then(trabajo).catch(function (e) { P.error(e); throw e; }).finally(function () { if (boton) boton.disabled = false; });
+    trabajoEnCurso++;
+    return Promise.resolve().then(trabajo).catch(function (e) { P.error(e); throw e; }).finally(function () {
+      trabajoEnCurso--;
+      if (boton) boton.disabled = false;
+    });
   };
 
   // ------------------------------------------------------------------ autorizaciones (clave del día o aprobación a distancia)
