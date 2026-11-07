@@ -309,7 +309,11 @@
     if (P.modo === "remoto") {
       return P.get("/estado-remoto", { sinRedireccion: true }).then(function (r) { P.estado.remoto = r; actualizarConexion(); pintarBandaRemota(); }).catch(function () {});
     }
-    return P.get("/estado-publico", { sinRedireccion: true }).then(function (r) { P.estado.conexion = r; actualizarConexion(); }).catch(function () {
+    return P.get("/estado-publico", { sinRedireccion: true }).then(function (r) {
+      P.estado.conexion = r;
+      actualizarConexion();
+      P.continuidad.comprobar(r);
+    }).catch(function () {
       P.estado.conexion = null;
       var el = document.getElementById("conexion");
       if (el) { el.classList.remove("en-linea"); el.classList.add("sin-linea"); el.lastChild.textContent = "Sin servidor"; }
@@ -383,6 +387,7 @@
     botonMenu.classList.add("barra-menu");
     botonMenu.setAttribute("aria-controls", "riel");
     botonMenu.setAttribute("aria-expanded", "false");
+    P.abrirMenu = abrirMenu;
     P.cerrarMenu = cerrarMenu;
     var puesto = P.puesto();
     var etiquetaPuesto = puesto && [puesto.boca, puesto.caja].filter(Boolean).join(" · ");
@@ -432,18 +437,22 @@
     if (!pagina || !document.body.contains(pagina)) P.repintarMarco();
     var nueva = h("div.pagina");
     P.reemplazar(pagina, nueva);
+    P.continuidad.entrar(nueva);
     marcarActivo();
     window.scrollTo(0, 0);
     if (!encontrada) {
       nueva.appendChild(P.vacio("info", "No encontramos esa pantalla", "", P.btn("Ir al inicio", { tipo: "primario", onclick: function () { P.ruta.ir("/"); } })));
+      P.continuidad.montada();
       return;
     }
     if (encontrada.admin && !P.esAdmin()) {
       nueva.appendChild(P.vacio("candado", "Esta sección es del administrador", ""));
+      P.continuidad.montada();
       return;
     }
     if (encontrada.local && P.modo !== "local") {
       nueva.appendChild(P.vacio("info", "Esta pantalla se usa en las PCs del camping", "Desde el sistema general podés ver las ventas en Estadísticas o en Caja."));
+      P.continuidad.montada();
       return;
     }
     if (encontrada.titulo) document.title = encontrada.titulo + " · " + ((P.estado.sesion.predio || {}).nombre || "Predio");
@@ -453,6 +462,8 @@
     } catch (e) {
       P.reemplazar(nueva, P.mensaje("No se pudo mostrar la pantalla: " + e.message, "error"));
       if (window.console) console.error(e);
+    } finally {
+      P.continuidad.montada(r);
     }
   }
   window.addEventListener("hashchange", navegar);
@@ -480,6 +491,8 @@
       temporizadores.forEach(clearInterval);
       temporizadores = [];
       P.pantallaCambioClave(app, claveDeIngreso);
+      P.continuidad.entrar(app);
+      P.continuidad.montada();
       return;
     }
     P.equipo.recordarPuesto(r.puesto);
@@ -511,14 +524,23 @@
       consultarEstadiasVencidas();
       temporizadores.push(setInterval(consultarEstadiasVencidas, 120000));
     }
-    consultarConexion();
     temporizadores.push(setInterval(consultarAvisos, 10000));
-    temporizadores.push(setInterval(consultarConexion, P.modo === "remoto" ? 10000 : 20000));
+    consultarConexion();
+    if (P.modo === "remoto") {
+      temporizadores.push(setInterval(consultarConexion, 10000));
+    }
+  }
+
+  function mostrarIngreso(estado) {
+    P.pantallaIngreso(app, estado);
+    P.continuidad.entrar(app);
+    P.continuidad.montada();
   }
 
   function iniciar() {
     temporizadores.forEach(clearInterval);
     temporizadores = [];
+    P.continuidad.desmontar();
     P.reemplazar(app, P.cargando("Abriendo el sistema del predio…"));
     if (P.modo === "remoto") {
       if (!P.sesion.token()) {
@@ -534,19 +556,25 @@
     P.get("/estado-publico", { sinRedireccion: true }).then(function (estado) {
       P.estado.conexion = estado;
       document.title = (estado.nombre || "Predio") + " · AJB";
-      if (!P.sesion.token()) { P.pantallaIngreso(app, estado); return; }
+      if (!P.sesion.token()) { mostrarIngreso(estado); return; }
       return P.get("/sesion", { sinRedireccion: true }).then(function (r) { P.alIngresar(r); }).catch(function () {
         P.sesion.borrar();
-        P.pantallaIngreso(app, estado);
+        mostrarIngreso(estado);
       });
     }).catch(function (e) {
       P.reemplazar(app, h("div.pagina", P.vacio("alerta", "No se puede conectar con el servidor del camping", e.message,
         P.btn("Reintentar", { tipo: "primario", icono: "refrescar", onclick: iniciar }))));
+      P.continuidad.entrar(app);
+      P.continuidad.montada();
     });
   }
 
   P.alRenovarSesionRemota = function () {
     if (P.modo === "remoto" && !P.estado.sesion) iniciar();
   };
+  if (P.modo === "local") {
+    setInterval(consultarConexion, 20000);
+    document.addEventListener("visibilitychange", function () { if (!document.hidden) consultarConexion(); });
+  }
   iniciar();
 })();

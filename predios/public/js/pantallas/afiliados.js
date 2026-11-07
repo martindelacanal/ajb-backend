@@ -25,6 +25,7 @@
     var obs = P.input({ valor: base.observaciones, max: 250, placeholder: "Opcional" });
     var m = P.modal({
       titulo: editar ? base.nombre : "Nuevo afiliado",
+      reanudar: { id: "afiliado-formulario" },
       subtitulo: sistema ? "Sus datos vienen del sistema general: acá sólo cambia el límite." : (editar ? "Cargado a mano." : "Para quien todavía no aparece por sincronización. Cuando llegue del sistema general se une solo por DNI o legajo."),
       ancho: "ancha",
       contenido: h("div.columna",
@@ -40,6 +41,7 @@
         }).catch(function () {});
       } })],
     });
+    return m;
   }
 
   // ------------------------------------------------------------------ modificación masiva de límites
@@ -112,6 +114,7 @@
   P.ruta.registrar(/^\/gestion\/afiliados$/, function (c, _p, q) {
     P.solapasGestion(c, "/gestion/afiliados");
     if (q.en_predio) P.cache["tabla:afiliados"] = { filtros: { en_predio: q.en_predio } };
+    function abrirAfiliado() { return formAfiliado({}, function () { t.recargar(); }); }
     var t = P.tabla({
       listado: "afiliados", placeholderBuscar: "Nombre, DNI, legajo o departamental",
       alClickFila: function (f) { P.ruta.ir("/afiliados/" + f.id); },
@@ -127,8 +130,9 @@
       P.btn("Modificar límites", { tipo: "suave", chico: true, icono: "descuento", onclick: function () { limitesMasivos(function () { t.recargar(); }); } }),
       P.btn("Liquidaciones y deudas", { tipo: "suave", chico: true, icono: "planilla", onclick: function () { P.ruta.ir("/gestion/liquidaciones"); } }),
       P.btn("Historial de límites", { tipo: "suave", chico: true, icono: "historial", onclick: function () { P.ruta.ir("/gestion/limites"); } })),
-      h("div.gestion-accion-nueva", P.btn("Nuevo afiliado", { tipo: "primario", icono: "mas", onclick: function () { formAfiliado({}, function () { t.recargar(); }); } }))));
+      h("div.gestion-accion-nueva", P.btn("Nuevo afiliado", { tipo: "primario", icono: "mas", onclick: abrirAfiliado }))));
     c.appendChild(t.el);
+    P.continuidad.registrarVentana("afiliado-formulario", abrirAfiliado);
   }, { admin: true, titulo: "Afiliados" });
 
   P.ruta.registrar(/^\/gestion\/limites$/, function (c) {
@@ -169,7 +173,12 @@
   // ------------------------------------------------------------------ ficha del afiliado
   P.ruta.registrar(/^\/afiliados\/(\d+)$/, function (c, params) {
     var id = Number(params[0]);
-    return P.get("/afiliados/" + id).then(function (d) {
+    var cargar = P.get("/afiliados/" + id);
+    function abrirAfiliado() {
+      return cargar.then(function (d) { return formAfiliado(d.afiliado, function () { P.ruta.ir("/afiliados/" + id); }); });
+    }
+    P.continuidad.registrarVentana("afiliado-formulario", abrirAfiliado);
+    return cargar.then(function (d) {
       var a = d.afiliado;
       var disp = d.disponible;
       var hoy = P.hoy();
@@ -179,7 +188,7 @@
           h("h1.titulo-pagina", a.nombre),
           h("p.subtitulo", [a.dni ? "DNI " + P.documento(a.dni) : null, a.legajo ? "Legajo " + a.legajo : null, a.departamental].filter(Boolean).join(" · "), " ",
             enPredio ? P.chip("En el predio", "CONFIRMADA") : null, " ", a.origen === "MANUAL" ? P.chip("Cargado a mano", "PENDIENTE") : null)),
-        h("div.pagina-acciones", P.btn("Editar / límite", { tipo: "secundario", icono: "editar", onclick: function () { formAfiliado(a, function () { P.ruta.ir("/afiliados/" + id); }); } }))));
+        h("div.pagina-acciones", P.btn("Editar / límite", { tipo: "secundario", icono: "editar", onclick: abrirAfiliado }))));
       c.appendChild(h("div.grilla.grilla-4",
         P.cifra("Límite de descuento", P.f.pesos(disp.limite), disp.habilitado ? "Habilitado para descuento" : "No habilitado"),
         P.cifra("Consumido sin liquidar", P.f.pesos(disp.pendiente), d.pendiente_liquidar.cantidad + " compra(s) con descuento"),

@@ -161,11 +161,13 @@
     }
     c.appendChild(h("a.volver", { href: desdePanel ? "#/caja" : "#/vender" }, P.icono("volver"), desdePanel ? "Todas las cajas" : "Vender"));
     return P.get(rutaEstado).then(function (r) {
+      if (!c.isConnected) return;
       var nombre = r.boca.nombre + " · " + r.caja.nombre;
       var esPropia = P.puesto() && Number(P.puesto().caja_id) === Number(cajaId);
       var caja = [{ valor: cajaId, texto: nombre }];
       var acciones = [P.btn("Mis ventas", { tipo: "suave", chico: true, icono: "lista", onclick: function () { P.ruta.ir(desdePanel ? "/caja/" + cajaId + "/ventas" : "/mis-ventas"); } })];
       if (desdePanel) {
+        registrarFormulariosCaja(function () { return caja; }, refrescar);
         acciones.push(
           P.btn("Saldo de apertura", { tipo: "suave", chico: true, icono: "efectivo", onclick: function () { modalApertura(caja, cajaId, refrescar); } }),
           P.btn("Ajuste de caja", { tipo: "suave", chico: true, icono: "transferencia", onclick: function () { modalAjuste(caja, cajaId, refrescar); } }));
@@ -192,12 +194,25 @@
   P.ruta.registrar(/^\/caja\/(\d+)$/, function (c, params) { return detalleCaja(c, Number(params[0]), true); }, { admin: true, titulo: "Caja" });
 
   // ------------------------------------------------------------------ caja del administrador
-  function modalApertura(cajas, cajaId, alTerminar) {
-    var caja = P.select(cajas, cajaId);
-    var fecha = P.input({ tipo: "date", valor: P.hoy() });
-    var importe = P.dinero({});
+  function registrarFormulariosCaja(opciones, alTerminar) {
+    function reabrir(formulario) {
+      return function (datos) {
+        var cajas = opciones();
+        if (datos.cajaId != null) cajas = cajas.filter(function (c) { return String(c.valor) === String(datos.cajaId); });
+        if (!cajas.some(function (c) { return String(c.valor) === datos.seleccion; })) return null;
+        return formulario(cajas, datos.cajaId, alTerminar, datos);
+      };
+    }
+    P.continuidad.registrarVentana("caja-apertura", reabrir(modalApertura));
+    P.continuidad.registrarVentana("caja-ajuste", reabrir(modalAjuste));
+  }
+  function modalApertura(cajas, cajaId, alTerminar, previo) {
+    var caja = P.select(cajas, previo ? previo.seleccion : cajaId);
+    var fecha = P.input({ tipo: "date", valor: previo ? previo.fecha : P.hoy() });
+    var importe = P.dinero({ autofocus: true });
     var obs = P.input({ max: 200, placeholder: "Opcional" });
     var m = P.modal({
+      reanudar: { id: "caja-apertura", datos: function () { return { cajaId: cajaId, seleccion: caja.value, fecha: fecha.value }; } },
       titulo: "Saldo de apertura",
       subtitulo: "El efectivo con el que arranca la caja. El cajero lo va a ver y confirmar.",
       contenido: h("div.columna", P.campo("Caja", caja), P.campo("Día", fecha), P.campo("Importe", h("div.campo-con-prefijo.campo-grande", h("span", "$"), importe), { requerido: true }), P.campo("Observación", obs)),
@@ -210,18 +225,20 @@
         });
       } })],
     });
-    setTimeout(function () { importe.focus(); }, 60);
+    return m;
   }
 
-  function modalAjuste(cajas, cajaId, alTerminar) {
-    var caja = P.select(cajas, cajaId);
-    var concepto = P.select(CONCEPTOS_AJUSTE, "CIERRE_CAJA");
-    var tipo = P.segmentado([{ valor: "INGRESO", texto: "Ingreso" }, { valor: "EGRESO", texto: "Egreso" }], "EGRESO");
+  function modalAjuste(cajas, cajaId, alTerminar, previo) {
+    if (previo && !CONCEPTOS_AJUSTE.some(function (c) { return c.valor === previo.concepto; })) return null;
+    var caja = P.select(cajas, previo ? previo.seleccion : cajaId);
+    var concepto = P.select(CONCEPTOS_AJUSTE, previo ? previo.concepto : "CIERRE_CAJA");
+    var tipo = P.segmentado([{ valor: "INGRESO", texto: "Ingreso" }, { valor: "EGRESO", texto: "Egreso" }], previo ? previo.tipo : "EGRESO");
     concepto.addEventListener("change", function () { tipo.fijar(CONCEPTOS_AJUSTE.filter(function (x) { return x.valor === concepto.value; })[0].tipo); });
-    var importe = P.dinero({});
+    var importe = P.dinero({ autofocus: true });
     var recibo = P.input({ max: 40, placeholder: "N° de recibo (opcional)" });
     var obs = P.input({ max: 250, placeholder: "Opcional" });
     var m = P.modal({
+      reanudar: { id: "caja-ajuste", datos: function () { return { cajaId: cajaId, seleccion: caja.value, concepto: concepto.value, tipo: tipo.valor() }; } },
       titulo: "Ajuste de caja",
       subtitulo: "Para dejar asentado cuando ponés o sacás dinero de una caja.",
       contenido: h("div.columna", P.campo("Caja", caja), P.campo("Concepto", concepto), P.campo("Tipo", tipo),
@@ -243,7 +260,7 @@
         }).catch(function () {});
       } })],
     });
-    setTimeout(function () { importe.focus(); }, 60);
+    return m;
   }
 
   P.verCierre = function (id) {
@@ -290,7 +307,9 @@
     }
     function cargarTarjetas() {
       return Promise.all([P.get("/caja/panel"), P.opciones("cajas", true)]).then(function (r) {
+        if (!c.isConnected) return;
         cajasOp = r[1];
+        registrarFormulariosCaja(function () { return cajasOp; }, refrescar);
         if (!r[0].cajas.length) { P.reemplazar(tarjetas, P.vacio("caja", "No hay cajas", "Creá las cajas de cada boca en Gestión > Bocas y cajas.")); return; }
         P.reemplazar(tarjetas, r[0].cajas.map(function (cj) {
           var ap = cj.apertura;

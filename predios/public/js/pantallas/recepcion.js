@@ -200,10 +200,29 @@
     c.appendChild(h("div.hoja.rec-listado-filtros", h("div.tabla-barra", P.campo(null, q, { clase: "tabla-buscar" }), filtros), panel));
     c.appendChild(out);
     return get("opciones").then(function (o) {
+      if (!c.isConnected) return;
       o.servicios.forEach(function (s) {
         serv.appendChild(h("option", {
           value: s.id
         }, s.nombre));
+      });
+      var previo = P.continuidad.datosPantalla();
+      if (previo) {
+        q.value = previo.q;
+        desde.value = previo.desde;
+        hasta.value = previo.hasta;
+        tipo.value = previo.tipo;
+        serv.value = previo.servicio;
+        presencia.value = previo.presencia;
+        at.input.checked = previo.atipicas;
+        panel.hidden = previo.filtrosOcultos;
+        pag = previo.pagina;
+        if (soloVencidas && presencia.value !== "VENCIDA") c.querySelector("h1").textContent = "Reservas y estadías";
+        actualizarBoton();
+      }
+      P.continuidad.guardarPantalla(function () {
+        return { q: q.value, desde: desde.value, hasta: hasta.value, tipo: tipo.value, servicio: serv.value,
+          presencia: presencia.value, atipicas: at.input.checked, filtrosOcultos: panel.hidden, pagina: pag };
       });
       return cargar();
     });
@@ -229,6 +248,7 @@
     cargarRecursos(seleccion.recurso_id);
     servicio.onchange = function () { cargarRecursos(null); };
     var m = P.modal({
+      reanudar: { id: "recepcion-crear-adicional", datos: seleccion },
       titulo: "Crear adicional", subtitulo: "La tarifa se guarda también en Turismo.",
       contenido: h("div.columna", grid(P.campo("Artículo", nombre), P.campo("Precio por unidad y día ($)", precio)),
         grid(P.campo("Servicio", servicio), P.campo("Recurso", recurso), P.campo("Régimen", regimen)),
@@ -250,6 +270,7 @@
         });
       }, "primario")]
     });
+    return m;
   }
   P.ruta.registrar(/^\/recepcion\/adicionales$/, function (c) {
     var servicio, recurso, catalogo, out = h("div");
@@ -272,37 +293,54 @@
       pintar();
     }
     return get("opciones").then(function (o) {
+      if (!c.isConnected) return;
       catalogo = o;
       servicio = sel(lista(o.servicios), null, "Todos");
       recurso = sel([], null, "Todos");
       servicio.onchange = alServicio; recurso.onchange = pintar;
+      function abrirAdicional(seleccion) {
+        return crearAdicional(catalogo, seleccion, function () {
+          return get("opciones").then(function (v) { catalogo = v; pintar(); });
+        });
+      }
+      P.continuidad.registrarVentana("recepcion-crear-adicional", abrirAdicional);
+      var previo = P.continuidad.datosPantalla();
+      P.continuidad.guardarPantalla(function () {
+        return { servicio: servicio.value, recurso: recurso.value };
+      });
       c.appendChild(cab("Catálogo de adicionales", null, [
         btn("Todas las reservas", function () { ir(); }), btn("Crear adicional", function () {
-          crearAdicional(catalogo, { servicio_id: servicio.value, recurso_id: recurso.value }, function () {
-            return get("opciones").then(function (v) { catalogo = v; pintar(); });
-          });
+          return abrirAdicional({ servicio_id: servicio.value, recurso_id: recurso.value });
         }, "primario")]));
       c.appendChild(grupo("Tarifas por día", null, h("div.columna", grid(P.campo("Servicio", servicio), P.campo("Recurso", recurso)), out)));
+      if (previo) servicio.value = previo.servicio;
       alServicio();
+      if (previo) { recurso.value = previo.recurso; pintar(); }
     });
   }, { titulo: "Catálogo de adicionales", admin: true });
   function formulario(c, o, r, cuenta, accion) {
+    if (!c.isConnected) return;
     r = r || {};
+    var previo = P.continuidad.datosPantalla();
     var hoy = P.hoy(),
-      viajeros = (r.personas || []).map(function (p) {
+      viajeros = previo ? previo.viajeros : (r.personas || []).map(function (p) {
         return Object.assign({}, p);
       }),
-      extras = (r.adicionales_vigentes || r.adicionales || []).map(function (a) {
+      extras = previo ? previo.extras : (r.adicionales_vigentes || r.adicionales || []).map(function (a) {
         return Object.assign({}, a, { porDia: !!(a.fecha_desde || a.fecha_hasta) });
       });
-    var iniciada = viajeros.some(function (p) { return p.entrada; });
+    var iniciada = (r.personas || []).some(function (p) { return p.entrada; });
     var recursosFijos = !!r.bloque_fecha_id;
-    var familia = [],
-      titular = r.id ? {
+    var familia = previo ? previo.familia : [],
+      titular = previo ? previo.titular : r.id ? {
         dni: r.titular_dni
       } : null,
-      particular = null,
-      opId = nuevaClave();
+      particular = previo ? previo.particular : null,
+      titularMostrado = previo ? previo.titularMostrado : null,
+      particularSinFicha = previo ? previo.particularSinFicha : false,
+      cotizacion = previo ? previo.cotizacion : null,
+      opId = previo ? previo.opId : nuevaClave(),
+      versionInicial = previo ? previo.versionInicial : r.version;
     var tipo = sel(opciones(TIPOS), r.tipo || "GENERAL"),
       serv = sel(lista(o.servicios), r.servicio_id, "Elegí un servicio"),
       rec = sel([], null),
@@ -312,10 +350,10 @@
       entidad = input(r.entidad),
       cantidad = input(r.cantidad || 1, "number"),
       traslado = input(hoy, "date");
-    if (accion === "salida") {
+    if (!previo && accion === "salida") {
       viajeros.forEach(function (p) { if (p.entrada && !p.salida) p.salida = hoy; });
       if (fin.value < hoy && r.tipo !== "PASA_EL_DIA" && !r.bloque_fecha_id) fin.value = hoy;
-    } else if (accion === "extender") {
+    } else if (!previo && accion === "extender") {
       fin.value = P.sumarDias(fin.value < hoy ? hoy : fin.value, 1);
     }
     var dni = input(r.titular_dni),
@@ -342,6 +380,9 @@
       });
     var selectFamilia = sel([], null, "Elegí una persona"),
       selectExtra = sel([], null, "Elegí un adicional");
+    var campos = { tipo: tipo, servicio: serv, regimen: reg, inicio: inicio, fin: fin, entidad: entidad, cantidad: cantidad,
+      traslado: traslado, dni: dni, nombre: nom, apellido: ape, nacimiento: nac, marca: marca, color: color, patente: patente,
+      sector: sector, precio: manual, motivo: motivo, observaciones: obs };
     function inicioAlquiler() {
       return inicio.value && hoy < inicio.value ? inicio.value : fin.value && hoy > fin.value ? fin.value : hoy;
     }
@@ -383,14 +424,17 @@
       })) : h("span.texto-2", !rec.value || !reg.value ? "Elegí un recurso y un régimen para ver los artículos." :
           extras.length ? "No hay más artículos disponibles para esta selección." : "No hay artículos disponibles para esta selección."),
         P.esAdmin() && rec.value && reg.value ? btn("Crear adicional en el catálogo", function () {
-          crearAdicional(o, { servicio_id: serv.value, recurso_id: rec.value, regimen_id: reg.value, fecha_desde: inicioAlquiler() }, function (x) {
-            return get("opciones").then(function (v) {
-              o.adicionales = v.adicionales;
-              pintarAdicionales();
-              selectExtra.value = String(x.id);
-            });
-          });
+          return abrirAdicional({ servicio_id: serv.value, recurso_id: rec.value, regimen_id: reg.value, fecha_desde: inicioAlquiler() });
         }, "texto") : null);
+    }
+    function abrirAdicional(seleccion) {
+      return crearAdicional(o, seleccion, function (x) {
+        return get("opciones").then(function (v) {
+          o.adicionales = v.adicionales;
+          pintarAdicionales();
+          selectExtra.value = String(x.id);
+        });
+      });
     }
     function recursos(v) {
       opSelect(rec, lista(o.recursos.filter(function (x) {
@@ -456,6 +500,23 @@
         grupoViaje.querySelectorAll("fieldset")[viajeros.length - 1].querySelector("input").focus();
       })));
     }
+    function mostrarTitular(p) {
+      P.reemplazar(estadoTit, h("strong", p.apellido + ", " + p.nombre + " · " + (Number(p.afiliado) ? "Afiliado" : "Particular")));
+    }
+    function mostrarParticular() {
+      P.reemplazar(estadoTit, P.mensaje("No encontramos una ficha. Podés registrar un particular sin acceso a Mi AJB.", "info"));
+      P.reemplazar(part, grid(P.campo("Nombre", nom), P.campo("Apellido", ape), P.campo("Nacimiento", nac)), btn("Usar este particular", function () {
+        if (!nom.value || !ape.value || !nac.value || !/^\d{6,10}$/.test(dni.value)) throw Error("Completá DNI, nombre, apellido y nacimiento.");
+        particular = { nombre: nom.value, apellido: ape.value, fecha_nacimiento: nac.value, dni: dni.value, parentesco_id: 1, tipo_persona_id: 4 };
+        titular = titularMostrado = particular;
+        particularSinFicha = false;
+        familia = [particular];
+        viajeros = [Object.assign({}, particular)];
+        mostrarTitular(particular);
+        P.vaciar(part);
+        pintarPersonas();
+      }));
+    }
     function buscarTitular(q, editar) {
       return get("familia", {
         q: q
@@ -467,39 +528,24 @@
           viajeros = [];
         }
         familia = f.personas;
+        titularMostrado = f.titular;
+        particularSinFicha = !editar && !f.titular;
         P.vaciar(part);
         if (f.titular) {
-          P.reemplazar(estadoTit, h("strong", f.titular.apellido + ", " + f.titular.nombre + " · " + (Number(f.titular.afiliado) ? "Afiliado" : "Particular")));
+          mostrarTitular(f.titular);
           if (!editar) {
             dni.value = f.titular.dni;
             viajeros = [Object.assign({}, f.titular)];
           }
-        } else if (!editar) {
-          P.reemplazar(estadoTit, P.mensaje("No encontramos una ficha. Podés registrar un particular sin acceso a Mi AJB.", "info"));
-          P.reemplazar(part, grid(P.campo("Nombre", nom), P.campo("Apellido", ape), P.campo("Nacimiento", nac)), btn("Usar este particular", function () {
-            if (!nom.value || !ape.value || !nac.value || !/^\d{6,10}$/.test(dni.value)) throw Error("Completá DNI, nombre, apellido y nacimiento.");
-            particular = {
-              nombre: nom.value,
-              apellido: ape.value,
-              fecha_nacimiento: nac.value,
-              dni: dni.value,
-              parentesco_id: 1,
-              tipo_persona_id: 4
-            };
-            titular = particular;
-            familia = [particular];
-            viajeros = [Object.assign({}, particular)];
-            P.reemplazar(estadoTit, h("strong", ape.value + ", " + nom.value + " · Particular"));
-            P.vaciar(part);
-            pintarPersonas();
-          }));
-        }
+        } else if (particularSinFicha) mostrarParticular();
         pintarPersonas();
       });
     }
     dni.oninput = function () {
       titular = null;
       particular = null;
+      titularMostrado = null;
+      particularSinFicha = false;
       familia = [];
       viajeros = [];
       P.vaciar(estadoTit);
@@ -529,7 +575,7 @@
       return {
         operacion: opId,
         id: r.id,
-        version: r.version,
+        version: versionInicial,
         titular_dni: titular && String(titular.dni),
         particular: particular,
         tipo: tipo.value,
@@ -559,44 +605,51 @@
         observaciones: obs.value
       };
     }
+    function pintarCotizacion(b, x, enfocar) {
+      cotizacion = { cuerpo: b, resultado: x };
+      var confirmar = btn(accion === "salida" ? "Confirmar salida" : r.id ? "Guardar cambios" : "Crear reserva aprobada", function () {
+        var nuevo = cuerpo();
+        if (JSON.stringify(nuevo) !== JSON.stringify(b)) {
+          cotizacion = null;
+          P.vaciar(pre);
+          throw Error("Cambiaste el formulario. Revisá el importe de nuevo.");
+        }
+        return P.post("/recepcion/guardar", Object.assign({}, b, { cotizacion_esperada: x.cotizacion_esperada, cuenta_esperada: x.cuenta })).then(function (res) {
+          if (res.encolado) {
+            ir();
+            return;
+          }
+          P.aviso(res.mensaje, "ok");
+          ir(res.id);
+        });
+      }, "primario");
+      var saldo = x.cuenta || cuenta;
+      P.reemplazar(pre, h("div.columna", h("div.rec-cotizacion", h("h3", "Revisión del importe"),
+        grid(P.dato("Precio final de la reserva", pesos(x.total)), P.dato("Incluye adicionales", pesos(x.adicionales || 0)),
+          r.id ? P.dato(x.diferencia < 0 ? "Disminución del precio" : "Aumento del precio", pesos(Math.abs(x.diferencia))) : null), x.personas.map(function (p) {
+        return h("div", p.nombre + " · " + pesos(p.precio));
+      })), x.detalle_alquileres && x.detalle_alquileres.length ? tabla(
+        ["Artículo", "Unidades", "Primer día", "Último día", "Días cobrados", "Subtotal"], x.detalle_alquileres.map(function (a) {
+          return [a.nombre, a.cantidad, fecha(a.fecha_desde), fecha(a.fecha_hasta), a.dias, pesos(a.subtotal)];
+        })) : null,
+        saldo ? cobroFinal(Number(saldo.pendiente) + Number(x.diferencia), Number(saldo.neto_consumos)) : null, confirmar));
+      if (enfocar) confirmar.focus();
+    }
     var guardar = btn("Revisar importe", function () {
       var b = cuerpo();
       return P.post("/recepcion/cotizar", b).then(function (x) {
-        var confirmar = btn(accion === "salida" ? "Confirmar salida" : r.id ? "Guardar cambios" : "Crear reserva aprobada", function () {
-          var nuevo = cuerpo();
-          if (JSON.stringify(nuevo) !== JSON.stringify(b)) {
-            P.vaciar(pre);
-            throw Error("Cambiaste el formulario. Revisá el importe de nuevo.");
-          }
-          return P.post("/recepcion/guardar", Object.assign({}, b, { cotizacion_esperada: x.cotizacion_esperada, cuenta_esperada: x.cuenta })).then(function (res) {
-            if (res.encolado) {
-              ir();
-              return;
-            }
-            P.aviso(res.mensaje, "ok");
-            ir(res.id);
-          });
-        }, "primario");
-        var saldo = x.cuenta || cuenta;
-        P.reemplazar(pre, h("div.columna", h("div.rec-cotizacion", h("h3", "Revisión del importe"),
-          grid(P.dato("Precio final de la reserva", pesos(x.total)), P.dato("Incluye adicionales", pesos(x.adicionales || 0)),
-            r.id ? P.dato(x.diferencia < 0 ? "Disminución del precio" : "Aumento del precio", pesos(Math.abs(x.diferencia))) : null), x.personas.map(function (p) {
-          return h("div", p.nombre + " · " + pesos(p.precio));
-        })), x.detalle_alquileres && x.detalle_alquileres.length ? tabla(
-          ["Artículo", "Unidades", "Primer día", "Último día", "Días cobrados", "Subtotal"], x.detalle_alquileres.map(function (a) {
-            return [a.nombre, a.cantidad, fecha(a.fecha_desde), fecha(a.fecha_hasta), a.dias, pesos(a.subtotal)];
-          })) : null,
-          saldo ? cobroFinal(Number(saldo.pendiente) + Number(x.diferencia), Number(saldo.neto_consumos)) : null, confirmar));
-        confirmar.focus();
+        pintarCotizacion(b, x, true);
       });
     }, "primario");
     var gExtra = grupo("Alquiler de artículos y adicionales", "Se cobra cada unidad por cada día de uso, incluidos el primero y el último.", cargos);
     var contingente = grid(P.campo("Integrantes totales (incluye responsables)", cantidad), P.campo("Entidad (opcional)", entidad));
-    function modalidad() {
+    function modalidad(conservarFechas) {
       contingente.hidden = tipo.value !== "CONTINGENTE";
       manual.required = tipo.value !== "GENERAL";
-      if (tipo.value === "PASA_EL_DIA") fin.value = inicio.value;
-      else if (tipo.value === "GENERAL" && inicio.value && fin.value <= inicio.value) fin.value = P.sumarDias(inicio.value, 1);
+      if (conservarFechas !== true) {
+        if (tipo.value === "PASA_EL_DIA") fin.value = inicio.value;
+        else if (tipo.value === "GENERAL" && inicio.value && fin.value <= inicio.value) fin.value = P.sumarDias(inicio.value, 1);
+      }
       fin.readOnly = tipo.value === "PASA_EL_DIA";
       pintarAdicionales();
     }
@@ -631,15 +684,34 @@
     base.appendChild(grupo("Importe y observaciones", null, h("div.columna", grid(P.campo("Precio acordado sin alquileres por día ($)", manual, {
       ayuda: "En General, dejalo vacío para usar la tarifa. En las otras modalidades es obligatorio. Cero indica gratuidad del alojamiento."
     }), P.campo("Motivo del cambio o de la salida", motivo), P.campo("Observaciones de la reserva", obs)), guardar, pre)));
-    recursos(r.recurso_id);
+    if (previo) {
+      Object.keys(campos).forEach(function (clave) { campos[clave].value = previo.campos[clave]; });
+      if (titularMostrado) mostrarTitular(titularMostrado);
+      else if (particularSinFicha) mostrarParticular();
+    }
+    recursos(previo ? previo.recurso : r.recurso_id);
     pintarPersonas();
-    modalidad();
+    modalidad(!!previo);
+    if (P.esAdmin()) P.continuidad.registrarVentana("recepcion-crear-adicional", abrirAdicional);
+    P.continuidad.guardarPantalla(function () {
+      var valores = {};
+      Object.keys(campos).forEach(function (clave) { valores[clave] = campos[clave].value; });
+      return { campos: valores, recurso: rec.value, familiarElegido: selectFamilia.value, adicionalElegido: selectExtra.value,
+        familia: familia, titular: titular, particular: particular, titularMostrado: titularMostrado, particularSinFicha: particularSinFicha,
+        viajeros: viajeros, extras: extras, cotizacion: cotizacion, opId: opId, versionInicial: versionInicial };
+    });
+    if (previo) {
+      selectFamilia.value = previo.familiarElegido;
+      selectExtra.value = previo.adicionalElegido;
+      if (cotizacion) pintarCotizacion(cotizacion.cuerpo, cotizacion.resultado, false);
+      return;
+    }
     if (accion === "extender") fin.focus();
     if (r.id) return buscarTitular(String(r.titular_dni), true);
   }
   P.ruta.registrar(/^\/recepcion\/nueva$/, function (c) {
     return get("opciones").then(function (o) {
-      formulario(c, o);
+      return formulario(c, o);
     });
   }, {
     titulo: "Nueva reserva"
@@ -671,15 +743,19 @@
       LIQUIDAR: a.cierre_pendiente === false && "La cuenta está al día.",
       PAGO_RESERVA: !Number(a.pendiente) && "La reserva no tiene diferencias pendientes."
     };
+    P.continuidad.registrarVentana("recepcion-operar-cuenta", function (datos) {
+      if (!Object.prototype.hasOwnProperty.call(ACC, datos.accion) || inactivo[datos.accion]) return null;
+      return operarCuenta(r, a, datos.accion, cargar, datos.operacion);
+    });
     return h("div", !presentes.length && !a.movimientos.length ? h("p.texto-2", inactivo.CARGA) : null,
       a.cierre_pendiente === false && a.movimientos.some(function (m) { return m.concepto === "SALDAR_CONSUMOS"; }) ? h("p.fuerte", "Cuenta de consumos saldada") : null,
       h("div.fila", Object.keys(ACC).map(function (k) {
-        var boton = btn(ACC[k], function () { operarCuenta(r, a, k, cargar); });
+        var boton = btn(ACC[k], function () { return operarCuenta(r, a, k, cargar); });
         if (inactivo[k]) { boton.disabled = true; boton.title = inactivo[k]; }
         return boton;
       })));
   }
-  function operarCuenta(r, a, accion, refrescar) {
+  function operarCuenta(r, a, accion, refrescar, operacion) {
     var presentes = a.personas.filter(function (p) {
       return p.entrada && !p.salida;
     });
@@ -733,7 +809,7 @@
     var medio = sel(opciones(met), accion === "LIQUIDAR" && met.HABERES ? "HABERES" : null),
       caja = sel([], null, "Elegí una caja"),
       campoCaja = P.campo("Caja de efectivo", caja);
-    if (!repartir && (!liquidar || n)) P.opciones("cajas").then(function (xs) {
+    var cargarCajas = !repartir && (!liquidar || n) ? P.opciones("cajas").then(function (xs) {
       var asignada = P.puesto() && P.puesto().caja_id;
       if (!P.esAdmin()) xs = xs.filter(function (x) { return asignada && String(x.valor) === String(asignada); });
       xs.forEach(function (x) {
@@ -743,14 +819,15 @@
       });
       if (asignada && xs.some(function (x) { return String(x.valor) === String(asignada); })) caja.value = asignada;
       else if (xs.length === 1) caja.value = xs[0].valor;
-    }).catch(P.error);
+    }).catch(P.error) : Promise.resolve();
     function actualizar() {
       campoCaja.hidden = medio.value !== "EFECTIVO" || accion === "REPARTIR" || liquidar && Number(n) === 0;
     }
     medio.onchange = actualizar;
     actualizar();
-    var key = nuevaClave();
+    var key = operacion || nuevaClave();
     var m = P.modal({
+      reanudar: { id: "recepcion-operar-cuenta", datos: { accion: accion, operacion: key } },
       titulo: ACC[accion],
       contenido: h("div.columna", liquidar ? h("div.rec-resumen", n < 0 ? "A devolver" : n > 0 ? "A cobrar" : "Sin diferencia de dinero", h("strong", pesos(Math.abs(n)))) : grid(P.campo(repartir ? "Desde" : "Persona", origen), repartir ? P.campo("Hacia", dest) : null, P.campo("Importe ($)", imp)), repartir ? vistaReparto : liquidar && !n ? null : P.campo("Medio", medio), campoCaja, P.campo("Observación", nota), accion === "LIQUIDAR" ? P.mensaje("Se cancelarán los saldos disponibles de todos los integrantes. Solo se liquida lo consumido, descontando los anticipos.", "info") : null),
       acciones: [btn("Volver", function () {
@@ -783,6 +860,7 @@
         });
       }, "primario")]
     });
+    return cargarCajas.then(function () { return m; });
   }
   P.ruta.registrar(/^\/recepcion\/(\d+)$/, function (c, param) {
     var id = param[0];
@@ -790,6 +868,7 @@
       return get("detalle", {
         id: id
       }).then(function (d) {
+        if (!c.isConnected) return;
         var r = d.reserva,
           a = d.cuenta;
         var pasajeros = r.personas.map(function (p) {
