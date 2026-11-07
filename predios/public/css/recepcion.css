@@ -228,3 +228,13 @@ a.rec-enlace:hover, a.rec-enlace:focus-visible { text-decoration: underline; }
 .rec-grid-vehiculos-salida { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
 .rec-grid-vehiculos-salida .campo-etiqueta { white-space: normal; overflow-wrap: anywhere; }
 @media (max-width: 600px) { .rec-grid-vehiculos-salida { grid-template-columns: minmax(0, 1fr); } }
+
+/* Contable: detalle de recibos y notas de crédito. */
+.rec-cobro-item .contable-efecto { grid-column: 1 / -1; margin: 0; }
+.contable-total { justify-content: space-between; margin-top: 10px; }
+.contable-historial { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.contable-historial li { position: relative; padding: 0 0 0 18px; border-left: 2px solid var(--borde, #d6e6f2); }
+.contable-historial li::before { content: ""; position: absolute; left: -6px; top: 4px; width: 10px; height: 10px; border-radius: 50%; background: var(--azul); }
+.contable-historial-cabeza { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.contable-historial p { margin: 2px 0 0; overflow-wrap: anywhere; }
+.contable-detalle .rec-datos { overflow-wrap: anywhere; }

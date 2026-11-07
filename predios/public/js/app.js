@@ -29,6 +29,7 @@
       { ruta: "/compras", texto: "Compras", icono: "compras" },
       { ruta: "/gestion", texto: "Gestión", icono: "gestion" },
       { ruta: "/recepcion", texto: "Reservas y estadías", icono: "usuarios" },
+      { ruta: "/contable", texto: "Contable", icono: "planilla" },
       itemVehiculos,
       { ruta: "/usuarios", texto: "Usuarios", icono: "usuarios" },
       { ruta: "/estadisticas", texto: "Estadísticas", icono: "estadisticas" },

@@ -1,87 +1,17 @@
 "use strict";
 
-// Cobro y comprobantes de alquileres y compras de una reserva.
-// Un cobro paga en el momento uno o varios artículos: deja un PAGO_ADICIONAL por artículo, todos con
-// el mismo número de comprobante (el id del primero), y un solo movimiento de caja por el efectivo.
-// Un pago anterior a los comprobantes (sin número) se reimprime con su propio id como número.
-// El comprobante no es fiscal: el predio no factura ante AFIP.
+// Cobro de alquileres y compras de una reserva.
+// Un cobro paga en el momento uno o varios artículos: deja un PAGO_ADICIONAL por artículo, un solo
+// movimiento de caja por el efectivo y un recibo (lib/comprobantes.js) con un renglón por artículo.
+// El recibo no es fiscal; se reimprime, se anula o se corrige con una nota de crédito desde Contable.
 
 const U = require("../util");
 const N = require("../negocio");
-const { permiso, turismo, cuenta, estadoAdicionales, movimiento, caja, empresa } = require("./recepcion");
+const C = require("../comprobantes");
+const { permiso, turismo, cuenta, estadoAdicionales, movimiento, caja, resumen } = require("./recepcion");
 
 const MEDIOS = ["EFECTIVO", "TRANSFERENCIA"];
 const MAX_ITEMS = 60;
-
-// Sin `undefined`: la respuesta guardada para los reintentos tiene que ser idéntica a la original.
-const nulo = v => v === undefined || v === "" ? null : v;
-const esPago = m =>m.concepto === "PAGO_ADICIONAL" && Number(m.importe) > 0 && !m.anula_mov_id;
-const numeroDe = m => Number(m.comprobante || m.id);
-
-function nombreRecursos(r) {
-  return (r.recursos || []).map(x => x.nombre).filter(Boolean).join(", ") || r.recurso || null;
-}
-// El detalle de una anulación es «Anula el pago de <artículo> · motivo» (ver operarAdicional).
-function motivoAnulacion(detalle, nombre) {
-  const d = String(detalle || ""), prefijo = "Anula el pago de " + nombre;
-  if (d === prefijo) return null;
-  return d.indexOf(prefijo + " · ") === 0 ? d.slice(prefijo.length + 3) || null : d || null;
-}
-
-/** Datos para imprimir el comprobante `numero` de la reserva, con las anulaciones posteriores. */
-function armarComprobante(r, a, numero, datosEmpresa) {
-  const pagos = a.movimientos.filter(m => esPago(m) && numeroDe(m) === numero).sort((x, y) => Number(x.id) - Number(y.id));
-  if (!pagos.length) throw U.error("No encontramos ese comprobante en la reserva.", 404);
-  const anulaciones = new Map(a.movimientos.filter(m => m.anula_mov_id).map(m => [Number(m.anula_mov_id), m]));
-  const lineas = new Map(estadoAdicionales(r, a).map(l => [Number(l.adicional_id), l]));
-  let observacion = null;
-  const items = pagos.map(m => {
-    const l = lineas.get(Number(m.adicional_id));
-    const detalle = String(m.detalle || "");
-    // El detalle del movimiento es «artículo · observación».
-    const nombre = l ? l.nombre : detalle.split(" · ")[0] || "Artículo";
-    if (!observacion && detalle.indexOf(nombre + " · ") === 0) observacion = detalle.slice(nombre.length + 3) || null;
-    const an = anulaciones.get(Number(m.id)) || null;
-    return {
-      movimiento_id: Number(m.id),
-      adicional_id: Number(m.adicional_id),
-      nombre,
-      modalidad: nulo(l && l.modalidad),
-      cantidad: nulo(l && l.cantidad),
-      dias: nulo(l && l.dias),
-      fecha_desde: nulo(l && l.fecha_desde),
-      fecha_hasta: nulo(l && l.fecha_hasta),
-      importe: U.redondear(m.importe),
-      anulado: !!an,
-      anulacion: an ? { fecha: an.fecha, usuario_nombre: nulo(an.usuario_nombre), motivo: motivoAnulacion(an.detalle, nombre) } : null
-    };
-  });
-  const total = U.redondear(items.reduce((s, x) => s + x.importe, 0));
-  const anulado = U.redondear(items.reduce((s, x) => s + (x.anulado ? x.importe : 0), 0));
-  const primero = pagos[0];
-  return {
-    numero,
-    fecha: primero.fecha,
-    medio: primero.medio,
-    empleado: nulo(primero.usuario_nombre),
-    observacion,
-    estado: !anulado ? "VIGENTE" : anulado >= total ? "ANULADO" : "ANULADO_PARCIAL",
-    total,
-    anulado,
-    vigente: U.redondear(total - anulado),
-    items,
-    reserva: {
-      id: r.id,
-      titular_nombre: nulo(r.titular_nombre),
-      titular_dni: nulo(r.titular_dni),
-      servicio: nulo(r.servicio),
-      recurso: nombreRecursos(r),
-      fecha_inicio: nulo(r.fecha_inicio),
-      fecha_fin: nulo(r.fecha_fin)
-    },
-    empresa: Object.fromEntries(Object.entries(datosEmpresa || {}).map(([k, v]) => [k, nulo(v)]))
-  };
-}
 
 async function cobrar(ctx) {
   permiso(ctx);
@@ -115,36 +45,22 @@ async function cobrar(ctx) {
       return { linea, importe: n };
     });
     const total = U.redondear(items.reduce((s, x) => s + x.importe, 0));
-    if (medio === "EFECTIVO") await caja(t, ctx, b, total, id, "ADICIONAL_ESTADIA");
-    let numero = null;
+    const cajaMov = medio === "EFECTIVO" ? await caja(t, ctx, b, total, id, "ADICIONAL_ESTADIA") : null;
+    const movimientos = [];
     for (const x of items) {
-      const movId = await movimiento(t, ctx, id, "PAGO_ADICIONAL", x.importe, medio, [x.linea.nombre, nota].filter(Boolean).join(" · "), null, null, null,
-        { adicional_id: Number(x.linea.adicional_id), comprobante: numero });
-      if (numero === null) {
-        numero = movId;
-        await N.actualizar(t, ctx, "predio_estadia_mov", movId, { comprobante: movId });
-      }
+      movimientos.push(await movimiento(t, ctx, id, "PAGO_ADICIONAL", x.importe, medio, [x.linea.nombre, nota].filter(Boolean).join(" · "), null, null, null,
+        { adicional_id: Number(x.linea.adicional_id) }));
     }
-    const datos = armarComprobante(r, await cuenta(t, ctx, id), numero, await empresa({ ...ctx, db: t }));
+    const comprobante = await C.emitir(t, ctx, { reserva: r, movimientos, medio, operacion: "ARTICULOS", observacion: nota, cajaMovimiento: cajaMov });
     const respuesta = {
-      mensaje: (items.length === 1 ? "Pago de " + items[0].linea.nombre + " registrado" : "Cobro de " + items.length + " artículos registrado") + " · Comprobante N° " + numero,
-      comprobante: numero,
+      mensaje: (items.length === 1 ? "Pago de " + items[0].linea.nombre + " registrado" : "Cobro de " + items.length + " artículos registrado") + " · Recibo " + comprobante.codigo,
+      comprobante: resumen(comprobante),
       total,
-      datos
+      datos: C.leer(await N.obtener(t, ctx, "predio_comprobante", comprobante.id))
     };
     await N.insertar(t, ctx, "predio_recepcion_recibo", { clave: key, huella, respuesta: JSON.stringify(respuesta) });
     return respuesta;
   });
-}
-
-async function verComprobante(ctx) {
-  permiso(ctx);
-  const id = U.id(ctx.params.id),
-    numero = U.id(ctx.params.numero, "El número de comprobante");
-  // Turismo confirma que la reserva es de este predio y que el usuario puede verla.
-  const { reserva: r } = await turismo(ctx.db, ctx, "detalle", { id });
-  const a = await cuenta(ctx.db, ctx, id);
-  return armarComprobante(r, a, numero, await empresa(ctx));
 }
 
 const rutas = [{
@@ -152,10 +68,6 @@ const rutas = [{
   p: "/recepcion/:id/articulos/cobrar",
   escritura: true,
   h: cobrar
-}, {
-  m: "GET",
-  p: "/recepcion/:id/articulos/comprobante/:numero",
-  h: verComprobante
 }];
 
-module.exports = { rutas, armarComprobante };
+module.exports = { rutas };

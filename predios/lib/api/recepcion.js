@@ -3,7 +3,8 @@ const { verificarOperador, turnoAbierto } = require("../turnos-caja");
 const { esCierreDeSaldo, resumirCuenta, repartir } = require("../cuenta-estadia");
 
 const U = require("../util"),
-  N = require("../negocio");
+  N = require("../negocio"),
+  C = require("../comprobantes");
 const {
   exigirPuesto,
   exigirBoca,
@@ -152,7 +153,7 @@ async function operarAdicional(ctx) {
     const linea = estadoAdicionales(r, a).find(x => Number(x.adicional_id) === adicionalId);
     if (!linea) throw U.error("Ese artículo no está en la reserva.", 404);
     const nota = U.texto(b.detalle, { max: 180 });
-    let mensaje;
+    let mensaje, comprobante = null;
     if (b.accion === "DEVOLVER" || b.accion === "DESHACER_DEVOLUCION") {
       if (linea.modalidad === "VENTA" || !linea.fecha_desde) throw U.error("Sólo se registra la devolución de un artículo alquilado por días.");
       const fila = await t.get("SELECT * FROM predio_adicional_devolucion WHERE predio_id=? AND reserva_id=? AND adicional_id=?" + t.forUpdate, [ctx.pid, id, adicionalId]);
@@ -172,19 +173,28 @@ async function operarAdicional(ctx) {
       U.opcion(b.medio, MEDIOS_ADICIONAL, "El medio");
       const n = importe(b.importe);
       if (n > linea.adeudado) throw U.error("El importe supera lo que falta pagar de " + linea.nombre + " (" + U.pesos(linea.adeudado) + ").");
-      if (b.medio === "EFECTIVO") await caja(t, ctx, b, n, id, "ADICIONAL_ESTADIA");
-      await movimiento(t, ctx, id, "PAGO_ADICIONAL", n, b.medio, [linea.nombre, nota].filter(Boolean).join(" · "), null, null, null, { adicional_id: adicionalId });
-      mensaje = "Pago de " + linea.nombre + " registrado";
+      const cajaMov = b.medio === "EFECTIVO" ? await caja(t, ctx, b, n, id, "ADICIONAL_ESTADIA") : null;
+      const movId = await movimiento(t, ctx, id, "PAGO_ADICIONAL", n, b.medio, [linea.nombre, nota].filter(Boolean).join(" · "), null, null, null, { adicional_id: adicionalId });
+      comprobante = await C.emitir(t, ctx, { reserva: r, movimientos: [movId], medio: b.medio, operacion: "ARTICULOS", observacion: nota, cajaMovimiento: cajaMov });
+      mensaje = "Pago de " + linea.nombre + " registrado · " + C.NOMBRE[comprobante.tipo] + " " + comprobante.codigo;
     } else if (b.accion === "ANULAR_PAGO") {
       const pago = a.movimientos.find(m => Number(m.id) === Number(b.movimiento_id));
       if (!pago || pago.concepto !== "PAGO_ADICIONAL" || Number(pago.adicional_id) !== adicionalId || Number(pago.importe) <= 0) throw U.error("No encontramos ese pago del artículo.", 404);
       if (a.pagos_anulados.includes(Number(pago.id))) throw U.error("Ese pago ya fue anulado.", 409);
+      // Un pago con recibo se devuelve con una nota de crédito sobre ese recibo (queda en Contable).
+      const recibo = pago.comprobante ? await t.get("SELECT * FROM predio_comprobante WHERE predio_id=? AND id=? AND tipo='RECIBO'", [ctx.pid, pago.comprobante]) : null;
+      if (recibo) {
+        comprobante = await require("./contable").devolverRenglones(t, ctx, recibo, [{ movimiento_id: pago.id, importe: null }],
+          { medio: pago.medio, motivo: nota || "Anulación del pago de " + linea.nombre, cuerpo: b });
+        mensaje = "Pago de " + linea.nombre + " anulado · " + C.NOMBRE[comprobante.tipo] + " " + comprobante.codigo;
+      } else {
       if (pago.medio === "EFECTIVO") await caja(t, ctx, b, -Number(pago.importe), id, "ADICIONAL_ESTADIA");
       await movimiento(t, ctx, id, "PAGO_ADICIONAL", -Number(pago.importe), pago.medio, ["Anula el pago de " + linea.nombre, nota].filter(Boolean).join(" · "), null, null, null,
         { adicional_id: adicionalId, anula_mov_id: Number(pago.id) });
       mensaje = "Pago de " + linea.nombre + " anulado";
+      }
     } else throw U.error("Operación de artículo inválida.");
-    const respuesta = { mensaje };
+    const respuesta = { mensaje, comprobante: resumen(comprobante) };
     await N.insertar(t, ctx, "predio_recepcion_recibo", { clave: key, huella, respuesta: JSON.stringify(respuesta) });
     return respuesta;
   });
@@ -223,6 +233,7 @@ async function sincronizar(t, ctx, r) {
 async function aplicarConfirmacion(t, ctx, r, key, huella, motivo) {
   const previo = await t.get("SELECT respuesta FROM predio_recepcion_recibo WHERE predio_id=? AND clave=?" + t.forUpdate, [ctx.pid, key]);
   if (previo) return JSON.parse(previo.respuesta);
+  let comprobante = null;
   await sincronizar(t, ctx, r);
   const diferenciales = r.diferenciales || (Number(r.diferencia) ? [{ importe: r.diferencia }] : []);
   if (diferenciales.length || r.plan_salida) {
@@ -231,7 +242,7 @@ async function aplicarConfirmacion(t, ctx, r, key, huella, motivo) {
       const p = personas.find(p => String(p.dni) === String(d.dni));
       await movimiento(t, ctx, r.id, "DIFERENCIAL", d.importe, null, "Variación del importe de la reserva", p?.id);
     }
-    if (r.plan_salida) await aplicarSalida(t, ctx, r.id, r.plan_salida, personas);
+    if (r.plan_salida) comprobante = await aplicarSalida(t, ctx, r.id, r.plan_salida, personas, r);
   }
   await N.auditar(t, ctx, "Operación atípica", "reserva", r.id, {
     operacion: key,
@@ -247,7 +258,8 @@ async function aplicarConfirmacion(t, ctx, r, key, huella, motivo) {
     id: r.id,
     total: r.precio_total,
     diferencia: r.diferencia,
-    mensaje: "Reserva T-" + r.id + " guardada"
+    mensaje: "Reserva T-" + r.id + " guardada" + (comprobante ? " · " + C.NOMBRE[comprobante.tipo] + " " + comprobante.codigo : ""),
+    comprobante: resumen(comprobante)
   };
   await N.insertar(t, ctx, "predio_recepcion_recibo", {
     clave: key,
@@ -304,8 +316,8 @@ async function prepararCaja(t, ctx, b) {
   return { caja_id: cajaId, boca_id: ca.boca_id, turno_id: turnoDeCaja(ctx, cajaId), fecha: U.fechaHora() };
 }
 async function registrarCaja(t, ctx, datos, n, id, concepto) {
-  if (!n) return;
-  await N.insertar(t, ctx, "predio_caja_movimiento", {
+  if (!n) return null;
+  return N.insertar(t, ctx, "predio_caja_movimiento", {
     ...datos,
     concepto,
     tipo: n < 0 ? "EGRESO" : "INGRESO",
@@ -316,7 +328,11 @@ async function registrarCaja(t, ctx, datos, n, id, concepto) {
   });
 }
 async function caja(t, ctx, b, n, id, concepto) {
-  if (n) await registrarCaja(t, ctx, await prepararCaja(t, ctx, b), n, id, concepto);
+  return n ? registrarCaja(t, ctx, await prepararCaja(t, ctx, b), n, id, concepto) : null;
+}
+/** Lo que vuelve a la pantalla de un comprobante recién emitido. */
+function resumen(c) {
+  return c ? { id: c.id, tipo: c.tipo, numero: c.numero, codigo: c.codigo, total: c.total } : null;
 }
 
 function liquidacionDeSalida(a, cotizacion) {
@@ -402,16 +418,17 @@ async function prepararSalida(t, ctx, b, salida) {
   return { personas, presentes, alojamiento, consumos, total, accion, medio, caja, vehiculos_salen };
 }
 
-async function aplicarSalida(t, ctx, id, plan, personas) {
+async function aplicarSalida(t, ctx, id, plan, personas, reserva = null) {
   const porDni = new Map(personas.map(p => [String(p.dni), p]));
   const traslada = plan.accion === "TRASLADAR";
-  if (plan.caja) await registrarCaja(t, ctx, plan.caja, plan.total, id, "LIQUIDACION_SALIDA");
+  const cajaMov = plan.caja ? await registrarCaja(t, ctx, plan.caja, plan.total, id, "LIQUIDACION_SALIDA") : null;
+  const cobrados = [];
   for (const p of plan.personas) {
     const h = porDni.get(p.dni);
-    if (p.alojamiento) await movimiento(t, ctx, id, traslada ? "TRASPASO_ALOJAMIENTO" : "PAGO_RESERVA",
-      traslada ? -p.alojamiento : p.alojamiento, traslada ? "CEDIDO" : plan.medio, "Salida de " + h.nombre, h.id);
-    if (p.consumos) await movimiento(t, ctx, id, traslada ? "TRASPASO_CONSUMOS" : "PAGO_SALIDA_CONSUMOS",
-      traslada ? -p.consumos : p.consumos, traslada ? "CEDIDO" : plan.medio, "Salida de " + h.nombre, h.id);
+    if (p.alojamiento) cobrados.push(await movimiento(t, ctx, id, traslada ? "TRASPASO_ALOJAMIENTO" : "PAGO_RESERVA",
+      traslada ? -p.alojamiento : p.alojamiento, traslada ? "CEDIDO" : plan.medio, "Salida de " + h.nombre, h.id));
+    if (p.consumos) cobrados.push(await movimiento(t, ctx, id, traslada ? "TRASPASO_CONSUMOS" : "PAGO_SALIDA_CONSUMOS",
+      traslada ? -p.consumos : p.consumos, traslada ? "CEDIDO" : plan.medio, "Salida de " + h.nombre, h.id));
     await movimiento(t, ctx, id, "CIERRE_SALIDA", 0, null, "Cuenta al registrar la salida", h.id);
   }
   if (traslada) {
@@ -429,6 +446,8 @@ async function aplicarSalida(t, ctx, id, plan, personas) {
     }
   }
   if (!plan.presentes.length) await movimiento(t, ctx, id, "SALDAR_CONSUMOS", 0, null, "Cierre de la estadía");
+  if (traslada || !reserva || !C.MEDIOS.includes(plan.medio)) return null;
+  return C.emitir(t, ctx, { reserva, movimientos: cobrados, medio: plan.medio, operacion: "SALIDA", cajaMovimiento: cajaMov });
 }
 
 async function planilla(t, ctx, r, n) {
@@ -483,7 +502,7 @@ async function administrar(ctx) {
       modo = b.medio;
     const p = a.personas.find(x => Number(x.id) === Number(b.huesped_id));
     const activo = x => x && x.entrada && !x.salida;
-    let liq = null;
+    let liq = null, comprobante = null, cajaMov = null;
     if (accion === "CARGA" || accion === "RETIRO" || accion === "REPARTIR") {
       if (!p || !activo(p) && accion === "CARGA") throw U.error("Para cargar saldo, la persona tiene que haber hecho el ingreso.");
       const n = importe(b.importe);
@@ -507,12 +526,13 @@ async function administrar(ctx) {
           }
           if (n > U.redondear(autorizado) || modo !== "AL_SALIR" && n > Math.max(0, -a.neto_consumos)) throw U.error("La devolución supera el saldo abonado por ese medio.");
         }
-        if (modo === "EFECTIVO") await caja(t, ctx, b, delta, id, "SALDO_ESTADIA");
+        if (modo === "EFECTIVO") cajaMov = await caja(t, ctx, b, delta, id, "SALDO_ESTADIA");
       }
       await N.actualizar(t, ctx, "predio_huesped", p.id, {
         saldo: U.redondear(Number(p.saldo) + delta)
       });
-      await movimiento(t, ctx, id, accion === "REPARTIR" ? "REPARTO" : accion, delta, accion === "REPARTIR" ? null : modo, nota, p.id);
+      const movId = await movimiento(t, ctx, id, accion === "REPARTIR" ? "REPARTO" : accion, delta, accion === "REPARTIR" ? null : modo, nota, p.id);
+      if (accion !== "REPARTIR" && C.MEDIOS.includes(modo)) comprobante = await C.emitir(t, ctx, { reserva: r, movimientos: [movId], medio: modo, operacion: "SALDO", observacion: nota, cajaMovimiento: cajaMov });
     } else if (accion === "LIQUIDAR" || accion === "PAGO_RESERVA") {
       const n = accion === "LIQUIDAR" ? a.neto_consumos : a.pendiente;
       if (accion === "PAGO_RESERVA" && !n) throw U.error("No hay una diferencia pendiente.");
@@ -521,15 +541,18 @@ async function administrar(ctx) {
       if (accion === "LIQUIDAR") await verificarAnulaciones(t, ctx, id, a);
       U.opcion(modo, ["EFECTIVO", "TRANSFERENCIA", "HABERES"], "El medio");
       if (modo === "HABERES" && n) liq = await planilla(t, ctx, r, n);
-      if (modo === "EFECTIVO") await caja(t, ctx, b, n, id, accion === "LIQUIDAR" ? "LIQUIDACION_ESTADIA" : "DIFERENCIA_RESERVA");
+      if (modo === "EFECTIVO") cajaMov = await caja(t, ctx, b, n, id, accion === "LIQUIDAR" ? "LIQUIDACION_ESTADIA" : "DIFERENCIA_RESERVA");
       if (accion === "LIQUIDAR") for (const h of a.personas) if (Number(h.saldo)) await N.actualizar(t, ctx, "predio_huesped", h.id, {
         saldo: 0
       });
-      await movimiento(t, ctx, id, accion === "LIQUIDAR" ? "SALDAR_CONSUMOS" : "PAGO_RESERVA", n, modo, [nota, liq ? "Planilla " + liq : null].filter(Boolean).join(" · "), null, null, liq);
+      const movId = await movimiento(t, ctx, id, accion === "LIQUIDAR" ? "SALDAR_CONSUMOS" : "PAGO_RESERVA", n, modo, [nota, liq ? "Planilla " + liq : null].filter(Boolean).join(" · "), null, null, liq);
+      if (n && C.MEDIOS.includes(modo)) comprobante = await C.emitir(t, ctx, { reserva: r, movimientos: [movId], medio: modo,
+        operacion: accion === "LIQUIDAR" ? "LIQUIDACION" : "DIFERENCIA_RESERVA", observacion: nota, cajaMovimiento: cajaMov });
     } else throw U.error("Operación de cuenta inválida.");
     const respuesta = {
-      mensaje: "Movimiento registrado",
-      liquidacion_id: liq
+      mensaje: "Movimiento registrado" + (comprobante ? " · " + C.NOMBRE[comprobante.tipo] + " " + comprobante.codigo : ""),
+      liquidacion_id: liq,
+      comprobante: resumen(comprobante)
     };
     await N.insertar(t, ctx, "predio_recepcion_recibo", {
       clave: key,
@@ -605,6 +628,7 @@ const rutas = ["opciones", "listar", "familia", "detalle", "movimientos"].map(ac
       r.cuenta = await cuenta(ctx.db, ctx, r.reserva.id);
       r.adicionales = estadoAdicionales(r.reserva, r.cuenta);
       r.empresa = await empresa(ctx);
+      r.comprobantes = await C.deReserva(ctx.db, ctx, r.reserva.id);
     }
     return r;
   }
@@ -692,5 +716,8 @@ module.exports = {
   sincronizar,
   movimiento,
   caja,
+  prepararCaja,
+  registrarCaja,
+  resumen,
   empresa
 };

@@ -174,8 +174,16 @@ async function bocaAlmacen(t, ctx) {
 const CONFIG_POR_DEFECTO = {
   nombre_predio: "Camping Miramar",
   razon_social: "Asociación Judicial Bonaerense",
-  cuit: "",
+  cuit: "30-57416579-9",
   direccion: "Miramar, Provincia de Buenos Aires",
+  // Datos del emisor en recibos y notas de crédito (los del talonario en papel del camping).
+  iibb: "902-316676-5",
+  inicio_actividades: "01/12/1992",
+  condicion_iva: "IVA y Ganancias: exento",
+  domicilio_legal: "Sede provincial: calle 50 N° 712, (B1900APT) La Plata",
+  telefono: "(0221) 422-8594",
+  correo: "",
+  leyenda_comprobante: "Documento no válido como factura. Exceptuado de emitir comprobantes: RG 1415, art. 5°, anexo I, apartado A.",
   leyenda_ticket: "¡Gracias por tu visita! Comprobante no válido como factura.",
   texto_autorizacion: "Me dirijo a ustedes a efectos de autorizar expresamente a la Asociación Judicial Bonaerense a retener de mi sueldo la suma indicada, en las cuotas detalladas, de acuerdo al sistema de descuento vigente.",
   vender_sin_stock: "0",
