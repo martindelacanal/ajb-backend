@@ -115,7 +115,7 @@
     P.autorizar("SOLICITUD_PRODUCTO", {}).then(function (aut) { P.formSolicitud("pedido", alTerminar, aut); }).catch(function (e) { if (e.status !== -1) P.error(e); });
   };
 
-  P.formBaja = function (alTerminar) {
+  P.formAjusteStock = function (alta, alTerminar) {
     P.opciones("bocas").then(function (bocas) {
       var almacen = bocas.filter(function (b) { return b.es_almacen; })[0];
       var boca = P.select(bocas, almacen ? almacen.valor : null);
@@ -127,17 +127,19 @@
         alElegir: function (o) { elegido = o.dato; disp.textContent = "Stock en la boca: " + P.f.numero(o.dato.stock_boca); cantidad.focus(); },
       });
       var cantidad = P.input({ inputmode: "decimal", valor: "1" });
-      var motivo = P.select(MOTIVOS, "VENCIMIENTO");
-      var obs = P.input({ max: 250, placeholder: "Ej.: botella rota en el traslado, vino picado…" });
+      var motivo = alta ? P.select([{ valor: "DONACION", texto: "Donación" }, { valor: "RECUENTO", texto: "Diferencia de recuento" }, { valor: "OTROS", texto: "Otro motivo" }], "DONACION") : P.select(MOTIVOS, "VENCIMIENTO");
+      var obs = P.input({ max: 250, placeholder: alta ? "Ej.: caja donada por un proveedor" : "Ej.: botella rota en el traslado" });
+      boca.addEventListener("change", function () { elegido = null; disp.textContent = ""; combo.limpiar(); });
       var m = P.modal({
-        titulo: "Bajar stock",
-        subtitulo: "Para productos que se rompieron, vencieron o se usaron como materia prima o insumo.",
+        titulo: alta ? "Sumar stock" : "Bajar stock",
+        subtitulo: alta ? "Indicá cuántas unidades ingresaron a la boca." : "Para productos que se rompieron, vencieron o se usaron como materia prima o insumo.",
         contenido: h("div.columna", P.campo("Boca", boca), P.campo("Producto", h("div", combo.el, disp)), P.campo("Cantidad", cantidad), P.campo("Motivo", motivo), P.campo("Observaciones", obs)),
-        acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn("Dar de baja", { tipo: "peligro-lleno", icono: "baja", onclick: function (ev) {
+        acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn(alta ? "Registrar alta" : "Dar de baja", { tipo: alta ? "primario" : "peligro-lleno", icono: alta ? "mas" : "baja", onclick: function (ev) {
           if (!elegido) { P.aviso("Elegí el producto", "error"); combo.foco(); return; }
           var cuerpo = { boca_id: Number(boca.value), producto_id: elegido.id, cantidad: P.numeroDe(cantidad.value), motivo: motivo.value, observaciones: obs.value };
           P.ejecutar(ev.currentTarget, function () {
-            return P.conConfirmacionStock(function (confirmar) { return P.post("/bajas", Object.assign({}, cuerpo, { confirmar_sin_stock: confirmar })); }, "Bajar igual").then(function (r) {
+            var guardar = alta ? P.post("/altas", cuerpo) : P.conConfirmacionStock(function (confirmar) { return P.post("/bajas", Object.assign({}, cuerpo, { confirmar_sin_stock: confirmar })); }, "Bajar igual");
+            return guardar.then(function (r) {
               if (!r.encolado) P.aviso(r.mensaje, "ok");
               m.cerrar();
               if (alTerminar) alTerminar();
@@ -226,26 +228,39 @@
   }, { titulo: "Stock" });
 
   // ------------------------------------------------------------------ mis ventas (cajero)
+  function puedeAnular() {
+    return P.esAdmin() || !!Number(P.estado.sesion.usuario.puede_anular_ticket);
+  }
+
   P.anularVenta = function (f, alTerminar) {
-    P.pedirTexto("Anular la venta N° " + f.id, { etiqueta: "Motivo", requerido: true, aceptar: "Continuar", peligro: true, subtitulo: "Total " + P.f.pesos(f.total) + ". Si fue en efectivo, se registra la devolución en la caja." }).then(function (motivo) {
+    var directa = puedeAnular();
+    var pedido = f.solicitud_anulacion;
+    var titulo = (directa ? "Anular la venta N° " : "Solicitar anulación de la venta N° ") + f.id;
+    var nota = directa ? "Si se cobró en efectivo, la devolución se registra en " + f.caja + "." : "El administrador revisará la venta y el motivo del pedido.";
+    P.pedirTexto(titulo, { etiqueta: "Motivo", requerido: true, valor: pedido ? pedido.detalle : "", aceptar: directa ? "Confirmar anulación" : "Enviar pedido",
+      peligro: directa, subtitulo: "Total " + P.f.pesos(f.total) + ". " + nota }).then(function (motivo) {
       if (!motivo) return;
-      P.conAutorizacion("ANULAR_VENTA", { referencia_id: f.id, detalle: "Venta N° " + f.id + " por " + P.f.pesos(f.total) }, function (aut) {
-        return P.post("/ventas/" + f.id + "/anular", Object.assign({ motivo: motivo }, aut));
-      }).then(function (r) {
-        if (!r.encolado) P.aviso(r.mensaje + (r.devolver_efectivo ? ". Devolvé " + P.f.pesos(r.devolver_efectivo) + " en efectivo." : ""), "ok", 8000);
+      var accion = directa ? P.post("/ventas/" + f.id + "/anular", { motivo: motivo, solicitud_id: pedido && pedido.id })
+        : P.post("/permisos", { tipo: "ANULAR_VENTA", referencia_id: f.id, detalle: motivo });
+      accion.then(function (r) {
+        if (!r.encolado) P.aviso(r.mensaje + (r.devolver_efectivo ? ". Corresponde devolver " + P.f.pesos(r.devolver_efectivo) + " en efectivo." : ""), "ok", 8000);
         if (alTerminar) alTerminar();
-      }).catch(function (e) { if (e.status !== -1) P.error(e); });
+        if (P.consultarAvisos) P.consultarAvisos();
+      }).catch(P.error);
     });
   };
 
   P.verVenta = function (id, alCambiar) {
     P.get("/ventas/" + id).then(function (d) {
       var v = d.venta;
+      var pedido = v.solicitud_anulacion;
+      var accion = puedeAnular() ? (pedido ? "Confirmar anulación" : "Anular ticket") : "Solicitar anulación";
       var m = P.modal({
         titulo: "Venta N° " + v.id, subtitulo: P.f.fechaHora(v.fecha) + " · " + v.boca + " · " + v.caja + " · " + v.usuario_nombre,
         ancho: "ancha",
         contenido: h("div.columna",
           v.estado === "ANULADA" ? P.mensaje("Anulada por " + v.anulada_por + " el " + P.f.fechaHora(v.anulada_fecha) + ": " + (v.anulacion_motivo || ""), "error") : null,
+          pedido ? P.mensaje("Pendiente de anulación. " + pedido.usuario_nombre + " la solicitó el " + P.f.fechaHora(pedido.fecha_solicitud) + ". Motivo: " + (pedido.detalle || "Sin detalle"), "aviso") : null,
           h("table.tabla", h("thead", h("tr", h("th", "Producto"), h("th.der", "Cantidad"), h("th.der", "Unitario"), h("th.der", "Subtotal"))),
             h("tbody", d.items.map(function (i) { return h("tr", h("td", i.descripcion), h("td.der", P.f.numero(i.cantidad)), h("td.der", P.f.pesos(i.precio_unitario)), h("td.der", P.f.pesos(i.subtotal))); })),
             h("tfoot", h("tr", h("td", { colspan: "3" }, "Total"), h("td.der", P.f.pesos(v.total))))),
@@ -255,7 +270,7 @@
             d.afiliado ? P.dato("Afiliado", d.afiliado.nombre + (d.afiliado.legajo ? " · Leg. " + d.afiliado.legajo : "")) : null,
             P.dato("Tickets impresos", String(v.impresiones || 0)))),
         acciones: [
-          v.estado !== "ANULADA" ? P.btn("Anular", { tipo: "peligro", icono: "borrar", onclick: function () { m.cerrar(); P.anularVenta(v, alCambiar); } }) : null,
+          v.estado !== "ANULADA" && (!pedido || puedeAnular()) ? P.btn(accion, { tipo: puedeAnular() ? "peligro" : "secundario", icono: "borrar", onclick: function () { m.cerrar(); P.anularVenta(v, alCambiar); } }) : null,
           P.btn("Imprimir ticket", { tipo: "primario", icono: "imprimir", onclick: function () { P.reimprimirVenta(v.id); } }),
         ],
       });
@@ -297,7 +312,7 @@
     });
     c.appendChild(h("div.pagina-cabecera", h("div",
       h("a.volver", { href: "#/mi-caja" }, P.icono("volver"), "Volver a la caja"),
-      h("h1.titulo-pagina", "Mis ventas"), h("p.subtitulo", "Tocá una venta para ver el detalle, reimprimir el ticket o anularla."))));
+      h("h1.titulo-pagina", "Mis ventas"), h("p.subtitulo", "Tocá una venta para ver el detalle, reimprimir el ticket o gestionar su anulación."))));
     c.appendChild(selector);
     c.appendChild(zona);
     function pintar() {

@@ -20,13 +20,13 @@
     return P.get("/caja/estado").then(function (r) {
       var a = r.apertura;
       if (!a) {
-        if (forzar) P.modal({ titulo: "Saldo de apertura", contenido: P.mensaje("El administrador todavía no cargó el saldo de apertura de hoy para " + puesto.caja + ". Podés empezar a vender igual.", "aviso") });
+        if (forzar) P.modal({ titulo: "Saldo de apertura", contenido: P.mensaje("El administrador todavía no cargó el saldo de apertura de esta jornada para " + puesto.caja + ". Podés empezar a vender igual.", "aviso") });
         return;
       }
       if (a.verificacion !== "PENDIENTE" && !forzar) return;
       var importe = h("div.total", h("span", "Saldo de apertura"), h("strong", P.f.pesos(a.importe)));
       if (a.verificacion !== "PENDIENTE") {
-        P.modal({ titulo: "Saldo de apertura de hoy", subtitulo: puesto.boca + " · " + puesto.caja, contenido: h("div.columna", importe,
+        P.modal({ titulo: "Saldo de apertura · " + P.f.fecha(a.fecha), subtitulo: puesto.boca + " · " + puesto.caja, contenido: h("div.columna", importe,
           a.verificacion === "CORRECTO" ? P.mensaje("Confirmado por " + (a.verificado_por || "") + " " + P.f.relativo(a.verificado_fecha) + ".", "ok")
             : P.mensaje("Se informó que no coincide. Comunicate con el administrador.", "error")) });
         return;
@@ -61,12 +61,26 @@
   };
 
   // ------------------------------------------------------------------ cierre de caja
+  function mostrarClave(cajaId, nombre, boton) {
+    return P.ejecutar(boton, function () {
+      return P.get("/caja/cierre/previa" + P.qs({ caja_id: cajaId })).then(function (p) {
+        return P.post("/caja/cierre/clave", { caja_id: cajaId, turno_id: p.turno ? p.turno.id : null, ultimo_cierre_id: p.resumen.ultimo_cierre ? p.resumen.ultimo_cierre.id : null });
+      }).then(function (r) {
+        if (r.encolado) { P.aviso("Cuando el predio esté conectado, volvé a generar la clave.", "info"); return; }
+        P.modal({ titulo: "Clave de cierre · " + nombre, contenido: h("div.columna",
+          h("strong.cifra-valor", r.clave), h("p", "Ingresá esta clave al confirmar el cierre. Vence a las " + P.f.hora(r.vence) + ".")) });
+      });
+    });
+  }
+
   P.cerrarCaja = function (cajaId, alTerminar) {
     return P.get("/caja/cierre/previa" + P.qs({ caja_id: cajaId })).then(function (r) {
       var s = r.resumen;
       var contado = P.dinero({ placeholder: "Contá el efectivo" });
       var queda = P.dinero({ valor: "0", placeholder: "0" });
       var obs = P.input({ max: 250, placeholder: "Opcional" });
+      var requiereClave = P.esAdmin() || !P.estado.sesion.usuario.puede_cerrar_caja;
+      var clave = requiereClave ? P.inputClave({ inputmode: "numeric", max: 8, autocomplete: "one-time-code" }) : null;
       var diferencia = h("div");
       function calcular() {
         var c = P.numeroDe(contado.value);
@@ -95,18 +109,29 @@
           h("div.columna",
             P.campo("Efectivo contado", h("div.campo-con-prefijo.campo-grande", h("span", "$"), contado), { requerido: true }),
             diferencia,
-            P.campo("Queda en la caja para mañana (cambio)", h("div.campo-con-prefijo", h("span", "$"), queda), { ayuda: "Lo demás se registra como retiro de la recaudación." }),
-            P.campo("Observaciones", obs))),
+            P.campo("Queda en caja para el próximo turno", h("div.campo-con-prefijo", h("span", "$"), queda), { ayuda: "Lo demás se registra como retiro de la recaudación." }),
+            P.campo("Observaciones", obs),
+            clave ? P.campo("Clave temporal del administrador", clave, { requerido: true, ayuda: "El administrador puede generarla en Caja para este cierre." }) : null,
+            clave && P.esAdmin() ? P.btn("Generar clave de cierre", { tipo: "suave", onclick: function (ev) { mostrarClave(r.caja.id, r.caja.nombre, ev.currentTarget); } }) : null)),
         acciones: [
           P.btn("Cancelar", { onclick: function () { m.cerrar(); } }),
           P.btn("Cerrar caja e imprimir", { tipo: "primario", icono: "imprimir", onclick: function (ev) {
             var c = P.numeroDe(contado.value);
             if (isNaN(c)) { contado.classList.add("invalido"); contado.focus(); return; }
+            if (clave && !/^\d{8}$/.test(clave.input.value.trim())) { P.aviso("Ingresá los ocho dígitos de la clave de cierre.", "error"); clave.input.focus(); return; }
             P.ejecutar(ev.currentTarget, function () {
-              return P.post("/caja/cierre", { caja_id: cajaId || undefined, efectivo_contado: c, queda_en_caja: P.numeroDe(queda.value) || 0, observaciones: obs.value }).then(function (x) {
+              return P.post("/caja/cierre", { caja_id: r.caja.id, efectivo_contado: c, queda_en_caja: P.numeroDe(queda.value) || 0,
+                revision: r.revision, turno_id: r.turno ? r.turno.id : null, ultimo_cierre_id: s.ultimo_cierre ? s.ultimo_cierre.id : null,
+                observaciones: obs.value, clave: clave ? clave.input.value.trim() : undefined }).then(function (x) {
                 m.cerrar();
+                if (x.encolado) return;
                 P.aviso(x.mensaje, x.diferencia === 0 ? "ok" : "error", 8000);
                 if (x.id) P.get("/caja/cierres/" + x.id).then(P.imprimirCierre).catch(P.error);
+                if (P.puesto() && Number(P.puesto().caja_id) === Number(r.caja.id)) {
+                  P.estado.sesion.puesto = null;
+                  P.repintarMarco();
+                  P.ruta.ir(P.esAdmin() ? "/caja" : "/puesto");
+                }
                 if (alTerminar) alTerminar(x);
               });
             });
@@ -147,7 +172,8 @@
       } else {
         acciones.push(P.btn("Ver saldo de apertura", { tipo: "suave", chico: true, icono: "efectivo", onclick: function () { P.verificarApertura(true); } }));
       }
-      if (P.modo === "local") acciones.push(P.btn("Cerrar caja", { tipo: "primario", icono: "candado", onclick: function () { P.cerrarCaja(cajaId, refrescar); } }));
+      if (desdePanel) acciones.push(P.btn("Generar clave de cierre", { tipo: "suave", chico: true, icono: "llave", onclick: function (ev) { mostrarClave(cajaId, nombre, ev.currentTarget); } }));
+      acciones.push(P.btn("Cerrar caja", { tipo: "primario", icono: "candado", onclick: function () { P.cerrarCaja(cajaId, refrescar); } }));
       c.appendChild(P.cabeceraConAcciones(esPropia ? "Mi caja" : "Caja", esPropia ? null : nombre, acciones));
       mostrarCifras(r);
       c.appendChild(cifras);
@@ -274,11 +300,12 @@
               !ap ? P.chip("Sin apertura", "VENCIDO") : ap.verificacion === "CORRECTO" ? P.chip("Apertura OK", "CORRECTO") : ap.verificacion === "NO_COINCIDE" ? P.chip("No coincide", "NO_COINCIDE") : P.chip("Sin confirmar", "PENDIENTE")),
             h("div.cifra-valor", { style: { fontSize: "24px" } }, P.f.pesos(cj.saldo)),
             h("div.texto-3.chico", cj.ventas_cantidad + " venta(s) · " + P.f.pesos(cj.ventas_total) + " desde el último cierre"),
-            h("div.texto-3.chico", cj.turno ? "Atiende " + cj.turno.usuario_nombre + " desde " + P.f.hora(cj.turno.inicio) : "Sin turno abierto"),
+            h("div.texto-3.chico", cj.turno ? "Atiende " + cj.turno.usuario_nombre + " desde " + P.f.fechaHora(cj.turno.inicio) : "Disponible"),
             h("div.fila", { style: { marginTop: "12px", gap: "6px" } },
               P.btn("Apertura", { tipo: "suave", chico: true, onclick: function () { modalApertura(cajaElegida, cj.id, refrescar); } }),
               P.btn("Ajuste", { tipo: "suave", chico: true, onclick: function () { modalAjuste(cajaElegida, cj.id, refrescar); } }),
-              P.modo === "local" ? P.btn("Cerrar", { tipo: "suave", chico: true, onclick: function () { P.cerrarCaja(cj.id, refrescar); } }) : null));
+              P.btn("Clave de cierre", { tipo: "suave", chico: true, onclick: function (ev) { mostrarClave(cj.id, cj.nombre, ev.currentTarget); } }),
+              P.btn("Cerrar", { tipo: "suave", chico: true, onclick: function () { P.cerrarCaja(cj.id, refrescar); } })));
         }));
       });
     }

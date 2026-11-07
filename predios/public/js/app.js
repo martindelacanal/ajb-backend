@@ -76,8 +76,8 @@
     var ses = P.estado.sesion;
     var items = [];
     if (P.modo === "local") {
-      items.push({ texto: P.esAdmin() ? "Trabajar en una caja" : "Cambiar de boca o caja", icono: "caja", accion: function () { P.ruta.ir("/puesto"); } });
-      if (P.esAdmin() && P.puesto() && P.puesto().caja_id) items.push({ texto: "Salir de caja y volver a administración", icono: "salir", accion: function () { P.salirDeCaja().catch(P.error); } });
+      if (!(P.puesto() && P.puesto().caja_id)) items.push({ texto: P.esAdmin() ? "Trabajar en una caja" : "Elegir boca o caja", icono: "caja", accion: function () { P.ruta.ir("/puesto"); } });
+      if (P.puesto() && P.puesto().caja_id) items.push({ texto: "Cerrar mi caja", icono: "candado", accion: function () { P.cerrarCaja(P.puesto().caja_id); } });
       if (P.puesto() && P.puesto().caja_id) items.push({ texto: "Ver saldo de apertura", icono: "efectivo", accion: function () { P.verificarApertura(true); } });
       if (!ses.usuario.es_admin_general) items.push({ texto: "Cambiar mi contraseña", icono: "candado", accion: cambiarClave });
       items.push("-");
@@ -94,7 +94,7 @@
     var repetir = P.inputClave();
     var m = P.modal({
       titulo: "Cambiar mi contraseña",
-      contenido: h("div.columna", P.campo("Contraseña actual", actual), P.campo("Contraseña nueva", nueva, { ayuda: "Al menos 4 caracteres" }), P.campo("Repetí la nueva", repetir)),
+      contenido: h("div.columna", P.campo("Contraseña actual", actual), P.campo("Contraseña nueva", nueva, { ayuda: "Al menos 6 caracteres. Evitá tu usuario, secuencias y repeticiones." }), P.campo("Repetí la nueva", repetir)),
       acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn("Guardar", { tipo: "primario", onclick: function (ev) {
         if (nueva.input.value !== repetir.input.value) { P.aviso("Las contraseñas nuevas no coinciden", "error"); return; }
         P.ejecutar(ev.currentTarget, function () {
@@ -105,13 +105,13 @@
   }
 
   function salir() {
-    P.post("/logout", {}, { sinRedireccion: true }).catch(function () {}).then(function () {
+    P.post("/logout", {}, { sinRedireccion: true }).then(function () {
       P.sesion.borrar();
       P.estado.sesion = null;
       if (typeof P.notificarCierreRemoto === "function") P.notificarCierreRemoto();
       location.hash = "";
       iniciar();
-    });
+    }).catch(function (e) { if (e.status === 401) P.sesionVencida(); else P.error(e); });
   }
 
   function botonUsuario(oscuro) {
@@ -139,14 +139,15 @@
     });
     if (items.length) items.push("-");
     (a.permisos || []).forEach(function (p) {
-      items.push({ texto: p.usuario_nombre + " pide autorización (" + (p.boca || "") + ")", icono: "llave", accion: function () { P.resolverPermiso(p); } });
+      var texto = p.tipo === "ANULAR_VENTA" ? p.usuario_nombre + " pide anular la venta N° " + p.referencia_id : p.usuario_nombre + " pide autorización";
+      items.push({ texto: texto + " (" + (p.boca || "") + ")", icono: "llave", accion: function () { P.resolverPermiso(p); } });
     });
     (a.aperturas || []).forEach(function (x) {
       items.push({ texto: x.boca + " · " + x.caja + ": el saldo de apertura no coincide", icono: "alerta", accion: function () { P.ruta.ir("/caja"); } });
     });
     if (a.solicitudes_despachar) items.push({ texto: a.solicitudes_despachar + " solicitud(es) para despachar", icono: "despachar", accion: function () { P.ruta.ir(P.esAdmin() ? "/gestion/solicitudes" : "/solicitudes"); } });
     if (a.solicitudes_recibir) items.push({ texto: a.solicitudes_recibir + " solicitud(es) para recibir", icono: "recibir", accion: function () { P.ruta.ir(P.esAdmin() ? "/gestion/solicitudes" : "/solicitudes"); } });
-    if (a.vencimientos) items.push({ texto: a.vencimientos + " producto(s) vencidos o por vencer", icono: "reloj", accion: function () { P.cache["tabla:productos"] = { filtros: { vencimiento: "7" } }; P.ruta.ir("/gestion/productos"); } });
+    if (a.vencimientos) items.push({ texto: a.vencimientos + " producto(s) vencidos o por vencer", icono: "reloj", accion: function () { P.cache["tabla:productos"] = { filtros: { vencimiento: "aviso" } }; P.ruta.ir("/gestion/productos"); } });
     if (a.stock_negativo) items.push({ texto: a.stock_negativo + " producto(s) con stock negativo en alguna boca", icono: "alerta", accion: function () { P.cache["tabla:stock"] = { filtros: { estado: "negativo" } }; P.ruta.ir("/gestion/stock"); } });
     if (items[items.length - 1] === "-") items.pop();
     if (!items.length) items.push({ texto: "Todavía no hay notificaciones", icono: "check", accion: function () {} });
@@ -199,21 +200,22 @@
   P.verNotificacion = verNotificacion;
 
   P.resolverPermiso = function (p) {
+    var esAnulacion = p.tipo === "ANULAR_VENTA";
     var tipos = { SOLICITUD_PRODUCTO: "pedir productos", ANULAR_VENTA: "anular una venta", VER_VENTAS_CAJA: "ver todas las ventas de su caja" };
     var m = P.modal({
-      titulo: "Autorización pedida",
+      titulo: esAnulacion ? "Anulación de la venta N° " + p.referencia_id : "Autorización pedida",
       subtitulo: p.usuario_nombre + (p.boca ? " · " + p.boca : "") + (p.caja ? " · " + p.caja : ""),
-      contenido: h("div.columna", h("p", { style: { margin: 0 } }, "Pide permiso para ", h("strong", tipos[p.tipo] || p.tipo), "."), p.detalle ? P.mensaje(p.detalle) : null,
+      contenido: h("div.columna", esAnulacion ? h("p", "Al confirmar, se anula el ticket y se registran las devoluciones.") : h("p", { style: { margin: 0 } }, "Pide permiso para ", h("strong", tipos[p.tipo] || p.tipo), "."), p.detalle ? P.mensaje(p.detalle) : null,
         h("p.texto-3.chico", "Pedido " + P.f.relativo(p.fecha_solicitud) + ".")),
       acciones: [
         P.btn("Rechazar", { tipo: "peligro", onclick: function (ev) { resolver(ev.currentTarget, false); } }),
-        P.btn("Aprobar", { tipo: "ok", icono: "check", onclick: function (ev) { resolver(ev.currentTarget, true); } }),
+        P.btn(esAnulacion ? "Confirmar anulación" : "Aprobar", { tipo: "ok", icono: "check", onclick: function (ev) { resolver(ev.currentTarget, true); } }),
       ],
     });
     function resolver(b, aprobar) {
       P.ejecutar(b, function () {
         return P.post("/permisos/" + p.id + "/resolver", { aprobar: aprobar }).then(function (r) {
-          if (!r.encolado) P.aviso(r.mensaje, "ok");
+          if (!r.encolado) P.aviso(r.mensaje + (r.devolver_efectivo ? ". Corresponde devolver " + P.f.pesos(r.devolver_efectivo) + " en efectivo." : ""), "ok");
           m.cerrar();
           consultarAvisos();
         });
@@ -246,7 +248,14 @@
 
   function consultarAvisos() {
     if (!P.estado.sesion) return;
+    var turnoAlConsultar = P.puesto() && P.puesto().turno_id;
     return P.get("/avisos", { sinRedireccion: true }).then(function (a) {
+      if (turnoAlConsultar && P.puesto() && P.puesto().turno_id === turnoAlConsultar && a.turno_id === null) {
+        P.estado.sesion.puesto = null;
+        P.repintarMarco();
+        P.ruta.ir(P.esAdmin() ? "/caja" : "/puesto");
+        P.aviso("Tu sesión dejó de operar en esta caja.", "info");
+      }
       var antes = P.estado.avisos;
       P.estado.avisos = a;
       pintarContadores();
@@ -261,7 +270,8 @@
         var max = Math.max.apply(null, a.permisos.map(function (p) { return p.id; }));
         if (antes && max > ultimoPermisoVisto) {
           var p = a.permisos.filter(function (x) { return x.id === max; })[0];
-          P.aviso(p.usuario_nombre + " pide autorización. Tocá la campana para responder.", "cola", 8000);
+          var accion = p.tipo === "ANULAR_VENTA" ? " pide anular la venta N° " + p.referencia_id : " pide autorización";
+          P.aviso(p.usuario_nombre + accion + ". Tocá la campana para responder.", "cola", 8000);
         }
         ultimoPermisoVisto = Math.max(ultimoPermisoVisto, max);
       }
@@ -381,7 +391,7 @@
   }
 
   function navegar() {
-    if (!P.estado.sesion) return;
+    if (!P.estado.sesion || P.estado.sesion.usuario.debe_cambiar_clave) return;
     limpiezas.splice(0).forEach(function (fn) { try { fn(); } catch (e) { /* nada */ } });
     var ruta = P.ruta.actual();
     if (ruta === "/" || ruta === "") {
@@ -436,10 +446,16 @@
     iniciar();
   };
 
-  P.alIngresar = function (r) {
+  P.alIngresar = function (r, claveDeIngreso) {
     P.estado.avisos = null;
     ultimoAvisoVisto = 0;
     P.estado.sesion = r;
+    if (r.usuario.debe_cambiar_clave) {
+      temporizadores.forEach(clearInterval);
+      temporizadores = [];
+      P.pantallaCambioClave(app, claveDeIngreso);
+      return;
+    }
     P.equipo.recordarPuesto(r.puesto);
     var ses = r;
     if (ses.usuario.rol !== "ADMIN" && !ses.puesto) {

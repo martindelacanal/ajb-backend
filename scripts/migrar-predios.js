@@ -28,6 +28,7 @@ const permiteProduccion = args.includes("--allow-production");
 const USUARIO_RUNTIME = "miajb_runtime";
 
 const DDL_CENTRALES = {
+  predio_inventario_envio: require("./migrar-predios-operacion").DDL_ENVIOS,
   recepcion_particular: `CREATE TABLE IF NOT EXISTS recepcion_particular (usuario_id INT NOT NULL PRIMARY KEY, predio_id INT NOT NULL, creado DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB`,
   recepcion_reserva_evento: `CREATE TABLE IF NOT EXISTS recepcion_reserva_evento (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, predio_id INT NOT NULL, reserva_id INT NOT NULL,

@@ -44,7 +44,7 @@
     // ---------------------------------------------------------------- cabecera
     c.appendChild(h("div.vender-cabecera",
       h("div.vender-titulo", h("h1.titulo-pagina", "Vender"),
-        P.esAdmin() ? P.btn("Salir de caja", { tipo: "secundario", icono: "salir", onclick: function (ev) { P.ejecutar(ev.currentTarget, P.salirDeCaja).catch(function () {}); } }) : null)));
+        P.btn("Cerrar caja", { tipo: "secundario", icono: "candado", onclick: function () { P.cerrarCaja(puesto.caja_id); } }))));
     c.appendChild(h("nav.vender-acciones", { "aria-label": "Acciones de caja" },
       P.btn("Reimprimir último", { tipo: "suave", chico: true, icono: "imprimir", onclick: function () {
         if (!ultimaVenta) { P.aviso("Todavía no hiciste ventas en esta caja desde esta PC. Buscalas en Caja > Mis ventas.", "error"); return; }

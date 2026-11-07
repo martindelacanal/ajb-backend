@@ -7,6 +7,8 @@
 const U = require("../util");
 const N = require("../negocio");
 const acceso = require("../acceso");
+const { turnoAbierto, turnoUsuario, exigirCierre } = require("../turnos-caja");
+const clavesUsuario = require("../claves-usuario");
 
 async function bocasUsuario(db, ctx, usuario) {
   if (usuario.rol === "ADMIN") {
@@ -39,17 +41,26 @@ async function puestosDisponibles(db, ctx, usuario, bocas) {
 async function crearSesion(ctx, usuario, recordar) {
   const token = U.tokenAleatorio(32);
   const ahora = U.fechaHora();
-  await ctx.db.run(
-    `INSERT INTO predio_sesion (token_hash, usuario_id, recordar, creada, vence, ultimo_uso, ip, agente)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [U.sha256(token), usuario.id, recordar ? 1 : 0, ahora,
-      recordar ? null : U.fechaHora(new Date(Date.now() + 12 * 3600 * 1000)), ahora,
-      String(ctx.ip || "").slice(0, 45), String(ctx.agenteHttp || "").slice(0, 200)]);
-  await ctx.db.tx(async (t) => {
+  const puesto = await ctx.db.tx(async (t) => {
+    const vigente = await N.obtener(t, ctx, "predio_usuario", usuario.id);
+    if (!Number(vigente?.activo) || vigente.password_hash !== usuario.password_hash) throw U.error("Tu cuenta cambió. Volvé a ingresar.", 401);
+    await t.run(
+      `INSERT INTO predio_sesion (token_hash, usuario_id, recordar, creada, vence, ultimo_uso, ip, agente)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [U.sha256(token), usuario.id, recordar ? 1 : 0, ahora,
+        recordar ? null : U.fechaHora(new Date(Date.now() + 12 * 3600 * 1000)), ahora,
+        String(ctx.ip || "").slice(0, 45), String(ctx.agenteHttp || "").slice(0, 200)]);
+    const turno = await turnoUsuario(t, ctx.pid, usuario.id);
+    // Un ingreso nuevo recupera el turno aunque haya vencido el token anterior.
+    // Quitar el puesto al token anterior evita cobrar desde dos equipos.
+    if (turno && (await turnoAbierto(t, ctx.pid, turno.caja_id))?.id === turno.id) {
+      await asignarPuesto(t, U.sha256(token), usuario.id, turno.boca_id, turno.caja_id, turno.id);
+    }
     await t.run("UPDATE predio_usuario SET ultimo_ingreso = ? WHERE predio_id = ? AND id = ?", [ahora, ctx.pid, usuario.id]);
     await N.auditar(t, { ...ctx, usuario }, "Ingreso al sistema", "sesion", usuario.id, { recordar: !!recordar });
+    return await t.get("SELECT boca_id, caja_id, turno_id FROM predio_sesion WHERE token_hash=?", [U.sha256(token)]);
   });
-  return token;
+  return { token, puesto };
 }
 
 async function asegurarUsuarioGeneral(ctx, datos) {
@@ -100,8 +111,8 @@ async function ingresar(ctx) {
     throw U.error("Usuario o contraseña incorrectos", 401);
   }
   await acceso.registrarExito(ctx, claves);
-  const token = await crearSesion(ctx, usuario, recordar);
-  return { token, recordar: !!recordar, ...(await armarSesion(ctx, usuario, {})) };
+  const { token, puesto } = await crearSesion(ctx, usuario, recordar);
+  return { token, recordar: !!recordar, ...(await armarSesion(ctx, usuario, puesto)) };
 }
 
 // Administradores del sistema general: se validan contra el sistema general cuando hay
@@ -135,6 +146,8 @@ async function verificarAdminGeneral(ctx, documento, password) {
 }
 
 async function armarSesion(ctx, usuario, sesion) {
+  const identidad = identidadUsuario(usuario);
+  if (identidad.debe_cambiar_clave) return { usuario: identidad, puesto: null, puestos: [], predio: {} };
   const bocas = await bocasUsuario(ctx.db, ctx, usuario);
   const puestos = await puestosDisponibles(ctx.db, ctx, usuario, bocas);
   const config = await N.leerConfig(ctx.db, ctx);
@@ -150,14 +163,17 @@ async function armarSesion(ctx, usuario, sesion) {
     if (b) puesto = { ...b, caja_id: null };
   }
   return {
-    usuario: {
-      id: usuario.id, usuario: usuario.usuario, nombre: usuario.nombre, rol: usuario.rol, gestionar_reservas: !!Number(usuario.gestionar_reservas),
-      es_admin_general: !!Number(usuario.es_admin_general), bocas,
-    },
+    usuario: { ...identidad, bocas },
     puestos,
     puesto,
     predio: { nombre: config.nombre_predio, razon_social: config.razon_social },
   };
+}
+
+function identidadUsuario(u) {
+  return { id: Number(u.id), usuario: u.usuario, nombre: u.nombre, rol: u.rol, es_admin_general: !!Number(u.es_admin_general),
+    gestionar_reservas: !!Number(u.gestionar_reservas), puede_cerrar_caja: !!Number(u.puede_cerrar_caja),
+    puede_anular_ticket: !!Number(u.puede_anular_ticket), debe_cambiar_clave: !!Number(u.debe_cambiar_clave) };
 }
 
 async function verSesion(ctx) {
@@ -165,80 +181,74 @@ async function verSesion(ctx) {
   return armarSesion(ctx, u, ctx.sesion || {});
 }
 
+async function asignarPuesto(t, token, usuarioId, bocaId, cajaId, turnoId) {
+  if (turnoId) {
+    await t.run("UPDATE predio_sesion SET boca_id=NULL, caja_id=NULL, turno_id=NULL WHERE usuario_id=? AND turno_id IS NOT NULL AND token_hash<>?", [usuarioId, token]);
+  }
+  const r = await t.run("UPDATE predio_sesion SET boca_id=?, caja_id=?, turno_id=? WHERE token_hash=? AND usuario_id=?", [bocaId, cajaId, turnoId, token, usuarioId]);
+  if (!r.cambios) throw U.error("Volvé a ingresar para elegir un puesto.", 401);
+}
+
 async function elegirPuesto(ctx) {
   const bocaId = U.id(ctx.body.boca_id, "La boca");
   const cajaId = ctx.body.caja_id ? U.id(ctx.body.caja_id, "La caja") : null;
   const u = await N.exigir(ctx.db, ctx, "predio_usuario", ctx.usuario.id, "El usuario ya no existe");
-  const bocas = await bocasUsuario(ctx.db, ctx, u);
-  if (!bocas.includes(bocaId)) throw U.error("No tenés asignada esa boca", 403);
-  if (cajaId) {
-    const caja = await N.exigir(ctx.db, ctx, "predio_caja", cajaId, "No encontramos la caja");
-    if (Number(caja.boca_id) !== bocaId || !Number(caja.activo)) throw U.error("La caja no pertenece a esa boca");
-  }
-  const sesion = ctx.sesion || {};
-  let turnoId = sesion.turno_id || null;
-  await ctx.db.tx(async (t) => {
-    if (turnoId && Number(sesion.caja_id) !== Number(cajaId)) {
-      await t.run("UPDATE predio_turno SET fin = ?, estado = 'CERRADO' WHERE predio_id = ? AND id = ? AND estado = 'ABIERTO'", [U.fechaHora(), ctx.pid, turnoId]);
-      turnoId = null;
+  const puesto = await ctx.db.tx(async (t) => {
+    const bocas = await bocasUsuario(t, ctx, u);
+    if (!bocas.includes(bocaId)) throw U.error("No tenés asignada esa boca", 403);
+    const propio = await turnoUsuario(t, ctx.pid, u.id);
+    if (propio && Number(propio.caja_id) !== cajaId) exigirCierre();
+    let turnoId = null;
+    if (cajaId) {
+      const caja = await N.exigir(t, ctx, "predio_caja", cajaId, "No encontramos la caja", { bloquear: true });
+      if (Number(caja.boca_id) !== bocaId || !Number(caja.activo)) throw U.error("La caja no pertenece a esa boca");
+      const responsable = await turnoAbierto(t, ctx.pid, cajaId);
+      if (responsable && Number(responsable.usuario_id) !== Number(u.id)) {
+        throw U.error("La caja está ocupada por " + responsable.usuario_nombre + ". Debe cerrarla antes del relevo.", 409, { codigo: "CAJA_OCUPADA" });
+      }
+      turnoId = responsable?.id;
+      if (!turnoId) {
+        turnoId = await N.insertar(t, ctx, "predio_turno", { caja_id: cajaId, boca_id: bocaId, usuario_id: u.id, usuario_nombre: u.nombre, inicio: U.fechaHora(), estado: "ABIERTO" });
+        await N.auditar(t, ctx, "Inicio de turno", "caja", cajaId, { turno_id: turnoId, boca_id: bocaId });
+      }
     }
-    if (cajaId && !turnoId) {
-      turnoId = await N.insertar(t, ctx, "predio_turno", {
-        caja_id: cajaId, boca_id: bocaId, usuario_id: u.id, usuario_nombre: u.nombre, inicio: U.fechaHora(), estado: "ABIERTO",
-      });
-      await N.auditar(t, ctx, "Inicio de turno", "caja", cajaId, { turno_id: turnoId, boca_id: bocaId });
-    }
+    await asignarPuesto(t, ctx.sesion?.token_hash, u.id, bocaId, cajaId, turnoId);
+    return { boca_id: bocaId, caja_id: cajaId, turno_id: turnoId };
   });
-  await ctx.db.run("UPDATE predio_sesion SET boca_id = ?, caja_id = ?, turno_id = ? WHERE token_hash = ?",
-    [bocaId, cajaId, cajaId ? turnoId : null, sesion.token_hash]);
   await acceso.registrarPuesto(ctx, bocaId, cajaId);
-  return armarSesion(ctx, u, { boca_id: bocaId, caja_id: cajaId, turno_id: cajaId ? turnoId : null });
-}
-
-async function cerrarTurno(ctx) {
-  const s = ctx.sesion || {};
-  if (s.turno_id) {
-    await ctx.db.tx(async (t) => {
-      await t.run("UPDATE predio_turno SET fin = ?, estado = 'CERRADO' WHERE predio_id = ? AND id = ? AND estado = 'ABIERTO'", [U.fechaHora(), ctx.pid, s.turno_id]);
-      await N.auditar(t, ctx, "Fin de turno", "caja", s.caja_id || null, { turno_id: s.turno_id });
-    });
-  }
+  return armarSesion(ctx, u, puesto);
 }
 
 async function salirPuesto(ctx) {
   const s = ctx.sesion || {};
   if (!s.token_hash) throw U.error("Iniciá sesión para continuar", 401);
   await ctx.db.tx(async (t) => {
-    if (s.turno_id) {
-      await t.run("UPDATE predio_turno SET fin = ?, estado = 'CERRADO' WHERE predio_id = ? AND id = ? AND usuario_id = ? AND estado = 'ABIERTO'",
-        [U.fechaHora(), ctx.pid, s.turno_id, ctx.usuario.id]);
-    }
-    await t.run("UPDATE predio_sesion SET boca_id = NULL, caja_id = NULL, turno_id = NULL WHERE token_hash = ? AND usuario_id = ?", [s.token_hash, ctx.usuario.id]);
-    await N.auditar(t, ctx, "Salida del puesto de caja", "caja", s.caja_id || null, { boca_id: s.boca_id || null, turno_id: s.turno_id || null });
+    if (await turnoUsuario(t, ctx.pid, ctx.usuario.id)) exigirCierre();
+    await asignarPuesto(t, s.token_hash, ctx.usuario.id, null, null, null);
+    await N.auditar(t, ctx, "Salida del puesto de caja", "caja", s.caja_id || null, { boca_id: s.boca_id || null });
   });
   const usuario = await N.exigir(ctx.db, ctx, "predio_usuario", ctx.usuario.id, "El usuario ya no existe");
   return { ok: true, ...(await armarSesion(ctx, usuario, {})) };
 }
 
 async function logout(ctx) {
-  await cerrarTurno(ctx);
-  await ctx.db.run("DELETE FROM predio_sesion WHERE token_hash = ?", [ctx.sesion.token_hash]);
-  await ctx.db.tx((t) => N.auditar(t, ctx, "Salida del sistema", "sesion", ctx.usuario.id, null));
+  await ctx.db.tx(async (t) => {
+    if (await turnoUsuario(t, ctx.pid, ctx.usuario.id)) exigirCierre();
+    await t.run("DELETE FROM predio_sesion WHERE token_hash = ?", [ctx.sesion.token_hash]);
+    await N.auditar(t, ctx, "Salida del sistema", "sesion", ctx.usuario.id, null);
+  });
   return { ok: true };
 }
 
 async function cambiarClave(ctx) {
-  const actual = String(ctx.body.actual || "");
-  const nueva = String(ctx.body.nueva || "");
-  const u = await N.exigir(ctx.db, ctx, "predio_usuario", ctx.usuario.id, "El usuario ya no existe");
-  if (Number(u.es_admin_general)) throw U.error("Tu contraseña es la del sistema general: cambiala desde ahí");
-  if (!U.verificarPassword(actual, u.password_hash)) throw U.error("La contraseña actual no es correcta", 403);
-  if (nueva.length < 4) throw U.error("La contraseña nueva tiene que tener al menos 4 caracteres");
+  if (ctx.usuario.es_admin_general) throw U.error("Cambiá tu contraseña desde el sistema general", 403);
   await ctx.db.tx(async (t) => {
-    await N.actualizar(t, ctx, "predio_usuario", u.id, { password_hash: U.hashPassword(nueva) });
+    const u = await N.exigir(t, ctx, "predio_usuario", ctx.usuario.id, "El usuario ya no existe");
+    const hash = ctx.hashClaveValidada || clavesUsuario.hashDeCambio(u, String(ctx.body.actual || ""), ctx.body.nueva);
+    await N.actualizar(t, ctx, "predio_usuario", u.id, { password_hash: hash, debe_cambiar_clave: 0 });
+    if (t.dialecto === "sqlite") await t.run("DELETE FROM predio_sesion WHERE usuario_id = ? AND token_hash <> ?", [u.id, ctx.sesion?.token_hash || ""]);
     await N.auditar(t, ctx, "Cambio de contraseña propia", "usuario", u.id, null);
   });
-  await ctx.db.run("DELETE FROM predio_sesion WHERE usuario_id = ? AND token_hash <> ?", [u.id, ctx.sesion.token_hash]);
   return { mensaje: "Contraseña cambiada" };
 }
 
@@ -266,7 +276,7 @@ async function primerUso(ctx) {
   if (!/^[a-z0-9._-]+$/.test(usuario)) throw U.error("El usuario sólo puede tener letras, números, punto, guion o guion bajo");
   const nombre = U.texto(ctx.body.nombre, { max: 120, campo: "El nombre", requerido: true });
   const password = String(ctx.body.password || "");
-  if (password.length < 4) throw U.error("La contraseña tiene que tener al menos 4 caracteres");
+  clavesUsuario.validarNueva(password, usuario);
   const actor = { ...ctx, usuario: { id: null, nombre: "Configuración inicial" } };
   const id = await ctx.db.tx(async (t) => {
     const nuevo = await N.insertar(t, actor, "predio_usuario", {
@@ -276,8 +286,8 @@ async function primerUso(ctx) {
     return nuevo;
   });
   const u = await N.obtener(ctx.db, ctx, "predio_usuario", id);
-  const token = await crearSesion(ctx, u, U.bool(ctx.body.recordar));
-  return { token, ...(await armarSesion(ctx, u, {})) };
+  const { token, puesto } = await crearSesion(ctx, u, U.bool(ctx.body.recordar));
+  return { token, ...(await armarSesion(ctx, u, puesto)) };
 }
 
 // Valida el token de una petición y arma ctx.usuario / ctx.sesion.
@@ -299,7 +309,7 @@ async function autenticar(ctx, token) {
   }
   const bocas = await bocasUsuario(ctx.db, ctx, u);
   return {
-    usuario: { id: Number(u.id), usuario: u.usuario, nombre: u.nombre, rol: u.rol, gestionar_reservas: !!Number(u.gestionar_reservas), bocas, es_admin_general: !!Number(u.es_admin_general) },
+    usuario: { ...identidadUsuario(u), bocas },
     sesion: { token_hash: hash, boca_id: s.boca_id, caja_id: s.caja_id, turno_id: s.turno_id },
   };
 }
@@ -315,6 +325,6 @@ module.exports = {
     { m: "GET", p: "/sesion", h: verSesion, soloLocal: true },
     { m: "POST", p: "/sesion/puesto", h: elegirPuesto, soloLocal: true },
     { m: "POST", p: "/sesion/salir-puesto", h: salirPuesto, soloLocal: true },
-    { m: "POST", p: "/sesion/clave", h: cambiarClave, soloLocal: true },
+    { m: "POST", p: "/sesion/clave", h: cambiarClave, escritura: true },
   ],
 };

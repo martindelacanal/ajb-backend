@@ -8,6 +8,9 @@ const U = require("../util");
 const N = require("../negocio");
 const { exigirAdmin, esAdmin, bocasDe, turnoDeCaja } = require("./comun");
 
+const { turnoAbierto, verificarOperador } = require("../turnos-caja");
+const claveCierre = require("../clave-cierre");
+
 const CONCEPTOS_AJUSTE = ["CIERRE_CAJA", "INGRESO_DINERO", "RETIRO_DINERO", "OTROS"];
 
 async function saldoCaja(t, ctx, cajaId) {
@@ -23,8 +26,8 @@ function cajaDelPedido(ctx, valor) {
   throw U.error("Elegí una caja");
 }
 
-async function exigirAccesoCaja(t, ctx, cajaId) {
-  const caja = await N.exigir(t, ctx, "predio_caja", cajaId, "No encontramos la caja");
+async function exigirAccesoCaja(t, ctx, cajaId, bloquear = false) {
+  const caja = await N.exigir(t, ctx, "predio_caja", cajaId, "No encontramos la caja", { bloquear });
   if (!esAdmin(ctx) && Number(ctx.sesion?.caja_id) !== Number(cajaId) && !bocasDe(ctx).includes(Number(caja.boca_id))) {
     throw U.error("No tenés acceso a esa caja", 403);
   }
@@ -88,7 +91,9 @@ async function estado(ctx) {
   const cajaId = cajaDelPedido(ctx, ctx.query.caja_id);
   const caja = await exigirAccesoCaja(db, ctx, cajaId);
   const boca = await N.obtener(db, ctx, "predio_boca", caja.boca_id);
-  const apertura = await db.get("SELECT * FROM predio_apertura WHERE predio_id = ? AND caja_id = ? AND fecha = ?", [ctx.pid, cajaId, U.hoy()]);
+  const responsable = await turnoAbierto(db, ctx.pid, cajaId);
+  const jornada = responsable ? responsable.inicio.slice(0, 10) : U.hoy();
+  const apertura = await db.get("SELECT * FROM predio_apertura WHERE predio_id = ? AND caja_id = ? AND fecha = ?", [ctx.pid, cajaId, jornada]);
   const resumen = await resumenAbierto(db, ctx, caja);
   let turno = null;
   const turnoId = turnoDeCaja(ctx, cajaId);
@@ -98,7 +103,7 @@ async function estado(ctx) {
        WHERE predio_id = ? AND turno_id = ? AND estado = 'CONFIRMADA'`, [ctx.pid, turnoId]);
     turno = { cantidad: Number(turno.cantidad), total: U.redondear(Number(turno.total), 2) };
   }
-  return { caja, boca: boca ? { id: boca.id, nombre: boca.nombre } : null, apertura: apertura || null, resumen, turno };
+  return { caja, jornada, responsable, boca: boca ? { id: boca.id, nombre: boca.nombre } : null, apertura: apertura || null, resumen, turno };
 }
 
 async function cargarApertura(ctx) {
@@ -109,6 +114,10 @@ async function cargarApertura(ctx) {
   const observacion = U.texto(ctx.body.observacion, { max: 255 });
   return ctx.db.tx(async (t) => {
     const caja = await N.exigir(t, ctx, "predio_caja", cajaId, "No encontramos la caja");
+    const turno = await turnoAbierto(t, ctx.pid, cajaId);
+    if (turno && turno.inicio.slice(0, 10) !== fecha) {
+      throw U.error("Esta caja tiene un turno abierto del " + turno.inicio.slice(0, 10) + ". Cerralo antes de cargar la apertura de otra jornada.", 409);
+    }
     const existente = await t.get("SELECT * FROM predio_apertura WHERE predio_id = ? AND caja_id = ? AND fecha = ?", [ctx.pid, cajaId, fecha]);
     const saldo = await saldoCaja(t, ctx, cajaId);
     // El movimiento lleva la caja exactamente al saldo declarado.
@@ -186,10 +195,40 @@ async function ajuste(ctx) {
   });
 }
 
+function revisionResumen(r) {
+  // La vista previa remota sale de MySQL; el escritor puede verificarla en SQLite.
+  const formas = r.ventas_por_forma.map(v => [v.forma_pago, v.cantidad, v.total]).sort((a, b) => a[0].localeCompare(b[0]));
+  return U.sha256(JSON.stringify([r.saldo_esperado, r.ingresos, r.egresos, r.ventas_cantidad, r.ventas_anuladas, formas]));
+}
+
 async function previaCierre(ctx) {
   const cajaId = cajaDelPedido(ctx, ctx.query.caja_id);
   const caja = await exigirAccesoCaja(ctx.db, ctx, cajaId);
-  return { caja, resumen: await resumenAbierto(ctx.db, ctx, caja) };
+  const turno = await turnoAbierto(ctx.db, ctx.pid, cajaId);
+  const resumen = await resumenAbierto(ctx.db, ctx, caja);
+  return { caja, turno, resumen, revision: revisionResumen(resumen) };
+}
+
+function comprobarCorte(ctx, turno, ultimo) {
+  const b = ctx.body;
+  if ((ctx.origen === "REMOTO" && (b.turno_id === undefined || b.ultimo_cierre_id === undefined))
+    || (b.turno_id !== undefined && Number(b.turno_id || 0) !== Number(turno?.id || 0))
+    || (b.ultimo_cierre_id !== undefined && Number(b.ultimo_cierre_id || 0) !== Number(ultimo?.id || 0))) {
+    throw U.error("El turno o el cierre cambió. Volvé a abrir el detalle de caja.", 409);
+  }
+}
+
+async function generarClaveCierre(ctx) {
+  exigirAdmin(ctx);
+  const cajaId = U.id(ctx.body.caja_id, "La caja");
+  return ctx.db.tx(async (t) => {
+    await exigirAccesoCaja(t, ctx, cajaId, true);
+    const turno = await turnoAbierto(t, ctx.pid, cajaId);
+    const ultimo = await ultimoCierre(t, ctx.pid, cajaId);
+    comprobarCorte(ctx, turno, ultimo);
+    await N.auditar(t, ctx, "Emisión de clave temporal de cierre", "caja", cajaId, { turno_id: turno?.id || null });
+    return claveCierre.generar(ctx, cajaId, turno?.id || null, ultimo?.id || null);
+  });
 }
 
 async function cerrar(ctx) {
@@ -200,11 +239,30 @@ async function cerrar(ctx) {
   const observaciones = U.texto(b.observaciones, { max: 255 });
   if (queda > contado) throw U.error("Lo que queda en la caja no puede ser más que lo contado");
   return ctx.db.tx(async (t) => {
-    const caja = await exigirAccesoCaja(t, ctx, cajaId);
-    if (!esAdmin(ctx) && Number(ctx.sesion?.caja_id) !== cajaId) throw U.error("Cerrá la caja en la que estás trabajando", 403);
+    const caja = await exigirAccesoCaja(t, ctx, cajaId, true);
+    const turno = await turnoAbierto(t, ctx.pid, cajaId);
+    if (!esAdmin(ctx)) {
+      if (!turno || Number(ctx.sesion?.caja_id) !== cajaId || Number(turno.id) !== Number(ctx.sesion.turno_id)) {
+        throw U.error("Cerrá el turno en el que estás trabajando.", 403);
+      }
+      await verificarOperador(t, ctx, cajaId);
+    }
     const r = await resumenAbierto(t, ctx, caja);
+    comprobarCorte(ctx, turno, r.ultimo_cierre);
+    if (b.revision && b.revision !== revisionResumen(r)) {
+      throw U.error("Los movimientos de caja cambiaron. Revisá nuevamente el detalle antes de cerrar.", 409);
+    }
+    const autorizacion = !esAdmin(ctx) && Number(ctx.usuario.puede_cerrar_caja) === 1
+      ? { metodo: "PERMISO_DE_USUARIO" }
+      : await claveCierre.verificar(t, ctx, cajaId, turno?.id || null, r.ultimo_cierre?.id || null);
+    const anterior = r.ultimo_cierre;
+    const corte = anterior && anterior.ultima_venta_id === undefined ? "v.fecha>?" : "v.id>?";
+    const pendiente = await t.get(`SELECT p.id FROM predio_permiso p JOIN predio_venta v ON v.predio_id=p.predio_id AND v.id=p.referencia_id
+      WHERE p.predio_id=? AND v.caja_id=? AND p.tipo='ANULAR_VENTA' AND p.estado='PENDIENTE' AND v.estado='CONFIRMADA' AND ${corte} LIMIT 1`,
+      [ctx.pid, cajaId, anterior?.ultima_venta_id ?? anterior?.fecha ?? 0]);
+    if (pendiente) throw U.error("Hay ventas pendientes de anulación. Un administrador debe confirmarlas o rechazarlas antes de cerrar la caja.", 409, { codigo: "ANULACIONES_PENDIENTES" });
     const diferencia = U.redondear(contado - r.saldo_esperado, 2);
-    const turnoId = turnoDeCaja(ctx, cajaId);
+    const turnoId = turno?.id || null;
     const retiro = U.redondear(contado - queda, 2);
     const ahora = U.fechaHora();
     const cierreId = await N.insertar(t, ctx, "predio_cierre", {
@@ -229,7 +287,11 @@ async function cerrar(ctx) {
     }
     await t.run("UPDATE predio_caja_movimiento SET cierre_id = ? WHERE predio_id = ? AND caja_id = ? AND cierre_id IS NULL", [cierreId, ctx.pid, cajaId]);
     const ultimaVenta = await t.get("SELECT COALESCE(MAX(id),0) AS id FROM predio_venta WHERE predio_id=? AND caja_id=?", [ctx.pid, cajaId]);
-    await N.auditar(t, ctx, "Cierre de caja", "caja", cajaId, { cierre_id: cierreId, ultima_venta_id: Number(ultimaVenta.id), esperado: r.saldo_esperado, contado, diferencia, retiro, queda });
+    // Las instalaciones anteriores podían tener turnos superpuestos en una caja.
+    // Un único cierre contable libera todos sus turnos y tokens asociados.
+    await t.run("UPDATE predio_turno SET fin=?, estado='CERRADO' WHERE predio_id=? AND caja_id=? AND estado='ABIERTO'", [ahora, ctx.pid, cajaId]);
+    if (t.dialecto === "sqlite") await t.run("UPDATE predio_sesion SET boca_id=NULL, caja_id=NULL, turno_id=NULL WHERE caja_id=?", [cajaId]);
+    await N.auditar(t, ctx, "Cierre de caja", "caja", cajaId, { cierre_id: cierreId, turno_id: turnoId, inicio_turno: turno?.inicio || null, autorizacion, ultima_venta_id: Number(ultimaVenta.id), esperado: r.saldo_esperado, contado, diferencia, retiro, queda });
     return { id: cierreId, diferencia, retiro, mensaje: diferencia === 0 ? "Caja cerrada sin diferencias" : `Caja cerrada con ${diferencia > 0 ? "sobrante" : "faltante"} de ${U.pesos(Math.abs(diferencia))}` };
   });
 }
@@ -262,8 +324,9 @@ async function panelCajas(ctx) {
   const salida = [];
   for (const c of cajas) {
     const r = await resumenAbierto(ctx.db, ctx, c);
-    const apertura = await ctx.db.get("SELECT id, importe, verificacion, verificado_por FROM predio_apertura WHERE predio_id = ? AND caja_id = ? AND fecha = ?", [ctx.pid, c.id, U.hoy()]);
-    const turno = await ctx.db.get("SELECT usuario_nombre, inicio FROM predio_turno WHERE predio_id = ? AND caja_id = ? AND estado = 'ABIERTO' ORDER BY id DESC LIMIT 1", [ctx.pid, c.id]);
+    const turno = await turnoAbierto(ctx.db, ctx.pid, c.id);
+    const jornada = turno ? turno.inicio.slice(0, 10) : U.hoy();
+    const apertura = await ctx.db.get("SELECT id, importe, verificacion, verificado_por FROM predio_apertura WHERE predio_id = ? AND caja_id = ? AND fecha = ?", [ctx.pid, c.id, jornada]);
     salida.push({ ...c, saldo: r.saldo_esperado, ventas_cantidad: r.ventas_cantidad, ventas_total: r.ventas_total, ultimo_cierre: r.ultimo_cierre, apertura: apertura || null, turno: turno || null });
   }
   return { cajas: salida };
@@ -295,6 +358,7 @@ module.exports = {
     { m: "POST", p: "/caja/apertura/:id/verificar", h: verificarApertura, escritura: true },
     { m: "POST", p: "/caja/ajuste", h: ajuste, escritura: true, roles: ["ADMIN"] },
     { m: "GET", p: "/caja/cierre/previa", h: previaCierre },
+    { m: "POST", p: "/caja/cierre/clave", h: generarClaveCierre, escritura: true, roles: ["ADMIN"] },
     { m: "POST", p: "/caja/cierre", h: cerrar, escritura: true },
     { m: "GET", p: "/caja/cierres/:id", h: detalleCierre },
   ],

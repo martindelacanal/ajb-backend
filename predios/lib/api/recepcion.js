@@ -1,4 +1,5 @@
 "use strict";
+const { verificarOperador, turnoAbierto } = require("../turnos-caja");
 
 const U = require("../util"),
   N = require("../negocio");
@@ -146,7 +147,13 @@ async function guardar(ctx) {
 async function caja(t, ctx, b, n, id, concepto) {
   if (!n) return;
   const cajaId = U.id(b.caja_id || ctx.sesion?.caja_id, "La caja que recibe o devuelve el efectivo");
-  const ca = await N.exigir(t, ctx, "predio_caja", cajaId);
+  const ca = await N.exigir(t, ctx, "predio_caja", cajaId, "No encontramos la caja", { bloquear: true });
+  if (ctx.usuario.rol !== "ADMIN" || Number(ctx.sesion?.caja_id) === cajaId) {
+    if (Number(ctx.sesion?.caja_id) !== cajaId) throw U.error("Ingresá a tu caja para registrar el efectivo de recepción.", 403);
+    await verificarOperador(t, ctx, cajaId);
+  } else if (await turnoAbierto(t, ctx.pid, cajaId)) {
+    throw U.error("Esta caja está ocupada. Usá tu propia caja para registrar el efectivo de recepción.", 409);
+  }
   exigirBoca(ctx, ca.boca_id);
   if (!Number(ca.activo)) throw U.error("La caja está inactiva.");
   await N.insertar(t, ctx, "predio_caja_movimiento", {
@@ -249,6 +256,14 @@ async function administrar(ctx) {
       if (accion === "PAGO_RESERVA" && !n) throw U.error("No hay una diferencia pendiente.");
       if (accion === "LIQUIDAR" && !a.cierre_pendiente) throw U.error("No hay consumos ni saldo para liquidar.");
       if (Number(b.esperado) !== n) throw U.error("El importe cambió. Actualizá la cuenta antes de confirmar.", 409);
+      if (accion === "LIQUIDAR") {
+        const ultimo = a.movimientos.find(esCierreDeSaldo);
+        const pendiente = await t.get(`SELECT m.venta_id FROM predio_estadia_mov m
+          JOIN predio_permiso p ON p.predio_id=m.predio_id AND p.referencia_id=m.venta_id
+          WHERE m.predio_id=? AND m.reserva_id=? AND m.id>? AND m.concepto='COMPRA'
+          AND p.tipo='ANULAR_VENTA' AND p.estado='PENDIENTE' LIMIT 1${t.forUpdate}`, [ctx.pid, id, ultimo?.id || 0]);
+        if (pendiente) throw U.error(`Resolvé la anulación pendiente del ticket N° ${pendiente.venta_id} antes de liquidar la estadía.`, 409);
+      }
       U.opcion(modo, ["EFECTIVO", "TRANSFERENCIA", "HABERES"], "El medio");
       if (modo === "HABERES" && n) liq = await planilla(t, ctx, r, n);
       if (modo === "EFECTIVO") await caja(t, ctx, b, n, id, accion === "LIQUIDAR" ? "LIQUIDACION_ESTADIA" : "DIFERENCIA_RESERVA");
@@ -286,12 +301,23 @@ async function buscarSaldo(ctx) {
     [ctx.pid, documento ? documento + "%" : null, prefijoLegajo, documento, legajo]);
   return filas.map(h => ({ ...h, exacto: h.dni === documento || String(h.legajo || "").toUpperCase() === legajo }));
 }
-async function aplicarVenta(t, ctx, huespedId, n, venta, reversa = false) {
+async function huespedParaDevolucion(t, ctx, huespedId, venta) {
   const h = await N.exigir(t, ctx, "predio_huesped", U.id(huespedId), "No encontramos al huésped", {
     bloquear: true
   });
+  const compra = await t.get(`SELECT id FROM predio_estadia_mov WHERE predio_id=? AND reserva_id=?
+    AND venta_id=? AND huesped_id=? AND concepto='COMPRA' ORDER BY id LIMIT 1${t.forUpdate}`, [ctx.pid, h.reserva_id, venta, h.id]);
+  if (!compra) throw U.error("No se encontró el débito del ticket en la cuenta del huésped.", 409);
+  const cierre = await t.get(`SELECT id FROM predio_estadia_mov WHERE predio_id=? AND reserva_id=? AND id>?
+    AND concepto='SALDAR_CONSUMOS' AND (COALESCE(medio,'')<>'HABERES' OR importe>=0) LIMIT 1${t.forUpdate}`, [ctx.pid, h.reserva_id, compra.id]);
+  if (cierre) throw U.error("La estadía ya liquidó esta compra; no se puede anular desde la caja.", 409);
+  return h;
+}
+
+async function aplicarVenta(t, ctx, huespedId, n, venta, reversa = false) {
+  const h = reversa ? await huespedParaDevolucion(t, ctx, huespedId, venta)
+    : await N.exigir(t, ctx, "predio_huesped", U.id(huespedId), "No encontramos al huésped", { bloquear: true });
   if (!reversa && (!h.entrada || h.salida || Number(h.saldo) < n)) throw U.error("El huésped no está presente o el saldo no alcanza.", 409);
-  if (reversa && (await t.get("SELECT id FROM predio_estadia_mov WHERE predio_id=? AND reserva_id=? AND concepto='SALDAR_CONSUMOS' AND id>(SELECT MAX(id) FROM predio_estadia_mov WHERE predio_id=? AND venta_id=? AND concepto='COMPRA')", [ctx.pid, h.reserva_id, ctx.pid, venta]))) throw U.error("La estadía ya liquidó esta compra; no se puede anular desde la caja.", 409);
   const delta = reversa ? n : -n;
   await N.actualizar(t, ctx, "predio_huesped", h.id, {
     saldo: U.redondear(Number(h.saldo) + delta)
@@ -350,6 +376,7 @@ rutas.push({
 module.exports = {
   rutas,
   aplicarVenta,
+  huespedParaDevolucion,
   cuenta,
   permiso,
   aplicarConfirmacion

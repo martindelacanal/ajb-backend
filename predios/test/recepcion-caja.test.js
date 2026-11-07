@@ -148,9 +148,14 @@ test("saldo personal, reparto, venta mixta y reversión conservan stock, caja y 
   assert.equal((await db.get("SELECT importe FROM predio_caja_movimiento WHERE venta_id=?", [v.id])).importe, 20);
   await assert.rejects(call("POST", "/ventas", venta), /saldo no alcanza/);
   assert.equal((await db.get("SELECT COUNT(*) AS n FROM predio_venta")).n, 1);
-  await call("POST", "/ventas/" + v.id + "/anular", {
-    motivo: "Duplicada"
-  });
+  const operador = { id: 2, rol: "CAJERO", nombre: "Cajero", bocas: [caja.boca_id] };
+  const pedirAnulacion = id => call("POST", "/permisos", {
+    tipo: "ANULAR_VENTA", referencia_id: id, detalle: "Duplicada"
+  }, {}, operador);
+  const solicitud = await pedirAnulacion(v.id);
+  await assert.rejects(mover({ accion: "LIQUIDAR", medio: "EFECTIVO", esperado: -70 }), /anulación pendiente/);
+  assert.equal((await cuenta()).saldo, 70);
+  assert.equal((await call("POST", "/permisos/" + solicitud.id + "/resolver", { aprobar: true })).devolver_efectivo, 20);
   assert.equal((await cuenta()).saldo, 100);
   assert.equal((await cuenta()).consumos, 0);
   r.personas[1].salida = U.hoy();
@@ -180,6 +185,7 @@ test("saldo personal, reparto, venta mixta y reversión conservan stock, caja y 
   await mover({ accion: "LIQUIDAR", medio: "EFECTIVO", esperado: 0 });
   await assert.rejects(mover({ accion: "LIQUIDAR", medio: "EFECTIVO", esperado: 0 }), /No hay consumos/);
   await assert.rejects(call("POST", "/ventas/" + consumido.id + "/anular", { motivo: "Cerrada" }), /liquidó/);
+  await assert.rejects(pedirAnulacion(consumido.id), /liquidó/);
   // La planilla no liquida la parte en efectivo de una venta combinada.
   r.afiliado = 1;
   r.personas[0].legajo = "L-23";
@@ -255,7 +261,9 @@ test("saldo personal, reparto, venta mixta y reversión conservan stock, caja y 
   // Un cobro en el mismo segundo que el cierre pertenece al período nuevo.
   const mismaHora = U.fechaHora();
   t.mock.method(U, "fechaHora", () => mismaHora);
-  await call("POST", "/caja/cierre", { caja_id: caja.id, efectivo_contado: 0 });
+  await db.tx(tx => N.insertar(tx, ctx, "predio_usuario", { usuario: "recepcion", nombre: "Empleada", rol: "ADMIN", activo: 1 }));
+  const { clave } = await call("POST", "/caja/cierre/clave", { caja_id: caja.id });
+  await call("POST", "/caja/cierre", { caja_id: caja.id, efectivo_contado: 0, clave });
   const siguiente = await call("POST", "/ventas", {
     items: venta.items, forma_pago: "MIXTO",
     pagos: [{ forma: "EFECTIVO", importe: 20 }, { forma: "QR", importe: 30 }],

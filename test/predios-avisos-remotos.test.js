@@ -21,6 +21,7 @@ let masivo;
 
 function adaptadorSQL(ejecutor) {
   return { async query(sql, params = []) {
+    sql = sql.replace("DATE_ADD(?, INTERVAL COALESCE(p.dias_aviso_vencimiento,7) DAY)", "date(?, '+' || COALESCE(p.dias_aviso_vencimiento,7) || ' days')");
     if (/^\s*SELECT/i.test(sql)) return [await ejecutor.all(sql, params)];
     const r = await ejecutor.run(sql, params);
     return [{ insertId: r.insertId, affectedRows: r.cambios }];

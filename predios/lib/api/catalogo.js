@@ -1,5 +1,7 @@
 "use strict";
 
+const clavesUsuario = require("../claves-usuario");
+
 // Catálogo: productos, proveedores, bocas, cajas, usuarios, configuración y
 // las listas de opciones de los desplegables.
 
@@ -251,8 +253,15 @@ function validarProducto(body, { parcial = false } = {}) {
   if (!parcial || body.fecha_caducidad !== undefined) datos.fecha_caducidad = U.fecha(body.fecha_caducidad, { campo: "La fecha de caducidad" });
   if (!parcial || body.stock_minimo !== undefined) datos.stock_minimo = U.numero(body.stock_minimo ?? 0, { min: 0, max: 9999999, decimales: 3, campo: "El stock mínimo" });
   if (!parcial || body.unidad !== undefined) datos.unidad = U.texto(body.unidad, { max: 20 });
-  if (datos.perecedero === 0 && body.fecha_caducidad === undefined) datos.fecha_caducidad = null;
-  if (datos.perecedero === 0) datos.fecha_caducidad = null;
+  if (!parcial || body.dias_aviso_vencimiento !== undefined) {
+    const valor = body.dias_aviso_vencimiento;
+    if (valor != null && valor !== "" && !/^\d{1,3}$/.test(String(valor))) throw U.error("Ingresá una cantidad entera de días entre 0 y 365");
+    datos.dias_aviso_vencimiento = U.entero(valor, { min: 0, max: 365, requerido: false, campo: "La anticipación del aviso" });
+  }
+  if (datos.perecedero === 0) {
+    datos.fecha_caducidad = null;
+    datos.dias_aviso_vencimiento = null;
+  }
   return datos;
 }
 
@@ -496,7 +505,10 @@ async function guardarCaja(ctx) {
       [ctx.pid, datos.boca_id, datos.nombre, id || -1]);
     if (dup) throw U.error("Esa boca ya tiene una caja con ese nombre", 409);
     if (id) {
-      const antes = await N.exigir(t, ctx, "predio_caja", id, "No encontramos la caja");
+      const antes = await N.exigir(t, ctx, "predio_caja", id, "No encontramos la caja", { bloquear: true });
+      if ((datos.activo === 0 || Number(antes.boca_id) !== datos.boca_id) && await require("../turnos-caja").turnoAbierto(t, ctx.pid, id)) {
+        throw U.error("Cerrá el turno antes de mover o deshabilitar esta caja.", 409);
+      }
       await N.actualizar(t, ctx, "predio_caja", id, datos);
       const cambios = N.diferencias(antes, await N.obtener(t, ctx, "predio_caja", id));
       if (Object.keys(cambios).length) await N.auditar(t, ctx, "Modificación de caja", "caja", id, cambios);
@@ -543,13 +555,17 @@ async function guardarUsuario(ctx) {
   };
   if (!/^[a-z0-9._-]+$/.test(datos.usuario)) throw U.error("El usuario sólo puede tener letras, números, punto, guion o guion bajo");
   if (b.gestionar_reservas !== undefined) datos.gestionar_reservas = U.bool(b.gestionar_reservas);
+  if (b.puede_cerrar_caja !== undefined) datos.puede_cerrar_caja = U.bool(b.puede_cerrar_caja);
+  if (b.puede_anular_ticket !== undefined) datos.puede_anular_ticket = U.bool(b.puede_anular_ticket);
   if (b.activo !== undefined) datos.activo = U.bool(b.activo);
   const bocas = Array.isArray(b.bocas) ? [...new Set(b.bocas.map((x) => U.id(x, "La boca")))] : [];
   if (datos.rol === "CAJERO" && !bocas.length) throw U.error("Asigná al menos una boca al usuario");
   const password = b.password ? String(b.password) : "";
-  if (!id && password.length < 4) throw U.error("La contraseña tiene que tener al menos 4 caracteres");
-  if (password && password.length < 4) throw U.error("La contraseña tiene que tener al menos 4 caracteres");
-  if (password) datos.password_hash = U.hashPassword(password);
+  if (!ctx.hashClaveValidada && (password || !id)) clavesUsuario.validarNueva(password, datos.usuario);
+  if (ctx.hashClaveValidada || password) {
+    datos.password_hash = ctx.hashClaveValidada || U.hashPassword(password);
+    datos.debe_cambiar_clave = 1;
+  }
   return ctx.db.tx(async (t) => {
     const dup = await t.get("SELECT id FROM predio_usuario WHERE predio_id = ? AND usuario = ? AND id <> ?", [ctx.pid, datos.usuario, id || -1]);
     if (dup) throw U.error("Ese nombre de usuario ya existe", 409);
@@ -559,8 +575,9 @@ async function guardarUsuario(ctx) {
       if (Number(antes.es_admin_general) === 1) throw U.error("Los administradores del sistema general se gestionan desde el sistema general", 409);
       if (Number(ctx.usuario.id) === id && datos.activo === 0) throw U.error("No podés deshabilitar tu propio usuario", 409);
       await N.actualizar(t, ctx, "predio_usuario", id, datos);
+      if (datos.password_hash && t.dialecto === "sqlite") await t.run("DELETE FROM predio_sesion WHERE usuario_id = ?", [id]);
       const cambios = N.diferencias(antes, await N.obtener(t, ctx, "predio_usuario", id));
-      if (password) cambios.password = "cambiada";
+      if (datos.password_hash) cambios.password = "cambiada";
       await N.auditar(t, ctx, "Modificación de usuario", "usuario", id, cambios);
     } else {
       usuarioId = await N.insertar(t, ctx, "predio_usuario", { ...datos, activo: 1, es_admin_general: 0 });

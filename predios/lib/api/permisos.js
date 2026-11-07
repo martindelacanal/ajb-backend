@@ -10,6 +10,7 @@ const { revisarPreciosVencidos } = require("../precios");
 const { revisarStockMinimo } = require("../stock-minimo");
 const { TIPOS_PERMISO, textoDe } = require("../listados");
 const { exigirAdmin, esAdmin, bocasDe, validarClave, exigirPuesto } = require("./comun");
+const { anularVenta, solicitarAnulacion } = require("./ventas");
 
 const TIPOS = TIPOS_PERMISO.map((t) => t.valor);
 
@@ -18,12 +19,11 @@ async function pedir(ctx) {
   const tipo = U.opcion(ctx.body.tipo, TIPOS, "El tipo de autorización");
   const referenciaId = ctx.body.referencia_id ? U.id(ctx.body.referencia_id, "La referencia") : (tipo === "VER_VENTAS_CAJA" ? ctx.sesion?.caja_id || null : null);
   const detalle = U.texto(ctx.body.detalle, { max: 255 });
-  if (tipo === "ANULAR_VENTA" && !referenciaId) throw U.error("Indicá qué venta querés anular");
+  if (tipo === "ANULAR_VENTA") {
+    if (!referenciaId) throw U.error("Indicá qué venta querés anular");
+    return solicitarAnulacion(ctx, referenciaId, detalle);
+  }
   return ctx.db.tx(async (t) => {
-    if (tipo === "ANULAR_VENTA") {
-      const v = await N.exigir(t, ctx, "predio_venta", referenciaId, "No encontramos la venta");
-      if (Number(v.caja_id) !== Number(ctx.sesion?.caja_id)) throw U.error("Sólo podés pedir anular ventas de tu caja", 403);
-    }
     const abierto = await t.get(
       `SELECT id FROM predio_permiso WHERE predio_id = ? AND usuario_id = ? AND tipo = ? AND estado = 'PENDIENTE'
        AND (referencia_id = ? OR (referencia_id IS NULL AND ? IS NULL)) ORDER BY id DESC LIMIT 1`,
@@ -51,6 +51,13 @@ async function resolver(ctx) {
   exigirAdmin(ctx);
   const id = U.id(ctx.params.id);
   const aprobar = ctx.body.aprobar === true || ctx.body.aprobar === 1 || ctx.body.aprobar === "1";
+  if (aprobar) {
+    const pedido = await N.exigir(ctx.db, ctx, "predio_permiso", id, "No encontramos el pedido");
+    if (pedido.tipo === "ANULAR_VENTA") {
+      const resultado = await anularVenta(ctx, pedido);
+      return { ...resultado, venta_id: resultado.id, id: pedido.id };
+    }
+  }
   return ctx.db.tx(async (t) => {
     const p = await N.exigir(t, ctx, "predio_permiso", id, "No encontramos el pedido", { bloquear: true });
     if (p.estado !== "PENDIENTE") throw U.error("Ese pedido ya fue resuelto", 409);
@@ -78,6 +85,7 @@ async function avisos(ctx) {
   const pid = ctx.pid;
   const hoy = U.hoy();
   const salida = { permisos: [], solicitudes_despachar: 0, solicitudes_recibir: 0, aperturas: [], vencimientos: 0, stock_negativo: 0, mis_permisos: [] };
+  if (ctx.sesion?.token_hash) salida.turno_id = ctx.sesion.turno_id || null;
   salida.notificaciones = await listarAvisos(ctx);
   const historial = await historialAvisos(ctx, { pagina: 1, tam: 10 });
   salida.recientes = historial.filas;
@@ -85,7 +93,7 @@ async function avisos(ctx) {
   salida.notificaciones_no_leidas = historial.no_leidas;
   if (esAdmin(ctx)) {
     salida.permisos = await db.all(
-      `SELECT x.id, x.tipo, x.usuario_nombre, x.detalle, x.fecha_solicitud, b.nombre AS boca, c.nombre AS caja
+      `SELECT x.id, x.tipo, x.referencia_id, x.usuario_nombre, x.detalle, x.fecha_solicitud, b.nombre AS boca, c.nombre AS caja
        FROM predio_permiso x LEFT JOIN predio_boca b ON b.predio_id = x.predio_id AND b.id = x.boca_id
        LEFT JOIN predio_caja c ON c.predio_id = x.predio_id AND c.id = x.caja_id
        WHERE x.predio_id = ? AND x.estado = 'PENDIENTE' ORDER BY x.id DESC LIMIT 30`, [pid]);
@@ -97,10 +105,11 @@ async function avisos(ctx) {
       `SELECT a.id, a.caja_id, a.importe, a.verificado_por, a.observacion, c.nombre AS caja, b.nombre AS boca
        FROM predio_apertura a JOIN predio_caja c ON c.predio_id = a.predio_id AND c.id = a.caja_id
        JOIN predio_boca b ON b.predio_id = c.predio_id AND b.id = c.boca_id
-       WHERE a.predio_id = ? AND a.fecha = ? AND a.verificacion = 'NO_COINCIDE'`, [pid, hoy]);
+       WHERE a.predio_id = ? AND a.fecha = COALESCE((SELECT SUBSTR(t.inicio,1,10) FROM predio_turno t
+          WHERE t.predio_id=a.predio_id AND t.caja_id=a.caja_id AND t.estado='ABIERTO' ORDER BY t.id DESC LIMIT 1), ?) AND a.verificacion = 'NO_COINCIDE'`, [pid, hoy]);
     const v = await db.get(
-      "SELECT COUNT(*) AS n FROM predio_producto WHERE predio_id = ? AND activo = 1 AND fecha_caducidad IS NOT NULL AND fecha_caducidad <= ?",
-      [pid, U.sumarDias(hoy, 7)]);
+      `SELECT COUNT(*) AS n FROM predio_producto p WHERE p.predio_id = ? AND ${require("../vencimientos").condicionVencimiento(db.dialecto, "?")}`,
+      [pid, hoy]);
     salida.vencimientos = Number(v.n);
     const neg = await db.get("SELECT COUNT(*) AS n FROM predio_stock WHERE predio_id = ? AND cantidad < 0", [pid]);
     salida.stock_negativo = Number(neg.n);
@@ -119,8 +128,9 @@ async function avisos(ctx) {
        ORDER BY id DESC LIMIT 10`, [pid, ctx.usuario.id, U.fechaHora(new Date(Date.now() - 2 * 3600000))]);
     if (ctx.sesion?.caja_id) {
       salida.apertura = await db.get(
-        "SELECT id, importe, verificacion FROM predio_apertura WHERE predio_id = ? AND caja_id = ? AND fecha = ?",
-        [pid, ctx.sesion.caja_id, hoy]) || null;
+        `SELECT id, importe, verificacion FROM predio_apertura WHERE predio_id=? AND caja_id=?
+         AND fecha=COALESCE((SELECT SUBSTR(inicio,1,10) FROM predio_turno WHERE predio_id=? AND id=? AND estado='ABIERTO'), ?)`,
+        [pid, ctx.sesion.caja_id, pid, ctx.sesion.turno_id || -1, hoy]) || null;
     }
   }
   salida.total = salida.notificaciones_no_leidas + salida.permisos.length + salida.aperturas.length + salida.solicitudes_despachar + salida.solicitudes_recibir;

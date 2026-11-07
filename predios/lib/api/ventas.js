@@ -4,6 +4,7 @@
 // el efectivo genera movimiento de caja y el saldo se descuenta de la cuenta de la estadía.
 
 const U = require("../util");
+const { verificarOperador } = require("../turnos-caja");
 const N = require("../negocio");
 const { productoEnBoca, bloquearPrecios } = require("../precio-boca");
 const { emitirAviso } = require("../avisos");
@@ -198,6 +199,7 @@ async function crearVenta(ctx) {
     if (t.forUpdate) await bloquearPrecios(t, ctx);
     const caja = await N.exigir(t, ctx, "predio_caja", puesto.caja_id, "La caja ya no existe");
     if (!Number(caja.activo)) throw U.error("La caja está deshabilitada", 409);
+    await verificarOperador(t, ctx, caja.id);
     if (Number(caja.boca_id) !== Number(puesto.boca_id)) throw U.error("Elegí nuevamente la boca y la caja", 409, { codigo: "SIN_PUESTO" });
     const config = await N.leerConfig(t, ctx);
     const lineas = [];
@@ -321,6 +323,9 @@ async function verVenta(ctx) {
   const id = U.id(ctx.params.id);
   const datos = await datosTicket(ctx.db, ctx, id);
   if (!puedeVerVenta(ctx, datos.venta)) throw U.error("No tenés acceso a esta venta", 403);
+  if (datos.venta.estado === "CONFIRMADA") {
+    datos.venta.solicitud_anulacion = await solicitudPendiente(ctx.db, ctx, id) || null;
+  }
   return datos;
 }
 
@@ -338,26 +343,66 @@ async function registrarImpresion(ctx) {
   });
 }
 
-async function anularVenta(ctx) {
-  const id = U.id(ctx.params.id);
-  const b = ctx.body;
-  const motivo = U.texto(b.motivo, { max: 255, campo: "El motivo de la anulación", requerido: true });
-  return ctx.db.tx(async (t) => {
-    const v = await N.exigir(t, ctx, "predio_venta", id, "No encontramos la venta", { bloquear: true });
-    if (v.estado === "ANULADA") throw U.error("La venta ya está anulada", 409);
-    if (!esAdmin(ctx)) {
-      const caja = ctx.sesion?.caja_id;
-      if (Number(v.caja_id) !== Number(caja)) throw U.error("Sólo podés anular ventas de la caja en la que estás trabajando", 403);
-    }
-    if (v.liquidacion_id) throw U.error("La venta ya está incluida en una liquidación del afiliado: anulá primero la liquidación", 409);
-    const cierre = await require("./caja").ultimoCierre(t, ctx.pid, v.caja_id);
-    if (cierre && (cierre.ultima_venta_id !== undefined ? Number(id) <= cierre.ultima_venta_id : cierre.fecha >= v.fecha)) {
-      throw U.error(`La caja se cerró después de esta venta (cierre N° ${cierre.id}): ya no se puede anular`, 409);
-    }
-    const autorizacion = await autorizar(t, ctx, "ANULAR_VENTA", {
-      clave: b.clave, permisoId: b.permiso_id, referenciaId: id, detalle: `Venta N° ${id} por ${U.pesos(v.total)}`,
+function solicitudPendiente(t, ctx, id, bloquear = false) {
+  return t.get(`SELECT id, usuario_nombre, detalle, fecha_solicitud FROM predio_permiso
+    WHERE predio_id=? AND tipo='ANULAR_VENTA' AND referencia_id=? AND estado='PENDIENTE'
+    ORDER BY id DESC LIMIT 1${bloquear ? t.forUpdate : ""}`, [ctx.pid, id]);
+}
+
+async function ventaParaAnulacion(t, ctx, id) {
+  // El cierre y la anulación deben ver el resultado de la operación que tomó la caja primero.
+  if (t.forUpdate) await t.get(`SELECT id FROM predio_caja WHERE predio_id=? AND id=(
+    SELECT caja_id FROM predio_venta WHERE predio_id=? AND id=?)${t.forUpdate}`, [ctx.pid, ctx.pid, id]);
+  const v = await N.exigir(t, ctx, "predio_venta", id, "No encontramos la venta", { bloquear: true });
+  if (!esAdmin(ctx)) {
+    exigirBoca(ctx, v.boca_id);
+    if (Number(v.caja_id) !== Number(ctx.sesion?.caja_id)) throw U.error("Sólo podés anular ventas de la caja en la que estás trabajando", 403);
+    await verificarOperador(t, ctx, v.caja_id);
+  }
+  if (v.estado === "ANULADA") throw U.error("La venta ya está anulada", 409);
+  if (v.liquidacion_id) throw U.error("La venta ya está incluida en una liquidación del afiliado: anulá primero la liquidación", 409);
+  const cierre = await require("./caja").ultimoCierre(t, ctx.pid, v.caja_id);
+  if (cierre && (cierre.ultima_venta_id !== undefined ? Number(id) <= cierre.ultima_venta_id : cierre.fecha >= v.fecha)) {
+    throw U.error(`La caja se cerró después de esta venta (cierre N° ${cierre.id}): ya no se puede anular`, 409);
+  }
+  return v;
+}
+
+async function solicitarAnulacion(ctx, ventaId, detalle) {
+  const motivo = U.texto(detalle, { max: 255, campo: "El motivo de la anulación", requerido: true });
+  return ctx.db.tx(async t => {
+    const v = await ventaParaAnulacion(t, ctx, ventaId);
+    const abierta = await solicitudPendiente(t, ctx, v.id, true);
+    if (abierta) return { id: abierta.id, mensaje: "La venta ya está pendiente de anulación." };
+    const saldos = await t.all("SELECT huesped_id FROM predio_venta_pago WHERE predio_id=? AND venta_id=? AND forma='SALDO' ORDER BY huesped_id", [ctx.pid, v.id]);
+    for (const pago of saldos) await require("./recepcion").huespedParaDevolucion(t, ctx, pago.huesped_id, v.id);
+    const id = await N.insertar(t, ctx, "predio_permiso", {
+      tipo: "ANULAR_VENTA", estado: "PENDIENTE", referencia_id: v.id, detalle: motivo,
+      boca_id: v.boca_id, caja_id: v.caja_id, usuario_id: ctx.usuario.id,
+      usuario_nombre: N.nombreActor(ctx), fecha_solicitud: U.fechaHora(),
     });
-    const items = await t.all("SELECT * FROM predio_venta_item WHERE predio_id = ? AND venta_id = ?", [ctx.pid, id]);
+    await N.auditar(t, ctx, "Solicitud de anulación de venta", "venta", v.id, { permiso_id: id, motivo });
+    return { id, mensaje: `El administrador recibió el pedido de anulación de la venta N° ${v.id}.` };
+  });
+}
+
+async function anularVenta(ctx, permiso = null) {
+  if (!esAdmin(ctx) && !Number(ctx.usuario.puede_anular_ticket)) {
+    throw U.error("Pedí la anulación del ticket para que la confirme el administrador.", 403);
+  }
+  const id = permiso ? permiso.referencia_id : U.id(ctx.params.id);
+  return ctx.db.tx(async t => {
+    const v = await ventaParaAnulacion(t, ctx, id);
+    const solicitudId = permiso?.id || ctx.body.solicitud_id;
+    if (solicitudId) {
+      const actual = await N.exigir(t, ctx, "predio_permiso", U.id(solicitudId), "No encontramos el pedido", { bloquear: true });
+      if (actual.tipo !== "ANULAR_VENTA" || Number(actual.referencia_id) !== Number(id)) throw U.error("El pedido no corresponde a esta venta", 409);
+      if (actual.estado !== "PENDIENTE") throw U.error("Ese pedido ya fue resuelto", 409);
+    }
+    const motivo = U.texto(permiso ? permiso.detalle || `Solicitud N° ${permiso.id}` : ctx.body.motivo,
+      { max: 255, campo: "El motivo de la anulación", requerido: true });
+    const metodo = esAdmin(ctx) ? "ADMIN" : "DELEGADO";
+    const items = await t.all("SELECT * FROM predio_venta_item WHERE predio_id = ? AND venta_id = ? ORDER BY producto_id", [ctx.pid, id]);
     for (const it of items) {
       if (MOVEDORES_STOCK.includes(it.destino)) {
         await N.moverStock(t, ctx, {
@@ -366,21 +411,26 @@ async function anularVenta(ctx) {
         });
       }
     }
-    const pagos=await t.all("SELECT * FROM predio_venta_pago WHERE predio_id=? AND venta_id=?",[ctx.pid,id]);
-    const efectivo=pagos.length?Number(pagos.find(p=>p.forma==="EFECTIVO")?.importe||0):(v.forma_pago==="EFECTIVO"?Number(v.total):0);
-    for(const p of pagos)if(p.forma==="SALDO")await require("./recepcion").aplicarVenta(t,ctx,p.huesped_id,Number(p.importe),id,true);
+    const pagos = await t.all("SELECT * FROM predio_venta_pago WHERE predio_id=? AND venta_id=?", [ctx.pid, id]);
+    const efectivo = pagos.length ? Number(pagos.find(p => p.forma === "EFECTIVO")?.importe || 0) : (v.forma_pago === "EFECTIVO" ? Number(v.total) : 0);
+    for (const p of pagos) {
+      if (p.forma === "SALDO") await require("./recepcion").aplicarVenta(t, ctx, p.huesped_id, Number(p.importe), id, true);
+    }
+    const fecha = U.fechaHora();
     if (efectivo > 0) {
       await N.insertar(t, ctx, "predio_caja_movimiento", {
-        caja_id: v.caja_id, boca_id: v.boca_id, fecha: U.fechaHora(), concepto: "ANULACION_VENTA", tipo: "EGRESO", importe: efectivo,
+        caja_id: v.caja_id, boca_id: v.boca_id, fecha, concepto: "ANULACION_VENTA", tipo: "EGRESO", importe: efectivo,
         observaciones: `Anulación de la venta N° ${id}`, venta_id: id, turno_id: turnoDeCaja(ctx, v.caja_id),
         usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),
       });
     }
     await N.actualizar(t, ctx, "predio_venta", id, {
-      estado: "ANULADA", anulada_fecha: U.fechaHora(), anulada_por: N.nombreActor(ctx), anulacion_motivo: motivo,
-      anulacion_autorizacion: autorizacion.metodo,
+      estado: "ANULADA", anulada_fecha: fecha, anulada_por: N.nombreActor(ctx), anulacion_motivo: motivo, anulacion_autorizacion: metodo,
     });
-    await N.auditar(t, ctx, "Anulación de venta", "venta", id, { motivo, total: Number(v.total), forma_pago: v.forma_pago, autorizacion: autorizacion.metodo });
+    await t.run(`UPDATE predio_permiso SET estado='USADO', resuelto_por=?, resuelto_fecha=?, usado_fecha=?, metodo=?
+      WHERE predio_id=? AND tipo='ANULAR_VENTA' AND referencia_id=? AND estado='PENDIENTE'`,
+    [N.nombreActor(ctx), fecha, fecha, metodo, ctx.pid, id]);
+    await N.auditar(t, ctx, "Anulación de venta", "venta", id, { motivo, total: Number(v.total), forma_pago: v.forma_pago, autorizacion: metodo });
     return { id, mensaje: `Venta N° ${id} anulada`, devolver_efectivo: efectivo };
   });
 }
@@ -397,6 +447,8 @@ async function habilitarVerCaja(ctx) {
 
 module.exports = {
   datosTicket,
+  solicitarAnulacion,
+  anularVenta,
   rutas: [
     { m: "POST", p: "/ventas/avisar-sin-stock", h: avisarSinStock, escritura: true, soloLocal: true },
     { m: "POST", p: "/ventas", h: crearVenta, escritura: true, soloLocal: true },

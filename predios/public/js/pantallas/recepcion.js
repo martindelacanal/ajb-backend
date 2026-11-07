@@ -582,12 +582,13 @@
       caja = sel([], null, "Elegí una caja"),
       campoCaja = P.campo("Caja de efectivo", caja);
     if (!repartir && (!liquidar || n)) P.opciones("cajas").then(function (xs) {
+      var asignada = P.puesto() && P.puesto().caja_id;
+      if (!P.esAdmin()) xs = xs.filter(function (x) { return asignada && String(x.valor) === String(asignada); });
       xs.forEach(function (x) {
         caja.appendChild(h("option", {
           value: x.valor
         }, x.texto));
       });
-      var asignada = P.puesto() && P.puesto().caja_id;
       if (asignada && xs.some(function (x) { return String(x.valor) === String(asignada); })) caja.value = asignada;
       else if (xs.length === 1) caja.value = xs[0].valor;
     }).catch(P.error);
@@ -610,7 +611,7 @@
           if (!(importe > 0)) { imp.focus(); throw Error("Ingresá un importe mayor que cero, con hasta dos decimales."); }
           if (accion !== "CARGA" && importe > Number(persona(origen).saldo)) { imp.focus(); throw Error("El saldo disponible no alcanza."); }
         }
-        if (!campoCaja.hidden && !caja.value) { caja.focus(); throw Error("Elegí la caja donde se registra el efectivo."); }
+        if (!campoCaja.hidden && !caja.value) { caja.focus(); throw Error(P.esAdmin() ? "Elegí la caja donde se registra el efectivo." : "Ingresá a tu caja para registrar el efectivo de recepción."); }
         return P.post("/recepcion/" + r.id + "/cuenta", {
           operacion: key,
           accion: accion,

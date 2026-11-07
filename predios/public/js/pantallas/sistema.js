@@ -352,7 +352,7 @@
           P.ejecutar(ev.currentTarget, function () { return P.put("/config", cuerpo).then(function (x) { if (!x.encolado) P.aviso(x.mensaje, "ok"); }); }).catch(function () {});
         } }))));
       c.appendChild(h("div.hoja.hoja-cuerpo", h("h2.seccion-titulo", "Clave del día"),
-        h("p.texto-3", { style: { marginBottom: 0 } }, "Cuando un usuario de boca necesita autorización (pedir productos, anular una venta, ver todas las ventas de la caja), el administrador puede escribir en esa PC la clave del día: es la fecha de hoy sin barras ni ceros adelante. Por ejemplo, el 5/11/2026 la clave es 5112026. También puede aprobarlo a distancia desde la campana de avisos.")));
+        h("p.texto-3", { style: { marginBottom: 0 } }, "Cuando un usuario de boca necesita autorización (pedir productos o ver todas las ventas de la caja), el administrador puede escribir en esa PC la clave del día: es la fecha de hoy sin barras ni ceros adelante. Por ejemplo, el 5/11/2026 la clave es 5112026. También puede aprobarlo a distancia desde la campana de avisos.")));
     });
   }, { admin: true, titulo: "Configuración" });
 

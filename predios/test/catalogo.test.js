@@ -110,6 +110,7 @@ test("importa el catálogo y elimina de a uno, varios o por filtro", async () =>
   const cajaProv = (await ok("GET", "/opciones/cajas", { token: admin })).find((c) => c.boca_id === proveeduria).valor;
   await ok("POST", "/usuarios", { token: admin, cuerpo: { usuario: "caja.prov", nombre: "Cajera", rol: "CAJERO", password: "clave12", bocas: [proveeduria] } });
   const cajero = (await ok("POST", "/login", { cuerpo: { usuario: "caja.prov", password: "clave12" } })).token;
+  await ok("POST", "/sesion/clave", { token: cajero, cuerpo: { actual: "clave12", nueva: "Venta-fixture" } });
   await ok("POST", "/sesion/puesto", { token: cajero, cuerpo: { boca_id: proveeduria, caja_id: cajaProv } });
   const apertura = await ok("POST", "/caja/apertura", { token: admin, cuerpo: { caja_id: cajaProv, importe: 1000 } });
   await ok("POST", `/caja/apertura/${apertura.id}/verificar`, { token: cajero, cuerpo: { correcto: 1 } });
@@ -160,13 +161,40 @@ test("importa el catálogo y elimina de a uno, varios o por filtro", async () =>
   assert.ok(auditoria.total >= 4);
 });
 
-test("contraseña de 4 caracteres, galería del ingreso y dirección por nombre", async () => {
+test("las claves iniciales y restablecidas exigen rotación y los permisos se configuran por separado", async () => {
   const admin = (await ok("POST", "/login", { cuerpo: { usuario: "admin", password: "secreto1" } })).token;
-  const corta = await api("POST", "/usuarios", { token: admin, cuerpo: { usuario: "corta", nombre: "Clave corta", rol: "ADMIN", password: "123" } });
-  assert.equal(corta.status, 400);
-  assert.match(corta.json.mensaje, /4 caracteres/);
-  await ok("POST", "/usuarios", { token: admin, cuerpo: { usuario: "cuatro", nombre: "Clave de cuatro", rol: "ADMIN", password: "1234" } });
-  await ok("POST", "/login", { cuerpo: { usuario: "cuatro", password: "1234" } });
+  const boca = (await ok("GET", "/opciones/bocas", { token: admin }))[0].valor;
+  const base = { usuario: "prueba", nombre: "Usuario de prueba", rol: "CAJERO", bocas: [boca] };
+  for (const password of ["1234", "111111", "123456", "121212", "password", "prueba"]) {
+    assert.equal((await api("POST", "/usuarios", { token: admin, cuerpo: { ...base, password } })).status, 400, password);
+  }
+  const { id } = await ok("POST", "/usuarios", { token: admin, cuerpo: { ...base, password: "Inicial-z9", puede_anular_ticket: true } });
+  const login = await ok("POST", "/login", { cuerpo: { usuario: base.usuario, password: "Inicial-z9" } });
+  assert.equal(login.usuario.debe_cambiar_clave, true);
+  assert.equal((await ok("GET", "/estado-publico", { token: login.token })).configurado, true);
+  for (const ruta of ["/listados/ventas", "/sistema/estado"]) {
+    assert.equal((await api("GET", ruta, { token: login.token })).json.codigo, "CAMBIO_CLAVE_OBLIGATORIO");
+  }
+  assert.equal((await api("POST", "/sesion/puesto", { token: login.token, cuerpo: { boca_id: boca } })).status, 403);
+  for (const nueva of ["111111", "Inicial-z9"]) {
+    assert.equal((await api("POST", "/sesion/clave", { token: login.token, cuerpo: { actual: "Inicial-z9", nueva } })).status, 400);
+  }
+  await ok("POST", "/sesion/clave", { token: login.token, cuerpo: { actual: "Inicial-z9", nueva: "Personal-z2" } });
+  assert.equal((await ok("GET", "/sesion", { token: login.token })).usuario.debe_cambiar_clave, false);
+  for (const [cierre, anular] of [[false, true], [true, false], [true, true], [false, false]]) {
+    await ok("PUT", "/usuarios/" + id, { token: admin, cuerpo: { ...base, puede_cerrar_caja: cierre, puede_anular_ticket: anular } });
+    const sesion = await ok("GET", "/sesion", { token: login.token });
+    assert.equal(sesion.usuario.puede_cerrar_caja, cierre);
+    assert.equal(sesion.usuario.puede_anular_ticket, anular);
+  }
+  await ok("PUT", "/usuarios/" + id, { token: admin, cuerpo: { ...base, password: "Reset-z3" } });
+  assert.equal((await api("GET", "/sesion", { token: login.token })).status, 401);
+  const nuevo = await ok("POST", "/login", { cuerpo: { usuario: base.usuario, password: "Reset-z3" } });
+  assert.equal(nuevo.usuario.debe_cambiar_clave, true);
+});
+
+test("galería del ingreso y dirección por nombre", async () => {
+  const admin = (await ok("POST", "/login", { cuerpo: { usuario: "admin", password: "secreto1" } })).token;
 
   // Sin sistema general configurado no hay fotos: el ingreso muestra el logo.
   const galeria = await ok("GET", "/login/imagenes");

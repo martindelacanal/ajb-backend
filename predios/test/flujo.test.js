@@ -99,6 +99,7 @@ test("flujo completo del camping", async () => {
   // Usuario de boca
   await ok("POST", "/usuarios", { token: admin, cuerpo: { usuario: "caja.prov", nombre: "Cajera Proveeduría", rol: "CAJERO", password: "clave12", bocas: [proveeduria] } });
   const cajero = (await ok("POST", "/login", { cuerpo: { usuario: "caja.prov", password: "clave12", recordar: 1 } })).token;
+  await ok("POST", "/sesion/clave", { token: cajero, cuerpo: { actual: "clave12", nueva: "Personal-proveeduria" } });
   await ok("POST", "/sesion/puesto", { token: cajero, cuerpo: { boca_id: proveeduria, caja_id: cajaProv } });
 
   // Solicitud: sin autorización -> 403; con clave del día -> ok
@@ -169,23 +170,29 @@ test("flujo completo del camping", async () => {
   }
   const qr = await ok("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: prod.id, cantidad: 1 }], forma_pago: "QR", codigo_pago: "MP-123" } });
 
-  // Anulación con clave
-  const sinClave = await api("POST", `/ventas/${qr.id}/anular`, { token: cajero, cuerpo: { motivo: "Error" } });
-  assert.equal(sinClave.status, 403);
-  await ok("POST", `/ventas/${qr.id}/anular`, { token: cajero, cuerpo: { motivo: "Error de carga", clave: claveDelDia() } });
+  // El cajero pide la anulación y la confirmación del administrador revierte la venta.
+  const intento = await api("POST", `/ventas/${qr.id}/anular`, { token: cajero, cuerpo: { motivo: "Error", clave: claveDelDia() } });
+  assert.equal(intento.status, 403);
+  const solicitudAnulacion = await ok("POST", "/permisos", { token: cajero, cuerpo: { tipo: "ANULAR_VENTA", referencia_id: qr.id, detalle: "Error de carga" } });
+  const pendientesAnulacion = await ok("GET", "/listados/ventas?f_estado=PENDIENTE_ANULACION", { token: admin });
+  assert.deepEqual(pendientesAnulacion.filas.map(f => f.id), [qr.id]);
+  const avisosAdmin = await ok("GET", "/avisos", { token: admin });
+  assert.ok(avisosAdmin.permisos.some(p => p.tipo === "ANULAR_VENTA" && p.referencia_id === qr.id));
+  await ok("POST", `/permisos/${solicitudAnulacion.id}/resolver`, { token: admin, cuerpo: { aprobar: true } });
   await ok("POST", `/ventas/${venta.id}/impresion`, { token: cajero, cuerpo: {} });
 
   // Ajuste y cierre
   await ok("POST", "/caja/ajuste", { token: admin, cuerpo: { caja_id: cajaProv, concepto: "RETIRO_DINERO", tipo: "EGRESO", importe: 1000, recibo: "R-9" } });
   const previa = await ok("GET", "/caja/cierre/previa", { token: cajero });
   assert.equal(previa.resumen.saldo_esperado, 5600);
-  const cierre = await ok("POST", "/caja/cierre", { token: cajero, cuerpo: { efectivo_contado: 5500, queda_en_caja: 500 } });
+  const claveCierre = await ok("POST", "/caja/cierre/clave", { token: admin, cuerpo: { caja_id: cajaProv } });
+  const cierre = await ok("POST", "/caja/cierre", { token: cajero, cuerpo: { clave: claveCierre.clave, efectivo_contado: 5500, queda_en_caja: 500 } });
   assert.equal(cierre.diferencia, -100);
   const { caja } = await ok("GET", `/cajas/${cajaProv}`, { token: admin });
   await ok("PUT", `/cajas/${cajaProv}`, { token: admin, cuerpo: { ...caja, ancho_ticket: 58 } });
   const ticketCierre = await ok("GET", `/caja/cierres/${cierre.id}`, { token: cajero });
   assert.equal(ticketCierre.ancho, 58);
-  const estado2 = await ok("GET", "/caja/estado", { token: cajero });
+  const estado2 = await ok("GET", "/caja/estado?caja_id=" + cajaProv, { token: cajero });
   assert.equal(estado2.resumen.saldo_esperado, 500);
 
   // Liquidación y modificación masiva
@@ -221,9 +228,9 @@ test("flujo completo del camping", async () => {
   }
   await ok("GET", `/listados/afiliado_consumos?f_afiliado=${af.id}`, { token: admin });
   const ventasCajero = await ok("GET", "/listados/ventas", { token: cajero });
-  assert.ok(ventasCajero.total >= 2);
-  assert.ok(ventasCajero.filas.some(v => v.estado === "ANULADA" && v.id === qr.id));
-  assert.equal((await api("GET", "/listados/ventas?ambito=caja", { token: cajero })).status, 403);
+  assert.equal(ventasCajero.total, 0, "el cajero ya salió del turno que cerró");
+  const sinTurno = await ok("GET", "/listados/ventas?ambito=caja", { token: cajero });
+  assert.equal(sinTurno.total, 0);
   const otroTurno = await ok("GET", "/listados/ventas?ambito=turno", { token: admin });
   assert.equal(otroTurno.total, 0, "el administrador no atendió ninguna venta en ese turno");
   const unaCaja = await ok("GET", `/listados/ventas?f_caja=${cajaProv}&tam=25`, { token: admin });

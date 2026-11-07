@@ -23,7 +23,7 @@ function identidad(sub) {
   if (predioId > 2147483647 || usuarioId > 2147483647) throw invalida();
   return { predioId, usuarioId };
 }
-function datosPublicos(c) { return { id: Number(c.id), rol: "predio_admin", usuario: c.usuario, nombre: c.nombre, apellido: "", predio_id: Number(c.predio_id), predio_codigo: c.predio_codigo, predio_nombre: c.predio_nombre, acceso_predio: true, habilitado: "S", area_turismo: 0, area_coseguro: 0, modulo_turismo: 0, modulo_coseguro: 0, modulo_olimpiadas: 0 }; }
+function datosPublicos(c) { return { id: Number(c.id), rol: "predio_admin", usuario: c.usuario, nombre: c.nombre, apellido: "", predio_id: Number(c.predio_id), predio_codigo: c.predio_codigo, predio_nombre: c.predio_nombre, debe_cambiar_clave: !!Number(c.debe_cambiar_clave), acceso_predio: true, habilitado: "S", area_turismo: 0, area_coseguro: 0, modulo_turismo: 0, modulo_coseguro: 0, modulo_olimpiadas: 0 }; }
 function crearToken(c, sid, recordar, jwtSecret) { return jwt.sign({ tipo: TIPO, sid, pv: versionCuenta(c, jwtSecret), data: JSON.stringify(datosPublicos(c)) }, secreto(jwtSecret), { algorithm: "HS256", audience: AUDIENCIA, issuer: EMISOR, subject: `${c.predio_id}:${c.id}`, expiresIn: recordar ? "15m" : "8h" }); }
 function verificarToken(token, jwtSecret, ignorarVencimiento = false) {
   let p;
@@ -39,7 +39,7 @@ async function cargarCuenta(db, predioId, usuarioId) {
   // Los locking reads evitan reutilizar una instantánea anterior de MySQL al
   // revalidar dentro de una transacción que ya había hecho otras consultas.
   await db.query("SELECT id FROM predio WHERE id = ? FOR UPDATE", [predioId]);
-  const [rows] = await db.query(`SELECT u.id, u.predio_id, u.usuario, u.nombre, u.rol, u.activo, u.es_admin_general, u.password_hash,
+  const [rows] = await db.query(`SELECT u.id, u.predio_id, u.usuario, u.nombre, u.rol, u.activo, u.es_admin_general, u.password_hash, u.debe_cambiar_clave,
     p.codigo AS predio_codigo, p.nombre AS predio_nombre, p.activo AS predio_activo
     FROM predio_usuario u JOIN predio p ON p.id=u.predio_id WHERE u.predio_id=? AND u.id=? LIMIT 1 FOR UPDATE`, [predioId, usuarioId]);
   const c = rows[0]; if (!c) return null;

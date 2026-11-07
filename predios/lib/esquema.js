@@ -52,6 +52,9 @@ const TABLAS = {
       nombre: "str:120!",
       rol: "str:20!",
       gestionar_reservas: "bool",
+      puede_cerrar_caja: "bool!",
+      puede_anular_ticket: "bool!",
+      debe_cambiar_clave: "bool!",
       password_hash: "str:200",
       activo: "bool",
       es_admin_general: "bool",
@@ -103,6 +106,7 @@ const TABLAS = {
       destino: "str:20!",
       perecedero: "bool",
       fecha_caducidad: "date",
+      dias_aviso_vencimiento: "int",
       stock_minimo: "qty",
       unidad: "str:20",
       activo: "bool",
@@ -445,7 +449,7 @@ const TABLAS = {
       vence: "dt",
       usado_fecha: "dt",
     },
-    indices: [["estado"], ["usuario_id"]],
+    indices: [["estado"], ["usuario_id"], ["tipo", "referencia_id", "estado"]],
   },
   predio_auditoria: {
     columnas: {

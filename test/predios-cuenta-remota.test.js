@@ -67,6 +67,34 @@ function pedir(s, token, ruta, cuerpo) {
   return fetch(s.url + ruta, { method: cuerpo === undefined ? "GET" : "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, ...(cuerpo === undefined ? {} : { body: JSON.stringify(cuerpo) }) });
 }
 
+test("la clave temporal remota sólo habilita su cambio, directo o por orden sin secretos en claro", async t => {
+  for (const escritor of ["CENTRAL", "LOCAL"]) {
+    const s = await escenario(t, { escritor });
+    await s.db.run("UPDATE predio_usuario SET debe_cambiar_clave=1 WHERE predio_id=1 AND id=7");
+    const { token } = await ingresar(s);
+    const prefijo = "/app/MIRAMAR/api/";
+    assert.equal((await (await pedir(s, token, prefijo + "sesion")).json()).usuario.debe_cambiar_clave, true);
+    assert.equal((await pedir(s, token, prefijo + "avisos")).status, 403);
+    assert.equal((await pedir(s, token, prefijo + "productos", { nombre: "Producto bloqueado" })).status, 403);
+    assert.equal((await pedir(s, token, prefijo + "sesion/clave", { actual: "otra", nueva: "Personal-z9" })).status, 403);
+    const cambio = await pedir(s, token, prefijo + "sesion/clave", { actual: "clave-fixture", nueva: "Personal-z9" });
+    if (escritor === "CENTRAL") {
+      assert.equal(cambio.status, 200, await cambio.text());
+      assert.equal((await pedir(s, token, prefijo + "sesion")).status, 401);
+      const acceso = await A.ingresarPredio({ db: s.pool, identificador: "adminlocal", predioCodigo: "MIRAMAR", password: "Personal-z9", jwtSecret: SECRET });
+      assert.equal(acceso.data.debe_cambiar_clave, false);
+    } else {
+      assert.equal(cambio.status, 202, await cambio.text());
+      const orden = await s.db.get("SELECT actor, cuerpo FROM predio_comando WHERE ruta='/sesion/clave'");
+      assert.equal(orden.cuerpo, "{}");
+      assert.doesNotMatch(orden.actor, /Personal-z9|clave-fixture/);
+      const actor = JSON.parse(orden.actor);
+      assert.equal(actor.capacidad, "operacion-predio-v2");
+      assert.ok(U.verificarPassword("Personal-z9", actor.hash_clave_validada));
+    }
+  }
+});
+
 test("la cuenta propia abre exclusivamente su predio y conserva su identidad local aunque colisione con un admin general", async t => {
   const s = await escenario(t), { token } = await ingresar(s);
   const permisos = await pedir(s, token, "/api/predios-cuenta/permisos"); assert.equal(permisos.status, 200);

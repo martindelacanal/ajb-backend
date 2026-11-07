@@ -20,7 +20,7 @@ function crearCaso(t) {
   t.after(() => sqlite.close());
   sqlite.exec(`CREATE TABLE predio (id INTEGER PRIMARY KEY,codigo TEXT UNIQUE,nombre TEXT,activo INTEGER);
     CREATE TABLE predio_usuario (predio_id INTEGER,id INTEGER,usuario TEXT,nombre TEXT,rol TEXT,activo INTEGER,
-      es_admin_general INTEGER,password_hash TEXT,documento TEXT,PRIMARY KEY(predio_id,id));
+      es_admin_general INTEGER,password_hash TEXT,documento TEXT,debe_cambiar_clave INTEGER DEFAULT 0,PRIMARY KEY(predio_id,id));
     CREATE TABLE predio_auditoria (predio_id INTEGER,id INTEGER,entidad TEXT,entidad_id INTEGER,PRIMARY KEY(predio_id,id));
     CREATE TABLE predio_acceso_sesion (id TEXT PRIMARY KEY,predio_id INTEGER,usuario_id INTEGER,refresh_hash TEXT UNIQUE,
       refresh_anterior_hash TEXT,password_version TEXT,creada_en TEXT DEFAULT CURRENT_TIMESTAMP,ultimo_uso TEXT,
@@ -46,7 +46,7 @@ function crearCaso(t) {
   } };
   function usuario(predioId = 1, id = 1, cambios = {}) {
     const u = { usuario: "administrador", nombre: "Ana", rol: "ADMIN", activo: 1, es_admin_general: 0, password_hash: hash, documento: "32.123.456", ...cambios };
-    sqlite.prepare("INSERT INTO predio_usuario VALUES(?,?,?,?,?,?,?,?,?)").run(predioId, id, u.usuario, u.nombre, u.rol, u.activo, u.es_admin_general, u.password_hash, u.documento);
+    sqlite.prepare("INSERT INTO predio_usuario VALUES(?,?,?,?,?,?,?,?,?,?)").run(predioId, id, u.usuario, u.nombre, u.rol, u.activo, u.es_admin_general, u.password_hash, u.documento, u.debe_cambiar_clave || 0);
   }
   usuario();
   return { db, sqlite, consultas, usuario, avanzar: (ms) => { ahora = new Date(ahora.getTime() + ms); },

@@ -19,13 +19,13 @@ async function resolverActorRemoto({ db, pid, actor, origen = "REMOTO" }) {
     || !/^[a-f0-9]{64}$/.test(actor.credencial_sha256 || "") || !Number.isSafeInteger(actor.cuenta_revision) || actor.cuenta_revision < 0) {
     throw U.error("La orden no contiene una cuenta válida de este predio", 403);
   }
-  const u = await db.get("SELECT id, usuario, nombre, rol, activo, es_admin_general, password_hash FROM predio_usuario WHERE predio_id = ? AND id = ?", [pid, id]);
+  const u = await db.get("SELECT id, usuario, nombre, rol, activo, es_admin_general, password_hash, debe_cambiar_clave FROM predio_usuario WHERE predio_id = ? AND id = ?", [pid, id]);
   const auditoria = await db.get("SELECT COALESCE(MAX(id), 0) AS revision FROM predio_auditoria WHERE predio_id = ? AND entidad = 'usuario' AND entidad_id = ?", [pid, id]);
   if (!u || Number(u.activo) !== 1 || u.rol !== "ADMIN" || Number(u.es_admin_general) === 1
     || !U.igualesSeguros(U.sha256(u.password_hash || ""), actor.credencial_sha256) || Number(auditoria.revision) !== actor.cuenta_revision) {
     throw U.error("La cuenta que envió esta orden cambió o ya no tiene permisos de administración. Volvé a ingresar y enviá el cambio otra vez.", 403);
   }
   const bocas = await db.all("SELECT id FROM predio_boca WHERE predio_id = ? AND activo = 1", [pid]);
-  return { id: Number(u.id), usuario: u.usuario, nombre: u.nombre, rol: "ADMIN", bocas: bocas.map(b => Number(b.id)), es_admin_general: false };
+  return { id: Number(u.id), usuario: u.usuario, nombre: u.nombre, rol: "ADMIN", bocas: bocas.map(b => Number(b.id)), es_admin_general: false, debe_cambiar_clave: !!Number(u.debe_cambiar_clave) };
 }
 module.exports = { resolverActorRemoto };
