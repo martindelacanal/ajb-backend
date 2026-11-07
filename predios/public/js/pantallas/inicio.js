@@ -16,6 +16,9 @@
     var ses = P.estado.sesion;
     var nombre = String(ses.usuario.nombre || "").replace(" (sistema general)", "").split(" ")[0];
     c.appendChild(h("div.pagina-cabecera", h("h1.titulo-pagina", P.saludo() + ", " + nombre)));
+    c.appendChild(h("div#inicio-estadias-vencidas", { hidden: !P.estado.estadiasVencidas },
+      P.mensaje(h("div.fila", h("strong", P.textoEstadiasVencidas()),
+        P.btn("Ver estadías", { tipo: "secundario", chico: true, onclick: function () { P.ruta.ir("/recepcion?ocupacion=VENCIDA"); } })), "aviso")));
     var cifras = h("div.grilla.inicio-cifras");
     var cuerpo = h("div.grilla.inicio-cuerpo");
     c.appendChild(cifras);

@@ -132,6 +132,9 @@
   function panelAvisos(ancla) {
     var a = P.estado.avisos || {};
     var items = [];
+    if (P.esAdmin() && P.estado.estadiasVencidas) items.push({
+      texto: P.textoEstadiasVencidas(), icono: "reloj", accion: function () { P.ruta.ir("/recepcion?ocupacion=VENCIDA"); }
+    });
     (a.recientes || a.notificaciones || []).slice(0, 10).forEach(function (n) {
       items.push({ texto: h("span.aviso-resumen" + (!n.leido && !n.resuelto_fecha ? ".aviso-no-leido" : ""),
         h("strong", n.titulo), h("span.chico.texto-3", P.f.fechaHora(n.fecha) + " · " + (n.resuelto_fecha ? "Resuelta" : n.leido ? "Leída" : "Sin leer"))),
@@ -242,8 +245,30 @@
       if (viejo) viejo.remove();
       var a = P.estado.avisos || {};
       var total = (typeof a.notificaciones_no_leidas === "number" ? a.notificaciones_no_leidas : (a.notificaciones || []).length) + (a.permisos || []).length + (a.aperturas || []).length + (a.solicitudes_despachar || 0) + (a.solicitudes_recibir || 0);
+      if (P.esAdmin()) total += P.estado.estadiasVencidas || 0;
       if (total) c.appendChild(h("span.campana-numero", total > 99 ? "99+" : String(total)));
     }
+  }
+  P.textoEstadiasVencidas = function () {
+    var n = P.estado.estadiasVencidas;
+    return n === 1 ? "1 estadía vencida sin salida" : n + " estadías vencidas sin salida";
+  };
+  P.actualizarEstadiasVencidas = function (cantidad) {
+    if (!P.esAdmin()) return;
+    P.estado.estadiasVencidas = Number(cantidad) || 0;
+    pintarContadores();
+    var zona = document.getElementById("inicio-estadias-vencidas");
+    if (zona) {
+      zona.hidden = !P.estado.estadiasVencidas;
+      zona.querySelector("strong").textContent = P.textoEstadiasVencidas();
+    }
+  };
+  function consultarEstadiasVencidas() {
+    var sesion = P.estado.sesion;
+    if (!P.esAdmin()) return;
+    return P.get("/recepcion/vencidas", { sinRedireccion: true }).then(function (r) {
+      if (sesion === P.estado.sesion) P.actualizarEstadiasVencidas(r.cantidad);
+    }).catch(function () {});
   }
 
   function consultarAvisos() {
@@ -448,6 +473,7 @@
 
   P.alIngresar = function (r, claveDeIngreso) {
     P.estado.avisos = null;
+    P.estado.estadiasVencidas = 0;
     ultimoAvisoVisto = 0;
     P.estado.sesion = r;
     if (r.usuario.debe_cambiar_clave) {
@@ -481,6 +507,10 @@
     temporizadores = [];
     P.repintarMarco();
     consultarAvisos();
+    if (P.esAdmin()) {
+      consultarEstadiasVencidas();
+      temporizadores.push(setInterval(consultarEstadiasVencidas, 120000));
+    }
     consultarConexion();
     temporizadores.push(setInterval(consultarAvisos, 10000));
     temporizadores.push(setInterval(consultarConexion, P.modo === "remoto" ? 10000 : 20000));
