@@ -210,8 +210,9 @@ async function operar(c, predio, actor, accion, b = {}, { detalle } = {}) {
   if (accion === "emitirVehiculoQr") return emitirQr(c, predio, codigos, U.id(b.id));
   const id = accion === "buscarVehiculoQr" ? await reservaDeToken(c, predio, b.token) : U.id(b.id);
   const r = await detalle(c, codigos, id);
-  // Por número de reserva, Seguridad sólo abre estadías en curso; con el QR, cualquiera del predio.
-  if (accion === "detalleVehiculo" && !(r.personas || []).some(presente) && actor.rol !== "ADMIN") throw noEncontrado();
+  // Por número de reserva, Seguridad sólo abre las que tienen un vehículo en el predio (las de su
+  // lista); con el QR de la etiqueta, la reserva de esa etiqueta.
+  if (accion === "detalleVehiculo" && actor.rol !== "ADMIN" && !vehiculosDe(r).some(v => vehiculoPresente(v, r))) throw noEncontrado();
   return ficha(c, r);
 }
 
