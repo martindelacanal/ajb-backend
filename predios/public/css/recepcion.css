@@ -7,7 +7,7 @@
 .rec-tabla {max-width:100%;overflow-x:auto;}
 .rec-tabla table {width:100%;border-collapse:collapse;text-align:left;}
 .rec-tabla th,.rec-tabla td {padding:9px 12px;border-bottom:1px solid var(--linea);vertical-align:top;}
-.rec-tabla th {color:var(--texto-2);background:var(--papel);font-size:13px;}
+.rec-tabla th {color:var(--texto-2);background:var(--papel);font-size:13px;white-space:nowrap;}
 .rec-tabla a {color:var(--azul);font-weight:700;}
 .rec-etiqueta-movil {display:none;}
 .rec-valor {overflow-wrap:break-word;}
@@ -31,5 +31,6 @@
   .rec-tabla td:last-child:nth-child(odd) {grid-column:1 / -1;}
   .rec-etiqueta-movil {display:block;color:var(--texto-2);font-size:12px;font-weight:700;}
   .rec-valor {overflow-wrap:anywhere;}
+  .rec-tabla .tabla-texto-largo {min-width:0;}
   .rec-evento summary {padding:10px 0;}
 }

@@ -24,6 +24,83 @@
     return { desde: inicio, hasta: hoy < inicio ? hoy : hoy };
   }
 
+  function panelEstadias(desde, hasta, estado) {
+    var servicio = P.select([], "", { vacio: "Todos los servicios" });
+    var recurso = P.select([], "", { vacio: "Todos los recursos" });
+    var adicional = P.select([], "", { vacio: "Todos los adicionales" });
+    var controles = [servicio, recurso, adicional];
+    var seleccion = estado.filtrosEstadias || {};
+    var opciones, solicitud = 0;
+    var resultados = h("div", { "aria-live": "polite" });
+    var periodo = h("p.texto-2");
+    var raiz = h("section", { style: { marginTop: "24px" } },
+      h("h2.seccion-titulo", "Reservas y estadías"), periodo,
+      h("div.tabla-filtros.tabla-periodo-controles", P.campo("Servicio", servicio), P.campo("Recurso", recurso), P.campo("Adicional", adicional)),
+      resultados);
+    controles.forEach(function (el) { el.disabled = true; });
+
+    function completar(select, filas, valor) {
+      while (select.options.length > 1) select.remove(1);
+      filas.forEach(function (fila) { select.appendChild(h("option", { value: fila.id }, fila.nombre)); });
+      select.value = valor || "";
+      if (select.selectedIndex < 0) select.selectedIndex = 0;
+    }
+    function recursos() {
+      completar(recurso, opciones.recursos.filter(function (fila) {
+        return !servicio.value || String(fila.servicio_id) === servicio.value;
+      }), seleccion.recurso_id);
+    }
+    function tabla(titulo, nota, columnas, filas, vacio) {
+      return h("div.hoja.hoja-cuerpo", { style: { minWidth: 0 } }, h("h3.seccion-titulo", titulo), h("p.texto-2", nota),
+        filas.length ? h("div.tabla-desplazable", { tabindex: "0", role: "region", "aria-label": titulo, style: { maxHeight: "320px" } },
+          h("table.tabla", h("thead", h("tr", columnas.map(function (col) { return h("th", { scope: "col" }, col); }))),
+            h("tbody", filas.map(function (fila) { return h("tr", fila.map(function (valor) { return h("td", valor); })); }))))
+          : h("p.texto-3", vacio));
+    }
+    function pintar(datos) {
+      var ingresos = datos.ingresos.reduce(function (total, dia) { return total + dia.personas; }, 0);
+      P.reemplazar(resultados, h("div.grilla.grilla-2",
+        tabla("Ingresos registrados · " + P.f.entero(ingresos), "Personas con ingreso registrado. Cada persona cuenta una vez por día.",
+          ["Fecha de ingreso", "Personas"], datos.ingresos.map(function (dia) { return [P.f.fecha(dia.dia), P.f.entero(dia.personas)]; }),
+          "Sin ingresos registrados para esta selección."),
+        tabla("Adicionales contratados", "Las unidades se cuentan por reserva. Los días de uso se suman por cada unidad.",
+          ["Adicional", "Unidades", "Días de uso", "Importe"], datos.adicionales.map(function (a) {
+            return [P.textoTabla(a.nombre), P.f.entero(a.unidades), P.f.entero(a.unidades_dia), P.f.pesos(a.importe)];
+          }), "Sin adicionales contratados para esta selección.")),
+        datos.sin_detalle ? h("p.texto-2", "Los adicionales antiguos sin detalle diario se contabilizan en la fecha de inicio de la reserva.") : null);
+    }
+    function cargar() {
+      var actual = ++solicitud;
+      P.reemplazar(resultados, P.cargando());
+      return P.get("/estadisticas/estadias" + P.qs(Object.assign({
+        desde: desde.value, hasta: hasta.value, opciones: opciones ? "" : "1"
+      }, seleccion))).then(function (datos) {
+        if (actual !== solicitud) return;
+        periodo.textContent = "Del " + P.f.fecha(datos.desde) + " al " + P.f.fecha(datos.hasta);
+        if (datos.opciones) {
+          opciones = datos.opciones;
+          completar(servicio, opciones.servicios, seleccion.servicio_id);
+          recursos();
+          completar(adicional, opciones.adicionales, seleccion.adicional_id);
+          controles.forEach(function (el) { el.disabled = false; });
+        }
+        pintar(datos);
+      }).catch(function (error) {
+        if (actual === solicitud) P.reemplazar(resultados, P.mensaje(error.message, "error"),
+          P.btn("Reintentar", { tipo: "suave", chico: true, onclick: cargar }));
+      });
+    }
+    controles.forEach(function (el) {
+      el.addEventListener("change", function () {
+        seleccion = { servicio_id: servicio.value, recurso_id: el === servicio ? "" : recurso.value, adicional_id: adicional.value };
+        if (el === servicio) recursos();
+        estado.filtrosEstadias = seleccion;
+        cargar();
+      });
+    });
+    return { el: raiz, cargar: cargar };
+  }
+
   function pantalla(c, params, q, vistaInicial) {
     var estado = P.cache["estadisticas"] || { desde: P.sumarDias(P.hoy(), -29), hasta: P.hoy(), boca: "" };
     var desde = P.input({ tipo: "date", valor: estado.desde });
@@ -53,7 +130,9 @@
     [desde, hasta, boca].forEach(function (el) { el.addEventListener("change", cargar); });
     var cifras = h("div.grilla.grilla-4", P.cargando());
     var graficos = h("div");
+    var estadias = panelEstadias(desde, hasta, estado);
     c.appendChild(cifras);
+    c.appendChild(estadias.el);
     c.appendChild(graficos);
 
     var vista = vistaInicial || P.cache["estadisticas:vista"] || "ventas";
@@ -86,10 +165,11 @@
 
     function cargar() {
       botonPeriodo.title = "Del " + P.f.fecha(desde.value) + " al " + P.f.fecha(hasta.value);
-      estado = { desde: desde.value, hasta: hasta.value, boca: boca.value };
+      Object.assign(estado, { desde: desde.value, hasta: hasta.value, boca: boca.value });
       P.cache["estadisticas"] = estado;
       ["est-ventas", "est-compras", "est-almacen", "est-ventas_productos", "est-solicitudes", "est-bajas"].forEach(function (k) { delete P.cache["tabla:" + k]; });
       pintarListado();
+      estadias.cargar();
       return P.get("/estadisticas" + P.qs({ desde: estado.desde, hasta: estado.hasta, boca_id: estado.boca })).then(function (d) {
         var k = d.kpi;
         P.reemplazar(cifras,

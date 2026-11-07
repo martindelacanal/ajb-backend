@@ -42,11 +42,14 @@ test("salir o cambiar de puesto exige cerrar la caja, incluso al administrador",
     await assert.rejects(llamar(admin, "POST", ruta, { boca_id: otra.boca_id, caja_id: otra.id }), { codigo: "TURNO_ABIERTO" });
   }
   await assert.rejects(llamar(admin, "POST", "/caja/cierre", { efectivo_contado: 0 }), { codigo: "CLAVE_CIERRE_REQUERIDA" });
-  const { clave } = await llamar(admin, "POST", "/caja/cierre/clave", { caja_id: caja.id });
-  await llamar(admin, "POST", "/caja/cierre", { efectivo_contado: 0, clave });
+  await assert.rejects(llamar(admin, "POST", "/caja/cierre", { efectivo_contado: 0, clave: "00000000" }), { codigo: "CLAVE_INCORRECTA" });
+  const { clave_del_dia: clave } = await llamar(admin, "GET", "/config");
+  assert.equal(clave, U.claveDelDia());
+  const cierre = { caja_id: caja.id, efectivo_contado: 0, clave, turno_id: ingreso.puesto.turno_id, ultimo_cierre_id: null };
+  await llamar(admin, "POST", "/caja/cierre", cierre);
   assert.equal((await db.get("SELECT estado FROM predio_turno WHERE id=?", [ingreso.puesto.turno_id])).estado, "CERRADO");
   assert.equal((await db.get("SELECT turno_id FROM predio_sesion WHERE token_hash='sesion'")).turno_id, null);
-  await assert.rejects(llamar(admin, "POST", "/caja/cierre", { caja_id: caja.id, efectivo_contado: 0, clave }), { codigo: "CLAVE_CIERRE_REQUERIDA" });
+  await assert.rejects(llamar(admin, "POST", "/caja/cierre", cierre), { status: 409 });
   await llamar(admin, "POST", "/logout");
   assert.equal((await db.get("SELECT COUNT(*) n FROM predio_sesion")).n, 0);
 });
@@ -68,8 +71,7 @@ test("administrar otra caja conserva el turno del puesto y separa los movimiento
     boca_id: otra.boca_id, caja_id: otra.id, fecha: "2026-11-05 10:00:00", forma_pago: "EFECTIVO", estado: "CONFIRMADA", total: 10,
   });
   await llamar(admin, "POST", `/ventas/${venta}/anular`, { motivo: "Error de carga" });
-  const { clave } = await llamar(admin, "POST", "/caja/cierre/clave", { caja_id: otra.id });
-  await llamar(admin, "POST", "/caja/cierre", { caja_id: otra.id, clave, efectivo_contado: 185, queda_en_caja: 40 });
+  await llamar(admin, "POST", "/caja/cierre", { caja_id: otra.id, clave: U.claveDelDia(), efectivo_contado: 185, queda_en_caja: 40 });
   const movimientos = await db.all("SELECT caja_id, turno_id FROM predio_caja_movimiento WHERE caja_id = ?", [otra.id]);
   assert.equal(movimientos.length, 4);
   assert.ok(movimientos.every(m => m.turno_id === null));
@@ -131,7 +133,7 @@ test("dos usuarios compiten por una caja, el titular retoma su turno y el relevo
   assert.equal(estado.apertura.fecha, "2026-11-05");
   assert.equal(estado.resumen.ventas_cantidad, 2);
   assert.equal(estado.resumen.ventas_total, 50);
-  await assert.rejects(llamar(responsable, "POST", "/caja/cierre/clave", puesto), { status: 403 });
+  assert.equal((await llamar(responsable, "GET", "/config")).clave_del_dia, undefined);
   await assert.rejects(llamar(responsable, "POST", "/caja/cierre", { efectivo_contado: 15, clave: U.claveDelDia() }), { status: 403 });
   await db.run("UPDATE predio_usuario SET puede_cerrar_caja=1 WHERE id=?", [responsable.usuario.id]);
   const delegado = await autenticar(reingreso.token);

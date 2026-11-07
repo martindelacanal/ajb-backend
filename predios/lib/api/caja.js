@@ -6,10 +6,9 @@
 
 const U = require("../util");
 const N = require("../negocio");
-const { exigirAdmin, esAdmin, bocasDe, turnoDeCaja } = require("./comun");
+const { exigirAdmin, esAdmin, bocasDe, turnoDeCaja, validarClave } = require("./comun");
 
 const { turnoAbierto, verificarOperador } = require("../turnos-caja");
-const claveCierre = require("../clave-cierre");
 
 const CONCEPTOS_AJUSTE = ["CIERRE_CAJA", "INGRESO_DINERO", "RETIRO_DINERO", "OTROS"];
 
@@ -218,17 +217,22 @@ function comprobarCorte(ctx, turno, ultimo) {
   }
 }
 
-async function generarClaveCierre(ctx) {
-  exigirAdmin(ctx);
-  const cajaId = U.id(ctx.body.caja_id, "La caja");
-  return ctx.db.tx(async (t) => {
-    await exigirAccesoCaja(t, ctx, cajaId, true);
-    const turno = await turnoAbierto(t, ctx.pid, cajaId);
-    const ultimo = await ultimoCierre(t, ctx.pid, cajaId);
-    comprobarCorte(ctx, turno, ultimo);
-    await N.auditar(t, ctx, "Emisión de clave temporal de cierre", "caja", cajaId, { turno_id: turno?.id || null });
-    return claveCierre.generar(ctx, cajaId, turno?.id || null, ultimo?.id || null);
-  });
+function validarClaveCierre(ctx, cajaId) {
+  if (!String(ctx.body.clave ?? "").trim()) {
+    throw U.error("Ingresá la clave del día de Sistema > Configuración.", 403, { codigo: "CLAVE_CIERRE_REQUERIDA" });
+  }
+  validarClave(ctx, ctx.body.clave, "CERRAR_CAJA", cajaId, "La clave del día es incorrecta. Revisala en Sistema > Configuración.");
+}
+
+function autorizarCierre(ctx, cajaId) {
+  if (!esAdmin(ctx)) {
+    if (Number(ctx.usuario.puede_cerrar_caja) !== 1) {
+      throw U.error("Pedile a un administrador que cierre la caja desde su cuenta.", 403, { codigo: "SIN_AUTORIZACION" });
+    }
+    return { metodo: "PERMISO_DE_USUARIO" };
+  }
+  if (ctx.origen !== "REMOTO" || ctx.claveDiaCierreValidada !== true) validarClaveCierre(ctx, cajaId);
+  return { metodo: "CLAVE_DEL_DIA", admin_id: ctx.usuario.id, administrador: N.nombreActor(ctx) };
 }
 
 async function cerrar(ctx) {
@@ -252,9 +256,7 @@ async function cerrar(ctx) {
     if (b.revision && b.revision !== revisionResumen(r)) {
       throw U.error("Los movimientos de caja cambiaron. Revisá nuevamente el detalle antes de cerrar.", 409);
     }
-    const autorizacion = !esAdmin(ctx) && Number(ctx.usuario.puede_cerrar_caja) === 1
-      ? { metodo: "PERMISO_DE_USUARIO" }
-      : await claveCierre.verificar(t, ctx, cajaId, turno?.id || null, r.ultimo_cierre?.id || null);
+    const autorizacion = autorizarCierre(ctx, cajaId);
     const anterior = r.ultimo_cierre;
     const corte = anterior && anterior.ultima_venta_id === undefined ? "v.fecha>?" : "v.id>?";
     const pendiente = await t.get(`SELECT p.id FROM predio_permiso p JOIN predio_venta v ON v.predio_id=p.predio_id AND v.id=p.referencia_id
@@ -350,6 +352,7 @@ async function configurarComanda(ctx) {
 module.exports = {
   ultimoCierre,
   saldoCaja,
+  validarClaveCierre,
   rutas: [
     { m: "GET", p: "/caja/estado", h: estado },
     { m: "GET", p: "/caja/panel", h: panelCajas, roles: ["ADMIN"] },
@@ -358,7 +361,6 @@ module.exports = {
     { m: "POST", p: "/caja/apertura/:id/verificar", h: verificarApertura, escritura: true },
     { m: "POST", p: "/caja/ajuste", h: ajuste, escritura: true, roles: ["ADMIN"] },
     { m: "GET", p: "/caja/cierre/previa", h: previaCierre },
-    { m: "POST", p: "/caja/cierre/clave", h: generarClaveCierre, escritura: true, roles: ["ADMIN"] },
     { m: "POST", p: "/caja/cierre", h: cerrar, escritura: true },
     { m: "GET", p: "/caja/cierres/:id", h: detalleCierre },
   ],

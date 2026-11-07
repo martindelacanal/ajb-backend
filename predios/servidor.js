@@ -168,8 +168,7 @@ async function ejecutarRemoto({ metodo, ruta, cuerpo, query, actor, db: dbOperac
     ...base,
     usuario: usuarioRemoto,
     hashClaveValidada: actor?.hash_clave_validada,
-    emisionClaveCierre: actor?.emision_clave_cierre,
-    hashClaveCierre: actor?.hash_clave_cierre,
+    claveDiaCierreValidada: ruta === "/caja/cierre" && actor?.capacidad === "cierre-clave-dia-v1" && actor.clave_dia_cierre_validada === true,
     sesion: {},
     query: query || {},
     body: cuerpo || {},
@@ -621,6 +620,7 @@ async function manejar(req, res) {
     const operacionId = req.headers["x-ajb-operacion"];
     if (ha && encontrada?.ruta.escritura && ctx.usuario && !operacionId) throw U.error("Actualizá la pantalla antes de registrar la operación", 409, { codigo: "OPERACION_SIN_IDENTIFICADOR" });
     if (operacionId && ctx.usuario && !["GET", "HEAD"].includes(req.method) && ctx.db.dialecto === "sqlite") {
+      if (encontrada?.ruta.p === "/caja/cierre") ctx.dbAuditoria = db;
       const r = await ejecutarPeticion(ctx, { id: operacionId, metodo: req.method, ruta: rutaApi }, (contexto) => api.ejecutar(contexto, req.method, rutaApi));
       return enviar(req, res, r.status, r.respuesta);
     }

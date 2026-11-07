@@ -11,6 +11,7 @@ const { revisarStockMinimo } = require("../stock-minimo");
 const { TIPOS_PERMISO, textoDe } = require("../listados");
 const { exigirAdmin, esAdmin, bocasDe, validarClave, exigirPuesto } = require("./comun");
 const { anularVenta, solicitarAnulacion } = require("./ventas");
+const { turismo } = require("./recepcion");
 
 const TIPOS = TIPOS_PERMISO.map((t) => t.valor);
 
@@ -139,6 +140,11 @@ async function avisos(ctx) {
 
 // ------------------------------------------------------------------ estadísticas
 
+function estadisticasEstadias(ctx) {
+  const consultar = db => turismo(db, ctx, "estadisticas", ctx.query);
+  return ctx.modo === "central" ? ctx.db.tx(consultar) : consultar(ctx.db);
+}
+
 async function estadisticas(ctx) {
   exigirAdmin(ctx);
   const db = ctx.db;
@@ -242,6 +248,7 @@ module.exports = {
     { m: "GET", p: "/avisos/historial", h: historialAvisos },
     { m: "POST", p: "/avisos/:id/leer", h: leerAviso, escritura: true },
     { m: "GET", p: "/estadisticas", h: estadisticas, roles: ["ADMIN"] },
+    { m: "GET", p: "/estadisticas/estadias", h: estadisticasEstadias, roles: ["ADMIN"] },
     { m: "GET", p: "/inicio", h: inicio },
   ],
 };

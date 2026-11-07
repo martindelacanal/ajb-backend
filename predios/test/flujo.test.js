@@ -18,10 +18,10 @@ const URL_BASE = `http://127.0.0.1:${PUERTO}/api`;
 let base;
 let servidor;
 
-async function api(metodo, ruta, { token, cuerpo, crudo } = {}) {
+async function api(metodo, ruta, { token, cuerpo, crudo, operacion } = {}) {
   const r = await fetch(`${URL_BASE}${ruta}`, {
     method: metodo,
-    headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(operacion ? { "X-AJB-Operacion": operacion } : {}) },
     body: cuerpo ? JSON.stringify(cuerpo) : undefined,
   });
   if (crudo) return r;
@@ -185,8 +185,11 @@ test("flujo completo del camping", async () => {
   await ok("POST", "/caja/ajuste", { token: admin, cuerpo: { caja_id: cajaProv, concepto: "RETIRO_DINERO", tipo: "EGRESO", importe: 1000, recibo: "R-9" } });
   const previa = await ok("GET", "/caja/cierre/previa", { token: cajero });
   assert.equal(previa.resumen.saldo_esperado, 5600);
-  const claveCierre = await ok("POST", "/caja/cierre/clave", { token: admin, cuerpo: { caja_id: cajaProv } });
-  const cierre = await ok("POST", "/caja/cierre", { token: cajero, cuerpo: { clave: claveCierre.clave, efectivo_contado: 5500, queda_en_caja: 500 } });
+  const intentoCierre = await api("POST", "/caja/cierre", { token: admin, operacion: "cierre-clave-invalida", cuerpo: { caja_id: cajaProv, clave: "00000000", efectivo_contado: 5500 } });
+  assert.equal(intentoCierre.status, 403);
+  const auditoriaCierre = await ok("GET", "/listados/auditoria", { token: admin });
+  assert.ok(auditoriaCierre.filas.some(f => f.accion === "Clave del día incorrecta" && JSON.parse(f.detalle).tipo === "CERRAR_CAJA"));
+  const cierre = await ok("POST", "/caja/cierre", { token: admin, cuerpo: { caja_id: cajaProv, clave: claveDelDia(), efectivo_contado: 5500, queda_en_caja: 500 } });
   assert.equal(cierre.diferencia, -100);
   const { caja } = await ok("GET", `/cajas/${cajaProv}`, { token: admin });
   await ok("PUT", `/cajas/${cajaProv}`, { token: admin, cuerpo: { ...caja, ancho_ticket: 58 } });
