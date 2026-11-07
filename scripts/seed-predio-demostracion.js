@@ -10,6 +10,7 @@ const { operar } = require("../api/services/recepcion");
 const CODIGO = "MIRAMAR_DEMO";
 const SERVICIO = "DEMO_RECEPCION_CABANAS";
 const NOMBRE = "Miramar · Demostración";
+const SERVICIO_MIRAMAR = "MIRAMAR_CABANAS";
 
 async function sembrar(pool, aplicar) {
   const db = crearMysql(pool, { predioId: 0 });
@@ -19,6 +20,13 @@ async function sembrar(pool, aplicar) {
     return await db.tx(async t => {
       const listarReservas = () => t.all("SELECT r.id,r.precio_total FROM reserva r JOIN servicio s ON s.id=r.servicio_id WHERE s.codigo=? ORDER BY r.id", [SERVICIO]);
       const miramar = await t.get("SELECT servicio_codigos FROM predio WHERE codigo='MIRAMAR'");
+      if (miramar && JSON.parse(miramar.servicio_codigos || "[]").includes(SERVICIO_MIRAMAR)) {
+        const reservas = await t.all(`SELECT r.id,r.precio_total FROM reserva r
+          JOIN servicio s ON s.id=r.servicio_id JOIN usuario u ON u.id=r.usuario_id
+          WHERE s.codigo=? AND u.documento IN (?,?,?,?,?) ORDER BY r.id`,
+          [SERVICIO_MIRAMAR, "99067310", "99067311", "99067312", "99067313", "99067314"]);
+        if (reservas.length) return { existente: true, predio: "MIRAMAR", servicio: SERVICIO_MIRAMAR, reservas };
+      }
       if (miramar && JSON.parse(miramar.servicio_codigos || "[]").includes(SERVICIO)) {
         return { existente: true, predio: "MIRAMAR", reservas: await listarReservas() };
       }
@@ -76,7 +84,7 @@ async function sembrar(pool, aplicar) {
       await call("POST","/traspasos",{boca_origen_id:almacen,boca_destino_id:prov,lineas:productos.map(producto_id=>({producto_id,cantidad:5}))});
       const articulo = (i,cantidad,a,b) => ({adicional_id:extras[i],cantidad,fecha_desde:dia(a),fecha_hasta:dia(b)});
       const casos = [
-        { nombre:"Mila",apellido:"Arenas Demo",ini:-1,fin:4,ingreso:-1,rec:[0,1],ad:[articulo(0,1,-1,0),articulo(1,2,0,1)],nota:"Una huésped, dos cabañas y artículos con distintos días de uso." },
+        { nombre:"Mila",apellido:"Arenas Demo",ini:-1,fin:4,ingreso:-1,rec:[0],ad:[articulo(0,1,-1,0),articulo(1,2,0,1)],nota:"Una huésped, una cabaña y artículos con distintos días de uso." },
         { nombre:"Bruno",apellido:"Médano Demo",ini:-4,fin:-1,ingreso:-4,rec:[2],ad:[articulo(1,1,-3,-2)],nota:"Salida prevista vencida. Se puede ampliar sin superponer la próxima reserva." },
         { nombre:"Luz",apellido:"Ribera Demo",ini:7,fin:10,rec:[0],ad:[articulo(2,1,8,8)],nota:"Próximo ingreso con una bicicleta reservada por un día." },
         { nombre:"Vera",apellido:"Salinas Demo",ini:-8,fin:-6,ingreso:-8,salida:-6,rec:[0],ad:[articulo(0,1,-7,-7)],pago:true,nota:"Estadía finalizada y abonada por transferencia." },
@@ -110,11 +118,11 @@ async function sembrar(pool, aplicar) {
         adicionales:r.adicionales_vigentes,operacion:U.uuid()});
       const cotizar = b => call("POST","/recepcion/cotizar",b);
       const confirmar = (b,cot) => call("POST","/recepcion/guardar",{...b,cuenta_esperada:cot.cuenta,cotizacion_esperada:cot.cotizacion_esperada});
-      const multi = (await detalle(reservas[0].id)).reserva;
-      assert.equal(multi.personas.length,1);
-      assert.equal(multi.recursos.length,2);
+      const individual = (await detalle(reservas[0].id)).reserva;
+      assert.equal(individual.personas.length,1);
+      assert.equal(individual.recursos.length,1);
       const futura = armar((await detalle(reservas[2].id)).reserva);
-      await assert.rejects(cotizar({...futura,fecha_inicio:hoy,fecha_fin:dia(2),recurso_id:recursos[1],recursos_ids:[recursos[1]],adicionales:[]}),/ocupad|reserva|disponib/i);
+      await assert.rejects(cotizar({...futura,fecha_inicio:hoy,fecha_fin:dia(2),recurso_id:recursos[0],recursos_ids:[recursos[0]],adicionales:[]}),/ocupad|reserva|disponib/i);
       const ampliar = armar((await detalle(vencida)).reserva);
       ampliar.fecha_fin = dia(1);
       ampliar.adicionales[0].fecha_hasta = hoy;
@@ -130,7 +138,7 @@ async function sembrar(pool, aplicar) {
       assert.equal((await detalle(vencida)).cuenta.pendiente,final.total);
       await call("POST","/recepcion/"+vencida+"/cuenta",{accion:"PAGO_RESERVA",medio:"TRANSFERENCIA",esperado:final.total,operacion:U.uuid()});
       assert.equal((await detalle(vencida)).cuenta.pendiente,0);
-      resumen.verificado = {recursos:multi.recursos.length,vencidas_tras_prorroga:0,checkout:final.total,saldo_tras_cobro:0};
+      resumen.verificado = {recursos:individual.recursos.length,vencidas_tras_prorroga:0,checkout:final.total,saldo_tras_cobro:0};
       throw prueba;
     });
   } catch (e) {

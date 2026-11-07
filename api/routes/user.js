@@ -1,4 +1,5 @@
 const express = require("express");
+const { recursoUnico } = require("../services/reserva-recurso-unico");
 const { ocupacionesSecundarias, bloqueSuperponeReserva } = require("../services/ocupacion-recursos-predio");
 const router = express.Router();
 
@@ -8611,7 +8612,7 @@ async function calcularTarifaBaseReserva(connection, {
          ))`;
     const [tarifasPersona] = await connection.query(
       `
-        SELECT id, precio, fecha_inicio, fecha_fin, usa_porcentaje, porcentaje_descuento
+        SELECT id, precio, fecha_inicio, fecha_fin, usa_porcentaje, porcentaje_descuento, precio_por_persona
         FROM tarifa
         WHERE recurso_id = ?
           AND tipo_persona_id = ?
@@ -8707,6 +8708,8 @@ async function calcularTarifaBaseReserva(connection, {
         precio: centavosANumero(precioCentavos),
         precio_original: centavosANumero(precioOriginalCentavos),
         tarifa_id: tarifa.id,
+        ...(recepcion && ["Y", "N"].includes(tarifa.precio_por_persona)
+          ? { por_persona: tarifa.precio_por_persona === "Y" } : {}),
         usa_porcentaje: usaPorcentaje,
         porcentaje_descuento: porcentajePuntosBase / 100,
       });
@@ -10050,7 +10053,7 @@ router.post("/reserva", verifyToken, async (req, res) => {
       }
 
       const servicioIdReserva = normalizarIdPositivo(servicio_id);
-      const recursoIdReserva = normalizarIdPositivo(recurso_id);
+      const recursoIdReserva = recursoUnico(req.body);
       const regimenIdReserva = normalizarIdPositivo(regimen_id);
       const fechaInicioReserva = formatearFechaSQL(fecha_inicio);
       const fechaFinReserva = formatearFechaSQL(fecha_fin);
@@ -10895,7 +10898,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
       }
 
       const servicioIdReserva = normalizarIdPositivo(servicio_id);
-      const recursoIdReserva = normalizarIdPositivo(recurso_id);
+      const recursoIdReserva = recursoUnico(req.body);
       const regimenIdReserva = normalizarIdPositivo(regimen_id);
       const fechaInicioReserva = formatearFechaSQL(fecha_inicio);
       const fechaFinReserva = formatearFechaSQL(fecha_fin);
@@ -10960,7 +10963,7 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
           );
         }
         if (Number(reservaActual.varios_recursos)) {
-          throw crearErrorNegocio("La reserva tiene varios recursos. Editala desde la recepción del predio.", 409);
+          throw crearErrorNegocio("Esta reserva conserva varios recursos anteriores. Separá sus recursos en reservas individuales antes de modificarla.", 409);
         }
         if (Number(reservaActual.cantidad_alquileres_predio) > 0) {
           throw crearErrorNegocio("La reserva tiene artículos alquilados por día. Editala desde la recepción del predio para conservar los días de uso.", 409);

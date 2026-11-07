@@ -251,7 +251,7 @@ const SERVICIOS = Object.freeze([
     legacyId: 3,
     codigo: "MIRAMAR_CABANAS",
     tipoServicioCodigo: "ALOJAMIENTO_RECURSO",
-    nombre: "Miramar Cabanas",
+    nombre: "Cabañas",
     lugar: "Miramar",
     rating: 3.5,
     descripcion: "Cabanas y dormis de la AJB en Miramar.",
