@@ -193,6 +193,13 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
   trabajando. Los retiros del día se descuentan primero de la recaudación.
 - En Usuarios se delega «Anular tickets». El permiso histórico «Cerrar caja» ya no
   habilita el cierre definitivo.
+- El saldo de apertura fija el **fondo de cambio** del período abierto (lo que quedó del
+  último cierre + aperturas cargadas): no absorbe lo ya cobrado. Después de un cierre
+  temporal la caja queda en $ 0 y el administrador puede cargarle el cambio a quien
+  sigue, también a distancia («Cargar cambio» en la lista de temporales o en el aviso);
+  al cajero le aparece enseguida para confirmarlo.
+- Un turno sin ventas ni movimientos de caja se libera al salir o al cambiar de caja,
+  sin cierre (queda auditado «Turno sin movimientos liberado»).
 - Sin permiso de anulación, el cajero solicita anular el ticket e indica el motivo.
   El administrador puede abrir la solicitud desde la campana o filtrar las ventas
   pendientes de anulación. La confirmación revierte el movimiento de la venta.

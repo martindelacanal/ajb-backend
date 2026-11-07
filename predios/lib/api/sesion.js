@@ -7,7 +7,7 @@
 const U = require("../util");
 const N = require("../negocio");
 const acceso = require("../acceso");
-const { turnoAbierto, turnoUsuario, exigirCierre } = require("../turnos-caja");
+const { turnoAbierto, turnoUsuario, exigirCierreOLiberar } = require("../turnos-caja");
 const clavesUsuario = require("../claves-usuario");
 
 async function bocasUsuario(db, ctx, usuario) {
@@ -266,7 +266,7 @@ async function elegirPuesto(ctx) {
     const bocas = await bocasUsuario(t, ctx, u);
     if (!bocas.includes(bocaId)) throw U.error("No tenés asignada esa boca", 403);
     const propio = await turnoUsuario(t, ctx.pid, u.id);
-    if (propio && Number(propio.caja_id) !== cajaId) exigirCierre();
+    if (propio && Number(propio.caja_id) !== cajaId) await exigirCierreOLiberar(t, ctx, propio);
     let turnoId = null;
     if (cajaId) {
       const caja = await N.exigir(t, ctx, "predio_caja", cajaId, "No encontramos la caja", { bloquear: true });
@@ -292,7 +292,7 @@ async function salirPuesto(ctx) {
   const s = ctx.sesion || {};
   if (!s.token_hash) throw U.error("Iniciá sesión para continuar", 401);
   await ctx.db.tx(async (t) => {
-    if (await turnoUsuario(t, ctx.pid, ctx.usuario.id)) exigirCierre();
+    await exigirCierreOLiberar(t, ctx, await turnoUsuario(t, ctx.pid, ctx.usuario.id));
     await asignarPuesto(t, s.token_hash, ctx.usuario.id, null, null, null);
     await N.auditar(t, ctx, "Salida del puesto de caja", "caja", s.caja_id || null, { boca_id: s.boca_id || null });
   });
@@ -302,7 +302,7 @@ async function salirPuesto(ctx) {
 
 async function logout(ctx) {
   await ctx.db.tx(async (t) => {
-    if (await turnoUsuario(t, ctx.pid, ctx.usuario.id)) exigirCierre();
+    await exigirCierreOLiberar(t, ctx, await turnoUsuario(t, ctx.pid, ctx.usuario.id));
     await t.run("DELETE FROM predio_sesion WHERE token_hash = ?", [ctx.sesion.token_hash]);
     await N.auditar(t, ctx, "Salida del sistema", "sesion", ctx.usuario.id, null);
   });
