@@ -15,6 +15,12 @@
   P.intervalo = function (fn, ms) { var t = setInterval(fn, ms); limpiezas.push(function () { clearInterval(t); }); return t; };
 
   // ------------------------------------------------------------------ navegación
+  var itemVehiculos = { ruta: "/vehiculos", texto: "Vehículos en el predio", icono: "qr" };
+
+  function esSeguridad() {
+    return P.estado.sesion?.usuario?.rol === "SEGURIDAD";
+  }
+
   function itemsAdmin() {
     var items = [
       { ruta: "/inicio", texto: "Inicio", icono: "inicio" },
@@ -23,6 +29,7 @@
       { ruta: "/compras", texto: "Compras", icono: "compras" },
       { ruta: "/gestion", texto: "Gestión", icono: "gestion" },
       { ruta: "/recepcion", texto: "Reservas y estadías", icono: "usuarios" },
+      itemVehiculos,
       { ruta: "/usuarios", texto: "Usuarios", icono: "usuarios" },
       { ruta: "/estadisticas", texto: "Estadísticas", icono: "estadisticas" },
       { ruta: "/sistema", texto: "Sistema", icono: "sistema" },
@@ -76,7 +83,7 @@
     var ses = P.estado.sesion;
     var items = [];
     if (P.modo === "local") {
-      if (!(P.puesto() && P.puesto().caja_id)) items.push({ texto: P.esAdmin() ? "Trabajar en una caja" : "Elegir boca o caja", icono: "caja", accion: function () { P.ruta.ir("/puesto"); } });
+      if (!esSeguridad() && !(P.puesto() && P.puesto().caja_id)) items.push({ texto: P.esAdmin() ? "Trabajar en una caja" : "Elegir boca o caja", icono: "caja", accion: function () { P.ruta.ir("/puesto"); } });
       if (P.puesto() && P.puesto().caja_id) items.push({ texto: "Cerrar mi caja", icono: "candado", accion: function () { P.cerrarCaja(P.puesto().caja_id); } });
       if (P.puesto() && P.puesto().caja_id) items.push({ texto: "Ver saldo de apertura", icono: "efectivo", accion: function () { P.verificarApertura(true); } });
       if (!ses.usuario.es_admin_general) items.push({ texto: "Cambiar mi contraseña", icono: "candado", accion: cambiarClave });
@@ -118,7 +125,7 @@
     var ses = P.estado.sesion;
     var b = h("button.usuario-boton", { type: "button", "aria-haspopup": "menu", "aria-label": "Menú de " + ses.usuario.nombre },
       h("span.avatar", P.iniciales(ses.usuario.nombre)),
-      h("span.usuario-nombre", ses.usuario.nombre.replace(" (sistema general)", ""), h("small", ses.usuario.rol === "ADMIN" ? (ses.usuario.es_admin_general ? "Administración general" : "Administración") : "Usuario de boca")));
+      h("span.usuario-nombre", ses.usuario.nombre.replace(" (sistema general)", ""), h("small", P.esAdmin() ? (ses.usuario.es_admin_general ? "Administración general" : "Administración") : esSeguridad() ? "Seguridad" : "Usuario de boca")));
     b.addEventListener("click", function () { menuUsuario(b); });
     return b;
   }
@@ -307,6 +314,7 @@
 
   function consultarConexion() {
     if (P.modo === "remoto") {
+      if (esSeguridad()) return;
       return P.get("/estado-remoto", { sinRedireccion: true }).then(function (r) { P.estado.remoto = r; actualizarConexion(); pintarBandaRemota(); }).catch(function () {});
     }
     return P.get("/estado-publico", { sinRedireccion: true }).then(function (r) {
@@ -335,9 +343,11 @@
   // ------------------------------------------------------------------ marco
   function marco() {
     var ses = P.estado.sesion;
+    var seguridad = esSeguridad();
+    var items = seguridad ? [itemVehiculos] : P.esAdmin() ? itemsAdmin() : itemsCajero();
     var riel = h("nav.riel#riel", { "aria-label": "Menú principal" },
       h("a.riel-marca", { href: "#/" }, h("img", { src: "img/logo-blanco-isotipo.png", alt: "" }), h("span", h("strong", ses.predio.nombre || "Predio"), h("span", "Sistema del predio · AJB"))),
-      h("div.nav", (P.esAdmin() ? itemsAdmin() : itemsCajero()).map(function (it) {
+      h("div.nav", items.map(function (it) {
         var clave = it.ruta === "/inicio" ? "inicio" : it.contador;
         var contador = clave ? h("span.nav-contador", { "data-contador": clave, hidden: true }) : null;
         return h("a.nav-item", { href: "#" + it.ruta, "data-ruta": it.ruta, onclick: function () { cerrarMenu(); } }, P.icono(it.icono), it.texto, contador);
@@ -393,10 +403,10 @@
     var etiquetaPuesto = puesto && [puesto.boca, puesto.caja].filter(Boolean).join(" · ");
     pagina = h("div#pagina");
     return h("div.estructura", riel, veloMenu, h("div.contenido",
-      P.modo === "remoto" ? h("div.remoto#banda-remota") : null,
+      P.modo === "remoto" && !seguridad ? h("div.remoto#banda-remota") : null,
       h("header.barra", botonMenu,
         etiquetaPuesto ? h("span.puesto-chip", { title: etiquetaPuesto }, P.icono("caja"), h("span", etiquetaPuesto)) : null,
-        h("div.espacio"), chipConexion(), campana(), botonUsuario()),
+        h("div.espacio"), seguridad && P.modo === "remoto" ? null : chipConexion(), seguridad ? null : campana(), botonUsuario()),
       pagina));
   }
 
@@ -424,6 +434,14 @@
     if (!P.estado.sesion || P.estado.sesion.usuario.debe_cambiar_clave) return;
     limpiezas.splice(0).forEach(function (fn) { try { fn(); } catch (e) { /* nada */ } });
     var ruta = P.ruta.actual();
+    if (esSeguridad() && ruta !== "/vehiculos") {
+      P.ruta.ir("/vehiculos");
+      return;
+    }
+    if (ruta === "/vehiculos" && !esSeguridad() && !P.esAdmin()) {
+      P.ruta.ir("/");
+      return;
+    }
     if (ruta === "/" || ruta === "") {
       P.ruta.ir(P.esAdmin() ? "/inicio" : (P.puesto() && P.puesto().caja_id ? "/vender" : P.puesto() ? "/solicitudes" : "/puesto"));
       return;
@@ -497,7 +515,7 @@
     }
     P.equipo.recordarPuesto(r.puesto);
     var ses = r;
-    if (ses.usuario.rol !== "ADMIN" && !ses.puesto) {
+    if (ses.usuario.rol === "CAJERO" && !ses.puesto) {
       var puestos = ses.puestos || [];
       if (puestos.length === 1 && puestos[0].cajas.length <= 1) {
         return P.elegirPuesto(puestos[0].boca_id, puestos[0].cajas[0] ? puestos[0].cajas[0].caja_id : null).then(function () {
@@ -511,7 +529,8 @@
       return;
     }
     arrancarMarco();
-    if (!location.hash || location.hash === "#" || location.hash === "#/") P.ruta.ir(ses.usuario.rol === "ADMIN" ? "/inicio" : "/vender");
+    if (esSeguridad() && P.ruta.actual() !== "/vehiculos") P.ruta.ir("/vehiculos");
+    else if (!location.hash || location.hash === "#" || location.hash === "#/") P.ruta.ir(P.esAdmin() ? "/inicio" : "/vender");
     else navegar();
   };
 
@@ -519,14 +538,16 @@
     temporizadores.forEach(clearInterval);
     temporizadores = [];
     P.repintarMarco();
-    consultarAvisos();
+    if (!esSeguridad()) {
+      consultarAvisos();
+      temporizadores.push(setInterval(consultarAvisos, 10000));
+    }
     if (P.esAdmin()) {
       consultarEstadiasVencidas();
       temporizadores.push(setInterval(consultarEstadiasVencidas, 120000));
     }
-    temporizadores.push(setInterval(consultarAvisos, 10000));
     consultarConexion();
-    if (P.modo === "remoto") {
+    if (P.modo === "remoto" && !esSeguridad()) {
       temporizadores.push(setInterval(consultarConexion, 10000));
     }
   }

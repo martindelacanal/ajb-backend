@@ -34,3 +34,23 @@
   .rec-tabla .tabla-texto-largo {min-width:0;}
   .rec-evento summary {padding:10px 0;}
 }
+.vehiculo-video {
+  display: block;
+  width: 100%;
+  max-height: 300px;
+  background: #111;
+  border-radius: 8px;
+  object-fit: contain;
+}
+.vehiculo-video[hidden] { display: none; }
+.vehiculo-resumen { gap: 8px; }
+.vehiculo-resumen h3 { margin: 0; }
+.vehiculo-detalle { list-style: none; margin: 0; padding: 0; }
+.vehiculo-detalle li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--borde);
+}

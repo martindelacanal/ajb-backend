@@ -131,7 +131,13 @@ const {
       ...normal,
       manual: 0
     }), /Justific/);
-    const camp = await call("guardar", normal);
+    const [salidaPrueba] = tarifa.salida.personas;
+    const alojamientoSalida = tarifa.diferenciales.find(p => p.dni === salidaPrueba.dni).importe;
+    const camp = await call("guardar", { ...normal, cotizacion_esperada: tarifa.cotizacion_esperada, _salida_plan: {
+      personas: [{ ...salidaPrueba, alojamiento: alojamientoSalida, consumos: 0 }],
+      presentes: tarifa.salida.presentes,
+      alojamiento: alojamientoSalida, consumos: 0, total: alojamientoSalida, accion: "TRASLADAR"
+    } });
     assert.ok(camp.numero_parcela > 0);
     assert.equal(camp.precio_total, tarifa.total);
     const despues = (await call("detalle", {id: camp.id})).reserva;

@@ -65,6 +65,7 @@ const CONCEPTOS_CAJA = [
   { valor: "SALDO_ESTADIA", texto: "Anticipo o retiro de saldo de estadía" },
   { valor: "LIQUIDACION_ESTADIA", texto: "Liquidación de consumos de estadía" },
   { valor: "DIFERENCIA_RESERVA", texto: "Diferencia de alojamiento" },
+  { valor: "LIQUIDACION_SALIDA", texto: "Liquidación al registrar salida" },
   { valor: "OTROS", texto: "Otros" },
 ];
 const FORMAS_LIQUIDACION = [
@@ -928,13 +929,13 @@ L.usuarios = {
     { clave: "id", titulo: "ID", expr: "u.id", tipo: "int", oculta: true },
     { clave: "usuario", titulo: "Usuario", expr: "u.usuario", buscar: true },
     { clave: "nombre", titulo: "Nombre", expr: "u.nombre", buscar: true },
-    { clave: "rol", titulo: "Rol", expr: "u.rol", tipo: "opcion", opciones: [{ valor: "ADMIN", texto: "Administrador" }, { valor: "CAJERO", texto: "Usuario de boca" }] },
+    { clave: "rol", titulo: "Rol", expr: "u.rol", tipo: "opcion", opciones: [{ valor: "ADMIN", texto: "Administrador" }, { valor: "CAJERO", texto: "Usuario de boca" }, { valor: "SEGURIDAD", texto: "Seguridad" }] },
     { clave: "es_admin_general", titulo: "Sistema general", expr: "u.es_admin_general", tipo: "bool" },
     { clave: "ultimo_ingreso", titulo: "Último ingreso", expr: "u.ultimo_ingreso", tipo: "dt" },
     { clave: "activo", titulo: "Activo", expr: "u.activo", tipo: "bool" },
   ],
   filtros: [
-    { clave: "rol", titulo: "Rol", tipo: "opciones", expr: "u.rol", opciones: [{ valor: "ADMIN", texto: "Administradores" }, { valor: "CAJERO", texto: "Usuarios de boca" }] },
+    { clave: "rol", titulo: "Rol", tipo: "opciones", expr: "u.rol", opciones: [{ valor: "ADMIN", texto: "Administradores" }, { valor: "CAJERO", texto: "Usuarios de boca" }, { valor: "SEGURIDAD", texto: "Seguridad" }] },
     { clave: "activo", titulo: "Estado", tipo: "opciones", expr: "u.activo", opciones: [{ valor: "1", texto: "Activos" }, { valor: "0", texto: "Deshabilitados" }] },
   ],
   orden: { clave: "nombre", dir: "asc" },

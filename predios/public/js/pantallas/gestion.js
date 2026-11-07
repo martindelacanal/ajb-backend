@@ -581,7 +581,11 @@
       }
       var usuario = P.input({ valor: u.usuario, max: 60, placeholder: "Ej.: maria.comedor" });
       var nombre = P.input({ valor: u.nombre, max: 120 });
-      var rol = P.segmentado([{ valor: "CAJERO", texto: "Usuario de boca" }, { valor: "ADMIN", texto: "Administrador" }], u.rol || "CAJERO", function (v) { zonaBocas.hidden = permisos.hidden = v === "ADMIN"; });
+      var rol = P.segmentado([
+        { valor: "CAJERO", texto: "Usuario de boca" },
+        { valor: "ADMIN", texto: "Administrador" },
+        { valor: "SEGURIDAD", texto: "Seguridad" }
+      ], u.rol || "CAJERO", function (v) { zonaBocas.hidden = permisos.hidden = v !== "CAJERO"; });
       var clave = P.inputClave({ placeholder: editar ? "Dejala vacía para no cambiarla" : "Al menos 6 caracteres", autocomplete: "new-password" });
       var recepcion = P.check("Gestionar reservas, ingresos, salidas y saldos", !!Number(u.gestionar_reservas));
       var cierre = P.check("Confirmar cierres de caja", !!Number(u.puede_cerrar_caja));
@@ -589,13 +593,13 @@
       var permisos = P.campo("Permisos del usuario", h("div.columna", recepcion, cierre, anulacion));
       var checks = bocas.map(function (b) { var ch = P.check(b.texto, asignadas.indexOf(b.valor) >= 0); ch.valor = b.valor; return ch; });
       var zonaBocas = P.campo("Bocas que atiende", h("div.grilla.grilla-2", { style: { gap: "8px" } }, checks), { ayuda: "Al ingresar va directo a su boca. Si tiene varias, elige." });
-      zonaBocas.hidden = permisos.hidden = (u.rol || "CAJERO") === "ADMIN";
+      zonaBocas.hidden = permisos.hidden = (u.rol || "CAJERO") !== "CAJERO";
       var activo = P.check("Usuario habilitado", editar ? Number(u.activo) === 1 : true);
       var m = P.modal({
         titulo: editar ? u.nombre : "Nuevo usuario", ancho: "ancha", reanudar: reanudar,
         contenido: h("div.columna",
           h("div.grilla.grilla-2", P.campo("Nombre y apellido", nombre, { requerido: true }), P.campo("Usuario (para ingresar)", usuario, { requerido: true })),
-          P.campo("Rol", rol, { ayuda: "El administrador del camping ve todo el predio pero no entra al sistema general." }),
+          P.campo("Rol", rol, { ayuda: "Seguridad puede consultar vehículos y deudas. Administración gestiona todo el predio." }),
           zonaBocas, permisos,
           P.campo(editar ? "Restablecer contraseña temporal" : "Contraseña temporal", clave, { requerido: !editar, ayuda: "El usuario deberá elegir su propia contraseña al ingresar." }),
           editar ? activo : null,

@@ -16,6 +16,7 @@ const modulos = [
   require("./compras"),
   require("./ventas"),
   require("./recepcion"),
+  require("./vehiculos"),
   require("./caja"),
   require("./afiliados"),
   require("./permisos"),
@@ -67,6 +68,12 @@ function buscarRuta(metodo, ruta) {
   return null;
 }
 
+function exigirPermisoSeguridad(usuario, ruta) {
+  if (usuario?.rol === "SEGURIDAD" && !ruta?.seguridad && !ruta?.roles?.includes("SEGURIDAD")) {
+    throw U.error("Tu cuenta de Seguridad sólo puede consultar los vehículos del predio.", 403);
+  }
+}
+
 // Ejecuta una ruta con un contexto ya autenticado (o público si la ruta lo permite).
 async function ejecutar(ctx, metodo, ruta) {
   const encontrada = buscarRuta(metodo, ruta);
@@ -75,6 +82,7 @@ async function ejecutar(ctx, metodo, ruta) {
   exigirCambio(ctx.usuario, metodo, ruta);
   if (ctx.modo === "central" && r.soloLocal) throw U.error("Esta operación se hace desde el camping", 409);
   if (!r.publica && !ctx.usuario) throw U.error("Iniciá sesión para continuar", 401, { codigo: "SIN_SESION" });
+  exigirPermisoSeguridad(ctx.usuario, r);
   if (r.roles && !r.roles.includes(ctx.usuario?.rol)) throw U.error("Esta acción la hace un administrador", 403);
   ctx.params = encontrada.params;
   ctx.query = ctx.query || {};
@@ -82,4 +90,4 @@ async function ejecutar(ctx, metodo, ruta) {
   return r.h(ctx);
 }
 
-module.exports = { RUTAS, buscarRuta, ejecutar };
+module.exports = { RUTAS, buscarRuta, ejecutar, exigirPermisoSeguridad };
