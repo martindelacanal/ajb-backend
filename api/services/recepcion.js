@@ -906,6 +906,10 @@ async function operar(c, predio, actor, accion, b) {
       return require("./recepcion-estadisticas").estadisticas(c, codigos, predio.id, b);
     }
     if (accion === "crearAdicional") return Catalogo.crearAdicionalSimple(c, predio, codigos, actor, b);
+    // Catálogo y resumen de estadías: sólo administradores, igual que en la pantalla del predio.
+    if (["catalogo", "adicional", "resumenEstadias"].includes(accion) && actor.rol !== "ADMIN") {
+      throw U.error("Solo un administrador puede consultar el catálogo de adicionales y las estadísticas de estadías.", 403);
+    }
     if (accion === "catalogo") return Catalogo.catalogo(c, predio, codigos);
     if (accion === "adicional") return Catalogo.adicional(c, predio, codigos, b.id);
     if (accion === "guardarAdicional") return Catalogo.guardarAdicional(c, predio, codigos, actor, b);
