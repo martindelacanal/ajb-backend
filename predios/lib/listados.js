@@ -33,6 +33,11 @@ const MOTIVOS_BAJA = [
   { valor: "CONSUMO_DESTINO", texto: "Consumo en destino" },
   { valor: "OTROS", texto: "Otros motivos" },
 ];
+const MOTIVOS_ALTA = [
+  { valor: "DONACION", texto: "Donación" },
+  { valor: "RECUENTO", texto: "Diferencia de recuento" },
+  { valor: "OTROS", texto: "Otro ingreso" },
+];
 const ESTADOS_SOLICITUD = [
   { valor: "PENDIENTE", texto: "Pendiente" },
   { valor: "DESPACHADA", texto: "Despachada" },
@@ -504,11 +509,50 @@ L.bajas = {
   },
 };
 
+const MOVIMIENTOS_STOCK_FROM = `predio_movimiento m
+    JOIN predio_producto p ON p.predio_id = m.predio_id AND p.id = m.producto_id
+    JOIN predio_boca b ON b.predio_id = m.predio_id AND b.id = m.boca_id`;
+
+L.altas = {
+  roles: ["ADMIN"],
+  titulo: "Altas de stock",
+  from: MOVIMIENTOS_STOCK_FROM,
+  where: "m.predio_id = :pid AND m.tipo = 'ALTA'",
+  columnas: [
+    { clave: "id", titulo: "ID", expr: "m.id", tipo: "int" },
+    { clave: "fecha", titulo: "Fecha", expr: "m.fecha", tipo: "dt" },
+    { clave: "boca", titulo: "Boca", expr: "b.nombre", buscar: true },
+    { clave: "producto", titulo: "Producto", expr: "p.nombre", buscar: true },
+    { clave: "cantidad", titulo: "Cantidad", expr: "m.cantidad", tipo: "qty" },
+    { clave: "motivo", titulo: "Motivo", expr: "m.motivo", tipo: "opcion", opciones: MOTIVOS_ALTA },
+    { clave: "detalle", titulo: "Detalle", expr: "m.detalle", buscar: true },
+    { clave: "usuario_nombre", titulo: "Usuario", expr: "m.usuario_nombre" },
+  ],
+  filtros: [
+    { clave: "motivo", titulo: "Motivo", tipo: "opciones", expr: "m.motivo", opciones: MOTIVOS_ALTA },
+    { clave: "boca", titulo: "Boca", tipo: "id", expr: "m.boca_id", fuente: "bocas" },
+    { clave: "producto", titulo: "Producto", tipo: "id", expr: "m.producto_id", fuente: "productos" },
+    { clave: "desde", titulo: "Desde", tipo: "desde", expr: "m.fecha" },
+    { clave: "hasta", titulo: "Hasta", tipo: "hasta", expr: "m.fecha" },
+  ],
+  orden: { clave: "id", dir: "desc" },
+  totales: [{ clave: "cantidad", expr: "SUM(m.cantidad)" }],
+  resumen: {
+    grupos: [
+      { clave: "motivo", titulo: "Motivo", expr: "m.motivo", opciones: MOTIVOS_ALTA },
+      { clave: "producto", titulo: "Producto", expr: "p.nombre" },
+      { clave: "boca", titulo: "Boca", expr: "b.nombre" },
+    ],
+    medidas: [
+      { titulo: "Altas", expr: "COUNT(*)", tipo: "int" },
+      { titulo: "Unidades", expr: "SUM(m.cantidad)", tipo: "qty" },
+    ],
+  },
+};
+
 L.movimientos = {
   titulo: "Movimientos de stock",
-  from: `predio_movimiento m
-    JOIN predio_producto p ON p.predio_id = m.predio_id AND p.id = m.producto_id
-    JOIN predio_boca b ON b.predio_id = m.predio_id AND b.id = m.boca_id`,
+  from: MOVIMIENTOS_STOCK_FROM,
   where: "m.predio_id = :pid",
   alcance: alcanceBocas("m.boca_id"),
   columnas: [

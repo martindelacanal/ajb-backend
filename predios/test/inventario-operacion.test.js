@@ -43,3 +43,38 @@ test("una donación suma existencias en su boca, queda auditada y respeta el umb
   await revisar(fecha);
   assert.equal((await avisos()).length, 0);
 });
+
+test("el historial de altas lista las líneas de Sumar stock y sólo está disponible para administradores", async t => {
+  const db = crearSqlite(":memory:", { predioId: 1 });
+  asegurarEsquema(db);
+  t.after(() => db.cerrar());
+  const ctx = { db, pid: 1, modo: "local", usuario: { id: 1, rol: "ADMIN", nombre: "Encargada", bocas: [] } };
+  await db.tx(tr => sembrarPredio(tr, ctx, "MIRAMAR"));
+  const llamar = (metodo, ruta, body, query = {}) => api.ejecutar({ ...ctx, query, body }, metodo, ruta);
+  const leche = await llamar("POST", "/productos", { nombre: "Leche", cantidad_almacen: 3 });
+  const pan = await llamar("POST", "/productos", { nombre: "Pan" });
+  const boca = await db.get("SELECT id, nombre FROM predio_boca WHERE activo=1 AND es_almacen=1");
+  await llamar("POST", "/altas", {
+    boca_id: boca.id, motivo: "DONACION", observaciones: "Dos cajas",
+    lineas: [{ producto_id: leche.id, cantidad: 12 }, { producto_id: pan.id, cantidad: 2.5 }],
+  });
+  await llamar("POST", "/altas", { boca_id: boca.id, producto_id: leche.id, cantidad: 1, motivo: "RECUENTO" });
+  await llamar("POST", "/bajas", { boca_id: boca.id, producto_id: leche.id, cantidad: 1, motivo: "ROTURA" });
+
+  const ruta = "/listados/altas";
+  const { filas, total, totales } = await llamar("GET", ruta);
+  assert.equal(total, 3);
+  assert.equal(totales.cantidad, 15.5);
+  assert.deepEqual(filas.map(f => [f.producto, f.cantidad, f.motivo]), [
+    ["Leche", 1, "RECUENTO"], ["Pan", 2.5, "DONACION"], ["Leche", 12, "DONACION"],
+  ]);
+  assert.deepEqual([filas[1].boca, filas[1].detalle, filas[1].usuario_nombre], [boca.nombre, "Donación · Dos cajas", "Encargada"]);
+  const filtrado = await llamar("GET", ruta, {}, { f_motivo: "DONACION", f_producto: leche.id });
+  assert.deepEqual(filtrado.filas.map(f => f.id), [filas[2].id]);
+  const { csv } = await llamar("GET", ruta, {}, { formato: "csv", modo: "resumen", grupo: "motivo" });
+  assert.match(csv, /Donación;2;14,5/);
+  const empleado = { ...ctx, query: {}, usuario: { id: 25, rol: "CAJERO", bocas: [boca.id] } };
+  for (const endpoint of [ruta, ruta + "/meta"]) {
+    await assert.rejects(api.ejecutar(empleado, "GET", endpoint), e => e.status === 403);
+  }
+});
