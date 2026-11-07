@@ -267,7 +267,7 @@ test("saldo personal, reparto, venta mixta y reversión conservan stock, caja y 
   // Un cobro en el mismo segundo que el cierre pertenece al período nuevo.
   const mismaHora = U.fechaHora();
   t.mock.method(U, "fechaHora", () => mismaHora);
-  await call("POST", "/caja/cierre", { caja_id: caja.id, efectivo_contado: 0, clave: U.claveDelDia() });
+  await call("POST", "/caja/cierre", { caja_id: caja.id, efectivo_contado: 0 });
   const siguiente = await call("POST", "/ventas", {
     items: venta.items, forma_pago: "MIXTO",
     pagos: [{ forma: "EFECTIVO", importe: 20 }, { forma: "QR", importe: 30 }],

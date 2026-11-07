@@ -1,7 +1,7 @@
 "use strict";
 
-const { error, claveDelDia, fechaHora, redondear, igualesSeguros } = require("../util");
-const { insertar, actualizar, auditar, leerConfig } = require("../negocio");
+const { error, fechaHora, redondear } = require("../util");
+const { actualizar } = require("../negocio");
 
 function esAdmin(ctx) {
   return ctx.usuario?.rol === "ADMIN";
@@ -26,78 +26,12 @@ function exigirPuesto(ctx) {
   return s;
 }
 
-// Intentos fallidos de la clave del día por usuario (en memoria): 5 cada 10 minutos.
-const fallosClave = new Map();
-const VENTANA_CLAVE_MS = 10 * 60 * 1000;
-
-function claveIntentos(ctx) {
-  const generalId = ctx.usuario?.general_usuario_id;
-  return `${ctx.pid}:${generalId ? "general-" + generalId : ctx.usuario?.id || ctx.ip || "anon"}`;
-}
-
-function controlarIntentosClave(ctx) {
-  const k = claveIntentos(ctx);
-  const e = fallosClave.get(k);
-  if (e && Date.now() - e.inicio < VENTANA_CLAVE_MS && e.n >= 5) {
-    throw error("Demasiados intentos con la clave. Esperá unos minutos o pedí la autorización a distancia.", 429, { codigo: "CLAVE_BLOQUEADA" });
-  }
-}
-
-function registrarFalloClave(ctx, tipo, referenciaId) {
-  const k = claveIntentos(ctx);
-  const e = fallosClave.get(k);
-  if (!e || Date.now() - e.inicio >= VENTANA_CLAVE_MS) fallosClave.set(k, { inicio: Date.now(), n: 1 });
-  else e.n++;
-  if (fallosClave.size > 2000) fallosClave.delete(fallosClave.keys().next().value);
-  // La auditoría del intento fallido va fuera de la transacción (que se revierte).
-  const detalle = { tipo, referencia_id: referenciaId || null };
-  const db = ctx.dbAuditoria || ctx.db;
-  const registro = ctx.auditarFalloClave ? ctx.auditarFalloClave(detalle)
-    : db.tx((t) => auditar(t, { ...ctx, db: t }, "Clave del día incorrecta", "permiso", null, detalle));
-  registro.catch(() => {});
-}
-
-function claveCorrecta(clave) {
-  const limpia = String(clave || "").replace(/\D/g, "");
-  return limpia.length > 0 && igualesSeguros(limpia, claveDelDia());
-}
-
-function validarClave(ctx, clave, tipo, referenciaId, mensaje = "La clave no es correcta. Pedile al administrador que la escriba.") {
-  controlarIntentosClave(ctx);
-  if (!claveCorrecta(clave)) {
-    registrarFalloClave(ctx, tipo, referenciaId);
-    throw error(mensaje, 403, { codigo: "CLAVE_INCORRECTA" });
-  }
-}
-
 // Autoriza una acción restringida para un usuario de boca. Un administrador no la necesita.
-// Formas: la clave del día que escribe el administrador en esa PC, o un permiso aprobado
-// a distancia (desde la cuenta del administrador, en el camping o en el sistema general).
-async function autorizar(t, ctx, tipo, { clave, permisoId, referenciaId, detalle } = {}) {
+// El permiso lo aprueba el administrador: a distancia (desde su cuenta, en el camping o en
+// el sistema general) o en esa misma PC, escribiendo su usuario y su contraseña
+// (POST /permisos/presencial). En los dos casos llega acá como un permiso APROBADO.
+async function autorizar(t, ctx, tipo, { permisoId, referenciaId } = {}) {
   if (esAdmin(ctx)) return { metodo: "ADMIN", permisoId: null };
-  if (clave !== undefined && clave !== null && String(clave).trim() !== "") {
-    validarClave(ctx, clave, tipo, referenciaId);
-    const config = await leerConfig(t, ctx);
-    const ahora = new Date();
-    const id = await insertar(t, ctx, "predio_permiso", {
-      tipo,
-      estado: "USADO",
-      usuario_id: ctx.usuario.id,
-      usuario_nombre: ctx.usuario.nombre,
-      boca_id: ctx.sesion?.boca_id || null,
-      caja_id: ctx.sesion?.caja_id || null,
-      referencia_id: referenciaId || null,
-      detalle: detalle ? String(detalle).slice(0, 255) : null,
-      fecha_solicitud: fechaHora(ahora),
-      resuelto_por: "Clave del día",
-      resuelto_fecha: fechaHora(ahora),
-      metodo: "CLAVE",
-      vence: fechaHora(new Date(ahora.getTime() + Number(config.minutos_permiso || 30) * 60000)),
-      usado_fecha: fechaHora(ahora),
-    });
-    await auditar(t, ctx, "Autorizado con la clave del día", "permiso", id, { tipo, referencia_id: referenciaId || null });
-    return { metodo: "CLAVE", permisoId: id };
-  }
   if (permisoId) {
     const permiso = await t.get(
       `SELECT * FROM predio_permiso WHERE predio_id = ? AND id = ?${t.forUpdate}`,
@@ -116,7 +50,7 @@ async function autorizar(t, ctx, tipo, { clave, permisoId, referenciaId, detalle
     if (tipo !== "VER_VENTAS_CAJA") {
       await actualizar(t, ctx, "predio_permiso", permiso.id, { estado: "USADO", usado_fecha: fechaHora() });
     }
-    return { metodo: "REMOTO", permisoId: permiso.id };
+    return { metodo: permiso.metodo === "PRESENCIAL" ? "PRESENCIAL" : "REMOTO", permisoId: permiso.id };
   }
   throw error("Necesitás la autorización del administrador", 403, { codigo: "SIN_AUTORIZACION", tipo });
 }
@@ -148,7 +82,5 @@ module.exports = {
   exigirPuesto,
   turnoDeCaja,
   autorizar,
-  claveCorrecta,
-  validarClave,
   disponibleAfiliado,
 };

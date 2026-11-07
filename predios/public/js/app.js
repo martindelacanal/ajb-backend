@@ -25,7 +25,7 @@
     var items = [
       { ruta: "/inicio", texto: "Inicio", icono: "inicio" },
       P.modo === "local" ? { ruta: "/vender", texto: "Vender", icono: "vender" } : null,
-      { ruta: "/caja", texto: "Caja", icono: "caja" },
+      { ruta: "/caja", texto: "Caja", icono: "caja", contador: "caja" },
       { ruta: "/compras", texto: "Compras", icono: "compras" },
       { ruta: "/gestion", texto: "Gestión", icono: "gestion" },
       { ruta: "/recepcion", texto: "Reservas y estadías", icono: "usuarios" },
@@ -112,6 +112,7 @@
     });
   }
 
+  P.salir = function () { salir(); };
   function salir() {
     P.post("/logout", {}, { sinRedireccion: true }).then(function () {
       P.sesion.borrar();
@@ -159,6 +160,7 @@
     (a.aperturas || []).forEach(function (x) {
       items.push({ texto: x.boca + " · " + x.caja + ": el saldo de apertura no coincide", icono: "alerta", accion: function () { P.ruta.ir("/caja"); } });
     });
+    if (a.cierres_temporales) items.push({ texto: a.cierres_temporales + (a.cierres_temporales === 1 ? " cierre temporal espera" : " cierres temporales esperan") + " el cierre definitivo", icono: "caja", accion: function () { P.ruta.ir("/caja"); } });
     if (a.solicitudes_despachar) items.push({ texto: a.solicitudes_despachar + " solicitud(es) para despachar", icono: "despachar", accion: function () { P.ruta.ir(P.esAdmin() ? "/gestion/solicitudes" : "/solicitudes"); } });
     if (a.solicitudes_recibir) items.push({ texto: a.solicitudes_recibir + " solicitud(es) para recibir", icono: "recibir", accion: function () { P.ruta.ir(P.esAdmin() ? "/gestion/solicitudes" : "/solicitudes"); } });
     if (a.vencimientos) items.push({ texto: a.vencimientos + " producto(s) vencidos o por vencer", icono: "reloj", accion: function () { P.cache["tabla:productos"] = { filtros: { vencimiento: "aviso" } }; P.ruta.ir("/gestion/productos"); } });
@@ -197,6 +199,7 @@
         d.agente ? h("p.texto-3.chico", "Navegador: " + d.agente) : null),
       acciones: [
         P.btn("Cerrar", { onclick: function () { m.cerrar(); } }),
+        n.tipo === "CIERRE_TEMPORAL" && d.cierre_id && P.esAdmin() ? P.btn("Ver el cierre", { tipo: "secundario", icono: "caja", onclick: function () { m.cerrar(); P.verCierre(d.cierre_id); } }) : null,
         !n.leido ? P.btn("Marcar como leída", { tipo: "primario", onclick: function (ev) {
           P.ejecutar(ev.currentTarget, function () {
             return P.post("/avisos/" + n.id + "/leer", {}).then(function (r) {
@@ -239,7 +242,8 @@
 
   function contadorNav(clave) {
     var a = P.estado.avisos || {};
-    if (clave === "inicio") return (a.permisos || []).length + (a.aperturas || []).length;
+    if (clave === "inicio") return (a.permisos || []).length + (a.aperturas || []).length + (a.cierres_temporales || 0);
+    if (clave === "caja") return a.cierres_temporales || 0;
     if (clave === "solicitudes") return (a.solicitudes_despachar || 0) + (a.solicitudes_recibir || 0);
     return 0;
   }

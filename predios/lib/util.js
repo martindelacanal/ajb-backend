@@ -45,13 +45,6 @@ function sumarDias(fechaIso, dias) {
   return `${f.getUTCFullYear()}-${pad(f.getUTCMonth() + 1)}-${pad(f.getUTCDate())}`;
 }
 
-// Clave dinámica del día pedida por el camping: día + mes + año, sin ceros a la izquierda.
-// 5/11/2026 -> "5112026".
-function claveDelDia(fecha = new Date()) {
-  const a = ahoraAR(fecha);
-  return `${a.getUTCDate()}${a.getUTCMonth() + 1}${a.getUTCFullYear()}`;
-}
-
 function esFechaIso(valor) {
   if (typeof valor !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(valor)) return false;
   const [y, m, d] = valor.split("-").map(Number);
@@ -205,7 +198,6 @@ module.exports = {
   fechaHora,
   hoy,
   sumarDias,
-  claveDelDia,
   esFechaIso,
   redondear,
   numero,

@@ -26,7 +26,6 @@ const { entregarAvisos } = require("../services/predios-avisos");
 const U = require("../../predios/lib/util");
 const clavesUsuario = require("../../predios/lib/claves-usuario");
 const apiPredio = require("../../predios/lib/api");
-const { validarClaveCierre } = require("../../predios/lib/api/caja");
 const sesionPredio = require("../../predios/lib/api/sesion");
 const { crearMysql } = require("../../predios/lib/db-mysql");
 const { TIPOS_PERMISO, textoDe } = require("../../predios/lib/listados");
@@ -72,7 +71,6 @@ async function ejecutarComoAdminGeneral(res, predio, usuario, { metodo, ruta, cu
   const encontrada = apiPredio.buscarRuta(metodo, ruta);
   if (!encontrada) throw U.error("No encontramos esa operación", 404);
   if (encontrada.ruta.soloLocal) throw U.error("Esta operación se hace desde las PCs del camping", 409);
-  base.claveDiaCierreValidada = validarCierreRemoto(ruta, base);
   if (encontrada.ruta.escritura) {
     if (predio.escritor === "CENTRAL") {
       // Todavía no hay notebook instalada: el sistema general es el dueño de los datos.
@@ -82,7 +80,7 @@ async function ejecutarComoAdminGeneral(res, predio, usuario, { metodo, ruta, cu
       await pool().query("UPDATE predio SET ultima_escritura_central = NOW() WHERE id = ?", [predio.id]);
       return enviarResultado(res, r);
     }
-    return encolarYEsperar(res, predio, usuario, { metodo, ruta, cuerpo: base.body, query: base.query, claveDiaCierreValidada: base.claveDiaCierreValidada });
+    return encolarYEsperar(res, predio, usuario, { metodo, ruta, cuerpo: base.body, query: base.query });
   }
   if (ruta === "/afiliados/buscar" || ruta.startsWith("/listados/afiliados") || ruta === "/inicio") {
     if (predio.escritor === "CENTRAL") await C.refrescarMaestrosCentral(pool(), predio).catch(() => {});
@@ -106,18 +104,7 @@ function enviarResultado(res, r) {
   return res.json(r === undefined ? { ok: true } : r);
 }
 
-function validarCierreRemoto(ruta, ctx) {
-  if (ruta !== "/caja/cierre") return false;
-  const cajaId = U.id(ctx.body.caja_id, "La caja");
-  // El evento es central. La auditoría de negocio puede pertenecer al escritor local.
-  const auditarFalloClave = (detalle) => C.evento(pool(), ctx.pid, "CLAVE_DIA_CIERRE_INCORRECTA", {
-    ...detalle, usuario_predio_id: ctx.usuario.id || null, usuario_nombre: ctx.usuario.nombre, ip: ctx.ip,
-  }, ctx.usuario.general_usuario_id || null);
-  validarClaveCierre({ ...ctx, auditarFalloClave }, cajaId);
-  return true;
-}
-
-function prepararOrden(actor, ruta, cuerpo, cuenta, claveDiaCierreValidada) {
+function prepararOrden(actor, ruta, cuerpo, cuenta) {
   // Solo esta frontera autenticada puede atestiguar una clave. Los secretos
   // introducidos en el formulario nunca se guardan en la cola ni el pendrive.
   const datos = { ...cuerpo };
@@ -136,17 +123,21 @@ function prepararOrden(actor, ruta, cuerpo, cuenta, claveDiaCierreValidada) {
   else if (/^\/recepcion\/\d+\/(?:estadia|qr|articulos\/cobrar)$/.test(ruta)) actor.capacidad = "recepcion-estadia-v3";
   // Contable: notas de crédito y anulaciones de recibos (una notebook anterior no conoce estas rutas).
   else if (/^\/contable\//.test(ruta)) actor.capacidad = "contable-v1";
+  // Cierre definitivo de un cierre temporal: las notebooks anteriores no lo conocen.
+  if (/^\/caja\/cierres\/\d+\/definitivo$/.test(ruta)) actor.capacidad = "caja-temporal-v1";
   if (/^\/usuarios(?:\/\d+)?$/.test(ruta) && datos.password) {
     clavesUsuario.validarNueva(datos.password, String(datos.usuario || "").trim().toLowerCase());
     actor.hash_clave_validada = U.hashPassword(datos.password);
     delete datos.password;
   }
   if (ruta === "/caja/cierre") {
-    // El escritor comprueba el corte y la identidad al aplicar la orden.
+    // El escritor comprueba el corte y la identidad al aplicar la orden. Ya no hay
+    // clave del día: el administrador entró con su cuenta. La marca sigue viajando
+    // porque las notebooks sin actualizar la exigen para aceptar un cierre a distancia.
     actor.capacidad = "cierre-clave-dia-v1";
-    actor.clave_dia_cierre_validada = claveDiaCierreValidada === true;
-    delete datos.clave;
+    actor.clave_dia_cierre_validada = true;
   }
+  for (const secreto of ["clave", "admin_usuario", "admin_password"]) delete datos[secreto];
   if (ruta === "/sesion/clave") {
     actor.hash_clave_validada = clavesUsuario.hashDeCambio(cuenta, String(datos.actual || ""), datos.nueva);
     return {};
@@ -154,9 +145,9 @@ function prepararOrden(actor, ruta, cuerpo, cuenta, claveDiaCierreValidada) {
   return datos;
 }
 
-async function encolarYEsperar(res, predio, usuario, { metodo, ruta, cuerpo, query, claveDiaCierreValidada }) {
+async function encolarYEsperar(res, predio, usuario, { metodo, ruta, cuerpo, query }) {
   const actor = { general_id: usuario.id, nombre: nombreUsuario(usuario), documento: usuario.documento };
-  const datos = prepararOrden(actor, ruta, cuerpo, null, claveDiaCierreValidada);
+  const datos = prepararOrden(actor, ruta, cuerpo, null);
   const [r] = await pool().query(
     "INSERT INTO predio_comando (predio_id, tipo, metodo, ruta, cuerpo, query, actor, descripcion, creado_por) VALUES (?, 'API', ?, ?, ?, ?, ?, ?, ?)",
     [predio.id, metodo, ruta, JSON.stringify(datos), JSON.stringify(query || {}), JSON.stringify(actor), `${metodo} ${ruta}`.slice(0, 255), usuario.id]);
@@ -224,11 +215,7 @@ async function ejecutarComoCuentaPredio(res, predio, cuenta, token, { metodo, ru
     }
     return enviarResultado(res, await apiPredio.ejecutar({ ...base, body: cuerpo, query }, metodo, ruta));
   }
-  let claveDiaCierreValidada = false;
-  if (ruta === "/caja/cierre") {
-    clavesUsuario.exigirCambio(cuenta, metodo, ruta);
-    claveDiaCierreValidada = validarCierreRemoto(ruta, { pid: predio.id, usuario: cuenta, ip, body: cuerpo });
-  }
+  if (ruta === "/caja/cierre") clavesUsuario.exigirCambio(cuenta, metodo, ruta);
   const conexion = await pool().getConnection();
   let salida;
   try {
@@ -255,13 +242,13 @@ async function ejecutarComoCuentaPredio(res, predio, cuenta, token, { metodo, ru
         query: (...args) => conexion.query(...args), beginTransaction: async () => {}, commit: async () => {}, rollback: async () => {}, release() {},
       }) }, { predioId: p.id });
       const base = await contextoCuentaPredio(db, p, vigente, ip);
-      const resultado = await apiPredio.ejecutar({ ...base, body: cuerpo, query, claveDiaCierreValidada }, metodo, ruta);
+      const resultado = await apiPredio.ejecutar({ ...base, body: cuerpo, query }, metodo, ruta);
       await conexion.query("UPDATE predio SET ultima_escritura_central = NOW() WHERE id = ?", [p.id]);
       salida = { resultado, predio: p };
     } else {
       const [revisiones] = await conexion.query("SELECT id FROM predio_auditoria WHERE predio_id = ? AND entidad = 'usuario' AND entidad_id = ? ORDER BY id DESC LIMIT 1 FOR UPDATE", [p.id, usuario.id]);
       const actor = { tipo: "PREDIO", predio_id: Number(p.id), predio_usuario_id: Number(usuario.id), credencial_sha256: U.sha256(usuario.password_hash), cuenta_revision: Number(revisiones[0]?.id || 0) };
-      const datos = prepararOrden(actor, ruta, cuerpo, usuario, claveDiaCierreValidada);
+      const datos = prepararOrden(actor, ruta, cuerpo, usuario);
       const [r] = await conexion.query(
         "INSERT INTO predio_comando (predio_id, tipo, metodo, ruta, cuerpo, query, actor, descripcion, creado_por) VALUES (?, 'API', ?, ?, ?, ?, ?, ?, ?)",
         [p.id, metodo, ruta, JSON.stringify(datos), JSON.stringify(query || {}), JSON.stringify(actor), `${metodo} ${ruta}`.slice(0, 255), null]);
@@ -476,6 +463,7 @@ function crearRouterAdmin() {
         comandos_adicionales: serializadas.filter(c => c.actor?.capacidad === "recepcion-adicionales-v2"),
         comandos_estadia: serializadas.filter(c => c.actor?.capacidad === "recepcion-estadia-v3"),
         comandos_contable: serializadas.filter(c => c.actor?.capacidad === "contable-v1"),
+        comandos_caja_temporal: serializadas.filter(c => c.actor?.capacidad === "caja-temporal-v1"),
       };
       if (req.query.codigo === "1") {
         const paquete = C.paqueteCodigo();
@@ -702,12 +690,14 @@ function crearRouterSync() {
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'recepcion-adicionales-v2')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'recepcion-estadia-v3')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'contable-v1')
+             AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'caja-temporal-v1')
            ORDER BY id LIMIT 20`, [p.id, capacidades.includes("cuentas-predio-v1") ? 1 : 0,
              capacidades.includes("precios-boca-v1") ? 1 : 0, capacidades.includes("stock-predio-v2") ? 1 : 0,
              capacidades.includes("operacion-predio-v2") ? 1 : 0, capacidades.includes("recepcion-alquileres-v1") ? 1 : 0,
              capacidades.includes("cierre-clave-dia-v1") ? 1 : 0, capacidades.includes("recepcion-salidas-v1") ? 1 : 0,
              capacidades.includes("recepcion-adicionales-v2") ? 1 : 0, capacidades.includes("recepcion-estadia-v3") ? 1 : 0,
-             capacidades.includes("contable-v1") ? 1 : 0]);
+             capacidades.includes("contable-v1") ? 1 : 0,
+             capacidades.includes("caja-temporal-v1") ? 1 : 0]);
         if (filas.length) {
           await conexion.query(`UPDATE predio_comando SET estado = 'ENTREGADO', entregado_en = NOW(), intentos = intentos + 1 WHERE id IN (?)`, [filas.map(c => c.id)]);
         }

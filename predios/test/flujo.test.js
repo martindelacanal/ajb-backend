@@ -10,7 +10,6 @@ const path = require("node:path");
 const fs = require("node:fs");
 const os = require("node:os");
 const { spawn, execFileSync } = require("node:child_process");
-const { claveDelDia } = require("../lib/util");
 
 const RAIZ = path.join(__dirname, "..");
 const PUERTO = 18000 + Math.floor(Math.random() * 1000);
@@ -102,14 +101,23 @@ test("flujo completo del camping", async () => {
   await ok("POST", "/sesion/clave", { token: cajero, cuerpo: { actual: "clave12", nueva: "Personal-proveeduria" } });
   await ok("POST", "/sesion/puesto", { token: cajero, cuerpo: { boca_id: proveeduria, caja_id: cajaProv } });
 
-  // Solicitud: sin autorización -> 403; con clave del día -> ok
+  // Solicitud: sin autorización -> 403; con la contraseña del administrador en la PC -> ok
   const sinAut = await api("POST", "/solicitudes", { token: cajero, cuerpo: { boca_origen_id: almacen, boca_destino_id: proveeduria, lineas: [{ producto_id: prod.id, cantidad: 5 }] } });
   assert.equal(sinAut.status, 403);
   assert.equal(sinAut.json.codigo, "SIN_AUTORIZACION");
-  const mucho = await api("POST", "/solicitudes", { token: cajero, cuerpo: { boca_origen_id: almacen, boca_destino_id: proveeduria, lineas: [{ producto_id: prod.id, cantidad: 500 }], clave: claveDelDia() } });
+  const malAdmin = await api("POST", "/permisos/presencial", { token: cajero, cuerpo: { tipo: "SOLICITUD_PRODUCTO", admin_usuario: "admin", admin_password: "otra-cosa" } });
+  assert.equal(malAdmin.status, 403);
+  assert.equal(malAdmin.json.codigo, "ADMIN_INCORRECTO");
+  const conCajero = await api("POST", "/permisos/presencial", { token: cajero, cuerpo: { tipo: "SOLICITUD_PRODUCTO", admin_usuario: "caja.prov", admin_password: "Personal-proveeduria" } });
+  assert.equal(conCajero.json.codigo, "ADMIN_INCORRECTO", "un usuario de boca no se aprueba a sí mismo");
+  const presencial = await ok("POST", "/permisos/presencial", { token: cajero, cuerpo: { tipo: "SOLICITUD_PRODUCTO", admin_usuario: "admin", admin_password: "secreto1" } });
+  assert.ok(presencial.permiso_id);
+  const mucho = await api("POST", "/solicitudes", { token: cajero, cuerpo: { boca_origen_id: almacen, boca_destino_id: proveeduria, lineas: [{ producto_id: prod.id, cantidad: 500 }], permiso_id: presencial.permiso_id } });
   assert.equal(mucho.status, 409);
   assert.equal(mucho.json.codigo, "STOCK_INSUFICIENTE");
-  const sol = await ok("POST", "/solicitudes", { token: cajero, cuerpo: { boca_origen_id: almacen, boca_destino_id: proveeduria, lineas: [{ producto_id: prod.id, cantidad: 5 }], clave: claveDelDia() } });
+  const sol = await ok("POST", "/solicitudes", { token: cajero, cuerpo: { boca_origen_id: almacen, boca_destino_id: proveeduria, lineas: [{ producto_id: prod.id, cantidad: 5 }], permiso_id: presencial.permiso_id } });
+  const reuso = await api("POST", "/solicitudes", { token: cajero, cuerpo: { boca_origen_id: almacen, boca_destino_id: proveeduria, lineas: [{ producto_id: prod.id, cantidad: 1 }], permiso_id: presencial.permiso_id } });
+  assert.equal(reuso.status, 403, "la aprobación en la PC sirve para una sola solicitud");
   assert.equal((await api("POST", `/solicitudes/${sol.ids[0]}/despachar`, { token: cajero, cuerpo: {} })).status, 403);
   await ok("POST", `/solicitudes/${sol.ids[0]}/despachar`, { token: admin, cuerpo: {} });
   await ok("POST", `/solicitudes/${sol.ids[0]}/recibir`, { token: cajero, cuerpo: {} });
@@ -171,7 +179,7 @@ test("flujo completo del camping", async () => {
   const qr = await ok("POST", "/ventas", { token: cajero, cuerpo: { items: [{ producto_id: prod.id, cantidad: 1 }], forma_pago: "QR", codigo_pago: "MP-123" } });
 
   // El cajero pide la anulación y la confirmación del administrador revierte la venta.
-  const intento = await api("POST", `/ventas/${qr.id}/anular`, { token: cajero, cuerpo: { motivo: "Error", clave: claveDelDia() } });
+  const intento = await api("POST", `/ventas/${qr.id}/anular`, { token: cajero, cuerpo: { motivo: "Error" } });
   assert.equal(intento.status, 403);
   const solicitudAnulacion = await ok("POST", "/permisos", { token: cajero, cuerpo: { tipo: "ANULAR_VENTA", referencia_id: qr.id, detalle: "Error de carga" } });
   const pendientesAnulacion = await ok("GET", "/listados/ventas?f_estado=PENDIENTE_ANULACION", { token: admin });
@@ -185,11 +193,21 @@ test("flujo completo del camping", async () => {
   await ok("POST", "/caja/ajuste", { token: admin, cuerpo: { caja_id: cajaProv, concepto: "RETIRO_DINERO", tipo: "EGRESO", importe: 1000, recibo: "R-9" } });
   const previa = await ok("GET", "/caja/cierre/previa", { token: cajero });
   assert.equal(previa.resumen.saldo_esperado, 5600);
-  const intentoCierre = await api("POST", "/caja/cierre", { token: admin, operacion: "cierre-clave-invalida", cuerpo: { caja_id: cajaProv, clave: "00000000", efectivo_contado: 5500 } });
+  // El cajero no hace el cierre definitivo solo; con una contraseña equivocada tampoco.
+  const soloCajero = await api("POST", "/caja/cierre", { token: cajero, cuerpo: { efectivo_contado: 5500 } });
+  assert.equal(soloCajero.status, 403);
+  assert.equal(soloCajero.json.codigo, "CIERRE_SOLO_ADMIN");
+  const intentoCierre = await api("POST", "/caja/cierre", { token: cajero, operacion: "cierre-admin-invalido", cuerpo: { efectivo_contado: 5500, admin_usuario: "admin", admin_password: "no-es" } });
   assert.equal(intentoCierre.status, 403);
-  const auditoriaCierre = await ok("GET", "/listados/auditoria", { token: admin });
-  assert.ok(auditoriaCierre.filas.some(f => f.accion === "Clave del día incorrecta" && JSON.parse(f.detalle).tipo === "CERRAR_CAJA"));
-  const cierre = await ok("POST", "/caja/cierre", { token: admin, cuerpo: { caja_id: cajaProv, clave: claveDelDia(), efectivo_contado: 5500, queda_en_caja: 500 } });
+  let auditoriaCierre;
+  for (let i = 0; i < 20; i++) {
+    auditoriaCierre = await ok("GET", "/listados/auditoria", { token: admin });
+    if (auditoriaCierre.filas.some(f => f.accion === "Contraseña del administrador incorrecta")) break;
+    await new Promise(r => setTimeout(r, 50));
+  }
+  assert.ok(auditoriaCierre.filas.some(f => f.accion === "Contraseña del administrador incorrecta"));
+  assert.ok(!auditoriaCierre.filas.some(f => /no-es/.test(f.detalle || "")), "la contraseña no queda en la auditoría");
+  const cierre = await ok("POST", "/caja/cierre", { token: admin, cuerpo: { caja_id: cajaProv, efectivo_contado: 5500, queda_en_caja: 500 } });
   assert.equal(cierre.diferencia, -100);
   const { caja } = await ok("GET", `/cajas/${cajaProv}`, { token: admin });
   await ok("PUT", `/cajas/${cajaProv}`, { token: admin, cuerpo: { ...caja, ancho_ticket: 58 } });

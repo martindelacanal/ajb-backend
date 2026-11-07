@@ -600,9 +600,8 @@
       ], u.rol || "CAJERO", function (v) { zonaBocas.hidden = permisos.hidden = v !== "CAJERO"; });
       var clave = P.inputClave({ placeholder: editar ? "Dejala vacía para no cambiarla" : "Al menos 6 caracteres", autocomplete: "new-password" });
       var recepcion = P.check("Gestionar reservas, ingresos, salidas y saldos", !!Number(u.gestionar_reservas));
-      var cierre = P.check("Confirmar cierres de caja", !!Number(u.puede_cerrar_caja));
       var anulacion = P.check("Anular tickets", !!Number(u.puede_anular_ticket));
-      var permisos = P.campo("Permisos del usuario", h("div.columna", recepcion, cierre, anulacion));
+      var permisos = P.campo("Permisos del usuario", h("div.columna", recepcion, anulacion), { ayuda: "Al terminar su turno hace un cierre temporal; el cierre definitivo lo hace siempre un administrador." });
       var checks = bocas.map(function (b) { var ch = P.check(b.texto, asignadas.indexOf(b.valor) >= 0); ch.valor = b.valor; return ch; });
       var zonaBocas = P.campo("Bocas que atiende", h("div.grilla.grilla-2", { style: { gap: "8px" } }, checks), { ayuda: "Al ingresar va directo a su boca. Si tiene varias, elige." });
       zonaBocas.hidden = permisos.hidden = (u.rol || "CAJERO") !== "CAJERO";
@@ -620,7 +619,7 @@
           var cuerpo = {
             usuario: usuario.value, nombre: nombre.value, rol: rol.valor(), password: clave.input.value || undefined,
             gestionar_reservas: recepcion.input.checked,
-            puede_cerrar_caja: cierre.input.checked, puede_anular_ticket: anulacion.input.checked,
+            puede_anular_ticket: anulacion.input.checked,
             bocas: checks.filter(function (ch) { return ch.input.checked; }).map(function (ch) { return ch.valor; }),
           };
           if (editar) cuerpo.activo = activo.input.checked;

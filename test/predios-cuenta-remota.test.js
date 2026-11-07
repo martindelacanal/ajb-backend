@@ -240,7 +240,7 @@ test("el paquete de pendrive nunca lleva actores PREDIO, incluso si incluye una 
   assert.equal(s.db.conexion.prepare("SELECT estado FROM predio_comando WHERE id=1").get().estado, "PENDIENTE", "la orden propia espera un agente actualizado");
 });
 
-test("el administrador remoto confirma con la clave del día sin publicarla en la cola", async t => {
+test("el administrador remoto cierra con su cuenta, sin clave del día ni secretos en la cola", async t => {
   for (const escritor of ["CENTRAL", "LOCAL"]) {
     const s = await escenario(t, { escritor }), { token } = await ingresar(s);
     const base = "/app/MIRAMAR/api/caja/cierre";
@@ -260,11 +260,10 @@ test("el administrador remoto confirma con la clave del día sin publicarla en l
         const actor = JSON.parse(cmd.actor);
         assert.equal(actor.capacidad, "cierre-clave-dia-v1");
         assert.equal(actor.clave_dia_cierre_validada, true);
-        assert.equal(JSON.parse(cmd.cuerpo).clave, undefined);
+        for (const secreto of ["clave", "admin_usuario", "admin_password"]) assert.equal(JSON.parse(cmd.cuerpo)[secreto], undefined);
         const usuario = await require("../predios/lib/actor-remoto").resolverActorRemoto({ db: s.db, pid: 1, actor });
         const respuesta = await require("../predios/lib/api").ejecutar({ db: s.db, pid: 1, origen: "REMOTO", modo: "local",
-          usuario, sesion: {}, claveDiaCierreValidada: actor.clave_dia_cierre_validada,
-          body: JSON.parse(cmd.cuerpo) }, "POST", cmd.ruta);
+          usuario, sesion: {}, body: JSON.parse(cmd.cuerpo) }, "POST", cmd.ruta);
         assert.equal(respuesta.clave, undefined);
         await s.db.run("UPDATE predio_comando SET estado='OK', status=200, resultado=? WHERE id=?", [JSON.stringify(respuesta), cmd.id]);
       }
@@ -274,25 +273,19 @@ test("el administrador remoto confirma con la clave del día sin publicarla en l
       return json;
     }
     const config = await pedir(s, token, "/app/MIRAMAR/api/config");
-    const { clave_del_dia: clave } = await config.json();
-    assert.equal(clave, U.claveDelDia());
+    assert.equal((await config.json()).clave_del_dia, undefined, "ya no existe la clave del día");
     assert.equal((await pedir(s, token, base + "/clave", cuerpo)).status, 404);
-    assert.equal((await pedir(s, token, base, { ...cuerpo, efectivo_contado: 0, clave: "00000000", clave_dia_cierre_validada: true })).status, 403);
-    const fallo = await s.db.get("SELECT detalle FROM predio_evento WHERE tipo='CLAVE_DIA_CIERRE_INCORRECTA'");
-    const detalle = JSON.parse(fallo.detalle);
-    assert.equal(detalle.usuario_predio_id, 7);
-    assert.equal(detalle.tipo, "CERRAR_CAJA");
-    assert.equal(detalle.referencia_id, 3);
     assert.equal((await s.db.get("SELECT COUNT(*) AS n FROM predio_comando")).n, 0);
-    const cierre = await ejecutar({ ...cuerpo, efectivo_contado: 0, clave });
+    const secreto = "secreto-que-no-viaja";
+    const cierre = await ejecutar({ ...cuerpo, efectivo_contado: 0, clave: "5112026", admin_usuario: "otro", admin_password: secreto });
     assert.equal(cierre.diferencia, 0);
     const auditoria = await s.db.get("SELECT detalle FROM predio_auditoria WHERE accion='Cierre de caja'");
     const { autorizacion } = JSON.parse(auditoria.detalle);
     assert.equal(autorizacion.admin_id, 7);
-    assert.equal(autorizacion.metodo, "CLAVE_DEL_DIA");
+    assert.equal(autorizacion.metodo, "ADMIN");
     if (escritor === "LOCAL") {
       const filas = await s.db.all("SELECT cuerpo, actor, resultado FROM predio_comando");
-      assert.ok(filas.every(c => !JSON.stringify(c).includes('"' + clave + '"')));
+      assert.ok(filas.every(c => !JSON.stringify(c).includes(secreto) && !JSON.stringify(c).includes("5112026")));
     }
   }
 });

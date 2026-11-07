@@ -3,9 +3,13 @@
 const crypto = require("node:crypto");
 const U = require("./util");
 
+// Las contraseñas no entran en la huella guardada: un resumen rápido (sha256) de una
+// contraseña corta se podría adivinar probando.
 function canonico(valor) {
   if (Array.isArray(valor)) return valor.map(canonico);
-  if (valor && typeof valor === "object") return Object.fromEntries(Object.keys(valor).sort().map((k) => [k, canonico(valor[k])]));
+  if (valor && typeof valor === "object") {
+    return Object.fromEntries(Object.keys(valor).sort().map((k) => [k, /password/i.test(k) ? "***" : canonico(valor[k])]));
+  }
   return valor;
 }
 

@@ -157,7 +157,7 @@
       "html, body { padding: 0; margin: 0; color: #000; background: white; }" +
       "pre { width: " + (angosto ? 48 : 72) + "mm; margin: 0 auto; padding: 2mm 0 0; " +
       "font: " + (angosto ? "7pt" : "8.4pt") + "/4mm 'Courier New', monospace; white-space: pre; orphans: 1; widows: 1; }" +
-      ".comanda { page-break-before: always; break-before: page; }";
+      ".comanda, .corte { page-break-before: always; break-before: page; }";
     return P.imprimirHtml(P.h("div", partes), estilo, titulo);
   }
 
@@ -172,22 +172,119 @@
     return imprimir(partes, datos.ancho, "Ticket " + datos.venta.id);
   };
 
-  P.imprimirCierre = function (datos) {
-    var c = datos.cierre, e = datos.empresa || {};
-    var ancho = datos.ancho || (P.puesto() || {}).ancho_ticket;
-    var p = new Papel(ancho);
-    encabezado(p, e, c, "CIERRE DE CAJA NRO: " + c.id);
+  // ------------------------------------------------------------------ cierres de caja
+  function negativo(importe) { return "- " + P.f.pesos(importe); }
+
+  function lineaDiferencia(p, diferencia, prefijo) {
+    var d = Number(diferencia) || 0;
+    p.par((prefijo ? prefijo + " " : "") + (d === 0 ? "SIN DIFERENCIA" : d > 0 ? "SOBRANTE" : "FALTANTE"), P.f.pesos(Math.abs(d)));
+  }
+
+  function datosDelCierre(p, c) {
+    p.texto((c.tipo === "TEMPORAL" ? "CIERRE TEMPORAL NRO: " : "CIERRE DE CAJA NRO: ") + String(c.id).padStart(6, "0"));
     fechaHora(p, c.fecha);
-    if (c.usuario_nombre) p.texto("CAJERO: " + c.usuario_nombre);
+    if (c.usuario_nombre) p.texto("CERRO: " + c.usuario_nombre);
+    if (c.turno_inicio) p.texto("TURNO DESDE: " + P.f.fechaHora(c.turno_inicio));
+  }
+
+  function estadoDelCierre(p, c) {
+    if (c.tipo === "TEMPORAL" && c.estado !== "CERRADO") {
+      p.texto("FALTA EL CIERRE DEFINITIVO", "centro");
+      p.texto("LO HACE UN ADMINISTRADOR", "centro");
+      p.texto("AL RECIBIR LAS BOLSAS", "centro");
+    } else if (c.definitivo_usuario_nombre && (c.tipo === "TEMPORAL" || c.definitivo_usuario_nombre !== c.usuario_nombre)) {
+      p.texto((c.tipo === "TEMPORAL" ? "CIERRE DEFINITIVO: " : "AUTORIZO: ") + c.definitivo_usuario_nombre);
+      if (c.tipo === "TEMPORAL" && c.definitivo_fecha) p.texto("EL " + P.f.fechaHora(c.definitivo_fecha));
+    }
+  }
+
+  // Ticket de una bolsa del cierre temporal: va adentro de la bolsa, con los billetes.
+  function etiquetaBolsa(datos, cual, ancho, corte) {
+    var c = datos.cierre, e = datos.empresa || {}, ef = datos.efectivo || {};
+    var ventas = cual === "ventas";
+    var p = new Papel(ancho);
+    encabezado(p, e, c, "BOLSA " + (ventas ? "1" : "2") + " DE 2");
+    p.texto(ventas ? "RECAUDACION (VENTAS Y COBROS)" : "CAMBIO (SALDO INICIAL Y AGREGADOS)", "centro");
     p.separar();
-    p.par("SALDO INICIAL", P.f.pesos(c.saldo_inicial));
-    p.par("INGRESOS", P.f.pesos(c.ingresos));
-    p.par("EGRESOS", P.f.pesos(c.egresos));
+    datosDelCierre(p, c);
+    p.separar();
+    if (ventas) {
+      p.par("VENTAS EN EFECTIVO", P.f.pesos(ef.ventas || 0));
+      if (Number(ef.anulaciones)) p.par("ANULACIONES", negativo(ef.anulaciones));
+      if (Number(ef.otros_cobros)) p.par("OTROS COBROS", P.f.pesos(ef.otros_cobros));
+      if (Number(ef.retiros)) p.par("RETIROS DEL DIA", negativo(ef.retiros));
+    } else {
+      p.par("SALDO INICIAL", P.f.pesos(ef.saldo_inicial || 0));
+      if (Number(ef.agregados)) p.par("AGREGADOS EN EL DIA", P.f.pesos(ef.agregados));
+    }
+    var esperado = Number(ventas ? c.esperado_ventas : c.esperado_cambio) || 0;
+    var declarado = Number(ventas ? c.efectivo_ventas : c.efectivo_cambio) || 0;
+    p.par("ESPERADO EN LA BOLSA", P.f.pesos(esperado));
+    p.separar();
+    p.texto("EN ESTA BOLSA", "centro");
+    p.texto(P.f.pesos(declarado), "centro");
+    lineaDiferencia(p, declarado - esperado);
+    if (c.estado === "CERRADO") {
+      var recibido = ventas ? c.recibido_ventas : c.recibido_cambio;
+      p.separar();
+      p.texto("RECIBIDA POR: " + (c.definitivo_usuario_nombre || ""));
+      if (recibido != null) p.par("RECIBIDO", P.f.pesos(recibido));
+    } else {
+      p.separar();
+      p.texto("GUARDAR CON LOS BILLETES HASTA QUE UN ADMINISTRADOR LA RECIBA", "centro");
+    }
+    p.firma("FIRMA DEL CAJERO");
+    p.firma("FIRMA DE QUIEN RECIBE");
+    return p.terminar(corte ? "cierre.corte" : "cierre");
+  }
+
+  function resumenCierre(datos, ancho) {
+    var c = datos.cierre, e = datos.empresa || {}, ef = datos.efectivo;
+    var temporal = c.tipo === "TEMPORAL";
+    var p = new Papel(ancho);
+    encabezado(p, e, c, temporal ? "*** CIERRE TEMPORAL ***" : "CIERRE DE CAJA");
+    datosDelCierre(p, c);
+    estadoDelCierre(p, c);
+    p.separar();
+    if (ef) {
+      p.texto("EFECTIVO DE CAMBIO");
+      p.par("SALDO INICIAL", P.f.pesos(ef.saldo_inicial));
+      p.par("AGREGADOS EN EL DIA", P.f.pesos(ef.agregados));
+      p.par("TOTAL CAMBIO", P.f.pesos(ef.cambio));
+      p.separar();
+      p.texto("EFECTIVO DE VENTAS Y COBROS");
+      p.par("VENTAS EN EFECTIVO", P.f.pesos(ef.ventas));
+      if (Number(ef.anulaciones)) p.par("ANULACIONES", negativo(ef.anulaciones));
+      if (Number(ef.otros_cobros)) p.par("OTROS COBROS", P.f.pesos(ef.otros_cobros));
+      p.par("TOTAL VENTAS Y COBROS", P.f.pesos(ef.cobros));
+      if (Number(ef.retiros)) { p.separar(); p.par("RETIROS DEL DIA", negativo(ef.retiros)); }
+    } else {
+      p.par("SALDO INICIAL", P.f.pesos(c.saldo_inicial));
+      p.par("INGRESOS", P.f.pesos(c.ingresos));
+      p.par("EGRESOS", P.f.pesos(c.egresos));
+    }
+    p.separar();
     p.par("EFECTIVO ESPERADO", P.f.pesos(c.saldo_esperado));
-    p.par("EFECTIVO CONTADO", P.f.pesos(c.efectivo_contado));
-    p.par(Number(c.diferencia) === 0 ? "SIN DIFERENCIA" : Number(c.diferencia) > 0 ? "SOBRANTE" : "FALTANTE", P.f.pesos(Math.abs(c.diferencia)));
-    p.par("RETIRO", P.f.pesos(c.retiro));
-    p.par("QUEDA EN CAJA", P.f.pesos(c.queda_en_caja));
+    if (temporal) {
+      p.par("BOLSA 1 RECAUDACION", P.f.pesos(c.efectivo_ventas));
+      p.par("BOLSA 2 CAMBIO", P.f.pesos(c.efectivo_cambio));
+      p.par("TOTAL EN LAS BOLSAS", P.f.pesos(c.efectivo_contado));
+      lineaDiferencia(p, c.diferencia);
+      p.par("QUEDA EN CAJA", P.f.pesos(0));
+      if (c.estado === "CERRADO") {
+        p.separar();
+        p.texto("RECIBIDO EN EL CIERRE DEFINITIVO");
+        p.par("BOLSA 1 RECAUDACION", P.f.pesos(c.recibido_ventas));
+        p.par("BOLSA 2 CAMBIO", P.f.pesos(c.recibido_cambio));
+        lineaDiferencia(p, c.diferencia_recepcion, "VS. DECLARADO:");
+        if (c.observaciones_definitivo) p.texto("OBS.: " + c.observaciones_definitivo);
+      }
+    } else {
+      p.par("EFECTIVO CONTADO", P.f.pesos(c.efectivo_contado));
+      lineaDiferencia(p, c.diferencia);
+      p.par("RETIRO", P.f.pesos(c.retiro));
+      p.par("QUEDA EN CAJA", P.f.pesos(c.queda_en_caja));
+    }
     p.separar();
     p.par("VENTAS (" + c.ventas_cantidad + ")", P.f.pesos(c.ventas_total));
     (datos.ventas_por_forma || []).forEach(function (v) {
@@ -195,7 +292,19 @@
     });
     if (c.observaciones) { p.separar(); p.texto("OBSERVACIONES: " + c.observaciones); }
     p.firma("FIRMA DEL CAJERO");
-    p.firma("FIRMA DE QUIEN RECIBE");
-    return imprimir([p.terminar("cierre")], ancho, "Cierre " + c.id);
+    p.firma(temporal && c.estado !== "CERRADO" ? "FIRMA DEL ADMINISTRADOR" : "FIRMA DE QUIEN RECIBE");
+    return p.terminar("cierre");
+  }
+
+  // opciones.resumen (por defecto sí) y opciones.bolsas (sólo cierres temporales).
+  P.imprimirCierre = function (datos, opciones) {
+    opciones = opciones || {};
+    var c = datos.cierre;
+    var ancho = datos.ancho || (P.puesto() || {}).ancho_ticket;
+    var partes = [];
+    if (opciones.resumen !== false) partes.push(resumenCierre(datos, ancho));
+    // Cada bolsa sale en su propio papel; el primero arranca donde está el rollo.
+    if (opciones.bolsas && c.tipo === "TEMPORAL") partes.push(etiquetaBolsa(datos, "ventas", ancho, partes.length > 0), etiquetaBolsa(datos, "cambio", ancho, true));
+    return imprimir(partes, ancho, (c.tipo === "TEMPORAL" ? "Cierre temporal " : "Cierre ") + c.id);
   };
 })();

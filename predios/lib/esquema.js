@@ -349,8 +349,30 @@ const TABLAS = {
       retiro: "money",
       queda_en_caja: "money",
       observaciones: "str:255",
+      // DEFINITIVO (lo hace un administrador) o TEMPORAL (el cajero se fue sin un
+      // administrador: el efectivo quedó en dos bolsas). NULL = definitivo anterior.
+      tipo: "str:12",
+      // TEMPORAL: PENDIENTE hasta que un administrador recibe las bolsas; después CERRADO.
+      estado: "str:12",
+      turno_id: "int",
+      turno_inicio: "dt",
+      turno_usuario_nombre: "str:120",
+      // Lo que el sistema esperaba en cada bolsa y lo que declaró el cajero.
+      esperado_ventas: "money",
+      esperado_cambio: "money",
+      efectivo_ventas: "money",
+      efectivo_cambio: "money",
+      efectivo_detalle: "text",
+      autorizacion: "str:20",
+      definitivo_fecha: "dt",
+      definitivo_usuario_id: "int",
+      definitivo_usuario_nombre: "str:120",
+      recibido_ventas: "money",
+      recibido_cambio: "money",
+      diferencia_recepcion: "money",
+      observaciones_definitivo: "str:255",
     },
-    indices: [["caja_id"], ["fecha"]],
+    indices: [["caja_id"], ["fecha"], ["tipo", "estado"]],
   },
   predio_venta: {
     columnas: {

@@ -57,6 +57,11 @@
           pendientes.push(h("li", h("div", h("strong", a.boca + " · " + a.caja), h("div.texto-3.chico", "El saldo de apertura (" + P.f.pesos(a.importe) + ") no coincide" + (a.observacion ? ": " + a.observacion : ""))),
             P.btn("Revisar", { tipo: "secundario", chico: true, onclick: function () { P.ruta.ir("/caja"); } })));
         });
+        if (avisos.cierres_temporales) {
+          pendientes.push(h("li", h("div", h("strong", "Cierres temporales por recibir"),
+            h("div.texto-3.chico", avisos.cierres_temporales + (avisos.cierres_temporales === 1 ? " caja quedó" : " cajas quedaron") + " con las bolsas de recaudación y cambio esperando el cierre definitivo")),
+            P.btn("Recibir", { tipo: "secundario", chico: true, onclick: function () { P.ruta.ir("/caja"); } })));
+        }
         if (avisos.solicitudes_despachar || avisos.solicitudes_recibir) {
           pendientes.push(h("li", h("div", h("strong", "Solicitudes entre bocas"), h("div.texto-3.chico", avisos.solicitudes_despachar + " para despachar · " + avisos.solicitudes_recibir + " en camino")),
             P.btn("Ver", { tipo: "secundario", chico: true, onclick: function () { P.ruta.ir("/gestion/solicitudes"); } })));
@@ -73,7 +78,8 @@
               var ap = cj.apertura;
               return h("li", h("div",
                 h("strong", cj.boca + " · " + cj.nombre),
-                h("div.texto-3.chico", cj.turno ? "Atiende " + cj.turno.usuario_nombre : "Sin turno abierto")),
+                h("div.texto-3.chico", (cj.turno ? "Atiende " + cj.turno.usuario_nombre : "Sin turno abierto") +
+                  (cj.temporales_pendientes ? " · " + cj.temporales_pendientes + (cj.temporales_pendientes === 1 ? " cierre temporal por recibir" : " cierres temporales por recibir") : ""))),
                 h("div", { style: { textAlign: "right" } }, h("strong.dinero", P.f.pesos(cj.saldo)), h("div", { style: { marginTop: "4px" } },
                   !ap ? P.chip("Sin saldo de apertura", "VENCIDO") : ap.verificacion === "CORRECTO" ? P.chip("Apertura confirmada", "CORRECTO") : ap.verificacion === "NO_COINCIDE" ? P.chip("Apertura no coincide", "NO_COINCIDE") : P.chip("Apertura sin confirmar", "PENDIENTE"))));
             })) : h("p.texto-3", "No hay cajas. Crealas en Gestión > Bocas y cajas.")));
