@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const { crearSqlite, asegurarEsquema } = require("../lib/db-sqlite");
 const { sembrarPredio } = require("../lib/semilla");
 const N = require("../lib/negocio");
+const U = require("../lib/util");
 const api = require("../lib/api");
 
 async function escenario(t) {
@@ -31,25 +32,29 @@ test("la comanda se conserva por caja y sólo su operador o un administrador pue
   assert.equal(respuesta.imprimir_comanda, false);
 });
 
-test("salir de caja cierra sólo el turno propio y conserva sesión sin caja ni movimientos de dinero", async t => {
-  const { db, ctx, cajas, llamar } = await escenario(t);
-  const caja = cajas[0];
-  const turno = await db.tx(tx => N.insertar(tx, ctx, "predio_turno", { usuario_id: 1, caja_id: caja.id, boca_id: caja.boca_id, inicio: "2026-11-05 09:00:00", estado: "ABIERTO" }));
-  await db.run("INSERT INTO predio_sesion(token_hash,usuario_id,creada,boca_id,caja_id,turno_id) VALUES ('sesion',1,'2026-11-05',?,?,?)", [caja.boca_id, caja.id, turno]);
-  const respuesta = await llamar({ ...ctx, sesion: { token_hash: "sesion", boca_id: caja.boca_id, caja_id: caja.id, turno_id: turno } }, "POST", "/sesion/salir-puesto");
-  assert.equal(respuesta.puesto, null);
-  assert.equal(respuesta.usuario.id, 1);
-  assert.equal((await db.get("SELECT estado FROM predio_turno WHERE id=?", [turno])).estado, "CERRADO");
-  const sesion = await db.get("SELECT * FROM predio_sesion WHERE token_hash='sesion'");
-  assert.equal(sesion.caja_id, null); assert.equal(sesion.boca_id, null); assert.equal(sesion.turno_id, null);
-  assert.equal((await db.get("SELECT COUNT(*) n FROM predio_caja_movimiento")).n, 0);
-  assert.equal((await llamar(ctx, "GET", "/sesion")).puesto, null);
+test("salir o cambiar de puesto exige cerrar la caja, incluso al administrador", async t => {
+  const { db, ctx, cajas: [caja, otra], llamar } = await escenario(t);
+  await db.run("INSERT INTO predio_sesion(token_hash,usuario_id,creada) VALUES ('sesion',1,'2026-11-05')");
+  const admin = { ...ctx, sesion: { token_hash: "sesion" } };
+  const ingreso = await llamar(admin, "POST", "/sesion/puesto", { boca_id: caja.boca_id, caja_id: caja.id });
+  Object.assign(admin.sesion, ingreso.puesto);
+  for (const ruta of ["/sesion/salir-puesto", "/logout", "/sesion/puesto"]) {
+    await assert.rejects(llamar(admin, "POST", ruta, { boca_id: otra.boca_id, caja_id: otra.id }), { codigo: "TURNO_ABIERTO" });
+  }
+  await assert.rejects(llamar(admin, "POST", "/caja/cierre", { efectivo_contado: 0 }), { codigo: "CLAVE_CIERRE_REQUERIDA" });
+  const { clave } = await llamar(admin, "POST", "/caja/cierre/clave", { caja_id: caja.id });
+  await llamar(admin, "POST", "/caja/cierre", { efectivo_contado: 0, clave });
+  assert.equal((await db.get("SELECT estado FROM predio_turno WHERE id=?", [ingreso.puesto.turno_id])).estado, "CERRADO");
+  assert.equal((await db.get("SELECT turno_id FROM predio_sesion WHERE token_hash='sesion'")).turno_id, null);
+  await assert.rejects(llamar(admin, "POST", "/caja/cierre", { caja_id: caja.id, efectivo_contado: 0, clave }), { codigo: "CLAVE_CIERRE_REQUERIDA" });
+  await llamar(admin, "POST", "/logout");
+  assert.equal((await db.get("SELECT COUNT(*) n FROM predio_sesion")).n, 0);
 });
 
 test("administrar otra caja conserva el turno del puesto y separa los movimientos de cada caja", async t => {
   const { db, ctx, cajas: [propia, otra], llamar } = await escenario(t);
   const turno = await N.insertar(db, ctx, "predio_turno", {
-    usuario_id: 1, caja_id: propia.id, boca_id: propia.boca_id, inicio: "2026-11-05 09:00:00", estado: "ABIERTO",
+    usuario_id: 1, caja_id: propia.id, boca_id: propia.boca_id, inicio: U.hoy() + " 09:00:00", estado: "ABIERTO",
   });
   const admin = { ...ctx, sesion: { caja_id: propia.id, boca_id: propia.boca_id, turno_id: turno } };
   await llamar(admin, "POST", "/caja/apertura", { caja_id: propia.id, importe: 100 });
@@ -63,7 +68,8 @@ test("administrar otra caja conserva el turno del puesto y separa los movimiento
     boca_id: otra.boca_id, caja_id: otra.id, fecha: "2026-11-05 10:00:00", forma_pago: "EFECTIVO", estado: "CONFIRMADA", total: 10,
   });
   await llamar(admin, "POST", `/ventas/${venta}/anular`, { motivo: "Error de carga" });
-  await llamar(admin, "POST", "/caja/cierre", { caja_id: otra.id, efectivo_contado: 185, queda_en_caja: 40 });
+  const { clave } = await llamar(admin, "POST", "/caja/cierre/clave", { caja_id: otra.id });
+  await llamar(admin, "POST", "/caja/cierre", { caja_id: otra.id, clave, efectivo_contado: 185, queda_en_caja: 40 });
   const movimientos = await db.all("SELECT caja_id, turno_id FROM predio_caja_movimiento WHERE caja_id = ?", [otra.id]);
   assert.equal(movimientos.length, 4);
   assert.ok(movimientos.every(m => m.turno_id === null));
@@ -78,4 +84,63 @@ test("administrar otra caja conserva el turno del puesto y separa los movimiento
   assert.equal(metaCierres.columnas.find(c => c.clave === "saldo").titulo, "Saldo");
   assert.equal((await llamar(admin, "GET", "/caja/estado")).resumen.saldo_esperado, 100);
   assert.deepEqual(await db.all("SELECT id, estado FROM predio_turno"), [{ id: turno, estado: "ABIERTO" }]);
+});
+
+test("dos usuarios compiten por una caja, el titular retoma su turno y el relevo puede empezar a las 2", async t => {
+  const { db, ctx, cajas: [caja], llamar } = await escenario(t);
+  const acceso = require("../lib/api/sesion").autenticar;
+  const clave = "Turno-nuevo24";
+  const puesto = { boca_id: caja.boca_id, caja_id: caja.id };
+  const usuarios = ["ana", "juan"];
+  await db.tx(async tx => {
+    for (const usuario of usuarios) {
+      const id = await N.insertar(tx, ctx, "predio_usuario", { usuario, nombre: usuario, rol: "CAJERO", activo: 1, password_hash: U.hashPassword(clave) });
+      await N.insertar(tx, ctx, "predio_usuario_boca", { usuario_id: id, boca_id: caja.boca_id });
+    }
+  });
+  const login = usuario => llamar(ctx, "POST", "/login", { usuario, password: clave });
+  const autenticar = async token => ({ ...ctx, ...await acceso(ctx, token) });
+  const sesiones = await Promise.all(usuarios.map(login));
+  const actores = await Promise.all(sesiones.map(s => autenticar(s.token)));
+  const resultados = await Promise.allSettled(actores.map(a => llamar(a, "POST", "/sesion/puesto", puesto)));
+  assert.equal(resultados.filter(r => r.status === "fulfilled").length, 1);
+  const i = resultados.findIndex(r => r.status === "fulfilled"), otro = 1 - i;
+  assert.equal(resultados[otro].reason.codigo, "CAJA_OCUPADA");
+  const primero = await autenticar(sesiones[i].token);
+  const turno = primero.sesion.turno_id;
+  // La apertura, la primera venta y la segunda pertenecen al mismo turno aunque
+  // los comprobantes tengan fechas civiles distintas.
+  const inicio = "2026-11-05 23:00:00", madrugada = "2026-11-06 02:00:00";
+  await db.run("UPDATE predio_turno SET inicio=? WHERE id=?", [inicio, turno]);
+  await llamar(ctx, "POST", "/caja/apertura", { caja_id: caja.id, importe: 15, fecha: inicio.slice(0, 10) });
+  await assert.rejects(llamar(ctx, "POST", "/caja/apertura", { caja_id: caja.id, importe: 0, fecha: madrugada.slice(0, 10) }), { status: 409 });
+  await db.tx(async tx => {
+    for (const fecha of ["2026-11-05 23:59:59", "2026-11-06 01:59:59"]) {
+      await N.insertar(tx, ctx, "predio_venta", { ...puesto, turno_id: turno, usuario_id: primero.usuario.id, total: 25, forma_pago: "QR", estado: "CONFIRMADA", fecha });
+    }
+  });
+  const panel = await llamar(ctx, "GET", "/caja/panel");
+  assert.equal(panel.cajas.find(c => c.id === caja.id).turno.usuario_nombre, usuarios[i]);
+  // El navegador original pierde su token. El dueño puede retomar la misma caja.
+  const reingreso = await login(usuarios[i]);
+  assert.equal(reingreso.puesto.turno_id, turno);
+  assert.equal((await autenticar(sesiones[i].token)).sesion.turno_id, null);
+  await assert.rejects(llamar(primero, "POST", "/caja/cierre", { efectivo_contado: 15 }), { codigo: "SIN_PUESTO" });
+  const responsable = await autenticar(reingreso.token);
+  const estado = await llamar(responsable, "GET", "/caja/estado");
+  assert.equal(estado.apertura.fecha, "2026-11-05");
+  assert.equal(estado.resumen.ventas_cantidad, 2);
+  assert.equal(estado.resumen.ventas_total, 50);
+  await assert.rejects(llamar(responsable, "POST", "/caja/cierre/clave", puesto), { status: 403 });
+  await assert.rejects(llamar(responsable, "POST", "/caja/cierre", { efectivo_contado: 15, clave: U.claveDelDia() }), { status: 403 });
+  await db.run("UPDATE predio_usuario SET puede_cerrar_caja=1 WHERE id=?", [responsable.usuario.id]);
+  const delegado = await autenticar(reingreso.token);
+  const original = U.fechaHora;
+  t.mock.method(U, "fechaHora", fecha => fecha ? original(fecha) : madrugada);
+  const cierre = await llamar(delegado, "POST", "/caja/cierre", { efectivo_contado: 15, queda_en_caja: 15 });
+  assert.equal(cierre.diferencia, 0);
+  assert.equal((await db.get("SELECT fin FROM predio_turno WHERE id=?", [turno])).fin, madrugada);
+  const siguiente = await llamar(actores[otro], "POST", "/sesion/puesto", puesto);
+  assert.notEqual(siguiente.puesto.turno_id, turno);
+  await llamar(await autenticar(reingreso.token), "POST", "/logout");
 });

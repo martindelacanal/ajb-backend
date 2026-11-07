@@ -461,6 +461,7 @@ io.on("connection", (socket) => {
 server.listen(port);
 require("./api/services/usuarios-bienvenida").iniciarBienvenidas(mysqlConnection.promise());
 iniciarMantenimientoReservas(mysqlConnection.promise());
+require("./api/services/predios-inventario").iniciarInventario(mysqlConnection.promise());
 iniciarMantenimientoHolds(mysqlConnection.promise(), {
     onExpirados: async (holds) => {
         for (const hold of holds) {

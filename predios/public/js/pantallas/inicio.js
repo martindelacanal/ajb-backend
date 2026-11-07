@@ -39,10 +39,13 @@
             })) : h("p.texto-3", "Todavía no hay ventas."));
         var pendientes = [];
         (avisos.permisos || []).forEach(function (p) {
-          pendientes.push(h("li", h("div", h("strong", p.usuario_nombre), h("div.texto-3.chico", ({ SOLICITUD_PRODUCTO: "Pide permiso para pedir productos", ANULAR_VENTA: "Pide anular una venta", VER_VENTAS_CAJA: "Pide ver las ventas de la caja" })[p.tipo] + (p.boca ? " · " + p.boca : "") + (p.detalle ? " · " + p.detalle : ""))),
+          pendientes.push(h("li", h("div", h("strong", p.usuario_nombre), h("div.texto-3.chico", ({ SOLICITUD_PRODUCTO: "Pide permiso para pedir productos", ANULAR_VENTA: "Pide anular la venta N° " + p.referencia_id, VER_VENTAS_CAJA: "Pide ver las ventas de la caja" })[p.tipo] + (p.boca ? " · " + p.boca : "") + (p.detalle ? " · " + p.detalle : ""))),
             h("div.fila", { style: { gap: "6px", flexWrap: "nowrap" } },
               P.btn("Rechazar", { tipo: "peligro", chico: true, onclick: function (ev) { resolver(ev.currentTarget, p, false); } }),
-              P.btn("Aprobar", { tipo: "ok", chico: true, icono: "check", onclick: function (ev) { resolver(ev.currentTarget, p, true); } }))));
+              P.btn(p.tipo === "ANULAR_VENTA" ? "Ver venta" : "Aprobar", { tipo: "ok", chico: true, icono: "check", onclick: function (ev) {
+                if (p.tipo === "ANULAR_VENTA") P.verVenta(p.referencia_id, cargar);
+                else resolver(ev.currentTarget, p, true);
+              } }))));
         });
         (avisos.aperturas || []).forEach(function (a) {
           pendientes.push(h("li", h("div", h("strong", a.boca + " · " + a.caja), h("div.texto-3.chico", "El saldo de apertura (" + P.f.pesos(a.importe) + ") no coincide" + (a.observacion ? ": " + a.observacion : ""))),
@@ -53,8 +56,8 @@
             P.btn("Ver", { tipo: "secundario", chico: true, onclick: function () { P.ruta.ir("/gestion/solicitudes"); } })));
         }
         if (avisos.vencimientos) {
-          pendientes.push(h("li", h("div", h("strong", "Vencimientos"), h("div.texto-3.chico", avisos.vencimientos + " producto(s) vencidos o que vencen en 7 días")),
-            P.btn("Ver", { tipo: "secundario", chico: true, onclick: function () { P.cache["tabla:productos"] = { filtros: { vencimiento: "7" } }; P.ruta.ir("/gestion/productos"); } })));
+          pendientes.push(h("li", h("div", h("strong", "Vencimientos"), h("div.texto-3.chico", avisos.vencimientos + " producto(s) vencidos o dentro del plazo de aviso")),
+            P.btn("Ver", { tipo: "secundario", chico: true, onclick: function () { P.cache["tabla:productos"] = { filtros: { vencimiento: "aviso" } }; P.ruta.ir("/gestion/productos"); } })));
         }
         P.reemplazar(cuerpo, porBoca,
           h("section.hoja.hoja-cuerpo", h("h2.seccion-titulo", "Para resolver"),

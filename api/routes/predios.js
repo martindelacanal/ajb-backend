@@ -23,6 +23,8 @@ const propietario = require("../services/predios-propietario");
 const { validarAutorizacionHa } = require("../services/predios-ha");
 const { entregarAvisos } = require("../services/predios-avisos");
 const U = require("../../predios/lib/util");
+const claveCierre = require("../../predios/lib/clave-cierre");
+const clavesUsuario = require("../../predios/lib/claves-usuario");
 const apiPredio = require("../../predios/lib/api");
 const sesionPredio = require("../../predios/lib/api/sesion");
 const { crearMysql } = require("../../predios/lib/db-mysql");
@@ -49,6 +51,7 @@ function nombreUsuario(u) {
 // Ejecuta una operación de la API del predio como administrador general: lectura sobre la
 // réplica; escritura directa si todavía no hay notebook, o como orden para la notebook.
 async function ejecutarComoAdminGeneral(res, predio, usuario, { metodo, ruta, cuerpo, query }) {
+  if (ruta === "/sesion/clave") throw U.error("Cambiá tu contraseña desde el sistema general", 403);
   const nombre = `${nombreUsuario(usuario)} (sistema general)`;
   const db = crearMysql(pool(), { predioId: predio.id });
   const bocas = (await db.all("SELECT id FROM predio_boca WHERE predio_id = ?", [predio.id])).map((b) => Number(b.id));
@@ -101,22 +104,50 @@ function enviarResultado(res, r) {
   return res.json(r === undefined ? { ok: true } : r);
 }
 
-// Una notebook anterior podría confirmar una compra temporal o permitir un egreso sin saldo.
-function actorParaOrden(actor, ruta) {
-  if (/^\/(?:compras|productos|ventas|traspasos|solicitudes|bajas)(?:\/|$)/.test(ruta)) actor.capacidad = "stock-predio-v2";
+function prepararOrden(actor, ruta, cuerpo, cuenta, predioId, respuestaPrivada) {
+  // Solo esta frontera autenticada puede atestiguar un hash. Los secretos
+  // introducidos en el formulario nunca se guardan en la cola ni el pendrive.
+  const datos = { ...cuerpo };
+  if (/^\/(?:usuarios|altas|productos|permisos|caja)(?:\/|$)/.test(ruta) || ruta === "/sesion/clave" ||
+    /^\/(?:ventas\/\d+\/anular|afiliados\/\d+\/liquidaciones|recepcion\/\d+\/cuenta)$/.test(ruta)) {
+    actor.capacidad = "operacion-predio-v2";
+  } else if (/^\/(?:compras|ventas|traspasos|solicitudes|bajas)(?:\/|$)/.test(ruta)) actor.capacidad = "stock-predio-v2";
   else if (/^\/bocas(?:\/|$)/.test(ruta)) actor.capacidad = "precios-boca-v1";
-  return actor;
+  if (/^\/usuarios(?:\/\d+)?$/.test(ruta) && datos.password) {
+    clavesUsuario.validarNueva(datos.password, String(datos.usuario || "").trim().toLowerCase());
+    actor.hash_clave_validada = U.hashPassword(datos.password);
+    delete datos.password;
+  }
+  if (ruta === "/caja/cierre/clave" || ruta === "/caja/cierre") {
+    const cajaId = U.id(datos.caja_id, "La caja");
+    if (ruta === "/caja/cierre/clave") {
+      const { privada, registro } = claveCierre.nueva(predioId, cajaId);
+      Object.assign(respuestaPrivada, privada);
+      actor.emision_clave_cierre = registro;
+    } else {
+      actor.hash_clave_cierre = claveCierre.huella(predioId, cajaId, datos.clave);
+      if (!actor.hash_clave_cierre) throw U.error("Ingresá los ocho dígitos de la clave temporal de cierre.", 403);
+    }
+    delete datos.clave;
+  }
+  if (ruta === "/sesion/clave") {
+    actor.hash_clave_validada = clavesUsuario.hashDeCambio(cuenta, String(datos.actual || ""), datos.nueva);
+    return {};
+  }
+  return datos;
 }
 
 async function encolarYEsperar(res, predio, usuario, { metodo, ruta, cuerpo, query }) {
   const actor = { general_id: usuario.id, nombre: nombreUsuario(usuario), documento: usuario.documento };
+  const respuestaPrivada = {};
+  const datos = prepararOrden(actor, ruta, cuerpo, null, predio.id, respuestaPrivada);
   const [r] = await pool().query(
     "INSERT INTO predio_comando (predio_id, tipo, metodo, ruta, cuerpo, query, actor, descripcion, creado_por) VALUES (?, 'API', ?, ?, ?, ?, ?, ?, ?)",
-    [predio.id, metodo, ruta, JSON.stringify(cuerpo || {}), JSON.stringify(query || {}), JSON.stringify(actorParaOrden(actor, ruta)), `${metodo} ${ruta}`.slice(0, 255), usuario.id]);
-  return esperarComando(res, predio, r.insertId);
+    [predio.id, metodo, ruta, JSON.stringify(datos), JSON.stringify(query || {}), JSON.stringify(actor), `${metodo} ${ruta}`.slice(0, 255), usuario.id]);
+  return esperarComando(res, predio, r.insertId, respuestaPrivada);
 }
 
-async function esperarComando(res, predio, id) {
+async function esperarComando(res, predio, id, respuestaPrivada) {
   accesoRemoto.set(predio.codigo, Date.now());
   if (C.enLinea(predio)) {
     const limite = Date.now() + 15000;
@@ -126,7 +157,7 @@ async function esperarComando(res, predio, id) {
       if (c && (c.estado === "OK" || c.estado === "ERROR")) {
         let respuesta = null;
         try { respuesta = JSON.parse(c.resultado || "null"); } catch (_e) { respuesta = null; }
-        if (c.estado === "OK") return res.json(respuesta === null ? { ok: true } : respuesta);
+        if (c.estado === "OK") return res.json(respuestaPrivada?.clave ? respuestaPrivada : (respuesta === null ? { ok: true } : respuesta));
         return res.status(c.status && c.status >= 400 ? c.status : 500).json(respuesta || { mensaje: "El camping no pudo aplicar el cambio" });
       }
     }
@@ -149,7 +180,7 @@ async function contextoCuentaPredio(db, predio, cuenta, ip = null) {
   const bocas = (await db.all("SELECT id FROM predio_boca WHERE predio_id = ? AND activo = 1", [predio.id])).map(b => Number(b.id));
   const base = { db, pid: predio.id, modo: "central", origen: "REMOTO", ip, servicios: {},
     revisarPreciosCentral: predio.escritor === "CENTRAL",
-    usuario: { id: Number(cuenta.id), usuario: cuenta.usuario, nombre: cuenta.nombre, rol: "ADMIN", bocas, es_admin_general: false }, sesion: {} };
+    usuario: { id: Number(cuenta.id), usuario: cuenta.usuario, nombre: cuenta.nombre, rol: "ADMIN", bocas, es_admin_general: false, debe_cambiar_clave: !!Number(cuenta.debe_cambiar_clave) }, sesion: {} };
   base.alAvisosPrecios = (t, filas) => entregarAvisos({ query: async (sql, params) => {
     if (/^\s*SELECT/i.test(sql)) return [await t.all(sql, params)];
     const r = await t.run(sql, params); return [{ insertId: r.insertId }];
@@ -176,6 +207,11 @@ async function ejecutarComoAdminPredio(res, predio, cuenta, token, { metodo, rut
   try {
     await conexion.beginTransaction();
     const [[actual]] = await conexion.query("SELECT * FROM predio WHERE id = ? FOR UPDATE", [predio.id]);
+    // En REPEATABLE READ, tomar la caja antes de la primera lectura sin lock
+    // permite que el arqueo incluya cualquier movimiento que acaba de confirmar.
+    if (actual?.escritor === "CENTRAL" && ["/caja/cierre", "/caja/cierre/clave", "/caja/apertura", "/caja/ajuste"].includes(ruta)) {
+      await conexion.query("SELECT id FROM predio_caja WHERE predio_id=? AND id=? FOR UPDATE", [predio.id, U.id(cuerpo.caja_id, "La caja")]);
+    }
     const [[usuario]] = await conexion.query("SELECT * FROM predio_usuario WHERE predio_id = ? AND id = ? FOR UPDATE", [predio.id, cuenta.id]);
     // La validación posterior al lock une token, contraseña vigente y actor. Un
     // token viejo no puede tomar el hash nuevo después de un cambio de clave.
@@ -183,6 +219,7 @@ async function ejecutarComoAdminPredio(res, predio, cuenta, token, { metodo, rut
     if (!actual || !Number(actual.activo) || Number(vigente.predio_id) !== Number(actual.id) || Number(vigente.id) !== Number(cuenta.id)
       || !usuario || usuario.rol !== "ADMIN" || Number(usuario.activo) !== 1 || Number(usuario.es_admin_general) === 1) throw U.error("Tu cuenta ya no tiene acceso a este predio", 401, { codigo: "SIN_SESION" });
     const p = C.normalizar(actual);
+    clavesUsuario.exigirCambio(vigente, metodo, ruta);
     if (p.escritor === "CENTRAL") {
       // Todo el negocio comparte la transacción que bloqueó la identidad; no
       // crea un usuario del sistema general ni abre transacciones anidadas.
@@ -196,15 +233,17 @@ async function ejecutarComoAdminPredio(res, predio, cuenta, token, { metodo, rut
     } else {
       const [revisiones] = await conexion.query("SELECT id FROM predio_auditoria WHERE predio_id = ? AND entidad = 'usuario' AND entidad_id = ? ORDER BY id DESC LIMIT 1 FOR UPDATE", [p.id, usuario.id]);
       const actor = { tipo: "PREDIO", predio_id: Number(p.id), predio_usuario_id: Number(usuario.id), credencial_sha256: U.sha256(usuario.password_hash), cuenta_revision: Number(revisiones[0]?.id || 0) };
+      const respuestaPrivada = {};
+      const datos = prepararOrden(actor, ruta, cuerpo, usuario, p.id, respuestaPrivada);
       const [r] = await conexion.query(
         "INSERT INTO predio_comando (predio_id, tipo, metodo, ruta, cuerpo, query, actor, descripcion, creado_por) VALUES (?, 'API', ?, ?, ?, ?, ?, ?, ?)",
-        [p.id, metodo, ruta, JSON.stringify(cuerpo || {}), JSON.stringify(query || {}), JSON.stringify(actorParaOrden(actor, ruta)), `${metodo} ${ruta}`.slice(0, 255), null]);
-      salida = { comandoId: r.insertId, predio: p };
+        [p.id, metodo, ruta, JSON.stringify(datos), JSON.stringify(query || {}), JSON.stringify(actor), `${metodo} ${ruta}`.slice(0, 255), null]);
+      salida = { comandoId: r.insertId, predio: p, respuestaPrivada };
     }
     await conexion.commit();
   } catch (e) { await conexion.rollback(); throw e; }
   finally { conexion.release(); }
-  return salida.comandoId ? esperarComando(res, salida.predio, salida.comandoId) : enviarResultado(res, salida.resultado);
+  return salida.comandoId ? esperarComando(res, salida.predio, salida.comandoId, salida.respuestaPrivada) : enviarResultado(res, salida.resultado);
 }
 
 function crearRouterCuenta() {
@@ -319,7 +358,7 @@ function crearRouterAdmin() {
          WHERE predio_id = ? ORDER BY id DESC LIMIT 30`, [p.id]);
       const [eventos] = await pool().query("SELECT id, fecha, tipo, detalle FROM predio_evento WHERE predio_id = ? ORDER BY id DESC LIMIT 30", [p.id]);
       const [permisos] = await pool().query(
-        `SELECT x.id, x.tipo, x.usuario_nombre, x.detalle, x.fecha_solicitud, b.nombre AS boca FROM predio_permiso x
+        `SELECT x.id, x.tipo, x.referencia_id, x.usuario_nombre, x.detalle, x.fecha_solicitud, b.nombre AS boca FROM predio_permiso x
          LEFT JOIN predio_boca b ON b.predio_id = x.predio_id AND b.id = x.boca_id
          WHERE x.predio_id = ? AND x.estado = 'PENDIENTE' ORDER BY x.id DESC LIMIT 20`, [p.id]);
       res.json({
@@ -332,7 +371,8 @@ function crearRouterAdmin() {
           return n;
         }),
         eventos: eventos.map(C.normalizar),
-        permisos: permisos.map((x) => ({ ...C.normalizar(x), tipo_texto: textoDe(TIPOS_PERMISO, x.tipo) })),
+        permisos: permisos.map((x) => ({ ...C.normalizar(x), tipo_texto: x.tipo === "ANULAR_VENTA"
+          ? `anular el ticket N° ${x.referencia_id}. Al aprobar se registra la anulación` : textoDe(TIPOS_PERMISO, x.tipo) })),
       });
     } catch (e) { responderError(res, e); }
   });
@@ -402,6 +442,7 @@ function crearRouterAdmin() {
         comandos: serializadas.filter(c => !c.actor?.capacidad),
         comandos_precios: serializadas.filter(c => c.actor?.capacidad === "precios-boca-v1"),
         comandos_stock: serializadas.filter(c => c.actor?.capacidad === "stock-predio-v2"),
+        comandos_operacion: serializadas.filter(c => c.actor?.capacidad === "operacion-predio-v2"),
       };
       if (req.query.codigo === "1") {
         const paquete = C.paqueteCodigo();
@@ -458,6 +499,11 @@ function crearRouterAdmin() {
       if (!c) throw U.error("No encontramos la orden", 404);
       const n = C.normalizar(c);
       try { n.resultado = JSON.parse(n.resultado || "null"); } catch (_e) { /* texto */ }
+      if (String(c.ruta).startsWith("/caja/cierre")) {
+        delete n.cuerpo;
+        delete n.actor;
+        delete n.query;
+      }
       res.json({ comando: n });
     } catch (e) { responderError(res, e); }
   });
@@ -597,7 +643,8 @@ function crearRouterSync() {
         await crearNotificacion(pool(), {
           usuarioId: a.id,
           tipo: "PREDIO_PERMISO_PENDIENTE",
-          titulo: `${p.nombre}: ${permiso.usuario_nombre || "un usuario"} pide autorización`,
+          titulo: permiso.tipo === "ANULAR_VENTA" ? `${p.nombre}: pedido de anulación del ticket N° ${permiso.referencia_id}`
+            : `${p.nombre}: ${permiso.usuario_nombre || "un usuario"} pide autorización`,
           mensaje: `Para ${textoDe(TIPOS_PERMISO, permiso.tipo).toLowerCase()}${permiso.detalle ? ` (${permiso.detalle})` : ""}. Podés aprobarlo desde Predios.`,
           payload: { predio: p.codigo, permiso_id: permiso.id },
         });
@@ -615,8 +662,10 @@ function crearRouterSync() {
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.tipo')), '') <> 'PREDIO')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'precios-boca-v1')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'stock-predio-v2')
+             AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'operacion-predio-v2')
            ORDER BY id LIMIT 20`, [p.id, capacidades.includes("cuentas-predio-v1") ? 1 : 0,
-             capacidades.includes("precios-boca-v1") ? 1 : 0, capacidades.includes("stock-predio-v2") ? 1 : 0]);
+             capacidades.includes("precios-boca-v1") ? 1 : 0, capacidades.includes("stock-predio-v2") ? 1 : 0,
+             capacidades.includes("operacion-predio-v2") ? 1 : 0]);
         if (filas.length) {
           await conexion.query(`UPDATE predio_comando SET estado = 'ENTREGADO', entregado_en = NOW(), intentos = intentos + 1 WHERE id IN (?)`, [filas.map(c => c.id)]);
         }
@@ -775,6 +824,7 @@ function crearRouterApp() {
       const { usuario, predio, cuentaPredio, token } = await autenticar(req);
       const ruta = `/${req.params[0]}`.replace(/\/+$/, "") || "/";
       const metodo = req.method === "HEAD" ? "GET" : req.method;
+      clavesUsuario.exigirCambio(usuario, metodo, ruta);
       const nombre = `${nombreUsuario(usuario)} (sistema general)`;
       const db = crearMysql(pool(), { predioId: predio.id });
       const bocas = (await db.all("SELECT id FROM predio_boca WHERE predio_id = ?", [predio.id])).map((b) => Number(b.id));
@@ -784,6 +834,7 @@ function crearRouterApp() {
         sesion: {}, query: { ...req.query }, body: req.body && typeof req.body === "object" ? req.body : {},
       };
       if (metodo === "GET" && ruta === "/sesion") {
+        if (base.usuario.debe_cambiar_clave) return res.json({ usuario: { ...base.usuario, bocas: [] }, puestos: [], puesto: null, predio: { nombre: predio.nombre } });
         const config = await db.all("SELECT clave, valor FROM predio_config WHERE predio_id = ?", [predio.id]);
         const nombrePredio = config.find((c) => c.clave === "nombre_predio")?.valor || predio.nombre;
         return res.json({

@@ -153,7 +153,7 @@
       P.ejecutar(boton, function () {
         return P.post("/login", Object.assign({ usuario: usuario.value.trim(), password: clave.value, recordar: recordar.checked }, P.equipo.datos()), { sinRedireccion: true }).then(function (r) {
           P.sesion.guardar(r.token, recordar.checked);
-          P.alIngresar(r);
+          P.alIngresar(r, clave.value);
         });
       }).catch(function (e) { error.mostrar(e.message); clave.select(); });
     });
@@ -164,7 +164,7 @@
     var nombre = P.input({ placeholder: "Nombre y apellido" });
     var usuario = P.input({ placeholder: "Por ejemplo: administracion" });
     usuario.setAttribute("autocapitalize", "none");
-    var clave = P.input({ tipo: "password", placeholder: "Al menos 4 caracteres", autocomplete: "new-password" });
+    var clave = P.input({ tipo: "password", placeholder: "Al menos 6 caracteres", autocomplete: "new-password" });
     var repetir = P.input({ tipo: "password", placeholder: "Otra vez la misma", autocomplete: "new-password" });
     var error = cajaError();
     var boton = botonIngresar("Crear administrador e ingresar");
@@ -192,6 +192,49 @@
     return form;
   }
 
+  P.pantallaCambioClave = function (app, claveDeIngreso) {
+    var actual = claveDeIngreso ? null : P.input({ tipo: "password", autocomplete: "current-password" });
+    var nueva = P.input({ tipo: "password", autocomplete: "new-password" });
+    var repetir = P.input({ tipo: "password", autocomplete: "new-password" });
+    var boton = botonIngresar("Guardar mi contraseña");
+    var error = cajaError();
+    var form = h("form.lg-form", h("h1.lg-titulo.lg-titulo-chico", "Elegí tu contraseña"),
+      h("p.lg-bajada", "Usá al menos 6 caracteres. Evitá tu usuario, secuencias y repeticiones."),
+      actual ? campoLg("Contraseña temporal", "candado", actual, true) : null,
+      campoLg("Nueva contraseña", "candado", nueva, true), campoLg("Repetí la nueva contraseña", "candado", repetir, true), error, boton);
+    function cerrar() {
+      P.post("/logout", {}, { sinRedireccion: true }).then(reingresar).catch(function (e) {
+        if (e.status === 401) reingresar();
+        else error.mostrar(e.message);
+      });
+    }
+    function reingresar() {
+      P.sesion.borrar();
+      if (P.notificarCierreRemoto) P.notificarCierreRemoto();
+      else location.reload();
+    }
+    var salir = P.btn("Cerrar sesión", { tipo: "texto", onclick: cerrar });
+    var tarjeta = h("section.lg-tarjeta", form, salir);
+    P.reemplazar(app, h("main.lg", h("div.lg-escenario", h("div.lg-interior", tarjeta))));
+    (actual || nueva).focus();
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      error.ocultar();
+      if (nueva.value !== repetir.value) { error.mostrar("Las contraseñas no coinciden."); repetir.focus(); return; }
+      P.ejecutar(boton, function () {
+        return P.post("/sesion/clave", { actual: claveDeIngreso || actual.value, nueva: nueva.value }).then(function (r) {
+          if (P.modo === "remoto") {
+            P.reemplazar(tarjeta, h("h1.lg-titulo.lg-titulo-chico", r.encolado ? "Cambio pendiente" : "Contraseña actualizada"),
+              h("p.lg-bajada", r.encolado ? "Tu cambio quedó pendiente de sincronización con el camping. Cuando se aplique, ingresá con tu nueva contraseña." : "Volvé a ingresar a Mi AJB con tu nueva contraseña."),
+              P.btn("Volver al ingreso", { tipo: "primario", onclick: reingresar }));
+            return;
+          }
+          return P.get("/sesion").then(function (ses) { P.alIngresar(ses); });
+        });
+      }).catch(function (e) { error.mostrar(e.message); });
+    });
+  };
+
   // ------------------------------------------------------------------ elegir boca y caja
   P.elegirPuesto = function (boca_id, caja_id) {
     return P.post("/sesion/puesto", Object.assign({ boca_id: boca_id, caja_id: caja_id || null }, P.equipo.datos())).then(function (r) {
@@ -201,27 +244,15 @@
     });
   };
 
-  P.salirDeCaja = function () {
-    return P.post("/sesion/salir-puesto", {}).then(function (r) {
-      return r.usuario ? r : P.get("/sesion");
-    }).then(function (sesion) {
-      P.estado.sesion = sesion;
-      P.repintarMarco();
-      P.ruta.ir("/inicio");
-      P.aviso("Saliste de la caja y volviste a administración", "ok");
-    });
-  };
-
   P.pantallaPuesto = function (contenedor) {
     var ses = P.estado.sesion;
     var puestos = (ses.puestos || []).filter(function (p) { return P.esAdmin() ? p.cajas.length : true; });
     contenedor.appendChild(h("div.pagina-cabecera", h("div",
       h("h1.titulo-pagina", P.esAdmin() ? "Trabajar en una caja" : "¿Dónde trabajás hoy?"),
-      h("p.subtitulo", P.esAdmin() ? "Elegí la caja para vender o cerrar caja como administrador." : "Elegí tu boca y la caja. Podés cambiarla después desde tu nombre, arriba a la derecha."))));
-    if (P.esAdmin() && P.puesto() && P.puesto().caja_id) {
-      contenedor.appendChild(P.btn("Salir de caja y volver a administración", { tipo: "secundario", icono: "salir", onclick: function (ev) {
-        P.ejecutar(ev.currentTarget, P.salirDeCaja).catch(function () {});
-      } }));
+      h("p.subtitulo", P.esAdmin() ? "Elegí la caja para vender o cerrar caja como administrador." : "Elegí tu boca y caja. Al cerrar tu turno, la caja queda disponible para el relevo."))));
+    if (P.puesto() && P.puesto().caja_id) {
+      contenedor.appendChild(P.btn("Cerrar " + P.puesto().caja, { tipo: "primario", icono: "candado", onclick: function () { P.cerrarCaja(P.puesto().caja_id); } }));
+      return;
     }
     if (!puestos.length) {
       contenedor.appendChild(h("div.hoja.hoja-cuerpo", P.mensaje("No tenés bocas asignadas. Pedile al administrador que te asigne una.", "aviso")));

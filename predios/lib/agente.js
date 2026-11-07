@@ -103,7 +103,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
   async function pedir(metodo, ruta, { cuerpo, binario = false, timeout = 20000, crudo = false } = {}) {
     const url = `${String(config.servidor).replace(/\/+$/, "")}/predios-sync${ruta}`;
     const cabeceras = { Authorization: `Bearer ${config.token}`, "X-Predio": String(config.predio_codigo || ""), "X-Predio-Instancia": instancia, "X-Predio-Equipo": equipoId };
-    cabeceras["X-Predio-Capacidades"] = "cuentas-predio-v1,precios-boca-v1,stock-predio-v2";
+    cabeceras["X-Predio-Capacidades"] = "cuentas-predio-v1,precios-boca-v1,stock-predio-v2,operacion-predio-v2";
     if (!/^\/(?:version|codigo)(?:\?|$)/.test(ruta)) {
       if (!puedeSincronizar()) throw U.error("Esta PC está en espera: sólo el servidor actual sincroniza con el sistema general", 503);
       if (grupoLocal().habilitado) {
@@ -209,13 +209,13 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
   }
 
   function insertarFilas(tabla, filas) {
-    const cols = Object.keys(columnasDe(tabla));
-    const st = db.conexion.prepare(`INSERT OR REPLACE INTO ${tabla} (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`);
+    const disponibles = Object.keys(columnasDe(tabla));
+    const sentencias = new Map();
     for (const fila of filas) {
-      st.run(...cols.map((c) => {
-        const v = c === "predio_id" ? pid : fila[c];
-        return v === undefined ? null : v;
-      }));
+      const cols = disponibles.filter(c => c === "predio_id" || Object.hasOwn(fila, c));
+      const campos = cols.join(", ");
+      if (!sentencias.has(campos)) sentencias.set(campos, db.conexion.prepare(`INSERT OR REPLACE INTO ${tabla} (${campos}) VALUES (${cols.map(() => "?").join(", ")})`));
+      sentencias.get(campos).run(...cols.map(c => c === "predio_id" ? pid : fila[c]));
     }
   }
 
@@ -228,6 +228,9 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
         if (!tablas[tabla]) continue;
         db.conexion.prepare(`DELETE FROM ${tabla} WHERE predio_id = ?`).run(pid);
         insertarFilas(tabla, tablas[tabla]);
+      }
+      if (tablas.predio_usuario?.some(u => !Object.hasOwn(u, "debe_cambiar_clave")) && Array.isArray(tablas.predio_auditoria)) {
+        db.conexion.exec(require("./claves-usuario").SQL_MARCAR_TEMPORALES);
       }
       db.conexion.prepare("DELETE FROM predio_secuencia").run();
       const max = db.conexion.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM predio_outbox").get();
@@ -560,7 +563,8 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
       estado.maestros = { ...resumen.maestros, fecha: U.fechaHora(), afiliados: (datos.maestros.afiliados || []).length };
       await guardarMeta("maestros_resumen", JSON.stringify(estado.maestros));
     }
-    for (const c of [...(datos.comandos || []), ...(datos.comandos_precios || []), ...(datos.comandos_stock || [])].sort((a, b) => a.id - b.id)) {
+    const comandos = [...(datos.comandos || []), ...(datos.comandos_precios || []), ...(datos.comandos_stock || []), ...(datos.comandos_operacion || [])];
+    for (const c of comandos.sort((a, b) => a.id - b.id)) {
       const r = await ejecutarComando(c);
       resumen.comandos++;
       if (!r.ok) resumen.errores++;

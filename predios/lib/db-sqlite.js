@@ -242,6 +242,10 @@ function asegurarEsquema(db) {
     db.exec(`CREATE TRIGGER IF NOT EXISTS "trg_${tabla}_ad" AFTER DELETE ON "${tabla}" BEGIN INSERT INTO predio_outbox (tabla, fila_id, op) VALUES ('${tabla}', OLD.id, 'D'); END`);
   }
   db.exec("CREATE INDEX IF NOT EXISTS ix_outbox_tabla_fila ON predio_outbox (tabla, fila_id)");
+  if (!leerMeta(db, "claves_emitidas_v1")) {
+    db.exec(require("./claves-usuario").SQL_MARCAR_TEMPORALES);
+    escribirMeta(db, "claves_emitidas_v1", "1");
+  }
 }
 
 function leerMeta(db, clave) {

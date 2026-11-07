@@ -133,7 +133,9 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
   (`Rename-Computer`, corre como SYSTEM) y abre UDP 137/5353/5355 en el firewall.
   Las PCs entran con `http://nombre:puerto`, que Windows resuelve solo por NetBIOS/LLMNR.
   El nombre nuevo se aplica al reiniciar, y desde la misma pantalla se puede reiniciar la notebook.
-- Las contraseñas de usuarios del camping tienen como mínimo 4 caracteres.
+- La contraseña creada o restablecida por administración se reemplaza al ingresar.
+  La nueva clave debe tener entre 6 y 128 caracteres. Se rechazan las secuencias,
+  las repeticiones simples y el nombre del usuario.
 - Desde el quinto intento de contraseña incorrecta se avisa al dueño de la cuenta,
   cualquiera sea su rol. Se informa la cantidad, los horarios, la IP, el dispositivo
   y la última boca/caja registrada. El décimo fallo bloquea la cuenta y la PC durante
@@ -175,9 +177,21 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
 - Cada caja conserva su opción «Imprimir comanda». El ticket del cliente y la copia
   completa marcada COMANDA se imprimen en un único trabajo. La opción se sincroniza
   y no afecta a las demás cajas.
-- Un administrador puede salir del puesto desde Ventas, el menú o la selección de
-  cajas sin elegir otra. Se cierra su turno y se libera su puesto; sigue autenticado
-  para administrar y no se altera el dinero de la caja.
+- Cada caja tiene un responsable hasta el cierre. Si se interrumpe la conexión,
+  al volver a ingresar recupera su turno. El panel de cajas muestra quién atiende.
+  Un turno que cruza la medianoche conserva su apertura y se cierra a la hora real.
+- Administración genera en la caja un código de cierre de un uso, válido durante
+  cinco minutos. En Usuarios puede delegar «Cerrar caja» y «Anular tickets» por
+  separado. El cajero con permiso de cierre puede cerrar su propio turno.
+- Sin permiso de anulación, el cajero solicita anular el ticket e indica el motivo.
+  El administrador puede abrir la solicitud desde la campana o filtrar las ventas
+  pendientes de anulación. La confirmación revierte el movimiento de la venta.
+- En Productos y stock, «Sumar stock» registra unidades recibidas por donación o
+  ajuste de recuento. El historial conserva boca, motivo, cantidad y responsable.
+  Mi AJB envía a sus administradores el recuento mensual de ajustes por predio.
+- En los perecederos con stock y fecha de caducidad, el personal recibe el aviso
+  con la anticipación configurada en el producto (7 días por defecto). A los
+  administradores de Mi AJB se les avisa con un mes calendario de anticipación.
 
 ## Precios, compras y recordatorios
 

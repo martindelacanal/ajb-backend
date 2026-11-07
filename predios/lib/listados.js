@@ -7,6 +7,7 @@
 const { error, hoy, sumarDias, esFechaIso, redondear } = require("./util");
 const { limiteRevision, fechaRevisionSql, historialRevisionSql } = require("./precios");
 const { precioGeneralSql, precioBocaSql, joinMargenSql } = require("./precio-boca");
+const { condicionVencimiento } = require("./vencimientos");
 const Porciones = require("./porciones");
 
 const DESTINOS = [
@@ -40,6 +41,7 @@ const ESTADOS_SOLICITUD = [
   { valor: "ANULADA", texto: "Anulada" },
 ];
 const TIPOS_MOVIMIENTO = [
+  { valor: "ALTA", texto: "Alta de stock" },
   { valor: "ALTA_INICIAL", texto: "Alta inicial" },
   { valor: "COMPRA", texto: "Compra" },
   { valor: "COMPRA_TEMPORAL", texto: "Recepción temporal" },
@@ -142,6 +144,7 @@ L.productos = {
     { clave: "destino", titulo: "Destino", expr: "p.destino", tipo: "opcion", opciones: DESTINOS },
     { clave: "perecedero", titulo: "Perecedero", expr: "p.perecedero", tipo: "bool" },
     { clave: "fecha_caducidad", titulo: "Caducidad", expr: "p.fecha_caducidad", tipo: "date" },
+    { clave: "dias_aviso_vencimiento", titulo: "Días de aviso", expr: "COALESCE(p.dias_aviso_vencimiento, 7)", tipo: "int", oculta: true },
     { clave: "activo", titulo: "Activo", expr: "p.activo", tipo: "bool", oculta: true },
     { clave: "fecha_modificacion", titulo: "Modificado", expr: "p.fecha_modificacion", tipo: "dt", oculta: true },
   ],
@@ -165,6 +168,7 @@ L.productos = {
       clave: "vencimiento", titulo: "Caducidad", tipo: "opciones",
       opciones: [
         { valor: "vencidos", texto: "Vencidos", sql: "p.fecha_caducidad IS NOT NULL AND p.fecha_caducidad < :hoy" },
+        { valor: "aviso", texto: "Con aviso de vencimiento", sql: ctx => condicionVencimiento(ctx.db.dialecto, ":hoy") },
         { valor: "7", texto: "Vencen en 7 días", sql: "p.fecha_caducidad IS NOT NULL AND p.fecha_caducidad >= :hoy AND p.fecha_caducidad <= :hoy7" },
         { valor: "30", texto: "Vencen en 30 días", sql: "p.fecha_caducidad IS NOT NULL AND p.fecha_caducidad >= :hoy AND p.fecha_caducidad <= :hoy30" },
       ],
@@ -543,11 +547,20 @@ L.movimientos = {
   },
 };
 
+// Las ventas pendientes siguen contabilizadas hasta que se confirma la anulación.
+const ESTADO_VENTA_LISTADO = "CASE WHEN v.estado='CONFIRMADA' AND pa.referencia_id IS NOT NULL THEN 'PENDIENTE_ANULACION' ELSE v.estado END";
+const ESTADOS_VENTA_LISTADO = [
+  { valor: "CONFIRMADA", texto: "Confirmada" },
+  { valor: "PENDIENTE_ANULACION", texto: "Pendiente de anulación" },
+  { valor: "ANULADA", texto: "Anulada" },
+];
+
 L.ventas = {
   titulo: "Ventas",
   from: `predio_venta v
     JOIN predio_boca b ON b.predio_id = v.predio_id AND b.id = v.boca_id
     JOIN predio_caja c ON c.predio_id = v.predio_id AND c.id = v.caja_id
+    LEFT JOIN (SELECT DISTINCT referencia_id FROM predio_permiso WHERE predio_id = :pid AND tipo='ANULAR_VENTA' AND estado='PENDIENTE') pa ON pa.referencia_id = v.id
     LEFT JOIN (SELECT venta_id, COUNT(*) AS items, SUM(cantidad) AS unidades FROM predio_venta_item WHERE predio_id = :pid GROUP BY venta_id) it ON it.venta_id = v.id`,
   where: "v.predio_id = :pid",
   alcance: (ctx, query) => {
@@ -573,14 +586,14 @@ L.ventas = {
     { clave: "forma_pago", titulo: "Forma de pago", expr: "v.forma_pago", tipo: "opcion", opciones: FORMAS_PAGO },
     { clave: "codigo_pago", titulo: "Código de pago", expr: "v.codigo_pago", buscar: true, oculta: true },
     { clave: "total", titulo: "Importe", expr: "v.total", tipo: "money" },
-    { clave: "estado", titulo: "Estado", expr: "v.estado", tipo: "opcion", opciones: [{ valor: "CONFIRMADA", texto: "Confirmada" }, { valor: "ANULADA", texto: "Anulada" }] },
+    { clave: "estado", titulo: "Estado", expr: ESTADO_VENTA_LISTADO, tipo: "opcion", opciones: ESTADOS_VENTA_LISTADO },
     { clave: "caja_id", titulo: "Caja ID", expr: "v.caja_id", tipo: "int", oculta: true, interna: true },
   ],
   filtros: [
     { clave: "boca", titulo: "Boca", tipo: "id", expr: "v.boca_id", fuente: "bocas_venta" },
     { clave: "caja", titulo: "Caja", tipo: "id", expr: "v.caja_id", fuente: "cajas" },
     { clave: "forma_pago", titulo: "Forma de pago", tipo: "opciones", expr: "v.forma_pago", opciones: FORMAS_PAGO },
-    { clave: "estado", titulo: "Estado", tipo: "opciones", expr: "v.estado", opciones: [{ valor: "CONFIRMADA", texto: "Confirmadas" }, { valor: "ANULADA", texto: "Anuladas" }] },
+    { clave: "estado", titulo: "Estado", tipo: "opciones", expr: ESTADO_VENTA_LISTADO, opciones: ESTADOS_VENTA_LISTADO },
     {
       clave: "afiliado", titulo: "Comprador", tipo: "opciones",
       opciones: [{ valor: "si", texto: "Afiliados", sql: "v.afiliado_id IS NOT NULL" }, { valor: "no", texto: "No afiliados", sql: "v.afiliado_id IS NULL" }],
@@ -1110,7 +1123,7 @@ function construirWhere(def, ctx, query, db) {
     if (f.tipo === "opciones") {
       const op = f.opciones.find((o) => o.valor === valor);
       if (!op) continue;
-      if (op.sql) partes.push(traducir(op.sql, valores, nombres));
+      if (op.sql) partes.push(traducir(typeof op.sql === "function" ? op.sql(ctx) : op.sql, valores, nombres));
       else { partes.push(`${f.expr} = ?`); valores.push(op.valor); }
     } else if (f.tipo === "id") {
       const n = Number(valor);

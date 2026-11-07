@@ -204,11 +204,17 @@ async function crearLiquidacion(ctx) {
   const cajaId = b.caja_id ? U.id(b.caja_id, "La caja") : null;
   if (forma === "DESCUENTO_HABERES" && pagada) throw U.error("El descuento de haberes queda pendiente hasta que la departamental lo cobre");
   return ctx.db.tx(async (t) => {
-    const a = await N.exigir(t, ctx, "predio_afiliado", afiliadoId, "No encontramos al afiliado");
+    const caja = pagada && forma === "EFECTIVO" && cajaId
+      ? await N.exigir(t, ctx, "predio_caja", cajaId, "No encontramos la caja", { bloquear: true }) : null;
+    const a = await N.exigir(t, ctx, "predio_afiliado", afiliadoId, "No encontramos al afiliado", { bloquear: true });
     const ventas = await t.all(
       `SELECT id, fecha, COALESCE(importe_haberes,total) AS total FROM predio_venta WHERE predio_id = ? AND afiliado_id = ? AND estado = 'CONFIRMADA'
-       AND (forma_pago='DESCUENTO' OR importe_haberes>0) AND liquidacion_id IS NULL ORDER BY fecha`, [ctx.pid, afiliadoId]);
+       AND (forma_pago='DESCUENTO' OR importe_haberes>0) AND liquidacion_id IS NULL ORDER BY fecha, id${t.forUpdate}`, [ctx.pid, afiliadoId]);
     if (!ventas.length) throw U.error("El afiliado no tiene consumos por descuento pendientes de liquidar", 409);
+    const pendiente = await t.get(`SELECT v.id FROM predio_venta v JOIN predio_permiso p ON p.predio_id=v.predio_id AND p.referencia_id=v.id
+      WHERE v.predio_id=? AND v.afiliado_id=? AND v.estado='CONFIRMADA' AND (v.forma_pago='DESCUENTO' OR v.importe_haberes>0)
+      AND v.liquidacion_id IS NULL AND p.tipo='ANULAR_VENTA' AND p.estado='PENDIENTE' LIMIT 1${t.forUpdate}`, [ctx.pid, afiliadoId]);
+    if (pendiente) throw U.error(`Resolvé la anulación pendiente del ticket N° ${pendiente.id} antes de liquidar los consumos.`, 409);
     const consumos = U.redondear(ventas.reduce((s, v) => s + Number(v.total), 0), 2);
     const total = U.redondear(consumos * (1 - porcentaje / 100), 2);
     const valorCuota = U.redondear(total / cuotas, 2);
@@ -222,8 +228,7 @@ async function crearLiquidacion(ctx) {
     await t.run(
       `UPDATE predio_venta SET liquidacion_id = ? WHERE predio_id = ? AND afiliado_id = ? AND estado = 'CONFIRMADA'
        AND (forma_pago='DESCUENTO' OR importe_haberes>0) AND liquidacion_id IS NULL`, [id, ctx.pid, afiliadoId]);
-    if (pagada && forma === "EFECTIVO" && cajaId) {
-      const caja = await N.exigir(t, ctx, "predio_caja", cajaId, "No encontramos la caja");
+    if (caja) {
       await N.insertar(t, ctx, "predio_caja_movimiento", {
         caja_id: cajaId, boca_id: caja.boca_id, fecha: ahora, concepto: "COBRO_LIQUIDACION", tipo: "INGRESO", importe: total,
         recibo, observaciones: `Liquidación N° ${id} · ${a.nombre}`, usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx),

@@ -100,6 +100,7 @@
   P.dato = function (etiqueta, valor) { return h("div.dato", h("span", etiqueta), h("strong", valor === null || valor === undefined || valor === "" ? "—" : valor)); };
 
   var CHIPS = {
+    PENDIENTE_ANULACION: "accion",
     CONFIRMADA: "ok", CARGADA: "ok", RECIBIDA: "ok", APROBADO: "ok", PAGADA: "ok", CORRECTO: "ok", OK: "ok", ABIERTO: "curso",
     ANULADA: "error", RECHAZADA: "error", RECHAZADO: "error", NO_COINCIDE: "error", ERROR: "error",
     PENDIENTE: "accion", DESPACHADA: "curso", ENTREGADO: "curso", USADO: "anillo", VENCIDO: "anillo", CANCELADO: "anillo", CERRADO: "anillo",

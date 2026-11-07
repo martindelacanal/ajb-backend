@@ -67,6 +67,34 @@ function pedir(s, token, ruta, cuerpo) {
   return fetch(s.url + ruta, { method: cuerpo === undefined ? "GET" : "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, ...(cuerpo === undefined ? {} : { body: JSON.stringify(cuerpo) }) });
 }
 
+test("la clave temporal remota sólo habilita su cambio, directo o por orden sin secretos en claro", async t => {
+  for (const escritor of ["CENTRAL", "LOCAL"]) {
+    const s = await escenario(t, { escritor });
+    await s.db.run("UPDATE predio_usuario SET debe_cambiar_clave=1 WHERE predio_id=1 AND id=7");
+    const { token } = await ingresar(s);
+    const prefijo = "/app/MIRAMAR/api/";
+    assert.equal((await (await pedir(s, token, prefijo + "sesion")).json()).usuario.debe_cambiar_clave, true);
+    assert.equal((await pedir(s, token, prefijo + "avisos")).status, 403);
+    assert.equal((await pedir(s, token, prefijo + "productos", { nombre: "Producto bloqueado" })).status, 403);
+    assert.equal((await pedir(s, token, prefijo + "sesion/clave", { actual: "otra", nueva: "Personal-z9" })).status, 403);
+    const cambio = await pedir(s, token, prefijo + "sesion/clave", { actual: "clave-fixture", nueva: "Personal-z9" });
+    if (escritor === "CENTRAL") {
+      assert.equal(cambio.status, 200, await cambio.text());
+      assert.equal((await pedir(s, token, prefijo + "sesion")).status, 401);
+      const acceso = await A.ingresarPredio({ db: s.pool, identificador: "adminlocal", predioCodigo: "MIRAMAR", password: "Personal-z9", jwtSecret: SECRET });
+      assert.equal(acceso.data.debe_cambiar_clave, false);
+    } else {
+      assert.equal(cambio.status, 202, await cambio.text());
+      const orden = await s.db.get("SELECT actor, cuerpo FROM predio_comando WHERE ruta='/sesion/clave'");
+      assert.equal(orden.cuerpo, "{}");
+      assert.doesNotMatch(orden.actor, /Personal-z9|clave-fixture/);
+      const actor = JSON.parse(orden.actor);
+      assert.equal(actor.capacidad, "operacion-predio-v2");
+      assert.ok(U.verificarPassword("Personal-z9", actor.hash_clave_validada));
+    }
+  }
+});
+
 test("la cuenta propia abre exclusivamente su predio y conserva su identidad local aunque colisione con un admin general", async t => {
   const s = await escenario(t), { token } = await ingresar(s);
   const permisos = await pedir(s, token, "/api/predios-cuenta/permisos"); assert.equal(permisos.status, 200);
@@ -99,6 +127,16 @@ test("cerrar desde el iframe revoca sólo su sesión propia y el token deja de a
   assert.equal((await pedir(s, otra.token, "/api/predios-cuenta/permisos")).status, 200);
   assert.equal(s.db.conexion.prepare("SELECT COUNT(*) n FROM predio_acceso_sesion WHERE revocado_en IS NOT NULL").get().n, 1);
   assert.equal(s.db.conexion.prepare("SELECT revocado_en FROM auth_sesion WHERE id='general-vigente'").get().revocado_en, null);
+});
+
+test("los comandos de anulación, caja y liquidación esperan una notebook con los controles nuevos", async t => {
+  const s = await escenario(t), { token } = await ingresar(s);
+  for (const ruta of ["/permisos/1/resolver", "/ventas/1/anular", "/recepcion/1/cuenta", "/afiliados/1/liquidaciones", "/caja/apertura"]) {
+    const r = await pedir(s, token, "/app/MIRAMAR/api" + ruta, {});
+    assert.equal(r.status, 202);
+    const orden = await s.db.get("SELECT actor FROM predio_comando WHERE ruta=?", [ruta]);
+    assert.equal(JSON.parse(orden.actor).capacidad, "operacion-predio-v2", ruta);
+  }
 });
 
 test("una escritura propia crea orden con actor local, credencial y revisión, sin creado_por general ni usuario artificial", async t => {
@@ -139,6 +177,7 @@ test("el paquete de pendrive nunca lleva actores PREDIO, incluso si incluye una 
     .run(JSON.stringify({ tipo: "PREDIO", predio_id: 1, predio_usuario_id: 7 }), JSON.stringify({ general_id: 7, nombre: "General" }));
   s.db.conexion.prepare("INSERT INTO predio_comando(predio_id,tipo,metodo,ruta,actor) VALUES(1,'API','POST','/compras',?)").run(JSON.stringify({ general_id: 7, capacidad: "precios-boca-v1" }));
   s.db.conexion.prepare("INSERT INTO predio_comando(predio_id,tipo,metodo,ruta,actor) VALUES(1,'API','POST','/compras',?)").run(JSON.stringify({ general_id: 7, capacidad: "stock-predio-v2" }));
+  s.db.conexion.prepare("INSERT INTO predio_comando(predio_id,tipo,metodo,ruta,actor) VALUES(1,'API','POST','/usuarios',?)").run(JSON.stringify({ general_id: 7, capacidad: "operacion-predio-v2" }));
   t.mock.method(C, "armarMaestros", async () => ({}));
   t.mock.method(C, "paqueteCodigo", () => ({ buffer: Buffer.from("código firmado de fixture"), version: "fixture" }));
   t.mock.method(C, "paqueteFirmado", datos => Buffer.from(JSON.stringify(datos)));
@@ -148,9 +187,55 @@ test("el paquete de pendrive nunca lleva actores PREDIO, incluso si incluye una 
     const paquete = await r.json();
     assert.equal(paquete.comandos_precios.length, 1); assert.equal(paquete.comandos_precios[0].ruta, "/compras");
     assert.deepEqual(paquete.comandos_stock.map(c => c.actor.capacidad), ["stock-predio-v2"]);
+    assert.deepEqual(paquete.comandos_operacion.map(c => c.ruta), ["/usuarios"]);
     assert.equal(paquete.comandos.length, 1); assert.equal(paquete.comandos[0].actor.general_id, 7);
     assert.equal(paquete.comandos.some(c => c.actor.tipo === "PREDIO"), false);
     assert.equal(!!paquete.codigo, conCodigo === "1");
   }
   assert.equal(s.db.conexion.prepare("SELECT estado FROM predio_comando WHERE id=1").get().estado, "PENDIENTE", "la orden propia espera un agente actualizado");
+});
+
+test("el administrador remoto obtiene la clave de su caja y confirma en el escritor sin publicar el secreto en la cola", async t => {
+  for (const escritor of ["CENTRAL", "LOCAL"]) {
+    const s = await escenario(t, { escritor }), { token } = await ingresar(s);
+    const base = "/app/MIRAMAR/api/caja/cierre";
+    s.db.exec("INSERT INTO predio_caja(predio_id,id,boca_id,nombre,activo) VALUES(1,3,1,'Recepción',1)");
+    await s.db.run("UPDATE predio SET ultima_conexion=? WHERE id=1", [U.fechaHora()]);
+    if (escritor === "CENTRAL") s.db.exec("DROP TABLE predio_sesion");
+    const cuerpo = { caja_id: 3, turno_id: null, ultimo_cierre_id: null };
+    async function ejecutar(ruta, datos) {
+      const peticion = pedir(s, token, base + ruta, datos);
+      if (escritor === "LOCAL") {
+        let cmd;
+        for (let n = 0; n < 100 && !cmd; n++) {
+          await new Promise(resolve => setTimeout(resolve, 10));
+          cmd = await s.db.get("SELECT * FROM predio_comando WHERE estado='PENDIENTE' ORDER BY id LIMIT 1");
+        }
+        assert.ok(cmd, "se encoló el comando para la notebook");
+        const actor = JSON.parse(cmd.actor);
+        assert.equal(actor.capacidad, "operacion-predio-v2");
+        assert.equal(JSON.parse(cmd.cuerpo).clave, undefined);
+        const usuario = await require("../predios/lib/actor-remoto").resolverActorRemoto({ db: s.db, pid: 1, actor });
+        const respuesta = await require("../predios/lib/api").ejecutar({ db: s.db, pid: 1, origen: "REMOTO", modo: "local",
+          usuario, sesion: {}, emisionClaveCierre: actor.emision_clave_cierre, hashClaveCierre: actor.hash_clave_cierre,
+          body: JSON.parse(cmd.cuerpo) }, "POST", cmd.ruta);
+        assert.equal(respuesta.clave, undefined);
+        await s.db.run("UPDATE predio_comando SET estado='OK', status=200, resultado=? WHERE id=?", [JSON.stringify(respuesta), cmd.id]);
+      }
+      const r = await peticion;
+      const json = await r.json();
+      assert.equal(r.status, 200, json.mensaje);
+      return json;
+    }
+    const { clave } = await ejecutar("/clave", cuerpo);
+    assert.match(clave, /^\d{8}$/);
+    const cierre = await ejecutar("", { ...cuerpo, efectivo_contado: 0, clave });
+    assert.equal(cierre.diferencia, 0);
+    const auditoria = await s.db.get("SELECT detalle FROM predio_auditoria WHERE accion='Cierre de caja'");
+    assert.equal(JSON.parse(auditoria.detalle).autorizacion.admin_id, 7);
+    if (escritor === "LOCAL") {
+      const filas = await s.db.all("SELECT cuerpo, actor, resultado FROM predio_comando");
+      assert.ok(filas.every(c => !JSON.stringify(c).includes('"' + clave + '"')));
+    }
+  }
 });

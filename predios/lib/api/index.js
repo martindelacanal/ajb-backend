@@ -6,6 +6,7 @@
 const U = require("../util");
 const listados = require("../listados");
 const N = require("../negocio");
+const { exigirCambio } = require("../claves-usuario");
 
 const modulos = [
   require("./sesion"),
@@ -71,6 +72,7 @@ async function ejecutar(ctx, metodo, ruta) {
   const encontrada = buscarRuta(metodo, ruta);
   if (!encontrada) throw U.error("No encontramos esa operación", 404);
   const r = encontrada.ruta;
+  exigirCambio(ctx.usuario, metodo, ruta);
   if (ctx.modo === "central" && r.soloLocal) throw U.error("Esta operación se hace desde el camping", 409);
   if (!r.publica && !ctx.usuario) throw U.error("Iniciá sesión para continuar", 401, { codigo: "SIN_SESION" });
   if (r.roles && !r.roles.includes(ctx.usuario?.rol)) throw U.error("Esta acción la hace un administrador", 403);

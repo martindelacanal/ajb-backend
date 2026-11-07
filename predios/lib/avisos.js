@@ -15,6 +15,7 @@ async function emitirAviso(t, ctx, { tipo, usuarioId = null, generalUsuarioId = 
 async function destinatarioSql(ctx, alias = "a") {
   const broadcast = `${alias}.usuario_id IS NULL AND ${alias}.general_usuario_id IS NULL AND ${alias}.general_documento IS NULL`;
   const condiciones = [`${alias}.usuario_id = ?`];
+  condiciones.push(`(${broadcast} AND ${alias}.tipo = 'VENCIMIENTO_PRODUCTO')`);
   const params = [ctx.usuario.id];
   if (ctx.usuario?.rol === "ADMIN") {
     condiciones.push(`(${broadcast})`);

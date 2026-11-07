@@ -174,11 +174,15 @@
       cantidad.style.textAlign = "right";
       var perecedero = P.check("Es perecedero", Number(p.perecedero) === 1, null, function (v) {
         zonaVence.hidden = !v;
+        zonaAviso.hidden = !v;
         filaCaducidad.classList.toggle("con-fecha", v);
       });
       var vence = P.input({ tipo: "date", valor: p.fecha_caducidad || "" });
       var zonaVence = P.campo("Fecha de caducidad (opcional)", vence);
       zonaVence.hidden = Number(p.perecedero) !== 1;
+      var diasAviso = P.input({ inputmode: "numeric", valor: p.dias_aviso_vencimiento == null ? "" : String(p.dias_aviso_vencimiento), placeholder: "7" });
+      var zonaAviso = P.campo("Avisar al predio con cuántos días de anticipación", diasAviso, { ayuda: "Por defecto se avisa 7 días antes. Con 0, se avisa el día del vencimiento." });
+      zonaAviso.hidden = zonaVence.hidden;
       var filaCaducidad = h("div.grilla.grilla-2.producto-caducidad" + (Number(p.perecedero) === 1 ? ".con-fecha" : ""), perecedero, zonaVence);
       var minimo = P.input({ inputmode: "decimal", valor: p.stock_minimo ? valorEditable(p.stock_minimo) : "", placeholder: "Opcional" });
       var activo = P.check("Producto activo", editar ? Number(p.activo) === 1 : true, "Los dados de baja no aparecen para vender ni comprar.");
@@ -239,7 +243,7 @@
           P.campo("Margen de utilidad (%)", margen)),
         h("div.grilla.grilla-2.producto-venta", manual,
           P.campo("Precio de venta", h("div.campo-con-prefijo", h("span", "$"), venta), { ayuda: ayudaVenta })),
-        filaCaducidad,
+        filaCaducidad, zonaAviso,
         P.campo("Stock mínimo para avisos", minimo, { ayuda: "Avisa al personal de la boca y a administración cuando el stock queda por debajo de esta cantidad. Con 0, no se generan avisos de stock mínimo." }),
         editar ? activo : null);
 
@@ -301,6 +305,7 @@
           var cuerpo = {
             nombre: nombre.value, codigo: codigo.value.trim() || null, precio_compra: compraIngresada || 0, margen: porcentajeOpcional(margen) || 0,
             destino: destino.value, perecedero: perecedero.input.checked, fecha_caducidad: perecedero.input.checked ? vence.value || null : null,
+            dias_aviso_vencimiento: perecedero.input.checked ? diasAviso.value || null : null,
             stock_minimo: P.numeroDe(minimo.value) || 0, cantidad_almacen: P.numeroDe(cantidad.value) || 0,
             precio_venta_manual: manual.input.checked ? P.precioDeVenta(manualIngresado) : null,
           };
@@ -353,10 +358,10 @@
       celdas: {
         stock: function (v, f) { return h("span.numero" + (Number(v) < 0 ? ".negativo" : ""), P.f.numero(v)); },
         revision_precio: function (v) { return /^Revisar/.test(v || "") ? P.chip(v, "PENDIENTE") : (v || ""); },
-        fecha_caducidad: function (v) {
+        fecha_caducidad: function (v, f) {
           if (!v) return "";
           var vencido = v < P.hoy();
-          var pronto = !vencido && v <= P.sumarDias(P.hoy(), 7);
+          var pronto = !vencido && v <= P.sumarDias(P.hoy(), Number(f.dias_aviso_vencimiento));
           return vencido ? P.chip(P.f.fecha(v), "ANULADA") : pronto ? P.chip(P.f.fecha(v), "PENDIENTE") : P.f.fecha(v);
         },
       },
@@ -365,7 +370,8 @@
       h("div.gestion-acciones-grupo",
       P.btn("Administrar solicitudes", { tipo: "suave", chico: true, icono: "solicitud", onclick: function () { P.ruta.ir("/gestion/solicitudes"); } }),
       P.btn("Traspasos entre bocas", { tipo: "suave", chico: true, icono: "traspaso", onclick: function () { P.formSolicitud("traspaso", function () { tabla.recargar(); }); } }),
-      P.btn("Bajar stock", { tipo: "suave", chico: true, icono: "baja", onclick: function () { P.formBaja(function () { tabla.recargar(); }); } }),
+      P.btn("Sumar stock", { tipo: "suave", chico: true, icono: "mas", onclick: function () { P.formAjusteStock(true, function () { tabla.recargar(); }); } }),
+      P.btn("Bajar stock", { tipo: "suave", chico: true, icono: "baja", onclick: function () { P.formAjusteStock(false, function () { tabla.recargar(); }); } }),
       P.btn("Más", { tipo: "suave", chico: true, icono: "lista", onclick: function (ev) {
         P.menuFlotante(ev.currentTarget, [
           { texto: "Stock por boca", icono: "stock", accion: function () { P.ruta.ir("/gestion/stock"); } },
@@ -405,7 +411,7 @@
   P.ruta.registrar(/^\/gestion\/bajas$/, function (c) {
     var t = null;
     subpagina(c, "Bajas de stock", "Productos rotos, vencidos o usados como materia prima o insumo.", [
-      P.btn("Bajar stock", { tipo: "primario", icono: "baja", onclick: function () { P.formBaja(function () { t.recargar(); }); } }),
+      P.btn("Bajar stock", { tipo: "primario", icono: "baja", onclick: function () { P.formAjusteStock(false, function () { t.recargar(); }); } }),
     ]);
     t = P.tabla({ listado: "bajas" });
     c.appendChild(t.el);
@@ -549,26 +555,30 @@
       }
       var usuario = P.input({ valor: u.usuario, max: 60, placeholder: "Ej.: maria.comedor" });
       var nombre = P.input({ valor: u.nombre, max: 120 });
-      var rol = P.segmentado([{ valor: "CAJERO", texto: "Usuario de boca" }, { valor: "ADMIN", texto: "Administrador" }], u.rol || "CAJERO", function (v) { zonaBocas.hidden = v === "ADMIN"; });
-      var clave = P.inputClave({ placeholder: editar ? "Dejala vacía para no cambiarla" : "Al menos 4 caracteres" });
+      var rol = P.segmentado([{ valor: "CAJERO", texto: "Usuario de boca" }, { valor: "ADMIN", texto: "Administrador" }], u.rol || "CAJERO", function (v) { zonaBocas.hidden = permisos.hidden = v === "ADMIN"; });
+      var clave = P.inputClave({ placeholder: editar ? "Dejala vacía para no cambiarla" : "Al menos 6 caracteres", autocomplete: "new-password" });
       var recepcion = P.check("Gestionar reservas, ingresos, salidas y saldos", !!Number(u.gestionar_reservas));
+      var cierre = P.check("Confirmar cierres de caja", !!Number(u.puede_cerrar_caja));
+      var anulacion = P.check("Anular tickets", !!Number(u.puede_anular_ticket));
+      var permisos = P.campo("Permisos del usuario", h("div.columna", recepcion, cierre, anulacion));
       var checks = bocas.map(function (b) { var ch = P.check(b.texto, asignadas.indexOf(b.valor) >= 0); ch.valor = b.valor; return ch; });
       var zonaBocas = P.campo("Bocas que atiende", h("div.grilla.grilla-2", { style: { gap: "8px" } }, checks), { ayuda: "Al ingresar va directo a su boca. Si tiene varias, elige." });
-      zonaBocas.hidden = (u.rol || "CAJERO") === "ADMIN";
+      zonaBocas.hidden = permisos.hidden = (u.rol || "CAJERO") === "ADMIN";
       var activo = P.check("Usuario habilitado", editar ? Number(u.activo) === 1 : true);
       var m = P.modal({
         titulo: editar ? u.nombre : "Nuevo usuario", ancho: "ancha",
         contenido: h("div.columna",
           h("div.grilla.grilla-2", P.campo("Nombre y apellido", nombre, { requerido: true }), P.campo("Usuario (para ingresar)", usuario, { requerido: true })),
           P.campo("Rol", rol, { ayuda: "El administrador del camping ve todo el predio pero no entra al sistema general." }),
-          zonaBocas, recepcion,
-          P.campo(editar ? "Nueva contraseña" : "Contraseña", clave, { requerido: !editar }),
+          zonaBocas, permisos,
+          P.campo(editar ? "Restablecer contraseña temporal" : "Contraseña temporal", clave, { requerido: !editar, ayuda: "El usuario deberá elegir su propia contraseña al ingresar." }),
           editar ? activo : null,
           editar ? h("p.texto-3.chico", "Último ingreso: " + (u.ultimo_ingreso ? P.f.fechaHora(u.ultimo_ingreso) : "nunca")) : null),
         acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), P.btn("Guardar", { tipo: "primario", icono: "check", onclick: function (ev) {
           var cuerpo = {
             usuario: usuario.value, nombre: nombre.value, rol: rol.valor(), password: clave.input.value || undefined,
             gestionar_reservas: recepcion.input.checked,
+            puede_cerrar_caja: cierre.input.checked, puede_anular_ticket: anulacion.input.checked,
             bocas: checks.filter(function (ch) { return ch.input.checked; }).map(function (ch) { return ch.valor; }),
           };
           if (editar) cuerpo.activo = activo.input.checked;

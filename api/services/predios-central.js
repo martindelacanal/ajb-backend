@@ -113,13 +113,21 @@ async function upsertFilas(conexion, predioId, tabla, filas) {
   if (!filas.length) return;
   const definicion = columnasDe(tabla);
   const existentes = await columnasMysql(conexion, tabla);
-  const cols = Object.keys(definicion).filter((c) => existentes.has(c));
+  const disponibles = Object.keys(definicion).filter(c => existentes.has(c));
+  const presentes = (f, c) => c === "predio_id" || Object.hasOwn(f, c);
+  // Una notebook anterior puede omitir columnas nuevas. Conservar los valores
+  // de la réplica al actualizar y usar el default de la tabla al insertar.
+  if (filas.some(f => disponibles.some(c => presentes(f, c) !== presentes(filas[0], c)))) {
+    for (const f of filas) await upsertFilas(conexion, predioId, tabla, [f]);
+    return;
+  }
+  const cols = disponibles.filter(c => presentes(filas[0], c));
   const valores = [];
   for (const f of filas) {
     for (const c of cols) valores.push(c === "predio_id" ? predioId : valorColumna(definicion[c], f[c]));
   }
   const filaSql = `(${cols.map(() => "?").join(", ")})`;
-  const actualizar = cols.filter((c) => c !== "predio_id" && c !== "id").map((c) => `\`${c}\` = VALUES(\`${c}\`)`).join(", ");
+  const actualizar = cols.filter((c) => c !== "predio_id" && c !== "id").map((c) => `\`${c}\` = VALUES(\`${c}\`)`).join(", ") || "id=VALUES(id)";
   await conexion.query(
     `INSERT INTO \`${tabla}\` (${cols.map((c) => `\`${c}\``).join(", ")}) VALUES ${filas.map(() => filaSql).join(", ")}
      ON DUPLICATE KEY UPDATE ${actualizar}`, valores);

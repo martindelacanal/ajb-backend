@@ -240,6 +240,31 @@ async function traspaso(ctx) {
   });
 }
 
+async function registrarAlta(ctx) {
+  exigirAdmin(ctx);
+  const { body } = ctx;
+  const bocaId = U.id(body.boca_id, "La boca");
+  const lineas = leerLineas(body);
+  const motivo = U.opcion(body.motivo, ["DONACION", "RECUENTO", "OTROS"], "El motivo");
+  const observaciones = U.texto(body.observaciones, { max: 255, requerido: motivo === "OTROS", campo: "La observación" });
+  const descripcion = { DONACION: "Donación", RECUENTO: "Diferencia de recuento", OTROS: "Otro ingreso" }[motivo];
+  return ctx.db.tx(async (t) => {
+    if (t.forUpdate) await bloquearPrecios(t, ctx);
+    const boca = await N.exigir(t, ctx, "predio_boca", bocaId, "No encontramos la boca");
+    if (!Number(boca.activo)) throw U.error("Elegí una boca activa");
+    for (const linea of lineas) {
+      const p = await N.exigir(t, ctx, "predio_producto", linea.producto_id, "No encontramos el producto", { bloquear: true });
+      if (!Number(p.activo)) throw U.error("Elegí un producto activo");
+      await N.moverStock(t, ctx, {
+        bocaId, productoId: p.id, cantidad: linea.cantidad, tipo: "ALTA", motivo, referenciaTipo: "producto", referenciaId: p.id,
+        detalle: observaciones ? descripcion + " · " + observaciones : descripcion,
+      });
+    }
+    await N.auditar(t, ctx, "Alta de stock", "producto", lineas[0].producto_id, { boca: bocaId, motivo, lineas, observaciones });
+    return { mensaje: "Alta de stock registrada" };
+  });
+}
+
 async function bajar(ctx) {
   exigirAdmin(ctx);
   const b = ctx.body;
@@ -299,5 +324,6 @@ module.exports = {
     { m: "POST", p: "/solicitudes/:id/anular", h: (ctx) => rechazarOAnular(ctx, "ANULADA"), escritura: true },
     { m: "POST", p: "/traspasos", h: traspaso, escritura: true, roles: ["ADMIN"] },
     { m: "POST", p: "/bajas", h: bajar, escritura: true, roles: ["ADMIN"] },
+    { m: "POST", p: "/altas", h: registrarAlta, escritura: true, roles: ["ADMIN"] },
   ],
 };

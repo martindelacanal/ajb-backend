@@ -167,6 +167,9 @@ async function ejecutarRemoto({ metodo, ruta, cuerpo, query, actor, db: dbOperac
   const ctx = {
     ...base,
     usuario: usuarioRemoto,
+    hashClaveValidada: actor?.hash_clave_validada,
+    emisionClaveCierre: actor?.emision_clave_cierre,
+    hashClaveCierre: actor?.hash_clave_cierre,
     sesion: {},
     query: query || {},
     body: cuerpo || {},
@@ -601,6 +604,7 @@ async function manejar(req, res) {
     const token = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization || "")?.[1];
     const auth = await sesion.autenticar(ctx, token);
     if (auth) Object.assign(ctx, auth);
+    require("./lib/claves-usuario").exigirCambio(ctx.usuario, req.method, rutaApi);
     if ((req.method === "GET" || req.method === "HEAD") && rutaApi.startsWith("/login/imagen")) return rutaGaleria(req, res, rutaApi);
     if (rutaApi.startsWith("/sistema/")) {
       if (!ctx.usuario) throw U.error("Iniciá sesión para continuar", 401, { codigo: "SIN_SESION" });
@@ -708,6 +712,13 @@ servidor.listen(config.puerto, "0.0.0.0", () => {
   }
   setTimeout(revisarPrecios, 6000).unref();
   setInterval(revisarPrecios, 6 * 3600 * 1000).unref();
+  function revisarVencimientos() {
+    if (!controlEquipo.puedeEscribir()) return;
+    db.tx(t => require("./lib/vencimientos").revisarVencimientos(t, { pid: config.predio_id }))
+      .catch(e => log(`Vencimientos de mercadería: ${e.message}`));
+  }
+  setTimeout(revisarVencimientos, 8000).unref();
+  setInterval(revisarVencimientos, 60 * 60 * 1000).unref();
   setInterval(() => {
     const marca = path.join(BASE, "app", "CONTROL");
     if (!fs.existsSync(marca)) return;
