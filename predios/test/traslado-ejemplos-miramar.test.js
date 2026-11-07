@@ -45,8 +45,8 @@ async function preparar(t) {
 test("el pago original salda T-55 y la compra abastece los dos depósitos una sola vez", async t => {
   const { db, ctx, trasladar } = await preparar(t);
   assert.equal((await cuenta(db,ctx,55)).pendiente,39500);
-  await trasladar();
-  await trasladar();
+  const aplicado = await trasladar();
+  assert.deepEqual(await trasladar(), aplicado);
   assert.equal((await cuenta(db,ctx,55)).pendiente,0);
   assert.equal((await cuenta(db,ctx,53)).pendiente,69600);
   const pagos = await db.all("SELECT fecha,medio,importe FROM predio_estadia_mov WHERE concepto='PAGO_RESERVA'");
@@ -59,6 +59,18 @@ test("el pago original salda T-55 y la compra abastece los dos depósitos una so
     JOIN predio_boca b ON b.predio_id=s.predio_id AND b.id=s.boca_id
     GROUP BY p.codigo ORDER BY p.codigo`);
   assert.deepEqual(stock.map(s=>[s.total,s.almacen,s.proveeduria]),[[24,19,5],[24,19,5],[10,5,5]]);
+});
+
+test("un código ocupado conserva el producto local y el pago pendiente", async t => {
+  const { db,ctx,trasladar } = await preparar(t);
+  const productoId = await db.tx(tx => N.insertar(tx,ctx,"predio_producto",{
+    codigo:"DEMO1003", nombre:"Yerba de la proveeduría", destino:"VENTA_DIRECTA", precio_venta:5500, activo:1
+  }));
+  await assert.rejects(trasladar,{ status:409 });
+  assert.deepEqual(await db.all("SELECT id,nombre,precio_venta FROM predio_producto"),
+    [{ id:productoId, nombre:"Yerba de la proveeduría", precio_venta:5500 }]);
+  assert.equal((await cuenta(db,ctx,55)).pendiente,39500);
+  assert.equal((await db.get("SELECT COUNT(*) AS n FROM predio_compra")).n,0);
 });
 
 test("un fallo al trasladar mercadería revierte también la compra, los productos y el pago", async t => {
