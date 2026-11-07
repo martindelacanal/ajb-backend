@@ -95,6 +95,11 @@
   function get(k, b) {
     return P.get("/recepcion/" + k + P.qs(b || {}));
   }
+  // «Parcela 2» cuando el recurso ya se llama Parcela; si no, «Sector A · Parcela 2».
+  function recursoYParcela(nombre, numero) {
+    if (!numero) return nombre || "";
+    return nombre && /parcela/i.test(nombre) ? nombre + " " + numero : [nombre, "Parcela " + numero].filter(Boolean).join(" · ");
+  }
   function nombresRecursos(r) {
     return (r.recursos || []).map(function (x) { return x.nombre; }).join(", ") || r.recurso || "";
   }
@@ -119,7 +124,8 @@
     var d = a.dias != null ? Number(a.dias) : a.fecha_desde ? dias(a.fecha_desde, a.fecha_hasta) : null;
     return n + (n === 1 ? " unidad" : " unidades") + (d ? " × " + d + (d === 1 ? " día" : " días") : "");
   }
-  P.recepcion = { TIPOS: TIPOS, MEDIOS: MEDIOS, cabecera: cabecera, get: get, nuevaClave: nuevaClave, periodo: periodo, detalleArticulo: detalleArticulo };
+  P.recepcion = { TIPOS: TIPOS, MEDIOS: MEDIOS, MODALIDAD: MODALIDAD, cabecera: cabecera, get: get, nuevaClave: nuevaClave, periodo: periodo, detalleArticulo: detalleArticulo,
+    recursoYParcela: recursoYParcela, opciones: opciones, lista: lista, sel: sel, input: input, texto: texto, btn: btn, grupo: grupo, grid: grid, tabla: tabla, ir: ir, dias: dias };
 
   // ------------------------------------------------------------------ cuenta de la estadía
 
@@ -188,7 +194,9 @@
     return caja;
   }
   P.recepcion.liquidacion = liquidacion;
+  P.recepcion.CONCEPTOS = CONCEPTOS;
 
+  P.recepcion.opSelect = opSelect;
   function opSelect(el, items, value, vacio) {
     P.vaciar(el);
     if (vacio != null) el.appendChild(h("option", { value: "" }, vacio));
@@ -206,9 +214,16 @@
     var medio = sel(opciones({ EFECTIVO: MEDIOS.EFECTIVO, TRANSFERENCIA: MEDIOS.TRANSFERENCIA }), borrador.medio, "Elegí un medio");
     var caja = sel([], null, "Elegí una caja");
     var campoMedio = P.campo("Medio de pago", medio), campoCaja = P.campo("Caja de efectivo", caja);
-    var vehiculo = sel([{ valor: "SALE", texto: "Sale del predio" }]
-      .concat(salida.presentes.length ? [{ valor: "PERMANECE", texto: "Permanece en el predio" }] : []),
-    borrador.vehiculo || (salida.presentes.length ? "" : "SALE"), salida.presentes.length ? "Elegí una opción" : null);
+    // Vehículos en el predio: si no queda nadie salen todos; si no, recepción elige uno por uno.
+    var pendientes = salida.vehiculos_pendientes || [];
+    var elegirVehiculos = pendientes.length > 0 && salida.presentes.length > 0;
+    borrador.vehiculos = borrador.vehiculos || {};
+    var selectsVehiculo = pendientes.map(function (v) {
+      var control = sel([{ valor: "SALE", texto: "Sale con quienes se van" }, { valor: "PERMANECE", texto: "Permanece en el predio" }],
+        borrador.vehiculos[v.patente] || "", "Elegí una opción");
+      control.onchange = function () { borrador.vehiculos[v.patente] = control.value; };
+      return { vehiculo: v, control: control };
+    });
     var cajasCargadas = false;
     function actualizar() {
       campoMedio.hidden = !total || resolver.value !== "COBRAR";
@@ -226,7 +241,6 @@
     resolver.onchange = function () { borrador.accion = resolver.value; actualizar(); };
     medio.onchange = function () { borrador.medio = medio.value; actualizar(); };
     caja.onchange = function () { borrador.caja_id = caja.value; };
-    vehiculo.onchange = function () { borrador.vehiculo = vehiculo.value; };
     actualizar();
     return {
       vista: h("div.rec-cotizacion.columna",
@@ -240,15 +254,22 @@
         h("p.fuerte", total < 0 ? "Total a devolver: " + pesos(-total) : total > 0 ? "Total a cobrar: " + pesos(total) : "Sin diferencia de dinero"),
         puedeTrasladar ? P.campo("Qué hacer con la deuda", resolver) : null,
         puedeTrasladar ? h("p.chico.texto-2", "Si la dejás pendiente, el importe quedará para " + salida.presentes.map(function (p) { return p.nombre; }).join(", ") + ".") : null,
-        grid(campoMedio, campoCaja, salida.vehiculo_pendiente ? P.campo("Salida del vehículo", vehiculo) : null)),
+        grid(campoMedio, campoCaja),
+        elegirVehiculos ? h("div.columna", h("h4.rec-subtitulo-seccion", pendientes.length === 1 ? "Vehículo en el predio" : "Vehículos en el predio"),
+          h("div.rec-grid.rec-grid-vehiculos-salida", selectsVehiculo.map(function (x) {
+            return P.campo(x.vehiculo.patente + " · " + [x.vehiculo.marca, x.vehiculo.color].filter(Boolean).join(" "), x.control);
+          }))) : pendientes.length ? h("p.chico.texto-2", "Registran su salida " + (pendientes.length === 1 ? "el vehículo " : "los vehículos ") +
+          pendientes.map(function (v) { return v.patente; }).join(", ") + ".") : null),
       datos: function () {
         var accion = hayMovimientos ? resolver.value : undefined;
         if (hayMovimientos && !accion) { resolver.focus(); throw Error("Elegí si se cobra ahora o se traslada la deuda."); }
         if (!campoMedio.hidden && !medio.value) { medio.focus(); throw Error("Elegí cómo se registra el pago."); }
         if (!campoCaja.hidden && !caja.value) { caja.focus(); throw Error(P.esAdmin() ? "Elegí una caja para registrar el efectivo." : "Ingresá a tu caja para registrar el efectivo de recepción."); }
-        if (salida.vehiculo_pendiente && !vehiculo.value) { vehiculo.focus(); throw Error("Indicá si el vehículo se va o permanece en el predio."); }
+        var sinElegir = elegirVehiculos && selectsVehiculo.filter(function (x) { return !x.control.value; })[0];
+        if (sinElegir) { sinElegir.control.focus(); throw Error("Indicá si el vehículo " + sinElegir.vehiculo.patente + " se va o permanece en el predio."); }
         return { accion: accion, medio: campoMedio.hidden ? undefined : medio.value, caja_id: campoCaja.hidden ? undefined : caja.value,
-          vehiculo: salida.vehiculo_pendiente ? vehiculo.value : undefined };
+          vehiculos_salen: !pendientes.length ? undefined : elegirVehiculos ? selectsVehiculo.filter(function (x) { return x.control.value === "SALE"; })
+            .map(function (x) { return x.vehiculo.patente; }) : pendientes.map(function (v) { return v.patente; }) };
       }
     };
   }
@@ -266,6 +287,7 @@
   }
 
   P.ruta.registrar(/^\/recepcion$/, function (c) {
+    P.recepcion.descartarBorrador();
     var soloVencidas = P.ruta.query().ocupacion === "VENCIDA";
     var zonaAvisos = h("div.rec-avisos", { "aria-live": "polite" });
     var servicios = [];
@@ -348,7 +370,8 @@
               var tam = Number(r.tam || p.tam || 40);
               return {
                 filas: r.filas.map(function (x) {
-                  return Object.assign({}, x, { recurso: nombresRecursos(x), tipo: x.tipo || "GENERAL", importe: x.precio_total });
+                  return Object.assign({}, x, { recurso: [recursoYParcela(nombresRecursos(x), x.numero_parcela), x.ubicacion].filter(Boolean).join(" · "),
+                    tipo: x.tipo || "GENERAL", importe: x.precio_total });
                 }),
                 total: total, pagina: Number(r.pagina) || 1, tam: tam, paginas: Number(r.paginas) || Math.max(1, Math.ceil(total / tam))
               };
@@ -362,109 +385,32 @@
     titulo: "Reservas y estadías"
   });
 
-  var ORIGEN_MOV = { RECEPCION: "Recepción", TURISMO: "Turismo", CUENTA: "Cuenta de estadía" };
-  var CONCEPTO_CUENTA = {
-    CARGA: "Carga de saldo", RETIRO: "Retiro de saldo", REPARTO: "Reparto de saldo",
-    COMPRA: "Compra", ANULACION: "Anulación de compra", SALDAR_CONSUMOS: "Liquidación de consumos",
-    PAGO_RESERVA: "Pago de diferencia", DIFERENCIAL: "Diferencia de precio",
-    CIERRE_SALIDA: "Cierre de cuenta por salida", PAGO_SALIDA_CONSUMOS: "Consumos liquidados al salir",
-    TRASPASO_ALOJAMIENTO: "Traslado de deuda de alojamiento", TRASPASO_CONSUMOS: "Traslado de deuda de consumos"
-  };
-  function conceptoMovimiento(f) {
-    return f.origen === "CUENTA" ? CONCEPTO_CUENTA[f.concepto] || CONCEPTOS[f.concepto] || f.concepto : f.concepto;
-  }
-  function verMovimiento(f) {
-    P.modal({
-      titulo: conceptoMovimiento(f),
-      subtitulo: "Reserva T-" + f.reserva_id + " · " + P.f.fechaHora(f.fecha),
-      ancho: "ancha",
-      contenido: h("div.columna", grid(P.dato("Origen", ORIGEN_MOV[f.origen]), P.dato("Registró", texto(f.actor)),
-        P.dato("Servicio", texto(f.servicio)), P.dato("Recurso", texto(f.recurso)),
-        f.adicionales ? P.dato("Adicionales", f.adicionales) : null,
-        f.importe == null ? null : P.dato("Importe", pesos(f.importe)),
-        f.medio ? P.dato("Medio", MEDIOS[f.medio] || f.medio) : null),
-      f.detalle ? h("p", f.detalle) : null,
-      f.cambios && f.cambios.length ? tabla(["Campo", "Antes", "Después"], f.cambios.map(function (cambio) {
-        return cambio.map(function (v) { return h("span", texto(v)); });
-      })) : null)
-    });
-  }
-
-  P.ruta.registrar(/^\/recepcion\/movimientos$/, function (c) {
-    var clave = "tabla:recepcion-movimientos",
-      guardado = P.cache[clave] || {},
-      aplicados = guardado.filtros || {},
-      q = P.input({ tipo: "search", max: 80, valor: aplicados.q, placeholder: "Reserva, titular o empleado…" }),
-      desde = input(aplicados.desde, "date"), hasta = input(aplicados.hasta, "date"),
-      serv = sel([], "", "Todos"), recurso = sel([], "", "Todos"), adicional = sel([], "", "Todos"),
-      origen = sel(opciones(ORIGEN_MOV), aplicados.origen, "Todos"),
-      out = h("div.columna", { "aria-live": "polite" }),
-      catalogo, seq = 0;
-    function cargarRecursos(valor) {
-      if (!catalogo) return;
-      opSelect(recurso, lista(catalogo.recursos.filter(function (r) {
-        return !serv.value || String(r.servicio_id) === serv.value;
-      })), valor, "Todos");
-    }
-    function cargar(pag) {
-      var turno = ++seq;
-      out.setAttribute("aria-busy", "true");
-      P.reemplazar(out, P.cargando("Cargando movimientos…"));
-      return get("movimientos", Object.assign({}, aplicados, { pagina: pag, filtros: catalogo ? "" : "1" })).then(function (d) {
-        if (turno !== seq || !c.isConnected) return;
-        if (d.filtros) {
-          catalogo = d.filtros;
-          opSelect(serv, lista(catalogo.servicios), aplicados.servicio_id, "Todos");
-          cargarRecursos(aplicados.recurso_id);
-          opSelect(adicional, lista(catalogo.adicionales), aplicados.adicional_id, "Todos");
-        }
-        P.cache[clave] = { filtros: aplicados, pagina: d.pagina };
-        P.reemplazar(out, d.filas.length ? tabla(
-          ["Fecha", "Reserva / titular", "Servicio / recurso", "Adicionales", "Movimiento", "Registró", "Importe", "Detalle"],
-          d.filas.map(function (f) {
-            return [P.f.fechaHora(f.fecha), h("a", { href: "#/recepcion/" + f.reserva_id },
-              P.textoTabla("T-" + f.reserva_id + " · " + f.titular)),
-              [f.servicio, f.recurso].filter(Boolean).join(" · "), texto(f.adicionales),
-              conceptoMovimiento(f), texto(f.actor), f.importe == null ? "—" : pesos(f.importe),
-              P.btn("Ver", { chico: true, tipo: "texto", titulo: "Ver detalle del movimiento", onclick: function () { verMovimiento(f); } })];
-          })) : P.mensaje("No hay movimientos con esos filtros.", "info"),
-          d.pagina > 1 || d.siguiente ? h("div.fila",
-            P.btn("Anterior", { deshabilitado: d.pagina <= 1, onclick: function () { cargar(d.pagina - 1); } }),
-            espacio("Página " + d.pagina),
-            P.btn("Siguiente", { deshabilitado: !d.siguiente, onclick: function () { cargar(d.pagina + 1); } })) : null);
-      }).catch(function (e) {
-        if (turno === seq && c.isConnected) P.reemplazar(out, P.mensaje(e.message || "No se pudieron cargar los movimientos.", "error"));
-      }).finally(function () {
-        if (turno === seq) out.removeAttribute("aria-busy");
-      });
-    }
-    P.alSalir(function () { seq++; });
-    serv.onchange = function () { cargarRecursos(recurso.value); };
-    c.appendChild(cabecera("Movimientos de reservas y estadías", {
-      volver: ["Reservas y estadías", "/recepcion"],
-      subtitulo: "Historial de Turismo, operaciones de recepción y movimientos de cuenta."
-    }));
-    c.appendChild(h("form.hoja.rec-listado-filtros", {
-      onsubmit: function (e) {
-        e.preventDefault();
-        aplicados = { q: q.value, desde: desde.value, hasta: hasta.value, servicio_id: serv.value,
-          recurso_id: recurso.value, adicional_id: adicional.value, origen: origen.value };
-        cargar(1);
-      }
-    }, h("div.tabla-barra", P.campo("Buscar", q, { clase: "tabla-buscar" })),
-    h("div.tabla-filtros",
-      h("div.filtro-rango-fechas", { role: "group", "aria-label": "Fecha del movimiento" }, P.campo("Desde", desde), P.campo("Hasta", hasta)),
-      P.campo("Servicio", serv), P.campo("Recurso", recurso), P.campo("Adicional", adicional), P.campo("Origen", origen),
-      h("div.tabla-filtros-acciones", P.btn("Filtrar", { icono: "filtro", submit: true })))));
-    c.appendChild(out);
-    return cargar(guardado.pagina || 1);
-  }, { titulo: "Movimientos de reservas y estadías" });
   // ------------------------------------------------------------------ alta y edición
+
+  // Reserva a medio cargar mientras se pasa por el catálogo de adicionales: al volver al
+  // formulario (con el enlace o con «atrás») se recupera tal como estaba.
+  var CLAVE_BORRADOR = "recepcion:borrador", VIGENCIA_BORRADOR = 4 * 3600000;
+  function borrador() {
+    var b = P.cache[CLAVE_BORRADOR];
+    return b && Date.now() - b.fecha <= VIGENCIA_BORRADOR ? b : null;
+  }
+  function tomarBorrador() {
+    var b = borrador();
+    if (!b || b.hash !== location.hash) return null;
+    delete P.cache[CLAVE_BORRADOR];
+    return Object.assign({}, b.datos, { cotizacion: null, desdeBorrador: true });
+  }
+  P.recepcion.borrador = borrador;
+  P.recepcion.descartarBorrador = function () { delete P.cache[CLAVE_BORRADOR]; };
+  function esParcelaServicio(o, servicioId) {
+    var s = o.servicios.filter(function (x) { return String(x.id) === String(servicioId); })[0];
+    return !!s && s.tipo_codigo === "CUPO_NUMERADO";
+  }
 
   function formulario(c, o, r, cuenta, accion, lineasCuenta) {
     if (!c.isConnected) return;
     r = r || {};
-    var previo = P.continuidad.datosPantalla();
+    var previo = P.continuidad.datosPantalla() || tomarBorrador();
     var hoy = P.hoy(),
       viajeros = previo ? previo.viajeros : (r.personas || []).map(function (p) {
         return Object.assign({}, p);
@@ -505,11 +451,14 @@
       nom = input(""),
       ape = input(""),
       nac = input("", "date"),
-      veh = r.vehiculo || {},
-      marca = input(veh.marca),
-      color = input(veh.color),
-      patente = input(veh.patente),
-      sector = input(veh.sector);
+      ubic = input(r.ubicacion),
+      vehiculosPrevios = r.vehiculos || [],
+      vehiculos = previo && previo.vehiculos ? previo.vehiculos : vehiculosPrevios.map(function (v) { return Object.assign({}, v); }),
+      grupoVehiculos = h("div.columna");
+    ubic.maxLength = 120;
+    ubic.placeholder = "Ej.: bajo los pinos, frente al quincho";
+    var campoUbicacion = P.campo("Ubicación en la parcela (opcional)", ubic, {
+      clase: "rec-campo-ubicacion", ayuda: "Dónde arman la carpa. Se puede completar ahora, al ingresar o después desde el QR." });
     var manual = P.dinero({ valor: r.manual == null ? "" : P.f.numero(r.manual) });
     var motivo = input(""),
       obs = input(r.observaciones),
@@ -526,8 +475,9 @@
     var selectFamilia = sel([], null, "Familiares y acompañantes"),
       selectExtra = sel([], null, "Elegí un artículo");
     var campos = { tipo: tipo, servicio: serv, regimen: reg, inicio: inicio, fin: fin, entidad: entidad, cantidad: cantidad,
-      traslado: traslado, dni: dni, nombre: nom, apellido: ape, nacimiento: nac, marca: marca, color: color, patente: patente,
-      sector: sector, precio: manual, motivo: motivo, observaciones: obs };
+      traslado: traslado, dni: dni, nombre: nom, apellido: ape, nacimiento: nac, ubicacion: ubic, precio: manual, motivo: motivo, observaciones: obs };
+    function esParcela() { return esParcelaServicio(o, serv.value); }
+    function algunaPresente() { return viajeros.some(function (p) { return p.entrada && !p.salida; }); }
     function inicioAlquiler() {
       return inicio.value && hoy < inicio.value ? inicio.value : fin.value && hoy > fin.value ? fin.value : hoy;
     }
@@ -585,13 +535,18 @@
           extras.push({ adicional_id: x.valor, nombre: x.nombre, modalidad: x.modalidad, cantidad: 1, fecha_desde: inicioAlquiler(), fecha_hasta: inicioAlquiler(), porDia: true });
           pintarAdicionales();
         } }) : null),
-        P.esAdmin() ? h("p.texto-3.chico.rec-ayuda", "¿Falta un artículo o un precio? Cargalo antes en el ", h("a", { href: "#/recepcion/adicionales" }, "Catálogo de adicionales"), ".") : null);
+        P.esAdmin() ? h("p.texto-3.chico.rec-ayuda", "¿Falta un artículo o un precio? Cargalo en el ", h("a", { href: "#/recepcion/adicionales", onclick: function (e) {
+          e.preventDefault();
+          P.cache[CLAVE_BORRADOR] = { hash: location.hash, fecha: Date.now(), datos: instantanea(), titulo: r.id ? "Reserva T-" + r.id : "Nueva reserva" };
+          ir("adicionales");
+        } }, "Catálogo de adicionales"), ". Lo que ya cargaste en esta reserva se conserva para cuando vuelvas.") : null);
     }
     function recursos(v) {
       opSelect(rec, lista(o.recursos.filter(function (x) {
         return String(x.servicio_id) === serv.value;
       })), v, "Sin recurso");
       pintarRegimen(previo ? null : r.servicio_id && String(r.servicio_id) === serv.value ? r.regimen_id : null);
+      campoUbicacion.hidden = !esParcela();
       pintarAdicionales();
     }
     function pintarPersonas() {
@@ -691,6 +646,56 @@
         grupoViaje.querySelectorAll("fieldset")[viajeros.length - 1].querySelector("input").focus();
       }, "secundario", { icono: "mas" })));
     }
+    function pintarVehiculos() {
+      P.reemplazar(grupoVehiculos, vehiculos.map(function (v, i) {
+        var previoV = vehiculosPrevios.filter(function (x) { return x.patente === v.patente; })[0];
+        function campo(key, label, t, extra) {
+          var el = input(v[key], t);
+          if (key === "patente") { el.maxLength = 20; el.autocapitalize = "characters"; }
+          else if (t !== "date") el.maxLength = 50;
+          el.addEventListener("input", function () {
+            v[key] = key === "patente" ? el.value.toUpperCase() : el.value;
+            if (key === "patente") titulo.textContent = "Vehículo " + (i + 1) + (v.patente ? " · " + v.patente : "");
+          });
+          if (key === "patente" && previoV) el.readOnly = true;
+          if (t === "date") { el.min = inicio.value; el.max = hoy; }
+          return P.campo(label, el, extra);
+        }
+        var titulo = h("legend", "Vehículo " + (i + 1) + (v.patente ? " · " + v.patente : ""));
+        var entrada = campo("entrada", "Ingreso del vehículo", "date"), salida = campo("salida", "Salida del vehículo", "date");
+        // Un vehículo que ya ingresó no se borra: se registra su salida (salvo un error del mismo día).
+        var ingresoPrevio = previoV && (previoV.entrada || (iniciada ? r.fecha_inicio : null));
+        var borrable = !previoV || !previoV.salida && (!ingresoPrevio || ingresoPrevio === hoy);
+        function marcarHoy(key, etiqueta) {
+          v[key] = hoy;
+          var control = etiqueta.querySelector("input");
+          control.value = hoy;
+          control.focus();
+        }
+        return h("fieldset.rec-viajero.rec-vehiculo", titulo,
+          h("div.rec-grid", campo("patente", "Patente"), campo("marca", "Marca"), campo("color", "Color"),
+            campo("sector", "Sector de estacionamiento (opcional)")),
+          h("div.rec-grid.rec-grid-fechas", entrada, salida),
+          h("div.rec-botones-fecha", v.entrada ? null : btn("Ingresó hoy", function () { marcarHoy("entrada", entrada); }, "suave", { chico: true }),
+            v.salida ? null : btn("Salió hoy", function () {
+              if (!v.entrada && !algunaPresente()) { entrada.querySelector("input").focus(); throw Error("Registrá primero el ingreso del vehículo."); }
+              marcarHoy("salida", salida);
+            }, "suave", { chico: true }),
+            borrable ? btn("Quitar", function () { vehiculos.splice(i, 1); pintarVehiculos(); }, "texto", { chico: true, icono: "borrar" }) : null));
+      }), h("div.rec-agregar", btn("Agregar vehículo", function () {
+        if (vehiculos.length >= 20) throw Error("Una reserva admite hasta veinte vehículos.");
+        vehiculos.push({ patente: "", marca: "", color: "", sector: "", entrada: algunaPresente() ? hoy : "", salida: "" });
+        pintarVehiculos();
+        grupoVehiculos.querySelectorAll("fieldset")[vehiculos.length - 1].querySelector("input").focus();
+      }, "secundario", { icono: "mas" }), vehiculos.length ? null : h("span.texto-3", "Sin vehículos. Si llegan en auto, agregalo con su patente.")));
+    }
+    function instantanea() {
+      var valores = {};
+      Object.keys(campos).forEach(function (clave) { valores[clave] = campos[clave].value; });
+      return { campos: valores, recurso: rec.value, familiarElegido: selectFamilia.value, adicionalElegido: selectExtra.value,
+        familia: familia, titular: titular, particular: particular, titularMostrado: titularMostrado, particularSinFicha: particularSinFicha,
+        viajeros: viajeros, extras: extras, vehiculos: vehiculos, cotizacion: cotizacion, ajustesSalida: ajustesSalida, opId: opId, versionInicial: versionInicial };
+    }
     function mostrarTitular(p) {
       P.reemplazar(estadoTit, h("div.rec-titular", P.icono("persona"), h("strong", p.apellido + ", " + p.nombre),
         r.id ? h("span.texto-3", "DNI " + p.dni) : null, h("span.chip.chip-sin-punto", Number(p.afiliado) ? "Afiliado" : "Particular")));
@@ -785,12 +790,11 @@
         cantidad: cantidad.value,
         entidad: entidad.value,
         traslado: traslado.value,
-        vehiculo: {
-          marca: marca.value,
-          color: color.value,
-          patente: patente.value,
-          sector: sector.value
-        },
+        vehiculos: vehiculos.map(function (v) {
+          return { patente: String(v.patente || "").trim(), marca: String(v.marca || "").trim(), color: String(v.color || "").trim(),
+            sector: String(v.sector || "").trim(), entrada: v.entrada || null, salida: v.salida || null };
+        }),
+        ubicacion: esParcela() ? ubic.value.trim() : null,
         personas: viajeros.map(function (x) {
           var edadBebe = x.fecha_nacimiento && inicio.value && inicio.value < String(Number(x.fecha_nacimiento.slice(0, 4)) + 2) + x.fecha_nacimiento.slice(4);
           return Object.assign({}, x, {
@@ -821,7 +825,10 @@
             return;
           }
           P.aviso(res.mensaje, "ok");
-          P.ruta.ir("/recepcion/" + res.id + (checkout ? "?salida=1" : ""));
+          var ingresoNuevo = b.personas.some(function (p) {
+            return p.entrada && !(r.personas || []).some(function (a) { return String(a.dni) === String(p.dni) && a.entrada; });
+          });
+          P.ruta.ir("/recepcion/" + res.id + (checkout ? "?salida=1" : ingresoNuevo ? "?ingreso=1" : ""));
         });
       }, "primario", { icono: "check" });
       var saldo = Object.assign({}, cuenta || {}, x.cuenta || {});
@@ -906,32 +913,34 @@
       base.appendChild(grupo("Estadía", "Cada reserva tiene un recurso. Para otro recurso, creá otra reserva y asignale las personas que lo usarán.", h("div.columna",
         h("div.rec-grid", P.campo("Tipo de reserva", tipo), P.campo("Servicio", serv), P.campo("Recurso", rec), campoRegimen),
         h("div.rec-grid", P.campo("Ingreso", inicio), P.campo("Salida prevista", fin), campoTraslado),
+        campoUbicacion,
         contingente)));
     }
     base.appendChild(grupo(checkout ? "Personas presentes" : "Personas que viajan", checkout || editarFechas ? null :
       "Registrá el ingreso y la salida de cada persona con la fecha real. Si alguien se va otro día que el resto, cargá su salida prevista.", grupoViaje));
-    if (!checkout && !editarFechas) base.appendChild(grupo("Vehículo", "Si llegan sin auto, dejá los cuatro campos vacíos.", h("div.rec-grid", P.campo("Marca", marca), P.campo("Color", color), P.campo("Patente", patente), P.campo("Sector de estacionamiento", sector))));
-    if (checkout && veh.en_predio) base.appendChild(grupo("Vehículo en el predio", null, h("div.rec-grid", P.dato("Patente", veh.patente), P.dato("Estacionamiento", texto(veh.sector)))));
+    if (!checkout && !editarFechas) base.appendChild(grupo("Vehículos", "Cargá cada vehículo con su patente, marca y color; el sector de estacionamiento es opcional. " +
+      "Si durante la estadía llega otro auto, agregalo con su fecha de ingreso; si uno se va antes, registrá su salida.", grupoVehiculos));
+    var enPredio = vehiculosPrevios.filter(function (v) { return v.en_predio; });
+    if (checkout && enPredio.length) base.appendChild(grupo(enPredio.length === 1 ? "Vehículo en el predio" : "Vehículos en el predio", null,
+      tabla(["Patente", "Vehículo", "Estacionamiento"], enPredio.map(function (v) { return [h("strong", v.patente), [v.marca, v.color].filter(Boolean).join(" · "), texto(v.sector)]; }))));
     if (!editarFechas) base.appendChild(gExtra);
     base.appendChild(grupo(checkout ? "Liquidación" : "Importe y observaciones", null, h("div.columna", h("div.rec-grid", !checkout && !editarFechas ? P.campo("Precio acordado ($)", manual, {
       ayuda: "En General, vacío usa la tarifa. En las otras modalidades es obligatorio; cero es gratuidad. Los alquileres se suman aparte."
     }) : null, P.campo(checkout ? "Observación de la salida" : "Motivo del cambio", motivo), !checkout && !editarFechas ? P.campo("Observaciones de la reserva", obs) : null),
       h("div.rec-pie-acciones", guardar), pre)));
     if (previo) {
-      Object.keys(campos).forEach(function (clave) { campos[clave].value = previo.campos[clave]; });
+      Object.keys(campos).forEach(function (clave) { if (previo.campos[clave] !== undefined) campos[clave].value = previo.campos[clave]; });
       if (titularMostrado) mostrarTitular(titularMostrado);
       else if (particularSinFicha) mostrarParticular();
     }
     recursos(previo ? previo.recurso : r.recurso_id);
     pintarPersonas();
+    pintarVehiculos();
     modalidad(!!previo);
-    P.continuidad.guardarPantalla(function () {
-      var valores = {};
-      Object.keys(campos).forEach(function (clave) { valores[clave] = campos[clave].value; });
-      return { campos: valores, recurso: rec.value, familiarElegido: selectFamilia.value, adicionalElegido: selectExtra.value,
-        familia: familia, titular: titular, particular: particular, titularMostrado: titularMostrado, particularSinFicha: particularSinFicha,
-        viajeros: viajeros, extras: extras, cotizacion: cotizacion, ajustesSalida: ajustesSalida, opId: opId, versionInicial: versionInicial };
-    });
+    P.continuidad.guardarPantalla(instantanea);
+    if (previo && previo.desdeBorrador) c.insertBefore(P.mensaje(h("div.fila-separada",
+      h("span", "Recuperamos lo que habías cargado antes de ir al catálogo de adicionales."),
+      btn("Empezar de nuevo", function () { P.ruta.ir(location.hash.slice(1)); }, "texto", { chico: true })), "info"), base);
     if (previo) {
       selectFamilia.value = previo.familiarElegido;
       selectExtra.value = previo.adicionalElegido;
@@ -1098,107 +1107,111 @@
     });
     return cargarCajas.then(function () { return m; });
   }
-  function selectorCaja(caja) {
-    P.opciones("cajas").then(function (xs) {
-      var asignada = P.puesto() && P.puesto().caja_id;
-      if (!P.esAdmin()) xs = xs.filter(function (x) { return asignada && String(x.valor) === String(asignada); });
-      xs.forEach(function (x) {
-        caja.appendChild(h("option", { value: x.valor }, x.texto));
-      });
-      if (asignada && xs.some(function (x) { return String(x.valor) === String(asignada); })) caja.value = asignada;
-      else if (xs.length === 1) caja.value = xs[0].valor;
-    }).catch(P.error);
+
+  // ------------------------------------------------------------------ ubicación y vehículos sin cotizar
+
+  var ESTADOS_ACTIVOS = ["Aprobada", "Verificada", "Iniciada", "Adjudicada"];
+  function puedeAjustar(r) {
+    return ESTADOS_ACTIVOS.indexOf(r.estado) >= 0 && (P.esAdmin() || !!Number((P.estado.sesion.usuario || {}).gestionar_reservas));
   }
-  function operarArticulo(r, a, linea, accion, refrescar, pago) {
-    var key = nuevaClave();
-    var nota = input("");
-    var cuerpoModal, titulo, datos = {};
-    if (accion === "PAGAR") {
-      var imp = P.dinero({ valor: P.f.numero(linea.adeudado) });
-      var medio = sel(opciones({ EFECTIVO: MEDIOS.EFECTIVO, TRANSFERENCIA: MEDIOS.TRANSFERENCIA }), "EFECTIVO");
-      var caja = sel([], null, "Elegí una caja"), campoCaja = P.campo("Caja de efectivo", caja);
-      selectorCaja(caja);
-      medio.onchange = function () { campoCaja.hidden = medio.value !== "EFECTIVO"; };
-      titulo = "Registrar pago · " + linea.nombre;
-      cuerpoModal = h("div.columna", h("div.rec-resumen", "Falta pagar", h("strong", pesos(linea.adeudado))),
-        h("div.rec-grid", P.campo("Importe ($)", imp), P.campo("Medio", medio), campoCaja), P.campo("Observación", nota));
-      datos = function () {
-        var importe = P.importeDe(imp.value);
-        if (!(importe > 0) || importe > Number(linea.adeudado) + 0.001) { imp.focus(); throw Error("Ingresá un importe mayor que cero y que no supere lo que falta pagar."); }
-        if (medio.value === "EFECTIVO" && !caja.value) { caja.focus(); throw Error(P.esAdmin() ? "Elegí la caja donde se registra el efectivo." : "Ingresá a tu caja para registrar el efectivo de recepción."); }
-        return { importe: importe, medio: medio.value, caja_id: caja.value };
-      };
-    } else if (accion === "ANULAR_PAGO") {
-      var caja2 = sel([], null, "Elegí una caja"), campoCaja2 = P.campo("Caja que devuelve el efectivo", caja2);
-      campoCaja2.hidden = pago.medio !== "EFECTIVO";
-      if (pago.medio === "EFECTIVO") selectorCaja(caja2);
-      titulo = "Anular pago · " + linea.nombre;
-      cuerpoModal = h("div.columna", h("div.rec-resumen", "Pago del " + P.f.fechaHora(pago.fecha) + " · " + (MEDIOS[pago.medio] || pago.medio), h("strong", pesos(pago.importe))),
-        P.mensaje(pago.medio === "EFECTIVO" ? "Se registra la devolución del efectivo en la caja elegida." : "El importe vuelve a quedar pendiente de pago.", "info"), campoCaja2, P.campo("Motivo", nota));
-      datos = function () {
-        if (!campoCaja2.hidden && !caja2.value) { caja2.focus(); throw Error("Elegí la caja que devuelve el efectivo."); }
-        return { movimiento_id: pago.id, caja_id: caja2.value };
-      };
-    } else {
-      var dia = input(P.hoy() < linea.fecha_hasta ? P.hoy() : linea.fecha_hasta, "date");
-      dia.max = P.hoy();
-      dia.min = linea.fecha_desde;
-      titulo = (accion === "DEVOLVER" ? "Registrar devolución · " : "Quitar devolución · ") + linea.nombre;
-      cuerpoModal = h("div.columna", accion === "DEVOLVER" ? P.campo("Fecha de devolución", dia, { ayuda: detalleArticulo(linea) + " · " + periodo(linea) }) :
-        P.mensaje("El artículo vuelve a figurar como no devuelto.", "info"), P.campo("Observación", nota));
-      datos = function () { return accion === "DEVOLVER" ? { fecha: dia.value } : {}; };
-    }
+  // Ubicación y vehículos no cambian el precio: se guardan sin revisar el importe.
+  function ajustarEstadia(r, datos) {
+    return P.post("/recepcion/" + r.id + "/estadia", Object.assign({ operacion: nuevaClave(), version: r.version }, datos));
+  }
+  function datosVehiculo(v) {
+    return { patente: v.patente, marca: v.marca, color: v.color, sector: v.sector || "", entrada: v.entrada || null, salida: v.salida || null };
+  }
+  function editarUbicacion(r, alGuardar) {
+    var campo = input(r.ubicacion);
+    campo.maxLength = 120;
+    campo.placeholder = "Ej.: bajo los pinos, frente al quincho";
+    var guardar = btn("Guardar ubicación", function () {
+      return ajustarEstadia(r, { ubicacion: campo.value.trim() }).then(function (x) {
+        m.cerrar();
+        if (x.encolado) return;
+        P.aviso(x.sin_cambios ? x.mensaje : "Ubicación guardada.", "ok");
+        return alGuardar && alGuardar();
+      });
+    }, "primario", { icono: "check" });
     var m = P.modal({
-      titulo: titulo,
-      contenido: cuerpoModal,
-      acciones: [btn("Volver", function () { m.cerrar(); }), btn("Confirmar", function () {
-        return P.post("/recepcion/" + r.id + "/adicional", Object.assign({ operacion: key, accion: accion, adicional_id: linea.adicional_id, detalle: nota.value }, datos()))
-          .then(function (x) {
-            m.cerrar();
-            if (!x.encolado) {
-              P.aviso(x.mensaje, "ok");
-              return refrescar();
-            }
-          });
-      }, accion === "ANULAR_PAGO" ? "peligro" : "primario")]
+      titulo: "Ubicación en la parcela",
+      subtitulo: "Reserva T-" + r.id + " · " + r.titular_nombre + (r.numero_parcela ? " · Parcela " + r.numero_parcela : ""),
+      contenido: h("form.columna", { onsubmit: function (e) { e.preventDefault(); guardar.click(); } },
+        P.campo("Dónde está la carpa", campo, { ayuda: "Dejalo vacío si todavía no se sabe." })),
+      acciones: [btn("Cancelar", function () { m.cerrar(); }), guardar]
     });
+    setTimeout(function () { campo.focus(); }, 30);
+    return m;
   }
-
-  function chipsArticulo(l) {
-    var chips = [];
-    if (l.modalidad !== "VENTA" && l.fecha_desde) {
-      if (l.devuelto) chips.push(P.chip("Devuelto " + fecha(l.devuelto), "OK"));
-      else if (l.sin_devolver) chips.push(P.chip("Sin devolver" + (l.dias_atraso ? " · " + l.dias_atraso + (l.dias_atraso === 1 ? " día" : " días") : ""), "ERROR"));
-      else chips.push(P.chip("En uso", "ABIERTO"));
-    }
-    if (!Number(l.en_predio) && Number(l.subtotal)) chips.push(P.chip("Pagado en Turismo", "OK"));
-    else if (Number(l.adeudado)) chips.push(P.chip("Debe " + pesos(l.adeudado), "PENDIENTE"));
-    else if (l.saldado_con_reserva) chips.push(P.chip("Saldado con la reserva", "OK"));
-    else if (Number(l.en_predio)) chips.push(P.chip("Pagado", "OK"));
-    return h("div.rec-chips", chips);
+  P.recepcion.editarUbicacion = editarUbicacion;
+  function agregarVehiculo(r, alGuardar) {
+    var presentes = (r.personas || []).some(function (p) { return p.entrada && !p.salida; });
+    var patente = input(""), marca = input(""), color = input(""), sector = input(""), entrada = input(presentes ? P.hoy() : "", "date");
+    patente.maxLength = 20; marca.maxLength = color.maxLength = sector.maxLength = 50;
+    entrada.min = r.fecha_inicio; entrada.max = P.hoy();
+    var guardar = btn("Agregar vehículo", function () {
+      if (!patente.value.trim() || !marca.value.trim() || !color.value.trim()) throw Error("Completá patente, marca y color. El sector es opcional.");
+      var nuevo = { patente: patente.value.trim().toUpperCase(), marca: marca.value.trim(), color: color.value.trim(), sector: sector.value.trim(),
+        entrada: entrada.value || null, salida: null };
+      return ajustarEstadia(r, { vehiculos: (r.vehiculos || []).map(datosVehiculo).concat([nuevo]) }).then(function (x) {
+        m.cerrar();
+        if (x.encolado) return;
+        P.aviso("Vehículo " + nuevo.patente + " agregado.", "ok");
+        return alGuardar && alGuardar();
+      });
+    }, "primario", { icono: "mas" });
+    var m = P.modal({
+      titulo: "Agregar vehículo",
+      subtitulo: "Reserva T-" + r.id + " · " + r.titular_nombre,
+      contenido: h("form.columna", { onsubmit: function (e) { e.preventDefault(); guardar.click(); } },
+        grid(P.campo("Patente", patente), P.campo("Marca", marca), P.campo("Color", color), P.campo("Sector de estacionamiento (opcional)", sector),
+          P.campo("Ingreso del vehículo", entrada, { ayuda: presentes ? "Hoy, si llega ahora." : "Si queda vacío, entra con el grupo." }))),
+      acciones: [btn("Cancelar", function () { m.cerrar(); }), guardar]
+    });
+    setTimeout(function () { patente.focus(); }, 30);
+    return m;
   }
-
-  function tablaArticulos(r, a, lineas, cargar) {
-    var pagosDe = function (l) {
-      return a.movimientos.filter(function (m) {
-        return m.concepto === "PAGO_ADICIONAL" && Number(m.adicional_id) === Number(l.adicional_id) && Number(m.importe) > 0 && (a.pagos_anulados || []).indexOf(Number(m.id)) < 0;
+  function salidaVehiculo(r, v, alGuardar) {
+    var dia = input(P.hoy(), "date");
+    dia.min = v.entrada || r.fecha_inicio; dia.max = P.hoy();
+    var m = P.modal({
+      titulo: "Salida del vehículo " + v.patente,
+      subtitulo: [v.marca, v.color].filter(Boolean).join(" · ") + " · Reserva T-" + r.id,
+      contenido: h("div.columna", P.campo("Fecha de salida", dia), h("p.texto-2.chico", "Las personas de la reserva no cambian: sólo se registra que este vehículo ya no está en el predio.")),
+      acciones: [btn("Cancelar", function () { m.cerrar(); }), btn("Registrar salida", function () {
+        if (!dia.value) { dia.focus(); throw Error("Indicá la fecha de salida."); }
+        return ajustarEstadia(r, { vehiculos: (r.vehiculos || []).map(function (x) {
+          return x.patente === v.patente ? Object.assign(datosVehiculo(x), { salida: dia.value }) : datosVehiculo(x);
+        }) }).then(function (x) {
+          m.cerrar();
+          if (x.encolado) return;
+          P.aviso("Salida del vehículo " + v.patente + " registrada.", "ok");
+          return alGuardar && alGuardar();
+        });
+      }, "primario", { icono: "check" })]
+    });
+    return m;
+  }
+  function estadoVehiculo(v) {
+    return v.salida ? "Salió el " + fecha(v.salida) : v.en_predio ? P.chip("En el predio", "ABIERTO") : v.entrada ? "Ingreso " + fecha(v.entrada) : "Sin ingreso";
+  }
+  function seccionVehiculos(r, cargar) {
+    var vehiculos = r.vehiculos || [];
+    var editable = puedeAjustar(r);
+    var filas = vehiculos.map(function (v) {
+      var menu = editable && !v.salida ? P.btn("", { tipo: "texto", chico: true, icono: "menu", etiqueta: "Acciones del vehículo " + v.patente }) : null;
+      if (menu) menu.addEventListener("click", function () {
+        P.menuFlotante(menu, [
+          { texto: "Registrar salida", icono: "salir", accion: function () { salidaVehiculo(r, v, cargar); } },
+          { texto: "Imprimir etiqueta", icono: "qr", accion: function () { P.imprimirQRReserva(r, [v.patente]).catch(P.error); } }
+        ]);
       });
-    };
-    return tabla(["Artículo", "Detalle", "Importe", "Pagado", "Estado", ""], lineas.map(function (l) {
-      var items = [];
-      if (Number(l.adeudado)) items.push({ texto: "Registrar pago", icono: "efectivo", accion: function () { operarArticulo(r, a, l, "PAGAR", cargar); } });
-      pagosDe(l).forEach(function (pg) {
-        items.push({ texto: "Anular pago de " + pesos(pg.importe) + " (" + P.f.fecha(pg.fecha) + ")", icono: "cerrar", accion: function () { operarArticulo(r, a, l, "ANULAR_PAGO", cargar, pg); } });
-      });
-      if (l.modalidad !== "VENTA" && l.fecha_desde) {
-        items.push(l.devuelto ? { texto: "Quitar la devolución", icono: "historial", accion: function () { operarArticulo(r, a, l, "DESHACER_DEVOLUCION", cargar); } } :
-          { texto: "Registrar devolución", icono: "check", accion: function () { operarArticulo(r, a, l, "DEVOLVER", cargar); } });
-      }
-      var menu = items.length ? P.btn("", { tipo: "texto", chico: true, icono: "menu", etiqueta: "Acciones de " + l.nombre }) : null;
-      if (menu) menu.addEventListener("click", function () { P.menuFlotante(menu, items); });
-      return [h("div", h("strong", l.nombre), h("div.texto-3.chico", MODALIDAD[l.modalidad] || "")),
-        detalleArticulo(l) + " · " + periodo(l), pesos(l.subtotal), pesos(l.pagado), chipsArticulo(l), menu || ""];
-    }), ".rec-tabla-articulos");
+      return [h("strong.rec-codigo", v.patente), texto([v.marca, v.color].filter(Boolean).join(" · ")), texto(v.sector),
+        v.entrada ? fecha(v.entrada) : "Con el grupo", estadoVehiculo(v), menu || ""];
+    });
+    return h("div.columna",
+      vehiculos.length ? tabla(["Patente", "Vehículo", "Estacionamiento", "Ingreso", "Estado", ""], filas, ".rec-tabla-vehiculos") : null,
+      editable ? h("div.rec-botonera", btn("Agregar vehículo", function () { agregarVehiculo(r, cargar); }, "secundario", { chico: true, icono: "mas" })) : null);
   }
 
   // ------------------------------------------------------------------ detalle
@@ -1206,6 +1219,7 @@
   P.ruta.registrar(/^\/recepcion\/(\d+)$/, function (c, param) {
     var id = param[0];
     var recienSalida = P.ruta.query().salida === "1";
+    var recienIngreso = P.ruta.query().ingreso === "1";
     function cargar() {
       return get("detalle", { id: id }).then(function (d) {
         if (!c.isConnected) return;
@@ -1219,8 +1233,7 @@
           return [h("strong", P.textoTabla(p.apellido + ", " + p.nombre)), String(p.dni), p.entrada ? fecha(p.entrada) : "Sin ingreso",
             fecha(p.salida_prevista || r.fecha_fin), p.salida ? fecha(p.salida) : p.entrada ? P.chip("En el predio", "ABIERTO") : "—", pesos(p.precio), pesos(s ? s.saldo : 0)];
         });
-        var vh = r.vehiculo || {},
-          eventos = d.historial.map(function (e) {
+        var eventos = d.historial.map(function (e) {
             return h("details.rec-evento", h("summary", P.f.fechaHora(e.fecha) + " · " + e.actor), e.motivo ? h("p", e.motivo) : null, tabla(["Campo", "Antes", "Después"], e.cambios.map(function (f) {
               return f.map(texto);
             })));
@@ -1237,6 +1250,7 @@
           presentes ? btn("Registrar salida", function () { ir(id + "/editar?accion=salida"); }, "primario", { icono: "salir" }) : null,
           r.tipo !== "PASA_EL_DIA" && r.personas.some(function (p) { return !p.salida; }) ? btn("Modificar días por persona", function () { ir(id + "/editar?accion=fechas"); }) : null,
           btn("Editar reserva", function () { ir(id + "/editar"); }, "secundario", { icono: "editar" }),
+          !salieron && ESTADOS_ACTIVOS.indexOf(r.estado) >= 0 ? btn("Imprimir QR", function () { return P.elegirEtiquetasQR(r); }, "secundario", { icono: "qr" }) : null,
           imprimir];
         var vencidos = lineas.filter(function (l) { return l.sin_devolver; });
         function atraso(l) { return l.dias_atraso ? " (" + l.dias_atraso + (l.dias_atraso === 1 ? " día" : " días") + " de atraso)" : ""; }
@@ -1246,24 +1260,24 @@
             acciones: acciones,
             subtitulo: h("span.rec-subtitulo", h("span", r.titular_nombre + " · DNI " + r.titular_dni), P.chip(r.estado, ESTADO_CHIP[r.estado] || ""))
           }),
+          recienIngreso && !salieron ? P.mensaje(h("div.fila-separada", h("span", "Ingreso registrado. Imprimí el QR de la reserva para el parabrisas o la carpa: Seguridad lo escanea para ver vehículos, personas y deuda."),
+            btn("Imprimir QR", function () { return P.elegirEtiquetasQR(r); }, "primario", { chico: true, icono: "qr" })), "ok") : null,
           recienSalida ? P.mensaje(liq.total ? "Salida registrada. Revisá la liquidación, cobrá o devolvé lo pendiente e imprimí el comprobante." : "Salida registrada. La cuenta está saldada: podés imprimir el comprobante.", "ok") : null,
           vencida(r) ? P.mensaje("Quedan huéspedes con su fecha prevista vencida y sin salida registrada.", "aviso") : null,
           vencidos.length ? P.mensaje("Artículos sin devolver: " + vencidos.map(function (l) { return l.nombre + atraso(l); }).join(", ") + ". Registralo desde el menú de cada artículo.", "aviso") : null,
           grupo("Estadía", null, h("div.columna",
             h("div.datos.rec-datos",
-              P.dato("Servicio", r.servicio), P.dato("Recurso", texto(nombresRecursos(r)) + (r.numero_parcela ? " · Parcela " + r.numero_parcela : "")),
+              P.dato("Servicio", r.servicio), P.dato("Recurso", texto(recursoYParcela(nombresRecursos(r), r.numero_parcela))),
+              r.es_parcela ? h("div.dato.rec-dato-ubicacion", h("span", "Ubicación"), h("strong", texto(r.ubicacion)),
+                puedeAjustar(r) ? btn(r.ubicacion ? "Cambiar" : "Indicar ubicación", function () { editarUbicacion(r, cargar); }, "texto", { chico: true, icono: "editar" }) : null) : null,
               P.dato("Ingreso", fecha(r.fecha_inicio)), salidaReal ? P.dato("Salida", fecha(salidaReal) + (salidaReal !== r.fecha_fin ? " (prevista " + fecha(r.fecha_fin) + ")" : "")) : P.dato("Salida prevista", fecha(r.fecha_fin)),
               P.dato("Tipo", TIPOS[r.tipo] || r.tipo), P.dato("Personas", r.cantidad),
               r.entidad ? P.dato("Entidad", r.entidad) : null),
             r.observaciones ? h("p.rec-observaciones", h("strong", "Observaciones: "), r.observaciones) : null)),
-          vh.patente ? grupo("Vehículo", null, h("div.columna",
-            h("div.datos.rec-datos", P.dato("Patente", vh.patente), P.dato("Marca y color", texto([vh.marca, vh.color].filter(Boolean).join(" · "))),
-              P.dato("Estacionamiento", texto(vh.sector)), P.dato("Estado", vh.salida ? "Salió el " + fecha(vh.salida) : vh.en_predio ? "En el predio" : "Sin ingreso")),
-            !vh.salida ? h("div.rec-botonera", P.btn("Imprimir etiqueta QR", { tipo: "secundario", chico: true, icono: "imprimir", onclick: function (e) {
-              P.ejecutar(e.currentTarget, function () { return P.imprimirQRVehiculo(r); }).catch(function () {});
-            } })) : null)) : null,
+          (r.vehiculos || []).length || puedeAjustar(r) ? grupo((r.vehiculos || []).length === 1 ? "Vehículo" : "Vehículos",
+            (r.vehiculos || []).length ? null : "Sin vehículos registrados.", seccionVehiculos(r, cargar)) : null,
           grupo("Pasajeros", null, tabla(["Nombre", "DNI", "Ingreso", "Salida prevista", "Salida efectiva", "Estadía", "Saldo"], pasajeros)),
-          grupo("Alquileres y compras", lineas.length ? null : "Sin artículos. Para sumarlos, editá la reserva.", lineas.length ? tablaArticulos(r, a, lineas, cargar) : null),
+          grupo("Alquileres y compras", lineas.length ? null : "Sin artículos. Para sumarlos, editá la reserva.", lineas.length ? P.recepcion.tablaArticulos(r, a, lineas, cargar) : null),
           grupo("Cuenta de la estadía", null, h("div.columna", liq, accionesCuenta(r, a, cargar),
             a.movimientos.length ? h("details.rec-movimientos", { open: a.movimientos.length <= 6 ? "" : null },
               h("summary", "Movimientos de la cuenta (" + a.movimientos.length + ")"),

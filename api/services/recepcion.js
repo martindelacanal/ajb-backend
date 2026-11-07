@@ -81,13 +81,16 @@ async function familia(c, q, pid, soloDni = false) {
 }
 async function detalle(c, codigos, id, lock = false) {
   const r = await uno(c, `SELECT r.id,r.usuario_id,r.servicio_id,r.recurso_id,r.regimen_id,r.fecha_inicio,r.fecha_fin,r.precio_total,r.observaciones,r.numero_parcela,r.bloque_fecha_id,r.sorteo_id,r.estado_reserva_id,er.nombre AS estado,s.nombre AS servicio,rec.nombre AS recurso,
-    u.documento AS titular_dni,CONCAT_WS(', ',u.apellido,u.nombre) AS titular_nombre,u.legajo AS titular_legajo,(u.rol_id=2 AND u.habilitado='Y') AS afiliado
-    FROM reserva r JOIN servicio s ON s.id=r.servicio_id JOIN usuario u ON u.id=r.usuario_id LEFT JOIN recurso rec ON rec.id=r.recurso_id
+    u.documento AS titular_dni,CONCAT_WS(', ',u.apellido,u.nombre) AS titular_nombre,u.legajo AS titular_legajo,(u.rol_id=2 AND u.habilitado='Y') AS afiliado,
+    (ts.codigo='CUPO_NUMERADO') AS es_parcela
+    FROM reserva r JOIN servicio s ON s.id=r.servicio_id JOIN tipo_servicio ts ON ts.id=s.tipo_servicio_id
+    JOIN usuario u ON u.id=r.usuario_id LEFT JOIN recurso rec ON rec.id=r.recurso_id
     JOIN estado_reserva er ON er.id=r.estado_reserva_id WHERE r.id=? AND s.codigo IN (?)${lock ? " FOR UPDATE OF r" : ""}`, [id, codigos]);
   if (!r) throw U.error("No se encontró esa reserva entre los servicios asignados al predio.", 404);
   await cargarRecursos(c, [r], lock);
   const ev = await ultimo(c, id, lock),
     ext = ev ? JSON.parse(ev.actual) : {};
+  r.es_parcela = Number(r.es_parcela) === 1;
   if (ext.dia_sin_noche && r.fecha_fin === U.sumarDias(r.fecha_inicio, 1)) r.fecha_fin = r.fecha_inicio;
   const personas = await todos(c, `SELECT ${personaCols},rf.parentesco_id,rf.tipo_persona_id,rf.precio FROM reserva_familiar rf JOIN usuario u ON u.id=rf.usuario_id WHERE rf.reserva_id=? ORDER BY rf.id`, [id]);
   for (const p of personas) {
@@ -109,9 +112,6 @@ async function detalle(c, codigos, id, lock = false) {
       if (alquiler && periodo) Object.assign(a, periodo, { recurso_tarifa_id: alquiler.recurso_tarifa_id, regimen_tarifa_id: alquiler.regimen_tarifa_id });
     }
   }
-  // Lo que cada adicional ya costaba en Turismo antes del primer cambio del predio (se pagó allá).
-  const base = lock ? new Map() : (await Catalogo.basesDeTurismo(c, [id])).get(Number(id)) || new Map();
-  for (const a of adicionales) a.base_turismo = base.get(Number(a.adicional_id)) || 0;
   const tramos = Array.isArray(ext.tramos) && Number(ext.tramos.at(-1)?.recurso_id) === Number(r.recurso_id) ? ext.tramos : [];
   const seleccion = tramos.at(-1)?.adicionales;
   const datos = {
@@ -120,7 +120,8 @@ async function detalle(c, codigos, id, lock = false) {
     tipo: ext.tipo || "GENERAL",
     entidad: ext.entidad || null,
     cantidad: ext.cantidad || personas.length,
-    vehiculo: ext.vehiculo || {},
+    vehiculos: VEHICULOS.vehiculosDe(ext, await VEHICULOS.salidaAnterior(c, ev?.predio_id, id, ext)),
+    ubicacion: r.es_parcela ? ext.ubicacion || null : null,
     manual: ext.manual ?? null,
     automatico: ext.automatico ?? r.precio_total,
     cuotas_alojamiento: ext.cuotas_alojamiento || null,
@@ -132,9 +133,16 @@ async function detalle(c, codigos, id, lock = false) {
       : adicionales,
     revision: ev ? Number(ev.id) : 0
   };
+  // La versión firmada no incluye lo pagado en Turismo: con y sin bloqueo tiene que dar igual.
+  const version = firma(datos);
+  if (!lock) {
+    // Lo que cada adicional ya costaba en Turismo antes del primer cambio del predio (se pagó allá).
+    const base = (await Catalogo.basesDeTurismo(c, [id])).get(Number(id)) || new Map();
+    for (const a of adicionales) a.base_turismo = base.get(Number(a.adicional_id)) || 0;
+  }
   return {
     ...datos,
-    version: firma(datos)
+    version
   };
 }
 function resumenCambios(a, b) {
@@ -157,9 +165,12 @@ function resumenCambios(a, b) {
   })) {
     if (String(a?.[k] ?? "") !== String(b[k] ?? "")) cambios.push([l, a?.[k], b[k]]);
   }
-  for (const k of ["marca", "color", "patente", "sector"]) {
-    if ((a?.vehiculo?.[k] || "") !== (b.vehiculo[k] || "")) cambios.push([k, a?.vehiculo?.[k], b.vehiculo[k]]);
+  const vehiculos = r => new Map(VEHICULOS.vehiculosDe(r).map(v => [VEHICULOS.placa(v.patente), VEHICULOS.describirVehiculo(v)]));
+  const vAntes = vehiculos(a), vDespues = vehiculos(b);
+  for (const k of new Set([...vAntes.keys(), ...vDespues.keys()])) {
+    if (vAntes.get(k) !== vDespues.get(k)) cambios.push(["Vehículo", vAntes.get(k) || null, vDespues.get(k) || null]);
   }
+  if ((a?.ubicacion || "") !== (b.ubicacion || "")) cambios.push(["Ubicación", a?.ubicacion || null, b.ubicacion || null]);
   const mapa = (xs, fn) => new Map((xs || []).map(x => [String(fn(x)), x]));
   for (const [key, id, describe] of [["personas", "dni", p => nombre(p) + " · DNI " + p.dni + " · " + (p.entrada || "sin ingreso") + " / " + (p.salida || "sin salida") + (p.salida_prevista ? " · Prevista " + p.salida_prevista : "") + " · $" + Number(p.precio || 0)], ["adicionales", "adicional_id", p => p.nombre + " × " + p.cantidad + (p.fecha_desde ? " · " + p.fecha_desde + " a " + p.fecha_hasta : "") + " · $" + Number(p.subtotal)]]) {
     const ant = mapa(a?.[key], p => p[id]),
@@ -171,7 +182,7 @@ function resumenCambios(a, b) {
     }
   }
   if (b.plan_salida) {
-    if (b.plan_salida.vehiculo) cambios.push(["Vehículo", null, b.plan_salida.vehiculo === "SALE" ? "Salida registrada" : "Permanece en el predio"]);
+    if (b.plan_salida.vehiculos_salen?.length) cambios.push(["Salida de vehículos", null, b.plan_salida.vehiculos_salen.join(", ")]);
     if (b.plan_salida.accion) cambios.push(["Cuenta de la salida", null,
       (b.plan_salida.accion === "TRASLADAR" ? "Trasladada a quienes permanecen" : "Saldada") +
       " · Alojamiento $" + b.plan_salida.alojamiento + " · Consumos $" + b.plan_salida.consumos]);
@@ -261,9 +272,10 @@ async function listar(c, codigos, b) {
   const tam = U.entero(b.tam || 40, { min: 1, max: 200, campo: "La cantidad por página" });
   const dir = String(b.dir || "").toLowerCase() === "asc" ? "ASC" : "DESC";
   const orden = ORDEN_LISTADO[b.orden] ? ORDEN_LISTADO[b.orden].map(x => x + " " + dir).join(",") + ",r.id " + dir : "r.fecha_inicio DESC,r.id DESC";
-  const filas = await todos(c, `SELECT r.id,r.fecha_inicio,${fechaFinVisibleSql("e")} AS fecha_fin,r.precio_total,s.nombre AS servicio,r.recurso_id,rec.nombre AS recurso,er.nombre AS estado,CONCAT_WS(', ',u.apellido,u.nombre) AS titular,COALESCE(JSON_UNQUOTE(JSON_EXTRACT(e.actual,'$.tipo')),'GENERAL') AS tipo,(${condicionVencida}) AS vencida,
+  const filas = await todos(c, `SELECT r.id,r.fecha_inicio,${fechaFinVisibleSql("e")} AS fecha_fin,r.precio_total,s.nombre AS servicio,r.recurso_id,rec.nombre AS recurso,r.numero_parcela,
+    CASE WHEN e.predio_id=? THEN JSON_UNQUOTE(JSON_EXTRACT(e.actual,'$.ubicacion')) END AS ubicacion,er.nombre AS estado,CONCAT_WS(', ',u.apellido,u.nombre) AS titular,COALESCE(JSON_UNQUOTE(JSON_EXTRACT(e.actual,'$.tipo')),'GENERAL') AS tipo,(${condicionVencida}) AS vencida,
     CASE WHEN e.predio_id=? THEN JSON_EXTRACT(e.actual,'$.personas') END AS pasajeros_evento${from}
-    ORDER BY ${orden} LIMIT ${tam} OFFSET ${(pagina - 1) * tam}`, [pid, hoy, hoy, pid, pid, ...p]);
+    ORDER BY ${orden} LIMIT ${tam} OFFSET ${(pagina - 1) * tam}`, [pid, pid, hoy, hoy, pid, pid, ...p]);
   await cargarRecursos(c, filas);
   const vencidas = [];
   for (const r of filas) {
@@ -495,8 +507,17 @@ function validarPlanSalida(salida, plan) {
   if (haySaldo || plan.accion) U.opcion(plan.accion, salida.presentes.length ? ["COBRAR", "TRASLADAR"] : ["COBRAR"], "La liquidación");
   if (plan.accion === "COBRAR" && plan.total) U.opcion(plan.medio, ["EFECTIVO", "TRANSFERENCIA"], "El medio de pago");
   if (plan.medio === "EFECTIVO" && (!plan.caja?.caja_id || !plan.caja?.boca_id || !plan.caja?.fecha)) throw error();
-  if (salida.vehiculo_pendiente) U.opcion(plan.vehiculo, salida.presentes.length ? ["SALE", "PERMANECE"] : ["SALE"], "La salida del vehículo");
-  else if (plan.vehiculo) throw error();
+  const pendientes = (salida.vehiculos_pendientes || []).map(v => v.patente);
+  let salen = Array.isArray(plan.vehiculos_salen) ? plan.vehiculos_salen.map(VEHICULOS.placa) : null;
+  if (!salen && plan.vehiculo) {
+    U.opcion(plan.vehiculo, salida.presentes.length ? ["SALE", "PERMANECE"] : ["SALE"], "La salida del vehículo");
+    salen = plan.vehiculo === "SALE" ? pendientes : [];
+  }
+  if (!salen) salen = pendientes.length && salida.presentes.length ? null : pendientes;
+  if (!salen || salen.some(p => !pendientes.includes(p)) || new Set(salen).size !== salen.length) throw error();
+  // Si no queda nadie, salen todos los vehículos.
+  if (!salida.presentes.length && salen.length !== pendientes.length) throw error();
+  plan.vehiculos_salen = salen;
 }
 
 async function guardar(c, predio, actor, b, codigos, previa) {
@@ -670,29 +691,29 @@ async function guardar(c, predio, actor, b, codigos, previa) {
   const entidad = tipo === "CONTINGENTE" ? U.texto(b.entidad, {
     max: 120
   }) : null;
-  const vehiculo = {};
-  for (const k of ["marca", "color", "patente", "sector"]) vehiculo[k] = U.texto(b.vehiculo?.[k], {
-    max: 50
+  // Vehículos de la reserva, cada uno con su ingreso y su salida. Un cliente anterior
+  // manda un solo `vehiculo`: se toma como una lista de uno.
+  const vehiculosPrevios = anterior?.vehiculos || [];
+  const listaVehiculos = Array.isArray(b.vehiculos) ? b.vehiculos : b.vehiculo
+    ? [{ ...(vehiculosPrevios.find(v => VEHICULOS.placa(v.patente) === VEHICULOS.placa(b.vehiculo.patente)) || {}), ...b.vehiculo }]
+    : vehiculosPrevios;
+  const vehiculos = VEHICULOS.normalizarVehiculos(listaVehiculos, vehiculosPrevios, {
+    inicio, fin, personas, ingresoAnterior: Boolean(anterior?.personas.some(p => p.entrada))
   });
-  if (vehiculo.patente) {
-    vehiculo.patente = anterior?.vehiculo?.patente?.toUpperCase() === vehiculo.patente.toUpperCase()
-      ? anterior.vehiculo.patente : vehiculo.patente.toUpperCase();
-  }
-  if (Object.values(vehiculo).some(Boolean) && Object.values(vehiculo).some(v => !v)) throw U.error("Completá marca, color, patente y sector, o dejalos vacíos si no hay vehículo.");
+  // La ubicación (dónde arman la carpa) sólo corresponde a las parcelas de camping.
+  const ubicacion = servicio.tipo_codigo !== "CUPO_NUMERADO" ? null : b.ubicacion === undefined
+    ? anterior?.ubicacion || null : U.texto(b.ubicacion, { max: 120 }) || null;
   const nuevasSalidas = personas.filter(p => p.salida && !anterior?.personas.some(a => String(a.dni) === String(p.dni) && a.salida));
   const presentes = personas.filter(p => p.entrada && !p.salida);
   let salida = null;
   if (nuevasSalidas.length) {
-    const antesDeSalir = { ...anterior, vehiculo, personas: [...nuevasSalidas.map(p => ({ ...p, salida: null })), ...presentes] };
-    const estadoAnterior = anterior && await VEHICULOS.estadoVehiculo(c, predio, anterior, { bloquear: true });
-    if (estadoAnterior?.presente && String(anterior.vehiculo.patente).trim().toUpperCase() !== String(vehiculo.patente || "").trim().toUpperCase()) {
-      throw U.error("Registrá primero la salida del vehículo que estaba en el predio.");
-    }
-    const estadoVehiculo = anterior?.id && vehiculo.patente ? await VEHICULOS.estadoVehiculo(c, predio, antesDeSalir, { bloquear: true }) : { presente: Boolean(vehiculo.patente) };
+    const antesDeSalir = { personas: [...nuevasSalidas.map(p => ({ ...p, salida: null })), ...presentes] };
+    const pendientes = vehiculos.filter(v => VEHICULOS.vehiculoPresente(v, antesDeSalir));
     const ref = p => ({ dni: String(p.dni), nombre: nombre(p) });
     salida = { personas: nuevasSalidas.map(ref), presentes: presentes.map(ref),
       elegibles: personas.filter(p => !p.salida || nuevasSalidas.includes(p)).map(ref),
-      vehiculo_pendiente: estadoVehiculo.presente };
+      vehiculos_pendientes: pendientes.map(v => ({ patente: v.patente, marca: v.marca, color: v.color, sector: v.sector })),
+      vehiculo_pendiente: pendientes.length > 0 };
   }
   const extrasAnteriores = Number(anterior?.servicio_id) === Number(servicio.id) ? anterior.adicionales_vigentes : [];
   const ad = seleccionArticulos(b.adicionales ?? [], { inicio, fin, tipo, personas, recursoId, regimenId, anteriores: extrasAnteriores });
@@ -849,7 +870,8 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     tipo,
     cantidad,
     entidad,
-    vehiculo,
+    vehiculos: vehiculos.map(v => ({ ...v })),
+    ubicacion,
     tramos,
     manual,
     automatico,
@@ -870,11 +892,11 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     p.salida = a.salida;
     p.salida_prevista = a.salida_prevista;
   }
-  await VEHICULOS.limpiarCambioVehiculo(c, predio, anterior, actual);
   if (salida) {
     actual.plan_salida = planSalida;
-    if (planSalida.vehiculo === "SALE") {
-      await VEHICULOS.registrarSalida(c, predio, actor, actual, nuevasSalidas.map(p => p.salida).sort().at(-1));
+    const dia = nuevasSalidas.map(p => p.salida).sort().at(-1);
+    for (const v of actual.vehiculos) {
+      if (planSalida.vehiculos_salen.includes(v.patente)) v.salida = v.entrada && v.entrada > dia ? v.entrada : dia;
     }
   }
   const cambios = resumenCambios(anterior, actual);
@@ -894,8 +916,83 @@ async function guardar(c, predio, actor, b, codigos, previa) {
   if (anterior) await T.cerrarGuardiaArchivoReserva(c, id);
   return actual;
 }
+// Datos de la estadía que no cambian el precio ni la disponibilidad: dónde está la carpa
+// en la parcela y los vehículos (ingresos, salidas, alta de uno nuevo). Se guardan como una
+// revisión nueva de la reserva, sin cotizar. La revisión no trae diferencias de dinero, así
+// que la notebook sólo actualiza los huéspedes al confirmarla (o al recuperarla).
+async function ajustarEstadia(c, predio, actor, accion, b, codigos) {
+  const retiro = accion === "retirarVehiculo";
+  // Una versión anterior de la pantalla de Seguridad no identificaba la operación.
+  const operacion = String(b.operacion || (retiro ? "vehiculo-" + require("node:crypto").randomBytes(12).toString("hex") : ""));
+  if (!/^[a-zA-Z0-9_-]{16,64}$/.test(operacion)) throw U.error("Falta identificar la operación.");
+  const huella = firma({ actor: actor.id, accion, datos: b });
+  const recibo = await uno(c, "SELECT id,huella,actual FROM recepcion_reserva_evento WHERE predio_id=? AND operacion=?", [predio.id, operacion]);
+  if (recibo) {
+    if (recibo.huella !== huella) throw U.error("El comprobante corresponde a otro cambio.", 409);
+    return { ...JSON.parse(recibo.actual), evento_id: Number(recibo.id) };
+  }
+  const id = U.id(b.id);
+  const anterior = await detalle(c, codigos, id, true);
+  if (b.version && anterior.version !== b.version) throw U.error("Otra persona modificó la reserva. Volvé a abrirla antes de guardar.", 409);
+  if (!["Aprobada", "Verificada", "Iniciada", "Adjudicada"].includes(anterior.estado)) throw U.error("El estado de esta reserva no permite modificar la estadía.", 409);
+  const previo = JSON.parse((await ultimo(c, id, true))?.actual || "{}");
+  let vehiculos = anterior.vehiculos, ubicacion = anterior.ubicacion;
+  if (retiro) {
+    const v = vehiculos.find(x => VEHICULOS.placa(x.patente) === VEHICULOS.placa(b.patente));
+    if (!v) throw U.error("Ese vehículo ya no figura en la reserva. Volvé a abrirla.", 409);
+    if (v.salida) return { ...anterior, evento_id: anterior.revision, sin_cambios: true };
+    if (!VEHICULOS.vehiculoPresente(v, anterior)) throw U.error("El vehículo no figura en el predio.", 404);
+    const hoy = U.hoy();
+    vehiculos = vehiculos.map(x => x === v ? { ...x, entrada: x.entrada || [hoy, ...anterior.personas.map(p => p.entrada).filter(Boolean)].sort()[0], salida: hoy } : x);
+  }
+  if (Object.hasOwn(b, "vehiculos")) {
+    vehiculos = VEHICULOS.normalizarVehiculos(b.vehiculos, anterior.vehiculos, {
+      inicio: anterior.fecha_inicio, fin: anterior.fecha_fin, personas: anterior.personas,
+      ingresoAnterior: anterior.personas.some(p => p.entrada)
+    });
+  }
+  if (Object.hasOwn(b, "ubicacion")) {
+    if (!anterior.es_parcela) throw U.error("La ubicación se indica sólo en las parcelas de camping.");
+    ubicacion = U.texto(b.ubicacion, { max: 120 }) || null;
+  }
+  const motivo = U.texto(b.motivo, { max: 255 });
+  const actual = await detalle(c, codigos, id);
+  Object.assign(actual, {
+    dia_sin_noche: Boolean(previo.dia_sin_noche),
+    vehiculos: vehiculos.map(v => ({ ...v })),
+    ubicacion,
+    diferencia: 0,
+    diferenciales: []
+  });
+  if (Array.isArray(previo.alquileres)) actual.alquileres = previo.alquileres;
+  const cambios = resumenCambios(anterior, actual);
+  if (!cambios.length) return { ...anterior, evento_id: anterior.revision, sin_cambios: true };
+  actual.cambios = cambios;
+  actual.huella_local = U.sha256(JSON.stringify([actor.id, b]));
+  const nota = ("Operación atípica · " + predio.nombre + " · " + actor.nombre + (motivo ? " · " + motivo : "")).slice(0, 500);
+  const actorId = actor.general_usuario_id || null;
+  actual.historial_ids = [];
+  for (const [campo, antes, despues] of cambios) {
+    const [fila] = await c.query(
+      "INSERT INTO historial_reserva(reserva_id,tipo_operacion,campo_modificado,valor_anterior,valor_nuevo,usuario_modificador_id,observaciones) VALUES(?,?,?,?,?,?,?)",
+      [id, "UPDATE", campo, antes == null ? null : String(antes), despues == null ? null : String(despues), actorId, nota]
+    );
+    actual.historial_ids.push(Number(fila.insertId));
+  }
+  const [evento] = await c.query("INSERT INTO recepcion_reserva_evento(predio_id,reserva_id,operacion,huella,actor,empleado_id,anterior,actual,motivo) VALUES(?,?,?,?,?,?,?,?,?)",
+    [predio.id, id, operacion, huella, actor.nombre, actor.id || null, JSON.stringify(anterior), JSON.stringify(actual), motivo]);
+  actual.evento_id = Number(evento.insertId);
+  return actual;
+}
 async function operar(c, predio, actor, accion, b) {
-  if (VEHICULOS.acciones.has(accion)) return VEHICULOS.operar(c, predio, actor, accion, b);
+  if (accion === "retirarVehiculo" || accion === "ajustarEstadia") {
+    const autorizado = accion === "retirarVehiculo" ? VEHICULOS.permitir(actor, accion) : VEHICULOS.gestiona(actor);
+    if (!autorizado) throw U.error(accion === "retirarVehiculo" ? "Sólo un administrador corrige la salida de un vehículo." : "No tenés permiso de recepción.", 403);
+    const codigos = serviciosDe(predio);
+    if (!codigos.length) throw U.error("Este predio no tiene servicios asignados.", 403);
+    return ajustarEstadia(c, predio, actor, accion, b || {}, codigos);
+  }
+  if (VEHICULOS.acciones.has(accion)) return VEHICULOS.operar(c, predio, actor, accion, b, { detalle });
   if (!actor || actor.rol !== "ADMIN" && !Number(actor.gestionar_reservas)) throw U.error("No tenés permiso de recepción.", 403);
   const codigos = serviciosDe(predio);
   if (!codigos.length) throw U.error("Este predio no tiene servicios asignados.", 403);
@@ -924,8 +1021,7 @@ async function operar(c, predio, actor, accion, b) {
     });
     if (accion === "detalle") {
       const r = await detalle(c, codigos, U.id(b.id));
-      const vehiculo = await VEHICULOS.estadoVehiculo(c, predio, r);
-      Object.assign(r.vehiculo, { en_predio: vehiculo.presente, salida: vehiculo.salida });
+      for (const v of r.vehiculos) v.en_predio = VEHICULOS.vehiculoPresente(v, r);
       const eventos = await todos(c, "SELECT DATE_FORMAT(fecha,'%Y-%m-%d %H:%i:%s') AS fecha,actor,anterior,actual,motivo FROM recepcion_reserva_evento WHERE reserva_id=? ORDER BY id DESC", [r.id]);
       return {
         reserva: r,

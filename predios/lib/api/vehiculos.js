@@ -2,6 +2,7 @@
 
 const U = require("../util");
 const { resumirCuenta } = require("../cuenta-estadia");
+const { randomBytes } = require("node:crypto");
 
 const lectores = ["ADMIN", "SEGURIDAD"];
 
@@ -105,16 +106,49 @@ async function lectura(ctx, accion, datos) {
   return r.filas ? { filas } : filas[0];
 }
 
+function exigirRecepcion(ctx) {
+  if (ctx.usuario.rol !== "ADMIN" && !Number(ctx.usuario.gestionar_reservas)) throw U.error("Tu usuario no tiene permiso para gestionar reservas y estadías.", 403);
+}
+
+// Cambios de la estadía sin precio (ubicación, vehículos): Turismo guarda una revisión
+// nueva y la notebook actualiza los huéspedes con esa revisión (así la deuda queda al día).
+async function ajustar(ctx, accion, datos) {
+  const operacion = String(datos.operacion || randomBytes(16).toString("hex"));
+  if (!/^[a-zA-Z0-9_-]{16,64}$/.test(operacion)) throw U.error("Identificador de operación inválido.");
+  const cuerpo = { ...datos, operacion };
+  const huella = U.sha256(JSON.stringify([ctx.usuario.id, accion, cuerpo]));
+  return ctx.db.tx(async t => {
+    const previo = await t.get("SELECT huella,respuesta FROM predio_recepcion_recibo WHERE predio_id=? AND clave=?" + t.forUpdate, [ctx.pid, operacion]);
+    if (previo) {
+      if (previo.huella !== huella) throw U.error("Identificador ya utilizado para otra operación.", 409);
+      return JSON.parse(previo.respuesta);
+    }
+    const r = await turismo(t, ctx, accion, cuerpo);
+    if (r.sin_cambios) return { id: Number(r.id), sin_cambios: true, mensaje: "No había cambios para guardar." };
+    const { aplicarConfirmacion } = require("./recepcion");
+    return aplicarConfirmacion(t, ctx, r, operacion, huella, datos.motivo);
+  });
+}
+
 module.exports = {
   rutas: [
     { m: "GET", p: "/recepcion/vehiculos", roles: lectores, h: ctx => lectura(ctx, "vehiculos", {}) },
     { m: "GET", p: "/recepcion/vehiculos/qr/:token", roles: lectores, h: ctx => lectura(ctx, "buscarVehiculoQr", { token: ctx.params.token }) },
     { m: "GET", p: "/recepcion/vehiculos/:id", roles: lectores, h: ctx => lectura(ctx, "detalleVehiculo", { id: ctx.params.id }) },
     { m: "POST", p: "/recepcion/vehiculos/:id/salida", roles: ["ADMIN"], escritura: true,
-      h: ctx => ctx.db.tx(t => turismo(t, ctx, "retirarVehiculo", { id: ctx.params.id, patente: ctx.body.patente })) },
-    { m: "POST", p: "/recepcion/:id/vehiculo/qr", escritura: true, h: ctx => {
-      if (ctx.usuario.rol !== "ADMIN" && !Number(ctx.usuario.gestionar_reservas)) throw U.error("Tu usuario no tiene permiso para gestionar reservas y estadías.", 403);
-      return ctx.db.tx(t => turismo(t, ctx, "emitirVehiculoQr", { id: ctx.params.id, patente: ctx.body.patente }));
+      h: ctx => ajustar(ctx, "retirarVehiculo", { id: ctx.params.id, patente: ctx.body.patente, operacion: ctx.body.operacion }) },
+    // QR de la reserva (la ruta vieja «vehiculo/qr» queda por las pantallas anteriores).
+    ...["/recepcion/:id/qr", "/recepcion/:id/vehiculo/qr"].map(p => ({ m: "POST", p, escritura: true, h: ctx => {
+      exigirRecepcion(ctx);
+      return ctx.db.tx(t => turismo(t, ctx, "emitirVehiculoQr", { id: ctx.params.id }));
+    } })),
+    { m: "POST", p: "/recepcion/:id/estadia", escritura: true, h: ctx => {
+      exigirRecepcion(ctx);
+      const b = ctx.body || {};
+      const datos = { id: ctx.params.id, operacion: b.operacion, version: b.version, motivo: b.motivo };
+      if (Object.hasOwn(b, "ubicacion")) datos.ubicacion = b.ubicacion;
+      if (Object.hasOwn(b, "vehiculos")) datos.vehiculos = b.vehiculos;
+      return ajustar(ctx, "ajustarEstadia", datos);
     } }
   ]
 };

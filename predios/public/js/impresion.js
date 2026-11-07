@@ -140,6 +140,67 @@
     return imprimirHtml(h("div", copia("ORIGINAL"), copia("DUPLICADO")), ESTILO_COMPROBANTE, "Comprobante T-" + r.id);
   };
 
+  // Comprobante de un cobro de artículos alquilados o comprados (no fiscal), con original y duplicado.
+  // Si después se anuló algún pago, sale marcado ANULADO (o ANULADO EN PARTE) con la anulación detallada.
+  // datos: respuesta de GET /recepcion/:id/articulos/comprobante/:numero (o `datos` del cobro recién hecho).
+  // opciones: { reimpresion: true } agrega la fecha y hora de la reimpresión.
+  var ESTILO_ARTICULOS = ESTILO_COMPROBANTE +
+    ".sello-anulado { display: inline-block; margin: 6px 0 0 6px; padding: 3px 10px; border: 2px solid #b3261e; border-radius: 6px; font-weight: 800; letter-spacing: .1em; color: #b3261e; }" +
+    ".item-tipo { display: block; font-size: 11px; color: #5d7690; } tr.anulado td { color: #7b8ea3; } tr.anulado td.tachado { text-decoration: line-through; }" +
+    "tr.nota-anulacion td { padding-top: 0; font-size: 11px; color: #b3261e; } .observacion { margin-top: 12px; }";
+  P.imprimirComprobanteArticulos = function (datos, opciones) {
+    opciones = opciones || {};
+    var e = datos.empresa || {}, r = datos.reserva || {}, R = P.recepcion;
+    var ahora = P.f.fechaHora(new Date(Date.now() - 3 * 3600 * 1000).toISOString().replace("T", " "));
+    var medio = FORMAS[datos.medio] || datos.medio || "—";
+    var sello = datos.estado === "ANULADO" ? "ANULADO" : datos.estado === "ANULADO_PARCIAL" ? "ANULADO EN PARTE" : null;
+    var filas = [];
+    (datos.items || []).forEach(function (it) {
+      var conLinea = !!it.modalidad;
+      filas.push(h("tr" + (it.anulado ? ".anulado" : ""),
+        h("td.tachado", it.nombre, conLinea ? h("span.item-tipo", it.modalidad === "VENTA" ? "Compra" : "Alquiler") : null),
+        h("td", conLinea ? R.detalleArticulo(it) : "—"),
+        h("td", conLinea ? R.periodo(it) : "—"),
+        h("td.num.tachado", P.f.pesos(it.importe))));
+      if (it.anulado) {
+        var an = it.anulacion || {};
+        filas.push(h("tr.nota-anulacion", h("td", { colspan: "4" }, "Pago anulado" + (an.fecha ? " el " + P.f.fechaHora(an.fecha) : "") +
+          (an.usuario_nombre ? " por " + an.usuario_nombre : "") + (an.motivo ? ". Motivo: " + an.motivo : "") + ".")));
+      }
+    });
+    function copia(tipo) {
+      return h("div.copia",
+        h("div.cab",
+          h("div", h("h1", e.razon_social || "Asociación Judicial Bonaerense"), h("div.gris", e.nombre_predio || datos.predio || ""), e.direccion ? h("div.gris", e.direccion) : null,
+            e.cuit ? h("div.gris", "CUIT " + e.cuit) : null),
+          h("div.der", h("h1", "Comprobante de pago"), h("div", h("strong", "N° " + datos.numero + " · Reserva T-" + r.id)),
+            h("div.gris", "Cobrado el " + P.f.fechaHora(datos.fecha)), opciones.reimpresion ? h("div.gris", "Reimpreso el " + ahora) : null,
+            h("div.no-fiscal", "Comprobante de pago — no válido como factura"),
+            h("div", h("span.tipo-copia", tipo), sello ? h("span.sello-anulado", sello) : null))),
+        h("h2", "Titular"),
+        h("div.datos",
+          h("div", h("span", "Titular"), h("strong", r.titular_nombre || "")),
+          h("div", h("span", "DNI"), h("strong", documento(r.titular_dni) || "—")),
+          h("div", h("span", "Reserva"), h("strong", "T-" + r.id)),
+          h("div", h("span", "Estadía"), h("strong", [r.servicio, r.recurso].filter(Boolean).join(" · ") || "—")),
+          h("div", h("span", "Medio de pago"), h("strong", medio)),
+          h("div", h("span", "Atendió"), h("strong", datos.empleado || "—"))),
+        h("h2", "Artículos pagados"),
+        h("table", h("thead", h("tr", h("th", "Artículo"), h("th", "Cantidad"), h("th", "Período"), h("th.num", "Importe"))),
+          h("tbody", filas.map(function (f) { return f.cloneNode(true); }))),
+        h("div.totales",
+          h("div" + (datos.anulado ? "" : ".final"), h("span", "Total cobrado"), h("span", P.f.pesos(datos.total))),
+          datos.anulado ? h("div", h("span", "Pagos anulados"), h("strong", "− " + P.f.pesos(datos.anulado))) : null,
+          datos.anulado ? h("div.final", h("span", "Total vigente"), h("span", P.f.pesos(datos.vigente))) : null,
+          h("div", h("span", "Medio de pago"), h("strong", medio))),
+        datos.observacion ? h("p.observacion", h("span.gris", "Observación: "), datos.observacion) : null,
+        h("div.firmas", h("div", "Firma del huésped"), h("div", "Aclaración"), h("div", "Firma y sello del predio")),
+        h("div.pie", (tipo === "ORIGINAL" ? "Original para el huésped. " : "Duplicado para el predio. ") +
+          "Comprobante interno del pago de artículos alquilados o comprados en el predio; no es una factura."));
+    }
+    return imprimirHtml(h("div", copia("ORIGINAL"), copia("DUPLICADO")), ESTILO_ARTICULOS, "Comprobante " + datos.numero + " T-" + r.id);
+  };
+
   P.imprimirCompra = function (datos) {
     var c = datos.compra;
     var temporal = c.estado === "TEMPORAL" || c.estado === "DESCARTADA";

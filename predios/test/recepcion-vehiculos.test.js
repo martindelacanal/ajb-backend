@@ -55,3 +55,41 @@ test("Seguridad lee sólo vehículos y el saldo usa la cuenta sin duplicar los t
   vehiculo.revision = 31;
   assert.equal((await ejecutar("GET", "/recepcion/vehiculos/91")).deuda.desactualizada, true);
 });
+
+test("ubicación y vehículos sin cotizar: la revisión nueva actualiza los huéspedes una sola vez y sin dinero", async t => {
+  const U = require("../lib/util");
+  const db = crearSqlite(":memory:", { predioId: 1 });
+  t.after(() => db.cerrar());
+  asegurarEsquema(db);
+  const llamadas = [];
+  let sinCambios = false;
+  const admin = { id: 1, rol: "ADMIN", nombre: "Recepción" };
+  const ctx = {
+    db, modo: "local", pid: 1, usuario: admin, sesion: {},
+    servicios: { recepcion: async (accion, datos) => {
+      llamadas.push([accion, datos]);
+      assert.equal(accion, "ajustarEstadia");
+      if (sinCambios) return { id: 40, sin_cambios: true };
+      return { id: 40, titular_dni: "30111222", afiliado: 0, precio_total: 500, diferencia: 0, diferenciales: [], evento_id: 77,
+        personas: [{ dni: "30111222", nombre: "Ana", apellido: "Paz", entrada: U.hoy(), salida: null }],
+        cambios: [["Ubicación", null, "Bajo los pinos"]] };
+    } }
+  };
+  const ejecutar = (m, ruta, body = {}, usuario = admin) => api.ejecutar({ ...ctx, usuario, body }, m, ruta);
+  const cuerpo = { operacion: "ubicacion-0000000001", ubicacion: "Bajo los pinos", version: "v1" };
+  const primera = await ejecutar("POST", "/recepcion/40/estadia", cuerpo);
+  const segunda = await ejecutar("POST", "/recepcion/40/estadia", cuerpo);
+  assert.deepEqual(segunda, primera);
+  assert.equal(llamadas.length, 1, "el reintento no vuelve a Turismo");
+  assert.deepEqual(llamadas[0][1], { id: "40", operacion: cuerpo.operacion, version: "v1", motivo: undefined, ubicacion: "Bajo los pinos" });
+  const huesped = await db.get("SELECT * FROM predio_huesped WHERE reserva_id=40");
+  assert.equal(Number(huesped.ultima_revision), 77);
+  assert.equal((await db.get("SELECT COUNT(*) AS n FROM predio_estadia_mov")).n, 0);
+  await assert.rejects(ejecutar("POST", "/recepcion/40/estadia", { ...cuerpo, ubicacion: "Otra" }), { status: 409 });
+  await assert.rejects(ejecutar("POST", "/recepcion/40/estadia", cuerpo, { id: 5, rol: "SEGURIDAD", nombre: "Guardia" }), { status: 403 });
+  await assert.rejects(ejecutar("POST", "/recepcion/40/estadia", cuerpo, { id: 6, rol: "CAJERO", nombre: "Caja", gestionar_reservas: 0 }), { status: 403 });
+  sinCambios = true;
+  const nada = await ejecutar("POST", "/recepcion/40/estadia", { operacion: "ubicacion-0000000002", ubicacion: "Bajo los pinos" });
+  assert.equal(nada.sin_cambios, true);
+  assert.equal(await db.get("SELECT 1 AS hay FROM predio_recepcion_recibo WHERE clave='ubicacion-0000000002'"), undefined);
+});

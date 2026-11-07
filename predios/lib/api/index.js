@@ -16,6 +16,7 @@ const modulos = [
   require("./compras"),
   require("./ventas"),
   require("./recepcion"),
+  require("./recepcion-articulos"),
   require("./vehiculos"),
   require("./caja"),
   require("./afiliados"),

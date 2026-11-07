@@ -48,11 +48,22 @@
 
   // ------------------------------------------------------------------ catálogo
 
+  // Si se llegó desde una reserva a medio cargar, el catálogo ofrece volver a ella tal como estaba.
+  function avisoBorrador() {
+    var b = R.borrador && R.borrador();
+    if (!b) return null;
+    return P.mensaje(h("div.fila-separada", h("span", h("strong", b.titulo || "Reserva a medio cargar"),
+      " · Lo que cargaste se conserva. Cuando termines con el catálogo, volvé para seguir."),
+    P.btn("Volver a la reserva", { tipo: "primario", chico: true, icono: "volver", onclick: function () { location.hash = b.hash; } })), "info");
+  }
+
   P.ruta.registrar(/^\/recepcion\/adicionales$/, function (c) {
     c.appendChild(R.cabecera("Catálogo de adicionales", {
       volver: ["Reservas y estadías", "/recepcion"],
       acciones: [P.btn("Crear adicional", { tipo: "primario", icono: "mas", onclick: function () { ir("nuevo"); } })]
     }));
+    var aviso = avisoBorrador();
+    if (aviso) c.appendChild(h("div.rec-avisos", aviso));
     var zona = h("div", P.cargando());
     c.appendChild(zona);
     return R.get("catalogo").then(function (cat) {
@@ -235,6 +246,8 @@
       volver: ["Catálogo de adicionales", "/recepcion/adicionales"],
       subtitulo: adicional && datos.usos && datos.usos.reservas ? "Usado en " + datos.usos.reservas + (datos.usos.reservas === 1 ? " reserva" : " reservas") + ". Cambiar un precio no modifica las reservas ya cotizadas." : null
     }));
+    var avisoReserva = avisoBorrador();
+    if (avisoReserva) c.appendChild(h("div.rec-avisos", avisoReserva));
     c.appendChild(h("section.hoja.rec-seccion", h("div.rec-seccion-cabecera", h("h2", "Artículo")),
       h("div.rec-grid.rec-grid-articulo", P.campo("Nombre", nombre, { ayuda: nombre.readOnly ? nombre.title : null }),
         h("div.campo", h("span.campo-etiqueta", "Tipo"), segmento, ayudaModalidad))));

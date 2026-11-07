@@ -320,7 +320,7 @@ async function caja(t, ctx, b, n, id, concepto) {
 }
 
 function liquidacionDeSalida(a, cotizacion) {
-  const { personas, presentes, elegibles, vehiculo_pendiente } = cotizacion.salida;
+  const { personas, presentes, elegibles, vehiculos_pendientes = [] } = cotizacion.salida;
   const candidatos = presentes.length ? elegibles : personas;
   const porDni = new Map(candidatos.map(p => [p.dni, {
     ...p, alojamiento: 0, consumos: 0, trasladado: 0, ...a.saldos_individuales[p.dni]
@@ -346,7 +346,8 @@ function liquidacionDeSalida(a, cotizacion) {
   });
   const alojamiento = U.redondear(salidas.reduce((s, p) => s + p.alojamiento, 0));
   const consumos = U.redondear(salidas.reduce((s, p) => s + p.consumos, 0));
-  return { personas: salidas, presentes, alojamiento, consumos, total: U.redondear(alojamiento + consumos), vehiculo_pendiente };
+  return { personas: salidas, presentes, alojamiento, consumos, total: U.redondear(alojamiento + consumos),
+    vehiculos_pendientes, vehiculo_pendiente: vehiculos_pendientes.length > 0 };
 }
 
 async function revisarSalida(t, ctx, b, bloquear = false) {
@@ -379,18 +380,26 @@ async function verificarAnulaciones(t, ctx, id, a, seleccion = null) {
 
 async function prepararSalida(t, ctx, b, salida) {
   const eleccion = b.salida || {};
-  const { alojamiento, consumos, total, personas, presentes, vehiculo_pendiente } = salida;
+  const { alojamiento, consumos, total, personas, presentes, vehiculos_pendientes = [] } = salida;
   const accion = eleccion.accion || alojamiento || consumos
     ? U.opcion(eleccion.accion, presentes.length ? ["COBRAR", "TRASLADAR"] : ["COBRAR"], "La liquidación")
     : null;
   const medio = accion === "COBRAR" && total ? U.opcion(eleccion.medio, ["EFECTIVO", "TRANSFERENCIA"], "El medio de pago") : null;
-  const vehiculo = vehiculo_pendiente
-    ? U.opcion(eleccion.vehiculo, presentes.length ? ["SALE", "PERMANECE"] : ["SALE"], "La salida del vehículo")
-    : null;
+  // Qué vehículos salen: si no queda nadie, todos; si no, los que eligió recepción.
+  const pendientes = vehiculos_pendientes.map(v => v.patente);
+  let vehiculos_salen = [];
+  if (pendientes.length && !presentes.length) vehiculos_salen = pendientes;
+  else if (pendientes.length) {
+    const elegidos = Array.isArray(eleccion.vehiculos_salen) ? eleccion.vehiculos_salen.map(String)
+      : eleccion.vehiculo === "SALE" ? pendientes : eleccion.vehiculo === "PERMANECE" ? [] : null;
+    if (!elegidos) throw U.error("Indicá qué vehículos salen del predio y cuáles permanecen.");
+    if (elegidos.some(p => !pendientes.includes(p))) throw U.error("Revisá los vehículos que salen: cambió la lista de la reserva.", 409);
+    vehiculos_salen = pendientes.filter(p => elegidos.includes(p));
+  }
   const id = U.id(b.id, "La reserva", false);
   if (id) await verificarAnulaciones(t, ctx, id, await cuenta(t, ctx, id, true), presentes.length ? new Set(personas.map(p => p.dni)) : null);
   const caja = medio === "EFECTIVO" ? await prepararCaja(t, ctx, eleccion) : null;
-  return { personas, presentes, alojamiento, consumos, total, accion, medio, caja, vehiculo };
+  return { personas, presentes, alojamiento, consumos, total, accion, medio, caja, vehiculos_salen };
 }
 
 async function aplicarSalida(t, ctx, id, plan, personas) {
@@ -679,5 +688,9 @@ module.exports = {
   cuenta,
   permiso,
   turismo,
-  aplicarConfirmacion
+  aplicarConfirmacion,
+  sincronizar,
+  movimiento,
+  caja,
+  empresa
 };

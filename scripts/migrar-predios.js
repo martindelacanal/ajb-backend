@@ -30,6 +30,7 @@ const USUARIO_RUNTIME = "miajb_runtime";
 const DDL_CENTRALES = {
   recepcion_reserva_recurso: require("./migrar-recepcion-recursos").DDL_RECURSOS,
   recepcion_vehiculo: require("./migrar-recepcion-vehiculos").DDL_VEHICULOS,
+  recepcion_reserva_qr: require("./migrar-recepcion-qr").DDL_QR,
   predio_inventario_envio: require("./migrar-predios-operacion").DDL_ENVIOS,
   recepcion_particular: `CREATE TABLE IF NOT EXISTS recepcion_particular (usuario_id INT NOT NULL PRIMARY KEY, predio_id INT NOT NULL, creado DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB`,
   recepcion_reserva_evento: `CREATE TABLE IF NOT EXISTS recepcion_reserva_evento (
@@ -163,6 +164,9 @@ async function main() {
   if (soloRevisar) { await c.end(); return; }
 
   for (const [t, ddl] of Object.entries(DDL_CENTRALES)) await c.query(ddl);
+  // QR por reserva: las etiquetas de vehículo ya impresas apuntan a su reserva.
+  const etiquetas = await require("./migrar-recepcion-qr").copiarEtiquetas(c);
+  if (etiquetas) console.log(`  + ${etiquetas} etiquetas QR anteriores pasan a su reserva`);
   // Precios de adicionales por reglas (catálogo del predio y temporadas): ver migrar-adicionales-precios.js.
   await require("./migrar-adicionales-precios").aplicarEsquema(c);
   if (!(await columnasExistentes(c, "predio")).has("equipo_id")) await c.query("ALTER TABLE predio ADD COLUMN equipo_id VARCHAR(64) NULL");

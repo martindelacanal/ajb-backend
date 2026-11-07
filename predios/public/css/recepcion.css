@@ -117,16 +117,22 @@
 .rec-precio-quitar { display: flex; justify-content: flex-end; }
 .rec-precio-fila[data-fila] { padding: 8px 0; border-top: 1px solid var(--linea); }
 
-@media (max-width: 1100px) {
+@media (max-width: 1260px) {
   .rec-articulo { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .rec-articulo-nombre { grid-column: 1 / -1; }
   .rec-articulo-pie { grid-column: 1 / -1; }
 }
-@media (max-width: 900px) {
+@media (max-width: 1240px) {
   .rec-precio-encabezado { display: none; }
   .rec-precio-fila, .rec-precios.con-regimen .rec-precio-fila { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 12px 0; }
   .rec-precio-celda .rec-etiqueta-movil { display: block; margin-bottom: 4px; color: var(--texto-2); font-size: 12px; font-weight: 700; }
   .rec-precio-quitar { grid-column: 1 / -1; }
+}
+@media (max-width: 1360px) {
+  .rec-precios.con-regimen .rec-precio-encabezado { display: none; }
+  .rec-precios.con-regimen .rec-precio-fila { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 12px 0; }
+  .rec-precios.con-regimen .rec-precio-celda .rec-etiqueta-movil { display: block; margin-bottom: 4px; color: var(--texto-2); font-size: 12px; font-weight: 700; }
+  .rec-precios.con-regimen .rec-precio-quitar { grid-column: 1 / -1; }
 }
 @media (max-width: 600px) {
   .rec-seccion { padding: 14px; }
@@ -158,3 +164,67 @@
 .vehiculo-resumen h3 { margin: 0; }
 .vehiculo-detalle { list-style: none; margin: 0; padding: 0; }
 .vehiculo-detalle li { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--borde); }
+
+/* ---------------------------------------------------------------- cobro de artículos y comprobantes de pago */
+.rec-cobro-barra { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; justify-content: space-between; padding: 10px 14px; background: var(--cielo); border-radius: var(--radio-chico); }
+.rec-cobro-barra > .btn { flex: 0 0 auto; }
+.rec-cobro-falta { flex: 1 1 220px; min-width: 0; margin: 0; color: var(--tinta); }
+.rec-cobro-falta strong { font-variant-numeric: tabular-nums; }
+.rec-cobro-ayuda { margin: 0; }
+.rec-cobro-lista { display: flex; flex-direction: column; gap: 8px; }
+.rec-cobro-item { display: grid; grid-template-columns: minmax(0, 1fr) minmax(112px, 150px); gap: 8px 14px; align-items: center;
+  padding: 10px 12px; border: 1px solid var(--borde); border-radius: var(--radio-chico); background: var(--blanco); }
+.rec-cobro-item.elegido:not(.unico) { border-color: var(--azul); background: #f7fbff; }
+.rec-cobro-item .check { display: flex; min-width: 0; }
+.rec-cobro-item .check > span { min-width: 0; overflow-wrap: anywhere; }
+.rec-cobro-importe { display: flex; flex-direction: column; align-items: stretch; gap: 4px; min-width: 0; }
+.rec-cobro-importe .campo-control { width: 100%; min-width: 0; }
+.rec-cobro-importe .campo-control:disabled { opacity: .55; }
+.rec-cobro-debe { color: var(--texto-3); font-size: 12.5px; text-align: right; white-space: nowrap; }
+.rec-cobro-total { justify-content: space-between; }
+.rec-cobro-total strong { font-size: 20px; color: var(--azul-hondo); font-variant-numeric: tabular-nums; }
+.rec-cobro-hecho { margin: 0; padding: 0; list-style: none; }
+.rec-cobro-hecho li { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--linea); }
+.rec-cobro-hecho li span { min-width: 0; overflow-wrap: anywhere; }
+.rec-cobro-hecho li strong { flex: none; font-variant-numeric: tabular-nums; }
+.rec-tabla-comprobantes td:last-child { width: 1%; white-space: nowrap; text-align: right; }
+@media (max-width: 600px) {
+  .rec-cobro-barra > .btn { flex: 1 1 100%; }
+  .rec-tabla-comprobantes td:last-child { width: auto; white-space: normal; text-align: left; }
+}
+@media (max-width: 420px) {
+  .rec-cobro-item { grid-template-columns: minmax(0, 1fr); }
+  .rec-cobro-importe { flex-direction: row; align-items: center; justify-content: space-between; padding-left: 30px; }
+  .rec-cobro-item.unico .rec-cobro-importe { padding-left: 0; }
+  .rec-cobro-importe .campo-control { flex: 0 1 150px; width: auto; }
+  .rec-cobro-debe { min-width: 0; text-align: left; white-space: normal; }
+}
+
+/* ---------------------------------------------------------------- vehículos de la reserva y ubicación en la parcela */
+.rec-vehiculo legend { overflow-wrap: anywhere; }
+.rec-campo-ubicacion { display: flex; max-width: 520px; }
+.rec-campo-ubicacion[hidden] { display: none; }
+.rec-dato-ubicacion { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; }
+.rec-dato-ubicacion strong { overflow-wrap: anywhere; }
+.rec-dato-ubicacion .btn { margin-left: -8px; }
+.rec-tabla-vehiculos td:last-child { width: 44px; text-align: right; }
+.rec-subtitulo-seccion { margin: 6px 0 0; font-size: 15px; color: var(--azul-hondo); }
+.vehiculo-ficha .datos { margin-bottom: 4px; }
+.vehiculo-detalle li > div:first-child { min-width: 0; overflow-wrap: anywhere; }
+.vehiculo-estado { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: none; text-align: right; }
+.vehiculo-resaltado { margin: 0 -8px; padding-left: 8px !important; padding-right: 8px !important; background: var(--cielo); border-radius: var(--radio-chico); }
+.vehiculo-codigo { align-items: flex-end; }
+.vehiculo-codigo > .campo { flex: 1 1 220px; min-width: 0; }
+@media (max-width: 600px) {
+  .rec-tabla-vehiculos td:last-child { width: auto; text-align: left; }
+  .vehiculo-detalle li { flex-wrap: wrap; }
+  .vehiculo-estado { align-items: flex-start; text-align: left; flex: 1 1 100%; }
+}
+
+/* Enlace a la reserva dentro de una tabla: como el código T-, subrayado sólo al pasar. */
+a.rec-enlace { color: var(--azul); text-decoration: none; }
+a.rec-enlace:hover, a.rec-enlace:focus-visible { text-decoration: underline; }
+.vehiculo-reserva { min-width: 150px; }
+.rec-grid-vehiculos-salida { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+.rec-grid-vehiculos-salida .campo-etiqueta { white-space: normal; overflow-wrap: anywhere; }
+@media (max-width: 600px) { .rec-grid-vehiculos-salida { grid-template-columns: minmax(0, 1fr); } }
