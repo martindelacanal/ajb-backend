@@ -17,8 +17,9 @@ const importe = x => U.numero(x, {
   max: 99999999,
   campo: "El importe"
 });
-async function movimiento(t, ctx, reserva, concepto, valor, medio, detalle, persona = null, venta = null, liquidacion = null) {
+async function movimiento(t, ctx, reserva, concepto, valor, medio, detalle, persona = null, venta = null, liquidacion = null, extra = {}) {
   return N.insertar(t, ctx, "predio_estadia_mov", {
+    ...extra,
     reserva_id: reserva,
     huesped_id: persona,
     venta_id: venta,
@@ -42,7 +43,156 @@ async function turismo(t, ctx, accion, datos) {
 async function cuenta(t, ctx, id, lock = false) {
   const personas = await t.all("SELECT * FROM predio_huesped WHERE predio_id=? AND reserva_id=? ORDER BY id" + (lock ? t.forUpdate : ""), [ctx.pid, id]);
   const movimientos = await t.all("SELECT * FROM predio_estadia_mov WHERE predio_id=? AND reserva_id=? ORDER BY id DESC" + (lock ? t.forUpdate : ""), [ctx.pid, id]);
-  return resumirCuenta(personas, movimientos);
+  const a = resumirCuenta(personas, movimientos);
+  a.devoluciones = (await t.all("SELECT * FROM predio_adicional_devolucion WHERE predio_id=? AND reserva_id=?" + (lock ? t.forUpdate : ""), [ctx.pid, id]))
+    .filter(d => !Number(d.anulada));
+  return a;
+}
+
+// ------------------------------------------------------------------ adicionales de la estadía
+
+const MEDIOS_ADICIONAL = ["EFECTIVO", "TRANSFERENCIA"];
+
+/** Estado de cada artículo de la reserva: lo que cuesta en el predio, lo pagado, lo adeudado y la devolución. */
+function estadoAdicionales(reserva, a, hoy = U.hoy()) {
+  const devueltos = new Map((a.devoluciones || []).map(d => [Number(d.adicional_id), d]));
+  const saldada = Number(a.pendiente) <= 0;
+  // Si ya salieron todos, lo alquilado que no se devolvió queda pendiente aunque su período no haya terminado.
+  const ingresaron = (reserva.personas || []).filter(p => p.entrada);
+  const salieronTodos = ingresaron.length > 0 && ingresaron.every(p => p.salida);
+  return (reserva.adicionales || []).map(x => {
+    const id = Number(x.adicional_id);
+    const enPredio = U.redondear(Math.max(0, Number(x.subtotal || 0) - Number(x.base_turismo || 0)));
+    const pagado = U.redondear(Number(a.pagos_adicionales?.[String(id)] || 0));
+    const adeudado = saldada ? 0 : U.redondear(Math.max(0, enPredio - pagado));
+    const alquiler = x.modalidad !== "VENTA" && !!x.fecha_hasta;
+    const devolucion = devueltos.get(id) || null;
+    return {
+      ...x,
+      en_predio: enPredio,
+      pagado,
+      adeudado,
+      saldado_con_reserva: saldada && enPredio > pagado,
+      devuelto: devolucion ? devolucion.fecha : null,
+      devolucion_por: devolucion ? devolucion.usuario_nombre : null,
+      sin_devolver: alquiler && !devolucion && (x.fecha_hasta < hoy || salieronTodos || !!x.todos_salieron),
+      dias_atraso: alquiler && !devolucion && x.fecha_hasta < hoy ? Math.round((Date.parse(hoy) - Date.parse(x.fecha_hasta)) / 86400000) : 0
+    };
+  });
+}
+
+async function saldosPorReserva(db, pid, ids) {
+  if (!ids.length) return new Map();
+  const movs = await db.all(`SELECT reserva_id, concepto, adicional_id, importe FROM predio_estadia_mov
+    WHERE predio_id=? AND reserva_id IN (${ids.map(() => "?").join(",")}) AND concepto IN ('DIFERENCIAL','PAGO_RESERVA','PAGO_ADICIONAL')`, [pid, ...ids]);
+  const devs = await db.all(`SELECT reserva_id, adicional_id, fecha, usuario_nombre FROM predio_adicional_devolucion
+    WHERE predio_id=? AND COALESCE(anulada,0)=0 AND reserva_id IN (${ids.map(() => "?").join(",")})`, [pid, ...ids]);
+  const mapa = new Map(ids.map(id => [Number(id), { pendiente: 0, pagos_adicionales: {}, devoluciones: [] }]));
+  for (const m of movs) {
+    const x = mapa.get(Number(m.reserva_id));
+    const n = Number(m.importe);
+    if (m.concepto === "DIFERENCIAL") x.pendiente += n;
+    else x.pendiente -= n;
+    if (m.concepto === "PAGO_ADICIONAL") x.pagos_adicionales[String(m.adicional_id)] = U.redondear((x.pagos_adicionales[String(m.adicional_id)] || 0) + n);
+  }
+  for (const d of devs) mapa.get(Number(d.reserva_id)).devoluciones.push(d);
+  for (const x of mapa.values()) x.pendiente = U.redondear(x.pendiente);
+  return mapa;
+}
+
+/**
+ * Artículos alquilados cuyo período ya terminó sin devolverse o sin pagarse, y artículos sin pagar
+ * de estadías en las que ya salieron todos. Los datos de la reserva vienen de Turismo; la devolución
+ * y los pagos, de las tablas del predio (siempre al día en la notebook).
+ */
+async function adicionalesPendientes(ctx) {
+  const r = await turismo(ctx.db, ctx, "alquileres", {});
+  const hoy = r.hoy || U.hoy();
+  const porReserva = new Map();
+  for (const l of r.lineas || []) {
+    if (!porReserva.has(l.reserva_id)) porReserva.set(l.reserva_id, []);
+    porReserva.get(l.reserva_id).push(l);
+  }
+  const saldos = await saldosPorReserva(ctx.db, ctx.pid, [...porReserva.keys()]);
+  const salida = [];
+  for (const [reservaId, lineas] of porReserva) {
+    const a = saldos.get(reservaId);
+    const estados = estadoAdicionales({ adicionales: lineas }, a, hoy);
+    for (const e of estados) {
+      const vencido = e.modalidad !== "VENTA" && e.fecha_hasta && e.fecha_hasta < hoy;
+      const sinPagar = e.adeudado > 0 && (vencido || e.todos_salieron);
+      if (!e.sin_devolver && !sinPagar) continue;
+      salida.push({
+        id: reservaId + "-" + e.adicional_id, reserva_id: reservaId, titular: e.titular, servicio: e.servicio, recurso: e.recurso,
+        adicional_id: e.adicional_id, nombre: e.nombre, modalidad: e.modalidad, cantidad: e.cantidad, fecha_desde: e.fecha_desde, fecha_hasta: e.fecha_hasta,
+        dias_atraso: e.fecha_hasta && e.fecha_hasta < hoy ? Math.round((Date.parse(hoy) - Date.parse(e.fecha_hasta)) / 86400000) : 0,
+        sin_devolver: e.sin_devolver, sin_pagar: sinPagar, adeudado: e.adeudado, salieron: !!e.todos_salieron
+      });
+    }
+  }
+  return { hoy, filas: salida.sort((x, y) => y.dias_atraso - x.dias_atraso || x.reserva_id - y.reserva_id) };
+}
+
+async function operarAdicional(ctx) {
+  permiso(ctx);
+  const b = ctx.body,
+    id = U.id(ctx.params.id);
+  return ctx.db.tx(async t => {
+    const key = String(b.operacion || "");
+    if (!/^[a-zA-Z0-9_-]{16,64}$/.test(key)) throw U.error("Identificador de operación inválido.");
+    const huella = U.sha256(JSON.stringify([ctx.usuario.id, id, "adicional", b]));
+    const previo = await t.get("SELECT huella,respuesta FROM predio_recepcion_recibo WHERE predio_id=? AND clave=?" + t.forUpdate, [ctx.pid, key]);
+    if (previo) {
+      if (previo.huella !== huella) throw U.error("Identificador ya utilizado para otra operación.", 409);
+      return JSON.parse(previo.respuesta);
+    }
+    const { reserva: r } = await turismo(t, ctx, "detalle", { id });
+    const a = await cuenta(t, ctx, id, true);
+    const adicionalId = U.id(b.adicional_id, "El artículo");
+    const linea = estadoAdicionales(r, a).find(x => Number(x.adicional_id) === adicionalId);
+    if (!linea) throw U.error("Ese artículo no está en la reserva.", 404);
+    const nota = U.texto(b.detalle, { max: 180 });
+    let mensaje;
+    if (b.accion === "DEVOLVER" || b.accion === "DESHACER_DEVOLUCION") {
+      if (linea.modalidad === "VENTA" || !linea.fecha_desde) throw U.error("Sólo se registra la devolución de un artículo alquilado por días.");
+      const fila = await t.get("SELECT * FROM predio_adicional_devolucion WHERE predio_id=? AND reserva_id=? AND adicional_id=?" + t.forUpdate, [ctx.pid, id, adicionalId]);
+      if (b.accion === "DEVOLVER") {
+        const fecha = U.fecha(b.fecha || U.hoy(), { campo: "La fecha de devolución" });
+        if (fecha > U.hoy() || fecha < linea.fecha_desde) throw U.error("La devolución tiene que ser entre el primer día de uso y hoy.");
+        const datos = { fecha, detalle: nota, anulada: 0, usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx), registrada: U.fechaHora() };
+        if (fila) await N.actualizar(t, ctx, "predio_adicional_devolucion", fila.id, datos);
+        else await N.insertar(t, ctx, "predio_adicional_devolucion", { ...datos, reserva_id: id, adicional_id: adicionalId });
+        mensaje = linea.nombre + " devuelto";
+      } else {
+        if (!fila || Number(fila.anulada)) throw U.error("Ese artículo no tiene una devolución registrada.");
+        await N.actualizar(t, ctx, "predio_adicional_devolucion", fila.id, { anulada: 1, detalle: nota || fila.detalle, usuario_id: ctx.usuario.id, usuario_nombre: N.nombreActor(ctx), registrada: U.fechaHora() });
+        mensaje = "Se quitó la devolución de " + linea.nombre;
+      }
+    } else if (b.accion === "PAGAR") {
+      U.opcion(b.medio, MEDIOS_ADICIONAL, "El medio");
+      const n = importe(b.importe);
+      if (n > linea.adeudado) throw U.error("El importe supera lo que falta pagar de " + linea.nombre + " (" + U.pesos(linea.adeudado) + ").");
+      if (b.medio === "EFECTIVO") await caja(t, ctx, b, n, id, "ADICIONAL_ESTADIA");
+      await movimiento(t, ctx, id, "PAGO_ADICIONAL", n, b.medio, [linea.nombre, nota].filter(Boolean).join(" · "), null, null, null, { adicional_id: adicionalId });
+      mensaje = "Pago de " + linea.nombre + " registrado";
+    } else if (b.accion === "ANULAR_PAGO") {
+      const pago = a.movimientos.find(m => Number(m.id) === Number(b.movimiento_id));
+      if (!pago || pago.concepto !== "PAGO_ADICIONAL" || Number(pago.adicional_id) !== adicionalId || Number(pago.importe) <= 0) throw U.error("No encontramos ese pago del artículo.", 404);
+      if (a.pagos_anulados.includes(Number(pago.id))) throw U.error("Ese pago ya fue anulado.", 409);
+      if (pago.medio === "EFECTIVO") await caja(t, ctx, b, -Number(pago.importe), id, "ADICIONAL_ESTADIA");
+      await movimiento(t, ctx, id, "PAGO_ADICIONAL", -Number(pago.importe), pago.medio, ["Anula el pago de " + linea.nombre, nota].filter(Boolean).join(" · "), null, null, null,
+        { adicional_id: adicionalId, anula_mov_id: Number(pago.id) });
+      mensaje = "Pago de " + linea.nombre + " anulado";
+    } else throw U.error("Operación de artículo inválida.");
+    const respuesta = { mensaje };
+    await N.insertar(t, ctx, "predio_recepcion_recibo", { clave: key, huella, respuesta: JSON.stringify(respuesta) });
+    return respuesta;
+  });
+}
+
+async function empresa(ctx) {
+  const config = await N.leerConfig(ctx.db, ctx);
+  return { nombre_predio: config.nombre_predio, razon_social: config.razon_social, cuit: config.cuit, direccion: config.direccion };
 }
 async function sincronizar(t, ctx, r) {
   const prev = await cuenta(t, ctx, r.id, true);
@@ -437,15 +587,59 @@ async function verPlanilla(ctx) {
     }
   });
 }
-const rutas = ["opciones", "listar", "familia", "detalle", "vencidas", "movimientos"].map(accion => ({
+const rutas = ["opciones", "listar", "familia", "detalle", "movimientos"].map(accion => ({
   m: "GET",
   p: "/recepcion/" + accion,
   h: async ctx => {
     const r = await turismo(ctx.db, ctx, accion, ctx.query);
-    if (accion === "detalle") r.cuenta = await cuenta(ctx.db, ctx, r.reserva.id);
+    if (accion === "detalle") {
+      r.cuenta = await cuenta(ctx.db, ctx, r.reserva.id);
+      r.adicionales = estadoAdicionales(r.reserva, r.cuenta);
+      r.empresa = await empresa(ctx);
+    }
     return r;
   }
 }));
+rutas.push({
+  m: "GET",
+  p: "/recepcion/vencidas",
+  h: async ctx => {
+    const r = await turismo(ctx.db, ctx, "vencidas", ctx.query);
+    // Un Turismo anterior no conoce los alquileres: el aviso de estadías sigue funcionando igual.
+    try { r.adicionales = (await adicionalesPendientes(ctx)).filas.length; } catch (_e) { r.adicionales = 0; }
+    return r;
+  }
+}, {
+  m: "GET",
+  p: "/recepcion/adicionales-pendientes",
+  h: adicionalesPendientes
+}, {
+  m: "GET",
+  p: "/recepcion/catalogo",
+  roles: ["ADMIN"],
+  h: ctx => turismo(ctx.db, ctx, "catalogo", {})
+}, {
+  m: "GET",
+  p: "/recepcion/catalogo/adicional",
+  roles: ["ADMIN"],
+  h: ctx => turismo(ctx.db, ctx, "adicional", { id: ctx.query.id })
+}, {
+  m: "POST",
+  p: "/recepcion/catalogo/guardar",
+  roles: ["ADMIN"],
+  escritura: true,
+  h: ctx => ctx.db.tx(t => turismo(t, ctx, "guardarAdicional", ctx.body))
+}, {
+  m: "GET",
+  p: "/recepcion/estadisticas",
+  roles: ["ADMIN"],
+  h: ctx => turismo(ctx.db, ctx, "resumenEstadias", ctx.query)
+}, {
+  m: "POST",
+  p: "/recepcion/:id/adicional",
+  escritura: true,
+  h: operarAdicional
+});
 rutas.push({
   m: "GET",
   p: "/recepcion/:id/planilla/:planilla",
@@ -478,6 +672,8 @@ rutas.push({
 });
 module.exports = {
   rutas,
+  estadoAdicionales,
+  adicionalesPendientes,
   aplicarVenta,
   huespedParaDevolucion,
   cuenta,

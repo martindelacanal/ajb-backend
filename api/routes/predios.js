@@ -131,6 +131,7 @@ function prepararOrden(actor, ruta, cuerpo, cuenta, claveDiaCierreValidada) {
   } else if (/^\/(?:compras|ventas|traspasos|solicitudes|bajas)(?:\/|$)/.test(ruta)) actor.capacidad = "stock-predio-v2";
   else if (/^\/bocas(?:\/|$)/.test(ruta)) actor.capacidad = "precios-boca-v1";
   else if (ruta === "/recepcion/adicionales") actor.capacidad = "recepcion-alquileres-v1";
+  else if (ruta === "/recepcion/catalogo/guardar" || /^\/recepcion\/\d+\/adicional$/.test(ruta)) actor.capacidad = "recepcion-adicionales-v2";
   if (/^\/usuarios(?:\/\d+)?$/.test(ruta) && datos.password) {
     clavesUsuario.validarNueva(datos.password, String(datos.usuario || "").trim().toLowerCase());
     actor.hash_clave_validada = U.hashPassword(datos.password);
@@ -468,6 +469,7 @@ function crearRouterAdmin() {
         comandos_recepcion: serializadas.filter(c => c.actor?.capacidad === "recepcion-alquileres-v1"),
         comandos_cierre: serializadas.filter(c => c.actor?.capacidad === "cierre-clave-dia-v1"),
         comandos_recepcion_salidas: serializadas.filter(c => c.actor?.capacidad === "recepcion-salidas-v1"),
+        comandos_adicionales: serializadas.filter(c => c.actor?.capacidad === "recepcion-adicionales-v2"),
       };
       if (req.query.codigo === "1") {
         const paquete = C.paqueteCodigo();
@@ -691,10 +693,12 @@ function crearRouterSync() {
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'recepcion-alquileres-v1')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'cierre-clave-dia-v1')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'recepcion-salidas-v1')
+             AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'recepcion-adicionales-v2')
            ORDER BY id LIMIT 20`, [p.id, capacidades.includes("cuentas-predio-v1") ? 1 : 0,
              capacidades.includes("precios-boca-v1") ? 1 : 0, capacidades.includes("stock-predio-v2") ? 1 : 0,
              capacidades.includes("operacion-predio-v2") ? 1 : 0, capacidades.includes("recepcion-alquileres-v1") ? 1 : 0,
-             capacidades.includes("cierre-clave-dia-v1") ? 1 : 0, capacidades.includes("recepcion-salidas-v1") ? 1 : 0]);
+             capacidades.includes("cierre-clave-dia-v1") ? 1 : 0, capacidades.includes("recepcion-salidas-v1") ? 1 : 0,
+             capacidades.includes("recepcion-adicionales-v2") ? 1 : 0]);
         if (filas.length) {
           await conexion.query(`UPDATE predio_comando SET estado = 'ENTREGADO', entregado_en = NOW(), intentos = intentos + 1 WHERE id IN (?)`, [filas.map(c => c.id)]);
         }

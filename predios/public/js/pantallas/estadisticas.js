@@ -32,11 +32,13 @@
     var seleccion = estado.filtrosEstadias || {};
     var opciones, solicitud = 0;
     var resultados = h("div", { "aria-live": "polite" });
+    // Cifras de la selección (antes estaban arriba de la tabla de reservas) y gráficos de ocupación.
+    var resumen = h("div", { "aria-live": "polite" });
     var periodo = h("p.texto-2");
     var raiz = h("section", { style: { marginTop: "24px" } },
       h("h2.seccion-titulo", "Reservas y estadías"), periodo,
       h("div.tabla-filtros.tabla-periodo-controles", P.campo("Servicio", servicio), P.campo("Recurso", recurso), P.campo("Adicional", adicional)),
-      resultados);
+      resumen, resultados);
     controles.forEach(function (el) { el.disabled = true; });
 
     function completar(select, filas, valor) {
@@ -69,8 +71,32 @@
           }), "Sin adicionales contratados para esta selección.")),
         datos.sin_detalle ? h("p.texto-2", "Los adicionales antiguos sin detalle diario se contabilizan en la fecha de inicio de la reserva.") : null);
     }
+    function pintarResumen(d) {
+      var k = d.kpi;
+      var TIPOS = { GENERAL: "General", PASA_EL_DIA: "Pasa el día", CONTINGENTE: "Contingente", FEDERACION: "Federación" };
+      function tarjeta(titulo, contenido) { return h("div.hoja.hoja-cuerpo", { style: { minWidth: 0 } }, h("h3.seccion-titulo", { style: { marginBottom: "14px" } }, titulo), contenido); }
+      var porDia = d.por_dia.map(function (x) { return { etiqueta: P.f.fecha(x.dia) + " (" + x.reservas + " reservas)", corta: x.dia.slice(8, 10) + "/" + x.dia.slice(5, 7), valor: x.personas }; });
+      P.reemplazar(resumen,
+        h("div.grilla.grilla-4", { style: { marginBottom: "16px" } },
+          P.cifra("Reservas", P.f.entero(k.reservas), P.f.entero(k.personas) + " personas · " + P.f.entero(k.noches) + " noches en el período"),
+          P.cifra("Importe de la selección", P.f.pesos(k.importe), "Promedio por reserva " + P.f.pesos(k.promedio)),
+          P.cifra("Alquileres y adicionales", P.f.pesos(k.adicionales), "Alojamiento " + P.f.pesos(k.alojamiento)),
+          P.cifra("En el predio ahora", P.f.entero(k.presentes_personas), P.f.entero(k.presentes_reservas) + " reservas con huéspedes · " + P.f.entero(k.atipicas) + " atípicas")),
+        tarjeta("Personas por día", P.graficoBarras(porDia, { formato: function (v) { return P.f.entero(v) + " personas"; }, formatoEje: P.f.numero })),
+        h("div.grilla.grilla-2", { style: { margin: "16px 0" } },
+          tarjeta("Por servicio", P.barrasH(d.por_servicio.map(function (x) { return { etiqueta: x.nombre + " (" + x.reservas + " · " + x.personas + " pers.)", valor: x.importe }; }), { formato: P.f.pesos })),
+          tarjeta("Por tipo de reserva", P.barrasH(d.por_tipo.map(function (x) { return { etiqueta: (TIPOS[x.clave] || x.clave) + " (" + x.reservas + ")", valor: x.importe }; }), { formato: P.f.pesos }))));
+    }
+    var solicitudResumen = 0;
+    function cargarResumen() {
+      var actual = ++solicitudResumen;
+      return P.get("/recepcion/estadisticas" + P.qs(Object.assign({ desde: desde.value, hasta: hasta.value }, seleccion)), { sinRedireccion: true })
+        .then(function (d) { if (actual === solicitudResumen) pintarResumen(d); })
+        .catch(function () { if (actual === solicitudResumen) P.vaciar(resumen); });
+    }
     function cargar() {
       var actual = ++solicitud;
+      cargarResumen();
       P.reemplazar(resultados, P.cargando());
       return P.get("/estadisticas/estadias" + P.qs(Object.assign({
         desde: desde.value, hasta: hasta.value, opciones: opciones ? "" : "1"

@@ -163,6 +163,8 @@ async function main() {
   if (soloRevisar) { await c.end(); return; }
 
   for (const [t, ddl] of Object.entries(DDL_CENTRALES)) await c.query(ddl);
+  // Precios de adicionales por reglas (catálogo del predio y temporadas): ver migrar-adicionales-precios.js.
+  await require("./migrar-adicionales-precios").aplicarEsquema(c);
   if (!(await columnasExistentes(c, "predio")).has("equipo_id")) await c.query("ALTER TABLE predio ADD COLUMN equipo_id VARCHAR(64) NULL");
   for (const t of NOMBRES_TABLAS) {
     await c.query(ddlTabla(t, "mysql"));

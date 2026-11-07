@@ -66,6 +66,7 @@ const CONCEPTOS_CAJA = [
   { valor: "LIQUIDACION_ESTADIA", texto: "Liquidación de consumos de estadía" },
   { valor: "DIFERENCIA_RESERVA", texto: "Diferencia de alojamiento" },
   { valor: "LIQUIDACION_SALIDA", texto: "Liquidación al registrar salida" },
+  { valor: "ADICIONAL_ESTADIA", texto: "Pago de alquileres y adicionales de estadía" },
   { valor: "OTROS", texto: "Otros" },
 ];
 const FORMAS_LIQUIDACION = [
