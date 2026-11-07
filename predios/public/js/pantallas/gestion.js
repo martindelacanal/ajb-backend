@@ -381,6 +381,7 @@
         P.menuFlotante(ev.currentTarget, [
           { texto: "Stock por boca", icono: "stock", accion: function () { P.ruta.ir("/gestion/stock"); } },
           { texto: "Movimientos de stock", icono: "historial", accion: function () { P.ruta.ir("/gestion/movimientos"); } },
+          { texto: "Altas registradas", icono: "mas", accion: function () { P.ruta.ir("/gestion/altas"); } },
           { texto: "Bajas registradas", icono: "baja", accion: function () { P.ruta.ir("/gestion/bajas"); } },
         ]);
       } })),
@@ -414,13 +415,24 @@
     c.appendChild(P.tabla({ listado: "movimientos" }).el);
   }, { admin: true, titulo: "Movimientos" });
 
+  function historialAjusteStock(c, alta, subtitulo) {
+    var tabla = P.tabla({ listado: alta ? "altas" : "bajas" });
+    var boton = P.btn(alta ? "Sumar stock" : "Bajar stock", {
+      tipo: "primario", icono: alta ? "mas" : "baja",
+      onclick: function () { P.formAjusteStock(alta, function () { tabla.recargar(); }); },
+    });
+    var cabecera = P.cabeceraConAcciones(alta ? "Altas de stock" : "Bajas de stock", subtitulo, boton);
+    cabecera.insertBefore(h("a.volver", { href: "#/gestion/productos" }, P.icono("volver"), "Productos y stock general"), cabecera.firstChild);
+    c.appendChild(cabecera);
+    c.appendChild(tabla.el);
+  }
+
+  P.ruta.registrar(/^\/gestion\/altas$/, function (c) {
+    historialAjusteStock(c, true, "Ingresos registrados con «Sumar stock» por donación, diferencia de recuento u otro motivo.");
+  }, { admin: true, titulo: "Altas" });
+
   P.ruta.registrar(/^\/gestion\/bajas$/, function (c) {
-    var t = null;
-    subpagina(c, "Bajas de stock", "Productos rotos, vencidos o usados como materia prima o insumo.", [
-      P.btn("Bajar stock", { tipo: "primario", icono: "baja", onclick: function () { P.formAjusteStock(false, function () { t.recargar(); }); } }),
-    ]);
-    t = P.tabla({ listado: "bajas" });
-    c.appendChild(t.el);
+    historialAjusteStock(c, false, "Productos rotos, vencidos o usados como materia prima o insumo.");
   }, { admin: true, titulo: "Bajas" });
 
   // ------------------------------------------------------------------ proveedores
