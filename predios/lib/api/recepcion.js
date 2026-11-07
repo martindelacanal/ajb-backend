@@ -679,5 +679,9 @@ module.exports = {
   cuenta,
   permiso,
   turismo,
-  aplicarConfirmacion
+  aplicarConfirmacion,
+  sincronizar,
+  movimiento,
+  caja,
+  empresa
 };
