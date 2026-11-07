@@ -82,7 +82,7 @@
         filaImporte("Efectivo de ventas y cobros", ef.cobros, "cierre-grupo-titulo"),
         filaImporte("Ventas en efectivo", ef.ventas),
         Number(ef.anulaciones) ? filaImporte("Anulaciones", -ef.anulaciones) : null,
-        Number(ef.otros_cobros) ? filaImporte("Cobros de recepción y liquidaciones", ef.otros_cobros) : null),
+        Number(ef.otros_cobros) ? filaImporte("Otros cobros y devoluciones", ef.otros_cobros) : null),
       Number(ef.retiros) ? h("div.cierre-grupo", filaImporte("Retiros durante la jornada", -ef.retiros)) : null);
   };
 

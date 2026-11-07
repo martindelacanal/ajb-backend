@@ -89,7 +89,8 @@ function separarEfectivo(arrastre, esperado, conceptos) {
   const anulaciones = r(-neto("ANULACION_VENTA"));
   const retiros = r(-neto("RETIRO_DINERO") - neto("CIERRE_CAJA") - neto("CIERRE_TEMPORAL") + suma("OTROS", "EGRESO"));
   const cambio = r(saldoInicial + agregados);
-  // Lo demás (recepción, liquidaciones de afiliados…) también es cobro en efectivo.
+  // Lo demás (recepción, liquidaciones de afiliados, notas de crédito…) también es
+  // efectivo cobrado o devuelto en el turno.
   const otrosCobros = r(esperado - cambio - (ventas - anulaciones) + retiros);
   const cobros = r(ventas - anulaciones + otrosCobros);
   let enVentas = Math.max(0, r(cobros - retiros));
