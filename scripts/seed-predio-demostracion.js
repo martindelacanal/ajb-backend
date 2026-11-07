@@ -1,7 +1,7 @@
 "use strict";
 
-// Una presentación autocontenida: no ocupa recursos de Miramar, no crea credenciales
-// de acceso y no publica el servicio al padrón de afiliados. Por defecto revierte.
+// Informa las reservas de presentación instaladas en Miramar. En una base vacía
+// el recorrido de prueba se realiza dentro de una transacción que se revierte.
 const U = require("../predios/lib/util");
 const N = require("../predios/lib/negocio");
 const { crearMysql } = require("../predios/lib/db-mysql");
@@ -17,12 +17,18 @@ async function sembrar(pool, aplicar) {
   let resumen;
   try {
     return await db.tx(async t => {
+      const listarReservas = () => t.all("SELECT r.id,r.precio_total FROM reserva r JOIN servicio s ON s.id=r.servicio_id WHERE s.codigo=? ORDER BY r.id", [SERVICIO]);
+      const miramar = await t.get("SELECT servicio_codigos FROM predio WHERE codigo='MIRAMAR'");
+      if (miramar && JSON.parse(miramar.servicio_codigos || "[]").includes(SERVICIO)) {
+        return { existente: true, predio: "MIRAMAR", reservas: await listarReservas() };
+      }
       const existente = await t.get("SELECT id,nombre,escritor,servicio_codigos FROM predio WHERE codigo=? FOR UPDATE", [CODIGO]);
       if (existente) {
         if (existente.nombre !== NOMBRE || existente.servicio_codigos !== JSON.stringify([SERVICIO])) throw Error("El código de la demostración ya pertenece a otro predio.");
         // No repone reservas ni pagos que haya modificado el usuario durante la presentación.
-        return { existente: true, predio: CODIGO, reservas: await t.all("SELECT r.id,r.precio_total FROM reserva r JOIN servicio s ON s.id=r.servicio_id WHERE s.codigo=? ORDER BY r.id", [SERVICIO]) };
+        return { existente: true, predio: CODIGO, reservas: await listarReservas() };
       }
+      if (aplicar) throw Error("La presentación corresponde a Camping Miramar. Este script sólo permite simular la carga o consultar los ejemplos existentes.");
       if (await t.get("SELECT id FROM servicio WHERE codigo=?", [SERVICIO])) throw Error("Ya existe el código de servicio de demostración.");
       const hoy = U.hoy(), dia = n => U.sumarDias(hoy, n);
       const desde = dia(-30), hasta = dia(100);
@@ -91,45 +97,41 @@ async function sembrar(pool, aplicar) {
         reservas.push({id:alta.id,titular:s.nombre+" "+s.apellido,total:alta.total});
       }
       resumen = {predio:CODIGO,hoy,reservas};
-      if (!aplicar) {
-        // Ensayar el recorrido de la presentación en la misma transacción. Ninguno
-        // de estos cambios queda en los cinco casos que se cargan con --apply.
-        const assert = require("node:assert/strict");
-        const detalle = id => call("GET","/recepcion/detalle",{}, {id});
-        const filtrar = () => call("GET","/recepcion/listar",{}, {ocupacion:"VENCIDA"});
-        const vencida = reservas[1].id;
-        assert.deepEqual((await filtrar()).filas.map(r=>r.id),[vencida]);
-        assert.equal((await detalle(reservas[3].id)).cuenta.pendiente,0);
-        const armar = r => ({id:r.id,version:r.version,tipo:r.tipo,servicio_id:r.servicio_id,
-          recurso_id:r.recurso_id,recursos_ids:r.recursos.map(x=>x.id),regimen_id:r.regimen_id,
-          titular_dni:r.titular_dni,personas:r.personas,fecha_inicio:r.fecha_inicio,fecha_fin:r.fecha_fin,
-          adicionales:r.adicionales_vigentes,operacion:U.uuid()});
-        const cotizar = b => call("POST","/recepcion/cotizar",b);
-        const confirmar = (b,cot) => call("POST","/recepcion/guardar",{...b,cuenta_esperada:cot.cuenta,cotizacion_esperada:cot.cotizacion_esperada});
-        const multi = (await detalle(reservas[0].id)).reserva;
-        assert.equal(multi.personas.length,1);
-        assert.equal(multi.recursos.length,2);
-        const futura = armar((await detalle(reservas[2].id)).reserva);
-        await assert.rejects(cotizar({...futura,fecha_inicio:hoy,fecha_fin:dia(2),recurso_id:recursos[1],recursos_ids:[recursos[1]],adicionales:[]}),/ocupad|reserva|disponib/i);
-        const ampliar = armar((await detalle(vencida)).reserva);
-        ampliar.fecha_fin = dia(1);
-        ampliar.adicionales[0].fecha_hasta = hoy;
-        const revision = await cotizar(ampliar);
-        assert.ok(revision.diferencia>0);
-        await confirmar(ampliar,revision);
-        assert.equal((await filtrar()).cantidad,0);
-        const salida = armar((await detalle(vencida)).reserva);
-        salida.fecha_fin=hoy;
-        salida.personas[0].salida=hoy;
-        const final = await cotizar(salida);
-        await confirmar(salida,final);
-        assert.equal((await detalle(vencida)).cuenta.pendiente,final.total);
-        await call("POST","/recepcion/"+vencida+"/cuenta",{accion:"PAGO_RESERVA",medio:"TRANSFERENCIA",esperado:final.total,operacion:U.uuid()});
-        assert.equal((await detalle(vencida)).cuenta.pendiente,0);
-        resumen.verificado = {recursos:multi.recursos.length,vencidas_tras_prorroga:0,checkout:final.total,saldo_tras_cobro:0};
-        throw prueba;
-      }
-      return resumen;
+      // Ensayar el recorrido completo antes de revertir la transacción.
+      const assert = require("node:assert/strict");
+      const detalle = id => call("GET","/recepcion/detalle",{}, {id});
+      const filtrar = () => call("GET","/recepcion/listar",{}, {ocupacion:"VENCIDA"});
+      const vencida = reservas[1].id;
+      assert.deepEqual((await filtrar()).filas.map(r=>r.id),[vencida]);
+      assert.equal((await detalle(reservas[3].id)).cuenta.pendiente,0);
+      const armar = r => ({id:r.id,version:r.version,tipo:r.tipo,servicio_id:r.servicio_id,
+        recurso_id:r.recurso_id,recursos_ids:r.recursos.map(x=>x.id),regimen_id:r.regimen_id,
+        titular_dni:r.titular_dni,personas:r.personas,fecha_inicio:r.fecha_inicio,fecha_fin:r.fecha_fin,
+        adicionales:r.adicionales_vigentes,operacion:U.uuid()});
+      const cotizar = b => call("POST","/recepcion/cotizar",b);
+      const confirmar = (b,cot) => call("POST","/recepcion/guardar",{...b,cuenta_esperada:cot.cuenta,cotizacion_esperada:cot.cotizacion_esperada});
+      const multi = (await detalle(reservas[0].id)).reserva;
+      assert.equal(multi.personas.length,1);
+      assert.equal(multi.recursos.length,2);
+      const futura = armar((await detalle(reservas[2].id)).reserva);
+      await assert.rejects(cotizar({...futura,fecha_inicio:hoy,fecha_fin:dia(2),recurso_id:recursos[1],recursos_ids:[recursos[1]],adicionales:[]}),/ocupad|reserva|disponib/i);
+      const ampliar = armar((await detalle(vencida)).reserva);
+      ampliar.fecha_fin = dia(1);
+      ampliar.adicionales[0].fecha_hasta = hoy;
+      const revision = await cotizar(ampliar);
+      assert.ok(revision.diferencia>0);
+      await confirmar(ampliar,revision);
+      assert.equal((await filtrar()).cantidad,0);
+      const salida = armar((await detalle(vencida)).reserva);
+      salida.fecha_fin=hoy;
+      salida.personas[0].salida=hoy;
+      const final = await cotizar(salida);
+      await confirmar(salida,final);
+      assert.equal((await detalle(vencida)).cuenta.pendiente,final.total);
+      await call("POST","/recepcion/"+vencida+"/cuenta",{accion:"PAGO_RESERVA",medio:"TRANSFERENCIA",esperado:final.total,operacion:U.uuid()});
+      assert.equal((await detalle(vencida)).cuenta.pendiente,0);
+      resumen.verificado = {recursos:multi.recursos.length,vencidas_tras_prorroga:0,checkout:final.total,saldo_tras_cobro:0};
+      throw prueba;
     });
   } catch (e) {
     if (e === prueba) return { ...resumen, simulacion:true };
