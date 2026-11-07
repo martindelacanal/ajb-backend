@@ -1,4 +1,5 @@
 const express = require("express");
+const { ocupacionesSecundarias, bloqueSuperponeReserva } = require("../services/ocupacion-recursos-predio");
 const router = express.Router();
 
 const mysqlConnection = require("../connection/connection");
@@ -4069,6 +4070,10 @@ router.post("/admin/bloques", verifyToken, async (req, res) => {
       });
     }
 
+    if (await bloqueSuperponeReserva(connection, recursosIds, fecha_inicio, fecha_fin)) {
+      await connection.rollback();
+      return res.status(409).json({ message: "Un recurso seleccionado ya tiene una reserva en esas fechas." });
+    }
     const errorCoberturaTarifas = validarCoberturaTarifasBloque(tarifas.configuracion_servicios, {
       fechaInicio: fecha_inicio,
       fechaFin: fecha_fin,
@@ -4228,6 +4233,10 @@ router.put("/admin/bloques/:id", verifyToken, async (req, res) => {
       });
     }
 
+    if (await bloqueSuperponeReserva(connection, recursosIds, fecha_inicio, fecha_fin)) {
+      await connection.rollback();
+      return res.status(409).json({ message: "Un recurso seleccionado ya tiene una reserva en esas fechas." });
+    }
     let temporadaTarifaId = bloques[0].temporada_tarifa_id || null;
     if (tarifas && Array.isArray(tarifas.configuracion_servicios) && tarifas.configuracion_servicios.length > 0) {
       const errorCoberturaTarifas = validarCoberturaTarifasBloque(tarifas.configuracion_servicios, {
@@ -4900,7 +4909,7 @@ router.put("/admin/sorteos/inscripciones/:id/adjudicar", verifyToken, async (req
       `,
       [reservaId, recursoId, reserva.fecha_fin, reserva.fecha_inicio, ESTADO_RESERVA_INICIADA_ID, ESTADOS_RESERVA_BAJA_IDS]
     );
-    if (conflictos.length > 0) {
+    if (conflictos.length > 0 || (await ocupacionesSecundarias(connection, [recursoId], reserva.fecha_inicio, reserva.fecha_fin, reservaId, true)).length) {
       await connection.rollback();
       return res.status(409).json("El recurso ya esta ocupado en ese bloque");
     }
@@ -5424,6 +5433,7 @@ router.post("/reserva/recursos", verifyToken, async (req, res) => {
         [...recursosIds, fecha_fin, fecha_inicio, ESTADO_RESERVA_INICIADA_ID, ESTADOS_RESERVA_BAJA_IDS]
       );
       const recursosOcupadosSet = new Set(reservasSolapadasRecursos.map((reserva) => Number(reserva.recurso_id)));
+      for (const r of await ocupacionesSecundarias(mysqlConnection.promise(), recursosIds, fecha_inicio, fecha_fin)) recursosOcupadosSet.add(Number(r.recurso_id));
       const recursosRetenidosSet = await obtenerRecursosRetenidos(db, {
         recursoIds: recursos.map((recurso) => Number(recurso.id)),
         fechaInicio: fechaInicioSolicitud,
@@ -9335,7 +9345,7 @@ async function bloquearYValidarDisponibilidadReserva(connection, {
      FOR UPDATE`,
     [...params, ESTADO_RESERVA_INICIADA_ID, ESTADOS_RESERVA_BAJA_IDS]
   ))[0];
-  if (conflictos.length > 0) {
+  if (conflictos.length > 0 || (ocupaciones === null && (await ocupacionesSecundarias(connection, [recursoIdNormalizado], inicio, fin, reservaExcluirNormalizada, true)).length)) {
     throw crearErrorNegocio(
       "El recurso ya tiene una reserva para parte del rango seleccionado",
       409,
@@ -10912,7 +10922,10 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
                   u.cbu AS usuario_cbu, u.usuario_familiar_id, u.es_familiar, u.parentesco_id,
                   EXISTS(SELECT 1 FROM reserva_politica_cancelacion pc WHERE pc.reserva_id = r.id) AS tiene_politica_aceptada,
                   COALESCE(r.servicio_id, (SELECT rec.servicio_id FROM recurso rec WHERE rec.id = r.recurso_id)) AS servicio_original_id,
-                  EXISTS(SELECT 1 FROM reserva_aprobacion_titular a WHERE a.reserva_id = r.id) AS tiene_aprobacion_titular
+                  EXISTS(SELECT 1 FROM reserva_aprobacion_titular a WHERE a.reserva_id = r.id) AS tiene_aprobacion_titular,
+                  EXISTS(SELECT 1 FROM recepcion_reserva_recurso rr WHERE rr.reserva_id=r.id) AS varios_recursos,
+                  (SELECT JSON_LENGTH(e.actual, '$.alquileres') FROM recepcion_reserva_evento e
+                   WHERE e.reserva_id=r.id ORDER BY e.id DESC LIMIT 1) AS cantidad_alquileres_predio
            FROM reserva r
            LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
            INNER JOIN usuario u ON u.id = r.usuario_id
@@ -10945,6 +10958,12 @@ router.put("/reserva/:id", verifyToken, async (req, res) => {
             409,
             "RESERVA_NO_EDITABLE_POR_ESTADO"
           );
+        }
+        if (Number(reservaActual.varios_recursos)) {
+          throw crearErrorNegocio("La reserva tiene varios recursos. Editala desde la recepción del predio.", 409);
+        }
+        if (Number(reservaActual.cantidad_alquileres_predio) > 0) {
+          throw crearErrorNegocio("La reserva tiene artículos alquilados por día. Editala desde la recepción del predio para conservar los días de uso.", 409);
         }
         if (Number(reservaActual.tiene_aprobacion_titular) === 1) {
           throw crearErrorNegocio(

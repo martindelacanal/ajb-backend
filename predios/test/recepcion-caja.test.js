@@ -90,12 +90,18 @@ test("saldo personal, reparto, venta mixta y reversión conservan stock, caja y 
     huesped_id: a.id,
     importe: 100
   }), /particulares/);
+  const antesDeCargar = await call("POST", "/recepcion/cotizar", { id: r.id });
   await mover({
     accion: "CARGA",
     medio: "EFECTIVO",
     huesped_id: a.id,
     importe: 100
   });
+  await assert.rejects(call("POST", "/recepcion/guardar", {
+    operacion: U.uuid(), id: r.id, cuenta_esperada: antesDeCargar.cuenta
+  }), /Cambió la cuenta/);
+  assert.deepEqual((await call("POST", "/recepcion/cotizar", { id: r.id })).cuenta,
+    { pendiente: 0, neto_consumos: -100 });
   await mover({
     accion: "REPARTIR",
     huesped_id: a.id,

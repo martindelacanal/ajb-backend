@@ -137,6 +137,12 @@ test("los comandos de anulación, caja y liquidación esperan una notebook con l
     const orden = await s.db.get("SELECT actor FROM predio_comando WHERE ruta=?", [ruta]);
     assert.equal(JSON.parse(orden.actor).capacidad, "operacion-predio-v2", ruta);
   }
+  for (const [ruta, datos] of [["/recepcion/adicionales", {}], ["/recepcion/guardar", { cuenta_esperada: { pendiente: 10, neto_consumos: 0 } }]]) {
+    const r = await pedir(s, token, "/app/MIRAMAR/api" + ruta, datos);
+    assert.equal(r.status, 202);
+    const orden = await s.db.get("SELECT actor FROM predio_comando WHERE ruta=?", [ruta]);
+    assert.equal(JSON.parse(orden.actor).capacidad, "recepcion-alquileres-v1", ruta);
+  }
 });
 
 test("una escritura propia crea orden con actor local, credencial y revisión, sin creado_por general ni usuario artificial", async t => {
@@ -178,6 +184,7 @@ test("el paquete de pendrive nunca lleva actores PREDIO, incluso si incluye una 
   s.db.conexion.prepare("INSERT INTO predio_comando(predio_id,tipo,metodo,ruta,actor) VALUES(1,'API','POST','/compras',?)").run(JSON.stringify({ general_id: 7, capacidad: "precios-boca-v1" }));
   s.db.conexion.prepare("INSERT INTO predio_comando(predio_id,tipo,metodo,ruta,actor) VALUES(1,'API','POST','/compras',?)").run(JSON.stringify({ general_id: 7, capacidad: "stock-predio-v2" }));
   s.db.conexion.prepare("INSERT INTO predio_comando(predio_id,tipo,metodo,ruta,actor) VALUES(1,'API','POST','/usuarios',?)").run(JSON.stringify({ general_id: 7, capacidad: "operacion-predio-v2" }));
+  s.db.conexion.prepare("INSERT INTO predio_comando(predio_id,tipo,metodo,ruta,actor) VALUES(1,'API','POST','/recepcion/adicionales',?)").run(JSON.stringify({ general_id: 7, capacidad: "recepcion-alquileres-v1" }));
   t.mock.method(C, "armarMaestros", async () => ({}));
   t.mock.method(C, "paqueteCodigo", () => ({ buffer: Buffer.from("código firmado de fixture"), version: "fixture" }));
   t.mock.method(C, "paqueteFirmado", datos => Buffer.from(JSON.stringify(datos)));
@@ -188,6 +195,7 @@ test("el paquete de pendrive nunca lleva actores PREDIO, incluso si incluye una 
     assert.equal(paquete.comandos_precios.length, 1); assert.equal(paquete.comandos_precios[0].ruta, "/compras");
     assert.deepEqual(paquete.comandos_stock.map(c => c.actor.capacidad), ["stock-predio-v2"]);
     assert.deepEqual(paquete.comandos_operacion.map(c => c.ruta), ["/usuarios"]);
+    assert.deepEqual(paquete.comandos_recepcion.map(c => c.ruta), ["/recepcion/adicionales"]);
     assert.equal(paquete.comandos.length, 1); assert.equal(paquete.comandos[0].actor.general_id, 7);
     assert.equal(paquete.comandos.some(c => c.actor.tipo === "PREDIO"), false);
     assert.equal(!!paquete.codigo, conCodigo === "1");

@@ -1,3 +1,4 @@
+const { ocupacionAlojamiento } = require("./ocupacion-recursos-predio");
 const ESTADO_RESERVA_CANCELADA_ID = 4;
 const UMBRAL_ULTIMOS_LUGARES = 10;
 const HORIZONTE_ALTERNATIVAS_DIAS = 120;
@@ -352,23 +353,7 @@ async function cargarContextoNoCamping(connection, {
   );
   tarifas.push(...reglas);
 
-  const filtroExclusion = reservaExcluirId ? " AND r.id <> ?" : "";
-  const paramsExclusion = reservaExcluirId ? [reservaExcluirId] : [];
-  const [reservas] = await connection.query(
-    `
-      SELECT r.recurso_id,
-             DATE_FORMAT(r.fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
-             DATE_FORMAT(r.fecha_fin, '%Y-%m-%d') AS fecha_fin
-      FROM reserva r
-      LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
-      WHERE r.recurso_id IN (${placeholders})
-        AND r.fecha_inicio < ?
-        AND r.fecha_fin > ?
-        AND COALESCE(r.estado_reserva_id, 1) <> ?
-        AND COALESCE(er.nombre, '') NOT IN (${ESTADOS_RESERVA_LIBERAN.map(() => "?").join(",")})${filtroExclusion}
-    `,
-    [...recursoIds, fechaHasta, fechaDesde, ESTADO_RESERVA_CANCELADA_ID, ...ESTADOS_RESERVA_LIBERAN, ...paramsExclusion]
-  );
+  const reservas = await ocupacionAlojamiento(connection, recursoIds, fechaDesde, fechaHasta, reservaExcluirId);
 
   const holds = await listarHoldsActivosRecursos(connection, {
     recursoIds,
@@ -1027,23 +1012,7 @@ async function obtenerOcupacionNochesRecurso(connection, {
 
   const id = Number(recursoId);
   const placeholders = "?";
-  const filtroExclusion = reservaExcluirId ? " AND r.id <> ?" : "";
-  const paramsExclusion = reservaExcluirId ? [reservaExcluirId] : [];
-  const [reservas] = await connection.query(
-    `
-      SELECT r.recurso_id,
-             DATE_FORMAT(r.fecha_inicio, '%Y-%m-%d') AS fecha_inicio,
-             DATE_FORMAT(r.fecha_fin, '%Y-%m-%d') AS fecha_fin
-      FROM reserva r
-      LEFT JOIN estado_reserva er ON er.id = r.estado_reserva_id
-      WHERE r.recurso_id IN (${placeholders})
-        AND r.fecha_inicio < ?
-        AND r.fecha_fin > ?
-        AND COALESCE(r.estado_reserva_id, 1) <> ?
-        AND COALESCE(er.nombre, '') NOT IN (${ESTADOS_RESERVA_LIBERAN.map(() => "?").join(",")})${filtroExclusion}
-    `,
-    [id, fechaHasta, fechaDesde, ESTADO_RESERVA_CANCELADA_ID, ...ESTADOS_RESERVA_LIBERAN, ...paramsExclusion]
-  );
+  const reservas = await ocupacionAlojamiento(connection, [id], fechaDesde, fechaHasta, reservaExcluirId);
   const holds = await listarHoldsActivosRecursos(connection, {
     recursoIds: [id],
     fechaInicio: fechaDesde,

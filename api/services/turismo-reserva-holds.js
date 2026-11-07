@@ -522,6 +522,8 @@ async function validarFechaLibreFueraDeBloque(connection, datos) {
   }
 }
 
+const { ocupacionesSecundarias } = require("./ocupacion-recursos-predio");
+
 async function validarReservaDefinitivaNoCamping(connection, datos) {
   const [rows] = await connection.query(
     `SELECT r.id
@@ -535,7 +537,7 @@ async function validarReservaDefinitivaNoCamping(connection, datos) {
       FOR UPDATE`,
     [datos.recursoId, datos.fechaFin, datos.fechaInicio]
   );
-  if (rows.length > 0) {
+  if (rows.length > 0 || (await ocupacionesSecundarias(connection, [datos.recursoId], datos.fechaInicio, datos.fechaFin, null, true)).length) {
     throw crearErrorHold(HOLD_CONFLICTO_MENSAJE, 409, "HOLD_RECURSO_NO_DISPONIBLE");
   }
 }

@@ -113,6 +113,7 @@ function prepararOrden(actor, ruta, cuerpo, cuenta, predioId, respuestaPrivada) 
     actor.capacidad = "operacion-predio-v2";
   } else if (/^\/(?:compras|ventas|traspasos|solicitudes|bajas)(?:\/|$)/.test(ruta)) actor.capacidad = "stock-predio-v2";
   else if (/^\/bocas(?:\/|$)/.test(ruta)) actor.capacidad = "precios-boca-v1";
+  else if (ruta === "/recepcion/adicionales" || ruta === "/recepcion/guardar" && datos.cuenta_esperada) actor.capacidad = "recepcion-alquileres-v1";
   if (/^\/usuarios(?:\/\d+)?$/.test(ruta) && datos.password) {
     clavesUsuario.validarNueva(datos.password, String(datos.usuario || "").trim().toLowerCase());
     actor.hash_clave_validada = U.hashPassword(datos.password);
@@ -443,6 +444,7 @@ function crearRouterAdmin() {
         comandos_precios: serializadas.filter(c => c.actor?.capacidad === "precios-boca-v1"),
         comandos_stock: serializadas.filter(c => c.actor?.capacidad === "stock-predio-v2"),
         comandos_operacion: serializadas.filter(c => c.actor?.capacidad === "operacion-predio-v2"),
+        comandos_recepcion: serializadas.filter(c => c.actor?.capacidad === "recepcion-alquileres-v1"),
       };
       if (req.query.codigo === "1") {
         const paquete = C.paqueteCodigo();
@@ -663,9 +665,10 @@ function crearRouterSync() {
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'precios-boca-v1')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'stock-predio-v2')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'operacion-predio-v2')
+             AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'recepcion-alquileres-v1')
            ORDER BY id LIMIT 20`, [p.id, capacidades.includes("cuentas-predio-v1") ? 1 : 0,
              capacidades.includes("precios-boca-v1") ? 1 : 0, capacidades.includes("stock-predio-v2") ? 1 : 0,
-             capacidades.includes("operacion-predio-v2") ? 1 : 0]);
+             capacidades.includes("operacion-predio-v2") ? 1 : 0, capacidades.includes("recepcion-alquileres-v1") ? 1 : 0]);
         if (filas.length) {
           await conexion.query(`UPDATE predio_comando SET estado = 'ENTREGADO', entregado_en = NOW(), intentos = intentos + 1 WHERE id IN (?)`, [filas.map(c => c.id)]);
         }
@@ -713,6 +716,13 @@ function crearRouterSync() {
           [predio.id, U.id(req.body.empleado_id)]
         );
         if (!actor || (actor.rol !== "ADMIN" && !Number(actor.gestionar_reservas))) throw U.error("La cuenta no tiene permiso de recepción sincronizado.", 403);
+        const capacidades = String(req.headers["x-predio-capacidades"] || "").split(",");
+        if (!capacidades.includes("recepcion-alquileres-v1") && ["cotizar", "guardar"].includes(req.body.accion) && req.body.datos?.id) {
+          const [[ultimo]] = await conexion.query(`SELECT JSON_LENGTH(e.actual, '$.alquileres') AS alquileres
+            FROM recepcion_reserva_evento e WHERE e.reserva_id=? AND e.predio_id=? ORDER BY e.id DESC LIMIT 1`,
+          [U.id(req.body.datos.id), predio.id]);
+          if (Number(ultimo?.alquileres)) throw U.error("Actualizá el sistema local del predio para editar una reserva con alquileres por día.", 409);
+        }
         return require("../services/recepcion").operar(conexion, predio, actor, req.body.accion, req.body.datos || {});
       });
       res.json(resultado);

@@ -76,11 +76,12 @@ async function archivarVersionReservaAntesDeReemplazo(
     ["convenio_propuestas", "SELECT * FROM reserva_convenio_propuesta WHERE reserva_id = ? ORDER BY id"],
     ["sorteo_respuestas", "SELECT * FROM sorteo_adjudicacion_respuesta WHERE reserva_id = ? ORDER BY id"],
     ["bloques_recurso", "SELECT * FROM bloque_fecha_recurso WHERE reserva_id = ? ORDER BY id"],
+    ["recursos_simultaneos", "SELECT recurso_id FROM recepcion_reserva_recurso WHERE reserva_id = ? ORDER BY recurso_id"],
   ];
   const contenido = { formato_version: 1, reserva: reservas[0] };
-  // Las tablas del módulo Descuentos pueden no existir todavía en una base sin
-  // esa migración: el archivo no debe bloquear la edición por eso.
-  const tablasOpcionales = new Set(["descuentos", "descuentos_archivos"]);
+  // Las bases que todavía no instalaron esos módulos pueden archivar las
+  // reservas anteriores con sus correspondientes colecciones vacías.
+  const tablasOpcionales = new Set(["descuentos", "descuentos_archivos", "recursos_simultaneos"]);
   for (const [clave, sql] of consultas) {
     try {
       const [rows] = await connection.query(sql, [reservaId]);

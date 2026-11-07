@@ -2,6 +2,7 @@
 
 // La reserva, sus tarifas, su historial y el recibo de reintento se confirman juntos en Turismo.
 const U = require("../../predios/lib/util");
+const { crearAdicional, seleccionArticulos, cotizarAlquileres } = require("./recepcion-alquileres");
 const {
   serviciosDe
 } = require("./predios-central");
@@ -25,12 +26,26 @@ const fechaFinVisibleSql = (evento) => `CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(${ev
 const personaCols = "u.id,u.documento AS dni,u.nombre,u.apellido,u.fecha_nacimiento,u.tipo_persona_id,u.parentesco_id,u.legajo";
 const firma = d => U.sha256(jsonCanonico(d));
 const nombre = p => [p.apellido, p.nombre].filter(Boolean).join(", ");
-const ultimo = (c, id, lock) => uno(c, "SELECT * FROM recepcion_reserva_evento WHERE reserva_id=? ORDER BY id DESC LIMIT 1" + (lock ? " FOR UPDATE" : ""), [id]);
+// Los eventos son inmutables y el runtime sólo los lee e inserta. Con la
+// cabecera bloqueada, FOR SHARE obtiene la revisión actual sin pedir UPDATE.
+const ultimo = (c, id, lock) => uno(c, "SELECT * FROM recepcion_reserva_evento WHERE reserva_id=? ORDER BY id DESC LIMIT 1" + (lock ? " FOR SHARE" : ""), [id]);
+async function cargarRecursos(c, filas, lock = false) {
+  if (!filas.length) return;
+  const otros = await todos(c, `SELECT rr.reserva_id, rc.id, rc.nombre FROM recepcion_reserva_recurso rr
+    JOIN recurso rc ON rc.id=rr.recurso_id WHERE rr.reserva_id IN (?) ORDER BY rc.id${lock ? " FOR SHARE" : ""}`, [filas.map(r => r.id)]);
+  for (const r of filas) {
+    r.recursos = r.recurso_id ? [{ id: r.recurso_id, nombre: r.recurso }] : [];
+    for (const o of otros) if (Number(o.reserva_id) === Number(r.id)) r.recursos.push({ id: o.id, nombre: o.nombre });
+  }
+}
 async function opciones(c, codigos) {
-  const servicios = await todos(c, "SELECT id,nombre,codigo,modelo_tarifa FROM servicio WHERE activo=1 AND estado_aprobacion='APROBADO' AND codigo IN (?) ORDER BY nombre", [codigos]);
+  const servicios = await todos(c, "SELECT s.id,s.nombre,s.codigo,s.modelo_tarifa,ts.codigo AS tipo_codigo FROM servicio s JOIN tipo_servicio ts ON ts.id=s.tipo_servicio_id WHERE s.activo=1 AND s.estado_aprobacion='APROBADO' AND s.codigo IN (?) ORDER BY s.nombre", [codigos]);
   const ids = servicios.map(s => s.id);
   const recursos = ids.length ? await todos(c, "SELECT id,nombre,servicio_id FROM recurso WHERE activo=1 AND servicio_id IN (?) ORDER BY orden,nombre", [ids]) : [];
-  const adicionales = ids.length ? await todos(c, "SELECT DISTINCT a.id,a.nombre,ta.recurso_id,ta.regimen_id FROM tarifa_adicional ta JOIN adicional a ON a.id=ta.adicional_id JOIN recurso r ON r.id=ta.recurso_id WHERE ta.activo=1 AND r.servicio_id IN (?) ORDER BY a.nombre", [ids]) : [];
+  const adicionales = ids.length ? await todos(c, `SELECT DISTINCT a.id,a.nombre,ta.recurso_id,ta.regimen_id,ta.precio,
+    ta.fecha_inicio AS fecha_desde,ta.fecha_fin AS fecha_hasta FROM tarifa_adicional ta
+    JOIN adicional a ON a.id=ta.adicional_id JOIN recurso r ON r.id=ta.recurso_id
+    WHERE ta.activo=1 AND r.activo=1 AND r.servicio_id IN (?) ORDER BY nombre,fecha_desde DESC`, [ids]) : [];
   return {
     servicios,
     recursos,
@@ -62,8 +77,9 @@ async function detalle(c, codigos, id, lock = false) {
   const r = await uno(c, `SELECT r.id,r.usuario_id,r.servicio_id,r.recurso_id,r.regimen_id,r.fecha_inicio,r.fecha_fin,r.precio_total,r.observaciones,r.numero_parcela,r.bloque_fecha_id,r.sorteo_id,r.estado_reserva_id,er.nombre AS estado,s.nombre AS servicio,rec.nombre AS recurso,
     u.documento AS titular_dni,CONCAT_WS(', ',u.apellido,u.nombre) AS titular_nombre,u.legajo AS titular_legajo,(u.rol_id=2 AND u.habilitado='Y') AS afiliado
     FROM reserva r JOIN servicio s ON s.id=r.servicio_id JOIN usuario u ON u.id=r.usuario_id LEFT JOIN recurso rec ON rec.id=r.recurso_id
-    JOIN estado_reserva er ON er.id=r.estado_reserva_id WHERE r.id=? AND s.codigo IN (?)${lock ? " FOR UPDATE" : ""}`, [id, codigos]);
+    JOIN estado_reserva er ON er.id=r.estado_reserva_id WHERE r.id=? AND s.codigo IN (?)${lock ? " FOR UPDATE OF r" : ""}`, [id, codigos]);
   if (!r) throw U.error("No se encontró esa reserva entre los servicios asignados al predio.", 404);
+  await cargarRecursos(c, [r], lock);
   const ev = await ultimo(c, id, lock),
     ext = ev ? JSON.parse(ev.actual) : {};
   if (ext.dia_sin_noche && r.fecha_fin === U.sumarDias(r.fecha_inicio, 1)) r.fecha_fin = r.fecha_inicio;
@@ -73,7 +89,19 @@ async function detalle(c, codigos, id, lock = false) {
     p.entrada = prev?.entrada || null;
     p.salida = prev?.salida || null;
   }
-  const adicionales = await todos(c, "SELECT adicional_id,cantidad,nombre_adicional AS nombre,subtotal FROM reserva_adicional WHERE reserva_id=? ORDER BY id", [id]);
+  const adicionales = await todos(c, `SELECT adicional_id,cantidad,nombre_adicional AS nombre,dias,subtotal
+    FROM reserva_adicional WHERE reserva_id=? ORDER BY id`, [id]);
+  if (ext.alquileres?.length && Number(ext.servicio_id) === Number(r.servicio_id)) {
+    // Turismo también puede editar la reserva: los días facturados vienen de sus renglones vigentes.
+    const periodos = await todos(c, `SELECT a.adicional_id,MIN(d.fecha) AS fecha_desde,MAX(d.fecha) AS fecha_hasta
+      FROM reserva_adicional a JOIN reserva_adicional_detalle d ON d.reserva_adicional_id=a.id
+      WHERE a.reserva_id=? GROUP BY a.adicional_id`, [id]);
+    for (const a of adicionales) {
+      const alquiler = ext.alquileres.find(x => Number(x.adicional_id) === Number(a.adicional_id));
+      const periodo = periodos.find(x => Number(x.adicional_id) === Number(a.adicional_id));
+      if (alquiler && periodo) Object.assign(a, periodo, { recurso_tarifa_id: alquiler.recurso_tarifa_id, regimen_tarifa_id: alquiler.regimen_tarifa_id });
+    }
+  }
   const tramos = Array.isArray(ext.tramos) && Number(ext.tramos.at(-1)?.recurso_id) === Number(r.recurso_id) ? ext.tramos : [];
   const seleccion = tramos.at(-1)?.adicionales;
   const datos = {
@@ -88,7 +116,7 @@ async function detalle(c, codigos, id, lock = false) {
     personas,
     adicionales,
     adicionales_vigentes: Array.isArray(seleccion)
-      ? adicionales.filter(a => seleccion.some(x => Number(x.adicional_id) === Number(a.adicional_id)))
+      ? adicionales.filter(a => a.fecha_desde || seleccion.some(x => Number(x.adicional_id) === Number(a.adicional_id)))
       : adicionales,
     revision: ev ? Number(ev.id) : 0
   };
@@ -99,6 +127,8 @@ async function detalle(c, codigos, id, lock = false) {
 }
 function resumenCambios(a, b) {
   const cambios = [];
+  const otros = r => (r?.recursos || []).slice(1).map(x => x.nombre).join(", ");
+  if (otros(a) !== otros(b)) cambios.push(["Otros recursos", otros(a) || null, otros(b) || null]);
   for (const [k, l] of Object.entries({
     estado: "Estado",
     servicio: "Servicio",
@@ -119,7 +149,7 @@ function resumenCambios(a, b) {
     if ((a?.vehiculo?.[k] || "") !== (b.vehiculo[k] || "")) cambios.push([k, a?.vehiculo?.[k], b.vehiculo[k]]);
   }
   const mapa = (xs, fn) => new Map((xs || []).map(x => [String(fn(x)), x]));
-  for (const [key, id, describe] of [["personas", "dni", p => nombre(p) + " · DNI " + p.dni + " · " + (p.entrada || "sin ingreso") + " / " + (p.salida || "sin salida") + " · $" + Number(p.precio || 0)], ["adicionales", "adicional_id", p => p.nombre + " × " + p.cantidad + " · $" + Number(p.subtotal)]]) {
+  for (const [key, id, describe] of [["personas", "dni", p => nombre(p) + " · DNI " + p.dni + " · " + (p.entrada || "sin ingreso") + " / " + (p.salida || "sin salida") + " · $" + Number(p.precio || 0)], ["adicionales", "adicional_id", p => p.nombre + " × " + p.cantidad + (p.fecha_desde ? " · " + p.fecha_desde + " a " + p.fecha_hasta : "") + " · $" + Number(p.subtotal)]]) {
     const ant = mapa(a?.[key], p => p[id]),
       sig = mapa(b[key], p => p[id]);
     for (const k of new Set([...ant.keys(), ...sig.keys()])) {
@@ -135,9 +165,30 @@ function resumenCambios(a, b) {
   }
   return cambios;
 }
+// La fecha prevista es inclusiva para esta alerta: quien sale hoy aún está en plazo.
+// El evento central se confirma antes de replicar los huéspedes de la notebook.
+// Así una salida recién guardada retira el aviso incluso entre sincronizaciones.
+const condicionVencida = `er.nombre IN ('Iniciada','Verificada','Aprobada','Adjudicada') AND ${fechaFinVisibleSql("e")} < ?
+  AND CASE WHEN e.predio_id=? AND JSON_TYPE(JSON_EXTRACT(e.actual,'$.personas'))='ARRAY' THEN EXISTS(
+    SELECT 1 FROM JSON_TABLE(COALESCE(e.actual,'{}'), '$.personas[*]' COLUMNS(
+      entrada VARCHAR(10) PATH '$.entrada', salida VARCHAR(10) PATH '$.salida')) p
+      WHERE p.entrada IS NOT NULL AND p.salida IS NULL)
+    ELSE EXISTS (SELECT 1 FROM predio_huesped hp WHERE hp.reserva_id=r.id AND hp.predio_id=?
+      AND hp.entrada IS NOT NULL AND hp.salida IS NULL) END`;
+const ultimoEventoSql = " LEFT JOIN recepcion_reserva_evento e ON e.id=(SELECT MAX(ev.id) FROM recepcion_reserva_evento ev WHERE ev.reserva_id=r.id)";
+async function contarVencidas(c, codigos, pid, hoy) {
+  return uno(c, `SELECT COUNT(*) AS cantidad FROM reserva r JOIN servicio s ON s.id=r.servicio_id
+    JOIN estado_reserva er ON er.id=r.estado_reserva_id ${ultimoEventoSql}
+    WHERE s.codigo IN (?) AND ${condicionVencida}`, [codigos, hoy, pid, pid]);
+}
 async function listar(c, codigos, b) {
   const cond = ["s.codigo IN (?)"],
     p = [codigos];
+  const hoy = U.hoy(), pid = U.id(b.predioId);
+  if (b.ocupacion === "VENCIDA") {
+    cond.push(condicionVencida);
+    p.push(hoy, pid, pid);
+  }
   if (b.ocupacion === "PRESENTE" || b.ocupacion === "SALIDA") {
     const modo = b.ocupacion === "PRESENTE" ? "hp.salida IS NULL" : "hp.salida IS NOT NULL";
     cond.push("EXISTS (SELECT 1 FROM predio_huesped hp WHERE hp.reserva_id=r.id AND hp.predio_id=? AND hp.entrada IS NOT NULL AND " + modo + ")");
@@ -171,15 +222,33 @@ async function listar(c, codigos, b) {
     p.push(U.id(b.servicio_id));
   }
   const from = ` FROM reserva r JOIN servicio s ON s.id=r.servicio_id JOIN usuario u ON u.id=r.usuario_id JOIN estado_reserva er ON er.id=r.estado_reserva_id LEFT JOIN recurso rec ON rec.id=r.recurso_id
-    LEFT JOIN recepcion_reserva_evento e ON e.id=(SELECT MAX(ev.id) FROM recepcion_reserva_evento ev WHERE ev.reserva_id=r.id) WHERE ${cond.join(" AND ")}`;
+    ${ultimoEventoSql} WHERE ${cond.join(" AND ")}`;
   const pagina = U.entero(b.pagina || 1, {
     min: 1,
     max: 999999
   });
-  const filas = await todos(c, `SELECT r.id,r.fecha_inicio,${fechaFinVisibleSql("e")} AS fecha_fin,r.precio_total,s.nombre AS servicio,rec.nombre AS recurso,er.nombre AS estado,CONCAT_WS(', ',u.apellido,u.nombre) AS titular,JSON_UNQUOTE(JSON_EXTRACT(e.actual,'$.tipo')) AS tipo${from} ORDER BY r.fecha_inicio DESC,r.id DESC LIMIT 40 OFFSET ${(pagina - 1) * 40}`, p);
+  const filas = await todos(c, `SELECT r.id,r.fecha_inicio,${fechaFinVisibleSql("e")} AS fecha_fin,r.precio_total,s.nombre AS servicio,r.recurso_id,rec.nombre AS recurso,er.nombre AS estado,CONCAT_WS(', ',u.apellido,u.nombre) AS titular,JSON_UNQUOTE(JSON_EXTRACT(e.actual,'$.tipo')) AS tipo,(${condicionVencida}) AS vencida,
+    CASE WHEN e.predio_id=? THEN JSON_EXTRACT(e.actual,'$.personas') END AS pasajeros_evento${from}
+    ORDER BY r.fecha_inicio DESC,r.id DESC LIMIT 40 OFFSET ${(pagina - 1) * 40}`, [hoy, pid, pid, pid, ...p]);
+  await cargarRecursos(c, filas);
+  const vencidas = [];
+  for (const r of filas) {
+    const pasajeros = typeof r.pasajeros_evento === "string" ? JSON.parse(r.pasajeros_evento) : r.pasajeros_evento;
+    delete r.pasajeros_evento;
+    if (!Number(r.vencida)) continue;
+    if (Array.isArray(pasajeros)) r.huespedes_pendientes = pasajeros.filter(p => p.entrada && !p.salida).map(nombre);
+    else vencidas.push(r);
+  }
+  if (vencidas.length) {
+    const presentes = await todos(c, `SELECT reserva_id,nombre FROM predio_huesped
+      WHERE predio_id=? AND reserva_id IN (?) AND entrada IS NOT NULL AND salida IS NULL ORDER BY nombre`,
+      [pid, vencidas.map(r => r.id)]);
+    for (const r of vencidas) r.huespedes_pendientes = presentes.filter(p => Number(p.reserva_id) === Number(r.id)).map(p => p.nombre);
+  }
   return {
     filas,
     pagina,
+    vencidas: Number((await contarVencidas(c, codigos, pid, hoy)).cantidad),
     ...(await uno(c, "SELECT COUNT(*) AS cantidad,COALESCE(SUM(COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(e.actual,\'$.cantidad\')) AS UNSIGNED),(SELECT COUNT(*) FROM reserva_familiar rf WHERE rf.reserva_id=r.id))),0) AS viajeros,COALESCE(SUM(r.precio_total),0) AS importe" + from, p))
   };
 }
@@ -189,13 +258,19 @@ async function listar(c, codigos, b) {
 async function ocupacionesHistoricas(c, servicioId, recursoId, inicio, fin, excluir) {
   if (inicio >= U.hoy()) return null;
   const reservas = await todos(c, `SELECT r.id,r.recurso_id,r.numero_parcela,r.fecha_inicio,r.fecha_fin,
+        rr.recurso_id AS secundario,
         JSON_EXTRACT(e.actual,'$.tramos') AS tramos
       FROM reserva r JOIN estado_reserva er ON er.id=r.estado_reserva_id
+      LEFT JOIN recepcion_reserva_recurso rr ON rr.reserva_id=r.id AND rr.recurso_id=?
       LEFT JOIN recepcion_reserva_evento e ON e.id=(SELECT MAX(ev.id) FROM recepcion_reserva_evento ev WHERE ev.reserva_id=r.id)
       WHERE r.servicio_id=? AND r.fecha_inicio<? AND r.fecha_fin>? AND r.id<>?
-        AND er.nombre NOT IN ('Cancelada','Rechazada','No adjudicada') FOR UPDATE`, [servicioId, fin, inicio, excluir || 0]);
+        AND er.nombre NOT IN ('Cancelada','Rechazada','No adjudicada') FOR UPDATE OF r`, [recursoId, servicioId, fin, inicio, excluir || 0]);
   const ocupadas = [];
   for (const r of reservas) {
+    if (Number(r.secundario)) {
+      ocupadas.push({ id: r.id, numero_parcela: null });
+      continue;
+    }
     const tramos = typeof r.tramos === "string" ? JSON.parse(r.tramos) : r.tramos;
     if (!tramos?.length || Number(tramos.at(-1).recurso_id) !== Number(r.recurso_id)) {
       if (Number(r.recurso_id) === recursoId) ocupadas.push({ id: r.id, numero_parcela: r.numero_parcela });
@@ -227,15 +302,32 @@ async function validarBloqueTurismo(c, recursoId, inicio, fin, anterior) {
     [recursoId, fin, inicio, anterior?.id || 0, anterior?.bloque_fecha_id || 0]);
   if (bloque) throw U.error("El recurso está reservado para un bloque de Turismo en esas fechas.", 409);
 }
+// Se ocupa una unidad por recurso seleccionado. Distribuir pasajeros antes de
+// llenar una segunda plaza y, si sobran unidades, usar la tarifa del responsable.
+function distribuirPasajeros(recursos, personas) {
+  const grupos = recursos.map(r => ({ id: Number(r.id), cupo: Number(r.cupo_maximo) || Infinity, personas: [] }));
+  let proximo = 0;
+  for (const p of personas) {
+    let elegido = grupos[proximo];
+    if (elegido.personas.length >= elegido.cupo) elegido = grupos.find(g => g.personas.length < g.cupo);
+    if (!elegido) throw U.error("La cantidad supera la capacidad de los recursos.");
+    elegido.personas.push(p);
+    proximo = (grupos.indexOf(elegido) + 1) % grupos.length;
+  }
+  for (const g of grupos) if (!g.personas.length && personas.length) g.personas.push(personas[0]);
+  return grupos;
+}
 async function cotizar(c, T, {
   tipo,
   servicio,
   recursoId,
+  recursos = [],
   regimenId,
   personas,
   inicio,
   fin,
   adicionales,
+  preciosPrevios = [],
   tramos,
   temporada,
   departamentalId
@@ -246,14 +338,12 @@ async function cotizar(c, T, {
     tarifa_original_individual: 0,
     tarifas_por_fecha: []
   }));
-  if (tipo !== "GENERAL") return {
-    personas: pasajeros,
-    total: 0,
-    extras: {
-      total: 0,
-      items: []
-    }
-  };
+  const alquileres = adicionales.filter(a => a.fecha_desde);
+  const alquilerIds = new Set(alquileres.map(a => Number(a.adicional_id)));
+  const itemsAlquiler = await cotizarAlquileres(c, T, alquileres, pasajeros, temporada, preciosPrevios);
+  const totalAlquileres = U.redondear(itemsAlquiler.reduce((s, a) => s + a.subtotal, 0));
+  if (tipo !== "GENERAL") return { personas: pasajeros, total: 0,
+    extras: { total: totalAlquileres, alquileres: totalAlquileres, items: itemsAlquiler } };
   let total = 0;
   const itemsExtra = new Map();
   const segmentos = tramos.length ? tramos : [{
@@ -266,28 +356,32 @@ async function cotizar(c, T, {
       z = segmentos[i + 1]?.desde || fin;
     if (a >= z) continue;
     const fijo = servicio.modelo_tarifa === "PRECIO_UNICO" || servicio.unidad_cobro === "POR_ESTADIA" || ["POR_RECURSO_NOCHE", "POR_RECURSO_DIA"].includes(servicio.unidad_cobro);
-    const cot = await T.calcularTarifaBaseReserva(c, {
-      recursoId: seg.recurso_id,
-      regimenId,
-      personas: servicio.modelo_tarifa === "PRECIO_UNICO" ? pasajeros.slice(0, 1) : pasajeros,
-      fechaInicio: a,
-      fechaFin: z,
-      temporadaTarifaId: temporada,
-      departamentalId,
-      recepcion: true
-    });
-    for (const row of cot.personas) {
-      const p = pasajeros.find(x => String(x.dni) === String(row.dni));
-      for (const noche of row.tarifas_por_fecha) {
-        const porNochePersonal = servicio.unidad_cobro !== "POR_ESTADIA" && (noche.por_persona ?? !fijo);
-        if (porNochePersonal && (noche.fecha < (p.entrada || inicio) || noche.fecha >= (p.salida || fin))) continue;
-        p.tarifas_por_fecha.push(noche);
-        p.tarifa_individual = U.redondear(p.tarifa_individual + Number(noche.precio));
-        p.tarifa_original_individual = U.redondear(p.tarifa_original_individual + Number(noche.precio_original ?? noche.precio));
-        total += Number(noche.precio);
+    const grupos = recursos.length > 1 ? distribuirPasajeros(recursos, pasajeros) : [{ id: seg.recurso_id, personas: pasajeros }];
+    for (const unidad of grupos) {
+      const cot = await T.calcularTarifaBaseReserva(c, {
+        recursoId: unidad.id,
+        regimenId,
+        personas: servicio.modelo_tarifa === "PRECIO_UNICO" ? unidad.personas.slice(0, 1) : unidad.personas,
+        fechaInicio: a,
+        fechaFin: z,
+        temporadaTarifaId: temporada,
+        departamentalId,
+        recepcion: true
+      });
+      for (const row of cot.personas) {
+        const p = pasajeros.find(x => String(x.dni) === String(row.dni));
+        for (const noche of row.tarifas_por_fecha) {
+          const porNochePersonal = servicio.unidad_cobro !== "POR_ESTADIA" && (noche.por_persona ?? !fijo);
+          if (porNochePersonal && (noche.fecha < (p.entrada || inicio) || noche.fecha >= (p.salida || fin))) continue;
+          p.tarifas_por_fecha.push({ ...noche, recurso_id: unidad.id });
+          p.tarifa_individual = U.redondear(p.tarifa_individual + Number(noche.precio));
+          p.tarifa_original_individual = U.redondear(p.tarifa_original_individual + Number(noche.precio_original ?? noche.precio));
+          total += Number(noche.precio);
+        }
       }
     }
-    const seleccionExtras = i === segmentos.length - 1 ? adicionales : (seg.adicionales ?? adicionales);
+    const seleccionExtras = (i === segmentos.length - 1 ? adicionales : (seg.adicionales ?? adicionales))
+      .filter(a => !alquilerIds.has(Number(a.adicional_id)));
     const extrasTramo = await T.calcularAdicionalesReserva(c, seleccionExtras, seg.recurso_id, regimenId, a, z, pasajeros, temporada, { recepcion: true });
     for (const item of extrasTramo.items) {
       const previo = itemsExtra.get(item.adicional_id);
@@ -302,11 +396,11 @@ async function cotizar(c, T, {
       previo.detalles.push(...item.detalles);
     }
   }
-  const items = Array.from(itemsExtra.values());
+  const items = [...itemsExtra.values(), ...itemsAlquiler];
   return {
     personas: pasajeros,
     total: U.redondear(total),
-    extras: { total: U.redondear(items.reduce((s, item) => s + item.subtotal, 0)), items }
+    extras: { total: U.redondear(items.reduce((s, item) => s + item.subtotal, 0)), alquileres: totalAlquileres, items }
   };
 }
 async function guardar(c, predio, actor, b, codigos, previa) {
@@ -352,9 +446,20 @@ async function guardar(c, predio, actor, b, codigos, previa) {
   const hasta = fin === inicio ? U.sumarDias(inicio, 1) : fin;
   const recursoId = U.id(b.recurso_id, "El recurso", tipo === "GENERAL"),
     regimenId = U.id(b.regimen_id, "El régimen", tipo === "GENERAL" && servicio.modelo_tarifa !== "PRECIO_UNICO");
-  const recurso = recursoId ? await uno(c, "SELECT * FROM recurso WHERE id=? AND servicio_id=? AND activo=1 FOR UPDATE", [recursoId, servicio.id]) : null;
-  if (recursoId && !recurso) throw U.error("El recurso no pertenece al servicio.", 422);
-  if (anterior?.bloque_fecha_id && (Number(anterior.recurso_id) !== recursoId || anterior.fecha_inicio !== inicio || anterior.fecha_fin !== fin)) throw U.error("Para cambiar un bloque adjudicado primero liberalo en Turismo.", 409);
+  const anteriores = (anterior?.recursos || []).map(x => Number(x.id));
+  const seleccion = b.recursos_ids ?? [recursoId, ...anteriores.slice(1)].filter(Boolean);
+  if (!Array.isArray(seleccion) || seleccion.length > 100) throw U.error("Revisá la selección de recursos (máximo 100).");
+  const ids = seleccion.map(x => U.id(x, "El recurso"));
+  if (new Set(ids).size !== ids.length || (ids[0] ?? null) !== recursoId) throw U.error("Indicá primero el recurso principal y elegí cada recurso una sola vez.");
+  if (servicio.tipo_codigo === "CUPO_NUMERADO" && ids.length > 1) throw U.error("Cada estadía de camping con cupo numerado tiene su propia parcela.");
+  const cambiaGrupo = ids[0] !== anteriores[0] || ids.length !== anteriores.length || ids.some(x => !anteriores.includes(x));
+  if (anterior?.bloque_fecha_id && (cambiaGrupo || anterior.fecha_inicio !== inicio || anterior.fecha_fin !== fin)) throw U.error("Para cambiar un bloque adjudicado primero liberalo en Turismo.", 409);
+  if (cambiaGrupo && Math.max(ids.length, anteriores.length) > 1 && anterior?.personas.some(p => p.entrada)) throw U.error("Después del ingreso se deben conservar los recursos de la reserva múltiple.", 409);
+  const catalogo = ids.length ? await todos(c, "SELECT * FROM recurso WHERE id IN (?) AND servicio_id=? AND activo=1 ORDER BY id FOR UPDATE", [ids, servicio.id]) : [];
+  if (catalogo.length !== ids.length) throw U.error("Los recursos deben pertenecer al servicio y estar activos.", 422);
+  // La selección queda en el mismo orden en las futuras ediciones y cotizaciones.
+  const recursos = [catalogo.find(r => Number(r.id) === recursoId), ...catalogo.filter(r => Number(r.id) !== recursoId)].filter(Boolean);
+  const recurso = recursos[0];
   const tramos = (anterior?.tramos || []).map(x => ({
     ...x
   }));
@@ -364,7 +469,7 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     if (desde < inicio || desde >= hasta || desde > U.hoy() || tramos.length && desde < tramos.at(-1).desde) throw U.error("La fecha del traslado debe estar dentro de la estadía, en orden y no ser futura.");
     if (!tramos.length) tramos.push({ desde: inicio, recurso_id: anterior.recurso_id });
     tramos.at(-1).numero_parcela = anterior.numero_parcela;
-    tramos.at(-1).adicionales = anterior.adicionales_vigentes.map(a => ({adicional_id: a.adicional_id, cantidad: a.cantidad}));
+    tramos.at(-1).adicionales = anterior.adicionales_vigentes.filter(a => !a.fecha_desde).map(a => ({adicional_id: a.adicional_id, cantidad: a.cantidad}));
     tramos.push({
       desde,
       recurso_id: recursoId
@@ -386,6 +491,14 @@ async function guardar(c, predio, actor, b, codigos, previa) {
       ocupaciones
     });
     await validarBloqueTurismo(c, recursoId, ocupacionDesde, hasta, anterior);
+  }
+  for (const otro of recursos.slice(1)) {
+    const id = Number(otro.id);
+    await T.bloquearYValidarDisponibilidadReserva(c, {
+      servicioId: servicio.id, recursoId: id, fechaInicio: inicio, fechaFin: hasta,
+      reservaIdExcluir: anterior?.id, ocupaciones: await ocupacionesHistoricas(c, servicio.id, id, inicio, hasta, anterior?.id)
+    });
+    await validarBloqueTurismo(c, id, inicio, hasta, anterior);
   }
   if (tramos.length && inicio < anterior.fecha_inicio) {
     // La ampliación hacia atrás corresponde al primer recurso, no al actual.
@@ -458,7 +571,11 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     if (existentesParticular && !existentesParticular.has(String(a.dni))) await c.query("UPDATE usuario SET habilitado=\'N\',modulo_turismo=0,modulo_coseguro=0,modulo_olimpiadas=0 WHERE id=? AND password IS NULL AND rol_id=4", [a.usuario_id]);
     a.entrada = U.fecha(p.entrada);
     a.salida = U.fecha(p.salida);
-    if (a.entrada && (a.entrada < inicio || a.entrada > fin || a.entrada > U.hoy()) || a.salida && (!a.entrada || a.salida < a.entrada || a.salida > fin || a.salida > U.hoy())) throw U.error("Revisá el ingreso y la salida de " + nombre(a) + ": deben estar dentro de la estadía y no ser futuros.");
+    if (a.entrada && (a.entrada < inicio || a.entrada > fin || a.entrada > U.hoy())) throw U.error("Revisá el ingreso de " + nombre(a) + ": debe estar dentro de la estadía y no ser futuro.");
+    if (a.salida && (!a.entrada || a.salida < a.entrada || a.salida > U.hoy())) throw U.error("Revisá la salida de " + nombre(a) + ": debe seguir al ingreso y no ser futura.");
+    // Los bloques y las visitas de un día tienen un período de cobro fijo;
+    // registrar cuándo salió el huésped sigue siendo posible si se demoró.
+    if (a.salida && a.salida > fin && tipo !== "PASA_EL_DIA" && !anterior?.bloque_fecha_id) throw U.error("Extendé la estadía hasta la salida efectiva de " + nombre(a) + " para calcular las noches adicionales.");
   }
   for (const previo of anterior?.personas || []) {
     const actual = personas.find(p => String(p.dni) === String(previo.dni));
@@ -468,7 +585,8 @@ async function guardar(c, predio, actor, b, codigos, previa) {
   const cantidad = tipo === "CONTINGENTE" ? U.id(b.cantidad, "La cantidad total del contingente") : personas.length;
   if (cantidad < personas.length || cantidad > 10000) throw U.error("La cantidad total debe incluir a las personas identificadas (máximo 10.000).");
   if (tipo === "CONTINGENTE" && !personas.some(p => p.edad >= 18)) throw U.error("El contingente requiere al menos un responsable adulto identificado.");
-  if (tipo === "GENERAL" && recurso?.cupo_maximo && servicio.tipo_codigo !== "CUPO_NUMERADO" && cantidad > Number(recurso.cupo_maximo)) throw U.error("La cantidad supera la capacidad del recurso.");
+  if (tipo === "GENERAL" && recursos.length && recursos.every(r => Number(r.cupo_maximo) > 0) && servicio.tipo_codigo !== "CUPO_NUMERADO"
+      && cantidad > recursos.reduce((n, r) => n + Number(r.cupo_maximo), 0)) throw U.error("La cantidad supera la capacidad de los recursos.");
   if (tipo === "GENERAL" && servicio.max_personas_reserva && cantidad > servicio.max_personas_reserva) throw U.error("La cantidad supera el máximo del servicio.");
   const entidad = tipo === "CONTINGENTE" ? U.texto(b.entidad, {
     max: 120
@@ -478,19 +596,26 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     max: 50
   });
   if (Object.values(vehiculo).some(Boolean) && Object.values(vehiculo).some(v => !v)) throw U.error("Completá marca, color, patente y sector, o dejalos vacíos si no hay vehículo.");
-  const ad = b.adicionales || [];
-  if (!Array.isArray(ad) || ad.length > 50 || new Set(ad.map(x => Number(x.adicional_id))).size !== ad.length || tipo !== "GENERAL" && ad.length) throw U.error("Revisá los adicionales.");
-  if (tramos.length) tramos.at(-1).adicionales = ad.map(a => ({adicional_id: Number(a.adicional_id), cantidad: Number(a.cantidad)}));
+  const extrasAnteriores = Number(anterior?.servicio_id) === Number(servicio.id) ? anterior.adicionales_vigentes : [];
+  const ad = seleccionArticulos(b.adicionales ?? [], { inicio, fin, tipo, personas, recursoId, regimenId, anteriores: extrasAnteriores });
+  if (tramos.length) tramos.at(-1).adicionales = ad.filter(a => !a.fecha_desde);
+  const conservarPrecios = ad.filter(a => a.fecha_desde && extrasAnteriores.some(p => p.fecha_desde && Number(p.adicional_id) === a.adicional_id)).map(a => a.adicional_id);
+  const preciosPrevios = conservarPrecios.length ? await todos(c, `SELECT ra.adicional_id,ra.nombre_adicional,d.fecha,d.precio_unitario,
+    d.tarifa_adicional_id,d.porcentaje_descuento,d.tarifa_id FROM reserva_adicional ra
+    JOIN reserva_adicional_detalle d ON d.reserva_adicional_id=ra.id
+    WHERE ra.reserva_id=? AND ra.adicional_id IN (?)`, [anterior.id, conservarPrecios]) : [];
   const temporada = anterior?.bloque_fecha_id ? (await uno(c, "SELECT temporada_tarifa_id FROM bloque_fecha WHERE id=?", [anterior.bloque_fecha_id]))?.temporada_tarifa_id : null;
   const cot = await cotizar(c, T, {
     tipo,
     servicio,
     recursoId,
+    recursos,
     regimenId,
     personas,
     inicio,
     fin,
     adicionales: ad,
+    preciosPrevios,
     tramos,
     temporada,
     departamentalId: titular.departamental_id
@@ -505,15 +630,16 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     adicionalesTotal: cot.extras.total,
     reservaId: anterior?.id
   });
-  const automatico = Math.max(0, Math.round(cot.total + cot.extras.total - Number(descuentos.total_descuento || 0)));
+  const subtotalAutomatico = cot.total + cot.extras.total - Number(descuentos.total_descuento || 0);
+  const automatico = Math.max(0, cot.extras.alquileres ? U.redondear(subtotalAutomatico) : Math.round(subtotalAutomatico));
   const manual = b.manual == null || b.manual === "" ? null : dinero(b.manual);
   const motivo = U.texto(b.motivo, {
     max: 255
   });
   if (tipo !== "GENERAL" && manual === null) throw U.error("Indicá el precio acordado. Puede ser cero.");
-  if (tipo === "GENERAL" && manual !== null && manual !== automatico && !motivo && (anterior?.manual == null || Number(anterior.manual) !== manual)) throw U.error("Justificá el cambio de precio en la observación.");
-  const total = manual ?? automatico,
-    diferencia = U.redondear(total - Number(anterior?.precio_total || 0));
+  const total = manual === null ? automatico : U.redondear(manual + cot.extras.alquileres);
+  if (tipo === "GENERAL" && manual !== null && total !== automatico && !motivo && (anterior?.manual == null || Number(anterior.manual) !== manual)) throw U.error("Justificá el cambio de precio en la observación.");
+  const diferencia = U.redondear(total - Number(anterior?.precio_total || 0));
   const cotizacion = {
     automatico,
     total,
@@ -524,6 +650,12 @@ async function guardar(c, predio, actor, b, codigos, previa) {
       precio: p.tarifa_individual
     })),
     adicionales: cot.extras.total,
+    alquileres: cot.extras.alquileres,
+    detalle_alquileres: ad.filter(a => a.fecha_desde).map(a => {
+      const item = cot.extras.items.find(i => i.adicional_id === a.adicional_id);
+      return { adicional_id: a.adicional_id, nombre: item.nombre_adicional, cantidad: a.cantidad,
+        dias: item.dias, fecha_desde: a.fecha_desde, fecha_hasta: a.fecha_hasta, subtotal: item.subtotal };
+    }),
     descuentos: descuentos.total_descuento
   };
   const huellaCotizacion = firma(cotizacion);
@@ -570,10 +702,20 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     const [r] = await c.query("INSERT INTO reserva (servicio_id,recurso_id,regimen_id,numero_parcela,fecha_inicio,fecha_fin,precio_total,monto_adicionales,monto_descuentos,observaciones,estado_reserva_id,modalidad,usuario_id,creado_por_usuario_id) VALUES (?,?,?,?,?,?,?,?,?,?,(SELECT id FROM estado_reserva WHERE nombre='Aprobada'),'FECHA_LIBRE',?,?)", [...args, titular.id, actorId]);
     id = r.insertId;
   }
+  if (cambiaGrupo) {
+    if (anteriores.length > 1) await c.query("DELETE FROM recepcion_reserva_recurso WHERE reserva_id=?", [id]);
+    for (const otro of recursos.slice(1)) await c.query("INSERT INTO recepcion_reserva_recurso (reserva_id,recurso_id) VALUES (?,?)", [id, otro.id]);
+  }
   for (const p of cot.personas) {
     const [r] = await c.query("INSERT INTO reserva_familiar(reserva_id,usuario_id,tipo_persona_id,parentesco_id,edad,precio) VALUES(?,?,?,?,?,?)", [id, p.usuario_id, p.tipo_persona_id, p.parentesco_id, p.edad, p.tarifa_individual]);
-    if (p.tarifas_por_fecha.length) await T.insertarTarifasFamiliaresCalculadas(c, [{
+    // Turismo toma un snapshot de una única tarifa por pasajero y noche. La
+    // primera corresponde a su unidad asignada. El evento detalla todas las
+    // unidades, incluso si el mismo titular contrató dos para la misma noche.
+    const noches = new Map();
+    for (const t of p.tarifas_por_fecha) if (!noches.has(t.fecha)) noches.set(t.fecha, t);
+    if (noches.size) await T.insertarTarifasFamiliaresCalculadas(c, [{
       ...p,
+      tarifas_por_fecha: [...noches.values()],
       reserva_familiar_id: r.insertId
     }]);
   }
@@ -602,6 +744,15 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     automatico,
     diferencia
   });
+  if (recursos.length > 1) actual.tarifas_recursos = cot.personas.map(p => ({
+    dni: p.dni, noches: p.tarifas_por_fecha.map(t => ({ fecha: t.fecha, recurso_id: t.recurso_id, tarifa_id: t.tarifa_id, precio: t.precio }))
+  }));
+  actual.alquileres = ad.filter(a => a.fecha_desde);
+  for (const a of actual.adicionales) {
+    for (const k of ["fecha_desde", "fecha_hasta", "recurso_tarifa_id", "regimen_tarifa_id"]) delete a[k];
+    const item = actual.alquileres.find(x => x.adicional_id === Number(a.adicional_id));
+    if (item) Object.assign(a, item);
+  }
   actual.adicionales_vigentes = actual.adicionales.filter(a => ad.some(x => Number(x.adicional_id) === Number(a.adicional_id)));
   for (const p of actual.personas) {
     const a = personas.find(x => String(x.dni) === String(p.dni));
@@ -631,7 +782,9 @@ async function operar(c, predio, actor, accion, b) {
   if (!codigos.length) throw U.error("Este predio no tiene servicios asignados.", 403);
   try {
     if (accion === "opciones") return opciones(c, codigos);
+    if (accion === "crearAdicional") return crearAdicional(c, codigos, actor, b);
     if (accion === "familia") return familia(c, b.q, predio.id);
+    if (accion === "vencidas") return contarVencidas(c, codigos, predio.id, U.hoy());
     if (accion === "listar") return listar(c, codigos, {
       ...b,
       predioId: predio.id

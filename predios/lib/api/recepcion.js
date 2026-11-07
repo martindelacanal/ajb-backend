@@ -140,6 +140,11 @@ async function guardar(ctx) {
       if (recibo.huella !== huella) throw U.error("El comprobante corresponde a otra operación.", 409);
       return JSON.parse(recibo.respuesta);
     }
+    if (b.id && b.cuenta_esperada) {
+      const a = await cuenta(t, ctx, U.id(b.id), true);
+      if (a.pendiente !== b.cuenta_esperada.pendiente || a.neto_consumos !== b.cuenta_esperada.neto_consumos)
+        throw U.error("Cambió la cuenta de la estadía. Revisá el total antes de confirmar.", 409);
+    }
     const r = await turismo(t, ctx, "guardar", b);
     return aplicarConfirmacion(t, ctx, r, key, huella, b.motivo);
   });
@@ -340,7 +345,7 @@ async function verPlanilla(ctx) {
     }
   });
 }
-const rutas = ["opciones", "listar", "familia", "detalle"].map(accion => ({
+const rutas = ["opciones", "listar", "familia", "detalle", "vencidas"].map(accion => ({
   m: "GET",
   p: "/recepcion/" + accion,
   h: async ctx => {
@@ -355,8 +360,18 @@ rutas.push({
   h: verPlanilla
 }, {
   m: "POST",
+  p: "/recepcion/adicionales",
+  roles: ["ADMIN"],
+  escritura: true,
+  h: ctx => ctx.db.tx(t => turismo(t, ctx, "crearAdicional", ctx.body))
+}, {
+  m: "POST",
   p: "/recepcion/cotizar",
-  h: ctx => ctx.db.tx(t => turismo(t, ctx, "cotizar", ctx.body))
+  h: ctx => ctx.db.tx(async t => {
+    const resultado = await turismo(t, ctx, "cotizar", ctx.body);
+    const { pendiente, neto_consumos } = ctx.body.id ? await cuenta(t, ctx, U.id(ctx.body.id)) : { pendiente: 0, neto_consumos: 0 };
+    return { ...resultado, cuenta: { pendiente, neto_consumos } };
+  })
 }, {
   m: "POST",
   p: "/recepcion/guardar",

@@ -251,6 +251,21 @@ test("la edición no puede alterar una reserva ya aprobada por el titular, ni si
   }
 });
 
+test("el editor general conserva los días alquilados y las unidades asignadas en recepción", async () => {
+  for (const campo of ["cantidad_alquileres_predio", "varios_recursos"]) {
+    setDatabaseHandler(async (sql) => {
+      if (/FROM reserva r[\s\S]+FOR UPDATE/.test(sql)) return [[{
+        id: 77, usuario_id: 100, estado_nombre: "Iniciada", modalidad: "FECHA_LIBRE", [campo]: 1
+      }]];
+      throw Error("No se debe reescribir la reserva");
+    });
+    const response = await request("/api/reserva/77", { method: "PUT", token: tokenFor(), body: bodyEdicion() });
+    assert.equal(response.status, 409);
+    assert.match(JSON.stringify(response.body), /recepción del predio/);
+    assert.deepEqual(transactionCalls, ["begin", "rollback"]);
+  }
+});
+
 test("una edición autorizada vuelve a exigir CBU antes de cambiar recurso o pasajeros", async () => {
   setDatabaseHandler(async (sql) => {
     if (/FROM reserva r[\s\S]+FOR UPDATE/.test(sql)) return [[{
