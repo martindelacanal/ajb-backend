@@ -230,10 +230,14 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
       }
     },
     async pruebaCentral() {
-      if (!core.estado().escritor || !c.certificado) throw Object.assign(new Error("Esta PC no tiene el control del grupo local"), { status: 503 });
+      const datos = c.certificado?.datos;
+      if (!core.estado().escritor || !datos) throw Object.assign(new Error("Esta PC no tiene el control del grupo local"), { status: 503 });
+      if (!config.token) throw Object.assign(new Error("La instalación no tiene una credencial de Mi AJB"), { status: 503 });
       const w = await estadoTestigo({ compacto: true });
       if (w.escritor !== c.nodoId || w.termino !== core.estado().termino || w.vence_en_ms <= 0 || !core.estado().escritor) throw Object.assign(new Error("El testigo no acredita a esta PC para sincronizar"), { status: 503 });
-      return Buffer.from(JSON.stringify({ certificado: c.certificado, estadoFirmado: w.sobre })).toString("base64");
+      // El instalador puede renovar el token sin cambiar el grupo ni su clave.
+      const firma = crypto.createHmac("sha256", config.token).update(JSON.stringify(datos)).digest("hex");
+      return Buffer.from(JSON.stringify({ certificado: { datos, firma }, estadoFirmado: w.sobre })).toString("base64");
     },
     async manejar(req, res) {
       const u = new URL(req.url, "http://local");

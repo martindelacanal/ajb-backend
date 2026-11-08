@@ -256,7 +256,7 @@
           h("div.grilla.grilla-2",
             h("div.hoja.hoja-cuerpo",
               h("div.fila-separada", h("h2.seccion-titulo", "Sincronización con el sistema general"),
-                !s.vinculado ? P.chip("Sin vincular", "VENCIDO") : s.en_linea ? P.chip("Conectado", "CONFIRMADA") : P.chip("Sin internet", "PENDIENTE")),
+                !s.vinculado ? P.chip("Sin vincular", "VENCIDO") : s.en_linea ? P.chip("Conectado", "CONFIRMADA") : P.chip("Sin conexión con Mi AJB", "PENDIENTE")),
               s.conflicto ? h("div", { style: { marginTop: "12px" } }, P.mensaje(s.conflicto, "error")) : null,
               !s.vinculado ? h("p.texto-3", "Esta instalación no tiene la clave del sistema general. Descargá el instalador desde Mi AJB > Predios para vincularla.") : null,
               h("div.datos", { style: { marginTop: "14px" } },
@@ -265,7 +265,7 @@
                 P.dato("Cambios por subir", P.f.entero(s.pendientes)),
                 P.dato("Afiliados con reserva", s.maestros ? P.f.entero(s.maestros.afiliados) + " (" + P.f.relativo(s.maestros.fecha) + ")" : "—")),
               s.ultimo_error && !s.en_linea ? h("p.texto-3.chico", "Último error: " + s.ultimo_error) : null,
-              h("p.texto-3.chico", d.escritura && d.escritura.autorizado === false ? "Esta instalación está en modo consulta. Usá el servidor autorizado para cargar ventas y movimientos." : "Sin internet el sistema funciona igual: todo se guarda en esta notebook y se sube solo cuando vuelve la conexión."),
+              h("p.texto-3.chico", d.escritura && d.escritura.autorizado === false ? "Esta instalación está en modo consulta. Usá el servidor autorizado para cargar ventas y movimientos." : "Si Mi AJB no responde, las operaciones se guardan en el camping y se suben al restablecerse la comunicación."),
               h("div.fila", { style: { marginTop: "6px" } },
                 P.btn("Sincronizar ahora", { tipo: "primario", icono: "refrescar", deshabilitado: !s.vinculado, onclick: function (ev) {
                   P.ejecutar(ev.currentTarget, function () { return P.post("/sistema/sincronizar").then(function (r) { P.aviso(r.mensaje, "ok"); cargar(); }); }).catch(function () {});

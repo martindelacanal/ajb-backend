@@ -9,11 +9,12 @@ const http = require("node:http");
 const crypto = require("node:crypto");
 const zlib = require("node:zlib");
 const { once } = require("node:events");
+const { setTimeout: esperar } = require("node:timers/promises");
 const { crearSqlite, asegurarEsquema, escribirMeta, leerMeta } = require("../lib/db-sqlite");
 const { crearAgente } = require("../lib/agente");
 const { generarPar, firmar } = require("../lib/firma");
 
-async function preparar(t, { escritor = true, restauracion = false, pruebaHa, codigo, clavePublica, automaticas = true } = {}) {
+async function preparar(t, { escritor = true, restauracion = false, pruebaHa, codigo, clavePublica, automaticas = true, rechazoHola, comandosPendientes } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "predio-agente-ha-"));
   const db = crearSqlite(path.join(base, "predio.db"), { predioId: 1 }); asegurarEsquema(db);
   escribirMeta(db, "instancia_id", "linaje-del-principal-original");
@@ -26,12 +27,13 @@ async function preparar(t, { escritor = true, restauracion = false, pruebaHa, co
     recibidas.push(r);
     if (req.url === "/predios-sync/codigo" && codigo) { res.writeHead(200, { "Content-Type": "application/octet-stream" }); return res.end(codigo.buffer); }
     let respuesta = {};
-    if (req.url === "/predios-sync/hola") respuesta = { escritor: "LOCAL", autoriza_escritura: true };
+    if (req.url === "/predios-sync/hola") respuesta = rechazoHola || { escritor: "LOCAL", autoriza_escritura: true, comandos_pendientes: comandosPendientes };
     else if (req.url === "/predios-sync/comandos") respuesta = { comandos: [] };
     else if (req.url === "/predios-sync/version") respuesta = codigo ? { version: codigo.version, sha256: crypto.createHash("sha256").update(codigo.buffer).digest("hex"), firma: codigo.firma } : { version: "test" };
     else if (req.url === "/predios-sync/push") respuesta = { aceptados: 1 };
     else if (req.url === "/predios-sync/maestros") respuesta = { departamentales: [], afiliados: [] };
-    res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(respuesta));
+    const status = req.url === "/predios-sync/hola" && rechazoHola ? 409 : 200;
+    res.writeHead(status, { "Content-Type": "application/json" }); res.end(JSON.stringify(respuesta));
   });
   servidor.listen(0, "127.0.0.1"); await once(servidor, "listening");
   const agente = crearAgente({ base, db, config: { predio_id: 1, predio_codigo: "CAMPING", servidor: `http://127.0.0.1:${servidor.address().port}`, token: "token-grupo", clave_publica: clavePublica, actualizaciones_automaticas: automaticas }, version: "test",
@@ -90,6 +92,28 @@ test("si se pierde el permiso mientras se obtiene la prueba no se envía la peti
   const s = await preparar(t, { pruebaHa: async ({ grupo }) => { grupo.escritor = false; return "prueba-obtenida-antes-del-relevo"; } });
   await assert.rejects(s.agente.verificarAdminGeneral("123", "clave"), { status: 503 });
   assert.equal(s.recibidas.length, 0);
+});
+
+test("los cambios locales se envían solos sin esperar el sondeo y no se piden órdenes vacías", { timeout: 7000 }, async t => {
+  const s = await preparar(t, { comandosPendientes: 0 });
+  s.agente.iniciar();
+  await s.agente.sincronizarAhora();
+  assert.deepEqual(s.recibidas.map(r => r.ruta), ["/predios-sync/hola", "/predios-sync/maestros", "/predios-sync/version"]);
+  await s.db.run("INSERT INTO predio_config(predio_id,id,clave,valor) VALUES(1,1,'venta_pendiente','202')");
+  const limite = Date.now() + 5000;
+  while (!s.agente.estadoPublico().ultima_subida && Date.now() < limite) await esperar(25);
+  assert.equal(s.agente.estadoPublico().pendientes, 0);
+  assert.deepEqual(s.recibidas.slice(3).map(r => r.ruta), ["/predios-sync/hola", "/predios-sync/push"]);
+});
+
+test("la sincronización muestra el rechazo real y todavía puede comprobar si hay una actualización", async t => {
+  const mensaje = "El certificado LAN no fue autorizado por la instalación autenticada";
+  const s = await preparar(t, { rechazoHola: { mensaje, codigo: "HA_NO_AUTORIZADA" } });
+  const llamadas = [s.agente.sincronizarAhora(), s.agente.sincronizarAhora()];
+  await Promise.all(llamadas.map(llamada => assert.rejects(llamada, { message: mensaje + " (HTTP 409, HA_NO_AUTORIZADA)" })));
+  assert.equal(s.agente.estadoPublico().en_linea, false);
+  assert.match(s.agente.estadoPublico().ultimo_error, /certificado LAN no fue autorizado/);
+  assert.deepEqual(s.recibidas.map(r => r.ruta), ["/predios-sync/hola", "/predios-sync/version"]);
 });
 
 test("una consulta al testigo fallida nunca continúa usando una prueba anterior", async t => {

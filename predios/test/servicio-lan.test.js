@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -146,8 +147,12 @@ test("la prueba central usa estado compacto fresco firmado por el PIN y conserva
   assert.equal((await H.pedir(a.url, "/lan/estado", opciones)).nodoId, s.ids.A, "el alta firmada se acepta sin reiniciar el servicio");
   await a.servicio.sondear();
   assert.equal(a.servicio.estado().miembros.length, 3);
+  a.config.token = "token-renovado";
   const cabecera = await a.servicio.pruebaCentral(), prueba = JSON.parse(Buffer.from(cabecera, "base64").toString());
   assert.ok(cabecera.length < 16 * 1024);
+  assert.deepEqual(prueba.certificado.datos, a.ha.certificado.datos);
+  assert.equal(prueba.certificado.firma, crypto.createHmac("sha256", "token-renovado").update(JSON.stringify(a.ha.certificado.datos)).digest("hex"));
+  assert.equal(a.ha.certificado.firma, "certificado-de-prueba");
   assert.equal(prueba.estadoFirmado.estado.compacto, true);
   assert.equal(prueba.estadoFirmado.estado.miembros, undefined);
   const estado = verificarEstadoFirmado(prueba.estadoFirmado, { clavePublica: s.pin, grupoId: s.grupoId, desafio: prueba.estadoFirmado.estado.desafio });

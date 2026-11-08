@@ -183,8 +183,8 @@ async function esperarComando(res, predio, id) {
   return res.status(202).json({
     encolado: true, comando_id: id,
     mensaje: C.enLinea(predio)
-      ? "El predio está tardando en responder: el cambio quedó en cola y se aplica en unos segundos."
-      : "El predio está sin conexión: el cambio quedó en cola y se aplica apenas vuelva internet.",
+      ? "El cambio quedó en cola. Se aplica cuando el predio vuelva a consultar a Mi AJB."
+      : "El predio está sin conexión con Mi AJB. El cambio se aplica al restablecerse la comunicación.",
   });
 }
 
@@ -608,7 +608,7 @@ function crearRouterSync() {
   });
 
   function remotoActivo(p) {
-    return Date.now() - (accesoRemoto.get(p.codigo) || 0) < 60000;
+    return Date.now() - (accesoRemoto.get(p.codigo) || 0) < 120000;
   }
 
   async function comandosPendientes(p) {

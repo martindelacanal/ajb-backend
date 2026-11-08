@@ -19,6 +19,8 @@ const { TABLAS, NOMBRES_TABLAS, columnasDe, tablasDeInstantanea } = require("./e
 const { leerMeta, escribirMeta } = require("./db-sqlite");
 const { aplicarMaestros } = require("./maestros");
 const { instalarPaquete, leerPaquete } = require("./paquete");
+const INTERVALO_SONDEO_MS = 60000;
+const INTERVALO_CAMBIOS_MS = 3000;
 const { verificar } = require("./firma");
 const { identidadEquipo } = require("./control-equipo");
 
@@ -79,7 +81,8 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
     maestros: leerMeta(db, "maestros_resumen") ? JSON.parse(leerMeta(db, "maestros_resumen")) : null,
   };
   let temporizador = null;
-  let corriendo = false;
+  let temporizadorCambios = null;
+  let cicloEnCurso = null;
   let detenido = false;
   let fallos = 0;
   let ultimoMaestros = 0;
@@ -447,20 +450,30 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
 
   // ---------------------------------------------------------------- ciclo
 
-  async function ciclo() {
-    if (corriendo || detenido || !configurado()) return;
+  function ciclo() {
+    if (cicloEnCurso) return cicloEnCurso;
+    if (detenido || !configurado()) return Promise.resolve();
+    clearTimeout(temporizador);
+    cicloEnCurso = ejecutarCiclo().finally(() => {
+      cicloEnCurso = null;
+      programar();
+    });
+    return cicloEnCurso;
+  }
+
+  async function ejecutarCiclo() {
     if (!puedeSincronizar()) {
       estado.en_linea = false; estado.ultimo_error = "Esta PC está en espera del servidor actual";
+      estado.remoto_activo = false;
+      estado.comandos_pendientes = 0;
+      fallos = 0;
       // Una PC en espera puede obtener código firmado. No anuncia control,
       // descarga tablas, consume órdenes ni sube cambios comerciales.
       if (grupoLocal().habilitado) {
-        corriendo = true;
         try { await buscarActualizacion(false); } catch (e) { log("Actualización del respaldo: " + e.message); }
-        finally { corriendo = false; programar(); }
-      } else programar();
+      }
       return;
     }
-    corriendo = true;
     try {
       const hola = await pedir("POST", "/hola", {
         cuerpo: {
@@ -468,9 +481,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
           vacia: baseVacia(), bootstrap: leerMeta(db, "bootstrap"), bootstrap_generado: leerMeta(db, "bootstrap_generado"),
         },
       });
-      estado.en_linea = true;
       estado.ultimo_contacto = U.fechaHora();
-      estado.ultimo_error = null;
       estado.escritor = hola.escritor;
       if (/^[a-f0-9]{64}$/.test(String(hola.clave_lan || "")) && config.clave_lan !== hola.clave_lan) {
         config.clave_lan = hola.clave_lan;
@@ -484,7 +495,6 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
       await guardarMeta("ultimo_contacto", estado.ultimo_contacto);
       await guardarMeta("escritor", hola.escritor || "");
       atenderRespuesta(hola);
-      fallos = 0;
 
       if (hola.accion === "DESCARGAR_DATOS") {
         await descargarInstantanea();
@@ -497,41 +507,52 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
       if (hola.autoriza_escritura === true) await db.exclusivo(() => controlEquipo?.confirmarCentral());
       if (controlEquipo && !controlEquipo.puedeEscribir()) {
         estado.conflicto = controlEquipo.estado().motivo;
-        await buscarActualizacion(false).catch((e) => log(`Actualización: ${e.message}`));
-        return;
-      }
-      if (hola.conflicto) {
+      } else if (hola.conflicto) {
         estado.conflicto = hola.conflicto;
       } else {
         estado.conflicto = null;
         await subir();
-        await atenderComandos();
+        if (estado.comandos_pendientes !== 0) await atenderComandos();
         await bajarMaestros(false).catch((e) => log(`Afiliados: ${e.message}`));
-        await buscarActualizacion(false).catch((e) => log(`Actualización: ${e.message}`));
       }
+      estado.en_linea = true;
+      estado.ultimo_error = null;
+      fallos = 0;
+      await buscarActualizacion(false).catch((e) => log(`Actualización: ${e.message}`));
     } catch (e) {
       if (e.status === 409 && ["OTRO_EQUIPO", "OTRA_INSTALACION", "SIN_CONTROL"].includes(e.codigo)) {
         controlEquipo?.rechazarCentral(e.message);
         estado.conflicto = e.message;
-        await buscarActualizacion(false).catch((fallo) => log(`Actualización: ${fallo.message}`));
       }
       fallos++;
       estado.en_linea = false;
-      estado.ultimo_error = e.name === "TimeoutError" || e.name === "AbortError" ? "Sin respuesta del sistema general" : (e.cause?.code ? "Sin conexión a internet" : e.message);
+      if (e.name === "TimeoutError" || e.name === "AbortError") {
+        estado.ultimo_error = "Mi AJB no respondió a tiempo";
+      } else if (e.cause) {
+        const causas = e.cause.errors?.length ? e.cause.errors : [e.cause];
+        const detalles = causas.map(c => c.message || c.code).filter(Boolean);
+        estado.ultimo_error = detalles.length ? [...new Set(detalles)].join(" / ") : e.message;
+      } else {
+        estado.ultimo_error = e.codigo && e.status ? `${e.message} (HTTP ${e.status}, ${e.codigo})` : e.message;
+      }
       if (fallos === 1 || fallos % 20 === 0) log(`Sincronización: ${estado.ultimo_error}`);
-    } finally {
-      corriendo = false;
-      programar();
+      // Una respuesta de rechazo comercial puede corregirse con una versión firmada.
+      if (e.status) await buscarActualizacion(false).catch((fallo) => log(`Actualización: ${fallo.message}`));
     }
   }
 
   function programar() {
     if (detenido) return;
     clearTimeout(temporizador);
-    let espera = estado.remoto_activo || estado.comandos_pendientes ? 2000 : 6000;
-    if (fallos) espera = Math.min(60000, 5000 * 2 ** Math.min(fallos - 1, 4));
+    let espera = estado.remoto_activo || estado.comandos_pendientes ? 2000 : INTERVALO_SONDEO_MS;
+    if (fallos) espera = Math.min(INTERVALO_SONDEO_MS, 5000 * 2 ** Math.min(fallos - 1, 4));
     temporizador = setTimeout(ciclo, espera);
     temporizador.unref?.();
+  }
+
+  function enviarCambiosPendientes() {
+    if (cicloEnCurso || detenido || fallos || estado.conflicto || !puedeSincronizar()) return;
+    if (db.conexion.prepare("SELECT 1 FROM predio_outbox WHERE seq > ? LIMIT 1").get(cursorEnviado())) ciclo();
   }
 
   // ---------------------------------------------------------------- archivos para pendrive
@@ -602,15 +623,25 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
       if (!grupoLocal().habilitado && !leerMeta(db, "restauracion_pendiente")) {
         try { cargarDatosIniciales(); } catch (e) { log(`No se pudieron cargar los datos iniciales: ${e.message}`); }
       }
-      if (configurado()) { temporizador = setTimeout(ciclo, 1500); temporizador.unref?.(); }
+      if (configurado()) {
+        clearTimeout(temporizador);
+        clearInterval(temporizadorCambios);
+        temporizador = setTimeout(ciclo, 1500);
+        temporizador.unref?.();
+        temporizadorCambios = setInterval(enviarCambiosPendientes, INTERVALO_CAMBIOS_MS);
+        temporizadorCambios.unref?.();
+      }
     },
-    detener() { detenido = true; clearTimeout(temporizador); },
+    detener() {
+      detenido = true;
+      clearTimeout(temporizador);
+      clearInterval(temporizadorCambios);
+    },
     async sincronizarAhora() {
       if (!configurado()) throw U.error("La notebook no está vinculada al sistema general");
-      clearTimeout(temporizador);
       ultimoMaestros = 0;
       await ciclo();
-      if (!estado.en_linea) throw U.error(estado.ultimo_error || "No hay conexión con el sistema general", 503);
+      if (!estado.en_linea) throw U.error(estado.ultimo_error || "Sin conexión con Mi AJB", 503);
       return estadoPublico();
     },
     async recepcion(accion, datos, actor) {

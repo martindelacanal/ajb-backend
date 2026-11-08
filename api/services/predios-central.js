@@ -64,7 +64,8 @@ function paqueteFirmado(datos) {
 function enLinea(predio) {
   if (!predio?.ultima_conexion) return false;
   const t = new Date(String(predio.ultima_conexion).replace(" ", "T") + "-03:00").getTime();
-  return Date.now() - t < 30000;
+  // Una instalación sin actividad se anuncia una vez por minuto.
+  return Date.now() - t < 120000;
 }
 
 function serviciosDe(predio) {
