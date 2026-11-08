@@ -188,6 +188,15 @@ const CONFIG_POR_DEFECTO = {
   texto_autorizacion: "Me dirijo a ustedes a efectos de autorizar expresamente a la Asociación Judicial Bonaerense a retener de mi sueldo la suma indicada, en las cuotas detalladas, de acuerdo al sistema de descuento vigente.",
   vender_sin_stock: "0",
   minutos_permiso: "30",
+  // Conteo de stock a ciegas al cerrar la caja (lib/api/conteo.js): apagado hasta que
+  // Administración lo active. Porcentaje del stock de la boca por cierre y tolerancia (%) en pesables.
+  conteo_cierre_activo: "0",
+  conteo_cierre_porcentaje: "10",
+  conteo_tolerancia_peso: "2",
+  // Etiquetas de balanza (public/js/balanza.js): prefijo y largo del código del producto.
+  balanza_activa: "1",
+  balanza_prefijo: "2",
+  balanza_digitos_codigo: "7",
 };
 
 async function leerConfig(t, ctx) {

@@ -190,6 +190,7 @@ function eliminar(clave) {
 
 module.exports = {
   ENTIDADES,
+  elegidos,
   rutas: [
     { m: "POST", p: "/productos/eliminar/previa", h: previa("productos"), roles: ["ADMIN"] },
     { m: "POST", p: "/productos/eliminar", h: eliminar("productos"), escritura: true, roles: ["ADMIN"] },

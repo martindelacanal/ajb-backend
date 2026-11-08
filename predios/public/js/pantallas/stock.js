@@ -30,12 +30,25 @@
       var disponible = h("div.campo-ayuda");
       var cantidad = P.input({ inputmode: "decimal", valor: "1" });
       cantidad.style.width = "100px";
+      // Pesables: se pasan en kilos o en gramos (o con la etiqueta de la balanza, que trae el peso).
+      var unidadCantidad = P.segmentado([{ valor: "kg", texto: "kg" }, { valor: "g", texto: "g" }], "kg");
+      unidadCantidad.hidden = true;
+      var ayudaCantidad = h("span.campo-ayuda", "Ej.: 0,5 para media unidad.");
+      function prepararCantidad() {
+        var kg = elegido && elegido.unidad === "KG";
+        unidadCantidad.hidden = !kg;
+        if (!kg) unidadCantidad.fijar("kg");
+        ayudaCantidad.textContent = elegido && elegido.receta
+          ? "En porciones: se mueve lo que corresponde de «" + elegido.receta.nombre + "» (rinde " + elegido.receta.rendimiento + " por unidad)."
+          : kg ? "En kilos (2,350) o en gramos (2350)." : "Ej.: 0,5 para media unidad.";
+        if (elegido && elegido.peso && kg) { unidadCantidad.fijar("kg"); cantidad.value = P.f.numero(elegido.peso).replace(/\./g, ""); }
+      }
       var combo = P.comboProducto({
         abrirAlEnfocar: false,
-        placeholder: "Escaneá o buscá el producto",
+        placeholder: "Escaneá (también la etiqueta de la balanza) o buscá el producto",
         bocaId: function () { return Number(origen.value); }, mostrarStock: true,
-        alCambiarTexto: function () { elegido = null; disponible.textContent = ""; },
-        alElegir: function (o) { elegido = o.dato; mostrarDisponible(); cantidad.focus(); cantidad.select(); },
+        alCambiarTexto: function () { elegido = null; disponible.textContent = ""; prepararCantidad(); },
+        alElegir: function (o) { elegido = o.dato; prepararCantidad(); mostrarDisponible(); cantidad.focus(); cantidad.select(); },
       });
       function mostrarDisponible() {
         if (!elegido) { disponible.textContent = ""; return; }
@@ -44,8 +57,10 @@
         disponible.textContent = "Consultando stock…";
         P.get("/stock/disponible" + P.qs({ boca_id: origen.value, producto_id: elegido.id })).then(function (x) {
           if (elegido !== productoConsultado || origen.value !== origenConsultado) return;
-          elegido.disponible = x.cantidad;
-          disponible.textContent = "Disponible en " + nombreOrigen + ": " + P.f.numero(x.cantidad);
+          elegido.disponible = x.insumo ? undefined : x.cantidad;
+          disponible.textContent = x.insumo
+            ? "Disponible en " + nombreOrigen + ": " + P.f.numero(x.cantidad) + " de «" + x.insumo.nombre + "» (unas " + P.f.entero(Math.floor(x.cantidad * x.insumo.rendimiento)) + " porciones)"
+            : "Disponible en " + nombreOrigen + ": " + P.f.cantidad(x.cantidad, elegido.unidad);
           disponible.style.color = x.cantidad <= 0 ? "var(--error)" : "";
         }).catch(function () { disponible.textContent = ""; });
       }
@@ -55,7 +70,7 @@
         lineas.forEach(function (l) {
           l.disponible = undefined;
           P.get("/stock/disponible" + P.qs({ boca_id: id, producto_id: l.producto.id })).then(function (r) {
-            if (origen.value === id) { l.disponible = r.cantidad; pintar(); }
+            if (origen.value === id) { l.disponible = r.insumo ? undefined : r.cantidad; pintar(); }
           }).catch(P.error);
         });
         mostrarDisponible(); pintar();
@@ -65,6 +80,9 @@
         if (!elegido) { combo.foco(); return; }
         var n = P.numeroDe(cantidad.value);
         if (!(n > 0)) { cantidad.focus(); return; }
+        if (elegido.unidad === "KG" && unidadCantidad.valor() === "g") n = n / 1000;
+        n = P.redondear(n, 3);
+        if (!(n > 0)) { cantidad.focus(); return; }
         var ex = lineas.filter(function (l) { return l.producto.id === elegido.id; })[0];
         if (ex) ex.cantidad = P.redondear(ex.cantidad + n, 3);
         else lineas.push({ producto: elegido, cantidad: n, disponible: elegido.disponible });
@@ -72,6 +90,7 @@
         combo.limpiar();
         cantidad.value = "1";
         disponible.textContent = "";
+        prepararCantidad();
         pintar();
         combo.foco();
       }
@@ -82,8 +101,9 @@
         lista.appendChild(h("table.tabla", h("thead", h("tr", h("th", "Producto"), h("th.der", "Cantidad"), h("th.der", "Disponible en origen"), h("th"))),
           h("tbody", lineas.map(function (l, i) {
             var falta = l.disponible !== undefined && l.cantidad > l.disponible;
-            return h("tr", h("td", h("strong", l.producto.nombre)), h("td.der", P.f.numero(l.cantidad)),
-              h("td.der" + (falta ? ".negativo" : ""), l.disponible === undefined ? "—" : P.f.numero(l.disponible) + (falta ? " (no alcanza)" : "")),
+            return h("tr", h("td", h("strong", l.producto.nombre), l.producto.receta ? h("div.texto-3.chico", "Se mueve «" + l.producto.receta.nombre + "»") : null),
+              h("td.der", l.producto.receta ? P.f.numero(l.cantidad) + " porciones" : P.f.cantidad(l.cantidad, l.producto.unidad)),
+              h("td.der" + (falta ? ".negativo" : ""), l.disponible === undefined ? "—" : P.f.cantidad(l.disponible, l.producto.unidad) + (falta ? " (no alcanza)" : "")),
               h("td.acciones", P.btn("", { tipo: "texto", chico: true, icono: "cerrar", etiqueta: "Quitar", onclick: function () { lineas.splice(i, 1); pintar(); } })));
           }))));
       }
@@ -96,7 +116,7 @@
         ancho: "ancha",
         contenido: h("div.columna",
           h("div.grilla.grilla-2", P.campo("Sale de (boca de origen)", origen), P.campo("Llega a (boca de destino)", destino)),
-          h("div.fila-campos", P.campo("Producto", h("div", combo.el, disponible), { clase: "crece" }), P.campo("Cantidad", cantidad, { ayuda: "Ej.: 0,5 para media unidad." }),
+          h("div.fila-campos", P.campo("Producto", h("div", combo.el, disponible), { clase: "crece" }), P.campo("Cantidad", h("div", h("div.fila.cantidad-con-unidad", cantidad, unidadCantidad), ayudaCantidad)),
             h("div.campo", h("span.campo-etiqueta", " "), P.btn("Agregar", { tipo: "celeste", icono: "mas", onclick: agregar }))),
           lista,
           P.esAdmin() ? baja : null,

@@ -341,7 +341,28 @@
         telefono: P.input({ valor: cf.telefono, max: 40 }),
         correo: P.input({ valor: cf.correo, max: 120, tipo: "email" }),
         leyenda_comprobante: h("textarea.campo-control", { maxlength: 300, rows: 2 }, cf.leyenda_comprobante || ""),
+        conteo_cierre_porcentaje: P.input({ valor: cf.conteo_cierre_porcentaje, inputmode: "numeric", max: 3 }),
+        conteo_tolerancia_peso: P.input({ valor: String(cf.conteo_tolerancia_peso || "").replace(".", ","), inputmode: "decimal", max: 4 }),
+        balanza_prefijo: P.input({ valor: cf.balanza_prefijo, inputmode: "numeric", max: 2 }),
+        balanza_digitos_codigo: P.input({ valor: cf.balanza_digitos_codigo, inputmode: "numeric", max: 1 }),
       };
+      // Conteo de stock al cerrar la caja (a ciegas, por rondas) y lectura de etiquetas de balanza.
+      var conteoActivo = P.check("Pedir un conteo de stock al cerrar cada caja", String(cf.conteo_cierre_activo) === "1",
+        "Antes del cierre temporal, el cajero cuenta una parte de los productos de su boca sin ver lo que dice el sistema. No se repiten productos hasta completar todo el stock de la boca.");
+      var balanzaActiva = P.check("Leer las etiquetas de la balanza en la caja", String(cf.balanza_activa) !== "0",
+        "Al escanear la etiqueta, la caja carga el producto con su peso y calcula el precio por kilo.");
+      var pruebaEtiqueta = P.input({ inputmode: "numeric", max: 13, placeholder: "Ej.: 2000140004850" });
+      var resultadoPrueba = h("span.campo-ayuda", "Escaneá o escribí una etiqueta para ver cómo la lee el sistema.");
+      function probarEtiqueta() {
+        var config = { balanza_activa: "1", balanza_prefijo: campos.balanza_prefijo.value, balanza_digitos_codigo: campos.balanza_digitos_codigo.value };
+        var texto = pruebaEtiqueta.value.trim();
+        if (!texto) { resultadoPrueba.textContent = "Escaneá o escribí una etiqueta para ver cómo la lee el sistema."; return; }
+        var e = P.balanza.leer(texto, config);
+        resultadoPrueba.textContent = e
+          ? "Código del producto " + e.codigo + (e.plu ? " (PLU " + e.plu + " de la balanza)" : "") + " · " + P.f.kilos(e.kg) + "."
+          : "No es una etiqueta de balanza con este formato (13 dígitos, empieza con el prefijo y el último dígito verifica el resto).";
+      }
+      [pruebaEtiqueta, campos.balanza_prefijo, campos.balanza_digitos_codigo].forEach(function (x) { x.addEventListener("input", probarEtiqueta); });
       c.appendChild(h("div.hoja.hoja-cuerpo",
         h("div.grilla.grilla-2",
           P.campo("Nombre del predio", campos.nombre_predio, { ayuda: "Aparece en el ingreso y en los tickets." }),
@@ -357,10 +378,33 @@
           P.campo("Condición frente al IVA", campos.condicion_iva), P.campo("Domicilio legal", campos.domicilio_legal),
           P.campo("Teléfono", campos.telefono), P.campo("Correo", campos.correo)),
         h("div", { style: { marginTop: "14px" } }, P.campo("Leyenda al pie del recibo", campos.leyenda_comprobante, { ayuda: "Por ejemplo, que no es válido como factura y la resolución que exceptúa de emitir comprobantes." })),
+        h("h2.seccion-titulo", { style: { marginTop: "22px" } }, "Conteo de stock al cerrar la caja"),
+        conteoActivo,
+        h("div.grilla.grilla-2", { style: { marginTop: "10px" } },
+          P.campo("Porcentaje del stock de la boca a contar en cada cierre", campos.conteo_cierre_porcentaje,
+            { ayuda: "De 1 a 100. Con 10 %, una boca con 200 productos pide 20 por cierre y completa la vuelta en 10 cierres." }),
+          P.campo("Tolerancia para los productos por peso (%)", campos.conteo_tolerancia_peso,
+            { ayuda: "Diferencia aceptada al pesar (por ejemplo, 2 %). En los productos por unidad tiene que coincidir exacto." })),
+        h("p.texto-3.chico", "Si lo contado no coincide, se avisa a Supervisión de la boca y a Administración, que deciden si ajustar el stock. Los conteos se revisan en Gestión → Productos y stock → Más → Conteos de stock."),
+        h("h2.seccion-titulo", { style: { marginTop: "22px" } }, "Etiquetas de balanza"),
+        balanzaActiva,
+        h("div.grilla.grilla-2", { style: { marginTop: "10px" } },
+          P.campo("Prefijo de las etiquetas", campos.balanza_prefijo, { ayuda: "Primer dígito de las etiquetas de la balanza (normalmente 2)." }),
+          P.campo("Dígitos del código del producto", campos.balanza_digitos_codigo,
+            { ayuda: "Con 7, la etiqueta 2000140 00485 0 es el producto 2000140 (PLU 14) y pesa 485 g. Los demás dígitos son los gramos y el verificador." })),
+        h("div", { style: { marginTop: "10px" } }, P.campo("Probar una etiqueta", h("div", pruebaEtiqueta, resultadoPrueba))),
         h("div.fila", { style: { marginTop: "18px", justifyContent: "flex-end" } }, P.btn("Guardar configuración", { tipo: "primario", icono: "check", onclick: function (ev) {
           var cuerpo = {};
           Object.keys(campos).forEach(function (k) { cuerpo[k] = campos[k].value; });
-          P.ejecutar(ev.currentTarget, function () { return P.put("/config", cuerpo).then(function (x) { if (!x.encolado) P.aviso(x.mensaje, "ok"); }); }).catch(function () {});
+          cuerpo.conteo_tolerancia_peso = String(cuerpo.conteo_tolerancia_peso || "").replace(",", ".");
+          cuerpo.conteo_cierre_activo = conteoActivo.input.checked ? "1" : "0";
+          cuerpo.balanza_activa = balanzaActiva.input.checked ? "1" : "0";
+          // Sólo viajan las claves que cambiaron: así una notebook sin actualizar no recibe claves que no conoce.
+          Object.keys(cuerpo).forEach(function (k) { if (String(cuerpo[k] == null ? "" : cuerpo[k]) === String(cf[k] == null ? "" : cf[k])) delete cuerpo[k]; });
+          if (!Object.keys(cuerpo).length) { P.aviso("No hay cambios para guardar"); return; }
+          P.ejecutar(ev.currentTarget, function () {
+            return P.put("/config", cuerpo).then(function (x) { Object.assign(cf, cuerpo); if (!x.encolado) P.aviso(x.mensaje, "ok"); });
+          }).catch(function () {});
         } }))));
     });
   }, { admin: true, titulo: "Configuración" });

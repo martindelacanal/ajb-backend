@@ -30,15 +30,21 @@ async function revisarPar(t, ctx, bocaId, productoId) {
     return { emitidos: 0, resueltos: abiertos.length };
   }
 
-  // Cada usuario de esa boca recibe su aviso privado. También se contempla un
-  // turno aún abierto si la asignación se modificó mientras estaba atendiendo.
+  // El aviso es para quien decide reponer: Administración (sin destinatario) y cada
+  // supervisor asignado a esa boca. Los cajeros no lo reciben.
   const usuarios = await t.all(`SELECT u.id FROM predio_usuario u
-    WHERE u.predio_id = ? AND u.activo = 1 AND u.rol <> 'ADMIN'
-      AND (EXISTS (SELECT 1 FROM predio_usuario_boca ub WHERE ub.predio_id = u.predio_id AND ub.usuario_id = u.id AND ub.boca_id = ?)
-        OR EXISTS (SELECT 1 FROM predio_turno tu WHERE tu.predio_id = u.predio_id AND tu.usuario_id = u.id AND tu.boca_id = ? AND tu.estado = 'ABIERTO'))`,
-  [ctx.pid, bocaId, bocaId]);
+    WHERE u.predio_id = ? AND u.activo = 1 AND u.rol = 'SUPERVISOR'
+      AND EXISTS (SELECT 1 FROM predio_usuario_boca ub WHERE ub.predio_id = u.predio_id AND ub.usuario_id = u.id AND ub.boca_id = ?)`,
+  [ctx.pid, bocaId]);
   const destinatarios = [null, ...usuarios.map((u) => Number(u.id))];
-  const previos = new Set(abiertos.map((a) => a.usuario_id == null ? null : Number(a.usuario_id)));
+  const vigentes = new Set(destinatarios);
+  const previos = new Set();
+  for (const aviso of abiertos) {
+    const usuarioId = aviso.usuario_id == null ? null : Number(aviso.usuario_id);
+    // Avisos anteriores a este criterio (cajeros) o de alguien que ya no supervisa la boca.
+    if (!vigentes.has(usuarioId)) await N.actualizar(t, ctx, "predio_aviso", aviso.id, { resuelto_fecha: U.fechaHora() });
+    else previos.add(usuarioId);
+  }
   const emitidos = [];
   for (const usuarioId of destinatarios) {
     if (previos.has(usuarioId)) continue;

@@ -11,6 +11,7 @@ const Porciones = require("../porciones");
 const { bloquearPrecios } = require("../precio-boca");
 const { MOTIVOS_BAJA } = require("../listados");
 const { exigirAdmin, esAdmin, bocasDe, autorizar } = require("./comun");
+const Conteo = require("./conteo");
 
 const MOTIVOS = MOTIVOS_BAJA.map((m) => m.valor);
 
@@ -37,6 +38,34 @@ function leerLineas(body) {
   if (!agrupadas.size) throw U.error("Agregá al menos un producto");
   if (agrupadas.size > 100) throw U.error("Podés pedir hasta 100 productos por vez");
   return [...agrupadas.entries()].map(([producto_id, cantidad]) => ({ producto_id, cantidad }));
+}
+
+// Un compuesto que sale de un insumo (p. ej. «Café» de un paquete de café en grano) no tiene
+// stock propio: se pide o se traspasa en porciones y se mueve el insumo equivalente, igual que
+// lo descuenta la caja. Los demás productos (también los pesables, en kilos) pasan tal cual.
+async function lineasFisicas(t, ctx, lineas) {
+  const porProducto = new Map();
+  const porciones = [];
+  for (const l of lineas) {
+    const receta = await Porciones.leer(t, ctx, l.producto_id);
+    let productoId = l.producto_id;
+    let cantidad = l.cantidad;
+    if (receta) {
+      const p = await N.exigir(t, ctx, "predio_producto", l.producto_id, "Uno de los productos no existe");
+      if (!Number(receta.activo)) throw U.error(`El insumo de «${p.nombre}» está dado de baja: elegí el insumo que corresponde.`);
+      productoId = Number(receta.insumo_id);
+      cantidad = Math.ceil(U.redondear(l.cantidad * 1000 / Number(receta.rendimiento), 6)) / 1000;
+      porciones.push({ producto_id: l.producto_id, producto: p.nombre, porciones: l.cantidad, insumo_id: productoId, insumo: receta.nombre, cantidad });
+    }
+    porProducto.set(productoId, U.redondear((porProducto.get(productoId) || 0) + cantidad, 3));
+  }
+  return { lineas: [...porProducto].map(([producto_id, cantidad]) => ({ producto_id, cantidad })), porciones };
+}
+
+function notaPorciones(observaciones, porciones) {
+  if (!porciones.length) return observaciones;
+  const nota = porciones.map((x) => `${x.porciones} porciones de ${x.producto} = ${x.cantidad} de ${x.insumo}`).join("; ");
+  return [observaciones, nota].filter(Boolean).join(" · ").slice(0, 255);
 }
 
 async function verificarDisponibles(t, ctx, bocaId, lineas, { mover = false } = {}) {
@@ -68,22 +97,27 @@ async function controlarSalida(t, ctx, bocaId, lineas, confirmarCompuesto) {
 async function disponible(ctx) {
   const bocaId = U.id(ctx.query.boca_id, "La boca");
   const productoId = U.id(ctx.query.producto_id, "El producto");
-  const cantidad = await N.stockActual(ctx.db, ctx, bocaId, productoId);
-  return { boca_id: bocaId, producto_id: productoId, cantidad };
+  await Conteo.exigirSinConteo(ctx.db, ctx);
+  // Un compuesto de insumo informa cuánto hay del insumo del que sale.
+  const receta = await Porciones.leer(ctx.db, ctx, productoId);
+  const cantidad = await N.stockActual(ctx.db, ctx, bocaId, receta ? Number(receta.insumo_id) : productoId);
+  return { boca_id: bocaId, producto_id: productoId, cantidad, insumo: receta ? { id: Number(receta.insumo_id), nombre: receta.nombre, rendimiento: Number(receta.rendimiento) } : undefined };
 }
 
 async function crearSolicitud(ctx) {
   const b = ctx.body;
   const origenId = U.id(b.boca_origen_id, "La boca de origen");
   const destinoId = U.id(b.boca_destino_id, "La boca de destino");
-  const lineas = leerLineas(b);
+  const pedidas = leerLineas(b);
   const bajaAutomatica = esAdmin(ctx) ? U.bool(b.baja_automatica) : 0;
-  const observaciones = U.texto(b.observaciones, { max: 255 });
+  let observaciones = U.texto(b.observaciones, { max: 255 });
   if (!esAdmin(ctx)) {
     const mias = bocasDe(ctx);
     if (!mias.includes(origenId) && !mias.includes(destinoId)) throw U.error("Sólo podés pedir para tus bocas", 403);
   }
   return ctx.db.tx(async (t) => {
+    const { lineas, porciones } = await lineasFisicas(t, ctx, pedidas);
+    observaciones = notaPorciones(observaciones, porciones);
     await validarBocas(t, ctx, origenId, destinoId);
     const faltantes = await verificarDisponibles(t, ctx, origenId, lineas);
     if (faltantes.length && !b.confirmar_sin_stock) {
@@ -107,7 +141,7 @@ async function crearSolicitud(ctx) {
     }
     await N.auditar(t, ctx, "Solicitud de productos", "solicitud", lote, {
       origen: origenId, destino: destinoId, lineas, baja_automatica: bajaAutomatica, autorizacion: autorizacion.metodo,
-      sin_stock: faltantes.length ? faltantes : undefined,
+      sin_stock: faltantes.length ? faltantes : undefined, porciones: porciones.length ? porciones : undefined,
     });
     return { ids, lote, mensaje: ids.length === 1 ? "Solicitud enviada" : `${ids.length} solicitudes enviadas` };
   });
@@ -204,11 +238,13 @@ async function traspaso(ctx) {
   const b = ctx.body;
   const origenId = U.id(b.boca_origen_id, "La boca de origen");
   const destinoId = U.id(b.boca_destino_id, "La boca de destino");
-  const lineas = leerLineas(b);
+  const pedidas = leerLineas(b);
   const bajaAutomatica = U.bool(b.baja_automatica);
-  const observaciones = U.texto(b.observaciones, { max: 255 });
+  let observaciones = U.texto(b.observaciones, { max: 255 });
   return ctx.db.tx(async (t) => {
     if (t.forUpdate) await bloquearPrecios(t, ctx);
+    const { lineas, porciones } = await lineasFisicas(t, ctx, pedidas);
+    observaciones = notaPorciones(observaciones, porciones);
     await validarBocas(t, ctx, origenId, destinoId);
     const faltantes = await controlarSalida(t, ctx, origenId, lineas, b.confirmar_fraccionado);
     const ahora = U.fechaHora();
@@ -233,7 +269,8 @@ async function traspaso(ctx) {
       await recibirInterno(t, ctx, s, { permitirCualquiera: true });
       ids.push(id);
     }
-    await N.auditar(t, ctx, "Traspaso directo entre bocas", "solicitud", lote, { origen: origenId, destino: destinoId, lineas, baja_automatica: bajaAutomatica, sin_stock: faltantes.length ? faltantes : undefined });
+    await N.auditar(t, ctx, "Traspaso directo entre bocas", "solicitud", lote, { origen: origenId, destino: destinoId, lineas, baja_automatica: bajaAutomatica,
+      sin_stock: faltantes.length ? faltantes : undefined, porciones: porciones.length ? porciones : undefined });
     return { ids, lote, mensaje: `Traspaso registrado (${ids.length} producto${ids.length === 1 ? "" : "s"})` };
   });
 }
@@ -307,8 +344,9 @@ async function detalleSolicitud(ctx) {
   if (!esAdmin(ctx) && !bocasDe(ctx).includes(Number(s.boca_origen_id)) && !bocasDe(ctx).includes(Number(s.boca_destino_id))) {
     throw U.error("No tenés acceso a esta solicitud", 403);
   }
-  const stockOrigen = await N.stockActual(ctx.db, ctx, s.boca_origen_id, s.producto_id);
-  return { solicitud: s, stock_origen: stockOrigen };
+  const oculto = !!(await Conteo.conteoEnCurso(ctx.db, ctx));
+  const stockOrigen = oculto ? null : await N.stockActual(ctx.db, ctx, s.boca_origen_id, s.producto_id);
+  return { solicitud: s, stock_origen: stockOrigen, stock_oculto: oculto || undefined };
 }
 
 module.exports = {

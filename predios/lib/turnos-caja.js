@@ -26,6 +26,7 @@ async function liberarTurnoVacio(t, ctx, turno) {
   const movimiento = venta ? null : await t.get("SELECT id FROM predio_caja_movimiento WHERE predio_id=? AND turno_id=? LIMIT 1", [ctx.pid, turno.id]);
   if (venta || movimiento) return false;
   const fin = U.fechaHora();
+  await require("./api/conteo").anularPendientes(t, ctx, { turnoId: turno.id });
   await t.run("UPDATE predio_turno SET fin=?, estado='CERRADO' WHERE predio_id=? AND id=? AND estado='ABIERTO'", [fin, ctx.pid, turno.id]);
   if (t.dialecto === "sqlite") await t.run("UPDATE predio_sesion SET boca_id=NULL, caja_id=NULL, turno_id=NULL WHERE turno_id=?", [turno.id]);
   await N.auditar(t, ctx, "Turno sin movimientos liberado", "caja", turno.caja_id, { turno_id: turno.id, inicio: turno.inicio, fin });

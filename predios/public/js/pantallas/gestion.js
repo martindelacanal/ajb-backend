@@ -87,17 +87,61 @@
   };
   function seleccionEliminar(clave) {
     var cfg = ELIMINABLES[clave];
-    return {
-      singular: cfg.singular, plural: cfg.plural,
-      acciones: [{ texto: "Eliminar", icono: "borrar", tipo: "peligro", accion: function (eleccion, despues) {
-        P.eliminarRegistros(clave, eleccion, function () { despues(); });
-      } }],
-    };
+    var acciones = [{ texto: "Eliminar", icono: "borrar", tipo: "peligro", accion: function (eleccion, despues) {
+      P.eliminarRegistros(clave, eleccion, function () { despues(); });
+    } }];
+    if (clave === "productos") acciones.unshift({ texto: "Vender por kilo", icono: "stock", tipo: "suave", accion: function (eleccion, despues) {
+      P.venderPorKilo(eleccion, function () { despues(); });
+    } });
+    return { singular: cfg.singular, plural: cfg.plural, acciones: acciones };
   }
+
+  // Pasa los elegidos a venta por peso. Los productos de balanza del sistema anterior tienen el
+  // precio por GRAMO (jamón cocido $22): con esa opción se multiplica por 1.000 y el stock se pasa a kilos.
+  P.venderPorKilo = function (eleccion, alTerminar) {
+    var cuerpoBase = eleccion.ids ? { ids: eleccion.ids } : { consulta: eleccion.consulta };
+    var precioPor = P.segmentado([{ valor: "GRAMO", texto: "Está por gramo (sistema anterior)" }, { valor: "KILO", texto: "Ya está por kilo" }], "GRAMO", function () { previa(); });
+    var detalle = h("div.columna", P.cargando());
+    var boton = P.btn("Pasar a venta por kilo", { tipo: "primario", icono: "check", deshabilitado: true, onclick: function (ev) {
+      P.ejecutar(ev.currentTarget, function () {
+        return P.post("/productos/peso", Object.assign({ precio_por: precioPor.valor() }, cuerpoBase)).then(function (r) {
+          if (!r.encolado) P.aviso(r.mensaje, "ok");
+          P.olvidarOpciones();
+          m.cerrar();
+          if (alTerminar) alTerminar(r);
+        });
+      }).catch(function () {});
+    } });
+    function previa() {
+      P.reemplazar(detalle, P.cargando());
+      boton.disabled = true;
+      return P.post("/productos/peso/previa", Object.assign({ precio_por: precioPor.valor() }, cuerpoBase)).then(function (pr) {
+        var porGramo = pr.precio_por === "GRAMO";
+        P.reemplazar(detalle,
+          h("p", { style: { margin: 0 } }, pr.cambian ? P.f.entero(pr.cambian) + (pr.cambian === 1 ? " producto pasa" : " productos pasan") + " a venderse por kilo" + (pr.sin_cambios ? " (" + P.f.entero(pr.sin_cambios) + " ya estaban por kilo o son alquileres)." : ".") : "Ninguno cambia: ya estaban por kilo o son alquileres."),
+          pr.muestra.length ? h("div.tabla-desplazable", h("table.tabla",
+            h("thead", h("tr", h("th", "Producto"), h("th.der", "Venta ahora"), h("th.der", porGramo ? "Venta por kilo" : "Queda"))),
+            h("tbody", pr.muestra.map(function (x) {
+              return h("tr", h("td", h("strong", x.nombre), h("div.texto-3.chico", x.codigo || "")), h("td.der.dinero", P.f.pesos(x.precio_venta)), h("td.der.dinero.fuerte", P.f.pesos(x.precio_venta_nuevo) + "/kg"));
+            }).concat(pr.cambian > pr.muestra.length ? [h("tr", h("td.texto-3", { colspan: 3 }, "y " + P.f.entero(pr.cambian - pr.muestra.length) + " más"))] : [])))) : null,
+          porGramo ? P.mensaje("Se multiplican por 1.000 el precio de compra y el de venta. El stock y el stock mínimo, que estaban en gramos, pasan a kilos" + (pr.existencias_a_convertir ? " (" + P.f.entero(pr.existencias_a_convertir) + " existencias en bocas, queda en Movimientos como «Paso a kilos»)" : "") + ".", "aviso")
+            : P.mensaje("Sólo cambia la unidad: los precios y el stock quedan como están.", "info"));
+        boton.disabled = !pr.cambian;
+      }).catch(function (e) { P.reemplazar(detalle, P.mensaje(e.message, "error")); });
+    }
+    var m = P.modal({
+      titulo: "Vender por kilo",
+      subtitulo: "En la caja se escanea la etiqueta de la balanza o se escribe el peso, y el precio sale por kilo.",
+      ancho: "ancha",
+      contenido: h("div.columna", P.campo("¿Cómo está cargado el precio hoy?", precioPor), detalle),
+      acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), boton],
+    });
+    previa();
+  };
 
   // ------------------------------------------------------------------ productos
   P.cantidadPorBoca = function (cantidad, fila) {
-    var fisico = h("strong.numero" + (Number(cantidad) < 0 ? ".negativo" : ""), P.f.numero(cantidad));
+    var fisico = h("strong.numero" + (Number(cantidad) < 0 ? ".negativo" : ""), P.f.cantidad(cantidad, fila.unidad));
     if (fila.porciones_disponibles == null) return fisico;
     var porciones = Number(fila.porciones_disponibles);
     return h("div.der", h("div", fisico, " en stock físico"),
@@ -146,6 +190,26 @@
       var ayudaVenta = h("span", "Redondeado hacia arriba a $100.");
       var precioIntervenido = false;
       var destino = P.select(DESTINOS, p.destino || "VENTA_DIRECTA");
+      // Se vende por unidad o por peso (kilos). En los pesables el número de la balanza (PLU)
+      // arma el código que trae la etiqueta: PLU 14 → 2000140.
+      var unidad = P.segmentado([{ valor: "U", texto: "Por unidad" }, { valor: "KG", texto: "Por peso (kg)" }], p.unidad === "KG" ? "KG" : "U", function () { configurarUnidad(); });
+      var plu = P.input({ inputmode: "numeric", max: 6, valor: P.balanza.pluDeCodigo(p.codigo) || "", placeholder: "Ej.: 14" });
+      var ayudaPlu = h("span.campo-ayuda");
+      var zonaPlu = P.campo("Número en la balanza (PLU)", h("div", plu, ayudaPlu));
+      var sufijosPorKilo = [h("span.campo-sufijo", "por kg"), h("span.campo-sufijo", "por kg")];
+      function configurarUnidad() {
+        var kg = unidad.valor() === "KG";
+        zonaPlu.hidden = !kg;
+        sufijosPorKilo.forEach(function (x) { x.hidden = !kg; });
+        if (cantidad) cantidad.placeholder = kg ? "En kilos, ej.: 4,5" : "0";
+        if (minimo) minimo.placeholder = kg ? "En kilos (opcional)" : "Opcional";
+      }
+      plu.addEventListener("input", function () {
+        var cod = P.balanza.codigoDePlu(plu.value);
+        if (cod) codigo.value = cod;
+        ayudaPlu.textContent = cod ? "Código del producto: " + cod + ". La etiqueta empieza así y sigue con los gramos." : "El número con el que está cargado en la balanza.";
+      });
+      ayudaPlu.textContent = P.balanza.pluDeCodigo(p.codigo) ? "Código del producto: " + p.codigo + "." : "El número con el que está cargado en la balanza.";
       var ayudaDestino = h("span.campo-ayuda", AYUDA_DESTINO[destino.value]);
       var zonaReceta = h("div.columna"), insumo, rendimiento;
       var recetaInicial = p.receta;
@@ -235,17 +299,19 @@
 
       var formulario = h("div.columna",
         h("div.grilla.grilla-2", P.campo("Nombre", nombre, { requerido: true }), P.campo("Código de barras o interno (opcional)", codigo)),
+        h("div.grilla.grilla-2", P.campo("Se vende", unidad, { ayuda: "Por peso: stock, compras y traspasos en kilos; en la caja se escanea la etiqueta de la balanza o se escribe el peso." }), zonaPlu),
         h("div.grilla.grilla-2", P.campo("Destino del producto", h("div", destino, ayudaDestino)),
           P.campo(editar ? "Cantidad en proveeduría (ajuste)" : "Cantidad en proveeduría", cantidad, { ayuda: editar ? "Si la cambiás, queda registrado como ajuste manual." : "Stock inicial en la boca que recibe las compras." })),
         zonaReceta,
         h("div.grilla.grilla-2",
-          P.campo("Precio de compra", h("div.campo-con-prefijo", h("span", "$"), compra)),
+          P.campo("Precio de compra", h("div.campo-con-prefijo", h("span", "$"), sufijosPorKilo[0], compra)),
           P.campo("Margen de utilidad (%)", margen)),
         h("div.grilla.grilla-2.producto-venta", manual,
-          P.campo("Precio de venta", h("div.campo-con-prefijo", h("span", "$"), venta), { ayuda: ayudaVenta })),
+          P.campo("Precio de venta", h("div.campo-con-prefijo", h("span", "$"), sufijosPorKilo[1], venta), { ayuda: ayudaVenta })),
         filaCaducidad, zonaAviso,
-        P.campo("Stock mínimo para avisos", minimo, { ayuda: "Avisa al personal de la boca y a administración cuando el stock queda por debajo de esta cantidad. Con 0, no se generan avisos de stock mínimo." }),
+        P.campo("Stock mínimo para avisos", minimo, { ayuda: "Avisa a Supervisión de la boca y a Administración cuando el stock queda por debajo de esta cantidad (los cajeros no reciben el aviso). Con 0, no se generan avisos de stock mínimo." }),
         editar ? activo : null);
+      configurarUnidad();
 
       var panelBocas = h("div.columna",
         h("span.texto-3", "Ingresá el margen especial (%) de este producto para cada boca. Si lo dejás vacío, se usa el margen de la boca o el precio general del producto."),
@@ -262,7 +328,7 @@
       if (detalle) {
         var stockLista = h("ul.lista-simple.stock-del-producto", detalle.stock.map(function (s) {
           return h("li", h("span", s.boca + (Number(s.activo) === 0 ? " (inactiva)" : "")),
-            P.cantidadPorBoca(s.cantidad, s));
+            P.cantidadPorBoca(s.cantidad, Object.assign({ unidad: p.unidad }, s)));
         }));
         var precios = h("ul.lista-simple", detalle.precios.map(function (x) {
           var actor = /sistema (anterior|actual)/i.test(x.usuario_nombre || "") ? "" : x.usuario_nombre;
@@ -309,6 +375,8 @@
             stock_minimo: P.numeroDe(minimo.value) || 0, cantidad_almacen: P.numeroDe(cantidad.value) || 0,
             precio_venta_manual: manual.input.checked ? P.precioDeVenta(manualIngresado) : null,
           };
+          // La unidad viaja sólo si cambió: así una edición común no espera a una notebook sin actualizar.
+          if (!editar || unidad.valor() !== (p.unidad === "KG" ? "KG" : "U")) cuerpo.unidad = unidad.valor() === "KG" ? "KG" : null;
           if (destino.value === "VENTA_COMPUESTA") {
             if (insumo.input.value.trim() && !insumo.valor()) { mostrarPanel("datos"); insumo.foco(); P.aviso("Elegí el insumo de la lista", "error"); return; }
             var elegido = insumo.valor(), rinde = Number(rendimiento.value);
@@ -383,6 +451,7 @@
           { texto: "Movimientos de stock", icono: "historial", accion: function () { P.ruta.ir("/gestion/movimientos"); } },
           { texto: "Altas registradas", icono: "mas", accion: function () { P.ruta.ir("/gestion/altas"); } },
           { texto: "Bajas registradas", icono: "baja", accion: function () { P.ruta.ir("/gestion/bajas"); } },
+          { texto: "Conteos de stock", icono: "lista", accion: function () { P.ruta.ir("/gestion/conteos"); } },
         ]);
       } })),
       P.esAdmin() ? h("div.gestion-accion-nueva", P.btn("Nuevo producto", { tipo: "primario", icono: "mas", onclick: function () { abrirProducto({}); } })) : null));
