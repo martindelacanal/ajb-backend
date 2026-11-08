@@ -16,14 +16,14 @@ function secreto(jwtSecret = process.env.JWT_SECRET) { if (!jwtSecret) throw new
 function huella(valor, uso, jwtSecret) { return crypto.createHmac("sha256", secreto(jwtSecret)).update(`${uso}\0${valor}`).digest("hex"); }
 function igual(a, b) { return typeof a === "string" && typeof b === "string" && a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); }
 function versionCuenta(c, jwtSecret) { return huella(JSON.stringify([Number(c.predio_id), Number(c.id), c.password_hash, Number(c.activo), c.rol, String(c.revision_cuenta || 0)]), "password-version", jwtSecret); }
-function habilitada(c) { return !!c && Number(c.predio_activo) === 1 && Number(c.activo) === 1 && ["ADMIN", "SEGURIDAD"].includes(c.rol) && Number(c.es_admin_general) === 0 && c.es_admin_general != null && HASH_PATTERN.test(c.password_hash || ""); }
+function habilitada(c) { return !!c && Number(c.predio_activo) === 1 && Number(c.activo) === 1 && ["ADMIN", "SUPERVISOR", "SEGURIDAD"].includes(c.rol) && Number(c.es_admin_general) === 0 && c.es_admin_general != null && HASH_PATTERN.test(c.password_hash || ""); }
 function identidad(sub) {
   const m = /^([1-9]\d{0,9}):([1-9]\d{0,9})$/.exec(String(sub || ""));
   if (!m) throw invalida(); const predioId = Number(m[1]), usuarioId = Number(m[2]);
   if (predioId > 2147483647 || usuarioId > 2147483647) throw invalida();
   return { predioId, usuarioId };
 }
-function datosPublicos(c) { return { id: Number(c.id), rol: c.rol === "SEGURIDAD" ? "predio_seguridad" : "predio_admin", usuario: c.usuario, nombre: c.nombre, apellido: "", predio_id: Number(c.predio_id), predio_codigo: c.predio_codigo, predio_nombre: c.predio_nombre, debe_cambiar_clave: !!Number(c.debe_cambiar_clave), acceso_predio: true, habilitado: "S", area_turismo: 0, area_coseguro: 0, modulo_turismo: 0, modulo_coseguro: 0, modulo_olimpiadas: 0 }; }
+function datosPublicos(c) { return { id: Number(c.id), rol: "predio_" + c.rol.toLowerCase(), usuario: c.usuario, nombre: c.nombre, apellido: "", predio_id: Number(c.predio_id), predio_codigo: c.predio_codigo, predio_nombre: c.predio_nombre, debe_cambiar_clave: !!Number(c.debe_cambiar_clave), acceso_predio: true, habilitado: "S", area_turismo: 0, area_coseguro: 0, modulo_turismo: 0, modulo_coseguro: 0, modulo_olimpiadas: 0 }; }
 function crearToken(c, sid, recordar, jwtSecret) { return jwt.sign({ tipo: TIPO, sid, pv: versionCuenta(c, jwtSecret), data: JSON.stringify(datosPublicos(c)) }, secreto(jwtSecret), { algorithm: "HS256", audience: AUDIENCIA, issuer: EMISOR, subject: `${c.predio_id}:${c.id}`, expiresIn: recordar ? "15m" : "8h" }); }
 function verificarToken(token, jwtSecret, ignorarVencimiento = false) {
   let p;
@@ -65,7 +65,7 @@ async function ingresarPredio({ db, identificador, password, recordar = false, p
   const [rows] = await db.query(`SELECT DISTINCT u.id, u.predio_id, u.usuario, u.nombre, u.rol, u.activo, u.es_admin_general, u.password_hash,
     p.codigo AS predio_codigo, p.nombre AS predio_nombre, p.activo AS predio_activo, COUNT(*) OVER () AS coincidencias
     FROM predio_usuario u JOIN predio p ON p.id=u.predio_id
-    WHERE p.activo=1 AND u.activo=1 AND u.rol IN ('ADMIN','SEGURIDAD') AND u.es_admin_general=0
+    WHERE p.activo=1 AND u.activo=1 AND u.rol IN ('ADMIN','SUPERVISOR','SEGURIDAD') AND u.es_admin_general=0
       AND (LOWER(TRIM(u.usuario))=? OR (?<>'' AND REPLACE(REPLACE(REPLACE(TRIM(u.documento),'.',''),'-',''),' ','')=?))
       ${predioCodigo ? "AND p.codigo=?" : ""} ORDER BY p.id, u.id LIMIT 20`, [nombre, documento, documento, ...(predioCodigo ? [predioCodigo.toUpperCase()] : [])]);
   if (!rows.length || Number(rows[0].coincidencias || rows.length) > 20) { comprobarDummy(password); throw fallo(); }

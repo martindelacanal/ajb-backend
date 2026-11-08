@@ -117,7 +117,7 @@
     function abrirAfiliado() { return formAfiliado({}, function () { t.recargar(); }); }
     var t = P.tabla({
       listado: "afiliados", placeholderBuscar: "Nombre, DNI, legajo o departamental",
-      alClickFila: function (f) { P.ruta.ir("/afiliados/" + f.id); },
+      alClickFila: P.esAdmin() ? function (f) { P.ruta.ir("/afiliados/" + f.id); } : null,
       celdas: {
         en_predio: function (v) { return Number(v) ? P.chip("En el predio", "CONFIRMADA") : ""; },
         disponible: function (v) { return h("span.dinero.fuerte" + (Number(v) <= 0 ? ".negativo" : ""), P.f.pesos(v)); },
@@ -125,15 +125,15 @@
       },
       tituloVacio: "No hay afiliados con estos filtros", textoVacio: "Los afiliados con reserva en el camping o en las cabañas llegan solos del sistema general.",
     });
-    c.appendChild(h("div.gestion-acciones",
+    if (P.esAdmin()) c.appendChild(h("div.gestion-acciones",
       h("div.gestion-acciones-grupo",
       P.btn("Modificar límites", { tipo: "suave", chico: true, icono: "descuento", onclick: function () { limitesMasivos(function () { t.recargar(); }); } }),
       P.btn("Liquidaciones y deudas", { tipo: "suave", chico: true, icono: "planilla", onclick: function () { P.ruta.ir("/gestion/liquidaciones"); } }),
       P.btn("Historial de límites", { tipo: "suave", chico: true, icono: "historial", onclick: function () { P.ruta.ir("/gestion/limites"); } })),
       h("div.gestion-accion-nueva", P.btn("Nuevo afiliado", { tipo: "primario", icono: "mas", onclick: abrirAfiliado }))));
     c.appendChild(t.el);
-    P.continuidad.registrarVentana("afiliado-formulario", abrirAfiliado);
-  }, { admin: true, titulo: "Afiliados" });
+    if (P.esAdmin()) P.continuidad.registrarVentana("afiliado-formulario", abrirAfiliado);
+  }, { cajas: true, titulo: "Afiliados" });
 
   P.ruta.registrar(/^\/gestion\/limites$/, function (c) {
     c.appendChild(h("div.pagina-cabecera", h("div", h("a.volver", { href: "#/gestion/afiliados" }, P.icono("volver"), "Afiliados"), h("h1.titulo-pagina", "Historial de límites"))));

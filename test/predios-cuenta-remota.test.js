@@ -92,6 +92,31 @@ test("Seguridad inicia sesión con alcance de predio y no puede ejecutar ni enco
   }
 });
 
+test("Supervisión remota conserva su rol y las órdenes esperan un agente compatible", async t => {
+  const s = await escenario(t);
+  await s.db.run("UPDATE predio_usuario SET rol='SUPERVISOR', gestionar_reservas=1, puede_anular_ticket=1 WHERE predio_id=1 AND id=7");
+  await s.db.run("INSERT INTO predio_usuario_boca(predio_id,id,usuario_id,boca_id) VALUES(1,1,7,1)");
+  const { token, data } = await ingresar(s);
+  assert.equal(data.rol, "predio_supervisor");
+  const prefijo = "/app/MIRAMAR/api/";
+  const sesion = await (await pedir(s, token, prefijo + "sesion")).json();
+  assert.equal(sesion.usuario.rol, "SUPERVISOR");
+  assert.equal(sesion.usuario.gestionar_reservas, true);
+  assert.equal(sesion.usuario.puede_anular_ticket, true);
+  assert.deepEqual(sesion.usuario.bocas, [1]);
+  assert.equal((await pedir(s, token, "/app/PARADOR/api/sesion")).status, 403);
+  for (const ruta of ["usuarios", "contable/comprobantes/1/anular", "recepcion/catalogo/guardar"]) {
+    assert.equal((await pedir(s, token, prefijo + ruta, {})).status, 403, ruta);
+  }
+  await s.db.run("UPDATE predio_usuario SET gestionar_reservas=0 WHERE predio_id=1 AND id=7");
+  assert.equal((await pedir(s, token, prefijo + "recepcion/guardar", {})).status, 403);
+  assert.equal((await s.db.get("SELECT COUNT(*) n FROM predio_comando")).n, 0);
+  const cambio = await pedir(s, token, prefijo + "sesion/clave", { actual: "clave-fixture", nueva: "Supervisor-z9" });
+  assert.equal(cambio.status, 202, await cambio.text());
+  const orden = await s.db.get("SELECT actor FROM predio_comando WHERE ruta='/sesion/clave'");
+  assert.equal(JSON.parse(orden.actor).capacidad, "supervisor-predio-v1");
+});
+
 test("la clave temporal remota sólo habilita su cambio, directo o por orden sin secretos en claro", async t => {
   for (const escritor of ["CENTRAL", "LOCAL"]) {
     const s = await escenario(t, { escritor });

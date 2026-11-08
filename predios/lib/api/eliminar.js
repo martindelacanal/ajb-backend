@@ -90,7 +90,7 @@ async function elegidos(t, ctx, clave) {
     const def = LISTADOS[clave];
     const { sql, valores, nombres } = construirWhere(def, ctx, consulta, t);
     const valoresFrom = [];
-    const from = traducir(def.from, valoresFrom, nombres);
+    const from = traducir(typeof def.from === "function" ? def.from(consulta, ctx) : def.from, valoresFrom, nombres);
     const filas = await t.all(
       `SELECT ${columnas} FROM ${from} WHERE ${sql} ORDER BY ${ent.alias}.${ent.campoNombre} LIMIT ${MAXIMO + 1}`,
       [...valoresFrom, ...valores]);

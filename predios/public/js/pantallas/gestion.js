@@ -29,7 +29,7 @@
     })));
   };
 
-  P.ruta.registrar(/^\/gestion$/, function () { P.ruta.ir("/gestion/productos"); }, { admin: true });
+  P.ruta.registrar(/^\/gestion$/, function () { P.ruta.ir("/gestion/productos"); }, { cajas: true });
 
   // ------------------------------------------------------------------ eliminar
   // eleccion = { ids: [...] } o { consulta: parametros de la tabla } (todos los que coinciden).
@@ -357,9 +357,9 @@
     }
     var tabla = P.tabla({
       listado: "productos",
-      alClickFila: function (f) { abrirProducto({ id: f.id }); },
+      alClickFila: P.esAdmin() ? function (f) { abrirProducto({ id: f.id }); } : null,
       placeholderBuscar: "Nombre o código",
-      seleccion: seleccionEliminar("productos"),
+      seleccion: P.esAdmin() ? seleccionEliminar("productos") : null,
       celdas: {
         stock: function (v, f) { return h("span.numero" + (Number(v) < 0 ? ".negativo" : ""), P.f.numero(v)); },
         revision_precio: function (v) { return /^Revisar/.test(v || "") ? P.chip(v, "PENDIENTE") : (v || ""); },
@@ -374,9 +374,9 @@
     c.appendChild(h("div.gestion-acciones",
       h("div.gestion-acciones-grupo",
       P.btn("Administrar solicitudes", { tipo: "suave", chico: true, icono: "solicitud", onclick: function () { P.ruta.ir("/gestion/solicitudes"); } }),
-      P.btn("Traspasos entre bocas", { tipo: "suave", chico: true, icono: "traspaso", onclick: function () { P.formSolicitud("traspaso", function () { tabla.recargar(); }); } }),
-      P.btn("Sumar stock", { tipo: "suave", chico: true, icono: "mas", onclick: function () { P.formAjusteStock(true, function () { tabla.recargar(); }); } }),
-      P.btn("Bajar stock", { tipo: "suave", chico: true, icono: "baja", onclick: function () { P.formAjusteStock(false, function () { tabla.recargar(); }); } }),
+      P.esAdmin() ? P.btn("Traspasos entre bocas", { tipo: "suave", chico: true, icono: "traspaso", onclick: function () { P.formSolicitud("traspaso", function () { tabla.recargar(); }); } }) : null,
+      P.esAdmin() ? P.btn("Sumar stock", { tipo: "suave", chico: true, icono: "mas", onclick: function () { P.formAjusteStock(true, function () { tabla.recargar(); }); } }) : null,
+      P.esAdmin() ? P.btn("Bajar stock", { tipo: "suave", chico: true, icono: "baja", onclick: function () { P.formAjusteStock(false, function () { tabla.recargar(); }); } }) : null,
       P.btn("Más", { tipo: "suave", chico: true, icono: "lista", onclick: function (ev) {
         P.menuFlotante(ev.currentTarget, [
           { texto: "Stock por boca", icono: "stock", accion: function () { P.ruta.ir("/gestion/stock"); } },
@@ -385,10 +385,10 @@
           { texto: "Bajas registradas", icono: "baja", accion: function () { P.ruta.ir("/gestion/bajas"); } },
         ]);
       } })),
-      h("div.gestion-accion-nueva", P.btn("Nuevo producto", { tipo: "primario", icono: "mas", onclick: function () { abrirProducto({}); } }))));
+      P.esAdmin() ? h("div.gestion-accion-nueva", P.btn("Nuevo producto", { tipo: "primario", icono: "mas", onclick: function () { abrirProducto({}); } })) : null));
     c.appendChild(tabla.el);
-    P.continuidad.registrarVentana("gestion-producto", abrirProducto);
-  }, { admin: true, titulo: "Productos y stock" });
+    if (P.esAdmin()) P.continuidad.registrarVentana("gestion-producto", abrirProducto);
+  }, { cajas: true, titulo: "Productos y stock" });
 
   function subpagina(c, titulo, subtitulo, acciones) {
     c.appendChild(h("div.pagina-cabecera", h("div",
@@ -398,29 +398,30 @@
 
   P.ruta.registrar(/^\/gestion\/solicitudes$/, function (c) {
     var v = null;
-    subpagina(c, "Solicitudes", "Todas las solicitudes entre bocas. Como administrador podés despachar y recibir cualquiera.", [
-      P.btn("Traspaso directo", { tipo: "primario", icono: "traspaso", onclick: function () { P.formSolicitud("traspaso", function () { v.recargar(); }); } }),
+    subpagina(c, "Solicitudes", P.esAdmin() ? "Todas las solicitudes entre bocas. Como administrador podés despachar y recibir cualquiera." :
+      "Solicitudes de las bocas que atendés.", [
+      P.esAdmin() ? P.btn("Traspaso directo", { tipo: "primario", icono: "traspaso", onclick: function () { P.formSolicitud("traspaso", function () { v.recargar(); }); } }) : null,
       P.btn("Nueva solicitud", { tipo: "secundario", icono: "mas", onclick: function () { P.formSolicitud("pedido", function () { v.recargar(); }); } }),
     ]);
-    v = P.vistaSolicitudes(c, { admin: true });
-  }, { admin: true, titulo: "Solicitudes" });
+    v = P.vistaSolicitudes(c, { admin: P.esAdmin() });
+  }, { cajas: true, titulo: "Solicitudes" });
 
   P.ruta.registrar(/^\/gestion\/stock$/, function (c) {
     subpagina(c, "Stock por boca", "Cuánto hay de cada producto en cada boca, según los movimientos.");
     c.appendChild(P.tabla({ listado: "stock", celdas: { cantidad: P.cantidadPorBoca } }).el);
-  }, { admin: true, titulo: "Stock por boca" });
+  }, { cajas: true, titulo: "Stock por boca" });
 
   P.ruta.registrar(/^\/gestion\/movimientos$/, function (c) {
     subpagina(c, "Movimientos de stock", "Compras, ventas, traspasos, bajas y ajustes. Filtrá por el almacén para ver sus movimientos.");
     c.appendChild(P.tabla({ listado: "movimientos" }).el);
-  }, { admin: true, titulo: "Movimientos" });
+  }, { cajas: true, titulo: "Movimientos" });
 
   function historialAjusteStock(c, alta, subtitulo) {
     var tabla = P.tabla({ listado: alta ? "altas" : "bajas" });
-    var boton = P.btn(alta ? "Sumar stock" : "Bajar stock", {
+    var boton = P.esAdmin() ? P.btn(alta ? "Sumar stock" : "Bajar stock", {
       tipo: "primario", icono: alta ? "mas" : "baja",
       onclick: function () { P.formAjusteStock(alta, function () { tabla.recargar(); }); },
-    });
+    }) : null;
     var cabecera = P.cabeceraConAcciones(alta ? "Altas de stock" : "Bajas de stock", subtitulo, boton);
     cabecera.insertBefore(h("a.volver", { href: "#/gestion/productos" }, P.icono("volver"), "Productos y stock general"), cabecera.firstChild);
     c.appendChild(cabecera);
@@ -429,11 +430,11 @@
 
   P.ruta.registrar(/^\/gestion\/altas$/, function (c) {
     historialAjusteStock(c, true, "Ingresos registrados con «Sumar stock» por donación, diferencia de recuento u otro motivo.");
-  }, { admin: true, titulo: "Altas" });
+  }, { cajas: true, titulo: "Altas" });
 
   P.ruta.registrar(/^\/gestion\/bajas$/, function (c) {
     historialAjusteStock(c, false, "Productos rotos, vencidos o usados como materia prima o insumo.");
-  }, { admin: true, titulo: "Bajas" });
+  }, { cajas: true, titulo: "Bajas" });
 
   // ------------------------------------------------------------------ proveedores
   P.formProveedor = function (base, alGuardar, alEliminar, reanudar) {
@@ -481,15 +482,15 @@
     }
     var t = P.tabla({
       listado: "proveedores",
-      alClickFila: function (f) { abrirProveedor({ id: f.id }); },
-      seleccion: seleccionEliminar("proveedores"),
+      alClickFila: P.esAdmin() ? function (f) { abrirProveedor({ id: f.id }); } : null,
+      seleccion: P.esAdmin() ? seleccionEliminar("proveedores") : null,
     });
     c.appendChild(h("div.gestion-acciones",
       h("div.gestion-acciones-grupo", P.btn("Compras por proveedor", { tipo: "suave", chico: true, icono: "estadisticas", onclick: function () { P.cache["compras:vista"] = "compras"; P.ruta.ir("/compras"); } })),
-      h("div.gestion-accion-nueva", P.btn("Nuevo proveedor", { tipo: "primario", icono: "mas", onclick: function () { abrirProveedor({}); } }))));
+      P.esAdmin() ? h("div.gestion-accion-nueva", P.btn("Nuevo proveedor", { tipo: "primario", icono: "mas", onclick: function () { abrirProveedor({}); } })) : null));
     c.appendChild(t.el);
-    P.continuidad.registrarVentana("gestion-proveedor", abrirProveedor);
-  }, { admin: true, titulo: "Proveedores" });
+    if (P.esAdmin()) P.continuidad.registrarVentana("gestion-proveedor", abrirProveedor);
+  }, { cajas: true, titulo: "Proveedores" });
 
   // ------------------------------------------------------------------ bocas y cajas
   function formBoca(base, alGuardar) {
@@ -562,22 +563,24 @@
     var tBocas = P.tabla({
       listado: "bocas",
       celdas: { margen_venta: function (valor) { return valor == null ? "General" : P.f.pct(valor); } },
-      alClickFila: function (f) { abrirBoca({ id: f.id }); },
+      alClickFila: P.esAdmin() ? function (f) { abrirBoca({ id: f.id }); } : null,
     });
     var tCajas = P.tabla({
       listado: "cajas",
-      alClickFila: function (f) { abrirCaja({ id: f.id }); },
+      alClickFila: function (f) { if (P.esAdmin()) abrirCaja({ id: f.id }); else P.ruta.ir("/caja/" + f.id); },
     });
     c.appendChild(h("div.fila-separada", { style: { marginBottom: "12px" } }, h("h2.seccion-titulo", "Bocas de expendio"),
-      P.btn("Nueva boca", { tipo: "primario", icono: "mas", onclick: function () { abrirBoca({}); } })));
+      P.esAdmin() ? P.btn("Nueva boca", { tipo: "primario", icono: "mas", onclick: function () { abrirBoca({}); } }) : null));
     c.appendChild(tBocas.el);
     c.appendChild(h("div.fila-separada", { style: { margin: "26px 0 12px" } }, h("h2.seccion-titulo", "Cajas"),
-      P.btn("Nueva caja", { tipo: "primario", icono: "mas", onclick: function () { abrirCaja({}); } })));
+      P.esAdmin() ? P.btn("Nueva caja", { tipo: "primario", icono: "mas", onclick: function () { abrirCaja({}); } }) : null));
     c.appendChild(h("p.texto-3", { style: { marginTop: "-6px" } }, "Cada boca puede tener varias cajas. Al ingresar, el usuario elige en qué caja trabaja."));
     c.appendChild(tCajas.el);
-    P.continuidad.registrarVentana("gestion-boca", abrirBoca);
-    P.continuidad.registrarVentana("gestion-caja", abrirCaja);
-  }, { admin: true, titulo: "Bocas y cajas" });
+    if (P.esAdmin()) {
+      P.continuidad.registrarVentana("gestion-boca", abrirBoca);
+      P.continuidad.registrarVentana("gestion-caja", abrirCaja);
+    }
+  }, { cajas: true, titulo: "Bocas y cajas" });
 
   // ------------------------------------------------------------------ usuarios
   function formUsuario(base, alGuardar) {
@@ -593,24 +596,37 @@
       }
       var usuario = P.input({ valor: u.usuario, max: 60, placeholder: "Ej.: maria.comedor" });
       var nombre = P.input({ valor: u.nombre, max: 120 });
+      var supervisorInicializado = u.rol === "SUPERVISOR";
       var rol = P.segmentado([
         { valor: "CAJERO", texto: "Usuario de boca" },
+        { valor: "SUPERVISOR", texto: "Supervisor" },
         { valor: "ADMIN", texto: "Administrador" },
         { valor: "SEGURIDAD", texto: "Seguridad" }
-      ], u.rol || "CAJERO", function (v) { zonaBocas.hidden = permisos.hidden = v !== "CAJERO"; });
+      ], u.rol || "CAJERO", mostrarPermisos);
       var clave = P.inputClave({ placeholder: editar ? "Dejala vacía para no cambiarla" : "Al menos 6 caracteres", autocomplete: "new-password" });
       var recepcion = P.check("Gestionar reservas, ingresos, salidas y saldos", !!Number(u.gestionar_reservas));
       var anulacion = P.check("Anular tickets", !!Number(u.puede_anular_ticket));
-      var permisos = P.campo("Permisos del usuario", h("div.columna", recepcion, anulacion), { ayuda: "Al terminar su turno hace un cierre temporal; el cierre definitivo lo hace siempre un administrador." });
+      var ayudaCierre = h("p.texto-3.chico");
+      var permisos = P.campo("Permisos del usuario", h("div.columna", recepcion, anulacion, ayudaCierre));
       var checks = bocas.map(function (b) { var ch = P.check(b.texto, asignadas.indexOf(b.valor) >= 0); ch.valor = b.valor; return ch; });
       var zonaBocas = P.campo("Bocas que atiende", h("div.grilla.grilla-2", { style: { gap: "8px" } }, checks), { ayuda: "Al ingresar va directo a su boca. Si tiene varias, elige." });
-      zonaBocas.hidden = permisos.hidden = (u.rol || "CAJERO") !== "CAJERO";
+      function mostrarPermisos(v) {
+        var supervisor = v === "SUPERVISOR";
+        zonaBocas.hidden = permisos.hidden = v !== "CAJERO" && !supervisor;
+        ayudaCierre.textContent = supervisor ? "Puede operar y cerrar definitivamente las cajas de sus bocas." :
+          "Al terminar su turno hace un cierre temporal. Un administrador o supervisor lo confirma.";
+        if (supervisor && !supervisorInicializado) {
+          supervisorInicializado = recepcion.input.checked = anulacion.input.checked = true;
+          checks.forEach(function (ch) { ch.input.checked = true; });
+        }
+      }
+      mostrarPermisos(rol.valor());
       var activo = P.check("Usuario habilitado", editar ? Number(u.activo) === 1 : true);
       var m = P.modal({
         titulo: editar ? u.nombre : "Nuevo usuario", ancho: "ancha", reanudar: reanudar,
         contenido: h("div.columna",
           h("div.grilla.grilla-2", P.campo("Nombre y apellido", nombre, { requerido: true }), P.campo("Usuario (para ingresar)", usuario, { requerido: true })),
-          P.campo("Rol", rol, { ayuda: "Seguridad puede consultar vehículos y deudas. Administración gestiona todo el predio." }),
+          P.campo("Rol", rol, { ayuda: "Supervisión opera las cajas asignadas. Seguridad consulta vehículos y deudas. Administración gestiona todo el predio." }),
           zonaBocas, permisos,
           P.campo(editar ? "Restablecer contraseña temporal" : "Contraseña temporal", clave, { requerido: !editar, ayuda: "El usuario deberá elegir su propia contraseña al ingresar." }),
           editar ? activo : null,

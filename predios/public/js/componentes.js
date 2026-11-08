@@ -452,8 +452,6 @@
     return P.get("/listados/" + nombre + "/meta").then(function (m) { metas[nombre] = m; return m; });
   };
 
-  // Columnas de nombres largos (productos, proveedores): no se parten en muchos renglones.
-  var COLUMNAS_ANCHAS = ["nombre", "producto", "razon_social", "proveedor"];
   var siguienteTabla = 0;
 
   // Fuente de datos en memoria para P.tabla: búsqueda, filtros, orden y páginas en el navegador.
@@ -514,8 +512,7 @@
 
   P.textoTabla = function (valor) {
     if (typeof valor !== "string" || !valor) return valor;
-    var largo = valor.length > 24;
-    return h("span.tabla-texto" + (largo ? ".tabla-texto-largo" : ""), { title: valor }, valor);
+    return h("span.tabla-texto", { title: valor }, valor);
   };
 
   // P.tabla({ listado }) lee un listado del servidor. Con { fuente: { meta, cargar(params) } } (por ejemplo
@@ -566,8 +563,17 @@
       desliz.firstChild.style.width = cuerpo.scrollWidth + "px";
       desliz.scrollLeft = cuerpo.scrollLeft;
     }
+    var observadorDesliz;
+    var tablaObservada;
+    function observarTabla(tabla) {
+      if (!observadorDesliz) return;
+      if (tablaObservada) observadorDesliz.unobserve(tablaObservada);
+      tablaObservada = tabla;
+      if (tablaObservada) observadorDesliz.observe(tablaObservada);
+    }
     if (window.ResizeObserver) {
-      new ResizeObserver(function () { medirDesliz(); }).observe(cuerpo);
+      observadorDesliz = new ResizeObserver(medirDesliz);
+      observadorDesliz.observe(cuerpo);
     } else {
       var alRedimensionar = function () {
         if (!document.body.contains(raiz)) { window.removeEventListener("resize", alRedimensionar); return; }
@@ -802,6 +808,7 @@
     function pintar(datos) {
       var cols = columnasVisibles();
       ultimos = datos;
+      observarTabla(null);
       P.vaciar(cuerpo);
       if (!datos.filas.length) {
         cuerpo.appendChild(P.vacio(opciones.iconoVacio || "lista", opciones.tituloVacio || "No hay registros", estado.q || Object.keys(estado.filtros).some(function (k) { return estado.filtros[k]; }) ? "Probá con otros filtros o borrá la búsqueda." : opciones.textoVacio));
@@ -809,7 +816,7 @@
         var thead = h("thead", h("tr", cols.map(function (c) {
           var ordenado = estado.orden === c.clave || (!estado.orden && meta.orden && meta.orden.clave === c.clave);
           var dir = estado.orden === c.clave ? estado.dir : (meta.orden ? meta.orden.dir : "asc");
-          return h("th.ordenable" + (ALINEA_DERECHA.indexOf(c.tipo) >= 0 ? ".der" : "") + (COLUMNAS_ANCHAS.indexOf(c.clave) >= 0 ? ".col-ancha" : ""), {
+          return h("th.ordenable" + (ALINEA_DERECHA.indexOf(c.tipo) >= 0 ? ".der" : ""), {
             "aria-sort": ordenado ? (dir === "desc" ? "descending" : "ascending") : null, scope: "col",
             onclick: function () {
               if (estado.orden === c.clave) estado.dir = estado.dir === "asc" ? "desc" : "asc";
@@ -831,7 +838,7 @@
             var contenido = especial ? especial(f[c.clave], f) : P.formatoCelda(c, f[c.clave]);
             var derecha = ALINEA_DERECHA.indexOf(c.tipo) >= 0;
             var sinCorte = derecha || c.tipo === "opcion" || c.tipo === "dt" || c.tipo === "date";
-            return h("td" + (derecha ? ".der" : "") + (COLUMNAS_ANCHAS.indexOf(c.clave) >= 0 ? ".col-ancha" : "") + (sinCorte ? ".sin-corte" : ""),
+            return h("td" + (derecha ? ".der" : "") + (sinCorte ? ".sin-corte" : ""),
               sinCorte ? contenido : P.textoTabla(contenido));
           }));
           if (opciones.acciones) tr.appendChild(h("td.acciones", opciones.acciones(f, recargar)));
@@ -846,6 +853,7 @@
           }).concat(opciones.acciones ? [h("td")] : []))));
         }
         cuerpo.appendChild(tabla);
+        observarTabla(tabla);
       }
       marcarFilas();
       pintarSeleccion();
@@ -884,6 +892,7 @@
       }).catch(function (e) {
         cuerpo.style.opacity = "";
         if (n !== pedido) return;
+        observarTabla(null);
         P.reemplazar(cuerpo, h("div", { style: { padding: "16px" } }, P.mensaje(e.message, "error")));
         if (opciones.alError) opciones.alError(e);
       });

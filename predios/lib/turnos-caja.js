@@ -2,6 +2,7 @@
 
 const U = require("./util");
 const N = require("./negocio");
+const { puedeGestionarCajas } = require("./api/comun");
 
 async function turnoAbierto(db, pid, cajaId) {
   return db.get("SELECT * FROM predio_turno WHERE predio_id=? AND caja_id=? AND estado='ABIERTO' ORDER BY id DESC LIMIT 1", [pid, cajaId]);
@@ -12,7 +13,7 @@ async function turnoUsuario(db, pid, usuarioId) {
 }
 
 function exigirCierre(ctx) {
-  const cierre = ctx.usuario.rol === "ADMIN" ? "el cierre de caja" : "un cierre temporal";
+  const cierre = puedeGestionarCajas(ctx) ? "el cierre de caja" : "un cierre temporal";
   throw U.error(`Tu turno tiene ventas o movimientos de caja. Hacé ${cierre} antes de salir.`, 409, { codigo: "TURNO_ABIERTO" });
 }
 

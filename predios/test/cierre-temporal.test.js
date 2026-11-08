@@ -25,13 +25,14 @@ async function escenario(t) {
     await N.insertar(tx, admin, "predio_usuario", { usuario: "admin", nombre: "Admin", rol: "ADMIN", activo: 1, password_hash: U.hashPassword(CLAVE_ADMIN) });
     await N.insertar(tx, admin, "predio_usuario", { usuario: "ana", nombre: "Ana", rol: "CAJERO", activo: 1, password_hash: U.hashPassword("Ana-cajera1") });
     await N.insertar(tx, admin, "predio_usuario", { usuario: "beto", nombre: "Beto", rol: "CAJERO", activo: 1, password_hash: U.hashPassword("Beto-cajero1") });
+    await N.insertar(tx, admin, "predio_usuario", { usuario: "supervisor", nombre: "Supervisión", rol: "SUPERVISOR", activo: 1 });
   });
   const [caja] = await db.all("SELECT * FROM predio_caja ORDER BY id LIMIT 1");
   const post = (actor, ruta, body = {}) => api.ejecutar({ ...actor, body, query: {} }, "POST", ruta);
   const get = (actor, ruta, query = {}) => api.ejecutar({ ...actor, body: {}, query }, "GET", ruta);
-  async function turnoDe(id, nombre) {
+  async function turnoDe(id, nombre, rol = "CAJERO") {
     const turno = await N.insertar(db, admin, "predio_turno", { caja_id: caja.id, boca_id: caja.boca_id, usuario_id: id, usuario_nombre: nombre, inicio: U.fechaHora(), estado: "ABIERTO" });
-    return { ...admin, ip: "10.0.0.2", usuario: { id, rol: "CAJERO", nombre, bocas: [caja.boca_id] }, sesion: { boca_id: caja.boca_id, caja_id: caja.id, turno_id: turno } };
+    return { ...admin, ip: "10.0.0.2", usuario: { id, rol, nombre, bocas: [caja.boca_id] }, sesion: { boca_id: caja.boca_id, caja_id: caja.id, turno_id: turno } };
   }
   const producto = await post(admin, "/productos", { nombre: "Gaseosa", destino: "VENTA_DIRECTA", precio_venta_manual: 100 });
   await db.tx((tx) => N.moverStock(tx, admin, { productoId: producto.id, bocaId: caja.boca_id, cantidad: 50, tipo: "AJUSTE" }));
@@ -133,6 +134,105 @@ test("el cajero cierra en forma temporal, el siguiente arranca de cero y el admi
   assert.equal(pendientes.total, 0);
   const todos = await get(admin, "/listados/cierres");
   assert.equal(todos.filas.find((f) => f.id === cierre.id).tipo, "TEMPORAL_CERRADO");
+});
+
+test("un supervisor opera y cierra su caja sin reingresar la contraseña, dentro de sus bocas", async (t) => {
+  const { db, caja, post, get, turnoDe, vender } = await escenario(t);
+  const otra = await db.get("SELECT * FROM predio_caja WHERE boca_id<>? ORDER BY id LIMIT 1", [caja.boca_id]);
+  const supervisor = await turnoDe(4, "Supervisión", "SUPERVISOR");
+  const panel = await get(supervisor, "/caja/panel");
+  assert.ok(panel.cajas.some(c => c.id === caja.id));
+  assert.ok(panel.cajas.every(c => c.boca_id === caja.boca_id));
+  await assert.rejects(get(supervisor, "/caja/estado", { caja_id: otra.id }), { status: 403 });
+  await assert.rejects(post(supervisor, "/caja/apertura", { caja_id: otra.id, importe: 150 }), { status: 403 });
+  await assert.rejects(post(supervisor, "/caja/cierre", { caja_id: otra.id, efectivo_contado: 0 }), { status: 403 });
+
+  const { id: apertura } = await post(supervisor, "/caja/apertura", { caja_id: caja.id, importe: 150 });
+  await post(supervisor, `/caja/apertura/${apertura}/verificar`, { correcto: true });
+  await post(supervisor, "/caja/ajuste", { caja_id: caja.id, concepto: "INGRESO_DINERO", tipo: "INGRESO", importe: 20 });
+  await vender(supervisor, 2, "EFECTIVO");
+  const previa = await get(supervisor, "/caja/cierre/previa");
+  const arqueo = { efectivo_contado: 370, queda_en_caja: 100, revision: previa.revision, turno_id: previa.turno.id, ultimo_cierre_id: null };
+  const sinBoca = { ...supervisor, usuario: { ...supervisor.usuario, bocas: [] } };
+  assert.deepEqual((await get(sinBoca, "/caja/panel")).cajas, []);
+  await assert.rejects(post(sinBoca, "/caja/cierre", arqueo), { status: 403 });
+
+  const cierre = await post(supervisor, "/caja/cierre", arqueo);
+  assert.equal(cierre.tipo, "DEFINITIVO");
+  assert.equal(cierre.diferencia, 0);
+  assert.equal(cierre.retiro, 270);
+  const { cierre: detalle } = await get(supervisor, `/caja/cierres/${cierre.id}`);
+  assert.equal(detalle.estado, "CERRADO");
+  assert.equal(detalle.autorizacion, "SUPERVISOR");
+  assert.equal(detalle.definitivo_usuario_id, supervisor.usuario.id);
+  assert.equal((await db.get("SELECT estado FROM predio_turno WHERE id = ?", [previa.turno.id])).estado, "CERRADO");
+  await assert.rejects(post(supervisor, "/caja/cierre", arqueo), { status: 409 });
+});
+
+test("un supervisor puede recibir a distancia el cierre temporal de una boca asignada", async (t) => {
+  const { admin, caja, post, get, turnoDe, vender } = await escenario(t);
+  const cajero = await turnoDe(2, "Ana");
+  const { id: venta } = await vender(cajero, 1, "EFECTIVO");
+  const supervisor = { ...admin, origen: "REMOTO", usuario: { id: 4, rol: "SUPERVISOR", nombre: "Supervisión", bocas: [caja.boca_id], puede_anular_ticket: 1 } };
+  const sinAnulacion = { ...supervisor, usuario: { ...supervisor.usuario, puede_anular_ticket: 0 } };
+  const sinBoca = { ...supervisor, usuario: { ...supervisor.usuario, bocas: [] } };
+  const anular = `/ventas/${venta}/anular`;
+  const motivo = { motivo: "Ticket duplicado" };
+  await assert.rejects(post(sinAnulacion, anular, motivo), { status: 403 });
+  await assert.rejects(post(sinBoca, anular, motivo), { status: 403 });
+  assert.equal((await post(supervisor, anular, motivo)).devolver_efectivo, 100);
+
+  const cierre = await post(cajero, "/caja/cierre/temporal", { efectivo_ventas: 0, efectivo_cambio: 0 });
+  const ruta = `/caja/cierres/${cierre.id}/definitivo`;
+  const bolsas = { recibido_ventas: 0, recibido_cambio: 0 };
+  assert.deepEqual((await get(sinBoca, "/caja/temporales")).cierres, []);
+  await assert.rejects(post(sinBoca, ruta, bolsas), { status: 403 });
+  assert.deepEqual((await get(supervisor, "/caja/temporales")).cierres.map(c => c.id), [cierre.id]);
+  await post(supervisor, ruta, bolsas);
+  const { cierre: detalle } = await get(supervisor, `/caja/cierres/${cierre.id}`);
+  assert.equal(detalle.estado, "CERRADO");
+  assert.equal(detalle.definitivo_usuario_id, supervisor.usuario.id);
+  assert.deepEqual((await get(supervisor, "/caja/temporales")).cierres, []);
+});
+
+test("el supervisor resuelve sólo las anulaciones de sus bocas cuando tiene permiso", async (t) => {
+  const { db, admin, caja, post, get, turnoDe, vender } = await escenario(t);
+  const cajero = await turnoDe(2, "Ana");
+  const supervisor = { ...admin, usuario: { id: 4, rol: "SUPERVISOR", nombre: "Supervisión", bocas: [caja.boca_id], puede_anular_ticket: 1 } };
+  const sinPermiso = { ...supervisor, usuario: { ...supervisor.usuario, puede_anular_ticket: 0 } };
+  const otra = await db.get("SELECT * FROM predio_caja WHERE boca_id<>? ORDER BY id LIMIT 1", [caja.boca_id]);
+  const ajena = await N.insertar(db, cajero, "predio_venta", {
+    caja_id: otra.id, boca_id: otra.boca_id, estado: "CONFIRMADA", forma_pago: "QR", total: 500, fecha: U.fechaHora(),
+  });
+  const pedidoAjeno = await N.insertar(db, cajero, "predio_permiso", {
+    tipo: "ANULAR_VENTA", estado: "PENDIENTE", referencia_id: ajena, boca_id: otra.boca_id, caja_id: otra.id, usuario_id: cajero.usuario.id,
+    fecha_solicitud: U.fechaHora(),
+  });
+  const { id: venta } = await vender(cajero, 1, "EFECTIVO");
+  const { id: segunda } = await vender(cajero, 1, "QR");
+  const pedir = id => post(cajero, "/permisos", { tipo: "ANULAR_VENTA", referencia_id: id, detalle: "Ticket duplicado" });
+  const { id: anular } = await pedir(venta);
+  const { id: conservar } = await pedir(segunda);
+  const { id: permisoCaja } = await post(cajero, "/permisos", { tipo: "VER_VENTAS_CAJA" });
+  const resolver = (actor, id, aprobar) => post(actor, `/permisos/${id}/resolver`, { aprobar });
+  const avisos = await get(supervisor, "/avisos");
+  assert.deepEqual(avisos.permisos.map(p => p.id), [conservar, anular]);
+  assert.deepEqual((await get(sinPermiso, "/avisos")).permisos, []);
+  assert.equal((await get(supervisor, `/permisos/${anular}`)).permiso.referencia_id, venta);
+  await assert.rejects(get(supervisor, `/permisos/${pedidoAjeno}`), { status: 403 });
+  await assert.rejects(resolver(supervisor, pedidoAjeno, false), { status: 403 });
+  await assert.rejects(resolver(supervisor, permisoCaja, true), { status: 403 });
+  await assert.rejects(resolver(sinPermiso, anular, true), { status: 403 });
+  await assert.rejects(post(supervisor, "/caja/cierre", { caja_id: caja.id, efectivo_contado: 100 }), { codigo: "ANULACIONES_PENDIENTES" });
+  assert.equal((await resolver(supervisor, anular, true)).devolver_efectivo, 100);
+  assert.equal((await resolver(supervisor, conservar, false)).mensaje, "Pedido rechazado");
+  assert.deepEqual((await get(supervisor, "/avisos")).permisos, []);
+  const inicio = await get(supervisor, "/inicio");
+  assert.deepEqual(inicio.ultimas_ventas.map(v => v.id), [segunda]);
+  assert.equal(inicio.hoy.total, 100);
+  assert.equal(inicio.efectivo_en_cajas, 0);
+  assert.equal(inicio.afiliados_en_predio, null);
+  assert.equal((await post(supervisor, "/caja/cierre", { caja_id: caja.id, efectivo_contado: 0 })).tipo, "DEFINITIVO");
 });
 
 test("el administrador presente aprueba en la PC del cajero y los intentos fallidos se bloquean", async (t) => {

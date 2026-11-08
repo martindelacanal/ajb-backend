@@ -1,21 +1,21 @@
 "use strict";
 
-// Caja: saldo de apertura (lo carga el administrador y lo confirma el cajero),
+// Caja: saldo de apertura (lo carga quien gestiona la caja y lo confirma el cajero),
 // ajustes manuales, cierres de caja y estado del día. El saldo de cada caja es la suma
 // de sus movimientos: ingresos menos egresos.
 //
 // Dos clases de cierre:
-//  - Definitivo: lo hace siempre un administrador desde su cuenta. Cuenta el efectivo
+//  - Definitivo: lo hace un administrador o supervisor desde su cuenta. Cuenta el efectivo
 //    y decide cuánto queda en la caja para el próximo turno.
 //  - Temporal: lo hace el cajero al terminar su turno. Todo el efectivo
 //    va a dos bolsas (recaudación y cambio), cada una con su ticket; la caja queda en
 //    cero y libre para el próximo cajero, que empieza de cero sin heredar nada del
-//    anterior. Cuando llega, el administrador recibe las bolsas y cierra cada cierre
+//    anterior. Administración o Supervisión recibe las bolsas y cierra cada cierre
 //    temporal en forma definitiva, sin tocar la caja que siguió trabajando.
 
 const U = require("../util");
 const N = require("../negocio");
-const { exigirAdmin, esAdmin, bocasDe, turnoDeCaja } = require("./comun");
+const { esAdmin, esSupervisor, puedeGestionarCajas, exigirBoca, bocasDe, turnoDeCaja, ROLES_GESTION_CAJA } = require("./comun");
 const { emitirAviso } = require("../avisos");
 
 const { turnoAbierto, verificarOperador } = require("../turnos-caja");
@@ -52,10 +52,17 @@ function cajaDelPedido(ctx, valor) {
 
 async function exigirAccesoCaja(t, ctx, cajaId, bloquear = false) {
   const caja = await N.exigir(t, ctx, "predio_caja", cajaId, "No encontramos la caja", { bloquear });
-  if (!esAdmin(ctx) && Number(ctx.sesion?.caja_id) !== Number(cajaId) && !bocasDe(ctx).includes(Number(caja.boca_id))) {
-    throw U.error("No tenés acceso a esa caja", 403);
+  if (esSupervisor(ctx) || Number(ctx.sesion?.caja_id) !== Number(cajaId)) {
+    exigirBoca(ctx, caja.boca_id, "No tenés acceso a esa caja");
   }
   return caja;
+}
+
+function alcanceCajas(ctx, columna) {
+  if (esAdmin(ctx)) return { sql: "", params: [] };
+  const bocas = bocasDe(ctx);
+  if (!bocas.length) return { sql: " AND 1=0", params: [] };
+  return { sql: ` AND ${columna} IN (${bocas.map(() => "?").join(",")})`, params: bocas };
 }
 
 async function ultimoCierre(t, pid, cajaId) {
@@ -162,13 +169,12 @@ async function estado(ctx) {
 }
 
 async function cargarApertura(ctx) {
-  exigirAdmin(ctx);
   const cajaId = U.id(ctx.body.caja_id, "La caja");
   const fecha = U.fecha(ctx.body.fecha || U.hoy(), { campo: "La fecha" });
   const importe = U.numero(ctx.body.importe, { min: 0, max: 99999999, campo: "El saldo de apertura" });
   const observacion = U.texto(ctx.body.observacion, { max: 255 });
   return ctx.db.tx(async (t) => {
-    const caja = await N.exigir(t, ctx, "predio_caja", cajaId, "No encontramos la caja", { bloquear: true });
+    const caja = await exigirAccesoCaja(t, ctx, cajaId, true);
     const turno = await turnoAbierto(t, ctx.pid, cajaId);
     if (turno && turno.inicio.slice(0, 10) !== fecha) {
       throw U.error("Esta caja tiene un turno abierto del " + turno.inicio.slice(0, 10) + ". Cerralo antes de cargar la apertura de otra jornada.", 409);
@@ -236,7 +242,6 @@ async function verificarApertura(ctx) {
 }
 
 async function ajuste(ctx) {
-  exigirAdmin(ctx);
   const b = ctx.body;
   const cajaId = U.id(b.caja_id, "La caja");
   const concepto = U.opcion(b.concepto, CONCEPTOS_AJUSTE, "El concepto");
@@ -245,7 +250,7 @@ async function ajuste(ctx) {
   const recibo = U.texto(b.recibo, { max: 40 });
   const observaciones = U.texto(b.observaciones, { max: 255 });
   return ctx.db.tx(async (t) => {
-    const caja = await N.exigir(t, ctx, "predio_caja", cajaId, "No encontramos la caja", { bloquear: true });
+    const caja = await exigirAccesoCaja(t, ctx, cajaId, true);
     const saldo = await saldoCaja(t, ctx, cajaId);
     if (tipo === "EGRESO" && importe > saldo + 0.001 && !b.confirmar_saldo_negativo) {
       throw U.error(`La caja tiene ${U.pesos(saldo)}: si sacás ${U.pesos(importe)} queda en negativo`, 409, { codigo: "SALDO_NEGATIVO", saldo });
@@ -276,7 +281,7 @@ async function previaCierre(ctx) {
   const resumen = await resumenAbierto(ctx.db, ctx, caja);
   return {
     caja, turno, resumen, revision: revisionResumen(resumen),
-    // El cierre temporal lo hace quien atiende la caja; el definitivo, un administrador.
+    // El cierre temporal lo hace quien atiende la caja desde su turno.
     puede_temporal: esOperador(ctx, cajaId, turno),
   };
 }
@@ -302,7 +307,7 @@ async function exigirSinAnulacionesPendientes(t, ctx, cajaId, anterior) {
     WHERE p.predio_id=? AND v.caja_id=? AND p.tipo='ANULAR_VENTA' AND p.estado='PENDIENTE' AND v.estado='CONFIRMADA' AND ${corte} LIMIT 1`,
   [ctx.pid, cajaId, anterior?.ultima_venta_id ?? anterior?.fecha ?? 0]);
   if (pendiente) {
-    throw U.error("Hay ventas pendientes de anulación. Un administrador debe confirmarlas o rechazarlas antes de cerrar la caja (puede hacerlo a distancia desde su cuenta).", 409, { codigo: "ANULACIONES_PENDIENTES" });
+    throw U.error("Hay ventas pendientes de anulación. Administración o un supervisor autorizado debe resolverlas antes de cerrar la caja.", 409, { codigo: "ANULACIONES_PENDIENTES" });
   }
 }
 
@@ -357,10 +362,10 @@ function textoDiferencia(diferencia) {
   return diferencia === 0 ? "sin diferencias" : `con ${diferencia > 0 ? "sobrante" : "faltante"} de ${U.pesos(Math.abs(diferencia))}`;
 }
 
-// Cierre definitivo de una caja abierta. Siempre lo hace un administrador.
+// Cierre definitivo de una caja abierta desde la sesión del responsable.
 async function cerrar(ctx) {
-  if (!esAdmin(ctx)) {
-    throw U.error("Hacé un cierre temporal desde tu turno. El administrador hace el cierre definitivo desde su cuenta.", 403, { codigo: "CIERRE_SOLO_ADMIN" });
+  if (!puedeGestionarCajas(ctx)) {
+    throw U.error("Hacé un cierre temporal desde tu turno. Administración o Supervisión hace el cierre definitivo desde su cuenta.", 403, { codigo: "CIERRE_SOLO_ADMIN" });
   }
   const b = ctx.body;
   const cajaId = cajaDelPedido(ctx, b.caja_id);
@@ -375,11 +380,12 @@ async function cerrar(ctx) {
     comprobarCorte(ctx, turno, r.ultimo_cierre);
     comprobarRevision(ctx, r);
     await exigirSinAnulacionesPendientes(t, ctx, cajaId, r.ultimo_cierre);
-    const admin = N.nombreActor(ctx);
-    const autorizacion = { metodo: "ADMIN", admin_id: ctx.usuario.id, administrador: admin };
+    const responsable = N.nombreActor(ctx);
+    const autorizacion = esAdmin(ctx) ? { metodo: "ADMIN", admin_id: ctx.usuario.id, administrador: responsable }
+      : { metodo: "SUPERVISOR", supervisor_id: ctx.usuario.id, supervisor: responsable };
     const c = await asentarCierre(t, ctx, {
       caja, turno, r, contado, queda, observaciones, temporal: false, autorizacion,
-      datos: (ahora) => ({ definitivo_fecha: ahora, definitivo_usuario_id: ctx.usuario.id || null, definitivo_usuario_nombre: admin }),
+      datos: (ahora) => ({ definitivo_fecha: ahora, definitivo_usuario_id: ctx.usuario.id || null, definitivo_usuario_nombre: responsable }),
     });
     return {
       id: c.cierreId, tipo: "DEFINITIVO", diferencia: c.diferencia, retiro: c.retiro,
@@ -389,7 +395,7 @@ async function cerrar(ctx) {
 }
 
 // Cierre temporal: el cajero termina su turno. El efectivo queda en dos
-// bolsas con su ticket hasta que un administrador las recibe y hace el cierre definitivo.
+// bolsas con su ticket hasta que Administración o Supervisión hace el cierre definitivo.
 async function cerrarTemporal(ctx) {
   const b = ctx.body;
   const cajaId = cajaDelPedido(ctx, b.caja_id);
@@ -416,7 +422,7 @@ async function cerrarTemporal(ctx) {
     await emitirAviso(t, ctx, {
       tipo: "CIERRE_TEMPORAL",
       titulo: `Cierre temporal N° ${c.cierreId} · ${boca?.nombre || "Caja"} · ${caja.nombre}`,
-      mensaje: `${N.nombreActor(ctx)} cerró la caja en forma temporal (${textoDiferencia(c.diferencia)}). Dejó la bolsa de recaudación con ${U.pesos(enVentas)} y la de cambio con ${U.pesos(enCambio)}. Falta que un administrador reciba las bolsas y haga el cierre definitivo. La caja quedó en $ 0: si quien sigue necesita cambio, cargale el saldo de apertura (también a distancia).`,
+      mensaje: `${N.nombreActor(ctx)} cerró la caja en forma temporal (${textoDiferencia(c.diferencia)}). Dejó la bolsa de recaudación con ${U.pesos(enVentas)} y la de cambio con ${U.pesos(enCambio)}. Falta que Administración o Supervisión reciba las bolsas y haga el cierre definitivo. La caja quedó en $ 0: si quien sigue necesita cambio, cargale el saldo de apertura (también a distancia).`,
       detalle: { cierre_id: c.cierreId, caja_id: cajaId, efectivo_ventas: enVentas, efectivo_cambio: enCambio },
     });
     return {
@@ -426,16 +432,16 @@ async function cerrarTemporal(ctx) {
   });
 }
 
-// El administrador recibe las bolsas de un cierre temporal y lo cierra en forma definitiva.
+// Recibe las bolsas de un cierre temporal y lo cierra en forma definitiva.
 // No toca los movimientos de la caja: el efectivo ya había salido al hacer el temporal.
 async function definitivoDeTemporal(ctx) {
-  exigirAdmin(ctx);
   const id = U.id(ctx.params.id, "El cierre");
   const recVentas = U.numero(ctx.body.recibido_ventas, { min: 0, max: 99999999, campo: "Lo que hay en la bolsa de recaudación" });
   const recCambio = U.numero(ctx.body.recibido_cambio, { min: 0, max: 99999999, campo: "Lo que hay en la bolsa de cambio" });
   const observaciones = U.texto(ctx.body.observaciones, { max: 255 });
   return ctx.db.tx(async (t) => {
     const c = await N.exigir(t, ctx, "predio_cierre", id, "No encontramos el cierre", { bloquear: true });
+    exigirBoca(ctx, c.boca_id, "No tenés acceso a este cierre");
     if (c.tipo !== "TEMPORAL") throw U.error("Ese cierre ya es definitivo.", 409);
     if (c.estado !== "PENDIENTE") {
       throw U.error(`Ese cierre temporal ya lo cerró ${c.definitivo_usuario_nombre || "un administrador"}${c.definitivo_fecha ? ` el ${c.definitivo_fecha}` : ""}.`, 409, { codigo: "CIERRE_YA_DEFINITIVO" });
@@ -480,20 +486,20 @@ async function detalleCierre(ctx) {
   };
 }
 
-// Cierres temporales que esperan que un administrador reciba las bolsas.
+// Cierres temporales que esperan que se reciban las bolsas.
 async function temporalesPendientes(ctx) {
-  exigirAdmin(ctx);
-  const filas = await ctx.db.all(`${SQL_CIERRE} WHERE ci.predio_id = ? AND ci.tipo = 'TEMPORAL' AND ci.estado = 'PENDIENTE' ORDER BY ci.id`, [ctx.pid]);
+  const alcance = alcanceCajas(ctx, "ci.boca_id");
+  const filas = await ctx.db.all(`${SQL_CIERRE} WHERE ci.predio_id = ? AND ci.tipo = 'TEMPORAL' AND ci.estado = 'PENDIENTE'${alcance.sql} ORDER BY ci.id`, [ctx.pid, ...alcance.params]);
   return { cierres: filas.map((c) => ({ ...c, efectivo: leerJson(c.efectivo_detalle, null) })) };
 }
 
-// Resumen de todas las cajas para el administrador.
+// Resumen de las cajas que puede gestionar la cuenta.
 async function panelCajas(ctx) {
-  exigirAdmin(ctx);
+  const alcance = alcanceCajas(ctx, "c.boca_id");
   const cajas = await ctx.db.all(
     `SELECT c.id, c.nombre, c.boca_id, b.nombre AS boca FROM predio_caja c
      JOIN predio_boca b ON b.predio_id = c.predio_id AND b.id = c.boca_id
-     WHERE c.predio_id = ? AND c.activo = 1 ORDER BY b.nombre, c.nombre`, [ctx.pid]);
+     WHERE c.predio_id = ? AND c.activo = 1${alcance.sql} ORDER BY b.nombre, c.nombre`, [ctx.pid, ...alcance.params]);
   const temporales = (await temporalesPendientes(ctx)).cierres;
   const salida = [];
   for (const c of cajas) {
@@ -513,7 +519,7 @@ async function panelCajas(ctx) {
 async function configurarComanda(ctx) {
   const id = U.id(ctx.params.id, "La caja");
   if (typeof ctx.body.imprimir_comanda !== "boolean") throw U.error("Indicá si la caja imprime comanda");
-  if (!esAdmin(ctx) && Number(ctx.sesion?.caja_id) !== id) throw U.error("Sólo podés cambiar la comanda de la caja en la que estás trabajando", 403);
+  if (!puedeGestionarCajas(ctx) && Number(ctx.sesion?.caja_id) !== id) throw U.error("Sólo podés cambiar la comanda de la caja en la que estás trabajando", 403);
   return ctx.db.tx(async (t) => {
     const caja = await exigirAccesoCaja(t, ctx, id);
     if (!Number(caja.activo)) throw U.error("La caja está deshabilitada", 409);
@@ -530,18 +536,19 @@ module.exports = {
   saldoCaja,
   separarEfectivo,
   APERTURA_VIGENTE,
+  alcanceCajas,
   rutas: [
     { m: "GET", p: "/caja/estado", h: estado },
-    { m: "GET", p: "/caja/panel", h: panelCajas, roles: ["ADMIN"] },
+    { m: "GET", p: "/caja/panel", h: panelCajas, roles: ROLES_GESTION_CAJA },
     { m: "POST", p: "/cajas/:id/comanda", h: configurarComanda, escritura: true },
-    { m: "POST", p: "/caja/apertura", h: cargarApertura, escritura: true, roles: ["ADMIN"] },
+    { m: "POST", p: "/caja/apertura", h: cargarApertura, escritura: true, roles: ROLES_GESTION_CAJA },
     { m: "POST", p: "/caja/apertura/:id/verificar", h: verificarApertura, escritura: true },
-    { m: "POST", p: "/caja/ajuste", h: ajuste, escritura: true, roles: ["ADMIN"] },
+    { m: "POST", p: "/caja/ajuste", h: ajuste, escritura: true, roles: ROLES_GESTION_CAJA },
     { m: "GET", p: "/caja/cierre/previa", h: previaCierre },
     { m: "POST", p: "/caja/cierre", h: cerrar, escritura: true },
     { m: "POST", p: "/caja/cierre/temporal", h: cerrarTemporal, escritura: true, soloLocal: true },
-    { m: "GET", p: "/caja/temporales", h: temporalesPendientes, roles: ["ADMIN"] },
+    { m: "GET", p: "/caja/temporales", h: temporalesPendientes, roles: ROLES_GESTION_CAJA },
     { m: "GET", p: "/caja/cierres/:id", h: detalleCierre },
-    { m: "POST", p: "/caja/cierres/:id/definitivo", h: definitivoDeTemporal, escritura: true, roles: ["ADMIN"] },
+    { m: "POST", p: "/caja/cierres/:id/definitivo", h: definitivoDeTemporal, escritura: true, roles: ROLES_GESTION_CAJA },
   ],
 };

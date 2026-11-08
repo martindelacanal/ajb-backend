@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const { crearSqlite, asegurarEsquema } = require("../lib/db-sqlite");
 const { resolverActorRemoto } = require("../lib/actor-remoto");
 const api = require("../lib/api");
+const { autenticar } = require("../lib/api/sesion");
 const N = require("../lib/negocio");
 const U = require("../lib/util");
 async function escenario(t) {
@@ -76,6 +77,44 @@ test("Seguridad no hereda permisos de caja y sólo acepta órdenes para cambiar 
   const actual = { ...usuario, debe_cambiar_clave: false };
   await assert.rejects(api.ejecutar({ ...ctx, usuario: actual }, "POST", "/productos"), e => e.status === 403);
   await assert.rejects(api.ejecutar({ ...ctx, usuario: actual }, "GET", "/listados/ventas"), e => e.status === 403);
+});
+test("Supervisión empieza con todas las bocas activas y pierde acceso al revocarle permisos", async t => {
+  const { db, ctx } = await escenario(t);
+  await db.tx(async tx => {
+    await N.insertar(tx, ctx, "predio_boca", { nombre: "Comedor", activo: 1 });
+    await N.insertar(tx, ctx, "predio_boca", { nombre: "Inactiva", activo: 0 });
+    await N.insertar(tx, ctx, "predio_caja", { boca_id: 1, nombre: "Recepción", activo: 1 });
+    await N.insertar(tx, ctx, "predio_caja", { boca_id: 2, nombre: "Comedor", activo: 1 });
+  });
+  const datos = { usuario: "supervisor", nombre: "Supervisión", rol: "SUPERVISOR" };
+  const { id } = await api.ejecutar({ ...ctx, body: { ...datos, password: "Puesto-z9" } }, "POST", "/usuarios");
+  const { token } = await api.ejecutar({ ...ctx, usuario: null, body: { usuario: datos.usuario, password: "Puesto-z9" } }, "POST", "/login");
+  const operar = async (metodo, ruta, body) => api.ejecutar({ ...ctx, ...await autenticar(ctx, token), body }, metodo, ruta);
+  await operar("POST", "/sesion/clave", { actual: "Puesto-z9", nueva: "Puesto-definitiva-z9" });
+  const { usuario } = await operar("GET", "/sesion");
+  assert.equal(usuario.rol, "SUPERVISOR");
+  assert.deepEqual(usuario.bocas, [1, 2]);
+  assert.equal(usuario.gestionar_reservas, true);
+  assert.equal(usuario.puede_anular_ticket, true);
+  assert.equal((await operar("POST", "/sesion/puesto", { boca_id: 1, caja_id: 1 })).puesto.caja_id, 1);
+  assert.deepEqual((await operar("GET", "/listados/cajas")).filas.map(f => f.id).sort(), [1, 2]);
+  for (const ruta of ["/listados/usuarios", "/listados/auditoria", "/listados/comprobantes", "/estadisticas", "/config"]) {
+    await assert.rejects(operar("GET", ruta), { status: 403 }, ruta);
+  }
+  await assert.rejects(operar("POST", "/usuarios", {}), { status: 403 });
+  await api.ejecutar({ ...ctx, body: { ...datos, bocas: [2], gestionar_reservas: false, puede_anular_ticket: false } }, "PUT", "/usuarios/" + id);
+  await api.ejecutar({ ...ctx, body: datos }, "PUT", "/usuarios/" + id);
+  const vigente = await operar("GET", "/sesion");
+  assert.deepEqual(vigente.usuario.bocas, [2]);
+  assert.equal(vigente.usuario.gestionar_reservas, false);
+  assert.equal(vigente.usuario.puede_anular_ticket, false);
+  assert.equal(vigente.puesto, null);
+  assert.deepEqual((await operar("GET", "/listados/cajas")).filas.map(f => f.id), [2]);
+  await assert.rejects(operar("GET", "/cajas/1"), { status: 403 });
+  await assert.rejects(operar("GET", "/recepcion/listar"), { status: 403 });
+  await assert.rejects(operar("GET", "/recepcion/vehiculos"), { status: 403 });
+  await api.ejecutar({ ...ctx, body: { ...datos, bocas: [] } }, "PUT", "/usuarios/" + id);
+  assert.deepEqual((await operar("GET", "/listados/cajas")).filas, []);
 });
 test("se conserva el acceso general válido y se rechazan actores sin identidad o con tipo desconocido", async t => {
   const s = await escenario(t);

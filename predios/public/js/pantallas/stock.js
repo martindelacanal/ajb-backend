@@ -309,13 +309,13 @@
         h("h1.titulo-pagina", "Ventas de " + d.caja.nombre))));
       c.appendChild(tablaVentasCaja("ventas-caja-" + cajaId, { f_caja: cajaId }).el);
     });
-  }, { admin: true, titulo: "Ventas de la caja" });
+  }, { cajas: true, titulo: "Ventas de la caja" });
 
   P.ruta.registrar(/^\/mis-ventas$/, function (c) {
     var ambito = "turno";
     var zona = h("div", { style: { marginTop: "14px" } });
     var selector = P.segmentado([{ valor: "turno", texto: "Mi turno" }, { valor: "caja", texto: "Todas las de la caja" }], ambito, function (v) {
-      if (v === "caja" && !P.esAdmin()) {
+      if (v === "caja" && !P.puedeGestionarCajas()) {
         P.conAutorizacion("VER_VENTAS_CAJA", { detalle: "Ver todas las ventas de la caja" }, function (aut) { return P.post("/ventas/ver-caja", aut); })
           .then(function () { ambito = "caja"; pintar(); })
           .catch(function (e) { selector.fijar(ambito); if (e.status !== -1) P.error(e); });
@@ -324,7 +324,7 @@
       ambito = v;
       pintar();
     });
-    if (!P.esAdmin()) selector.setAttribute("data-sin-reanudar", "");
+    if (!P.puedeGestionarCajas()) selector.setAttribute("data-sin-reanudar", "");
     c.appendChild(h("div.pagina-cabecera", h("div",
       h("a.volver", { href: "#/mi-caja" }, P.icono("volver"), "Volver a la caja"),
       h("h1.titulo-pagina", "Mis ventas"), h("p.subtitulo", "Tocá una venta para ver el detalle, reimprimir el ticket o gestionar su anulación."))));

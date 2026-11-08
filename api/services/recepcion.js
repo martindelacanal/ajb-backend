@@ -2,6 +2,7 @@
 
 // La reserva, sus tarifas, su historial y el recibo de reintento se confirman juntos en Turismo.
 const U = require("../../predios/lib/util");
+const { puedeGestionarReservas } = require("../../predios/lib/api/comun");
 const { recursoUnico, MENSAJE_RECURSO_UNICO } = require("./reserva-recurso-unico");
 const { seleccionArticulos, cotizarAlquileres } = require("./recepcion-alquileres");
 const VEHICULOS = require("./recepcion-vehiculos");
@@ -1028,7 +1029,7 @@ async function operar(c, predio, actor, accion, b) {
     return ajustarEstadia(c, predio, actor, accion, b || {}, codigos);
   }
   if (VEHICULOS.acciones.has(accion)) return VEHICULOS.operar(c, predio, actor, accion, b, { detalle });
-  if (!actor || actor.rol !== "ADMIN" && !Number(actor.gestionar_reservas)) throw U.error("No tenés permiso de recepción.", 403);
+  if (!puedeGestionarReservas(actor)) throw U.error("No tenés permiso de recepción.", 403);
   const codigos = serviciosDe(predio);
   if (!codigos.length) throw U.error("Este predio no tiene servicios asignados.", 403);
   try {
