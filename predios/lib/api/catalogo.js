@@ -14,7 +14,7 @@ const { gtinValido, proximidadCodigo } = require("../codigo-barras");
 const { resolverRevisionProducto } = require("../precios");
 const { revisarProducto: revisarStockMinimoProducto, bloquearStockProducto } = require("../stock-minimo");
 const { turnoUsuario } = require("../turnos-caja");
-const { exigirAdmin, esAdmin, bocasDe, exigirPuesto, exigirBoca } = require("./comun");
+const { ROLES_GESTION_CAJA, exigirAdmin, esAdmin, esSupervisor, bocasDe, exigirPuesto, exigirBoca } = require("./comun");
 
 const DESTINOS_VALIDOS = DESTINOS.map((d) => d.valor);
 
@@ -35,6 +35,8 @@ async function opciones(ctx) {
   const fuente = ctx.params.fuente;
   const db = ctx.db;
   const pid = ctx.pid;
+  const supervisor = esSupervisor(ctx);
+  const asignadas = supervisor ? bocasDe(ctx) : [];
   switch (fuente) {
     case "bocas":
     case "bocas_origen":
@@ -47,7 +49,8 @@ async function opciones(ctx) {
       const filas = await db.all(
         `SELECT b.id, b.nombre, b.es_origen, b.es_destino, b.es_almacen, b.margen_venta FROM predio_boca b
          WHERE b.predio_id = ? AND b.activo = 1${extra} ORDER BY b.nombre`, [pid]);
-      return filas.map((f) => ({ valor: f.id, texto: f.nombre, es_origen: !!Number(f.es_origen), es_destino: !!Number(f.es_destino),
+      return filas.filter(f => !supervisor || fuente !== "bocas_venta" || asignadas.includes(Number(f.id)))
+        .map((f) => ({ valor: f.id, texto: f.nombre, es_origen: !!Number(f.es_origen), es_destino: !!Number(f.es_destino),
         es_almacen: !!Number(f.es_almacen), margen_venta: esAdmin(ctx) ? f.margen_venta : undefined }));
     }
     case "cajas": {
@@ -55,7 +58,8 @@ async function opciones(ctx) {
         `SELECT c.id, c.nombre, c.boca_id, b.nombre AS boca FROM predio_caja c
          JOIN predio_boca b ON b.predio_id = c.predio_id AND b.id = c.boca_id
          WHERE c.predio_id = ? AND c.activo = 1 ORDER BY b.nombre, c.nombre`, [pid]);
-      return filas.map((f) => ({ valor: f.id, texto: `${f.boca} · ${f.nombre}`, boca_id: f.boca_id }));
+      return filas.filter(f => !supervisor || asignadas.includes(Number(f.boca_id)))
+        .map((f) => ({ valor: f.id, texto: `${f.boca} · ${f.nombre}`, boca_id: f.boca_id }));
     }
     case "proveedores": {
       const filas = await db.all(
@@ -72,7 +76,10 @@ async function opciones(ctx) {
       }));
     }
     case "usuarios": {
-      const filas = await db.all("SELECT id, nombre FROM predio_usuario WHERE predio_id = ? ORDER BY nombre", [pid]);
+      if (supervisor && !asignadas.length) return [];
+      const filtro = supervisor ? `AND EXISTS (SELECT 1 FROM predio_venta v WHERE v.predio_id = u.predio_id
+        AND v.usuario_id = u.id AND v.boca_id IN (${db.lista(asignadas.length)}))` : "";
+      const filas = await db.all(`SELECT u.id, u.nombre FROM predio_usuario u WHERE u.predio_id = ? ${filtro} ORDER BY u.nombre`, [pid, ...asignadas]);
       return filas.map((f) => ({ valor: f.id, texto: f.nombre }));
     }
     case "departamentales": {
@@ -540,8 +547,9 @@ async function guardarCaja(ctx) {
 }
 
 async function detalleCaja(ctx) {
-  exigirAdmin(ctx);
-  return { caja: await N.exigir(ctx.db, ctx, "predio_caja", U.id(ctx.params.id), "No encontramos la caja") };
+  const caja = await N.exigir(ctx.db, ctx, "predio_caja", U.id(ctx.params.id), "No encontramos la caja");
+  exigirBoca(ctx, caja.boca_id);
+  return { caja };
 }
 
 async function detalleBoca(ctx) {
@@ -570,7 +578,7 @@ async function guardarUsuario(ctx) {
   const datos = {
     usuario: U.texto(b.usuario, { max: 60, min: 3, campo: "El usuario", requerido: true }).toLowerCase().replace(/\s+/g, ""),
     nombre: U.texto(b.nombre, { max: 120, campo: "El nombre", requerido: true }),
-    rol: U.opcion(b.rol || "CAJERO", ["ADMIN", "CAJERO", "SEGURIDAD"], "El rol"),
+    rol: U.opcion(b.rol || "CAJERO", ["ADMIN", "CAJERO", "SUPERVISOR", "SEGURIDAD"], "El rol"),
   };
   if (!/^[a-z0-9._-]+$/.test(datos.usuario)) throw U.error("El usuario sólo puede tener letras, números, punto, guion o guion bajo");
   const seguridad = datos.rol === "SEGURIDAD";
@@ -578,7 +586,7 @@ async function guardarUsuario(ctx) {
     if (seguridad || b[permiso] !== undefined) datos[permiso] = seguridad ? 0 : U.bool(b[permiso]);
   }
   if (b.activo !== undefined) datos.activo = U.bool(b.activo);
-  const bocas = !seguridad && Array.isArray(b.bocas) ? [...new Set(b.bocas.map((x) => U.id(x, "La boca")))] : [];
+  let bocas = !seguridad && Array.isArray(b.bocas) ? [...new Set(b.bocas.map((x) => U.id(x, "La boca")))] : [];
   if (datos.rol === "CAJERO" && !bocas.length) throw U.error("Asigná al menos una boca al usuario");
   const password = b.password ? String(b.password) : "";
   if (!ctx.hashClaveValidada && (password || !id)) clavesUsuario.validarNueva(password, datos.usuario);
@@ -590,8 +598,18 @@ async function guardarUsuario(ctx) {
     const dup = await t.get("SELECT id FROM predio_usuario WHERE predio_id = ? AND usuario = ? AND id <> ?", [ctx.pid, datos.usuario, id || -1]);
     if (dup) throw U.error("Ese nombre de usuario ya existe", 409);
     let usuarioId = id;
+    const antes = id ? await N.exigir(t, ctx, "predio_usuario", id, "No encontramos el usuario", { bloquear: true }) : null;
+    if (datos.rol === "SUPERVISOR") {
+      if (antes?.rol !== "SUPERVISOR") {
+        for (const permiso of ["gestionar_reservas", "puede_anular_ticket"]) {
+          if (datos[permiso] === undefined) datos[permiso] = 1;
+        }
+        if (b.bocas === undefined) bocas = (await t.all("SELECT id FROM predio_boca WHERE predio_id = ? AND activo = 1", [ctx.pid])).map(f => Number(f.id));
+      } else if (b.bocas === undefined) {
+        bocas = (await t.all("SELECT boca_id FROM predio_usuario_boca WHERE predio_id = ? AND usuario_id = ?", [ctx.pid, id])).map(f => Number(f.boca_id));
+      }
+    }
     if (id) {
-      const antes = await N.exigir(t, ctx, "predio_usuario", id, "No encontramos el usuario", { bloquear: true });
       if (Number(antes.es_admin_general) === 1) throw U.error("Los administradores del sistema general se gestionan desde el sistema general", 409);
       if (Number(ctx.usuario.id) === id && datos.activo === 0) throw U.error("No podés deshabilitar tu propio usuario", 409);
       if (seguridad && antes.rol !== datos.rol && await turnoUsuario(t, ctx.pid, id)) {
@@ -628,6 +646,7 @@ const CLAVES_CONFIG = ["nombre_predio", "razon_social", "cuit", "direccion", "le
   "iibb", "inicio_actividades", "condicion_iva", "domicilio_legal", "telefono", "correo", "leyenda_comprobante"];
 
 async function verConfig(ctx) {
+  if (esSupervisor(ctx)) exigirAdmin(ctx);
   const config = await N.leerConfig(ctx.db, ctx);
   return { config };
 }
@@ -666,7 +685,7 @@ module.exports = {
     { m: "GET", p: "/bocas/:id", h: detalleBoca, roles: ["ADMIN"] },
     { m: "POST", p: "/bocas", h: guardarBoca, escritura: true, roles: ["ADMIN"] },
     { m: "PUT", p: "/bocas/:id", h: guardarBoca, escritura: true, roles: ["ADMIN"] },
-    { m: "GET", p: "/cajas/:id", h: detalleCaja, roles: ["ADMIN"] },
+    { m: "GET", p: "/cajas/:id", h: detalleCaja, roles: ROLES_GESTION_CAJA },
     { m: "POST", p: "/cajas", h: guardarCaja, escritura: true, roles: ["ADMIN"] },
     { m: "PUT", p: "/cajas/:id", h: guardarCaja, escritura: true, roles: ["ADMIN"] },
     { m: "GET", p: "/usuarios/:id", h: detalleUsuario, roles: ["ADMIN"] },

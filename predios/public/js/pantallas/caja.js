@@ -1,6 +1,6 @@
-/* Caja: saldo de apertura (lo carga el administrador y lo confirma el cajero), ajustes,
+/* Caja: saldo de apertura (lo carga quien gestiona la caja y lo confirma el cajero), ajustes,
    cierres y movimientos. El cajero hace un cierre temporal (dos bolsas con su ticket).
-   El cierre definitivo lo hace siempre un administrador desde su cuenta. */
+   El cierre definitivo lo hace un administrador o supervisor desde su cuenta. */
 (function () {
   "use strict";
   if (window.__SIN_SOPORTE) return;
@@ -121,7 +121,7 @@
     if (P.puesto() && Number(P.puesto().caja_id) === Number(cajaId)) {
       P.estado.sesion.puesto = null;
       P.repintarMarco();
-      P.ruta.ir(P.esAdmin() ? "/caja" : "/puesto");
+      P.ruta.ir(P.puedeGestionarCajas() ? "/caja" : "/puesto");
     }
   }
 
@@ -135,7 +135,7 @@
         h("div.cierre-bolsas",
           h("div.cierre-bolsa", h("span", "Bolsa 1 · Recaudación"), h("strong.dinero", P.f.pesos(c.efectivo_ventas))),
           h("div.cierre-bolsa", h("span", "Bolsa 2 · Cambio"), h("strong.dinero", P.f.pesos(c.efectivo_cambio)))),
-        P.mensaje("Guardá cada bolsa con su ticket. Un administrador las va a recibir y hacer el cierre definitivo. La caja quedó libre y en $ 0: quien sigue abre su propio turno, sin mezclar nada con el tuyo, y el administrador le carga el cambio (puede hacerlo a distancia).", "ok")),
+        P.mensaje("Guardá cada bolsa con su ticket. Administración o Supervisión las va a recibir y hacer el cierre definitivo. La caja quedó libre y en $ 0: quien sigue abre su propio turno y recibe su propio saldo de apertura.", "ok")),
       acciones: [
         P.btn("Reimprimir tickets", { tipo: "suave", icono: "imprimir", onclick: function () { P.imprimirCierre(d, { bolsas: true }).catch(P.error); } }),
         P.btn("Elegir otra caja", { tipo: "secundario", onclick: function () { m.cerrar(); P.ruta.ir("/puesto"); } }),
@@ -145,9 +145,9 @@
   }
 
   P.cerrarCaja = function (cajaId, alTerminar) {
-    var esAdmin = P.esAdmin();
+    var definitivo = P.puedeGestionarCajas();
     return P.get("/caja/cierre/previa" + P.qs({ caja_id: cajaId })).then(function (r) {
-      if (!esAdmin && !r.puede_temporal) { P.aviso("La caja la cierra quien la está atendiendo, desde su turno.", "info"); return; }
+      if (!definitivo && !r.puede_temporal) { P.aviso("El cierre temporal se hace desde tu turno.", "info"); return; }
       var s = r.resumen;
       var ef = s.efectivo;
       var obs = P.input({ max: 250, placeholder: "Opcional" });
@@ -155,7 +155,7 @@
       var formulario;
       var botonCierre;
 
-      if (esAdmin) {
+      if (definitivo) {
         var contado = P.dinero({ placeholder: "Contá el efectivo" });
         var queda = P.dinero({ valor: "0", placeholder: "0" });
         var diferencia = h("div");
@@ -165,7 +165,7 @@
           diferencia,
           P.campo("Queda en caja para el próximo turno", h("div.campo-con-prefijo", h("span", "$"), queda), { ayuda: "Lo demás se registra como retiro de la recaudación." }),
           Number(ef.esperado_cambio) > 0 ? h("div", P.btn("Dejar el cambio en la caja (" + P.f.pesos(ef.esperado_cambio) + ")", { tipo: "texto", chico: true, onclick: function () { queda.value = aEntrada(ef.esperado_cambio); } })) : null);
-        botonCierre = P.btn("Cerrar caja e imprimir", { tipo: "primario", icono: "imprimir", onclick: function (ev) {
+        botonCierre = P.btn("Cerrar definitivamente e imprimir", { tipo: "primario", icono: "imprimir", onclick: function (ev) {
           var c = P.numeroDe(contado.value);
           if (isNaN(c)) { contado.classList.add("invalido"); contado.focus(); return; }
           P.ejecutar(ev.currentTarget, function () {
@@ -192,7 +192,7 @@
         bolsaVentas.addEventListener("input", calcularTemporal);
         bolsaCambio.addEventListener("input", calcularTemporal);
         formulario = h("div.columna",
-          P.mensaje("Separá el efectivo en dos bolsas: lo cobrado y el cambio. Se imprime un ticket para cada bolsa y el resumen del cierre. Cuando las recibe, el administrador hace el cierre definitivo desde su cuenta.", "info"),
+          P.mensaje("Separá lo cobrado y el cambio en dos bolsas. Se imprime un ticket para cada bolsa y el resumen del cierre. Administración o Supervisión hace el cierre definitivo cuando las recibe.", "info"),
           P.campo("Bolsa 1 · Recaudación (ventas y cobros)", h("div.campo-con-prefijo.campo-grande", h("span", "$"), bolsaVentas),
             { requerido: true, ayuda: "El sistema espera " + P.f.pesos(ef.esperado_ventas) + (Number(ef.retiros) ? ", ya descontados los retiros." : ".") }),
           difVentas,
@@ -218,7 +218,7 @@
       }
 
       var m = P.modal({
-        titulo: (esAdmin ? "Cerrar caja · " : "Cierre temporal · ") + r.caja.nombre,
+        titulo: (definitivo ? "Cerrar caja · " : "Cierre temporal · ") + r.caja.nombre,
         subtitulo: s.ultimo_cierre ? "Desde el cierre N° " + s.ultimo_cierre.id + " (" + P.f.fechaHora(s.ultimo_cierre.fecha) + ")" : "Primer cierre de esta caja",
         ancho: "ancha",
         contenido: h("div.grilla.grilla-2",
@@ -232,7 +232,7 @@
     }).catch(P.error);
   };
 
-  // El administrador recibe las bolsas de un cierre temporal y lo cierra en forma definitiva.
+  // Recepción de bolsas y confirmación de un cierre temporal.
   P.recibirTemporal = function (c, alTerminar) {
     var recVentas = P.dinero({ placeholder: "Contá la bolsa" });
     var recCambio = P.dinero({ placeholder: "Contá la bolsa" });
@@ -294,7 +294,7 @@
     return m;
   };
 
-  // Lista de cierres temporales que esperan las bolsas (panel de caja del administrador).
+  // Lista de cierres temporales que esperan que se reciban las bolsas.
   function seccionTemporales(temporales, alTerminar) {
     if (!temporales.length) return null;
     return h("section.hoja.hoja-cuerpo.cierres-temporales",
@@ -340,7 +340,7 @@
       var nombre = r.boca.nombre + " · " + r.caja.nombre;
       var esPropia = P.puesto() && Number(P.puesto().caja_id) === Number(cajaId);
       var caja = [{ valor: cajaId, texto: nombre }];
-      var acciones = [P.btn("Mis ventas", { tipo: "suave", chico: true, icono: "lista", onclick: function () { P.ruta.ir(desdePanel ? "/caja/" + cajaId + "/ventas" : "/mis-ventas"); } })];
+      var acciones = [P.btn(desdePanel ? "Ventas de la caja" : "Mis ventas", { tipo: "suave", chico: true, icono: "lista", onclick: function () { P.ruta.ir(desdePanel ? "/caja/" + cajaId + "/ventas" : "/mis-ventas"); } })];
       if (desdePanel) {
         registrarFormulariosCaja(function () { return caja; }, refrescar);
         acciones.push(
@@ -349,7 +349,7 @@
       } else {
         acciones.push(P.btn("Ver saldo de apertura", { tipo: "suave", chico: true, icono: "efectivo", onclick: function () { P.verificarApertura(true); } }));
       }
-      acciones.push(P.btn(P.esAdmin() ? "Cerrar caja" : "Cierre temporal", { tipo: "primario", icono: "candado", onclick: function () { P.cerrarCaja(cajaId, refrescar); } }));
+      acciones.push(P.btn(P.puedeGestionarCajas() ? "Cerrar caja" : "Cierre temporal", { tipo: "primario", icono: "candado", onclick: function () { P.cerrarCaja(cajaId, refrescar); } }));
       c.appendChild(P.cabeceraConAcciones(esPropia ? "Mi caja" : "Caja", esPropia ? null : nombre, acciones));
       mostrarCifras(r);
       c.appendChild(cifras);
@@ -365,9 +365,9 @@
     return detalleCaja(c, puesto.caja_id, false);
   }, { titulo: "Mi caja", local: true });
 
-  P.ruta.registrar(/^\/caja\/(\d+)$/, function (c, params) { return detalleCaja(c, Number(params[0]), true); }, { admin: true, titulo: "Caja" });
+  P.ruta.registrar(/^\/caja\/(\d+)$/, function (c, params) { return detalleCaja(c, Number(params[0]), true); }, { cajas: true, titulo: "Caja" });
 
-  // ------------------------------------------------------------------ caja del administrador
+  // ------------------------------------------------------------------ panel de cajas
   function registrarFormulariosCaja(opciones, alTerminar) {
     function reabrir(formulario) {
       return function (datos) {
@@ -483,8 +483,8 @@
             ci.observaciones ? h("div.texto-3", ci.observaciones) : null)),
         acciones: [
           temporal ? P.btn("Tickets de las bolsas", { tipo: "suave", icono: "imprimir", onclick: function () { P.imprimirCierre(d, { resumen: false, bolsas: true }).catch(P.error); } }) : null,
-          P.btn("Imprimir resumen", { tipo: pendiente && P.esAdmin() ? "secundario" : "primario", icono: "imprimir", onclick: function () { P.imprimirCierre(d).catch(P.error); } }),
-          pendiente && P.esAdmin() ? P.btn("Hacer el cierre definitivo", { tipo: "primario", icono: "check", onclick: function () {
+          P.btn("Imprimir resumen", { tipo: pendiente && P.puedeGestionarCajas() ? "secundario" : "primario", icono: "imprimir", onclick: function () { P.imprimirCierre(d).catch(P.error); } }),
+          pendiente && P.puedeGestionarCajas() ? P.btn("Hacer el cierre definitivo", { tipo: "primario", icono: "check", onclick: function () {
             m.cerrar();
             P.recibirTemporal(Object.assign({}, ci, { efectivo: d.efectivo }), alCambiar);
           } }) : null,
@@ -521,7 +521,10 @@
         cajasOp = r[1];
         registrarFormulariosCaja(function () { return cajasOp; }, refrescar);
         P.reemplazar(zonaTemporales, seccionTemporales(r[0].temporales || [], refrescar));
-        if (!r[0].cajas.length) { P.reemplazar(tarjetas, P.vacio("caja", "No hay cajas", "Creá las cajas de cada boca en Gestión > Bocas y cajas.")); return; }
+        if (!r[0].cajas.length) {
+          P.reemplazar(tarjetas, P.vacio("caja", "No hay cajas disponibles", P.esAdmin() ? "Creá las cajas de cada boca en Gestión > Bocas y cajas." : "Se muestran las cajas activas de las bocas que tenés asignadas."));
+          return;
+        }
         P.reemplazar(tarjetas, r[0].cajas.map(function (cj) {
           var ap = cj.apertura;
           var cajaElegida = [{ valor: cj.id, texto: cj.boca + " · " + cj.nombre }];
@@ -544,5 +547,5 @@
     pintarTabla();
     P.intervalo(function () { cargarTarjetas().catch(function () {}); }, 20000);
     return cargarTarjetas();
-  }, { admin: true, titulo: "Caja" });
+  }, { cajas: true, titulo: "Caja" });
 })();

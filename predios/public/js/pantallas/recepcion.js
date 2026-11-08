@@ -233,7 +233,7 @@
       cajasCargadas = true;
       P.opciones("cajas").then(function (xs) {
         var asignada = P.puesto() && P.puesto().caja_id;
-        if (!P.esAdmin()) xs = xs.filter(function (x) { return asignada && String(x.valor) === String(asignada); });
+        if (!P.puedeGestionarCajas()) xs = xs.filter(function (x) { return asignada && String(x.valor) === String(asignada); });
         var preferida = borrador.caja_id || asignada || (xs.length === 1 ? xs[0].valor : "");
         opSelect(caja, xs, preferida, "Elegí una caja");
         borrador.caja_id = caja.value;
@@ -265,7 +265,7 @@
         var accion = hayMovimientos ? resolver.value : undefined;
         if (hayMovimientos && !accion) { resolver.focus(); throw Error("Elegí si se cobra ahora o se traslada la deuda."); }
         if (!campoMedio.hidden && !medio.value) { medio.focus(); throw Error("Elegí cómo se registra el pago."); }
-        if (!campoCaja.hidden && !caja.value) { caja.focus(); throw Error(P.esAdmin() ? "Elegí una caja para registrar el efectivo." : "Ingresá a tu caja para registrar el efectivo de recepción."); }
+        if (!campoCaja.hidden && !caja.value) { caja.focus(); throw Error(P.puedeGestionarCajas() ? "Elegí una caja para registrar el efectivo." : "Ingresá a tu caja para registrar el efectivo de recepción."); }
         var sinElegir = elegirVehiculos && selectsVehiculo.filter(function (x) { return !x.control.value; })[0];
         if (sinElegir) { sinElegir.control.focus(); throw Error("Indicá si el vehículo " + sinElegir.vehiculo.patente + " se va o permanece en el predio."); }
         return { accion: accion, medio: campoMedio.hidden ? undefined : medio.value, caja_id: campoCaja.hidden ? undefined : caja.value,
@@ -1067,7 +1067,7 @@
       campoCaja = P.campo("Caja de efectivo", caja);
     var cargarCajas = !repartir && (!liquidar || n) ? P.opciones("cajas").then(function (xs) {
       var asignada = P.puesto() && P.puesto().caja_id;
-      if (!P.esAdmin()) xs = xs.filter(function (x) { return asignada && String(x.valor) === String(asignada); });
+      if (!P.puedeGestionarCajas()) xs = xs.filter(function (x) { return asignada && String(x.valor) === String(asignada); });
       xs.forEach(function (x) {
         caja.appendChild(h("option", {
           value: x.valor
@@ -1096,7 +1096,7 @@
           if (!(importe > 0)) { imp.focus(); throw Error("Ingresá un importe mayor que cero, con hasta dos decimales."); }
           if (accion !== "CARGA" && importe > Number(persona(origen).saldo)) { imp.focus(); throw Error("El saldo disponible no alcanza."); }
         }
-        if (!campoCaja.hidden && !caja.value) { caja.focus(); throw Error(P.esAdmin() ? "Elegí la caja donde se registra el efectivo." : "Ingresá a tu caja para registrar el efectivo de recepción."); }
+        if (!campoCaja.hidden && !caja.value) { caja.focus(); throw Error(P.puedeGestionarCajas() ? "Elegí la caja donde se registra el efectivo." : "Ingresá a tu caja para registrar el efectivo de recepción."); }
         return P.post("/recepcion/" + r.id + "/cuenta", {
           operacion: key,
           accion: accion,

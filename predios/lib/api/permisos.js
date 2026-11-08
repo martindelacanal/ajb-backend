@@ -9,13 +9,21 @@ const { listarAvisos, historialAvisos, leerAviso } = require("../avisos");
 const { revisarPreciosVencidos } = require("../precios");
 const { revisarStockMinimo } = require("../stock-minimo");
 const { TIPOS_PERMISO, textoDe } = require("../listados");
-const { exigirAdmin, esAdmin, bocasDe, exigirPuesto } = require("./comun");
+const { exigirAdmin, esAdmin, esSupervisor, bocasDe, exigirPuesto, puedeGestionarCajas, puedeGestionarReservas, ROLES_GESTION_CAJA } = require("./comun");
 const { verificarAdministrador } = require("./sesion");
 const { anularVenta, solicitarAnulacion } = require("./ventas");
 const { turismo } = require("./recepcion");
 
 const TIPOS = TIPOS_PERMISO.map((t) => t.valor);
-const { APERTURA_VIGENTE } = require("./caja");
+const { APERTURA_VIGENTE, alcanceCajas } = require("./caja");
+
+function supervisaAnulaciones(ctx) {
+  return esSupervisor(ctx) && Number(ctx.usuario.puede_anular_ticket) === 1;
+}
+
+function puedeResolver(ctx, pedido) {
+  return esAdmin(ctx) || supervisaAnulaciones(ctx) && pedido.tipo === "ANULAR_VENTA" && bocasDe(ctx).includes(Number(pedido.boca_id));
+}
 
 async function pedir(ctx) {
   if (esAdmin(ctx)) throw U.error("Como administrador no necesitás pedir autorización");
@@ -45,17 +53,17 @@ async function pedir(ctx) {
 async function verPermiso(ctx) {
   const id = U.id(ctx.params.id);
   const p = await N.exigir(ctx.db, ctx, "predio_permiso", id, "No encontramos el pedido");
-  if (!esAdmin(ctx) && Number(p.usuario_id) !== Number(ctx.usuario.id)) throw U.error("No tenés acceso a este pedido", 403);
+  if (!puedeResolver(ctx, p) && Number(p.usuario_id) !== Number(ctx.usuario.id)) throw U.error("No tenés acceso a este pedido", 403);
   const vencido = p.estado === "APROBADO" && p.vence && p.vence < U.fechaHora();
   return { permiso: { ...p, estado: vencido ? "VENCIDO" : p.estado } };
 }
 
 async function resolver(ctx) {
-  exigirAdmin(ctx);
   const id = U.id(ctx.params.id);
   const aprobar = ctx.body.aprobar === true || ctx.body.aprobar === 1 || ctx.body.aprobar === "1";
   if (aprobar) {
     const pedido = await N.exigir(ctx.db, ctx, "predio_permiso", id, "No encontramos el pedido");
+    if (!puedeResolver(ctx, pedido)) throw U.error("No tenés permiso para resolver este pedido", 403);
     if (pedido.tipo === "ANULAR_VENTA") {
       const resultado = await anularVenta(ctx, pedido);
       return { ...resultado, venta_id: resultado.id, id: pedido.id };
@@ -63,11 +71,13 @@ async function resolver(ctx) {
   }
   return ctx.db.tx(async (t) => {
     const p = await N.exigir(t, ctx, "predio_permiso", id, "No encontramos el pedido", { bloquear: true });
+    if (!puedeResolver(ctx, p)) throw U.error("No tenés permiso para resolver este pedido", 403);
     if (p.estado !== "PENDIENTE") throw U.error("Ese pedido ya fue resuelto", 409);
     const config = await N.leerConfig(t, ctx);
     const ahora = new Date();
     await N.actualizar(t, ctx, "predio_permiso", id, {
-      estado: aprobar ? "APROBADO" : "RECHAZADO", resuelto_por: N.nombreActor(ctx), resuelto_fecha: U.fechaHora(ahora), metodo: "REMOTO",
+      estado: aprobar ? "APROBADO" : "RECHAZADO", resuelto_por: N.nombreActor(ctx), resuelto_fecha: U.fechaHora(ahora),
+      metodo: esSupervisor(ctx) ? "SUPERVISOR" : "REMOTO",
       vence: aprobar ? U.fechaHora(new Date(ahora.getTime() + Number(config.minutos_permiso || 30) * 60000)) : null,
     });
     await N.auditar(t, ctx, aprobar ? "Autorización aprobada" : "Autorización rechazada", "permiso", id, { tipo: p.tipo, usuario: p.usuario_nombre });
@@ -112,24 +122,35 @@ async function avisos(ctx) {
   salida.recientes = historial.filas;
   salida.notificaciones_total = historial.total;
   salida.notificaciones_no_leidas = historial.no_leidas;
-  if (esAdmin(ctx)) {
+  if (esAdmin(ctx) || supervisaAnulaciones(ctx)) {
+    const alcance = alcanceCajas(ctx, "x.boca_id");
+    const tipo = esAdmin(ctx) ? "" : " AND x.tipo = 'ANULAR_VENTA'";
     salida.permisos = await db.all(
       `SELECT x.id, x.tipo, x.referencia_id, x.usuario_nombre, x.detalle, x.fecha_solicitud, b.nombre AS boca, c.nombre AS caja
        FROM predio_permiso x LEFT JOIN predio_boca b ON b.predio_id = x.predio_id AND b.id = x.boca_id
        LEFT JOIN predio_caja c ON c.predio_id = x.predio_id AND c.id = x.caja_id
-       WHERE x.predio_id = ? AND x.estado = 'PENDIENTE' ORDER BY x.id DESC LIMIT 30`, [pid]);
-    const d = await db.get("SELECT COUNT(*) AS n FROM predio_solicitud WHERE predio_id = ? AND estado = 'PENDIENTE'", [pid]);
-    const r = await db.get("SELECT COUNT(*) AS n FROM predio_solicitud WHERE predio_id = ? AND estado = 'DESPACHADA'", [pid]);
-    salida.solicitudes_despachar = Number(d.n);
-    salida.solicitudes_recibir = Number(r.n);
+       WHERE x.predio_id = ? AND x.estado = 'PENDIENTE'${tipo}${alcance.sql} ORDER BY x.id DESC LIMIT 30`, [pid, ...alcance.params]);
+  }
+  if (puedeGestionarCajas(ctx)) {
+    const alcanceAperturas = alcanceCajas(ctx, "c.boca_id");
+    const alcanceTemporales = alcanceCajas(ctx, "boca_id");
     salida.aperturas = await db.all(
       `SELECT a.id, a.caja_id, a.importe, a.verificado_por, a.observacion, c.nombre AS caja, b.nombre AS boca
        FROM predio_apertura a JOIN predio_caja c ON c.predio_id = a.predio_id AND c.id = a.caja_id
        JOIN predio_boca b ON b.predio_id = c.predio_id AND b.id = c.boca_id
        WHERE a.predio_id = ? AND a.fecha = COALESCE((SELECT SUBSTR(t.inicio,1,10) FROM predio_turno t
-          WHERE t.predio_id=a.predio_id AND t.caja_id=a.caja_id AND t.estado='ABIERTO' ORDER BY t.id DESC LIMIT 1), ?) AND a.verificacion = 'NO_COINCIDE' AND ${APERTURA_VIGENTE}`, [pid, hoy]);
-    const temporales = await db.get("SELECT COUNT(*) AS n FROM predio_cierre WHERE predio_id = ? AND tipo = 'TEMPORAL' AND estado = 'PENDIENTE'", [pid]);
+          WHERE t.predio_id=a.predio_id AND t.caja_id=a.caja_id AND t.estado='ABIERTO' ORDER BY t.id DESC LIMIT 1), ?) AND a.verificacion = 'NO_COINCIDE' AND ${APERTURA_VIGENTE}${alcanceAperturas.sql}`,
+      [pid, hoy, ...alcanceAperturas.params]);
+    const temporales = await db.get(
+      `SELECT COUNT(*) AS n FROM predio_cierre WHERE predio_id = ? AND tipo = 'TEMPORAL' AND estado = 'PENDIENTE'${alcanceTemporales.sql}`,
+      [pid, ...alcanceTemporales.params]);
     salida.cierres_temporales = Number(temporales.n);
+  }
+  if (esAdmin(ctx)) {
+    const d = await db.get("SELECT COUNT(*) AS n FROM predio_solicitud WHERE predio_id = ? AND estado = 'PENDIENTE'", [pid]);
+    const r = await db.get("SELECT COUNT(*) AS n FROM predio_solicitud WHERE predio_id = ? AND estado = 'DESPACHADA'", [pid]);
+    salida.solicitudes_despachar = Number(d.n);
+    salida.solicitudes_recibir = Number(r.n);
     const v = await db.get(
       `SELECT COUNT(*) AS n FROM predio_producto p WHERE p.predio_id = ? AND ${require("../vencimientos").condicionVencimiento(db.dialecto, "?")}`,
       [pid, hoy]);
@@ -229,33 +250,38 @@ async function estadisticas(ctx) {
   };
 }
 
-// Resumen del día para la portada del administrador.
+// Resumen del día para quienes gestionan cajas, o del turno para un cajero.
 async function inicio(ctx) {
   const db = ctx.db;
   const pid = ctx.pid;
   const hoy = U.hoy();
-  if (!esAdmin(ctx)) {
+  if (!puedeGestionarCajas(ctx)) {
     const s = exigirPuesto(ctx);
     const r = await db.get("SELECT COUNT(*) AS n, COALESCE(SUM(total), 0) AS t FROM predio_venta WHERE predio_id = ? AND turno_id = ? AND estado = 'CONFIRMADA'", [pid, s.turno_id || -1]);
     return { turno: { ventas: Number(r.n), total: U.redondear(Number(r.t)) } };
   }
+  const alcance = alcanceCajas(ctx, "v.boca_id");
+  const alcanceEfectivo = alcanceCajas(ctx, "m.boca_id");
   const ventas = await db.get(
-    "SELECT COUNT(*) AS n, COALESCE(SUM(total), 0) AS t FROM predio_venta WHERE predio_id = ? AND estado = 'CONFIRMADA' AND fecha >= ?", [pid, hoy]);
+    `SELECT COUNT(*) AS n, COALESCE(SUM(v.total), 0) AS t FROM predio_venta v
+     WHERE v.predio_id = ? AND v.estado = 'CONFIRMADA' AND v.fecha >= ?${alcance.sql}`, [pid, hoy, ...alcance.params]);
   const porBoca = await db.all(
     `SELECT b.nombre AS boca, COUNT(*) AS ventas, COALESCE(SUM(v.total), 0) AS total FROM predio_venta v
      JOIN predio_boca b ON b.predio_id = v.predio_id AND b.id = v.boca_id
-     WHERE v.predio_id = ? AND v.estado = 'CONFIRMADA' AND v.fecha >= ? GROUP BY b.nombre ORDER BY total DESC`, [pid, hoy]);
-  const enPredio = await db.get(
-    "SELECT COUNT(DISTINCT afiliado_id) AS n FROM predio_estadia WHERE predio_id = ? AND activo = 1 AND fecha_inicio <= ? AND fecha_fin >= ?", [pid, hoy, hoy]);
+     WHERE v.predio_id = ? AND v.estado = 'CONFIRMADA' AND v.fecha >= ?${alcance.sql} GROUP BY b.nombre ORDER BY total DESC`,
+    [pid, hoy, ...alcance.params]);
+  const enPredio = puedeGestionarReservas(ctx.usuario) ? await db.get(
+    "SELECT COUNT(DISTINCT afiliado_id) AS n FROM predio_estadia WHERE predio_id = ? AND activo = 1 AND fecha_inicio <= ? AND fecha_fin >= ?", [pid, hoy, hoy]) : null;
   const efectivo = await db.get(
-    "SELECT COALESCE(SUM(CASE WHEN tipo = 'INGRESO' THEN importe ELSE -importe END), 0) AS s FROM predio_caja_movimiento WHERE predio_id = ?", [pid]);
+    `SELECT COALESCE(SUM(CASE WHEN m.tipo = 'INGRESO' THEN m.importe ELSE -m.importe END), 0) AS s
+     FROM predio_caja_movimiento m WHERE m.predio_id = ?${alcanceEfectivo.sql}`, [pid, ...alcanceEfectivo.params]);
   const ultimas = await db.all(
     `SELECT v.id, v.fecha, v.total, v.forma_pago, v.afiliado_nombre, b.nombre AS boca FROM predio_venta v
      JOIN predio_boca b ON b.predio_id = v.predio_id AND b.id = v.boca_id
-     WHERE v.predio_id = ? AND v.estado = 'CONFIRMADA' ORDER BY v.id DESC LIMIT 8`, [pid]);
+     WHERE v.predio_id = ? AND v.estado = 'CONFIRMADA'${alcance.sql} ORDER BY v.id DESC LIMIT 8`, [pid, ...alcance.params]);
   return {
     hoy: { ventas: Number(ventas.n), total: U.redondear(Number(ventas.t)), por_boca: porBoca.map((b) => ({ ...b, total: U.redondear(Number(b.total)) })) },
-    afiliados_en_predio: Number(enPredio.n),
+    afiliados_en_predio: enPredio ? Number(enPredio.n) : null,
     efectivo_en_cajas: U.redondear(Number(efectivo.s)),
     ultimas_ventas: ultimas,
   };
@@ -265,7 +291,7 @@ module.exports = {
   rutas: [
     { m: "POST", p: "/permisos", h: pedir, escritura: true },
     { m: "GET", p: "/permisos/:id", h: verPermiso },
-    { m: "POST", p: "/permisos/:id/resolver", h: resolver, escritura: true, roles: ["ADMIN"] },
+    { m: "POST", p: "/permisos/:id/resolver", h: resolver, escritura: true, roles: ROLES_GESTION_CAJA },
     { m: "POST", p: "/permisos/presencial", h: aprobarPresencial, escritura: true, soloLocal: true },
     { m: "GET", p: "/avisos", h: avisos },
     { m: "GET", p: "/avisos/historial", h: historialAvisos },

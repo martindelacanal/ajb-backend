@@ -7,14 +7,15 @@
 // El QR identifica la reserva (no un vehículo): Seguridad ve sus vehículos, personas y deuda.
 const { randomBytes } = require("node:crypto");
 const U = require("../../predios/lib/util");
+const { puedeGestionarReservas } = require("../../predios/lib/api/comun");
 const { serviciosDe } = require("./predios-central");
 
 const lecturas = new Set(["vehiculos", "detalleVehiculo", "buscarVehiculoQr"]);
 const acciones = new Set([...lecturas, "emitirVehiculoQr", "retirarVehiculo"]);
-const gestiona = actor => actor?.rol === "ADMIN" || actor?.rol === "CAJERO" && Number(actor.gestionar_reservas) === 1;
-const puedeLeer = actor => ["ADMIN", "SEGURIDAD"].includes(actor?.rol);
+const gestionaVehiculos = actor => ["ADMIN", "SUPERVISOR"].includes(actor?.rol) && puedeGestionarReservas(actor);
+const puedeLeer = actor => actor?.rol === "SEGURIDAD" || gestionaVehiculos(actor);
 const permitir = (actor, accion) => lecturas.has(accion) ? puedeLeer(actor)
-  : accion === "emitirVehiculoQr" ? gestiona(actor) : accion === "retirarVehiculo" && actor?.rol === "ADMIN";
+  : accion === "emitirVehiculoQr" ? puedeGestionarReservas(actor) : accion === "retirarVehiculo" && gestionaVehiculos(actor);
 const tokenValido = /^[A-Za-z0-9_-]{32}$/;
 const MAX_VEHICULOS = 20;
 const todos = async (c, sql, params) => (await c.query(sql, params))[0];
@@ -217,6 +218,6 @@ async function operar(c, predio, actor, accion, b = {}, { detalle } = {}) {
 }
 
 module.exports = {
-  acciones, permitir, gestiona, operar, placa, vehiculosDe, vehiculoPresente, salidaAnterior,
+  acciones, permitir, gestiona: puedeGestionarReservas, operar, placa, vehiculosDe, vehiculoPresente, salidaAnterior,
   normalizarVehiculos, describirVehiculo, MAX_VEHICULOS
 };

@@ -151,7 +151,7 @@
   .rec-tabla td:last-child:nth-child(odd) { grid-column: 1 / -1; }
   .rec-etiqueta-movil { display: block; color: var(--texto-2); font-size: 12px; font-weight: 700; }
   .rec-valor { overflow-wrap: anywhere; }
-  .rec-tabla .tabla-texto-largo { min-width: 0; }
+  .rec-tabla td .tabla-texto { width: auto; max-width: 100%; }
   .rec-liquidacion th, .rec-liquidacion td { padding: 9px 10px; }
   .rec-liquidacion tfoot th, .rec-liquidacion tfoot td { font-size: 15.5px; }
   .rec-evento summary { padding: 10px 0; }

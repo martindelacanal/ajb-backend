@@ -27,6 +27,7 @@ const U = require("../../predios/lib/util");
 const clavesUsuario = require("../../predios/lib/claves-usuario");
 const apiPredio = require("../../predios/lib/api");
 const sesionPredio = require("../../predios/lib/api/sesion");
+const { puedeGestionarReservas } = require("../../predios/lib/api/comun");
 const { crearMysql } = require("../../predios/lib/db-mysql");
 const { TIPOS_PERMISO, textoDe } = require("../../predios/lib/listados");
 const { autenticarCuentaPredio, cerrarSesionPredio, esTokenPredio } = require("../security/predios-acceso");
@@ -137,6 +138,9 @@ function prepararOrden(actor, ruta, cuerpo, cuenta) {
     actor.capacidad = "cierre-clave-dia-v1";
     actor.clave_dia_cierre_validada = true;
   }
+  if (cuenta?.rol === "SUPERVISOR" || /^\/usuarios(?:\/\d+)?$/.test(ruta) && datos.rol === "SUPERVISOR") {
+    actor.capacidad = "supervisor-predio-v1";
+  }
   for (const secreto of ["clave", "admin_usuario", "admin_password"]) delete datos[secreto];
   if (ruta === "/sesion/clave") {
     actor.hash_clave_validada = clavesUsuario.hashDeCambio(cuenta, String(datos.actual || ""), datos.nueva);
@@ -184,15 +188,17 @@ function tokenBearer(req) {
 }
 
 function rolCuentaPredio(cuenta) {
-  return cuenta.rol === "predio_seguridad" ? "SEGURIDAD" : "ADMIN";
+  return cuenta.rol.slice("predio_".length).toUpperCase();
 }
 
 async function contextoCuentaPredio(db, predio, cuenta, ip = null) {
   const rol = rolCuentaPredio(cuenta);
-  const bocas = rol === "ADMIN" ? (await db.all("SELECT id FROM predio_boca WHERE predio_id = ? AND activo = 1", [predio.id])).map(b => Number(b.id)) : [];
+  const fila = rol === "SUPERVISOR" ? await db.get("SELECT gestionar_reservas, puede_anular_ticket FROM predio_usuario WHERE predio_id = ? AND id = ?", [predio.id, cuenta.id]) : null;
+  const usuario = sesionPredio.identidadUsuario({ ...cuenta, ...fila, rol });
+  const bocas = await sesionPredio.bocasUsuario(db, { pid: predio.id }, usuario);
   const base = { db, pid: predio.id, modo: "central", origen: "REMOTO", ip, servicios: {},
     revisarPreciosCentral: predio.escritor === "CENTRAL",
-    usuario: { id: Number(cuenta.id), usuario: cuenta.usuario, nombre: cuenta.nombre, rol, bocas, es_admin_general: false, debe_cambiar_clave: !!Number(cuenta.debe_cambiar_clave) }, sesion: {} };
+    usuario: { ...usuario, bocas }, sesion: {} };
   base.alAvisosPrecios = (t, filas) => entregarAvisos({ query: async (sql, params) => {
     if (/^\s*SELECT/i.test(sql)) return [await t.all(sql, params)];
     const r = await t.run(sql, params); return [{ insertId: r.insertId }];
@@ -205,7 +211,7 @@ async function contextoCuentaPredio(db, predio, cuenta, ip = null) {
 async function ejecutarComoCuentaPredio(res, predio, cuenta, token, { metodo, ruta, cuerpo, query, ip }) {
   const encontrada = apiPredio.buscarRuta(metodo, ruta);
   if (!encontrada) throw U.error("No encontramos esa operación", 404);
-  apiPredio.exigirPermisoSeguridad({ rol: rolCuentaPredio(cuenta) }, encontrada.ruta);
+  apiPredio.exigirPermisoRuta({ rol: rolCuentaPredio(cuenta) }, encontrada.ruta);
   if (encontrada.ruta.soloLocal) throw U.error("Esta operación se hace desde las PCs del camping", 409);
   if (!encontrada.ruta.escritura) {
     const db = crearMysql(pool(), { predioId: predio.id });
@@ -234,7 +240,10 @@ async function ejecutarComoCuentaPredio(res, predio, cuenta, token, { metodo, ru
       || !usuario || usuario.rol !== rolCuentaPredio(vigente) || Number(usuario.activo) !== 1 || Number(usuario.es_admin_general) === 1) throw U.error("Tu cuenta ya no tiene acceso a este predio", 401, { codigo: "SIN_SESION" });
     const p = C.normalizar(actual);
     clavesUsuario.exigirCambio(vigente, metodo, ruta);
-    apiPredio.exigirPermisoSeguridad(usuario, encontrada.ruta);
+    apiPredio.exigirPermisoRuta(usuario, encontrada.ruta);
+    if (usuario.rol === "SUPERVISOR" && ruta.startsWith("/recepcion/") && !puedeGestionarReservas(usuario)) {
+      throw U.error("Tu usuario no tiene permiso para gestionar reservas y estadías.", 403);
+    }
     if (p.escritor === "CENTRAL") {
       // Todo el negocio comparte la transacción que bloqueó la identidad; no
       // crea un usuario del sistema general ni abre transacciones anidadas.
@@ -464,6 +473,7 @@ function crearRouterAdmin() {
         comandos_estadia: serializadas.filter(c => c.actor?.capacidad === "recepcion-estadia-v3"),
         comandos_contable: serializadas.filter(c => c.actor?.capacidad === "contable-v1"),
         comandos_caja_temporal: serializadas.filter(c => c.actor?.capacidad === "caja-temporal-v1"),
+        comandos_supervisor: serializadas.filter(c => c.actor?.capacidad === "supervisor-predio-v1"),
       };
       if (req.query.codigo === "1") {
         const paquete = C.paqueteCodigo();
@@ -691,13 +701,14 @@ function crearRouterSync() {
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'recepcion-estadia-v3')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'contable-v1')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'caja-temporal-v1')
+             AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'supervisor-predio-v1')
            ORDER BY id LIMIT 20`, [p.id, capacidades.includes("cuentas-predio-v1") ? 1 : 0,
              capacidades.includes("precios-boca-v1") ? 1 : 0, capacidades.includes("stock-predio-v2") ? 1 : 0,
              capacidades.includes("operacion-predio-v2") ? 1 : 0, capacidades.includes("recepcion-alquileres-v1") ? 1 : 0,
              capacidades.includes("cierre-clave-dia-v1") ? 1 : 0, capacidades.includes("recepcion-salidas-v1") ? 1 : 0,
              capacidades.includes("recepcion-adicionales-v2") ? 1 : 0, capacidades.includes("recepcion-estadia-v3") ? 1 : 0,
              capacidades.includes("contable-v1") ? 1 : 0,
-             capacidades.includes("caja-temporal-v1") ? 1 : 0]);
+             capacidades.includes("caja-temporal-v1") ? 1 : 0, capacidades.includes("supervisor-predio-v1") ? 1 : 0]);
         if (filas.length) {
           await conexion.query(`UPDATE predio_comando SET estado = 'ENTREGADO', entregado_en = NOW(), intentos = intentos + 1 WHERE id IN (?)`, [filas.map(c => c.id)]);
         }
@@ -747,7 +758,7 @@ function crearRouterSync() {
         const { accion } = req.body;
         const vehiculos = recepcionVehiculos.acciones.has(accion);
         const autorizado = vehiculos ? recepcionVehiculos.permitir(actor, accion)
-          : actor?.rol === "ADMIN" || actor?.rol === "CAJERO" && Number(actor.gestionar_reservas);
+          : puedeGestionarReservas(actor);
         if (!autorizado) throw U.error("La cuenta no tiene permiso de recepción sincronizado.", 403);
         clavesUsuario.exigirCambio(actor, "POST", "/recepcion");
         const capacidades = String(req.headers["x-predio-capacidades"] || "").split(",");
@@ -887,8 +898,9 @@ function crearRouterApp() {
         }
         const config = await db.all("SELECT clave, valor FROM predio_config WHERE predio_id = ?", [predio.id]);
         const nombrePredio = config.find((c) => c.clave === "nombre_predio")?.valor || predio.nombre;
+        const puestos = base.usuario.rol === "SUPERVISOR" ? await sesionPredio.puestosDisponibles(db, base, base.usuario.bocas) : [];
         return res.json({
-          usuario: base.usuario, puestos: [], puesto: null, predio: { nombre: nombrePredio }, remoto: await estadoRemoto(predio),
+          usuario: base.usuario, puestos, puesto: null, predio: { nombre: nombrePredio }, remoto: await estadoRemoto(predio),
         });
       }
       if (metodo === "GET" && ruta === "/estado-remoto") {

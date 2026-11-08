@@ -8,10 +8,12 @@ const U = require("../util"),
 const {
   exigirPuesto,
   exigirBoca,
+  puedeGestionarCajas,
+  puedeGestionarReservas,
   turnoDeCaja
 } = require("./comun");
 function permiso(ctx) {
-  if (ctx.usuario?.rol !== "ADMIN" && !Number(ctx.usuario?.gestionar_reservas)) throw U.error("Tu usuario no tiene permiso para gestionar reservas y estadías.", 403);
+  if (!puedeGestionarReservas(ctx.usuario)) throw U.error("Tu usuario no tiene permiso para gestionar reservas y estadías.", 403);
 }
 const importe = x => U.numero(x, {
   min: 0.01,
@@ -308,7 +310,7 @@ async function guardar(ctx) {
 async function prepararCaja(t, ctx, b) {
   const cajaId = U.id(b.caja_id || ctx.sesion?.caja_id, "La caja que recibe o devuelve el efectivo");
   const ca = await N.exigir(t, ctx, "predio_caja", cajaId, "No encontramos la caja", { bloquear: true });
-  if (ctx.usuario.rol !== "ADMIN" || Number(ctx.sesion?.caja_id) === cajaId) {
+  if (!puedeGestionarCajas(ctx) || Number(ctx.sesion?.caja_id) === cajaId) {
     if (Number(ctx.sesion?.caja_id) !== cajaId) throw U.error("Ingresá a tu caja para registrar el efectivo de recepción.", 403);
     await verificarOperador(t, ctx, cajaId);
   } else if (await turnoAbierto(t, ctx.pid, cajaId)) {

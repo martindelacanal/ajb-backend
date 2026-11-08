@@ -3,8 +3,10 @@
 const U = require("../util");
 const { resumirCuenta } = require("../cuenta-estadia");
 const { randomBytes } = require("node:crypto");
+const { ROLES_GESTION_CAJA, esSupervisor } = require("./comun");
+const { permiso: exigirRecepcion } = require("./recepcion");
 
-const lectores = ["ADMIN", "SEGURIDAD"];
+const lectores = [...ROLES_GESTION_CAJA, "SEGURIDAD"];
 
 function turismo(t, ctx, accion, datos) {
   if (ctx.servicios?.recepcion) return ctx.servicios.recepcion(accion, datos, ctx.usuario, t);
@@ -94,6 +96,7 @@ async function conDeuda(t, ctx, filas) {
 }
 
 async function lectura(ctx, accion, datos) {
+  if (esSupervisor(ctx)) exigirRecepcion(ctx);
   if (ctx.modo === "central") {
     return ctx.db.tx(async t => {
       const r = await turismo(t, ctx, accion, datos);
@@ -104,10 +107,6 @@ async function lectura(ctx, accion, datos) {
   const r = await turismo(ctx.db, ctx, accion, datos);
   const filas = await conDeuda(ctx.db, ctx, r.filas || [r]);
   return r.filas ? { filas } : filas[0];
-}
-
-function exigirRecepcion(ctx) {
-  if (ctx.usuario.rol !== "ADMIN" && !Number(ctx.usuario.gestionar_reservas)) throw U.error("Tu usuario no tiene permiso para gestionar reservas y estadías.", 403);
 }
 
 // Cambios de la estadía sin precio (ubicación, vehículos): Turismo guarda una revisión
@@ -135,8 +134,10 @@ module.exports = {
     { m: "GET", p: "/recepcion/vehiculos", roles: lectores, h: ctx => lectura(ctx, "vehiculos", {}) },
     { m: "GET", p: "/recepcion/vehiculos/qr/:token", roles: lectores, h: ctx => lectura(ctx, "buscarVehiculoQr", { token: ctx.params.token }) },
     { m: "GET", p: "/recepcion/vehiculos/:id", roles: lectores, h: ctx => lectura(ctx, "detalleVehiculo", { id: ctx.params.id }) },
-    { m: "POST", p: "/recepcion/vehiculos/:id/salida", roles: ["ADMIN"], escritura: true,
-      h: ctx => ajustar(ctx, "retirarVehiculo", { id: ctx.params.id, patente: ctx.body.patente, operacion: ctx.body.operacion }) },
+    { m: "POST", p: "/recepcion/vehiculos/:id/salida", roles: ROLES_GESTION_CAJA, escritura: true, h: ctx => {
+      exigirRecepcion(ctx);
+      return ajustar(ctx, "retirarVehiculo", { id: ctx.params.id, patente: ctx.body.patente, operacion: ctx.body.operacion });
+    } },
     // QR de la reserva (la ruta vieja «vehiculo/qr» queda por las pantallas anteriores).
     ...["/recepcion/:id/qr", "/recepcion/:id/vehiculo/qr"].map(p => ({ m: "POST", p, escritura: true, h: ctx => {
       exigirRecepcion(ctx);

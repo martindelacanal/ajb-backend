@@ -3,8 +3,23 @@
 const { error, fechaHora, redondear } = require("../util");
 const { actualizar } = require("../negocio");
 
+const ROLES_GESTION_CAJA = ["ADMIN", "SUPERVISOR"];
+
 function esAdmin(ctx) {
   return ctx.usuario?.rol === "ADMIN";
+}
+
+function esSupervisor(ctx) {
+  return ctx.usuario?.rol === "SUPERVISOR";
+}
+
+function puedeGestionarCajas(ctx) {
+  return ROLES_GESTION_CAJA.includes(ctx.usuario?.rol);
+}
+
+function puedeGestionarReservas(usuario) {
+  return usuario?.rol === "ADMIN" ||
+    ["CAJERO", "SUPERVISOR"].includes(usuario?.rol) && Number(usuario.gestionar_reservas) === 1;
 }
 
 function exigirAdmin(ctx) {
@@ -75,7 +90,11 @@ function turnoDeCaja(ctx, cajaId) {
 }
 
 module.exports = {
+  ROLES_GESTION_CAJA,
   esAdmin,
+  esSupervisor,
+  puedeGestionarCajas,
+  puedeGestionarReservas,
   exigirAdmin,
   bocasDe,
   exigirBoca,

@@ -11,7 +11,7 @@ const { productoEnBoca, bloquearPrecios } = require("../precio-boca");
 const { emitirAviso } = require("../avisos");
 const { autorizacionDescuento } = require("../autorizacion-descuento");
 const { FORMAS_PAGO } = require("../listados");
-const { esAdmin, bocasDe, exigirPuesto, exigirBoca, autorizar, disponibleAfiliado, turnoDeCaja } = require("./comun");
+const { esAdmin, esSupervisor, puedeGestionarCajas, bocasDe, exigirPuesto, exigirBoca, autorizar, disponibleAfiliado, turnoDeCaja } = require("./comun");
 
 const FORMAS = FORMAS_PAGO.map((f) => f.valor).filter(f => f !== "DESCUENTO");
 async function avisarFaltante(t, ctx, { producto, busqueda, cantidad, stock }) {
@@ -304,15 +304,17 @@ function solicitudPendiente(t, ctx, id, bloquear = false) {
     ORDER BY id DESC LIMIT 1${bloquear ? t.forUpdate : ""}`, [ctx.pid, id]);
 }
 
-async function ventaParaAnulacion(t, ctx, id) {
+async function ventaParaAnulacion(t, ctx, id, directa = false) {
   // El cierre y la anulación deben ver el resultado de la operación que tomó la caja primero.
   if (t.forUpdate) await t.get(`SELECT id FROM predio_caja WHERE predio_id=? AND id=(
     SELECT caja_id FROM predio_venta WHERE predio_id=? AND id=?)${t.forUpdate}`, [ctx.pid, ctx.pid, id]);
   const v = await N.exigir(t, ctx, "predio_venta", id, "No encontramos la venta", { bloquear: true });
   if (!esAdmin(ctx)) {
     exigirBoca(ctx, v.boca_id);
-    if (Number(v.caja_id) !== Number(ctx.sesion?.caja_id)) throw U.error("Sólo podés anular ventas de la caja en la que estás trabajando", 403);
-    await verificarOperador(t, ctx, v.caja_id);
+    if (!directa || !esSupervisor(ctx)) {
+      if (Number(v.caja_id) !== Number(ctx.sesion?.caja_id)) throw U.error("Sólo podés anular ventas de la caja en la que estás trabajando", 403);
+      await verificarOperador(t, ctx, v.caja_id);
+    }
   }
   if (v.estado === "ANULADA") throw U.error("La venta ya está anulada", 409);
   if (v.liquidacion_id) throw U.error("La venta ya está incluida en una liquidación del afiliado: anulá primero la liquidación", 409);
@@ -347,7 +349,7 @@ async function anularVenta(ctx, permiso = null) {
   }
   const id = permiso ? permiso.referencia_id : U.id(ctx.params.id);
   return ctx.db.tx(async t => {
-    const v = await ventaParaAnulacion(t, ctx, id);
+    const v = await ventaParaAnulacion(t, ctx, id, true);
     const solicitudId = permiso?.id || ctx.body.solicitud_id;
     if (solicitudId) {
       const actual = await N.exigir(t, ctx, "predio_permiso", U.id(solicitudId), "No encontramos el pedido", { bloquear: true });
@@ -356,7 +358,7 @@ async function anularVenta(ctx, permiso = null) {
     }
     const motivo = U.texto(permiso ? permiso.detalle || `Solicitud N° ${permiso.id}` : ctx.body.motivo,
       { max: 255, campo: "El motivo de la anulación", requerido: true });
-    const metodo = esAdmin(ctx) ? "ADMIN" : "DELEGADO";
+    const metodo = puedeGestionarCajas(ctx) ? ctx.usuario.rol : "DELEGADO";
     // Las porciones pueden cambiar de rendimiento después de cobrarse. El kardex
     // conserva tanto el insumo como la cantidad exacta que salió en esa venta.
     const movimientos = await t.all(`SELECT producto_id, cantidad FROM predio_movimiento
@@ -393,8 +395,11 @@ async function anularVenta(ctx, permiso = null) {
 
 // Permite a un cajero ver todas las ventas de su caja (con autorización) durante un rato.
 async function habilitarVerCaja(ctx) {
-  exigirPuesto(ctx);
-  if (esAdmin(ctx)) return { ok: true };
+  const puesto = exigirPuesto(ctx);
+  if (puedeGestionarCajas(ctx)) {
+    exigirBoca(ctx, puesto.boca_id);
+    return { ok: true };
+  }
   return ctx.db.tx(async (t) => {
     const r = await autorizar(t, ctx, "VER_VENTAS_CAJA", { permisoId: ctx.body.permiso_id, referenciaId: ctx.sesion.caja_id });
     return { ok: true, permiso_id: r.permisoId };

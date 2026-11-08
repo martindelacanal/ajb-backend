@@ -251,7 +251,7 @@
 
   /** Ficha de la reserva para Seguridad: estadía, vehículos, personas y deuda. */
   function ficha(f, recargar, resaltar) {
-    var admin = P.esAdmin();
+    var admin = P.puedeGestionarCajas() && P.puedeGestionarReservas();
     var deuda = f.deuda || {};
     var ventana;
     function volverAAbrir() {

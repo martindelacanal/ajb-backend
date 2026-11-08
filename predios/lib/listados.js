@@ -119,7 +119,11 @@ function textoDe(lista, valor) {
 }
 
 const esAdmin = (ctx) => ctx.usuario?.rol === "ADMIN";
+const ROLES_GESTION = ["ADMIN", "SUPERVISOR"];
 const bocasDe = (ctx) => (ctx.usuario?.bocas || []).map(Number).filter(Boolean);
+const inventarioAsignado = (ctx, alias) => esAdmin(ctx) ? "" : `AND EXISTS (
+  SELECT 1 FROM predio_usuario_boca ub JOIN predio_boca b ON b.predio_id = ub.predio_id AND b.id = ub.boca_id AND b.activo = 1
+  WHERE ub.predio_id = ${alias}.predio_id AND ub.boca_id = ${alias}.boca_id AND ub.usuario_id = :usuario)`;
 
 function alcanceBocas(expr) {
   return (ctx) => {
@@ -138,10 +142,13 @@ const FECHA_REVISION = fechaRevisionSql();
 const PRECIO_PENDIENTE = `p.activo = 1 AND COALESCE(st.positivo, 0) > 0 AND (${FECHA_REVISION} IS NULL OR ${FECHA_REVISION} < pl.fecha)`;
 
 L.productos = {
-  roles: ["ADMIN"],
+  roles: ROLES_GESTION,
   titulo: "Productos y stock general",
-  from: `predio_producto p
-    LEFT JOIN (SELECT producto_id, SUM(cantidad) AS total, SUM(CASE WHEN cantidad > 0 THEN cantidad ELSE 0 END) AS positivo FROM predio_stock WHERE predio_id = :pid GROUP BY producto_id) st ON st.producto_id = p.id
+  from: (_query, ctx) => `predio_producto p
+    LEFT JOIN (SELECT s.producto_id, SUM(s.cantidad) AS total, SUM(CASE WHEN s.cantidad > 0 THEN s.cantidad ELSE 0 END) AS positivo
+      FROM predio_stock s WHERE s.predio_id = :pid
+      ${inventarioAsignado(ctx, "s")}
+      GROUP BY s.producto_id) st ON st.producto_id = p.id
     LEFT JOIN predio_stock sa ON sa.predio_id = p.predio_id AND sa.producto_id = p.id AND sa.boca_id = :almacen
     ${historialRevisionSql()}
     LEFT JOIN (SELECT :revision_limite AS fecha) pl ON 1 = 1`,
@@ -150,8 +157,8 @@ L.productos = {
     { clave: "id", titulo: "ID", expr: "p.id", tipo: "int" },
     { clave: "nombre", titulo: "Nombre", expr: "p.nombre", buscar: true },
     { clave: "codigo", titulo: "Código", expr: "p.codigo", buscar: true },
-    { clave: "precio_compra", titulo: "Compra", expr: "p.precio_compra", tipo: "money" },
-    { clave: "margen", titulo: "Margen", expr: "p.margen", tipo: "pct" },
+    { clave: "precio_compra", titulo: "Compra", expr: "p.precio_compra", tipo: "money", soloAdmin: true },
+    { clave: "margen", titulo: "Margen", expr: "p.margen", tipo: "pct", soloAdmin: true },
     { clave: "precio_venta", titulo: "Venta", expr: precioGeneralSql, tipo: "money" },
     { clave: "revision_precio", titulo: "Revisión de precio", expr: `CASE WHEN ${PRECIO_PENDIENTE} THEN 'Revisar: más de 4 meses o sin fecha' WHEN COALESCE(st.positivo, 0) <= 0 THEN 'Sin stock' ELSE 'Al día' END` },
     { clave: "fecha_revision_precio", titulo: "Última revisión de precio", expr: FECHA_REVISION, tipo: "dt", oculta: true },
@@ -222,7 +229,7 @@ L.productos = {
       { titulo: "Productos", expr: "COUNT(*)", tipo: "int" },
       { titulo: "Unidades en stock", expr: "SUM(COALESCE(st.total, 0))", tipo: "qty" },
       { titulo: "Unidades en almacén", expr: "SUM(COALESCE(sa.cantidad, 0))", tipo: "qty" },
-      { titulo: "Valor a costo", expr: "SUM(COALESCE(st.total, 0) * COALESCE(p.precio_compra, 0))", tipo: "money" },
+      { titulo: "Valor a costo", expr: "SUM(COALESCE(st.total, 0) * COALESCE(p.precio_compra, 0))", tipo: "money", soloAdmin: true },
     ],
   },
 };
@@ -285,11 +292,12 @@ L.stock = {
 };
 
 L.proveedores = {
-  roles: ["ADMIN"],
+  roles: ROLES_GESTION,
   titulo: "Proveedores",
-  from: `predio_proveedor pr
+  from: (_query, ctx) => `predio_proveedor pr
     LEFT JOIN (SELECT proveedor_id, COUNT(*) AS compras, SUM(COALESCE(total_factura, total_items)) AS total, MAX(fecha_factura) AS ultima
-      FROM predio_compra WHERE predio_id = :pid AND estado = 'CARGADA' GROUP BY proveedor_id) c ON c.proveedor_id = pr.id`,
+      FROM predio_compra pc WHERE predio_id = :pid AND estado = 'CARGADA' ${inventarioAsignado(ctx, "pc")}
+      GROUP BY proveedor_id) c ON c.proveedor_id = pr.id`,
   where: "pr.predio_id = :pid",
   columnas: [
     { clave: "id", titulo: "ID", expr: "pr.id", tipo: "int", oculta: true },
@@ -477,12 +485,13 @@ L.solicitudes = {
 };
 
 L.bajas = {
-  roles: ["ADMIN"],
+  roles: ROLES_GESTION,
   titulo: "Bajas de stock",
   from: `predio_baja x
     JOIN predio_producto p ON p.predio_id = x.predio_id AND p.id = x.producto_id
     JOIN predio_boca b ON b.predio_id = x.predio_id AND b.id = x.boca_id`,
   where: "x.predio_id = :pid",
+  alcance: alcanceBocas("x.boca_id"),
   columnas: [
     { clave: "id", titulo: "ID", expr: "x.id", tipo: "int" },
     { clave: "fecha", titulo: "Fecha", expr: "x.fecha", tipo: "dt" },
@@ -490,7 +499,7 @@ L.bajas = {
     { clave: "producto", titulo: "Producto", expr: "p.nombre", buscar: true },
     { clave: "cantidad", titulo: "Cantidad", expr: "x.cantidad", tipo: "qty" },
     { clave: "motivo", titulo: "Motivo", expr: "x.motivo", tipo: "opcion", opciones: MOTIVOS_BAJA },
-    { clave: "valor", titulo: "Valor a costo", expr: "x.cantidad * COALESCE(p.precio_compra, 0)", tipo: "money" },
+    { clave: "valor", titulo: "Valor a costo", expr: "x.cantidad * COALESCE(p.precio_compra, 0)", tipo: "money", soloAdmin: true },
     { clave: "observaciones", titulo: "Observaciones", expr: "x.observaciones", buscar: true },
     { clave: "usuario_nombre", titulo: "Usuario", expr: "x.usuario_nombre" },
   ],
@@ -502,7 +511,7 @@ L.bajas = {
     { clave: "hasta", titulo: "Hasta", tipo: "hasta", expr: "x.fecha" },
   ],
   orden: { clave: "id", dir: "desc" },
-  totales: [{ clave: "cantidad", expr: "SUM(x.cantidad)" }, { clave: "valor", expr: "SUM(x.cantidad * COALESCE(p.precio_compra, 0))" }],
+  totales: [{ clave: "cantidad", expr: "SUM(x.cantidad)" }, { clave: "valor", expr: "SUM(x.cantidad * COALESCE(p.precio_compra, 0))", soloAdmin: true }],
   resumen: {
     grupos: [
       { clave: "motivo", titulo: "Motivo", expr: "x.motivo", opciones: MOTIVOS_BAJA },
@@ -512,7 +521,7 @@ L.bajas = {
     medidas: [
       { titulo: "Bajas", expr: "COUNT(*)", tipo: "int" },
       { titulo: "Unidades", expr: "SUM(x.cantidad)", tipo: "qty" },
-      { titulo: "Valor a costo", expr: "SUM(x.cantidad * COALESCE(p.precio_compra, 0))", tipo: "money" },
+      { titulo: "Valor a costo", expr: "SUM(x.cantidad * COALESCE(p.precio_compra, 0))", tipo: "money", soloAdmin: true },
     ],
   },
 };
@@ -522,10 +531,11 @@ const MOVIMIENTOS_STOCK_FROM = `predio_movimiento m
     JOIN predio_boca b ON b.predio_id = m.predio_id AND b.id = m.boca_id`;
 
 L.altas = {
-  roles: ["ADMIN"],
+  roles: ROLES_GESTION,
   titulo: "Altas de stock",
   from: MOVIMIENTOS_STOCK_FROM,
   where: "m.predio_id = :pid AND m.tipo = 'ALTA'",
+  alcance: alcanceBocas("m.boca_id"),
   columnas: [
     { clave: "id", titulo: "ID", expr: "m.id", tipo: "int" },
     { clave: "fecha", titulo: "Fecha", expr: "m.fecha", tipo: "dt" },
@@ -618,11 +628,10 @@ L.ventas = {
     LEFT JOIN (SELECT venta_id, COUNT(*) AS items, SUM(cantidad) AS unidades FROM predio_venta_item WHERE predio_id = :pid GROUP BY venta_id) it ON it.venta_id = v.id`,
   where: "v.predio_id = :pid",
   alcance: (ctx, query) => {
-    const admin = esAdmin(ctx);
-    // Sólo el listado general del administrador abarca otras cajas.
-    if (admin && !query?.ambito) return null;
+    const gestionCaja = esAdmin(ctx) || ctx.usuario?.rol === "SUPERVISOR";
+    if (gestionCaja && !query?.ambito) return alcanceBocas("v.boca_id")(ctx);
     const sesion = ctx.sesion || {};
-    if (query?.ambito === "caja" && (admin || ctx.verVentasCaja)) {
+    if (query?.ambito === "caja" && (gestionCaja || ctx.verVentasCaja)) {
       return { sql: "v.caja_id = ?", params: [sesion.caja_id || -1] };
     }
     return { sql: "v.turno_id = ?", params: [sesion.turno_id || -1] };
@@ -798,7 +807,8 @@ L.caja = {
     JOIN predio_boca b ON b.predio_id = m.predio_id AND b.id = m.boca_id
     LEFT JOIN predio_cierre ci ON ci.predio_id = m.predio_id AND ci.id = m.cierre_id`,
   where: "1 = 1",
-  alcance: (ctx) => (esAdmin(ctx) ? null : { sql: "m.caja_id = ?", params: [ctx.sesion?.caja_id || -1] }),
+  alcance: (ctx) => ctx.usuario?.rol === "SUPERVISOR" ? alcanceBocas("m.boca_id")(ctx)
+    : esAdmin(ctx) ? null : { sql: "m.caja_id = ?", params: [ctx.sesion?.caja_id || -1] },
   columnas: [
     { clave: "fecha", titulo: "Fecha", expr: "m.fecha", tipo: "dt" },
     { clave: "boca", titulo: "Boca", expr: "b.nombre" },
@@ -940,7 +950,7 @@ const FILTROS_AFILIADO = [
 
 L.afiliados = {
   titulo: "Afiliados",
-  roles: ["ADMIN"],
+  roles: ROLES_GESTION,
   from: `predio_afiliado a ${SQL_CONSUMO}`,
   where: "a.predio_id = :pid",
   columnas: [
@@ -1064,13 +1074,13 @@ L.usuarios = {
     { clave: "id", titulo: "ID", expr: "u.id", tipo: "int", oculta: true },
     { clave: "usuario", titulo: "Usuario", expr: "u.usuario", buscar: true },
     { clave: "nombre", titulo: "Nombre", expr: "u.nombre", buscar: true },
-    { clave: "rol", titulo: "Rol", expr: "u.rol", tipo: "opcion", opciones: [{ valor: "ADMIN", texto: "Administrador" }, { valor: "CAJERO", texto: "Usuario de boca" }, { valor: "SEGURIDAD", texto: "Seguridad" }] },
+    { clave: "rol", titulo: "Rol", expr: "u.rol", tipo: "opcion", opciones: [{ valor: "ADMIN", texto: "Administrador" }, { valor: "SUPERVISOR", texto: "Supervisor" }, { valor: "CAJERO", texto: "Usuario de boca" }, { valor: "SEGURIDAD", texto: "Seguridad" }] },
     { clave: "es_admin_general", titulo: "Sistema general", expr: "u.es_admin_general", tipo: "bool" },
     { clave: "ultimo_ingreso", titulo: "Último ingreso", expr: "u.ultimo_ingreso", tipo: "dt" },
     { clave: "activo", titulo: "Activo", expr: "u.activo", tipo: "bool" },
   ],
   filtros: [
-    { clave: "rol", titulo: "Rol", tipo: "opciones", expr: "u.rol", opciones: [{ valor: "ADMIN", texto: "Administradores" }, { valor: "CAJERO", texto: "Usuarios de boca" }, { valor: "SEGURIDAD", texto: "Seguridad" }] },
+    { clave: "rol", titulo: "Rol", tipo: "opciones", expr: "u.rol", opciones: [{ valor: "ADMIN", texto: "Administradores" }, { valor: "SUPERVISOR", texto: "Supervisores" }, { valor: "CAJERO", texto: "Usuarios de boca" }, { valor: "SEGURIDAD", texto: "Seguridad" }] },
     { clave: "activo", titulo: "Estado", tipo: "opciones", expr: "u.activo", opciones: [{ valor: "1", texto: "Activos" }, { valor: "0", texto: "Deshabilitados" }] },
   ],
   orden: { clave: "nombre", dir: "asc" },
@@ -1078,10 +1088,11 @@ L.usuarios = {
 
 L.bocas = {
   titulo: "Bocas de expendio",
-  roles: ["ADMIN"],
+  roles: ROLES_GESTION,
   from: `predio_boca b
     LEFT JOIN (SELECT boca_id, COUNT(*) AS cajas FROM predio_caja WHERE predio_id = :pid AND activo = 1 GROUP BY boca_id) c ON c.boca_id = b.id`,
   where: "b.predio_id = :pid",
+  alcance: alcanceBocas("b.id"),
   columnas: [
     { clave: "id", titulo: "ID", expr: "b.id", tipo: "int" },
     { clave: "nombre", titulo: "Boca", expr: "b.nombre", buscar: true },
@@ -1108,11 +1119,12 @@ L.bocas = {
 
 L.cajas = {
   titulo: "Cajas",
-  roles: ["ADMIN"],
+  roles: ROLES_GESTION,
   from: `predio_caja c
     JOIN predio_boca b ON b.predio_id = c.predio_id AND b.id = c.boca_id
     LEFT JOIN (SELECT caja_id, COUNT(*) AS ventas, SUM(total) AS total FROM predio_venta WHERE predio_id = :pid AND estado = 'CONFIRMADA' GROUP BY caja_id) v ON v.caja_id = c.id`,
   where: "c.predio_id = :pid",
+  alcance: alcanceBocas("c.boca_id"),
   columnas: [
     { clave: "id", titulo: "ID", expr: "c.id", tipo: "int" },
     { clave: "nombre", titulo: "Caja", expr: "c.nombre", buscar: true },
@@ -1218,6 +1230,7 @@ function parametrosBase(ctx) {
   const h = hoy();
   return {
     pid: ctx.pid,
+    usuario: ctx.usuario?.id || -1,
     hoy: h,
     hoy7: sumarDias(h, 7),
     hoy30: sumarDias(h, 30),
@@ -1319,7 +1332,7 @@ async function ejecutar(ctx, nombre, query = {}) {
   const db = ctx.db;
   const { sql: where, valores, nombres } = construirWhere(def, ctx, query, db);
   const valoresFrom = [];
-  const fromSql = traducir(typeof def.from === "function" ? def.from(query) : def.from, valoresFrom, nombres);
+  const fromSql = traducir(typeof def.from === "function" ? def.from(query, ctx) : def.from, valoresFrom, nombres);
 
   const admin = esAdmin(ctx);
   const columnas = def.columnas.filter((c) => admin || !c.soloAdmin);

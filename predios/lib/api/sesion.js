@@ -22,7 +22,7 @@ async function bocasUsuario(db, ctx, usuario) {
   return filas.map((f) => Number(f.boca_id));
 }
 
-async function puestosDisponibles(db, ctx, usuario, bocas) {
+async function puestosDisponibles(db, ctx, bocas) {
   if (!bocas.length) return [];
   const l = bocas.map(() => "?").join(", ");
   const filas = await db.all(
@@ -54,7 +54,8 @@ async function crearSesion(ctx, usuario, recordar) {
     const turno = usuario.rol === "SEGURIDAD" ? null : await turnoUsuario(t, ctx.pid, usuario.id);
     // Un ingreso nuevo recupera el turno aunque haya vencido el token anterior.
     // Quitar el puesto al token anterior evita cobrar desde dos equipos.
-    if (turno && (await turnoAbierto(t, ctx.pid, turno.caja_id))?.id === turno.id) {
+    if (turno && (usuario.rol !== "SUPERVISOR" || (await bocasUsuario(t, ctx, usuario)).includes(Number(turno.boca_id))) &&
+        (await turnoAbierto(t, ctx.pid, turno.caja_id))?.id === turno.id) {
       await asignarPuesto(t, U.sha256(token), usuario.id, turno.boca_id, turno.caja_id, turno.id);
     }
     await t.run("UPDATE predio_usuario SET ultimo_ingreso = ? WHERE predio_id = ? AND id = ?", [ahora, ctx.pid, usuario.id]);
@@ -217,7 +218,7 @@ async function armarSesion(ctx, usuario, sesion) {
   const identidad = identidadUsuario(usuario);
   if (identidad.debe_cambiar_clave) return { usuario: identidad, puesto: null, puestos: [], predio: {} };
   const bocas = await bocasUsuario(ctx.db, ctx, usuario);
-  const puestos = await puestosDisponibles(ctx.db, ctx, usuario, bocas);
+  const puestos = await puestosDisponibles(ctx.db, ctx, bocas);
   const config = await N.leerConfig(ctx.db, ctx);
   let puesto = null;
   if (sesion.caja_id) {
@@ -377,14 +378,19 @@ async function autenticar(ctx, token) {
     await ctx.db.run("UPDATE predio_sesion SET ultimo_uso = ?, vence = ? WHERE token_hash = ?", [ahora, vence, hash]);
   }
   const bocas = await bocasUsuario(ctx.db, ctx, u);
+  const vigente = u.rol !== "SUPERVISOR" || !s.boca_id || bocas.includes(Number(s.boca_id));
   return {
     usuario: { ...identidadUsuario(u), bocas },
-    sesion: { token_hash: hash, boca_id: s.boca_id, caja_id: s.caja_id, turno_id: s.turno_id },
+    sesion: vigente ? { token_hash: hash, boca_id: s.boca_id, caja_id: s.caja_id, turno_id: s.turno_id } :
+      { token_hash: hash, boca_id: null, caja_id: null, turno_id: null },
   };
 }
 
 module.exports = {
   autenticar,
+  bocasUsuario,
+  identidadUsuario,
+  puestosDisponibles,
   asegurarUsuarioGeneral,
   verificarAdministrador,
   rutas: [

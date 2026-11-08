@@ -22,19 +22,19 @@
     return P.estado.sesion?.usuario?.rol === "SEGURIDAD";
   }
 
-  function itemsAdmin() {
+  function itemsGestion() {
     var items = [
       { ruta: "/inicio", texto: "Inicio", icono: "inicio" },
       P.modo === "local" ? { ruta: "/vender", texto: "Vender", icono: "vender" } : null,
       { ruta: "/caja", texto: "Caja", icono: "caja", contador: "caja" },
       { ruta: "/compras", texto: "Compras", icono: "compras" },
       { ruta: "/gestion", texto: "Gestión", icono: "gestion" },
-      { ruta: "/recepcion", texto: "Reservas y estadías", icono: "usuarios" },
-      { ruta: "/contable", texto: "Contable", icono: "planilla" },
-      itemVehiculos,
-      { ruta: "/usuarios", texto: "Usuarios", icono: "usuarios" },
-      { ruta: "/estadisticas", texto: "Estadísticas", icono: "estadisticas" },
-      { ruta: "/sistema", texto: "Sistema", icono: "sistema" },
+      P.puedeGestionarReservas() ? { ruta: "/recepcion", texto: "Reservas y estadías", icono: "usuarios" } : null,
+      P.esAdmin() ? { ruta: "/contable", texto: "Contable", icono: "planilla" } : null,
+      P.puedeGestionarReservas() ? itemVehiculos : null,
+      P.esAdmin() ? { ruta: "/usuarios", texto: "Usuarios", icono: "usuarios" } : null,
+      P.esAdmin() ? { ruta: "/estadisticas", texto: "Estadísticas", icono: "estadisticas" } : null,
+      P.esAdmin() ? { ruta: "/sistema", texto: "Sistema", icono: "sistema" } : null,
     ];
     return items.filter(Boolean);
   }
@@ -54,7 +54,7 @@
 
   function activo(ruta) {
     var actual = P.ruta.actual();
-    if (actual === "/mis-ventas" || actual === "/mi-caja") return ruta === (P.esAdmin() ? "/caja" : "/mi-caja");
+    if (actual === "/mis-ventas" || actual === "/mi-caja") return ruta === (P.puedeGestionarCajas() ? "/caja" : "/mi-caja");
     return actual === ruta || actual.indexOf(ruta + "/") === 0 || (ruta === "/gestion" && /^\/(afiliados|productos)/.test(actual));
   }
 
@@ -85,8 +85,8 @@
     var ses = P.estado.sesion;
     var items = [];
     if (P.modo === "local") {
-      if (!esSeguridad() && !(P.puesto() && P.puesto().caja_id)) items.push({ texto: P.esAdmin() ? "Trabajar en una caja" : "Elegir boca o caja", icono: "caja", accion: function () { P.ruta.ir("/puesto"); } });
-      if (P.puesto() && P.puesto().caja_id) items.push({ texto: P.esAdmin() ? "Cerrar mi caja" : "Cierre temporal", icono: "candado", accion: function () { P.cerrarCaja(P.puesto().caja_id); } });
+      if (!esSeguridad() && !(P.puesto() && P.puesto().caja_id)) items.push({ texto: P.puedeGestionarCajas() ? "Trabajar en una caja" : "Elegir boca o caja", icono: "caja", accion: function () { P.ruta.ir("/puesto"); } });
+      if (P.puesto() && P.puesto().caja_id) items.push({ texto: P.puedeGestionarCajas() ? "Cerrar mi caja" : "Cierre temporal", icono: "candado", accion: function () { P.cerrarCaja(P.puesto().caja_id); } });
       if (P.puesto() && P.puesto().caja_id) items.push({ texto: "Ver saldo de apertura", icono: "efectivo", accion: function () { P.verificarApertura(true); } });
       if (!ses.usuario.es_admin_general) items.push({ texto: "Cambiar mi contraseña", icono: "candado", accion: cambiarClave });
       items.push("-");
@@ -128,7 +128,7 @@
     var ses = P.estado.sesion;
     var b = h("button.usuario-boton", { type: "button", "aria-haspopup": "menu", "aria-label": "Menú de " + ses.usuario.nombre },
       h("span.avatar", P.iniciales(ses.usuario.nombre)),
-      h("span.usuario-nombre", ses.usuario.nombre.replace(" (sistema general)", ""), h("small", P.esAdmin() ? (ses.usuario.es_admin_general ? "Administración general" : "Administración") : esSeguridad() ? "Seguridad" : "Usuario de boca")));
+      h("span.usuario-nombre", ses.usuario.nombre.replace(" (sistema general)", ""), h("small", P.esAdmin() ? (ses.usuario.es_admin_general ? "Administración general" : "Administración") : P.esSupervisor() ? "Supervisión" : esSeguridad() ? "Seguridad" : "Usuario de boca")));
     b.addEventListener("click", function () { menuUsuario(b); });
     return b;
   }
@@ -142,10 +142,10 @@
   function panelAvisos(ancla) {
     var a = P.estado.avisos || {};
     var items = [];
-    if (P.esAdmin() && P.estado.estadiasVencidas) items.push({
+    if (P.puedeGestionarCajas() && P.puedeGestionarReservas() && P.estado.estadiasVencidas) items.push({
       texto: P.textoEstadiasVencidas(), icono: "reloj", accion: function () { P.ruta.ir("/recepcion?ocupacion=VENCIDA"); }
     });
-    if (P.esAdmin() && P.estado.adicionalesPendientes) items.push({
+    if (P.puedeGestionarCajas() && P.puedeGestionarReservas() && P.estado.adicionalesPendientes) items.push({
       texto: P.textoAdicionalesPendientes(), icono: "tag", accion: function () { P.ruta.ir("/recepcion/adicionales/pendientes"); }
     });
     (a.recientes || a.notificaciones || []).slice(0, 10).forEach(function (n) {
@@ -162,8 +162,8 @@
       items.push({ texto: x.boca + " · " + x.caja + ": el saldo de apertura no coincide", icono: "alerta", accion: function () { P.ruta.ir("/caja"); } });
     });
     if (a.cierres_temporales) items.push({ texto: a.cierres_temporales + (a.cierres_temporales === 1 ? " cierre temporal espera" : " cierres temporales esperan") + " el cierre definitivo", icono: "caja", accion: function () { P.ruta.ir("/caja"); } });
-    if (a.solicitudes_despachar) items.push({ texto: a.solicitudes_despachar + " solicitud(es) para despachar", icono: "despachar", accion: function () { P.ruta.ir(P.esAdmin() ? "/gestion/solicitudes" : "/solicitudes"); } });
-    if (a.solicitudes_recibir) items.push({ texto: a.solicitudes_recibir + " solicitud(es) para recibir", icono: "recibir", accion: function () { P.ruta.ir(P.esAdmin() ? "/gestion/solicitudes" : "/solicitudes"); } });
+    if (a.solicitudes_despachar) items.push({ texto: a.solicitudes_despachar + " solicitud(es) para despachar", icono: "despachar", accion: function () { P.ruta.ir(P.puedeGestionarCajas() ? "/gestion/solicitudes" : "/solicitudes"); } });
+    if (a.solicitudes_recibir) items.push({ texto: a.solicitudes_recibir + " solicitud(es) para recibir", icono: "recibir", accion: function () { P.ruta.ir(P.puedeGestionarCajas() ? "/gestion/solicitudes" : "/solicitudes"); } });
     if (a.vencimientos) items.push({ texto: a.vencimientos + " producto(s) vencidos o por vencer", icono: "reloj", accion: function () { P.cache["tabla:productos"] = { filtros: { vencimiento: "aviso" } }; P.ruta.ir("/gestion/productos"); } });
     if (a.stock_negativo) items.push({ texto: a.stock_negativo + " producto(s) con stock negativo en alguna boca", icono: "alerta", accion: function () { P.cache["tabla:stock"] = { filtros: { estado: "negativo" } }; P.ruta.ir("/gestion/stock"); } });
     if (items[items.length - 1] === "-") items.pop();
@@ -200,8 +200,8 @@
         d.agente ? h("p.texto-3.chico", "Navegador: " + d.agente) : null),
       acciones: [
         P.btn("Cerrar", { onclick: function () { m.cerrar(); } }),
-        n.tipo === "CIERRE_TEMPORAL" && d.caja_id && P.esAdmin() ? P.btn("Cargar cambio", { tipo: "suave", icono: "efectivo", onclick: function () { m.cerrar(); P.cargarApertura(d.caja_id); } }) : null,
-        n.tipo === "CIERRE_TEMPORAL" && d.cierre_id && P.esAdmin() ? P.btn("Ver el cierre", { tipo: "secundario", icono: "caja", onclick: function () { m.cerrar(); P.verCierre(d.cierre_id); } }) : null,
+        n.tipo === "CIERRE_TEMPORAL" && d.caja_id && P.puedeGestionarCajas() ? P.btn("Cargar cambio", { tipo: "suave", icono: "efectivo", onclick: function () { m.cerrar(); P.cargarApertura(d.caja_id); } }) : null,
+        n.tipo === "CIERRE_TEMPORAL" && d.cierre_id && P.puedeGestionarCajas() ? P.btn("Ver el cierre", { tipo: "secundario", icono: "caja", onclick: function () { m.cerrar(); P.verCierre(d.cierre_id); } }) : null,
         !n.leido ? P.btn("Marcar como leída", { tipo: "primario", onclick: function (ev) {
           P.ejecutar(ev.currentTarget, function () {
             return P.post("/avisos/" + n.id + "/leer", {}).then(function (r) {
@@ -262,7 +262,7 @@
       if (viejo) viejo.remove();
       var a = P.estado.avisos || {};
       var total = (typeof a.notificaciones_no_leidas === "number" ? a.notificaciones_no_leidas : (a.notificaciones || []).length) + (a.permisos || []).length + (a.aperturas || []).length + (a.solicitudes_despachar || 0) + (a.solicitudes_recibir || 0);
-      if (P.esAdmin()) total += (P.estado.estadiasVencidas || 0) + (P.estado.adicionalesPendientes || 0);
+      if (P.puedeGestionarCajas() && P.puedeGestionarReservas()) total += (P.estado.estadiasVencidas || 0) + (P.estado.adicionalesPendientes || 0);
       if (total) c.appendChild(h("span.campana-numero", total > 99 ? "99+" : String(total)));
     }
   }
@@ -276,7 +276,7 @@
   };
   // Un valor undefined conserva el último conocido (cada pantalla actualiza lo que consultó).
   P.actualizarEstadiasVencidas = function (cantidad, adicionales) {
-    if (!P.esAdmin()) return;
+    if (!P.puedeGestionarCajas() || !P.puedeGestionarReservas()) return;
     if (cantidad !== undefined) P.estado.estadiasVencidas = Number(cantidad) || 0;
     if (adicionales !== undefined) P.estado.adicionalesPendientes = Number(adicionales) || 0;
     pintarContadores();
@@ -293,7 +293,7 @@
   };
   function consultarEstadiasVencidas() {
     var sesion = P.estado.sesion;
-    if (!P.esAdmin()) return;
+    if (!P.puedeGestionarCajas() || !P.puedeGestionarReservas()) return;
     return P.get("/recepcion/vencidas", { sinRedireccion: true }).then(function (r) {
       if (sesion === P.estado.sesion) P.actualizarEstadiasVencidas(r.cantidad, r.adicionales || 0);
     }).catch(function () {});
@@ -306,7 +306,7 @@
       if (turnoAlConsultar && P.puesto() && P.puesto().turno_id === turnoAlConsultar && a.turno_id === null) {
         P.estado.sesion.puesto = null;
         P.repintarMarco();
-        P.ruta.ir(P.esAdmin() ? "/caja" : "/puesto");
+        P.ruta.ir(P.puedeGestionarCajas() ? "/caja" : "/puesto");
         P.aviso("Tu sesión dejó de operar en esta caja.", "info");
       }
       var antes = P.estado.avisos;
@@ -319,7 +319,7 @@
           ultimoAvisoVisto = aviso.id;
         }
       }
-      if (P.esAdmin() && a.permisos && a.permisos.length) {
+      if (a.permisos && a.permisos.length) {
         var max = Math.max.apply(null, a.permisos.map(function (p) { return p.id; }));
         if (antes && max > ultimoPermisoVisto) {
           var p = a.permisos.filter(function (x) { return x.id === max; })[0];
@@ -373,7 +373,7 @@
   function marco() {
     var ses = P.estado.sesion;
     var seguridad = esSeguridad();
-    var items = seguridad ? [itemVehiculos] : P.esAdmin() ? itemsAdmin() : itemsCajero();
+    var items = seguridad ? [itemVehiculos] : P.puedeGestionarCajas() ? itemsGestion() : itemsCajero();
     var riel = h("nav.riel#riel", { "aria-label": "Menú principal" },
       h("a.riel-marca", { href: "#/" }, h("img", { src: "img/logo-blanco-isotipo.png", alt: "" }), h("span", h("strong", ses.predio.nombre || "Predio"), h("span", "Sistema del predio · AJB"))),
       h("div.nav", items.map(function (it) {
@@ -467,12 +467,12 @@
       P.ruta.ir("/vehiculos");
       return;
     }
-    if (ruta === "/vehiculos" && !esSeguridad() && !P.esAdmin()) {
+    if (ruta === "/vehiculos" && !esSeguridad() && !(P.puedeGestionarCajas() && P.puedeGestionarReservas())) {
       P.ruta.ir("/");
       return;
     }
     if (ruta === "/" || ruta === "") {
-      P.ruta.ir(P.esAdmin() ? "/inicio" : (P.puesto() && P.puesto().caja_id ? "/vender" : P.puesto() ? "/solicitudes" : "/puesto"));
+      P.ruta.ir(P.puedeGestionarCajas() ? "/inicio" : (P.puesto() && P.puesto().caja_id ? "/vender" : P.puesto() ? "/solicitudes" : "/puesto"));
       return;
     }
     var encontrada = null;
@@ -492,8 +492,9 @@
       P.continuidad.montada();
       return;
     }
-    if (encontrada.admin && !P.esAdmin()) {
-      nueva.appendChild(P.vacio("candado", "Esta sección es del administrador", ""));
+    if (encontrada.admin && !P.esAdmin() || encontrada.cajas && !P.puedeGestionarCajas() ||
+        P.esSupervisor() && /^\/recepcion(?:\/|$)/.test(ruta) && !P.puedeGestionarReservas()) {
+      nueva.appendChild(P.vacio("candado", "Tu cuenta no tiene permiso para esta sección", ""));
       P.continuidad.montada();
       return;
     }
@@ -560,7 +561,7 @@
     }
     arrancarMarco();
     if (esSeguridad() && P.ruta.actual() !== "/vehiculos") P.ruta.ir("/vehiculos");
-    else if (!location.hash || location.hash === "#" || location.hash === "#/") P.ruta.ir(P.esAdmin() ? "/inicio" : "/vender");
+    else if (!location.hash || location.hash === "#" || location.hash === "#/") P.ruta.ir(P.puedeGestionarCajas() ? "/inicio" : "/vender");
     else navegar();
   };
 
@@ -572,7 +573,7 @@
       consultarAvisos();
       temporizadores.push(setInterval(consultarAvisos, 10000));
     }
-    if (P.esAdmin()) {
+    if (P.puedeGestionarCajas() && P.puedeGestionarReservas()) {
       consultarEstadiasVencidas();
       temporizadores.push(setInterval(consultarEstadiasVencidas, 120000));
     }

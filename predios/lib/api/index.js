@@ -7,6 +7,7 @@ const U = require("../util");
 const listados = require("../listados");
 const N = require("../negocio");
 const { exigirCambio } = require("../claves-usuario");
+const { puedeGestionarCajas, esSupervisor, bocasDe } = require("./comun");
 
 const modulos = [
   require("./sesion"),
@@ -32,9 +33,9 @@ async function verListado(ctx) {
   const nombre = ctx.params.nombre;
   if (nombre === "productos") {
     const almacen = await N.bocaAlmacen(ctx.db, ctx);
-    ctx.almacenId = almacen ? almacen.id : null;
+    ctx.almacenId = almacen && (!esSupervisor(ctx) || bocasDe(ctx).includes(Number(almacen.id))) ? almacen.id : null;
   }
-  if (nombre === "ventas" && ctx.query.ambito === "caja" && ctx.usuario?.rol !== "ADMIN" && ctx.sesion?.caja_id) {
+  if (nombre === "ventas" && ctx.query.ambito === "caja" && !puedeGestionarCajas(ctx) && ctx.sesion?.caja_id) {
     const p = await ctx.db.get(
       `SELECT id FROM predio_permiso WHERE predio_id = ? AND usuario_id = ? AND tipo = 'VER_VENTAS_CAJA'
        AND estado IN ('APROBADO', 'USADO') AND referencia_id = ? AND vence >= ? ORDER BY id DESC LIMIT 1`,
@@ -76,6 +77,11 @@ function exigirPermisoSeguridad(usuario, ruta) {
   }
 }
 
+function exigirPermisoRuta(usuario, ruta) {
+  exigirPermisoSeguridad(usuario, ruta);
+  if (ruta.roles && !ruta.roles.includes(usuario?.rol)) throw U.error("Tu cuenta no tiene permiso para esta acción", 403);
+}
+
 // Ejecuta una ruta con un contexto ya autenticado (o público si la ruta lo permite).
 async function ejecutar(ctx, metodo, ruta) {
   const encontrada = buscarRuta(metodo, ruta);
@@ -84,12 +90,11 @@ async function ejecutar(ctx, metodo, ruta) {
   exigirCambio(ctx.usuario, metodo, ruta);
   if (ctx.modo === "central" && r.soloLocal) throw U.error("Esta operación se hace desde el camping", 409);
   if (!r.publica && !ctx.usuario) throw U.error("Iniciá sesión para continuar", 401, { codigo: "SIN_SESION" });
-  exigirPermisoSeguridad(ctx.usuario, r);
-  if (r.roles && !r.roles.includes(ctx.usuario?.rol)) throw U.error("Esta acción la hace un administrador", 403);
+  exigirPermisoRuta(ctx.usuario, r);
   ctx.params = encontrada.params;
   ctx.query = ctx.query || {};
   ctx.body = ctx.body && typeof ctx.body === "object" ? ctx.body : {};
   return r.h(ctx);
 }
 
-module.exports = { RUTAS, buscarRuta, ejecutar, exigirPermisoSeguridad };
+module.exports = { RUTAS, buscarRuta, ejecutar, exigirPermisoSeguridad, exigirPermisoRuta };

@@ -413,7 +413,6 @@ table.tabla { width: 100%; border-collapse: separate; border-spacing: 0; font-si
 .tabla tbody tr:last-child td { border-bottom: 0; }
 .tabla .der { text-align: right; }
 .tabla td.sin-corte { white-space: nowrap; }
-.tabla .col-ancha { min-width: 230px; }
 .tabla-texto {
   display: -webkit-box;
   -webkit-box-orient: vertical;
@@ -422,7 +421,11 @@ table.tabla { width: 100%; border-collapse: separate; border-spacing: 0; font-si
   overflow-wrap: anywhere;
   max-width: 52ch;
 }
-.tabla-texto-largo { min-width: 18ch; }
+/* El contenido da el ancho a la columna, incluso si el encabezado es más corto. */
+.tabla td .tabla-texto, .rec-tabla td .tabla-texto {
+  width: max-content;
+  max-width: clamp(26ch, 28vw, 36ch);
+}
 .tabla .centro { text-align: center; }
 .tabla td.der, .tabla th.der { font-variant-numeric: tabular-nums; }
 .tabla tfoot td { padding: 11px 12px; background: var(--papel); border-top: 1px solid var(--borde); font-weight: 800; }

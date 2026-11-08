@@ -739,5 +739,8 @@
   };
 
   P.esAdmin = function () { return !!(P.estado.sesion && P.estado.sesion.usuario && P.estado.sesion.usuario.rol === "ADMIN"); };
+  P.esSupervisor = function () { return P.estado.sesion?.usuario?.rol === "SUPERVISOR"; };
+  P.puedeGestionarCajas = function () { return P.esAdmin() || P.esSupervisor(); };
+  P.puedeGestionarReservas = function () { return P.esAdmin() || !!Number(P.estado.sesion?.usuario?.gestionar_reservas); };
   P.puesto = function () { return P.estado.sesion && P.estado.sesion.puesto; };
 })();

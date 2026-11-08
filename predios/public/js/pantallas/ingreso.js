@@ -246,12 +246,12 @@
 
   P.pantallaPuesto = function (contenedor) {
     var ses = P.estado.sesion;
-    var puestos = (ses.puestos || []).filter(function (p) { return P.esAdmin() ? p.cajas.length : true; });
+    var puestos = (ses.puestos || []).filter(function (p) { return P.puedeGestionarCajas() ? p.cajas.length : true; });
     contenedor.appendChild(h("div.pagina-cabecera", h("div",
-      h("h1.titulo-pagina", P.esAdmin() ? "Trabajar en una caja" : "¿Dónde trabajás hoy?"),
-      h("p.subtitulo", P.esAdmin() ? "Elegí la caja para vender o cerrar caja como administrador." : "Elegí tu boca y caja. Al cerrar tu turno, la caja queda disponible para el relevo."))));
+      h("h1.titulo-pagina", P.puedeGestionarCajas() ? "Trabajar en una caja" : "¿Dónde trabajás hoy?"),
+      h("p.subtitulo", P.puedeGestionarCajas() ? "Elegí la caja para operar." : "Elegí tu boca y caja. Al cerrar tu turno, la caja queda disponible para el relevo."))));
     if (P.puesto() && P.puesto().caja_id) {
-      contenedor.appendChild(P.btn(P.esAdmin() ? "Cerrar " + P.puesto().caja : "Cierre temporal", { tipo: "primario", icono: "candado", onclick: function () { P.cerrarCaja(P.puesto().caja_id); } }));
+      contenedor.appendChild(P.btn(P.puedeGestionarCajas() ? "Cerrar " + P.puesto().caja : "Cierre temporal", { tipo: "primario", icono: "candado", onclick: function () { P.cerrarCaja(P.puesto().caja_id); } }));
       return;
     }
     if (!puestos.length) {

@@ -35,7 +35,7 @@
           P.cifra("Ventas de hoy", P.f.entero(d.hoy.ventas)),
           P.cifra("Vendido hoy", P.f.pesos(d.hoy.total)),
           P.cifra("Efectivo en cajas", P.f.pesos(d.efectivo_en_cajas)),
-          P.cifra("Afiliados en el predio", P.f.entero(d.afiliados_en_predio)));
+          d.afiliados_en_predio == null ? null : P.cifra("Afiliados en el predio", P.f.entero(d.afiliados_en_predio)));
         var porBoca = h("section.hoja.hoja-cuerpo", h("h2.seccion-titulo", "Ventas de hoy por boca"),
           P.barrasH(d.hoy.por_boca.map(function (b) { return { etiqueta: b.boca + " (" + b.ventas + ")", valor: b.total }; }), { formato: P.f.pesos }));
         var ultimas = h("section.hoja.hoja-cuerpo", h("h2.seccion-titulo", "Últimas ventas"),
@@ -82,7 +82,7 @@
                   (cj.temporales_pendientes ? " · " + cj.temporales_pendientes + (cj.temporales_pendientes === 1 ? " cierre temporal por recibir" : " cierres temporales por recibir") : ""))),
                 h("div", { style: { textAlign: "right" } }, h("strong.dinero", P.f.pesos(cj.saldo)), h("div", { style: { marginTop: "4px" } },
                   !ap ? P.chip("Sin saldo de apertura", "VENCIDO") : ap.verificacion === "CORRECTO" ? P.chip("Apertura confirmada", "CORRECTO") : ap.verificacion === "NO_COINCIDE" ? P.chip("Apertura no coincide", "NO_COINCIDE") : P.chip("Apertura sin confirmar", "PENDIENTE"))));
-            })) : h("p.texto-3", "No hay cajas. Crealas en Gestión > Bocas y cajas.")));
+            })) : h("p.texto-3", P.esAdmin() ? "No hay cajas. Crealas en Gestión > Bocas y cajas." : "No hay cajas en tus bocas asignadas.")));
       });
     }
     function resolver(b, p, aprobar) {
@@ -92,5 +92,5 @@
     }
     P.intervalo(function () { cargar().catch(function () {}); }, 15000);
     return cargar();
-  }, { admin: true, titulo: "Inicio" });
+  }, { cajas: true, titulo: "Inicio" });
 })();

@@ -10,7 +10,7 @@
   function selectorCaja(caja) {
     P.opciones("cajas").then(function (xs) {
       var asignada = P.puesto() && P.puesto().caja_id;
-      if (!P.esAdmin()) xs = xs.filter(function (x) { return asignada && String(x.valor) === String(asignada); });
+      if (!P.puedeGestionarCajas()) xs = xs.filter(function (x) { return asignada && String(x.valor) === String(asignada); });
       xs.forEach(function (x) {
         caja.appendChild(h("option", { value: x.valor }, x.texto));
       });
@@ -119,7 +119,7 @@
         elegidas.forEach(function (f) {
           if (!valido(f)) { f.imp.focus(); throw Error("Revisá el importe de " + f.linea.nombre + ": tiene que ser mayor que cero y no superar lo que falta pagar (" + pesos(f.linea.adeudado) + ")."); }
         });
-        if (medio.value === "EFECTIVO" && !caja.value) { caja.focus(); throw Error(P.esAdmin() ? "Elegí la caja donde se registra el efectivo." : "Ingresá a tu caja para registrar el efectivo de recepción."); }
+        if (medio.value === "EFECTIVO" && !caja.value) { caja.focus(); throw Error(P.puedeGestionarCajas() ? "Elegí la caja donde se registra el efectivo." : "Ingresá a tu caja para registrar el efectivo de recepción."); }
         return P.post("/recepcion/" + r.id + "/articulos/cobrar", {
           operacion: key,
           items: elegidas.map(function (f) { return { adicional_id: f.linea.adicional_id, importe: importeDe(f) }; }),
