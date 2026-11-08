@@ -30,19 +30,39 @@
       var disponible = h("div.campo-ayuda");
       var cantidad = P.input({ inputmode: "decimal", valor: "1" });
       cantidad.style.width = "100px";
-      // Pesables: se pasan en kilos o en gramos (o con la etiqueta de la balanza, que trae el peso).
-      var unidadCantidad = P.segmentado([{ valor: "kg", texto: "kg" }, { valor: "g", texto: "g" }], "kg");
-      unidadCantidad.hidden = true;
-      var ayudaCantidad = h("span.campo-ayuda", "Ej.: 0,5 para media unidad.");
-      function prepararCantidad() {
-        var kg = elegido && elegido.unidad === "KG";
-        unidadCantidad.hidden = !kg;
-        if (!kg) unidadCantidad.fijar("kg");
-        ayudaCantidad.textContent = elegido && elegido.receta
-          ? "En porciones: se mueve lo que corresponde de «" + elegido.receta.nombre + "» (rinde " + elegido.receta.rendimiento + " por unidad)."
-          : kg ? "En kilos (2,350) o en gramos (2350)." : "Ej.: 0,5 para media unidad.";
-        if (elegido && elegido.peso && kg) { unidadCantidad.fijar("kg"); cantidad.value = P.f.numero(elegido.peso).replace(/\./g, ""); }
+      // La cantidad puede ser una parte: los pesables en kilos o gramos (o con la etiqueta de la
+      // balanza, que trae el peso) y un compuesto de insumo en su insumo o en porciones.
+      var zonaUnidad = h("div.unidad-cantidad");
+      var unidadCantidad = null;
+      var ayudaCantidad = h("span.campo-ayuda");
+      function unidadesDe(p) {
+        if (!p) return [];
+        if (p.receta) {
+          var base = p.receta.unidad === "KG" ? [{ valor: "kg", texto: "kg" }, { valor: "g", texto: "g" }] : [{ valor: "u", texto: "Unidades" }];
+          return base.concat([{ valor: "porciones", texto: "Porciones" }]);
+        }
+        return p.unidad === "KG" ? [{ valor: "kg", texto: "kg" }, { valor: "g", texto: "g" }] : [];
       }
+      function modoCantidad() { return unidadCantidad ? unidadCantidad.valor() : "u"; }
+      function textoAyuda() {
+        if (!elegido) return "Podés mandar una parte: 0,5 es la mitad. Las dos bocas quedan con stock.";
+        var modo = modoCantidad();
+        if (elegido.receta) {
+          return modo === "porciones"
+            ? "En porciones: se manda lo que corresponde de «" + elegido.receta.nombre + "» (rinde " + elegido.receta.rendimiento + " por " + (elegido.receta.unidad === "KG" ? "kilo" : "unidad") + ")."
+            : "Sale de «" + elegido.receta.nombre + "»: mandás una parte del insumo (" + (modo === "g" ? "en gramos" : modo === "kg" ? "en kilos, ej.: 0,5" : "ej.: 0,5 = la mitad") + ") y las dos bocas quedan con stock.";
+        }
+        if (elegido.unidad === "KG") return modo === "g" ? "En gramos (ej.: 500). Las dos bocas quedan con stock." : "En kilos (ej.: 0,5 = medio kilo). Las dos bocas quedan con stock.";
+        return "Podés mandar una parte: 0,5 es la mitad. Las dos bocas quedan con stock.";
+      }
+      function prepararCantidad() {
+        var opciones = unidadesDe(elegido);
+        unidadCantidad = opciones.length ? P.segmentado(opciones, opciones[0].valor, function () { ayudaCantidad.textContent = textoAyuda(); cantidad.focus(); }) : null;
+        P.reemplazar(zonaUnidad, unidadCantidad);
+        ayudaCantidad.textContent = textoAyuda();
+        if (elegido && elegido.peso && elegido.unidad === "KG") cantidad.value = P.f.numero(elegido.peso).replace(/\./g, "");
+      }
+      prepararCantidad();
       var combo = P.comboProducto({
         abrirAlEnfocar: false,
         placeholder: "Escaneá (también la etiqueta de la balanza) o buscá el producto",
@@ -57,20 +77,22 @@
         disponible.textContent = "Consultando stock…";
         P.get("/stock/disponible" + P.qs({ boca_id: origen.value, producto_id: elegido.id })).then(function (x) {
           if (elegido !== productoConsultado || origen.value !== origenConsultado) return;
-          elegido.disponible = x.insumo ? undefined : x.cantidad;
+          elegido.disponible = x.cantidad;
           disponible.textContent = x.insumo
-            ? "Disponible en " + nombreOrigen + ": " + P.f.numero(x.cantidad) + " de «" + x.insumo.nombre + "» (unas " + P.f.entero(Math.floor(x.cantidad * x.insumo.rendimiento)) + " porciones)"
+            ? "Disponible en " + nombreOrigen + ": " + P.f.cantidad(x.cantidad, elegido.receta && elegido.receta.unidad) + " de «" + x.insumo.nombre + "» (unas " + P.f.entero(Math.floor(x.cantidad * x.insumo.rendimiento)) + " porciones)"
             : "Disponible en " + nombreOrigen + ": " + P.f.cantidad(x.cantidad, elegido.unidad);
           disponible.style.color = x.cantidad <= 0 ? "var(--error)" : "";
         }).catch(function () { disponible.textContent = ""; });
       }
+      // Lo disponible en el origen se compara con la línea en la misma unidad (en porciones, no).
+      function disponibleDeLinea(l, cantidadOrigen) { return l.porciones ? undefined : cantidadOrigen; }
       origen.addEventListener("change", function () {
         if (elegido) elegido.disponible = undefined;
         var id = origen.value;
         lineas.forEach(function (l) {
           l.disponible = undefined;
           P.get("/stock/disponible" + P.qs({ boca_id: id, producto_id: l.producto.id })).then(function (r) {
-            if (origen.value === id) { l.disponible = r.insumo ? undefined : r.cantidad; pintar(); }
+            if (origen.value === id) { l.disponible = disponibleDeLinea(l, r.cantidad); pintar(); }
           }).catch(P.error);
         });
         mostrarDisponible(); pintar();
@@ -80,12 +102,18 @@
         if (!elegido) { combo.foco(); return; }
         var n = P.numeroDe(cantidad.value);
         if (!(n > 0)) { cantidad.focus(); return; }
-        if (elegido.unidad === "KG" && unidadCantidad.valor() === "g") n = n / 1000;
+        var modo = modoCantidad();
+        if (modo === "g") n = n / 1000;
         n = P.redondear(n, 3);
         if (!(n > 0)) { cantidad.focus(); return; }
-        var ex = lineas.filter(function (l) { return l.producto.id === elegido.id; })[0];
+        var porciones = modo === "porciones";
+        var ex = lineas.filter(function (l) { return l.producto.id === elegido.id && !!l.porciones === porciones; })[0];
         if (ex) ex.cantidad = P.redondear(ex.cantidad + n, 3);
-        else lineas.push({ producto: elegido, cantidad: n, disponible: elegido.disponible });
+        else {
+          var linea = { producto: elegido, cantidad: n, porciones: porciones };
+          linea.disponible = disponibleDeLinea(linea, elegido.disponible);
+          lineas.push(linea);
+        }
         elegido = null;
         combo.limpiar();
         cantidad.value = "1";
@@ -95,15 +123,16 @@
         combo.foco();
       }
       cantidad.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); agregar(); } });
+      function unidadDeLinea(l) { return l.producto.receta ? l.producto.receta.unidad : l.producto.unidad; }
       function pintar() {
         P.vaciar(lista);
         if (!lineas.length) { lista.appendChild(h("p.texto-3", "Agregá los productos de a uno (podés usar el escáner).")); return; }
         lista.appendChild(h("table.tabla", h("thead", h("tr", h("th", "Producto"), h("th.der", "Cantidad"), h("th.der", "Disponible en origen"), h("th"))),
           h("tbody", lineas.map(function (l, i) {
             var falta = l.disponible !== undefined && l.cantidad > l.disponible;
-            return h("tr", h("td", h("strong", l.producto.nombre), l.producto.receta ? h("div.texto-3.chico", "Se mueve «" + l.producto.receta.nombre + "»") : null),
-              h("td.der", l.producto.receta ? P.f.numero(l.cantidad) + " porciones" : P.f.cantidad(l.cantidad, l.producto.unidad)),
-              h("td.der" + (falta ? ".negativo" : ""), l.disponible === undefined ? "—" : P.f.cantidad(l.disponible, l.producto.unidad) + (falta ? " (no alcanza)" : "")),
+            return h("tr", h("td", h("strong", l.producto.nombre), l.producto.receta ? h("div.texto-3.chico", "Se manda «" + l.producto.receta.nombre + "»") : null),
+              h("td.der", l.porciones ? P.f.numero(l.cantidad) + " porciones" : P.f.cantidad(l.cantidad, unidadDeLinea(l))),
+              h("td.der" + (falta ? ".negativo" : ""), l.disponible === undefined ? "—" : P.f.cantidad(l.disponible, unidadDeLinea(l)) + (falta ? " (no alcanza)" : "")),
               h("td.acciones", P.btn("", { tipo: "texto", chico: true, icono: "cerrar", etiqueta: "Quitar", onclick: function () { lineas.splice(i, 1); pintar(); } })));
           }))));
       }
@@ -116,7 +145,7 @@
         ancho: "ancha",
         contenido: h("div.columna",
           h("div.grilla.grilla-2", P.campo("Sale de (boca de origen)", origen), P.campo("Llega a (boca de destino)", destino)),
-          h("div.fila-campos", P.campo("Producto", h("div", combo.el, disponible), { clase: "crece" }), P.campo("Cantidad", h("div", h("div.fila.cantidad-con-unidad", cantidad, unidadCantidad), ayudaCantidad)),
+          h("div.fila-campos", P.campo("Producto", h("div", combo.el, disponible), { clase: "crece" }), P.campo("Cantidad", h("div", h("div.fila.cantidad-con-unidad", cantidad, zonaUnidad), ayudaCantidad)),
             h("div.campo", h("span.campo-etiqueta", " "), P.btn("Agregar", { tipo: "celeste", icono: "mas", onclick: agregar }))),
           lista,
           P.esAdmin() ? baja : null,
@@ -127,7 +156,7 @@
           if (!lineas.length) { P.aviso("Agregá al menos un producto", "error"); return; }
           var cuerpo = Object.assign({
             boca_origen_id: Number(origen.value), boca_destino_id: Number(destino.value), baja_automatica: baja.input.checked, observaciones: obs.value,
-            lineas: lineas.map(function (l) { return { producto_id: l.producto.id, cantidad: l.cantidad }; }),
+            lineas: lineas.map(function (l) { return { producto_id: l.producto.id, cantidad: l.cantidad, porciones: l.porciones || undefined }; }),
           }, autorizacion || {});
           P.ejecutar(ev.currentTarget, function () {
             return P.conConfirmacionStock(function (confirmar) {

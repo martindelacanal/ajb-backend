@@ -25,6 +25,9 @@ async function validarBocas(t, ctx, origenId, destinoId) {
   return { origen, destino };
 }
 
+// Cada línea es un producto y una cantidad, que puede ser una parte (0,5 = la mitad; en los
+// pesables, kilos con gramos). `porciones: true` sólo tiene sentido en un compuesto que sale
+// de un insumo: la cantidad son porciones en lugar de unidades (o kilos) del insumo.
 function leerLineas(body) {
   const crudas = Array.isArray(body.lineas) && body.lineas.length
     ? body.lineas
@@ -33,19 +36,24 @@ function leerLineas(body) {
   for (const l of crudas) {
     const productoId = U.id(l.producto_id, "El producto");
     const cantidad = U.numero(l.cantidad, { min: 0.001, max: 9999999, decimales: 3, campo: "La cantidad" });
-    agrupadas.set(productoId, U.redondear((agrupadas.get(productoId) || 0) + cantidad, 3));
+    const porciones = l.porciones === true;
+    const clave = `${productoId}:${porciones ? 1 : 0}`;
+    const previa = agrupadas.get(clave);
+    agrupadas.set(clave, { producto_id: productoId, cantidad: U.redondear((previa?.cantidad || 0) + cantidad, 3), porciones });
   }
   if (!agrupadas.size) throw U.error("Agregá al menos un producto");
   if (agrupadas.size > 100) throw U.error("Podés pedir hasta 100 productos por vez");
-  return [...agrupadas.entries()].map(([producto_id, cantidad]) => ({ producto_id, cantidad }));
+  return [...agrupadas.values()];
 }
 
-// Un compuesto que sale de un insumo (p. ej. «Café» de un paquete de café en grano) no tiene
-// stock propio: se pide o se traspasa en porciones y se mueve el insumo equivalente, igual que
-// lo descuenta la caja. Los demás productos (también los pesables, en kilos) pasan tal cual.
+// Los compuestos con stock propio (quesos, fiambres, medias hormas) se parten tal cual: si
+// el almacén tiene 1 kg y manda 0,5 kg a la confitería, quedan 0,5 kg en cada boca. Un
+// compuesto que sale de un insumo (p. ej. «Café» de un paquete de café en grano) no tiene stock
+// propio: se manda una parte del insumo (en su unidad) o, si se pide en porciones, el insumo
+// equivalente, igual que lo descuenta la caja.
 async function lineasFisicas(t, ctx, lineas) {
   const porProducto = new Map();
-  const porciones = [];
+  const conversiones = [];
   for (const l of lineas) {
     const receta = await Porciones.leer(t, ctx, l.producto_id);
     let productoId = l.producto_id;
@@ -54,17 +62,19 @@ async function lineasFisicas(t, ctx, lineas) {
       const p = await N.exigir(t, ctx, "predio_producto", l.producto_id, "Uno de los productos no existe");
       if (!Number(receta.activo)) throw U.error(`El insumo de «${p.nombre}» está dado de baja: elegí el insumo que corresponde.`);
       productoId = Number(receta.insumo_id);
-      cantidad = Math.ceil(U.redondear(l.cantidad * 1000 / Number(receta.rendimiento), 6)) / 1000;
-      porciones.push({ producto_id: l.producto_id, producto: p.nombre, porciones: l.cantidad, insumo_id: productoId, insumo: receta.nombre, cantidad });
+      if (l.porciones) cantidad = Math.ceil(U.redondear(l.cantidad * 1000 / Number(receta.rendimiento), 6)) / 1000;
+      conversiones.push({ producto_id: l.producto_id, producto: p.nombre, porciones: l.porciones ? l.cantidad : null, insumo_id: productoId, insumo: receta.nombre, cantidad });
     }
     porProducto.set(productoId, U.redondear((porProducto.get(productoId) || 0) + cantidad, 3));
   }
-  return { lineas: [...porProducto].map(([producto_id, cantidad]) => ({ producto_id, cantidad })), porciones };
+  return { lineas: [...porProducto].map(([producto_id, cantidad]) => ({ producto_id, cantidad })), porciones: conversiones };
 }
 
 function notaPorciones(observaciones, porciones) {
   if (!porciones.length) return observaciones;
-  const nota = porciones.map((x) => `${x.porciones} porciones de ${x.producto} = ${x.cantidad} de ${x.insumo}`).join("; ");
+  const nota = porciones.map((x) => x.porciones != null
+    ? `${x.porciones} porciones de ${x.producto} = ${x.cantidad} de ${x.insumo}`
+    : `${x.producto}: se mandan ${x.cantidad} de ${x.insumo}`).join("; ");
   return [observaciones, nota].filter(Boolean).join(" · ").slice(0, 255);
 }
 

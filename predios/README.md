@@ -49,8 +49,9 @@ es `scripts/migrar-predios.js`; las sesiones de cuentas propias usan
   Mi AJB; y en Mi AJB, *Descargar paquete* (`.ajbpaquete`: afiliados, órdenes en cola y, opcional,
   la versión nueva) para cargar en el camping.
 - **Actualizaciones**: la versión es `package.json` + huella del contenido. Cada deploy del backend
-  publica la versión nueva; la notebook la descarga, la instala en `app/versiones/<versión>/` y se
-  reinicia sola. Si no arranca dos veces seguidas, el lanzador vuelve a la anterior.
+  publica la versión nueva; la notebook la busca cada 15 minutos (un respaldo HA, cada minuto),
+  la instala en `app/versiones/<versión>/` y se reinicia sola. Si no arranca dos veces seguidas,
+  el lanzador vuelve a la anterior. Desde Mi AJB → Predios se puede forzar la búsqueda.
 
 ## Firma de actualizaciones y paquetes
 
@@ -223,12 +224,17 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
   (`unidad = 'KG'`). El ticket imprime `0,485 KG  22.000,00/KG`. Prefijo y largo del código
   se cambian en Sistema → Configuración, con un probador de etiquetas.
 - El sistema anterior dejó los productos de balanza (código `2000XXX`) con precio **por gramo**
-  (jamón $22). En Gestión → Productos, filtro «Se vende: Código de balanza todavía por unidad»,
-  elegirlos y «Vender por kilo» → «Está por gramo»: precios × 1.000 y stock/stock mínimo ÷ 1.000
-  (movimiento «Paso a kilos», historial de precios y auditoría). `POST /productos/peso[/previa]`.
-- **Traspasos y pedidos entre bocas**: los pesables se pasan en kilos o gramos (o escaneando la
-  etiqueta). Un compuesto que sale de un insumo (Café → paquete de café) se pide en porciones y
-  se mueve el insumo equivalente; la observación y la auditoría guardan la conversión.
+  (jamón $22). El 2026-11-08 se pasaron a venta por kilo los 61 de Miramar con precio por gramo
+  (orden remota, auditada en la notebook); quedaron por unidad facturas, pebetes, huevo, melón,
+  ajo, papas fritas y pan de hamburguesa, y sin precio prueba, pollo y los de La Chocolata.
+  Para otros: elegirlos en Gestión → Productos y «Vender por kilo» («está por gramo» = precios
+  × 1.000 y stock/stock mínimo ÷ 1.000, movimiento «Paso a kilos»). `POST /productos/peso[/previa]`.
+- **Traspasos y pedidos entre bocas**: cualquier producto se puede partir (0,5 = la mitad) y
+  las dos bocas quedan con stock: 1 kg de queso en el almacén, 0,5 kg a la confitería → 0,5 kg
+  en cada una. Los pesables se pasan en kilos o gramos (o escaneando la etiqueta). Un compuesto
+  que sale de un insumo (Café → paquete de café) manda una parte del insumo o, si se elige
+  «Porciones» (`porciones: true` en la línea), el insumo equivalente; la observación y la
+  auditoría guardan la conversión.
 - **Conteo de stock al cerrar la caja** (`lib/api/conteo.js`, tablas `predio_conteo` y
   `predio_conteo_item`): opcional, lo activa Administración en Sistema → Configuración con el
   porcentaje del stock de la boca por cierre y la tolerancia en pesables. Antes del cierre

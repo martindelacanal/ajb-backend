@@ -182,12 +182,10 @@ L.productos = {
     ] },
     { clave: "destino", titulo: "Destino", tipo: "opciones", expr: "p.destino", opciones: DESTINOS },
     {
-      // Los de la balanza del sistema anterior: código 2 + PLU + 0 (2000140 = jamón cocido, PLU 14).
       clave: "unidad", titulo: "Se vende", tipo: "opciones",
       opciones: [
         { valor: "KG", texto: "Por peso (kg)", sql: "p.unidad = 'KG'" },
         { valor: "U", texto: "Por unidad", sql: "COALESCE(p.unidad, '') <> 'KG'" },
-        { valor: "balanza", texto: "Código de balanza (2000…) todavía por unidad", sql: "COALESCE(p.unidad, '') <> 'KG' AND p.codigo LIKE '2000___'" },
       ],
     },
     { clave: "perecedero", titulo: "Perecedero", tipo: "opciones", expr: "p.perecedero", opciones: SI_NO },
