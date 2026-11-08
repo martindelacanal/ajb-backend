@@ -311,10 +311,12 @@ Al haber tres PCs listas, contando la principal, el sistema pausa las escrituras
 para copiar la última base de la principal y activa el reemplazo automáticamente.
 El instalador prepara «Sistema del Camping - Caja». Cada equipo incorporado puede
 guardar una copia y participar en la elección del servidor. Con tres votantes, dos
-pueden seguir operando tras la caída del tercero. Los equipos necesitan mantener
-sus direcciones IPv4 dentro de la red del predio (por ejemplo, con reservas DHCP).
-El navegador puede usar HTTP. La incorporación y la réplica usan una conexión
-interna con certificados preparados por el instalador.
+pueden seguir operando tras la caída del tercero. Los equipos incorporados se
+encuentran por su identidad en la misma LAN, incluso si el router les asigna
+IPv4 nuevas. Usá el acceso de caja del escritorio después del cambio. Para
+encontrarse, los equipos intercambian mensajes autenticados por UDP 39879 en
+la red local. La actualización prepara esa regla en Windows. El navegador
+puede usar HTTP. La incorporación y la réplica usan certificados internos.
 
 El permiso de un ZIP vence en una hora y se usa en la PC donde se solicitó.
 Si se interrumpe la instalación, usá `CONTINUAR-INSTALACION.bat` en la carpeta

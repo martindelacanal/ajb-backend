@@ -21,6 +21,7 @@ const { crearAgente } = require("./lib/agente");
 const N = require("./lib/negocio");
 const { crearControlEquipo } = require("./lib/control-equipo");
 const { crearDescubrimiento } = require("./lib/descubrimiento");
+const { crearUbicacionLan } = require("./lib/ubicacion-lan");
 const { leerRuntime, invocarControl, migrarRuntime, prepararAccesoCaja } = require("./lib/runtime");
 const { leerTls, prepararTls } = require("./lib/tls-local");
 const { revisarPreciosVencidos } = require("./lib/precios");
@@ -95,6 +96,7 @@ function autoridadLocal() {
 function instalarAutoridad(haNueva, packet) {
   configHa = haNueva;
   ha = crearServicioLan({ base: BASE, dirApp: DIR_APP, config, db, ha: haNueva, log,
+    ubicarGrupo, puertoHttps: () => tlsCargado?.puerto,
     prepararQuorum: nueva => escribirHa(BASE, nueva),
     alReiniciar: () => { setTimeout(() => apagar(75), 100).unref(); } });
   if (packet) ha.registrarInicial(packet);
@@ -105,10 +107,17 @@ function instalarAutoridad(haNueva, packet) {
 if (configHa) instalarAutoridad(configHa);
 else if (congelado) controlEquipo.configurarAutoridadLocal(autoridadLocal);
 let descubrimiento = null;
+let ubicacionGrupo = null;
 let servidorHttps = null;
 let tlsCargado = null;
 let errorHttps = null;
 let preparandoHttps = null;
+
+function ubicarGrupo({ grupoId, claveDatos }) {
+  ubicacionGrupo ??= crearUbicacionLan({ grupoId, claveDatos, nodoId: controlEquipo.equipoId, log,
+    puertos: () => ({ https: tlsCargado?.puerto, raft: configHa?.quorum?.puerto }) });
+  return ubicacionGrupo;
+}
 
 function estadoHttps() {
   return { ...(tlsCargado?.publico || { preparado: false, puerto: 8443 }), activo: Boolean(servidorHttps?.listening),
@@ -193,6 +202,7 @@ const agente = crearAgente({
 servicios.agente = agente;
 const grupoLocal = crearGrupoLocal({ base: BASE, dirApp: DIR_APP, version: VERSION, config, db,
   equipoId: controlEquipo.equipoId, haActual: () => ha?.estado(), configuracionHa: () => configHa, log,
+  ubicarGrupo, consultarQuorum: () => ha?.consultarQuorum(),
   promoverQuorum: (r, disponibles, haQuorum, pedirEquipo) => ha.promoverQuorum(r, disponibles, haQuorum, pedirEquipo),
   bloquearEscritura() {
     const archivo = path.join(BASE, "ha-activacion-pendiente.json");
@@ -684,6 +694,7 @@ function apagar(codigo = 0) {
   agente.detener();
   ha?.detener();
   descubrimiento?.detener();
+  ubicacionGrupo?.detener();
   const abiertos = [servidor, servidorHttps].filter((s) => s?.listening);
   let restantes = abiertos.length;
   function cerrar() { if (--restantes <= 0) { db.cerrar(); process.exit(salirConCodigo || 0); } }

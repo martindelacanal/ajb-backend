@@ -26,9 +26,9 @@ function guardar(archivo, datos) {
   try { fd = fs.openSync(temporal, "wx", 0o600); fs.writeFileSync(fd, JSON.stringify(datos, null, 2)); fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined; fs.renameSync(temporal, archivo); }
   finally { if (fd !== undefined) fs.closeSync(fd); if (fs.existsSync(temporal)) fs.unlinkSync(temporal); }
 }
-function solicitar({ url, caPublica, cabeceras, cuerpo }) {
+function solicitar({ url, caPublica, cabeceras, cuerpo, servername }) {
   return new Promise((resolve, reject) => {
-    const req = https.request(url, { method: "POST", ca: caPublica, rejectUnauthorized: true, headers: { ...cabeceras, "Content-Type": "application/json", "Content-Length": cuerpo.length } }, (res) => {
+    const req = https.request(url, { method: "POST", ca: caPublica, servername, rejectUnauthorized: true, headers: { ...cabeceras, "Content-Type": "application/json", "Content-Length": cuerpo.length } }, (res) => {
       const partes = []; let total = 0;
       res.on("data", (p) => { total += p.length; if (total > 2 * 1024 * 1024) req.destroy(new Error("La incorporación excede el tamaño permitido")); else partes.push(p); });
       res.on("error", reject); res.on("end", () => { clearTimeout(timer); if (res.statusCode !== 200) reject(new Error("El principal rechazó la incorporación; revisá si el permiso sigue vigente")); else resolve(Buffer.concat(partes)); });
@@ -67,7 +67,7 @@ async function enrolarApoyo({ base, continuar = false }, dependencias = {}) {
   }
   const url = new URL("/lan/incorporar", principal), cuerpo = Buffer.from(JSON.stringify(datos));
   const cabeceras = { ...firmarPeticion({ grupoId: inicial.grupoId, nodoId, metodo: "POST", ruta: url.pathname, cuerpo, clave: inc.clave, ahora: d.ahora() }), "X-AJB-Incorporacion": String(inc.id) };
-  const buffer = await d.solicitar({ url: url.toString(), caPublica: caPublicaPrincipal, cabeceras, cuerpo });
+  const buffer = await d.solicitar({ url: url.toString(), caPublica: caPublicaPrincipal, cabeceras, cuerpo, servername: inc.nombreTls });
   let respuesta;
   try { respuesta = descifrarJson(buffer, inc.clave); } catch (_e) { throw new Error("La respuesta de incorporación no pudo autenticarse"); }
   const ha = respuesta?.ha;

@@ -8,6 +8,7 @@ const { spawn } = require("node:child_process");
 const H = require("./http-lan");
 const { crearVerificador, verificarAckReplica, verificarEstadoFirmado } = require("./protocolo-lan");
 const { protegerCarpetaTestigo } = require("./testigo-lan");
+const { conectarMiembro } = require("./ubicacion-lan");
 
 const USO_MS = 5000;
 const revisionValida = r => Number.isSafeInteger(r?.indice) && r.indice >= 0 && /^[a-f0-9]{64}$/.test(r.sha256);
@@ -15,13 +16,14 @@ const misma = (a, b) => a?.indice === b?.indice && a?.sha256 === b?.sha256;
 const publico = ({ id, nombre, url, caPublica, preferido }) => ({ id, nombre, url, caPublica, preferido });
 const error = (mensaje, status = 503) => Object.assign(new Error(mensaje), { status });
 const RUTA_ALTA = "/api/sistema/grupo-local/incorporar-equipo";
+const direccionRaft = (id, puerto) => `${id.slice(0, 32)}.${id.slice(32)}.raft.predio.ajb:${puerto}`;
 
 function acreditarOrigen(ip, c) {
   const datos = Buffer.from(JSON.stringify({ ip, nodo: c.nodoId, fecha: Date.now() })).toString("base64url");
   return `${datos}.${crypto.createHmac("sha256", c.claveDatos).update(datos).digest("hex")}`;
 }
 
-function origenAcreditado(cabecera, c, miembros, ipPar) {
+function origenAcreditado(cabecera, c, miembros, ipPar, ubicacion) {
   const [datos, firma] = String(cabecera || "").split(".");
   if (!datos || datos.length > 256 || !/^[a-f0-9]{64}$/.test(firma || "")) return null;
   const esperada = crypto.createHmac("sha256", c.claveDatos).update(datos).digest();
@@ -29,12 +31,12 @@ function origenAcreditado(cabecera, c, miembros, ipPar) {
   try {
     const { ip, nodo, fecha } = JSON.parse(Buffer.from(datos, "base64url"));
     const miembro = miembros.find(m => m.id === nodo);
-    if (miembro && new URL(miembro.url).hostname === ipPar && Number.isSafeInteger(fecha) && Math.abs(Date.now() - fecha) < 15000 && isIPv4(ip)) return ip;
+    if (miembro && new URL(conectarMiembro(miembro, ubicacion).url).hostname === ipPar && Number.isSafeInteger(fecha) && Math.abs(Date.now() - fecha) < 15000 && isIPv4(ip)) return ip;
   } catch (_e) { /* origen no verificable */ }
   return null;
 }
 
-function iniciarConsenso({ base, dirApp, config, log }) {
+function iniciarConsenso({ base, dirApp, config, log, ubicacion }) {
   const q = config.quorum;
   const ejecutable = path.join(dirApp, "windows", "ajb-quorum.exe");
   if (!fs.existsSync(ejecutable)) throw error("La versión instalada no incluye el coordinador del grupo de PCs");
@@ -42,7 +44,7 @@ function iniciarConsenso({ base, dirApp, config, log }) {
   protegerCarpetaTestigo(carpeta);
   const localKey = crypto.randomBytes(32).toString("hex");
   const proceso = spawn(ejecutable, [], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
-  let cerrado = false;
+  let cerrado = false, timer;
   const url = new Promise((resolve, reject) => {
     let salida = "";
     proceso.stdout.on("data", b => {
@@ -54,7 +56,7 @@ function iniciarConsenso({ base, dirApp, config, log }) {
       }
     });
     proceso.once("error", reject);
-    proceso.once("exit", () => { cerrado = true; reject(error("El coordinador del grupo se detuvo")); });
+    proceso.once("exit", () => { cerrado = true; clearInterval(timer); reject(error("El coordinador del grupo se detuvo")); });
   });
   // Startup can fail before the first election poll has attached a waiter.
   url.catch(e => log(e.message));
@@ -63,17 +65,28 @@ function iniciarConsenso({ base, dirApp, config, log }) {
   proceso.stdin.write(JSON.stringify({ id: config.nodoId, listen: `0.0.0.0:${q.puerto}`, advertise: q.direccion,
     directory: carpeta, secret: q.secreto, localKey, bootstrap: q.bootstrap }) + "\n");
 
-  return {
-    async pedir(ruta, cuerpo) {
-      if (cerrado) throw error("El coordinador del grupo se detuvo");
-      const destino = await url;
-      const r = await fetch(destino + ruta, { method: cuerpo ? "POST" : "GET", signal: AbortSignal.timeout(4500),
-        headers: { Authorization: "Bearer " + localKey, "Content-Type": "application/json" }, body: cuerpo && JSON.stringify(cuerpo) });
-      if (!r.ok) throw error(r.status === 409 ? "Cambió la configuración del grupo" : "Esta PC espera a la mayoría del grupo", r.status);
-      return r.json();
-    },
-    detener() { if (!cerrado) proceso.stdin.end(); },
-  };
+  async function pedir(ruta, cuerpo) {
+    if (cerrado) throw error("El coordinador del grupo se detuvo");
+    const destino = await url;
+    const r = await fetch(destino + ruta, { method: cuerpo ? "POST" : "GET", signal: AbortSignal.timeout(4500),
+      headers: { Authorization: "Bearer " + localKey, "Content-Type": "application/json" }, body: cuerpo && JSON.stringify(cuerpo) });
+    if (!r.ok) throw error(r.status === 409 ? "Cambió la configuración del grupo" : "Esta PC espera a la mayoría del grupo", r.status);
+    return r.json();
+  }
+  let publicadas = "{}", enviando = false;
+  async function publicar() {
+    const direcciones = ubicacion.direccionesRaft();
+    const actual = JSON.stringify(direcciones);
+    if (cerrado || enviando || actual === publicadas) return;
+    enviando = true;
+    try { await pedir("/locations", direcciones); publicadas = actual; }
+    catch (e) { if (!cerrado) log("Ubicación del grupo: " + e.message); }
+    finally { enviando = false; }
+  }
+  timer = ubicacion ? setInterval(publicar, 1000) : null;
+  timer?.unref();
+  if (ubicacion) publicar();
+  return { pedir, detener() { clearInterval(timer); if (!cerrado) proceso.stdin.end(); } };
 }
 
 function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
@@ -155,7 +168,7 @@ function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
     throw error("La operación no corresponde a un permiso vigente", 409);
   }
   function cambiarMembresia(lectura, miembro, voter) {
-    return consenso.pedir("/member", { id: miembro.id, address: `${new URL(miembro.url).hostname}:${config.quorum.puerto}`, voter,
+    return consenso.pedir("/member", { id: miembro.id, address: direccionRaft(miembro.id, config.quorum.puerto), voter,
       expected: lectura.register.version, term: lectura.term, configuration: lectura.configuration });
   }
   return {
@@ -190,13 +203,23 @@ function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
   };
 }
 
-function clienteQuorum(c) {
+function clienteQuorum(c, { ubicacion, miembrosLocales, puertoHttps } = {}) {
   let miembros = c.miembros;
+  function conectar(miembro) {
+    const puerto = miembro.id === c.nodoId && puertoHttps?.();
+    return puerto ? { url: `https://127.0.0.1:${puerto}`, ca: miembro.caPublica } : conectarMiembro(miembro, ubicacion);
+  }
   async function estado({ compacto = false } = {}) {
+    if (miembrosLocales && Object.keys(ubicacion?.direccionesRaft() || {}).some(id => !miembros.some(m => m.id === id))) {
+      const locales = await miembrosLocales().catch(() => []);
+      const conocidos = new Set(miembros.map(m => m.id));
+      miembros = [...miembros, ...locales.filter(m => !conocidos.has(m.id))];
+    }
     const desafio = crypto.randomBytes(20).toString("hex"), inicio = performance.now();
     const ruta = `/lan/quorum/estado?desafio=${desafio}${compacto ? "&compacto=1" : ""}`;
     const { sobre, e } = await Promise.any(miembros.map(async m => {
-      const sobre = await H.pedir(m.url, ruta, { metodo: "GET", ca: m.caPublica, timeout: 4000 });
+      const destino = conectar(m);
+      const sobre = await H.pedir(destino.url, ruta, { ...destino, metodo: "GET", timeout: 4000 });
       return { sobre, e: verificarEstadoFirmado(sobre, { clavePublica: c.clavePublicaTestigo, grupoId: c.grupoId, desafio }) };
     })).catch(() => { throw error("Esperando una mayoría de PCs conectadas en el camping"); });
     const tardanza = performance.now() - inicio;
@@ -210,10 +233,11 @@ function clienteQuorum(c) {
       // El escritor siempre coincide con el líder de consenso. Sólo ese equipo
       // puede adquirir el permiso; un seguidor no envía mutaciones a otra PC.
       const yo = miembros.find(m => m.id === c.nodoId);
-      return H.pedir(yo.url, `/lan/quorum/${accion}`, { grupoId: c.grupoId, nodoId: c.nodoId, clave: c.clave,
-        cuerpo, ca: yo.caPublica, timeout: 4000 });
+      const destino = conectar(yo);
+      return H.pedir(destino.url, `/lan/quorum/${accion}`, { ...destino, grupoId: c.grupoId, nodoId: c.nodoId, clave: c.clave,
+        cuerpo, timeout: 4000 });
     },
   };
 }
 
-module.exports = { iniciarConsenso, crearAutoridadQuorum, clienteQuorum, RUTA_ALTA, acreditarOrigen, origenAcreditado };
+module.exports = { iniciarConsenso, crearAutoridadQuorum, clienteQuorum, direccionRaft, RUTA_ALTA, acreditarOrigen, origenAcreditado };

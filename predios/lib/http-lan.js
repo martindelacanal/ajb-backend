@@ -28,7 +28,7 @@ function descifrarJson(buffer, clave) {
   d.setAuthTag(buffer.subarray(-16));
   return JSON.parse(Buffer.concat([d.update(buffer.subarray(12, -16)), d.final()]).toString("utf8"));
 }
-async function pedir(urlBase, ruta, { grupoId, nodoId, clave, metodo = "POST", cuerpo, buffer, timeout = 4000, binario = false, ca } = {}) {
+async function pedir(urlBase, ruta, { grupoId, nodoId, clave, metodo = "POST", cuerpo, buffer, timeout = 4000, binario = false, ca, servername } = {}) {
   const url = new URL(ruta, urlBase);
   if (url.origin !== new URL(urlBase).origin || !["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("La dirección LAN no es válida");
   const datos = buffer || (cuerpo === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(cuerpo)));
@@ -36,7 +36,7 @@ async function pedir(urlBase, ruta, { grupoId, nodoId, clave, metodo = "POST", c
   if (metodo !== "GET") headers["Content-Type"] = buffer ? "application/octet-stream" : "application/json";
   if (metodo !== "GET") headers["Content-Length"] = datos.length;
   const r = await new Promise((resolve, reject) => {
-    const req = (url.protocol === "https:" ? https : http).request(url, { method: metodo, headers, ca, rejectUnauthorized: true }, (res) => {
+    const req = (url.protocol === "https:" ? https : http).request(url, { method: metodo, headers, ca, servername, rejectUnauthorized: true }, (res) => {
       const partes = []; let total = 0;
       const limite = binario && res.statusCode === 200 ? 300 * 1024 * 1024 + 16384 : 2 * 1024 * 1024;
       res.on("data", (p) => { total += p.length; if (total > limite) req.destroy(new Error("La respuesta LAN supera el tamaño permitido")); else partes.push(p); });

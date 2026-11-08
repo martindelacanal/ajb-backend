@@ -12,7 +12,8 @@ const { armarInstaladorApoyo } = require("./instalador-apoyo");
 const { crearSnapshotDirecta } = require("./respaldo-lan");
 const httpLan = require("./http-lan");
 const { crearVerificador } = require("./protocolo-lan");
-const { clienteQuorum } = require("./quorum-lan");
+const { direccionRaft } = require("./quorum-lan");
+const { conectarMiembro } = require("./ubicacion-lan");
 const META = "ha_admin_json";
 const PUERTO_QUORUM = 39878;
 const nuevoSecreto = () => crypto.randomBytes(32).toString("hex");
@@ -34,7 +35,7 @@ function guardarPrivado(archivo, contenido) {
   finally { if (fd !== undefined) fs.closeSync(fd); if (fs.existsSync(temporal)) fs.unlinkSync(temporal); }
 }
 function escribirHa(base, ha) { guardarPrivado(path.join(base, "predio-ha.json"), Buffer.from(JSON.stringify(ha, null, 2))); }
-function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual = () => null, configuracionHa = () => null, promoverQuorum, bloquearEscritura, activarLocal, reiniciar = () => {}, deps = {} }) {
+function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual = () => null, configuracionHa = () => null, promoverQuorum, consultarQuorum, ubicarGrupo, bloquearEscritura, activarLocal, reiniciar = () => {}, deps = {} }) {
   const d = { armarInstaladorApoyo, pedir: httpLan.pedir, estadoTestigo: httpLan.estadoTestigo, crearSnapshotDirecta, leerTls: tlsLocal.leerTls, prepararTls: tlsLocal.prepararTls, identidadEquipo, ahora: Date.now, hostname: os.hostname, ...deps };
   equipoId ||= d.identidadEquipo();
   if (!/^[a-f0-9]{64}$/.test(equipoId || "") || !db || db.dialecto !== "sqlite") throw new Error("El grupo requiere la identidad física y la base local del predio");
@@ -65,7 +66,7 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
       const claves = activa?.quorum && activa.grupoId === r.grupoId
         ? activa.quorum : JSON.parse(fs.readFileSync(archivoClaves, "utf8"));
       if (!/^[a-f0-9]{64}$/.test(claves.secreto || "") || !claves.clavePrivada) throw new Error("Faltan las claves privadas de coordinación");
-      resultado.quorum = { puerto: PUERTO_QUORUM, direccion: `${new URL(miembro.url).hostname}:${PUERTO_QUORUM}`,
+      resultado.quorum = { puerto: PUERTO_QUORUM, direccion: direccionRaft(miembro.id, PUERTO_QUORUM),
         secreto: claves.secreto, clavePrivada: claves.clavePrivada, ...inicial };
     } else resultado.quorumPendiente = true;
     return resultado;
@@ -80,7 +81,7 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
     if (r?.testigo) try { vivo = await d.estadoTestigo(haPara(r, r.miembros.find((m) => m.id === equipoId) || r.miembros[0])); } catch (_e) { /* estado informativo sin degradar la autoridad */ }
     if (r?.quorum) {
       if (actual.habilitado && !congelado) {
-        try { vivo = await clienteQuorum(haQuorum(r, r.miembros.find(m => m.id === equipoId) || r.miembros[0])).estado(); }
+        try { vivo = await consultarQuorum?.(); }
         catch (_e) { /* la falta de mayoría se informa sin elegir otro escritor */ }
       }
       const copias = new Set(vivo?.ultimo_commit?.replicas || []);
@@ -120,7 +121,10 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
     if (!equipo && rol !== "Testigo" && !r.testigo) throw new Error("Primero incorporá el testigo del grupo");
     const pendiente = { id: crypto.randomUUID(), rol, clave: nuevoSecreto(), vence: d.ahora() + 3600000, ...(equipo && ip ? { ip } : {}) };
     r.pendientes = r.pendientes.filter((p) => p.vence > d.ahora() || p.usadoPor); r.pendientes.push(pendiente); await guardar(r);
-    const inicial = { habilitado: true, grupoId: r.grupoId, rolInstalacion: rol, incorporacion: { id: pendiente.id, clave: pendiente.clave, principalUrl: yo.url, caPublica: yo.caPublica, vence: pendiente.vence } };
+    const urlAlta = new URL(yo.url);
+    if (equipo && direccion) urlAlta.hostname = direccion;
+    const inicial = { habilitado: true, grupoId: r.grupoId, rolInstalacion: rol, incorporacion: { id: pendiente.id, clave: pendiente.clave, principalUrl: urlAlta.origin, caPublica: yo.caPublica, vence: pendiente.vence } };
+    if (equipo) inicial.incorporacion.nombreTls = String(d.hostname()).toLowerCase();
     if (equipo) inicial.quorumPendiente = true;
     if (rol === "Testigo") inicial.configTestigo = { grupoId: r.grupoId, miembros: r.miembros.map((m) => ({ ...m })), revisionInicial: { indice: 0, sha256: "0".repeat(64) }, permitirDegradado: true };
     try { return await d.armarInstaladorApoyo({ base, dirApp, version, configInicial: inicial, configPredio: config }); }
@@ -164,7 +168,6 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
       if (r.quorum) {
         if (!p.ip || p.ip !== ip) throw new Error("La incorporación necesita la dirección de la PC en la LAN");
         url.hostname = p.ip;
-        if (r.miembros.some(m => m.url === url.origin)) throw new Error("Ya hay una PC incorporada en esa dirección de red");
       }
       const nuevo = p.miembro || { id: nodo, nombre: datos.nombre, url: url.origin, caPublica: validarCA(datos.caPublica), clave: nuevoSecreto(), preferido: false };
       p.miembro = nuevo; await guardar(r);
@@ -180,7 +183,8 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
     return respuesta;
   }); }
   function pedirEquipo(r, miembro, ruta, datos) {
-    return d.pedir(miembro.url, ruta, { grupoId: r.grupoId, nodoId: equipoId, clave: r.claveDatos, ca: miembro.caPublica,
+    const destino = conectarMiembro(miembro, r.quorum && ubicarGrupo?.(r));
+    return d.pedir(destino.url, ruta, { ...destino, grupoId: r.grupoId, nodoId: equipoId, clave: r.claveDatos,
       timeout: Buffer.isBuffer(datos) ? 60000 : 5000, ...(Buffer.isBuffer(datos) ? { buffer: datos } : { cuerpo: datos }) });
   }
   async function disponibles(r) {
@@ -217,7 +221,7 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
       }
       const ultimo = { indice: 0, sha256: packet.manifest.sha256 };
       const miembros = [yo, ...otros];
-      const inicial = { bootstrap: miembros.map(m => ({ id: m.id, address: `${new URL(m.url).hostname}:${PUERTO_QUORUM}` })),
+      const inicial = { bootstrap: miembros.map(m => ({ id: m.id, address: direccionRaft(m.id, PUERTO_QUORUM) })),
         inicial: { grupoId: r.grupoId, termino: 0, preferidoId: r.principalId, ultimo, miembros, ultimoCommit: { ...ultimo, replicas: otros.map(m => m.id) } } };
       const activa = haQuorum(r, yo, inicial);
       escribirHa(base, activa);

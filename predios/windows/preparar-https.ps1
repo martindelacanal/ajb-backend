@@ -134,6 +134,10 @@ if (-not (Test-Path -LiteralPath $scriptConfianza)) { throw 'Falta confiar-certi
 # la LAN: no pasan otra vez por instalar.ps1. Se limita a la subred local.
 Get-NetFirewallRule -Name 'AJB-Predio-HTTPS' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction Stop
 New-NetFirewallRule -Name 'AJB-Predio-HTTPS' -DisplayName 'AJB Predio HTTPS' -Direction Inbound -Protocol TCP -LocalPort $Puerto -RemoteAddress LocalSubnet -Action Allow -Profile Any | Out-Null
+
+if (-not (Get-NetFirewallRule -Name 'AJB-Predio-Ubicacion-Quorum' -ErrorAction SilentlyContinue)) {
+  New-NetFirewallRule -Name 'AJB-Predio-Ubicacion-Quorum' -DisplayName 'AJB Predio Ubicacion LAN' -Direction Inbound -Protocol UDP -LocalPort 39879 -RemoteAddress LocalSubnet -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+}
 $publicos = Join-Path $baseAbsoluta 'certificados-PCs'
 New-Item -ItemType Directory -Path $publicos -Force | Out-Null
 Copy-Item -LiteralPath $publica -Destination (Join-Path $publicos 'autoridad.cer') -Force

@@ -14,6 +14,7 @@ const H = require("./http-lan");
 const { cabecerasSinSalto, origenPermitido } = require("./acceso-lan");
 const { emitirAviso } = require("./avisos");
 const { iniciarConsenso, crearAutoridadQuorum, clienteQuorum, RUTA_ALTA, acreditarOrigen, origenAcreditado } = require("./quorum-lan");
+const { conectarMiembro } = require("./ubicacion-lan");
 
 function leerConfiguracionLan(base, equipoId = identidadEquipo()) {
   const archivo = path.join(base, "predio-ha.json");
@@ -31,33 +32,36 @@ function extraerPaquete(buffer) {
   if (bytes > 8192 || bytes + 40 > buffer.length) throw new Error("La cabecera de la copia no es válida");
   return { manifest: JSON.parse(buffer.subarray(12, 12 + bytes).toString("utf8")), buffer };
 }
-function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQuorum, log = () => {}, alEstado = () => {} }) {
+function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQuorum, ubicarGrupo, puertoHttps, log = () => {}, alEstado = () => {} }) {
   const c = ha;
   let core, ultimoEstado = null, detenido = false, avisando = false;
-  let consenso, autoridad;
-  const cliente = c.quorum ? clienteQuorum(c) : null;
+  let consenso, autoridad, cliente, ubicacion;
   const colaAvisos = [];
   function miembros() { return ultimoEstado?.miembros || core?.estado().miembros || c.miembros; }
   const verificar = crearVerificador({ grupoId: c.grupoId, miembros: () => miembros().map(m => ({ id: m.id, clave: c.claveDatos })) });
   async function estadoTestigo(opciones) {
-    if (c.quorumPendiente) throw new Error("La PC espera la activación del grupo");
+    if (c.quorumPendiente || (c.quorum && !cliente)) throw new Error("La PC espera la activación del grupo");
     const w = await (cliente ? cliente.estado(opciones) : H.estadoTestigo(c, opciones));
     if (!opciones?.compacto) ultimoEstado = w;
     return w;
   }
-  function opciones(miembro) { origenPermitido(miembro.url); return { grupoId: c.grupoId, nodoId: c.nodoId, clave: c.claveDatos, ca: miembro.caPublica }; }
+  function pedirMiembro(miembro, ruta, opciones) {
+    const destino = conectarMiembro(miembro, ubicacion);
+    origenPermitido(destino.url);
+    return H.pedir(destino.url, ruta, { ...destino, grupoId: c.grupoId, nodoId: c.nodoId, clave: c.claveDatos, ...opciones });
+  }
   const transporte = {
     testigo(accion, payload) {
       if (accion === "estado") return estadoTestigo();
       if (cliente) return cliente.pedir(accion, payload);
       return H.pedir(c.testigo.url, "/lan/testigo/" + accion, { grupoId: c.grupoId, nodoId: c.nodoId, clave: c.clave, cuerpo: payload });
     },
-    replicar: (m, packet) => H.pedir(m.url, "/lan/replica", { ...opciones(m), buffer: packet.buffer, timeout: 4000 }),
+    replicar: (m, packet) => pedirMiembro(m, "/lan/replica", { buffer: packet.buffer, timeout: 4000 }),
     async obtenerSnapshot(m, revision) {
-      const r = await H.pedir(m.url, `/lan/replica?indice=${revision.indice}&sha256=${revision.sha256}`, { ...opciones(m), metodo: "GET", binario: true, timeout: 15000 });
+      const r = await pedirMiembro(m, `/lan/replica?indice=${revision.indice}&sha256=${revision.sha256}`, { metodo: "GET", binario: true, timeout: 15000 });
       return extraerPaquete(r.buffer);
     },
-    drenar: (m, cuerpo) => H.pedir(m.url, "/lan/drenar", { ...opciones(m), cuerpo, timeout: 15000 }),
+    drenar: (m, cuerpo) => pedirMiembro(m, "/lan/drenar", { cuerpo, timeout: 15000 }),
   };
   async function publicarAvisos() {
     if (avisando || detenido || !core.estado().escritor) return;
@@ -95,11 +99,14 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
   });
   const adaptador = {
     ...core, configuracion: c, transporte,
-    origenIncorporacion(cabecera, ip) { return cliente ? origenAcreditado(cabecera, c, miembros(), ip) : null; },
+    origenIncorporacion(cabecera, ip) { return cliente ? origenAcreditado(cabecera, c, miembros(), ip, ubicacion) : null; },
+    consultarQuorum: estadoTestigo,
     async iniciar() {
+      if (c.quorum || c.quorumPendiente) ubicacion ??= ubicarGrupo?.(c);
       if (c.quorumPendiente) return Promise.resolve();
-      if (cliente && !autoridad) {
-        consenso = iniciarConsenso({ base, dirApp, config: c, log });
+      if (c.quorum && !autoridad) {
+        consenso = iniciarConsenso({ base, dirApp, config: c, log, ubicacion });
+        cliente = clienteQuorum(c, { ubicacion, puertoHttps, miembrosLocales: async () => (await consenso.pedir("/local")).data?.miembros || [] });
         autoridad = crearAutoridadQuorum({ config: c, consenso });
       }
       return core.iniciar();
@@ -133,7 +140,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
     },
     async manejar(req, res) {
       const u = new URL(req.url, "http://local");
-      if (u.pathname === "/lan/quorum/listo" && cliente) {
+      if (u.pathname === "/lan/quorum/listo" && c.quorum) {
         try {
           if (!req.socket.encrypted || req.method !== "POST") throw new Error("La consulta requiere la conexión interna autenticada");
           const buffer = await H.leer(req, 4096);
@@ -143,7 +150,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
         } catch (e) { H.respuesta(res, e.status || 403, { mensaje: e.message }); }
         return true;
       }
-      if (u.pathname.startsWith("/lan/quorum/") && u.pathname !== "/lan/quorum/preparar" && cliente) {
+      if (u.pathname.startsWith("/lan/quorum/") && u.pathname !== "/lan/quorum/preparar" && c.quorum) {
         try {
           if (!req.socket.encrypted || !autoridad) throw new Error("La coordinación LAN todavía no está disponible");
           await autoridad.manejar(req, res);
@@ -159,7 +166,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
           else if (u.pathname === "/lan/replica/inicial") {
             H.respuesta(res, 200, await core.recibirInicial(extraerPaquete(buffer), { remitenteId: actor.nodoId }));
           } else if (u.pathname === "/lan/quorum/copia") {
-            const w = await clienteQuorum(c).estado();
+            const w = await clienteQuorum(c, { ubicacion }).estado();
             if (w.escritor !== actor.nodoId || !w.vence_en_ms) throw new Error("La copia debe provenir del escritor acreditado por la mayoría");
             core.recibirCopiaQuorum(extraerPaquete(buffer), w.ultimo);
             H.respuesta(res, 200, { equipo: c.nodoId, confirmada: w.ultimo });
@@ -171,7 +178,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
             if (nueva.quorum.inicial) {
               if (actor.nodoId !== c.miembros.find(m => m.preferido)?.id) throw new Error("La primera activación corresponde a la PC principal");
             } else {
-              const w = await clienteQuorum(c).estado();
+              const w = await clienteQuorum(c, { ubicacion }).estado();
               if (w.escritor !== actor.nodoId || !w.vence_en_ms || w.ultimo.sha256 !== ultimo?.sha256 || w.ultimo.indice !== ultimo?.indice) {
                 throw new Error("La incorporación debe provenir del escritor acreditado por la mayoría");
               }
@@ -210,7 +217,8 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
       try {
         const w = await estadoTestigo(), m = w.miembros?.find(n => n.id === w.escritor);
         if (!m || m.id === c.nodoId || w.vence_en_ms <= 0 || m.url !== w.escritorDatos?.url) throw new Error("Esperando un servidor actualizado y autorizado por el testigo.");
-        const origen = origenPermitido(m.url), url = new URL(req.url, origen), headers = cabecerasSinSalto(req.headers);
+        const destino = conectarMiembro(m, ubicacion);
+        const origen = origenPermitido(destino.url), url = new URL(req.url, origen), headers = cabecerasSinSalto(req.headers);
         if (url.origin !== origen || url.username || url.password) throw new Error("La solicitud no corresponde al servidor autorizado");
         for (const k of ["forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto"]) delete headers[k];
         delete headers["x-ajb-origen"];
@@ -219,7 +227,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
           headers["x-ajb-origen"] = acreditarOrigen(ip, c);
         }
         await new Promise((resolve, reject) => {
-          const upstream = (url.protocol === "https:" ? https : http).request(url, { method: req.method, headers, ca: m.caPublica, rejectUnauthorized: true }, r => {
+          const upstream = (url.protocol === "https:" ? https : http).request(url, { method: req.method, headers, ca: destino.ca, servername: destino.servername, rejectUnauthorized: true }, r => {
             const h = cabecerasSinSalto(r.headers); res.writeHead(r.statusCode, h); r.pipe(res); r.on("end", resolve); r.on("error", reject);
           });
           const timer = setTimeout(() => upstream.destroy(new Error("El servidor actual no respondió")), 120000);

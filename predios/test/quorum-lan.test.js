@@ -17,16 +17,16 @@ const { iniciarConsenso } = require("../lib/quorum-lan");
 const dirApp = path.join(__dirname, "..");
 const ejecutable = process.platform === "win32" && fs.existsSync(path.join(dirApp, "windows", "ajb-quorum.exe"));
 
-async function escuchar(s) {
-  await new Promise(resolve => s.listen(0, "127.0.0.1", resolve));
+async function escuchar(s, ip = "127.0.0.1", puerto = 0) {
+  await new Promise(resolve => s.listen(puerto, ip, resolve));
   return s.address().port;
 }
 async function cerrar(s) {
   if (s.listening) await new Promise(resolve => { s.close(resolve); s.closeAllConnections(); });
 }
 
-test("tres coordinadores conservan la última escritura al reelegir y bloquean una PC aislada", {
-  skip: !ejecutable, timeout: 90000,
+test("tres coordinadores recuperan el grupo con todas las IP nuevas y relevan al servidor conservando la última escritura", {
+  skip: !ejecutable, timeout: 120000,
 }, async t => {
   const raiz = fs.mkdtempSync(path.join(os.tmpdir(), "ajb-quorum-"));
   const grupoId = "quorum_fixture", claveDatos = "f".repeat(64), secreto = "e".repeat(64);
@@ -34,6 +34,16 @@ test("tres coordinadores conservan la última escritura al reelegir y bloquean u
   const clavePrivada = privateKey.export({ type: "pkcs8", format: "pem" });
   const clavePublicaTestigo = publicKey.export({ type: "spki", format: "pem" });
   const nodos = [], logs = [];
+  let redNueva = false;
+  const ubicacion = {
+    equipo(id) {
+      const nodo = redNueva && nodos.find(n => n.id === id && n.disponible);
+      return nodo && { ip: nodo.ip, https: nodo.http.address().port };
+    },
+    direccionesRaft() {
+      return redNueva ? Object.fromEntries(nodos.filter(n => n.disponible).map(n => [n.id, `${n.ip}:${n.puerto}`])) : {};
+    },
+  };
   t.after(async () => {
     for (const n of nodos) n.servicio?.detener();
     for (const n of nodos) { await cerrar(n.http); n.db?.cerrar(); }
@@ -48,7 +58,7 @@ test("tres coordinadores conservan la última escritura al reelegir y bloquean u
   for (const letra of ["a", "b", "c"]) {
     const base = path.join(raiz, letra);
     fs.mkdirSync(path.join(base, "datos"), { recursive: true });
-    const n = { id: letra.repeat(64), base, disponible: true };
+    const n = { id: letra.repeat(64), base, disponible: true, ip: `127.0.0.${nodos.length + 2}` };
     n.http = http.createServer(async (req, res) => {
       // El protocolo Raft entre los tres ejecutables usa TLS real. Aquí se
       // sustituye sólo el certificado HTTP del servidor de prueba.
@@ -59,7 +69,7 @@ test("tres coordinadores conservan la última escritura al reelegir y bloquean u
         respuesta(res, 200, { equipo: n.id });
       }
     });
-    n.url = `http://127.0.0.1:${await escuchar(n.http)}`;
+    n.url = `http://${n.ip}:${await escuchar(n.http, n.ip)}`;
     const reservado = http.createServer();
     n.puerto = await escuchar(reservado);
     puertosReservados.push(reservado);
@@ -68,7 +78,7 @@ test("tres coordinadores conservan la última escritura al reelegir y bloquean u
   }
   await Promise.all(puertosReservados.map(cerrar));
   const miembros = nodos.map((n, i) => ({ id: n.id, nombre: `PC ${i + 1}`, url: n.url, clave: String(i + 1).repeat(64), preferido: i === 0 }));
-  const bootstrap = nodos.map(n => ({ id: n.id, address: `127.0.0.1:${n.puerto}` }));
+  const bootstrap = nodos.map(n => ({ id: n.id, address: `${n.ip}:${n.puerto}` }));
   for (const [i, n] of nodos.entries()) {
     n.ha = { habilitado: true, grupoId, equipoId: n.id, nodoId: n.id, rolInstalacion: i ? "Respaldo" : "Principal",
       clave: miembros[i].clave, claveDatos, clavePublicaTestigo, permitirDegradado: false, miembros: miembros.map(({ clave, ...m }) => m),
@@ -79,7 +89,7 @@ test("tres coordinadores conservan la última escritura al reelegir y bloquean u
   const ultimo = { indice: 0, sha256: semilla.manifest.sha256 };
   const inicial = { grupoId, termino: 0, miembros, ultimo, preferidoId: nodos[0].id };
   const abrir = n => {
-    n.servicio = crearServicioLan({ base: n.base, dirApp, config: n.config, db: n.db, ha: n.ha,
+    n.servicio = crearServicioLan({ base: n.base, dirApp, config: n.config, db: n.db, ha: n.ha, ubicarGrupo: () => ubicacion,
       alReiniciar: () => { n.reiniciar = true; }, log: mensaje => { logs.push(mensaje); if (logs.length > 40) logs.shift(); } });
   };
   for (const [i, n] of nodos.entries()) {
@@ -116,12 +126,38 @@ test("tres coordinadores conservan la última escritura al reelegir y bloquean u
   }
   const escribir = (n, valor) => n.db.tx(t => t.run("INSERT INTO predio_config(predio_id,id,clave,valor) VALUES(1,1,'ultima_venta',?) ON CONFLICT(predio_id,id) DO UPDATE SET valor=excluded.valor", [String(valor)]));
   const leer = n => n.db.conexion.prepare("SELECT valor FROM predio_config WHERE clave='ultima_venta'").get()?.valor;
+  await escribir(await lider(), 101);
+  const anteriores = nodos.map(n => ({ ip: n.ip, http: n.http.address().port, raft: n.puerto }));
+  await Promise.all(nodos.map(async n => {
+    n.servicio.detener();
+    await cerrar(n.http);
+    await n.db.exclusivo(() => {});
+    n.db.cerrar();
+  }));
+  await esperar(500);
+  for (const [i, n] of nodos.entries()) {
+    // El router entrega las IP a otros miembros. Cada configuración
+    // guardada conserva las direcciones y el diario de la primera elección.
+    const asignada = anteriores[(i + 1) % nodos.length];
+    n.ip = asignada.ip;
+    n.url = `http://${n.ip}:${await escuchar(n.http, n.ip, asignada.http)}`;
+    n.ha.quorum.puerto = n.puerto = asignada.raft;
+    n.reiniciar = false;
+    aplicarPendiente({ base: n.base, config: n.config });
+    abrirDB(n); abrir(n);
+    n.db.configurarTransacciones(n.servicio);
+    n.servicio.iniciar().catch(e => logs.push(e.message));
+  }
+  await esperar(3000);
+  assert.ok(nodos.every(n => !n.servicio.estado().escritor), "las IP anteriores en otras PCs no acreditan su identidad");
+  redNueva = true;
   const primero = await lider();
-  await escribir(primero, 101);
+  assert.equal(leer(primero), "101");
+  await escribir(primero, 102);
   primero.disponible = false; primero.servicio.detener();
   const segundo = await lider();
   assert.notEqual(segundo.id, primero.id);
-  assert.equal(leer(segundo), "101");
+  assert.equal(leer(segundo), "102");
   const caja = nodos.find(n => n !== primero && n !== segundo);
   assert.deepEqual(await (await fetch(caja.url + "/api/estado-publico")).json(), { equipo: segundo.id });
   await escribir(segundo, 202);
@@ -133,7 +169,7 @@ test("tres coordinadores conservan la última escritura al reelegir y bloquean u
 test("el coordinador incorpora un equipo como votante después de replicarle el registro", { skip: !ejecutable, timeout: 30000 }, async t => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "ajb-quorum-alta-"));
   const reservados = Array.from({ length: 4 }, () => http.createServer());
-  const puertos = await Promise.all(reservados.map(escuchar));
+  const puertos = await Promise.all(reservados.map(s => escuchar(s)));
   await Promise.all(reservados.map(cerrar));
   const ids = ["a", "b", "c", "d"].map(s => s.repeat(64));
   const peers = ids.map((id, i) => ({ id, address: `127.0.0.1:${puertos[i]}` }));

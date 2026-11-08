@@ -23,9 +23,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	bolt "github.com/hashicorp/raft-boltdb/v2"
 )
@@ -110,7 +112,57 @@ type stream struct {
 func (s stream) Addr() net.Addr { return s.address }
 
 func (s stream) Dial(address raft.ServerAddress, timeout time.Duration) (net.Conn, error) {
-	return tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", string(address), s.client)
+	id, target, ok := strings.Cut(string(address), "@")
+	if !ok || !identifier.MatchString(id) || !validAddress(target) {
+		return nil, errors.New("no verified route to the Raft member")
+	}
+	client := s.client.Clone()
+	client.ServerName = peerName(id)
+	return tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", target, client)
+}
+
+const groupName = "raft.predio.ajb"
+
+func peerName(id string) string { return id[:32] + "." + id[32:] + "." + groupName }
+
+func validAddress(address string) bool {
+	host, port, err := net.SplitHostPort(address)
+	number, numberErr := strconv.ParseUint(port, 10, 16)
+	return err == nil && net.ParseIP(host).To4() != nil && numberErr == nil && number > 0
+}
+
+type locations struct {
+	mu         sync.RWMutex
+	registered map[raft.ServerID]string
+	discovered map[raft.ServerID]string
+}
+
+func (l *locations) remember(id raft.ServerID, address string) {
+	if validAddress(address) {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.registered[id] = address
+	}
+}
+
+func (l *locations) ServerAddr(id raft.ServerID) (raft.ServerAddress, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	address := l.discovered[id]
+	if address == "" {
+		address = l.registered[id]
+	}
+	// A missing address fails closed in Dial. Raft must never fall back to an
+	// unverified connection that could count the same peer as another voter.
+	return raft.ServerAddress(string(id) + "@" + address), nil
+}
+
+type identityTransport struct{ *raft.NetworkTransport }
+
+// Keep the original address in Raft headers and snapshots during upgrades.
+// The provider only changes where we dial.
+func (t identityTransport) EncodePeer(_ raft.ServerID, address raft.ServerAddress) []byte {
+	return []byte(address)
 }
 
 type advertised string
@@ -145,7 +197,7 @@ func secureStream(c config, secret []byte) (stream, error) {
 		return stream{}, err
 	}
 	cert := &x509.Certificate{SerialNumber: number, NotBefore: notBefore, NotAfter: notAfter,
-		DNSNames: []string{"raft.predio.ajb"}, KeyUsage: x509.KeyUsageDigitalSignature,
+		DNSNames: []string{groupName, peerName(c.ID)}, KeyUsage: x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}}
 	der, err := x509.CreateCertificate(rand.Reader, cert, root, pub, caKey)
 	if err != nil {
@@ -155,15 +207,22 @@ func secureStream(c config, secret []byte) (stream, error) {
 	pool.AddCert(root)
 	certs := []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}
 	server := &tls.Config{MinVersion: tls.VersionTLS13, Certificates: certs, ClientCAs: pool, ClientAuth: tls.RequireAndVerifyClientCert}
-	client := &tls.Config{MinVersion: tls.VersionTLS13, Certificates: certs, RootCAs: pool, ServerName: "raft.predio.ajb"}
+	server.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+		if hello.ServerName == peerName(c.ID) || (hello.ServerName == groupName && hello.Conn.LocalAddr().String() == c.Advertise) {
+			return nil, nil
+		}
+		return nil, errors.New("the requested Raft identity does not belong to this listener")
+	}
+	client := &tls.Config{MinVersion: tls.VersionTLS13, Certificates: certs, RootCAs: pool}
 	listener, err := tls.Listen("tcp", c.Listen, server)
 	return stream{Listener: listener, client: client, address: advertised(c.Advertise)}, err
 }
 
 type consensus struct {
-	raft *raft.Raft
-	fsm  *machine
-	mu   sync.Mutex
+	raft      *raft.Raft
+	fsm       *machine
+	locations *locations
+	mu        sync.Mutex
 }
 
 func (c *consensus) info() (uint64, raft.ServerID, raft.ConfigurationFuture, error) {
@@ -189,7 +248,25 @@ func (c *consensus) serve(key string) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		if r.Method == "GET" && r.URL.Path == "/local" {
-			_ = json.NewEncoder(w).Encode(map[string]any{"version": c.fsm.current().Version})
+			_ = json.NewEncoder(w).Encode(c.fsm.current())
+			return
+		}
+		if r.Method == "POST" && r.URL.Path == "/locations" {
+			var update map[raft.ServerID]string
+			if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&update) != nil || len(update) > 64 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			for id, address := range update {
+				if !identifier.MatchString(string(id)) || !validAddress(address) {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+			}
+			c.locations.mu.Lock()
+			c.locations.discovered = update
+			c.locations.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(true)
 			return
 		}
 		c.mu.Lock()
@@ -254,6 +331,7 @@ func (c *consensus) serve(key string) http.Handler {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				return
 			}
+			c.locations.remember(raft.ServerID(request.ID), request.Address)
 			_ = json.NewEncoder(w).Encode(true)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -294,7 +372,15 @@ func run(c config) error {
 	if err != nil {
 		return err
 	}
-	transport := raft.NewNetworkTransport(secure, 2, wait, os.Stderr)
+	routes := &locations{registered: make(map[raft.ServerID]string)}
+	for _, p := range c.Bootstrap {
+		routes.remember(raft.ServerID(p.ID), p.Address)
+	}
+	routes.remember(raft.ServerID(c.ID), c.Advertise)
+	transport := identityTransport{raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
+		Stream: secure, MaxPool: 2, Timeout: wait, ServerAddressProvider: routes,
+		Logger: hclog.New(&hclog.LoggerOptions{Name: "raft-net", Output: os.Stderr}),
+	})}
 	defer transport.Close()
 	settings := raft.DefaultConfig()
 	settings.LocalID = raft.ServerID(c.ID)
@@ -337,13 +423,20 @@ func run(c config) error {
 		return err
 	}
 	defer func() { _ = instance.Shutdown().Error() }()
+	configuration := instance.GetConfiguration()
+	if err := configuration.Error(); err != nil {
+		return err
+	}
+	for _, p := range configuration.Configuration().Servers {
+		routes.remember(p.ID, string(p.Address))
+	}
 	local, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
 	}
 	defer local.Close()
 	fmt.Println(local.Addr().String())
-	server := http.Server{Handler: (&consensus{raft: instance, fsm: fsm}).serve(c.LocalKey), ReadHeaderTimeout: wait}
+	server := http.Server{Handler: (&consensus{raft: instance, fsm: fsm, locations: routes}).serve(c.LocalKey), ReadHeaderTimeout: wait}
 	return server.Serve(local)
 }
 

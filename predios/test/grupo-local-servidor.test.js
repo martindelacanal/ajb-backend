@@ -20,7 +20,8 @@ const { crearTestigo } = require("../lib/testigo-lan");
 const { crearServidorTestigo } = require("../lib/servidor-testigo");
 const { crearServicioLan } = require("../lib/servicio-lan");
 const { firmarPeticion } = require("../lib/protocolo-lan");
-const { descifrarJson } = require("../lib/http-lan");
+const { descifrarJson, pedir: pedirLan } = require("../lib/http-lan");
+const { conectarMiembro } = require("../lib/ubicacion-lan");
 const RAIZ = path.join(__dirname, "..");
 const ipLan = Object.values(os.networkInterfaces()).flat().find(i => i.family === "IPv4" && !i.internal)?.address;
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -164,6 +165,19 @@ test("HTTP real protege roles y ZIP Windows; incorpora testigo/respaldo, congela
   const sesion = await pedir(s.http, "/api/sesion", { token: admin }); assert.equal(sesion.status, 200); assert.equal(sesion.json.usuario.usuario, "admin");
   const producto = await pedir(s.http, "/api/productos", { metodo: "POST", token: admin, headers: { "X-AJB-Operacion": crypto.randomUUID() }, cuerpo: { nombre: "Producto tras activar", precio_venta_manual: 100, destino: "VENTA_DIRECTA" } });
   assert.equal(producto.status, 200, producto.json?.mensaje || s.salida);
+});
+
+test("la IP descubierta usa el certificado de la misma PC por su nombre", { skip: process.platform !== "win32", timeout: 30000 }, async t => {
+  const s = await preparar(t, true);
+  const peer = https.createServer(s.tlsConfig, (_req, res) => res.end('{"encontrado":true}'));
+  s.limpiezas.push(() => cerrar(peer));
+  await new Promise(resolve => peer.listen(0, "127.0.0.2", resolve));
+  const miembro = { id: "a".repeat(64), url: s.https, caPublica: s.raiz };
+  const nombreTls = os.hostname().toLowerCase();
+  const ubicacion = { equipo: () => ({ ip: "127.0.0.2", https: peer.address().port, nombreTls }) };
+  const { url, ca, servername } = conectarMiembro(miembro, ubicacion);
+  await assert.rejects(pedirLan(url, "/", { metodo: "GET", ca }), { code: "ERR_TLS_CERT_ALTNAME_INVALID" });
+  assert.deepEqual(await pedirLan(url, "/", { metodo: "GET", ca, servername }), { encontrado: true });
 });
 
 test("freeze persistente al reiniciar no vuelve a legacy aunque no pueda reanudar automáticamente", { timeout: 30000 }, async (t) => {
