@@ -206,7 +206,7 @@ test("los productos de balanza del sistema anterior pasan a venta por kilo: prec
   assert.equal(previa.cambian, 1);
   assert.equal(previa.sin_cambios, 1);
   assert.equal(previa.muestra[0].precio_venta_nuevo, 22000);
-  const r = await post(admin, "/productos/peso", { consulta: { f_unidad: "balanza" }, precio_por: "GRAMO" });
+  const r = await post(admin, "/productos/peso", { ids: [jamon.id, ya.id], precio_por: "GRAMO" });
   assert.equal(r.cambiados, 1);
   const p = await db.get("SELECT * FROM predio_producto WHERE id = ?", [jamon.id]);
   assert.equal(p.unidad, "KG");
@@ -217,17 +217,58 @@ test("los productos de balanza del sistema anterior pasan a venta por kilo: prec
   assert.ok(await db.get("SELECT id FROM predio_auditoria WHERE accion = 'Producto pasado a venta por peso' AND entidad_id = ?", [jamon.id]));
 });
 
-test("un compuesto que sale de un insumo se traspasa en porciones y se mueve el insumo", async (t) => {
+test("un compuesto que sale de un insumo se manda en partes del insumo o en porciones", async (t) => {
   const { db, post, producto, mover, admin, caja } = await escenario(t);
   const almacen = await N.bocaAlmacen(db, admin);
   const paquete = await producto({ nombre: "Café en grano 1 kg", destino: "USO_INTERNO" });
   const cafe = await producto({ nombre: "Café", destino: "VENTA_COMPUESTA", precio_venta_manual: 3000, receta: { insumo_id: paquete.id, rendimiento: 60 } });
   await mover(paquete.id, 5, almacen.id);
-  const r = await post(admin, "/traspasos", { boca_origen_id: almacen.id, boca_destino_id: caja.boca_id, lineas: [{ producto_id: cafe.id, cantidad: 90 }] });
+  // Por defecto, la cantidad es del insumo: medio paquete.
+  const medio = await post(admin, "/traspasos", { boca_origen_id: almacen.id, boca_destino_id: caja.boca_id, lineas: [{ producto_id: cafe.id, cantidad: 0.5 }] });
+  const s1 = await db.get("SELECT * FROM predio_solicitud WHERE id = ?", [medio.ids[0]]);
+  assert.equal(s1.producto_id, paquete.id);
+  assert.equal(Number(s1.cantidad), 0.5);
+  assert.match(s1.observaciones, /Café: se mandan 0.5 de Café en grano/);
+  // En porciones, se manda el insumo equivalente.
+  const r = await post(admin, "/traspasos", { boca_origen_id: almacen.id, boca_destino_id: caja.boca_id, lineas: [{ producto_id: cafe.id, cantidad: 90, porciones: true }] });
   const s = await db.get("SELECT * FROM predio_solicitud WHERE id = ?", [r.ids[0]]);
   assert.equal(s.producto_id, paquete.id);
   assert.equal(Number(s.cantidad), 1.5);
   assert.match(s.observaciones, /90 porciones de Café = 1.5 de Café en grano/);
-  assert.equal(await N.stockActual(db, admin, caja.boca_id, paquete.id), 1.5);
+  assert.equal(await N.stockActual(db, admin, almacen.id, paquete.id), 3);
+  assert.equal(await N.stockActual(db, admin, caja.boca_id, paquete.id), 2);
   assert.equal(await N.stockActual(db, admin, caja.boca_id, cafe.id), 0);
+});
+
+test("un compuesto se parte entre bocas: 1 kg de queso en el almacén, 0,5 kg a la confitería y las dos tienen stock", async (t) => {
+  const { db, post, producto, mover, admin } = await escenario(t);
+  const almacen = await N.bocaAlmacen(db, admin);
+  const confiteria = await db.get("SELECT b.id, c.id AS caja_id FROM predio_boca b JOIN predio_caja c ON c.predio_id = b.predio_id AND c.boca_id = b.id WHERE b.nombre = 'Confitería'");
+  const queso = await producto({ nombre: "Queso cremoso", codigo: "2000070", unidad: "KG", destino: "VENTA_COMPUESTA", precio_venta_manual: 12000 });
+  const horma = await producto({ nombre: "Queso azul media horma", destino: "VENTA_COMPUESTA", precio_venta_manual: 17200 });
+  await mover(queso.id, 1, almacen.id);
+  await mover(horma.id, 1, almacen.id);
+
+  // Traspaso directo: medio kilo y media horma.
+  await post(admin, "/traspasos", { boca_origen_id: almacen.id, boca_destino_id: confiteria.id,
+    lineas: [{ producto_id: queso.id, cantidad: 0.5 }, { producto_id: horma.id, cantidad: 0.5 }] });
+  assert.equal(await N.stockActual(db, admin, almacen.id, queso.id), 0.5);
+  assert.equal(await N.stockActual(db, admin, confiteria.id, queso.id), 0.5);
+  assert.equal(await N.stockActual(db, admin, almacen.id, horma.id), 0.5);
+  assert.equal(await N.stockActual(db, admin, confiteria.id, horma.id), 0.5);
+
+  // Pedido de la confitería despachado en parte (250 g de los 300 g pedidos).
+  const pedido = await post(admin, "/solicitudes", { boca_origen_id: almacen.id, boca_destino_id: confiteria.id, lineas: [{ producto_id: queso.id, cantidad: 0.3 }] });
+  await post(admin, `/solicitudes/${pedido.ids[0]}/despachar`, { cantidad: 0.25 });
+  await post(admin, `/solicitudes/${pedido.ids[0]}/recibir`, {});
+  assert.equal(await N.stockActual(db, admin, almacen.id, queso.id), 0.25);
+  assert.equal(await N.stockActual(db, admin, confiteria.id, queso.id), 0.75);
+
+  // La confitería vende lo que recibió: 200 g de queso y media horma.
+  const turno = await N.insertar(db, admin, "predio_turno", { caja_id: confiteria.caja_id, boca_id: confiteria.id, usuario_id: 2, usuario_nombre: "Ana", inicio: U.fechaHora(), estado: "ABIERTO" });
+  const cajera = { ...admin, usuario: { id: 2, rol: "CAJERO", nombre: "Ana", bocas: [confiteria.id] }, sesion: { boca_id: confiteria.id, caja_id: confiteria.caja_id, turno_id: turno } };
+  const venta = await post(cajera, "/ventas", { items: [{ producto_id: queso.id, cantidad: 0.2 }, { producto_id: horma.id, cantidad: 0.5 }], forma_pago: "EFECTIVO" });
+  assert.equal(venta.total, 2400 + 8600);
+  assert.equal(await N.stockActual(db, admin, confiteria.id, queso.id), 0.55);
+  assert.equal(await N.stockActual(db, admin, confiteria.id, horma.id), 0);
 });

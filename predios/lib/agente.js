@@ -398,9 +398,11 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
 
   // ---------------------------------------------------------------- actualizaciones
 
+  // El servidor del camping busca una versión nueva cada 15 minutos (un respaldo HA, cada minuto).
+  const INTERVALO_ACTUALIZACION_MS = 15 * 60 * 1000;
   async function buscarActualizacion(forzar = false) {
     const grupo = grupoLocal();
-    const intervalo = grupo.habilitado && !grupo.escritor ? 60000 : 30 * 60 * 1000;
+    const intervalo = grupo.habilitado && !grupo.escritor ? 60000 : INTERVALO_ACTUALIZACION_MS;
     if (!forzar && Date.now() - ultimaVersion < intervalo) return null;
     ultimaVersion = Date.now();
     const info = await pedir("GET", "/version");
