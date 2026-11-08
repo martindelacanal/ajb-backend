@@ -31,7 +31,7 @@ const { resolverActorRemoto } = require("./lib/actor-remoto");
 const { bloquearInstalacion } = require("./lib/bloqueo-local");
 const { aplicarPendiente } = require("./lib/respaldo-lan");
 const { leerConfiguracionLan, crearServicioLan } = require("./lib/servicio-lan");
-const { crearGrupoLocal } = require("./lib/grupo-local");
+const { crearGrupoLocal, escribirHa } = require("./lib/grupo-local");
 const LAN = require("./lib/http-lan");
 
 const DIR_APP = __dirname;
@@ -94,7 +94,8 @@ function autoridadLocal() {
 }
 function instalarAutoridad(haNueva, packet) {
   configHa = haNueva;
-  ha = crearServicioLan({ base: BASE, config, db, ha: haNueva, log,
+  ha = crearServicioLan({ base: BASE, dirApp: DIR_APP, config, db, ha: haNueva, log,
+    prepararQuorum: nueva => escribirHa(BASE, nueva),
     alReiniciar: () => { setTimeout(() => apagar(75), 100).unref(); } });
   if (packet) ha.registrarInicial(packet);
   controlEquipo.configurarAutoridadLocal(autoridadLocal);
@@ -191,7 +192,8 @@ const agente = crearAgente({
 });
 servicios.agente = agente;
 const grupoLocal = crearGrupoLocal({ base: BASE, dirApp: DIR_APP, version: VERSION, config, db,
-  equipoId: controlEquipo.equipoId, haActual: () => ha?.estado(), log,
+  equipoId: controlEquipo.equipoId, haActual: () => ha?.estado(), configuracionHa: () => configHa, log,
+  promoverQuorum: (r, disponibles, haQuorum, pedirEquipo) => ha.promoverQuorum(r, disponibles, haQuorum, pedirEquipo),
   bloquearEscritura() {
     const archivo = path.join(BASE, "ha-activacion-pendiente.json");
     if (!fs.existsSync(archivo)) {
@@ -380,6 +382,18 @@ function rutaGaleria(req, res, rutaApi) {
 async function rutaSistema(ctx, metodo, ruta, req, res) {
   if (ctx.usuario?.rol !== "ADMIN") throw U.error("Esta sección es del administrador", 403);
   if (metodo === "GET" && ruta === "/sistema/grupo-local") return grupoLocal.estado();
+  if (metodo === "POST" && ruta === "/sistema/grupo-local/incorporar-equipo") {
+    controlEquipo.comprobar();
+    // El botón puede usarse desde HTTP en la LAN. La transferencia de datos
+    // y credenciales del equipo se realiza por el canal interno con CA fijada.
+    const ip = ha?.origenIncorporacion(req.headers["x-ajb-origen"], ctx.ip) || ctx.ip;
+    if (!esIpLocal(ip) || ip.startsWith("127.")) throw U.error("Abrí el sistema desde la PC de la red que vas a incorporar", 409);
+    await leerCuerpo(req, 1000);
+    const seguro = await actualizarHttps();
+    if (!seguro.activo) throw U.error("No se pudo preparar la conexión interna entre las PCs", 409);
+    const paquete = await grupoLocal.instalador("Respaldo", { equipo: true, ip, direccion: req.socket.localAddress });
+    return { archivo: paquete.buffer, nombreArchivo: "AJB-Incorporar-esta-PC.zip", tipo: "application/zip" };
+  }
   if (metodo === "POST" && ruta === "/sistema/grupo-local/instalador") {
     controlEquipo.comprobar();
     if (!req.socket.encrypted && !ctx.esLocalhost) throw U.error("Prepará el instalador desde HTTPS o desde esta PC servidor", 409);
@@ -567,6 +581,15 @@ function servirEstatico(req, res, ruta) {
 function ipDe(req) {
   return String(req.socket.remoteAddress || "").replace(/^::ffff:/, "");
 }
+function esIpLocal(ip) {
+  const octetos = ip.split(".").map(Number);
+  if (octetos.length !== 4 || octetos.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return false;
+  return Object.values(os.networkInterfaces()).flat().some(i => {
+    if (i.internal || i.family !== "IPv4" || !i.netmask) return false;
+    const propia = i.address.split(".").map(Number), mascara = i.netmask.split(".").map(Number);
+    return octetos.every((n, j) => (n & mascara[j]) === (propia[j] & mascara[j]));
+  });
+}
 
 async function manejar(req, res) {
   cabecerasSeguridad(res);
@@ -576,7 +599,7 @@ async function manejar(req, res) {
     if (!req.socket.encrypted || req.method !== "POST") return LAN.respuesta(res, 403, { mensaje: "La incorporación necesita HTTPS" });
     try {
       const cuerpo = await LAN.leer(req, 128 * 1024);
-      return LAN.respuesta(res, 200, await grupoLocal.incorporar({ metodo: req.method, ruta: req.url, cabeceras: req.headers, cuerpo }));
+      return LAN.respuesta(res, 200, await grupoLocal.incorporar({ metodo: req.method, ruta: req.url, cabeceras: req.headers, cuerpo, ip: ipDe(req) }));
     } catch (e) { return LAN.respuesta(res, e.status || 403, { mensaje: e.message }); }
   }
   if (ruta.startsWith("/lan/")) {
@@ -694,6 +717,7 @@ servidor.listen(config.puerto, "0.0.0.0", () => {
   agente.iniciar();
   if (ha && !congelado) ha.iniciar().catch(e => log("Respaldo local: " + e.message));
   if (congelado) grupoLocal.reanudarActivacion().catch(e => log("La activación del respaldo sigue pausada: " + e.message));
+  setInterval(() => grupoLocal.actualizarQuorum().catch(e => log("Incorporación de PCs: " + e.message)), 6000).unref();
   respaldoDiario();
   setInterval(respaldoDiario, 3 * 3600 * 1000).unref();
   migrarRuntime(BASE, DIR_APP, log).then(async (portable) => {

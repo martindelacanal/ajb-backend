@@ -301,8 +301,29 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
 
 ## PCs de respaldo y reemplazo automático sin internet
 
-Una PC sola conserva el funcionamiento habitual. Para agregar respaldo, desde
-**Sistema → PCs de respaldo**, en el servidor del camping:
+Una PC sola conserva el funcionamiento habitual. Para armar un grupo nuevo,
+desde **cada PC Windows que vas a incorporar**, abrí la dirección HTTP habitual
+del predio (por ejemplo `http://192.168.0.10:8080`) e ingresá como administrador.
+En **Sistema → PCs de respaldo → Incorporar esta PC**, descargá y extraé el ZIP.
+Ejecutá `INSTALAR-APOYO.bat` en esa misma PC y aceptá el permiso de Windows.
+
+Al haber tres PCs listas, contando la principal, el sistema pausa las escrituras
+para copiar la última base de la principal y activa el reemplazo automáticamente.
+El instalador prepara «Sistema del Camping - Caja». Cada equipo incorporado puede
+guardar una copia y participar en la elección del servidor. Con tres votantes, dos
+pueden seguir operando tras la caída del tercero. Los equipos necesitan mantener
+sus direcciones IPv4 dentro de la red del predio (por ejemplo, con reservas DHCP).
+El navegador puede usar HTTP. La incorporación y la réplica usan una conexión
+interna con certificados preparados por el instalador.
+
+El permiso de un ZIP vence en una hora y se usa en la PC donde se solicitó.
+Si se interrumpe la instalación, usá `CONTINUAR-INSTALACION.bat` en la carpeta
+que se creó en esa PC. Si había un servidor suelto del mismo predio en la ruta
+estándar, el instalador lo detiene y conserva su carpeta y su base.
+
+### Grupos ya configurados con un testigo separado
+
+Estos grupos usan la incorporación por rol desde **Sistema → PCs de respaldo**:
 
 1. Prepará el instalador de **Testigo** y ejecutalo como administrador en una PC
    de caja que quede encendida. Coordina el grupo y no guarda la base comercial.

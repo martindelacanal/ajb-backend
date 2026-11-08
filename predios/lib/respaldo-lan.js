@@ -292,7 +292,10 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
   }
   async function recibirInicial(packet, { remitenteId } = {}) {
     const decoded = abrir(packet.buffer, c, packet.manifest), m = decoded.manifest;
-    const w = await testigo("estado");
+    // Un equipo preparado para el grupo espera la semilla antes de iniciar Raft.
+    const w = config.respaldo_lan?.quorumPendiente
+      ? { preferido_id: c.miembros.find(n => n.preferido)?.id, termino: 0, escritor: null, ultimo: { indice: 0, sha256: "0".repeat(64) } }
+      : await testigo("estado");
     const repetida = igual(disco.confirmada, m) && (!disco.pendiente || igual(disco.pendiente, m));
     if (m.indice !== 0 || m.termino !== 0 || m.nodoId !== remitenteId || m.nodoId !== w.preferido_id || m.nodoId === c.nodoId
       || w.termino !== 0 || w.escritor !== null || w.ultimo.indice !== 0 || (w.ultimo.sha256 !== "0".repeat(64) && !(repetida && igual(w.ultimo, m)))
@@ -314,6 +317,11 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
     if (m.termino < 1) return { guardado: true, revision: revision(m) };
     const { firmarAckReplica } = require("./protocolo-lan");
     return firmarAckReplica({ grupoId: c.grupoId, nodoId: c.nodoId, escritorId: m.nodoId, termino: m.termino, indice: m.indice, sha256: m.sha256 }, c.clave);
+  }
+  function recibirCopiaQuorum(packet, ultimo) {
+    if (!config.respaldo_lan?.quorumPendiente || permiso || !igual(packet.manifest, ultimo)) throw error("La copia de incorporación no corresponde a la revisión confirmada");
+    custodiar(packet);
+    confirmarLocal(ultimo);
   }
   async function recuperar(rev) {
     if (tiene(rev)) return;
@@ -431,10 +439,14 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
     exigirModelo(w.ultimo);
     disco.degradado = w.degradado === true; guardar();
     if (w.escritor && w.escritor !== c.nodoId && Number(w.vence_en_ms) > 0) {
-      if (w.preferido_id === c.nodoId && typeof transporte.drenar === "function") {
+      if (!c.quorum && w.preferido_id === c.nodoId && typeof transporte.drenar === "function") {
         const retorno = await testigo("solicitar", { nodoId: c.nodoId, revision: w.ultimo });
         if (retorno.drenar && retorno.hacia_preferido === c.nodoId) await transporte.drenar(c.miembros.find(m => m.id === w.escritor), { haciaId: c.nodoId, revision: w.ultimo });
       }
+      return;
+    }
+    if (c.quorum && w.candidato === c.nodoId && !igual(disco.instalada, w.ultimo)) {
+      await prepararActivacion(w.ultimo, w);
       return;
     }
     const concedido = await pedirPermiso("solicitar", w.ultimo);
@@ -486,7 +498,7 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
       miembros: c.miembros.map(({ id, nombre, url, preferido, caPublica }) => ({ id, nombre, url, preferido, ...(caPublica ? { caPublica } : {}) })) };
   }
   return {
-    estado, antesTransaccion, antesCommit, despuesTransaccion, abortarTransaccion, recibirInicial, recibirSnapshot, obtenerSnapshot, registrarInicial, sondear, drenar,
+    estado, antesTransaccion, antesCommit, despuesTransaccion, abortarTransaccion, recibirInicial, recibirSnapshot, recibirCopiaQuorum, obtenerSnapshot, registrarInicial, sondear, drenar,
     iniciar() { if (!timer) timer = setInterval(() => sondear().catch(e => log(e.message)), 1500); timer.unref?.(); return sondear(); },
     detener() { detenido = true; permiso = null; clearInterval(timer); timer = null; },
     prepararInicial: () => db.exclusivo(() => snapshot({ indice: 0, termino: 0, nodoId: c.nodoId })),

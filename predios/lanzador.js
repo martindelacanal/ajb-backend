@@ -105,8 +105,12 @@ function requiereControlLan() {
 
 function carpetaCompatible(carpeta) {
   try {
+    const archivo = path.join(BASE, "predio-ha.json");
+    const config = fs.existsSync(archivo) ? JSON.parse(fs.readFileSync(archivo, "utf8").replace(/^\uFEFF/, "")) : null;
+    const quorum = config?.quorum || config?.quorumPendiente || fs.existsSync(path.join(BASE, "ha", "activacion-quorum.json"));
     return fs.statSync(path.join(carpeta, "servidor.js")).isFile()
-      && (!requiereControlLan() || fs.statSync(path.join(carpeta, "lib", "servicio-lan.js")).isFile());
+      && (!requiereControlLan() || fs.statSync(path.join(carpeta, "lib", "servicio-lan.js")).isFile())
+      && (!quorum || fs.statSync(path.join(carpeta, "windows", "ajb-quorum.exe")).isFile());
   } catch (_e) { return false; }
 }
 

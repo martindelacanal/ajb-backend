@@ -152,4 +152,4 @@ function crearTestigo({ base, config, ahora = Date.now, monotono = () => Number(
     };
   } catch (e) { cerrarCandado(); throw e; }
 }
-module.exports = { crearTestigo, LEASE_MS, USO_MS, CUARENTENA_MS };
+module.exports = { crearTestigo, protegerCarpetaTestigo: proteger, LEASE_MS, USO_MS, CUARENTENA_MS };

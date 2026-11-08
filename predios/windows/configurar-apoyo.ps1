@@ -40,9 +40,9 @@ if ($Rol -notin @('Testigo','Acceso','Respaldo') -or $ha.habilitado -ne $true -o
 $roles = if ($Rol -eq 'Testigo') { @('Testigo','Acceso') } elseif ($Rol -eq 'Acceso') { @('Acceso') } else { @() }
 $tareas = if ($Rol -eq 'Respaldo') { @('AJB Predio') } else { @($roles | ForEach-Object { 'AJB Predio ' + $_ }) }
 foreach ($nombre in $tareas) {
-  if (Get-ScheduledTask -TaskName $nombre -ErrorAction SilentlyContinue) { throw "Ya existe la tarea $nombre; no se modifico. Revisa la instalacion existente." }
+  if ((Get-ScheduledTask -TaskName $nombre -ErrorAction SilentlyContinue) -and -not ($Rol -eq 'Respaldo' -and $ha.quorumPendiente)) { throw "Ya existe la tarea $nombre; no se modifico. Revisa la instalacion existente." }
 }
-if (-not $Destino) { $Destino = 'C:\AJB-Predio-' + $Rol }
+if (-not $Destino) { $Destino = 'C:\AJB-Predio-' + $(if ($ha.quorumPendiente) { 'Equipo' } else { $Rol }) }
 $Destino = [IO.Path]::GetFullPath($Destino).TrimEnd('\')
 if ($Destino -eq [IO.Path]::GetPathRoot($Destino).TrimEnd('\') -or $Destino -eq $Origen -or (Dentro $Destino $Origen) -or (Dentro $Origen $Destino)) { throw 'Elige una carpeta nueva separada del paquete descargado.' }
 if (Test-Path -LiteralPath $Destino) { throw "La carpeta ya existe: $Destino. No se reemplazo ningun archivo. Elige otra carpeta con -Destino." }

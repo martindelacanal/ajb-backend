@@ -22,6 +22,7 @@ const { crearServicioLan } = require("../lib/servicio-lan");
 const { firmarPeticion } = require("../lib/protocolo-lan");
 const { descifrarJson } = require("../lib/http-lan");
 const RAIZ = path.join(__dirname, "..");
+const ipLan = Object.values(os.networkInterfaces()).flat().find(i => i.family === "IPv4" && !i.internal)?.address;
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
 async function puertoLibre() { const s = net.createServer(); await new Promise((r) => s.listen(0, "127.0.0.1", r)); const p = s.address().port; await new Promise((r) => s.close(r)); return p; }
 async function cerrar(s) { if (!s?.listening) return; await new Promise((r) => { s.close(r); s.closeAllConnections?.(); }); }
@@ -87,6 +88,37 @@ function leerZip(archivo) {
   const r = JSON.parse(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { windowsHide: true, encoding: "utf8", timeout: 30000, env: { ...process.env, AJB_GRUPO_ZIP: archivo } }));
   return { ha: JSON.parse(r.ha), nombres: r.nombres.map((n) => n.replace(/\\/g, "/")) };
 }
+
+test("un administrador descarga desde HTTP el paquete unificado para la misma PC", {
+  skip: process.platform !== "win32" || !ipLan || !fs.existsSync(path.join(RAIZ, "windows", "ajb-quorum.exe")), timeout: 120000,
+}, async t => {
+  const s = await preparar(t, true);
+  await s.iniciar();
+  const origen = `http://${ipLan}:${s.puerto}`;
+  const alta = "/api/sistema/grupo-local/incorporar-equipo";
+  const login = await pedir(origen, "/api/login", { metodo: "POST", cuerpo: { usuario: "admin", password: "fixture-admin" } });
+  assert.equal(login.status, 200, login.json?.mensaje);
+  assert.equal((await pedir(origen, alta, { metodo: "POST", cuerpo: {} })).status, 401);
+  assert.equal((await pedir(s.http, alta, { metodo: "POST", token: login.json.token, cuerpo: {} })).status, 409);
+  const r = await pedir(origen, alta, { metodo: "POST", token: login.json.token, cuerpo: {} });
+  assert.equal(r.status, 200, r.json?.mensaje);
+  assert.match(r.headers["content-disposition"], /AJB-Incorporar-esta-PC\.zip/);
+  const archivo = path.join(s.base, "equipo.zip");
+  fs.writeFileSync(archivo, r.buffer);
+  const { ha, nombres } = leerZip(archivo);
+  assert.equal(ha.quorumPendiente, true);
+  assert.equal(ha.rolInstalacion, "Respaldo");
+  assert.equal(ha.incorporacion.principalUrl, `https://${ipLan}:${s.seguro}`);
+  assert.ok(nombres.some(x => x.endsWith("/windows/ajb-quorum.exe")));
+  assert.ok(!nombres.some(x => /datos[\/]|\.pfx$|\.env$/.test(x)));
+  const inc = ha.incorporacion;
+  const ruta = "/lan/incorporar";
+  const cuerpo = Buffer.from(JSON.stringify({ rol: "Respaldo", nodoId: "d".repeat(64), nombre: "pc-caja", url: "https://pc-caja:8443", caPublica: s.raiz }));
+  const headers = { ...firmarPeticion({ grupoId: ha.grupoId, nodoId: "d".repeat(64), metodo: "POST", ruta, cuerpo, clave: inc.clave }), "X-AJB-Incorporacion": inc.id };
+  const desdeOtraPc = await pedir(s.https, ruta, { metodo: "POST", headers, cuerpo, ca: s.raiz });
+  assert.equal(desdeOtraPc.status, 403);
+  assert.match(desdeOtraPc.json.mensaje, /misma PC/);
+});
 
 test("HTTP real protege roles y ZIP Windows; incorpora testigo/respaldo, congela, siembra y reinicia sin perder sesión", { skip: process.platform !== "win32", timeout: 120000 }, async (t) => {
   const s = await preparar(t, true); await s.iniciar();

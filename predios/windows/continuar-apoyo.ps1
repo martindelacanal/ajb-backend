@@ -41,6 +41,19 @@ function Set-AjbFirewallApoyo([string]$Grupo, [string]$Rol, [int]$Puerto) {
   New-NetFirewallRule -Name $nombre -DisplayName ('AJB Predio ' + $Rol + ' ' + $Puerto + ' (' + $Grupo + ')') -Direction Inbound -Protocol TCP -LocalPort $Puerto -RemoteAddress LocalSubnet -Action Allow -Profile Any | Out-Null
 }
 function Set-AjbAccesoApoyo([string]$Directorio) { & (Join-Path $Directorio 'herramientas\configurar-acceso-caja.ps1') -Direccion 'http://127.0.0.1:8091' }
+function Get-AjbInstalacionAnterior($Tarea, [string]$Directorio) {
+  if (-not $Tarea) { return $null }
+  $acciones = @($Tarea.Actions)
+  if ($acciones.Count -ne 1) { return $null }
+  $anterior = 'C:\AJB-Predio'
+  if ([string]$acciones[0].WorkingDirectory -ine $anterior -or (Test-Path -LiteralPath (Join-Path $anterior 'predio-ha.json')) -or
+      (Test-Path -LiteralPath (Join-Path $anterior 'ha-activacion-pendiente.json'))) { return $null }
+  Assert-AjbTareaPropia $Tarea (Get-AjbAccionApoyo $anterior 'Respaldo')
+  $viejo = Get-Content -LiteralPath (Join-Path $anterior 'config.json') -Raw | ConvertFrom-Json
+  $nuevo = Get-Content -LiteralPath (Join-Path $Directorio 'config.json') -Raw | ConvertFrom-Json
+  if (-not $viejo.predio_id -or $viejo.predio_id -ne $nuevo.predio_id) { return $null }
+  return $anterior
+}
 function Invoke-AjbServidorApoyo([string]$Directorio) {
   @{ autoarranque = $true; detenido = $false } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Directorio 'runtime.json') -Encoding UTF8
   & (Join-Path $Directorio 'herramientas\control-servidor.ps1') -Base $Directorio -Accion Iniciar
@@ -63,14 +76,27 @@ function Continuar-AjbApoyo([string]$Directorio, [switch]$Inicial) {
   $equipo = Get-AjbIdentidadApoyo $node $carpetaVersion
   if ($ha.equipoId -cne $equipo -or $marca.equipoId -cne $equipo) { throw 'Esta instalacion pertenece a otra PC. No se cambia su identidad ni se inicia.' }
   $roles = if ($rol -eq 'Testigo') { @('Testigo','Acceso') } elseif ($rol -eq 'Acceso') { @('Acceso') } else { @('Respaldo') }
-  foreach ($componente in $roles) { $esperada = Get-AjbAccionApoyo $Directorio $componente; Assert-AjbTareaPropia (Get-ScheduledTask -TaskName $esperada.Nombre -ErrorAction SilentlyContinue) $esperada }
+  $unificado = $rol -eq 'Respaldo' -and ($ha.quorumPendiente -or $ha.quorum)
+  $anterior = $null
+  foreach ($componente in $roles) {
+    $esperada = Get-AjbAccionApoyo $Directorio $componente
+    $existente = Get-ScheduledTask -TaskName $esperada.Nombre -ErrorAction SilentlyContinue
+    if ($unificado) { $anterior = Get-AjbInstalacionAnterior $existente $Directorio }
+    if (-not $anterior) { Assert-AjbTareaPropia $existente $esperada }
+  }
   if ($ha.incorporacion) {
     if ($ha.incorporacion.id -cne $marca.incorporacionId) { throw 'El permiso pendiente no coincide con esta instalacion.' }
     Invoke-AjbIncorporacionApoyo $node $carpetaVersion $Directorio (-not $Inicial)
     $ha = Get-Content -LiteralPath (Join-Path $Directorio 'predio-ha.json') -Raw -Encoding UTF8 | ConvertFrom-Json
   }
   if ($ha.incorporacion -or $ha.equipoId -cne $equipo -or $ha.grupoId -cne $marca.grupoId -or $ha.rolInstalacion -cne $rol -or -not $ha.clavePublicaTestigo) { throw 'La incorporacion no devolvio la configuracion final de esta PC.' }
-  foreach ($componente in $roles) { $esperada = Get-AjbAccionApoyo $Directorio $componente; Assert-AjbTareaPropia (Get-ScheduledTask -TaskName $esperada.Nombre -ErrorAction SilentlyContinue) $esperada }
+  foreach ($componente in $roles) {
+    $esperada = Get-AjbAccionApoyo $Directorio $componente
+    $existente = Get-ScheduledTask -TaskName $esperada.Nombre -ErrorAction SilentlyContinue
+    if ($anterior) {
+      if ((Get-AjbInstalacionAnterior $existente $Directorio) -ne $anterior) { throw 'Cambio la instalacion anterior. Se conservaron sus archivos.' }
+    } else { Assert-AjbTareaPropia $existente $esperada }
+  }
   if ($rol -eq 'Acceso' -and ($ha.clave -or $ha.claveDatos -or $ha.claveAdministracion -or $ha.clavePrivadaTestigo -or @($ha.miembros | Where-Object { $_.clave }).Count)) { throw 'El acceso de caja debe contener solo configuracion publica.' }
   if ($rol -eq 'Respaldo') {
     foreach ($n in @('config.json','arranque.js','herramientas\control-servidor.ps1')) { if (-not (Test-Path -LiteralPath (Join-Path $Directorio $n) -PathType Leaf)) { throw 'La instalacion de respaldo esta incompleta.' } }
@@ -78,9 +104,13 @@ function Continuar-AjbApoyo([string]$Directorio, [switch]$Inicial) {
     $tls = Join-Path $Directorio 'datos\tls\config.json'
     if (-not (Test-Path -LiteralPath $tls -PathType Leaf)) { throw 'Falta HTTPS del respaldo. No se inicia sin completar TLS.' }
     $puertos += [int]((Get-Content -LiteralPath $tls -Raw -Encoding UTF8 | ConvertFrom-Json).puerto)
+    if ($unificado) { $puertos += 39878 }
   } elseif ($rol -eq 'Testigo') { $puertos = @(([uri]$ha.testigo.url).Port) } else { $puertos = @() }
   foreach ($puerto in @($puertos | Select-Object -Unique)) { if ($puerto -lt 1 -or $puerto -gt 65535) { throw 'Un puerto del apoyo no es valido.' }; Set-AjbFirewallApoyo ([string]$ha.grupoId) $rol $puerto }
-  if ($rol -eq 'Respaldo') { Invoke-AjbServidorApoyo $Directorio }
+  if ($rol -eq 'Respaldo') {
+    if ($anterior) { & (Join-Path $Directorio 'herramientas\control-servidor.ps1') -Base $anterior -Accion Detener }
+    Invoke-AjbServidorApoyo $Directorio
+  }
   else {
     if (-not (Test-Path -LiteralPath (Join-Path $Directorio 'arranque-apoyo.js') -PathType Leaf)) { throw 'Falta el supervisor de apoyo instalado.' }
     foreach ($componente in $roles) {

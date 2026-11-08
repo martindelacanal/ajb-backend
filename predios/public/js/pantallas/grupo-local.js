@@ -22,30 +22,51 @@
     var testigo = botonInstalador("Instalar testigo en una PC de caja", "Testigo");
     var respaldo = botonInstalador("Agregar PC de respaldo", "Respaldo");
     var acceso = botonInstalador("Preparar acceso de caja", "Acceso");
+    var equipo = P.btn("Incorporar esta PC", { tipo: "primario", icono: "descargar", deshabilitado: true, onclick: incorporarEquipo });
+    equipo.hidden = true;
     var activar = P.btn("Activar reemplazo automático", { tipo: "primario", icono: "check", deshabilitado: true, onclick: activarGrupo });
     var revisar = P.btn("Actualizar estado", { tipo: "texto", icono: "refrescar", onclick: function () { cargar(); } });
+    var pasos = h("ol", { style: { margin: 0, paddingLeft: "22px" } },
+      h("li", "Instalá el testigo en una PC de caja que permanezca encendida. Es liviano y no guarda la base de ventas ni stock."),
+      h("li", "Agregá las PCs de respaldo que necesites y completá su incorporación."),
+      h("li", "Activá el reemplazo automático y prepará el acceso de cada caja."));
+    var ayudaEquipo = h("p.texto-3", { hidden: true }, "Abrí esta pantalla en cada PC del camping y ejecutá el instalador que descargues ahí. El reemplazo se activa solo cuando hay tres PCs listas, contando la principal.");
+    var ayudaCaja = h("p.texto-3.chico", { style: { margin: 0 } }, "En las cajas, usá «Sistema del Camping - Caja»: abre localhost:8091 y encuentra la PC en servicio.");
+    var datosTestigo = h("div.dato", h("span", "Testigo en la red"), pcTestigo);
     var panel = h("section.hoja.hoja-cuerpo.columna", { "aria-label": "PCs de respaldo del predio" },
       h("div.fila-separada", h("h2.seccion-titulo", "PCs de respaldo"), estado),
       h("p.texto-3", { style: { margin: 0 } }, "Podés seguir trabajando con una sola PC. Si agregás respaldos, otra PC puede continuar atendiendo las cajas cuando falle la que está en servicio."),
-      h("div.datos", h("div.dato", h("span", "PC en servicio"), pcServicio), h("div.dato", h("span", "PC preferida"), preferida), h("div.dato", h("span", "Testigo en la red"), pcTestigo)),
+      h("div.datos", h("div.dato", h("span", "PC en servicio"), pcServicio), h("div.dato", h("span", "PC de origen"), preferida), datosTestigo),
       mensaje, problema, reducida,
-      h("ol", { style: { margin: 0, paddingLeft: "22px" } },
-        h("li", "Instalá el testigo en una PC de caja que permanezca encendida. Es liviano y no guarda la base de ventas ni stock."),
-        h("li", "Agregá las PCs de respaldo que necesites y completá su incorporación."),
-        h("li", "Activá el reemplazo automático y prepará el acceso de cada caja.")),
+      pasos, ayudaEquipo,
       equipos, sinEquipos, retorno,
-      h("div.fila", testigo, respaldo, acceso, activar),
-      h("p.texto-3.chico", { style: { margin: 0 } }, "En las cajas, usá «Sistema del Camping - Caja»: abre localhost:8091 y encuentra la PC en servicio."),
+      h("div.fila", equipo, testigo, respaldo, acceso, activar), ayudaCaja,
       aviso, h("div.fila", revisar));
 
     function actualizarControles() {
       var ocupado = trabajando || confirmando || activando || !datos;
+      var unificado = !!datos && (datos.modo === "quorum" || datos.puedeIncorporarEquipo);
+      equipo.hidden = !unificado;
+      equipo.disabled = ocupado || !datos.puedeIncorporarEquipo;
+      pasos.hidden = ayudaCaja.hidden = datosTestigo.hidden = testigo.hidden = respaldo.hidden = acceso.hidden = unificado;
+      ayudaEquipo.hidden = !unificado;
       testigo.disabled = ocupado || !datos.puedePrepararTestigo;
       respaldo.disabled = ocupado || !datos.puedePrepararRespaldo;
       acceso.disabled = ocupado || !datos.testigo;
       activar.disabled = ocupado || !datos.puedeActivar;
-      activar.hidden = !!datos && (datos.estado === "EN_MARCHA" || datos.estado === "SIN_TESTIGO");
+      activar.hidden = unificado || (!!datos && (datos.estado === "EN_MARCHA" || datos.estado === "SIN_TESTIGO"));
       revisar.disabled = consultando || activando;
+    }
+    function incorporarEquipo() {
+      if (trabajando || cerrado) return;
+      trabajando = true; actualizarControles();
+      P.ejecutar(equipo, function () {
+        return P.descargarPost("/sistema/grupo-local/incorporar-equipo", {}, "AJB-Incorporar-esta-PC.zip").then(function () {
+          if (cerrado) return;
+          aviso.textContent = "Extraé el ZIP, abrí INSTALAR-APOYO.bat y aceptá el permiso de Windows. El acceso de caja aparecerá en el escritorio.";
+          aviso.hidden = false;
+        });
+      }).catch(function () {}).finally(function () { trabajando = false; if (!cerrado) { actualizarControles(); cargar(); } });
     }
     function botonInstalador(texto, rol) {
       var boton = P.btn(texto, { tipo: "secundario", icono: "descargar", deshabilitado: true, onclick: function () {
@@ -67,6 +88,8 @@
         PREPARANDO: ["Preparando las PCs", "PENDIENTE"],
         EN_MARCHA: ["Reemplazo automático activo", "CONFIRMADA"],
         SIN_TESTIGO: ["Testigo sin conexión", "PENDIENTE"],
+        ACTIVANDO: ["Copiando los datos iniciales", "PENDIENTE"],
+        SIN_MAYORIA: ["Esperando una mayoría de PCs", "PENDIENTE"],
       };
       return estados[d.estado] || ["Revisar configuración", "PENDIENTE"];
     }
@@ -75,7 +98,7 @@
       var lista = (d.miembros || []).slice().sort(function (a, b) { return String(a.id).localeCompare(String(b.id)); });
       var nueva = JSON.stringify({ habilitado: d.habilitado, grupoId: d.grupoId, principal: d.principal, testigo: d.testigo, miembros: lista,
         escritor: d.escritor, degradado: d.degradado, estado: d.estado, puedeActivar: d.puedeActivar,
-        puedePrepararTestigo: d.puedePrepararTestigo, puedePrepararRespaldo: d.puedePrepararRespaldo, mensaje: d.mensaje });
+        puedePrepararTestigo: d.puedePrepararTestigo, puedePrepararRespaldo: d.puedePrepararRespaldo, modo: d.modo, mensaje: d.mensaje });
       if (huella !== nueva) {
         huella = nueva;
         var visible = estadoVisible(d);
@@ -86,7 +109,7 @@
         mensaje.hidden = !d.mensaje && d.estado !== "SIN_TESTIGO";
         if (!mensaje.hidden) P.reemplazar(mensaje, P.mensaje(d.mensaje || "Encendé la PC testigo y verificá que esté conectada a la red del predio.", d.estado === "SIN_TESTIGO" ? "aviso" : "info"));
         reducida.hidden = !d.degradado;
-        retorno.hidden = !d.habilitado;
+        retorno.hidden = !d.habilitado || d.modo === "quorum";
         var otras = lista.filter(function (m) { return !d.principal || m.id !== d.principal.id; });
         equipos.hidden = !otras.length; sinEquipos.hidden = !!otras.length;
         P.reemplazar(equipos, otras.map(function (m) {
