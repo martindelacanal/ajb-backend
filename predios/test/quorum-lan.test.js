@@ -25,7 +25,7 @@ async function cerrar(s) {
   if (s.listening) await new Promise(resolve => { s.close(resolve); s.closeAllConnections(); });
 }
 
-test("un grupo retira un respaldo y los tres restantes relevan al servidor tras cambiar de IP sin perder la última escritura", {
+test("el grupo releva tras cambiar las IP y devuelve el servicio a la principal con las ventas del respaldo", {
   skip: !ejecutable, timeout: 120000,
 }, async t => {
   const raiz = fs.mkdtempSync(path.join(os.tmpdir(), "ajb-quorum-"));
@@ -64,6 +64,10 @@ test("un grupo retira un respaldo y los tres restantes relevan al servidor tras 
       // sustituye sólo el certificado HTTP del servidor de prueba.
       req.socket.encrypted = true;
       if (!n.disponible) return respuesta(res, 503, { mensaje: "PC desconectada" });
+      if (n.sinRetorno && req.url === "/lan/retorno") {
+        n.intentoRetorno = true;
+        return respuesta(res, 404, { mensaje: "El respaldo todavía no se actualizó" });
+      }
       if (!await n.servicio.manejar(req, res)) {
         if (!n.servicio.estado().escritor) return n.servicio.reenviar(req, res);
         respuesta(res, 200, { equipo: n.id });
@@ -90,7 +94,8 @@ test("un grupo retira un respaldo y los tres restantes relevan al servidor tras 
   const inicial = { grupoId, termino: 0, miembros, ultimo, preferidoId: nodos[0].id };
   const abrir = n => {
     n.servicio = crearServicioLan({ base: n.base, dirApp, config: n.config, db: n.db, ha: n.ha, ubicarGrupo: () => ubicacion,
-      alReiniciar: () => { n.reiniciar = true; }, log: mensaje => { logs.push(mensaje); if (logs.length > 40) logs.shift(); } });
+      alReiniciar: () => { n.reiniciar = true; n.reinicios = (n.reinicios || 0) + 1; },
+      log: mensaje => { logs.push(mensaje); if (logs.length > 40) logs.shift(); } });
   };
   for (const [i, n] of nodos.entries()) {
     abrir(n);
@@ -104,7 +109,7 @@ test("un grupo retira un respaldo y los tres restantes relevan al servidor tras 
     n.db.configurarTransacciones(n.servicio);
     n.servicio.iniciar().catch(e => logs.push(e.message));
   }
-  async function lider() {
+  async function lider(esperado) {
     const limite = Date.now() + 32000;
     while (Date.now() < limite) {
       for (const n of nodos.filter(n => n.disponible && n.reiniciar)) {
@@ -119,14 +124,36 @@ test("un grupo retira un respaldo y los tres restantes relevan al servidor tras 
       }
       const activos = nodos.filter(n => n.disponible && n.servicio.estado().escritor);
       assert.ok(activos.length <= 1, "la mayoría habilita a un solo escritor");
-      if (activos.length === 1) return activos[0];
+      const activo = activos[0];
+      if (activo && (!esperado || activo === esperado)) {
+        // El servicio ya puede estar publicando su aviso de activación. Esperar
+        // a que termine esa escritura antes de simular la siguiente venta.
+        await new Promise(setImmediate);
+        await activo.db.exclusivo(() => {});
+        if (activo.servicio.estado().escritor) return activo;
+      }
       await esperar(100);
     }
     throw new Error("El grupo no eligió un escritor: " + logs.join("\n"));
   }
-  const escribir = (n, valor) => n.db.tx(t => t.run("INSERT INTO predio_config(predio_id,id,clave,valor) VALUES(1,1,'ultima_venta',?) ON CONFLICT(predio_id,id) DO UPDATE SET valor=excluded.valor", [String(valor)]));
+  const escribir = (n, valor) => n.db.tx(t => t.run("INSERT INTO predio_config(predio_id,id,clave,valor) VALUES(1,1,'ultima_venta',?) ON CONFLICT(predio_id,id) DO UPDATE SET valor=excluded.valor", [String(valor)]))
+    .catch(e => { e.message += "\n" + logs.slice(-12).join("\n"); throw e; });
   const leer = n => n.db.conexion.prepare("SELECT valor FROM predio_config WHERE clave='ultima_venta'").get()?.valor;
-  const activo = await lider();
+  async function comprobarAcceso(desde, escritor) {
+    for (const limite = Date.now() + 10000; Date.now() < limite;) {
+      const r = await fetch(desde.url + "/api/estado-publico", { signal: AbortSignal.timeout(5000) });
+      const datos = await r.json();
+      if (r.ok) { assert.deepEqual(datos, { equipo: escritor.id }); return; }
+      // Un sondeo puede coincidir con la renovación del permiso tras la
+      // elección. Debe esperar, nunca responder con otro servidor.
+      assert.equal(r.status, 503);
+      assert.equal(datos.codigo, "SERVIDOR_CAMBIANDO");
+      await esperar(150);
+    }
+    assert.fail("El acceso de caja no encontró al escritor " + escritor.id);
+  }
+  const principal = nodos[0];
+  const activo = await lider(principal);
   await escribir(activo, 101);
   const baja = nodos.find(n => n !== activo && n.id !== inicial.preferidoId);
   baja.disponible = false;
@@ -164,7 +191,7 @@ test("un grupo retira un respaldo y los tres restantes relevan al servidor tras 
   await esperar(3000);
   assert.ok(nodos.every(n => !n.servicio.estado().escritor), "las IP anteriores en otras PCs no acreditan su identidad");
   redNueva = true;
-  const primero = await lider();
+  const primero = await lider(principal);
   assert.equal(leer(primero), "101");
   await escribir(primero, 102);
   primero.disponible = false; primero.servicio.detener();
@@ -172,11 +199,32 @@ test("un grupo retira un respaldo y los tres restantes relevan al servidor tras 
   assert.notEqual(segundo.id, primero.id);
   assert.equal(leer(segundo), "102");
   const caja = nodos.find(n => n !== primero && n !== segundo);
-  assert.deepEqual(await (await fetch(caja.url + "/api/estado-publico")).json(), { equipo: segundo.id });
+  await comprobarAcceso(caja, segundo);
   await escribir(segundo, 202);
+  assert.equal(leer(principal), "102");
+  const reiniciosPrevios = principal.reinicios;
+  segundo.sinRetorno = true;
+  await principal.db.exclusivo(() => {});
+  principal.db.cerrar();
+  aplicarPendiente({ base: principal.base, config: principal.config });
+  abrirDB(principal); abrir(principal);
+  principal.db.configurarTransacciones(principal.servicio);
+  principal.disponible = true;
+  principal.servicio.iniciar().catch(e => logs.push(e.message));
+  for (const limite = Date.now() + 12000; !segundo.intentoRetorno && Date.now() < limite;) await esperar(100);
+  assert.equal(segundo.intentoRetorno, true);
+  assert.equal(segundo.servicio.estado().escritor, true, "un respaldo todavía sin actualizar sigue en servicio");
+  await escribir(segundo, 203);
+  segundo.sinRetorno = false;
+  assert.equal(await lider(principal), principal);
+  assert.equal(principal.reinicios, reiniciosPrevios, "recupera la copia sin perder su elección al reiniciar");
+  assert.equal(leer(principal), "203");
+  await comprobarAcceso(segundo, principal);
+  await escribir(principal, 204);
   caja.disponible = false; caja.servicio.detener();
-  await assert.rejects(escribir(segundo, 303));
-  assert.equal(segundo.servicio.estado().escritor, false);
+  segundo.disponible = false; segundo.servicio.detener();
+  await assert.rejects(escribir(principal, 303));
+  assert.equal(principal.servicio.estado().escritor, false);
 });
 
 test("el coordinador incorpora un equipo como votante después de replicarle el registro", { skip: !ejecutable, timeout: 30000 }, async t => {

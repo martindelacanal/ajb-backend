@@ -64,6 +64,8 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
       return extraerPaquete(r.buffer);
     },
     drenar: (m, cuerpo) => pedirMiembro(m, "/lan/drenar", { cuerpo, timeout: 15000 }),
+    solicitarRetorno: (m, cuerpo) => pedirMiembro(m, "/lan/retorno", { cuerpo, timeout: 8000 }),
+    transferirAlPrincipal: (...datos) => autoridad.transferirAlPrincipal(...datos),
   };
   async function publicarAvisos() {
     if (avisando || detenido || !core.estado().escritor) return;
@@ -246,7 +248,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
         } catch (e) { if (!res.headersSent && !res.destroyed) H.respuesta(res, e.status || 403, { mensaje: e.message }); }
         return true;
       }
-      if (!["/lan/replica", "/lan/replica/inicial", "/lan/drenar", "/lan/estado"].includes(u.pathname)) return false;
+      if (!["/lan/replica", "/lan/replica/inicial", "/lan/drenar", "/lan/retorno", "/lan/estado"].includes(u.pathname)) return false;
       try {
         const buffer = await H.leer(req, 301 * 1024 * 1024);
         // Refresca los miembros firmados para admitir una PC recién incorporada.
@@ -259,7 +261,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
           H.respuesta(res, 200, packet.buffer);
         } else if (req.method === "POST" && u.pathname === "/lan/replica") H.respuesta(res, 200, await core.recibirSnapshot(extraerPaquete(buffer), { remitenteId: actor.nodoId }));
         else if (req.method === "POST" && u.pathname === "/lan/replica/inicial") H.respuesta(res, 200, await core.recibirInicial(extraerPaquete(buffer), { remitenteId: actor.nodoId }));
-        else if (req.method === "POST" && u.pathname === "/lan/drenar") {
+        else if (req.method === "POST" && u.pathname === (c.quorum ? "/lan/retorno" : "/lan/drenar")) {
           const datos = JSON.parse(buffer.toString("utf8"));
           if (datos.haciaId !== actor.nodoId) throw new Error("La entrega debe pedirla el equipo preferido");
           H.respuesta(res, 200, await core.drenar(datos));

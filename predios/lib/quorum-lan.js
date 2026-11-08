@@ -187,6 +187,17 @@ function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
   }
   return {
     miembros() { return exclusivo(async () => (await leer()).members); },
+    transferirAlPrincipal(id, rev, termino, acuse) { return exclusivo(async () => {
+      const lectura = await leer();
+      if (id !== registro.preferidoId || escritor(lectura)?.id !== config.nodoId ||
+          termino !== lectura.term || !misma(registro.ultimo, rev)) {
+        throw error("Cambió el servidor o la copia confirmada antes del retorno", 409);
+      }
+      const acreditado = verificarAckReplica(acuse, { grupoId: config.grupoId, escritorId: config.nodoId,
+        termino, ...registro.ultimo, miembros: registro.miembros });
+      if (acreditado !== id) throw error("La copia debe acreditarla la PC principal", 403);
+      await consenso.pedir("/transfer", { id, expected: lectura.register.version, term: lectura.term, configuration: lectura.configuration });
+    }); },
     revisarRetiro(id) { return exclusivo(async () => {
       const lectura = await leer();
       if (registro.retirados?.includes(id)) return null;

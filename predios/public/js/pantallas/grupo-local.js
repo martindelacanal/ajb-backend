@@ -149,7 +149,7 @@
         mensaje.hidden = !d.mensaje && d.estado !== "SIN_TESTIGO";
         if (!mensaje.hidden) P.reemplazar(mensaje, P.mensaje(d.mensaje || "Encendé la PC testigo y verificá que esté conectada a la red del predio.", d.estado === "SIN_TESTIGO" ? "aviso" : "info"));
         reducida.hidden = !d.degradado;
-        retorno.hidden = !d.habilitado || d.modo === "quorum";
+        retorno.hidden = !d.habilitado;
         var otras = lista.filter(function (m) { return !d.principal || m.id !== d.principal.id; });
         equipos.hidden = !otras.length; sinEquipos.hidden = !!otras.length;
         P.reemplazar(equipos, otras.map(function (m) {

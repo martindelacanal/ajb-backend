@@ -9,6 +9,7 @@ const zlib = require("node:zlib");
 const { performance } = require("node:perf_hooks");
 const { NOMBRES_TABLAS } = require("./esquema");
 const { normalizarBusqueda } = require("./util");
+const { firmarAckReplica } = require("./protocolo-lan");
 
 const MAGIC = Buffer.from("AJBLAN01");
 const MAX_DB = 300 * 1024 * 1024;
@@ -338,7 +339,6 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
       try { limpiarCopias(); } catch (e) { log("No se pudo limpiar una copia antigua: " + e.message); }
     }
     if (m.termino < 1) return { guardado: true, revision: revision(m) };
-    const { firmarAckReplica } = require("./protocolo-lan");
     return firmarAckReplica({ grupoId: c.grupoId, nodoId: c.nodoId, escritorId: m.nodoId, termino: m.termino, indice: m.indice, sha256: m.sha256 }, c.clave);
   }
   function recibirCopiaQuorum(packet, ultimo) {
@@ -446,7 +446,7 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
     finally { enCurso = false; }
   }
   function abortarTransaccion() { enCurso = false; }
-  async function prepararActivacion(rev, w) {
+  async function prepararActivacion(rev, w, conservarConsenso = false) {
     exigirModelo(rev);
     if (activando) return;
     activando = true;
@@ -454,6 +454,15 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
     guardar();
     permiso = null;
     emitir("ACTIVACION_PREPARADA", { termino: w.termino, revision: rev, anterior: w.anterior || null });
+    if (conservarConsenso && typeof db.reabrirConCopia === "function") {
+      try {
+        const resultado = db.reabrirConCopia(() => aplicarPendiente({ base, config }));
+        if (!resultado.aplicado || !igual(resultado.revision, rev)) throw error("No se instaló la revisión elegida por el grupo");
+        disco = leerEstado(base, c);
+        activando = false;
+        return;
+      } catch (e) { log("No se pudo abrir la copia sin reiniciar: " + e.message); }
+    }
     await alActivar({ revision: rev, termino: w.termino, reiniciar: true });
   }
   async function sondearInterno() {
@@ -491,14 +500,24 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
     exigirModelo(w.ultimo);
     disco.degradado = w.degradado === true; guardar();
     if (w.escritor && w.escritor !== c.nodoId && Number(w.vence_en_ms) > 0) {
-      if (!c.quorum && w.preferido_id === c.nodoId && typeof transporte.drenar === "function") {
+      if (w.preferido_id !== c.nodoId) return;
+      const escritor = otros.find(m => m.id === w.escritor);
+      if (!escritor) return;
+      if (c.quorum) {
+        if (typeof transporte.solicitarRetorno !== "function" || !w.votantes?.includes(c.nodoId)) return;
+        const acuse = firmarAckReplica({ grupoId: c.grupoId, nodoId: c.nodoId, escritorId: w.escritor,
+          termino: w.termino, ...revision(w.ultimo) }, c.clave);
+        await transporte.solicitarRetorno(escritor, { haciaId: c.nodoId, revision: w.ultimo, acuse });
+      } else if (typeof transporte.drenar === "function") {
         const retorno = await testigo("solicitar", { nodoId: c.nodoId, revision: w.ultimo });
-        if (retorno.drenar && retorno.hacia_preferido === c.nodoId) await transporte.drenar(c.miembros.find(m => m.id === w.escritor), { haciaId: c.nodoId, revision: w.ultimo });
+        if (retorno.drenar && retorno.hacia_preferido === c.nodoId) await transporte.drenar(escritor, { haciaId: c.nodoId, revision: w.ultimo });
       }
       return;
     }
     if (c.quorum && w.candidato === c.nodoId && !igual(disco.instalada, w.ultimo)) {
-      await prepararActivacion(w.ultimo, w);
+      // Si reinicia toda la aplicación, también pierde la elección recién
+      // ganada y otra PC puede volver a tomar el control antes de que arranque.
+      await prepararActivacion(w.ultimo, w, true);
       return;
     }
     if (c.relevoManual && w.manual_activo !== (c.nodoId === c.relevoManual.cajaId)) return;
@@ -511,11 +530,23 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
     if (!sondeo) sondeo = db.exclusivo(sondearInterno).catch(e => { errorActual = e.message; permiso = null; throw e; }).finally(() => { sondeo = null; });
     return sondeo;
   }
-  async function drenar({ haciaId } = {}) {
+  async function drenar({ haciaId, revision: recibida, acuse } = {}) {
     exigirModelo(disco.confirmada);
     if (drenando || fenced || detenido) throw error("El escritor ya está detenido o drenando");
     const hacia = c.miembros.find(m => m.id === haciaId && m.id !== c.nodoId && m.preferido === true);
     if (!hacia) throw error("La entrega automática sólo corresponde al equipo preferido configurado");
+    if (c.quorum) return db.exclusivo(async () => {
+      if (fenced || detenido || activando || drenando || !vivo() || !igual(recibida, disco.confirmada)) {
+        throw error("La PC principal todavía no tiene la última revisión confirmada");
+      }
+      drenando = true;
+      try {
+        await transporte.transferirAlPrincipal(haciaId, disco.confirmada, permiso.termino, acuse);
+        permiso = null;
+        emitir("CONTROL_ENTREGADO", { haciaId, revision: disco.confirmada });
+        return { entregado: true, revision: disco.confirmada };
+      } finally { drenando = false; }
+    });
     drenando = true;
     return db.exclusivo(async () => {
       try {
@@ -558,8 +589,8 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
   };
 }
 
-// Único lugar que reemplaza predio.db: el lanzador/servidor lo invoca ANTES de
-// abrir SQLite. Toda identidad/configuración de la PC queda fuera del snapshot.
+// Único lugar que reemplaza predio.db. Siempre se ejecuta con SQLite cerrada.
+// Toda identidad/configuración de la PC queda fuera del snapshot.
 function aplicarPendiente({ base, config }) {
   const c = configuracion(base, config);
   if (!c.habilitado) return { aplicado: false };

@@ -119,12 +119,15 @@ const TABLAS_LOCALES = [
 function crearSqlite(archivo, { predioId }) {
   const Database = cargarSqlite();
   if (archivo !== ":memory:") fs.mkdirSync(path.dirname(archivo), { recursive: true });
-  const conexion = new Database(archivo);
-  conexion.exec("PRAGMA journal_mode = WAL");
-  conexion.exec("PRAGMA synchronous = NORMAL");
-  conexion.exec("PRAGMA busy_timeout = 5000");
-  conexion.exec("PRAGMA foreign_keys = OFF");
-  conexion.function("norm", { deterministic: true }, (s) => (s === null || s === undefined ? null : normalizarBusqueda(s)));
+  function abrir() {
+    const abierta = new Database(archivo);
+    try {
+      abierta.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = OFF");
+      abierta.function("norm", { deterministic: true }, (s) => (s === null || s === undefined ? null : normalizarBusqueda(s)));
+      return abierta;
+    } catch (e) { abierta.close(); throw e; }
+  }
+  let conexion = abrir();
 
   const sentencias = new Map();
   function preparar(sql) {
@@ -174,7 +177,7 @@ function crearSqlite(archivo, { predioId }) {
 
   const db = {
     ...comunes,
-    conexion,
+    get conexion() { return conexion; },
     archivo,
     async all(sql, params) { return candado.con(async () => ejecutor.all(sql, params)); },
     async get(sql, params) { return candado.con(async () => ejecutor.get(sql, params)); },
@@ -211,6 +214,15 @@ function crearSqlite(archivo, { predioId }) {
     // Trabajo sincrónico exclusivo: nunca corre en medio de una transacción abierta.
     async exclusivo(trabajo) {
       return candado.con(async () => trabajo());
+    },
+    // Sólo desde exclusivo. Reemplaza el archivo con SQLite cerrada y conserva
+    // el adaptador, el candado y la autoridad que usan las demás rutas.
+    reabrirConCopia(instalar) {
+      if (enTransaccion || archivo === ":memory:") throw new Error("La base todavía no se puede reemplazar");
+      sentencias.clear();
+      conexion.close();
+      try { return instalar(); }
+      finally { conexion = abrir(); }
     },
     exec(sql) { conexion.exec(sql); },
     cerrar() { try { conexion.close(); } catch (_e) { /* cerrada */ } },

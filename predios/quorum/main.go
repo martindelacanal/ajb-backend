@@ -303,6 +303,33 @@ func (c *consensus) serve(key string) http.Handler {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(c.fsm.current())
+		case "POST /transfer":
+			var request struct {
+				ID                            string
+				Expected, Term, Configuration uint64
+			}
+			if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&request) != nil || !identifier.MatchString(request.ID) {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			var group struct{ PreferidoID string }
+			if request.Term != term || request.Configuration != peers.Index() || request.Expected != current.Version ||
+				json.Unmarshal(current.Data, &group) != nil || request.ID != group.PreferidoID {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			id := raft.ServerID(request.ID)
+			for _, member := range peers.Configuration().Servers {
+				if member.ID == id && id != leader && member.Suffrage == raft.Voter {
+					if err := c.raft.LeadershipTransferToServer(id, member.Address).Error(); err != nil {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						return
+					}
+					_ = json.NewEncoder(w).Encode(true)
+					return
+				}
+			}
+			w.WriteHeader(http.StatusConflict)
 		case "POST /member":
 			var request struct {
 				peer
