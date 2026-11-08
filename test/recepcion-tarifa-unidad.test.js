@@ -72,3 +72,40 @@ test("el período previsto es individual y una noche adicional compartida se asi
   assert.equal(compartida.total, 90000);
   assert.deepEqual(compartida.personas.map(p => p.peso_alojamiento), [27000, 63000]);
 });
+
+test("Recepción puede cambiar o quitar el cupón sin perder un tipo de viaje de Turismo", async () => {
+  const reglas = {
+    1: { id: 1, tipo: "CUPON", codigo: "PROMO10", porcentaje_descuento: 10 },
+    2: { id: 2, tipo: "TIPO_VIAJE", codigo: "BODAS", porcentaje_descuento: 20 },
+    3: { id: 3, tipo: "CUPON", codigo: "PROMO15", porcentaje_descuento: 15, usos_maximos: 2 }
+  };
+  const base = { habilitado: 1, acumulable: 1, base_calculo: "PRECIO_FINAL" };
+  let conteoOcupado = false;
+  const c = { query: async (sql, params) => {
+    if (sql.includes("FROM reserva_descuento rd") && sql.includes("rd.reserva_id = ?")) {
+      return [[{ tipo: "TIPO_VIAJE", regla_id: 2 }, { tipo: "CUPON", regla_id: 1, codigo: "PROMO10" }]];
+    }
+    if (sql.includes("FROM descuento_regla r")) {
+      const regla = params.length === 1 ? reglas[params[0]] : Object.values(reglas).find(r => r.codigo === params[1]);
+      return [regla ? [{ ...base, ...regla }] : []];
+    }
+    if (sql.includes("FROM descuento_regla_")) return [[]];
+    if (sql.includes("FROM descuento_regla WHERE id = ? FOR UPDATE")) return [[{ id: 3 }]];
+    if (sql.includes("SELECT COUNT(*) AS total")) {
+      assert.match(sql, /FOR SHARE OF rd, r NOWAIT/);
+      if (conteoOcupado) throw Object.assign(new Error("Fila ocupada"), { code: "ER_LOCK_NOWAIT" });
+      return [[{ total: 1 }]];
+    }
+    throw new Error("Consulta inesperada: " + sql);
+  } };
+  const cotizarConCupon = cuponCodigo => turismo.aplicarDescuentosReserva(c, {
+    cabecera: { rol: "predio" }, cuponCodigo, servicioId: 10, usuarioTitular: { id: 5 }, reservaId: 6,
+    tarifaBase: { personas: [{ tipo_persona_id: 1, edad: 40, tarifa_individual: 10000 }] }, adicionalesTotal: 0
+  });
+  assert.equal((await cotizarConCupon(undefined)).total_final, 7000);
+  assert.equal((await cotizarConCupon("#promo15")).total_final, 6500);
+  assert.equal((await cotizarConCupon(null)).total_final, 8000);
+  await assert.rejects(cotizarConCupon("#NOEXISTE"), { statusCode: 404 });
+  conteoOcupado = true;
+  await assert.rejects(cotizarConCupon("#PROMO15"), { statusCode: 409, codigo: "DESCUENTO_EN_USO" });
+});

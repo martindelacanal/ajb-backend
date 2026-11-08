@@ -5,10 +5,9 @@
 // de sus movimientos: ingresos menos egresos.
 //
 // Dos clases de cierre:
-//  - Definitivo: lo hace siempre un administrador, desde su cuenta o escribiendo su
-//    usuario y su contraseña en la PC del cajero. Cuenta el efectivo y decide cuánto
-//    queda en la caja para el próximo turno.
-//  - Temporal: lo hace el cajero cuando se va y no hay un administrador. Todo el efectivo
+//  - Definitivo: lo hace siempre un administrador desde su cuenta. Cuenta el efectivo
+//    y decide cuánto queda en la caja para el próximo turno.
+//  - Temporal: lo hace el cajero al terminar su turno. Todo el efectivo
 //    va a dos bolsas (recaudación y cambio), cada una con su ticket; la caja queda en
 //    cero y libre para el próximo cajero, que empieza de cero sin heredar nada del
 //    anterior. Cuando llega, el administrador recibe las bolsas y cierra cada cierre
@@ -17,7 +16,6 @@
 const U = require("../util");
 const N = require("../negocio");
 const { exigirAdmin, esAdmin, bocasDe, turnoDeCaja } = require("./comun");
-const { verificarAdministrador } = require("./sesion");
 const { emitirAviso } = require("../avisos");
 
 const { turnoAbierto, verificarOperador } = require("../turnos-caja");
@@ -280,7 +278,6 @@ async function previaCierre(ctx) {
     caja, turno, resumen, revision: revisionResumen(resumen),
     // El cierre temporal lo hace quien atiende la caja; el definitivo, un administrador.
     puede_temporal: esOperador(ctx, cajaId, turno),
-    definitivo_pide_admin: !esAdmin(ctx),
   };
 }
 
@@ -362,37 +359,27 @@ function textoDiferencia(diferencia) {
 
 // Cierre definitivo de una caja abierta. Siempre lo hace un administrador.
 async function cerrar(ctx) {
+  if (!esAdmin(ctx)) {
+    throw U.error("Hacé un cierre temporal desde tu turno. El administrador hace el cierre definitivo desde su cuenta.", 403, { codigo: "CIERRE_SOLO_ADMIN" });
+  }
   const b = ctx.body;
   const cajaId = cajaDelPedido(ctx, b.caja_id);
   const contado = U.numero(b.efectivo_contado, { min: 0, max: 99999999, campo: "El efectivo contado" });
   const queda = U.numero(b.queda_en_caja ?? 0, { min: 0, max: 99999999, campo: "Lo que queda en la caja" });
   const observaciones = U.texto(b.observaciones, { max: 255 });
   if (queda > contado) throw U.error("Lo que queda en la caja no puede ser más que lo contado");
-  let presente = null;
-  if (!esAdmin(ctx)) {
-    if (!String(b.admin_usuario ?? "").trim() && !String(b.admin_password ?? "")) {
-      throw U.error("El cierre definitivo lo hace un administrador. Si no está, hacé un cierre temporal: guardás el efectivo en dos bolsas y el administrador lo cierra cuando llega.", 403, { codigo: "CIERRE_SOLO_ADMIN" });
-    }
-    presente = await verificarAdministrador(ctx, b.admin_usuario, b.admin_password);
-  }
   return ctx.db.tx(async (t) => {
     const caja = await exigirAccesoCaja(t, ctx, cajaId, true);
     const turno = await turnoAbierto(t, ctx.pid, cajaId);
-    if (!esAdmin(ctx)) {
-      if (!esOperador(ctx, cajaId, turno)) throw U.error("Cerrá el turno en el que estás trabajando.", 403);
-      await verificarOperador(t, ctx, cajaId);
-    }
     const r = await resumenAbierto(t, ctx, caja);
     comprobarCorte(ctx, turno, r.ultimo_cierre);
     comprobarRevision(ctx, r);
     await exigirSinAnulacionesPendientes(t, ctx, cajaId, r.ultimo_cierre);
-    const admin = presente || { id: ctx.usuario.id, nombre: N.nombreActor(ctx) };
-    const autorizacion = presente
-      ? { metodo: "ADMIN_PRESENTE", admin_id: presente.id, administrador: presente.nombre, admin_usuario: presente.usuario }
-      : { metodo: "ADMIN", admin_id: ctx.usuario.id, administrador: N.nombreActor(ctx) };
+    const admin = N.nombreActor(ctx);
+    const autorizacion = { metodo: "ADMIN", admin_id: ctx.usuario.id, administrador: admin };
     const c = await asentarCierre(t, ctx, {
       caja, turno, r, contado, queda, observaciones, temporal: false, autorizacion,
-      datos: (ahora) => ({ definitivo_fecha: ahora, definitivo_usuario_id: admin.id || null, definitivo_usuario_nombre: admin.nombre }),
+      datos: (ahora) => ({ definitivo_fecha: ahora, definitivo_usuario_id: ctx.usuario.id || null, definitivo_usuario_nombre: admin }),
     });
     return {
       id: c.cierreId, tipo: "DEFINITIVO", diferencia: c.diferencia, retiro: c.retiro,
@@ -401,7 +388,7 @@ async function cerrar(ctx) {
   });
 }
 
-// Cierre temporal: el cajero se va y no hay un administrador. El efectivo queda en dos
+// Cierre temporal: el cajero termina su turno. El efectivo queda en dos
 // bolsas con su ticket hasta que un administrador las recibe y hace el cierre definitivo.
 async function cerrarTemporal(ctx) {
   const b = ctx.body;

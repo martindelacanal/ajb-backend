@@ -1,6 +1,6 @@
 /* Caja: saldo de apertura (lo carga el administrador y lo confirma el cajero), ajustes,
-   cierres y movimientos. El cajero que se va sin un administrador hace un cierre temporal
-   (dos bolsas con su ticket); el cierre definitivo lo hace siempre un administrador. */
+   cierres y movimientos. El cajero hace un cierre temporal (dos bolsas con su ticket).
+   El cierre definitivo lo hace siempre un administrador desde su cuenta. */
 (function () {
   "use strict";
   if (window.__SIN_SOPORTE) return;
@@ -150,101 +150,75 @@
       if (!esAdmin && !r.puede_temporal) { P.aviso("La caja la cierra quien la está atendiendo, desde su turno.", "info"); return; }
       var s = r.resumen;
       var ef = s.efectivo;
-      var modo = esAdmin ? "DEFINITIVO" : "TEMPORAL";
       var obs = P.input({ max: 250, placeholder: "Opcional" });
       var corte = { caja_id: r.caja.id, revision: r.revision, turno_id: r.turno ? r.turno.id : null, ultimo_cierre_id: s.ultimo_cierre ? s.ultimo_cierre.id : null };
+      var formulario;
+      var botonCierre;
 
-      // Cierre temporal: dos bolsas.
-      var bolsaVentas = P.dinero({ placeholder: "Contá la bolsa" });
-      var bolsaCambio = P.dinero({ placeholder: "Contá la bolsa" });
-      var difVentas = h("div"), difCambio = h("div"), difTotal = h("div");
-      function calcularTemporal() {
-        var v = P.numeroDe(bolsaVentas.value), c = P.numeroDe(bolsaCambio.value);
-        pintarDiferencia(difVentas, v, ef.esperado_ventas);
-        pintarDiferencia(difCambio, c, ef.esperado_cambio);
-        pintarDiferencia(difTotal, isNaN(v) || isNaN(c) ? NaN : v + c, s.saldo_esperado, "En total");
-      }
-      bolsaVentas.addEventListener("input", calcularTemporal);
-      bolsaCambio.addEventListener("input", calcularTemporal);
-      var zonaTemporal = h("div.columna",
-        P.mensaje("Separá el efectivo en dos bolsas: lo cobrado y el cambio. Se imprime un ticket para cada bolsa y el resumen del cierre. El cierre definitivo lo hace un administrador cuando las recibe.", "info"),
-        P.campo("Bolsa 1 · Recaudación (ventas y cobros)", h("div.campo-con-prefijo.campo-grande", h("span", "$"), bolsaVentas),
-          { requerido: true, ayuda: "El sistema espera " + P.f.pesos(ef.esperado_ventas) + (Number(ef.retiros) ? ", ya descontados los retiros." : ".") }),
-        difVentas,
-        P.campo("Bolsa 2 · Cambio (saldo inicial y agregados)", h("div.campo-con-prefijo.campo-grande", h("span", "$"), bolsaCambio),
-          { requerido: true, ayuda: "El sistema espera " + P.f.pesos(ef.esperado_cambio) + "." }),
-        difCambio, difTotal);
-
-      // Cierre definitivo: lo hace un administrador.
-      var contado = P.dinero({ placeholder: "Contá el efectivo" });
-      var queda = P.dinero({ valor: "0", placeholder: "0" });
-      var diferencia = h("div");
-      var admin = esAdmin ? null : P.camposAdmin();
-      contado.addEventListener("input", function () { pintarDiferencia(diferencia, P.numeroDe(contado.value), s.saldo_esperado); });
-      var zonaDefinitiva = h("div.columna",
-        P.campo("Efectivo contado", h("div.campo-con-prefijo.campo-grande", h("span", "$"), contado), { requerido: true }),
-        diferencia,
-        P.campo("Queda en caja para el próximo turno", h("div.campo-con-prefijo", h("span", "$"), queda), { ayuda: "Lo demás se registra como retiro de la recaudación." }),
-        Number(ef.esperado_cambio) > 0 ? h("div", P.btn("Dejar el cambio en la caja (" + P.f.pesos(ef.esperado_cambio) + ")", { tipo: "texto", chico: true, onclick: function () { queda.value = aEntrada(ef.esperado_cambio); } })) : null,
-        admin ? h("div.columna", P.mensaje("El cierre definitivo lo hace un administrador: que escriba acá su usuario y su contraseña.", "info"), admin.el) : null);
-
-      var botonTemporal = P.btn("Cerrar temporalmente e imprimir", { tipo: "primario", icono: "imprimir", onclick: enviarTemporal });
-      var botonDefinitivo = P.btn("Cerrar caja e imprimir", { tipo: "primario", icono: "imprimir", onclick: enviarDefinitivo });
-      function pintarModo() {
-        zonaTemporal.hidden = modo !== "TEMPORAL";
-        botonTemporal.hidden = modo !== "TEMPORAL";
-        zonaDefinitiva.hidden = modo !== "DEFINITIVO";
-        botonDefinitivo.hidden = modo !== "DEFINITIVO";
-      }
-      var selector = esAdmin ? null : P.segmentado([
-        { valor: "TEMPORAL", texto: "Cierre temporal" },
-        { valor: "DEFINITIVO", texto: "Definitivo con el administrador" },
-      ], modo, function (v) { modo = v; pintarModo(); });
-      if (selector) selector.setAttribute("data-sin-reanudar", "");
-
-      function enviarTemporal(ev) {
-        var v = P.numeroDe(bolsaVentas.value), c = P.numeroDe(bolsaCambio.value);
-        if (isNaN(v)) { bolsaVentas.classList.add("invalido"); bolsaVentas.focus(); return; }
-        if (isNaN(c)) { bolsaCambio.classList.add("invalido"); bolsaCambio.focus(); return; }
-        P.ejecutar(ev.currentTarget, function () {
-          return P.post("/caja/cierre/temporal", Object.assign({ efectivo_ventas: v, efectivo_cambio: c, observaciones: obs.value }, corte)).then(function (x) {
-            m.cerrar();
-            liberarPuesto(r.caja.id);
-            if (alTerminar) alTerminar(x);
-            return P.get("/caja/cierres/" + x.id).then(function (d) {
-              cierreTemporalListo(d);
-              P.imprimirCierre(d, { bolsas: true }).catch(P.error);
+      if (esAdmin) {
+        var contado = P.dinero({ placeholder: "Contá el efectivo" });
+        var queda = P.dinero({ valor: "0", placeholder: "0" });
+        var diferencia = h("div");
+        contado.addEventListener("input", function () { pintarDiferencia(diferencia, P.numeroDe(contado.value), s.saldo_esperado); });
+        formulario = h("div.columna",
+          P.campo("Efectivo contado", h("div.campo-con-prefijo.campo-grande", h("span", "$"), contado), { requerido: true }),
+          diferencia,
+          P.campo("Queda en caja para el próximo turno", h("div.campo-con-prefijo", h("span", "$"), queda), { ayuda: "Lo demás se registra como retiro de la recaudación." }),
+          Number(ef.esperado_cambio) > 0 ? h("div", P.btn("Dejar el cambio en la caja (" + P.f.pesos(ef.esperado_cambio) + ")", { tipo: "texto", chico: true, onclick: function () { queda.value = aEntrada(ef.esperado_cambio); } })) : null);
+        botonCierre = P.btn("Cerrar caja e imprimir", { tipo: "primario", icono: "imprimir", onclick: function (ev) {
+          var c = P.numeroDe(contado.value);
+          if (isNaN(c)) { contado.classList.add("invalido"); contado.focus(); return; }
+          P.ejecutar(ev.currentTarget, function () {
+            return P.post("/caja/cierre", Object.assign({ efectivo_contado: c, queda_en_caja: P.numeroDe(queda.value) || 0, observaciones: obs.value }, corte)).then(function (x) {
+              m.cerrar();
+              if (x.encolado) return;
+              P.aviso(x.mensaje, x.diferencia === 0 ? "ok" : "error", 8000);
+              if (x.id) P.get("/caja/cierres/" + x.id).then(function (d) { return P.imprimirCierre(d); }).catch(P.error);
+              liberarPuesto(r.caja.id);
+              if (alTerminar) alTerminar(x);
             });
-          });
-        }).catch(function () {});
-      }
-
-      function enviarDefinitivo(ev) {
-        var c = P.numeroDe(contado.value);
-        if (isNaN(c)) { contado.classList.add("invalido"); contado.focus(); return; }
-        if (admin && !admin.completo()) return;
-        if (admin) admin.mostrarError("");
-        var boton = ev.currentTarget;
-        boton.disabled = true;
-        P.post("/caja/cierre", Object.assign({ efectivo_contado: c, queda_en_caja: P.numeroDe(queda.value) || 0, observaciones: obs.value }, corte, admin ? admin.datos() : {}))
-          .then(function (x) {
-            if (admin) admin.limpiar();
-            m.cerrar();
-            if (x.encolado) return;
-            P.aviso(x.mensaje, x.diferencia === 0 ? "ok" : "error", 8000);
-            if (x.id) P.get("/caja/cierres/" + x.id).then(function (d) { return P.imprimirCierre(d); }).catch(P.error);
-            liberarPuesto(r.caja.id);
-            if (alTerminar) alTerminar(x);
-          })
-          .catch(function (e) {
-            if (admin && /^ADMIN_/.test(e.codigo || "")) admin.mostrarError(e.message);
-            else P.error(e);
-          })
-          .finally(function () { boton.disabled = false; });
+          }).catch(function () {});
+        } });
+      } else {
+        var bolsaVentas = P.dinero({ placeholder: "Contá la bolsa" });
+        var bolsaCambio = P.dinero({ placeholder: "Contá la bolsa" });
+        var difVentas = h("div"), difCambio = h("div"), difTotal = h("div");
+        var calcularTemporal = function () {
+          var v = P.numeroDe(bolsaVentas.value), c = P.numeroDe(bolsaCambio.value);
+          pintarDiferencia(difVentas, v, ef.esperado_ventas);
+          pintarDiferencia(difCambio, c, ef.esperado_cambio);
+          pintarDiferencia(difTotal, isNaN(v) || isNaN(c) ? NaN : v + c, s.saldo_esperado, "En total");
+        };
+        bolsaVentas.addEventListener("input", calcularTemporal);
+        bolsaCambio.addEventListener("input", calcularTemporal);
+        formulario = h("div.columna",
+          P.mensaje("Separá el efectivo en dos bolsas: lo cobrado y el cambio. Se imprime un ticket para cada bolsa y el resumen del cierre. Cuando las recibe, el administrador hace el cierre definitivo desde su cuenta.", "info"),
+          P.campo("Bolsa 1 · Recaudación (ventas y cobros)", h("div.campo-con-prefijo.campo-grande", h("span", "$"), bolsaVentas),
+            { requerido: true, ayuda: "El sistema espera " + P.f.pesos(ef.esperado_ventas) + (Number(ef.retiros) ? ", ya descontados los retiros." : ".") }),
+          difVentas,
+          P.campo("Bolsa 2 · Cambio (saldo inicial y agregados)", h("div.campo-con-prefijo.campo-grande", h("span", "$"), bolsaCambio),
+            { requerido: true, ayuda: "El sistema espera " + P.f.pesos(ef.esperado_cambio) + "." }),
+          difCambio, difTotal);
+        botonCierre = P.btn("Cerrar temporalmente e imprimir", { tipo: "primario", icono: "imprimir", onclick: function (ev) {
+          var v = P.numeroDe(bolsaVentas.value), c = P.numeroDe(bolsaCambio.value);
+          if (isNaN(v)) { bolsaVentas.classList.add("invalido"); bolsaVentas.focus(); return; }
+          if (isNaN(c)) { bolsaCambio.classList.add("invalido"); bolsaCambio.focus(); return; }
+          P.ejecutar(ev.currentTarget, function () {
+            return P.post("/caja/cierre/temporal", Object.assign({ efectivo_ventas: v, efectivo_cambio: c, observaciones: obs.value }, corte)).then(function (x) {
+              m.cerrar();
+              liberarPuesto(r.caja.id);
+              if (alTerminar) alTerminar(x);
+              return P.get("/caja/cierres/" + x.id).then(function (d) {
+                cierreTemporalListo(d);
+                P.imprimirCierre(d, { bolsas: true }).catch(P.error);
+              });
+            });
+          }).catch(function () {});
+        } });
       }
 
       var m = P.modal({
-        titulo: "Cerrar caja · " + r.caja.nombre,
+        titulo: (esAdmin ? "Cerrar caja · " : "Cierre temporal · ") + r.caja.nombre,
         subtitulo: s.ultimo_cierre ? "Desde el cierre N° " + s.ultimo_cierre.id + " (" + P.f.fechaHora(s.ultimo_cierre.fecha) + ")" : "Primer cierre de esta caja",
         ancho: "ancha",
         contenido: h("div.grilla.grilla-2",
@@ -252,11 +226,9 @@
             P.resumenEfectivoCierre(ef),
             h("div.fuerte", h("span", "Efectivo esperado en la caja"), h("span.dinero", P.f.pesos(s.saldo_esperado))),
             resumenVentas(s, s.ventas_por_forma)),
-          h("div.columna", selector, zonaTemporal, zonaDefinitiva, P.campo("Observaciones", obs))),
-        alCerrar: function () { if (admin) admin.limpiar(); },
-        acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), botonTemporal, botonDefinitivo],
+          h("div.columna", formulario, P.campo("Observaciones", obs))),
+        acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), botonCierre],
       });
-      pintarModo();
     }).catch(P.error);
   };
 
@@ -377,7 +349,7 @@
       } else {
         acciones.push(P.btn("Ver saldo de apertura", { tipo: "suave", chico: true, icono: "efectivo", onclick: function () { P.verificarApertura(true); } }));
       }
-      acciones.push(P.btn("Cerrar caja", { tipo: "primario", icono: "candado", onclick: function () { P.cerrarCaja(cajaId, refrescar); } }));
+      acciones.push(P.btn(P.esAdmin() ? "Cerrar caja" : "Cierre temporal", { tipo: "primario", icono: "candado", onclick: function () { P.cerrarCaja(cajaId, refrescar); } }));
       c.appendChild(P.cabeceraConAcciones(esPropia ? "Mi caja" : "Caja", esPropia ? null : nombre, acciones));
       mostrarCifras(r);
       c.appendChild(cifras);

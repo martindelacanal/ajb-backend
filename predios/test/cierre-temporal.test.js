@@ -61,9 +61,9 @@ test("el cajero cierra en forma temporal, el siguiente arranca de cero y el admi
     esperado_ventas: 250, esperado_cambio: 1200,
   });
 
-  // Sin un administrador no hay cierre definitivo; tampoco sirve otro cajero.
+  // Desde el turno del cajero solo se puede cerrar en forma temporal.
   await assert.rejects(post(ana, "/caja/cierre", { efectivo_contado: 1450 }), { codigo: "CIERRE_SOLO_ADMIN" });
-  await assert.rejects(post(ana, "/caja/cierre", { efectivo_contado: 1450, admin_usuario: "beto", admin_password: "Beto-cajero1" }), { codigo: "ADMIN_INCORRECTO" });
+  await assert.rejects(post(ana, "/caja/cierre", { efectivo_contado: 1450, admin_usuario: "admin", admin_password: CLAVE_ADMIN }), { codigo: "CIERRE_SOLO_ADMIN" });
 
   const cierre = await post(ana, "/caja/cierre/temporal", {
     efectivo_ventas: 240, efectivo_cambio: 1200, observaciones: "Faltan $10", revision: previa.revision,

@@ -86,7 +86,7 @@
     var items = [];
     if (P.modo === "local") {
       if (!esSeguridad() && !(P.puesto() && P.puesto().caja_id)) items.push({ texto: P.esAdmin() ? "Trabajar en una caja" : "Elegir boca o caja", icono: "caja", accion: function () { P.ruta.ir("/puesto"); } });
-      if (P.puesto() && P.puesto().caja_id) items.push({ texto: "Cerrar mi caja", icono: "candado", accion: function () { P.cerrarCaja(P.puesto().caja_id); } });
+      if (P.puesto() && P.puesto().caja_id) items.push({ texto: P.esAdmin() ? "Cerrar mi caja" : "Cierre temporal", icono: "candado", accion: function () { P.cerrarCaja(P.puesto().caja_id); } });
       if (P.puesto() && P.puesto().caja_id) items.push({ texto: "Ver saldo de apertura", icono: "efectivo", accion: function () { P.verificarApertura(true); } });
       if (!ses.usuario.es_admin_general) items.push({ texto: "Cambiar mi contraseña", icono: "candado", accion: cambiarClave });
       items.push("-");
