@@ -35,7 +35,8 @@ function guardarPrivado(archivo, contenido) {
   finally { if (fd !== undefined) fs.closeSync(fd); if (fs.existsSync(temporal)) fs.unlinkSync(temporal); }
 }
 function escribirHa(base, ha) { guardarPrivado(path.join(base, "predio-ha.json"), Buffer.from(JSON.stringify(ha, null, 2))); }
-function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual = () => null, configuracionHa = () => null, promoverQuorum, consultarQuorum, ubicarGrupo, bloquearEscritura, activarLocal, reiniciar = () => {}, deps = {} }) {
+function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual = () => null, configuracionHa = () => null, promoverQuorum, consultarQuorum,
+  revisarRetiro, retirarQuorum, ubicarGrupo, bloquearEscritura, activarLocal, reiniciar = () => {}, deps = {} }) {
   const d = { armarInstaladorApoyo, pedir: httpLan.pedir, estadoTestigo: httpLan.estadoTestigo, crearSnapshotDirecta, leerTls: tlsLocal.leerTls, prepararTls: tlsLocal.prepararTls, identidadEquipo, ahora: Date.now, hostname: os.hostname, ...deps };
   equipoId ||= d.identidadEquipo();
   if (!/^[a-f0-9]{64}$/.test(equipoId || "") || !db || db.dialecto !== "sqlite") throw new Error("El grupo requiere la identidad física y la base local del predio");
@@ -99,9 +100,16 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
         catch (_e) { /* la falta de mayoría se informa sin elegir otro escritor */ }
       }
       const copias = new Set(vivo?.ultimo_commit?.replicas || []);
-      if (vivo) miembros = miembros.map(m => ({ ...m, actualizado: m.id === vivo.escritor || copias.has(m.id) }));
       const manual = Boolean(r.quorum.manual);
+      if (vivo?.miembros) {
+        const porId = new Map([...miembros, ...vivo.miembros].map(m => [m.id, m]));
+        for (const id of vivo.retirados || []) porId.delete(id);
+        miembros = [...porId.values()].map(m => ({ ...m, actualizado: m.id === vivo.escritor || copias.has(m.id) }));
+      }
+      miembros = miembros.map(m => ({ ...m, retirando: r.quorum.retiros?.includes(m.id) === true,
+        puedeQuitar: !manual && !congelado && m.id !== principal.id && m.id !== vivo?.escritor && (!actual.habilitado || !!vivo?.escritor) }));
       return { modo: manual ? "manual" : "quorum", puedeIncorporarEquipo: !manual && !congelado && (!actual.habilitado || !!vivo?.escritor),
+        puedePrepararAcceso: !manual && !!vivo?.escritor && !congelado,
         puedeConfigurarManual: !manual && !congelado && !actual.habilitado && r.principalId === equipoId && miembros.length === 2,
         manualActivo: vivo?.manual_activo === true, degradado: vivo?.degradado === true, habilitado: !!actual.habilitado && !congelado,
         estado: congelado ? "ACTIVANDO" : vivo?.escritor ? "EN_MARCHA" : actual.habilitado ? "SIN_MAYORIA" : "PREPARANDO",
@@ -114,6 +122,17 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
     const listo = !!r?.testigo && miembros.length >= 2;
     const testigo = r?.testigo ? { id: r.testigo.id, nombre: r.testigo.nombre, url: r.testigo.url, conectado: !!vivo } : null;
     return { puedeIncorporarEquipo: !congelado && !activo && admiteGrupoNuevo(r) && tieneCoordinador(), habilitado: activo, grupoId: r?.grupoId || null, principal, testigo, miembros, escritor: vivo?.escritor ? miembros.find((m) => m.id === vivo.escritor) || null : !activo && !congelado ? principal : null, degradado: !!(vivo?.degradado || actual.degradado), estado: !r ? "SIN_CONFIGURAR" : activo ? (vivo ? "EN_MARCHA" : "SIN_TESTIGO") : "PREPARANDO", puedeActivar: !activo && !congelado && listo && !!vivo && vivo.termino === 0, puedePrepararTestigo: !r?.testigo && !r?.pendientes.some((p) => p.rol === "Testigo" && p.vence > d.ahora()), puedePrepararRespaldo: !!r?.testigo, mensaje: congelado ? "La activación está en curso o necesita completarse; las escrituras permanecen bloqueadas." : activo ? "El escritor se acredita con el testigo de la red local." : "Podés preparar los equipos mientras el servidor actual sigue trabajando. Activá el grupo cuando estén incorporados.", pendientes: r?.pendientes.map(({ id, rol, vence, respuesta }) => ({ id, rol, vence, incorporado: !!respuesta })) || [] };
+  }
+  async function instaladorAcceso() {
+    const r = leer();
+    if (!r?.quorum || r.quorum.manual || congelado || !haActual()?.habilitado) {
+      throw Object.assign(new Error("Esperá a que el grupo automático esté en servicio para descargar el acceso de caja"), { status: 409 });
+    }
+    const vivo = await consultarQuorum();
+    if (!vivo.escritor || !vivo.miembros?.length) throw Object.assign(new Error("El grupo todavía no tiene un servidor en servicio"), { status: 503 });
+    const configInicial = { habilitado: true, accesoQuorum: true, rolInstalacion: "Acceso", grupoId: r.grupoId,
+      clavePublicaTestigo: r.quorum.publica, miembros: vivo.miembros.map(publico) };
+    return d.armarInstaladorApoyo({ base, dirApp, version, configInicial });
   }
   function instalador(rol, { equipo = false, ip, direccion } = {}) { return exclusivo(async () => {
     if (!["Testigo", "Respaldo", "Acceso"].includes(rol)) throw new Error("Elegí un rol de apoyo válido");
@@ -161,6 +180,7 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
     if (p.ip && ip !== p.ip) throw new Error("Descargá el instalador desde la misma PC que vas a incorporar");
     const nodo = headers["x-ajb-nodo"];
     if (!/^[a-f0-9]{64}$/.test(nodo || "")) throw new Error("La identidad física del equipo no es válida");
+    if (r.quorum?.retiros?.includes(nodo)) throw new Error("Esta PC fue retirada del grupo. Usá el acceso de caja sin voto.");
     let verificar = verificadores.get(p.id);
     if (!verificar) { verificar = crearVerificador({ grupoId: r.grupoId, miembros: () => [{ id: nodo, clave: p.clave }], ahora: d.ahora }); verificadores.set(p.id, verificar); }
     verificar({ metodo, ruta, cuerpo, cabeceras });
@@ -328,8 +348,31 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
     await guardar(r);
     return activarQuorum(r);
   });
+  const quitarRespaldo = id => exclusivo(async () => {
+    const r = leer();
+    if (typeof id !== "string" || !/^[a-f0-9]{64}$/.test(id) || !r?.quorum || r.quorum.manual || congelado ||
+        id === r.principalId || id === equipoId) {
+      throw Object.assign(new Error("Elegí un respaldo que no sea la PC de origen ni la PC en servicio"), { status: 409 });
+    }
+    const activo = haActual()?.habilitado === true, retiros = r.quorum.retiros || [];
+    if (!retiros.includes(id)) {
+      if (!r.miembros.some(m => m.id === id)) throw Object.assign(new Error("La PC ya no figura en el grupo"), { status: 404 });
+      if (activo) await revisarRetiro(id);
+      r.miembros = r.miembros.filter(m => m.id !== id);
+      r.pendientes = r.pendientes.filter(p => p.usadoPor !== id && p.miembro?.id !== id);
+      // Replicar primero la baja administrativa impide que un líder posterior
+      // vuelva a incorporar la PC a partir del registro guardado en SQLite.
+      if (activo) r.quorum.retiros = [...retiros, id];
+      await guardar(r);
+    }
+    if (activo) {
+      try { await retirarQuorum(id); }
+      catch (_e) { return { retirado: false, pendiente: true }; }
+    }
+    return { retirado: true };
+  });
   const activar = () => exclusivo(() => activarInterno());
   const reanudarActivacion = () => exclusivo(() => activarInterno({ reanudar: true }));
-  return { estado, instalador, incorporar, activar, configurarManual, reanudarActivacion, actualizarQuorum };
+  return { estado, instalador, instaladorAcceso, incorporar, activar, configurarManual, quitarRespaldo, reanudarActivacion, actualizarQuorum };
 }
 module.exports = { crearGrupoLocal, escribirHa };

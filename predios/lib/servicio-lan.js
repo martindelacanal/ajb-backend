@@ -99,10 +99,29 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
       alEstado(e);
     },
   });
+  function revisarRetiro(id) {
+    if (!autoridad || !core.estado().escritor) throw Object.assign(new Error("Esperando al servidor en servicio para quitar el respaldo"), { status: 503 });
+    return autoridad.revisarRetiro(id);
+  }
+  function retirarQuorum(id) {
+    return db.exclusivo(async () => {
+      const retiro = await revisarRetiro(id);
+      if (!retiro) return;
+      let acuses = [];
+      if (retiro.requiereCopias) {
+        const packet = core.copiaDelEscritor(retiro.ultimo);
+        const resultados = await Promise.allSettled(retiro.miembros.filter(m => m.id !== c.nodoId).map(m => transporte.replicar(m, packet)));
+        acuses = resultados.filter(r => r.status === "fulfilled").map(r => r.value);
+      }
+      await autoridad.quitarMiembro(id, retiro.ultimo, acuses);
+    });
+  }
   const adaptador = {
     ...core, configuracion: c, transporte,
     origenIncorporacion(cabecera, ip) { return cliente ? origenAcreditado(cabecera, c, miembros(), ip, ubicacion) : null; },
     consultarQuorum: estadoTestigo,
+    revisarRetiro,
+    retirarQuorum,
     async iniciar() {
       if (c.quorum || c.quorumPendiente || c.relevoManual) ubicacion ??= ubicarGrupo?.(c);
       if (c.quorumPendiente) return Promise.resolve();
@@ -122,6 +141,9 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
     },
     async promoverQuorum(r, disponibles, haQuorum, pedirEquipo) {
       if (!autoridad || !core.estado().escritor) return;
+      for (const id of r.quorum.retiros || []) {
+        if (!ultimoEstado?.retirados?.includes(id)) await retirarQuorum(id);
+      }
       const votantes = new Set((await autoridad.miembros()).filter(m => m.Suffrage === 0).map(m => m.ID));
       for (const m of await disponibles({ ...r, miembros: r.miembros.filter(n => !votantes.has(n.id)) })) {
         await db.exclusivo(async () => {
@@ -177,7 +199,8 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
       }
       if (u.pathname.startsWith("/lan/quorum/") && u.pathname !== "/lan/quorum/preparar" && c.quorum) {
         try {
-          if (!req.socket.encrypted || !autoridad) throw new Error("La coordinación LAN todavía no está disponible");
+          const estadoPublico = req.method === "GET" && u.pathname === "/lan/quorum/estado";
+          if ((!req.socket.encrypted && !estadoPublico) || !autoridad) throw new Error("La coordinación LAN todavía no está disponible");
           await autoridad.manejar(req, res);
         } catch (e) { if (!res.headersSent && !res.destroyed) H.respuesta(res, e.status || 503, { mensaje: e.message }); }
         return true;

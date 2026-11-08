@@ -10,11 +10,14 @@ const PUERTO = 39879;
 const VIGENCIA = 12000;
 const CONSULTA = "AJB_QUORUM_BUSCAR";
 const RESPUESTA = "AJB_QUORUM_UBICACION";
+const CONSULTA_ACCESO = "AJB_ACCESO_BUSCAR";
+const RESPUESTA_ACCESO = "AJB_ACCESO_UBICACION";
 const nodoValido = id => typeof id === "string" && /^[a-f0-9]{64}$/.test(id);
 const nombreValido = nombre => typeof nombre === "string" && /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(nombre);
 const puertoValido = n => Number.isInteger(n) && n > 0 && n <= 65535;
+const nonceValido = nonce => typeof nonce === "string" && /^[a-f0-9]{32}$/.test(nonce);
 
-function crearUbicacionLan({ grupoId, nodoId, claveDatos, puertos, log = () => {}, red = os.networkInterfaces,
+function crearUbicacionLan({ grupoId, nodoId, claveDatos, puertos, firmaAcceso, log = () => {}, red = os.networkInterfaces,
   nombre = os.hostname, ahora = () => performance.now(), intervaloMs = 2000 }) {
   const clave = crypto.createHmac("sha256", Buffer.from(claveDatos, "hex")).update("ajb-quorum-ubicacion-v1").digest("hex");
   const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
@@ -41,8 +44,19 @@ function crearUbicacionLan({ grupoId, nodoId, claveDatos, puertos, log = () => {
     if (detenido || buffer.length > 2048 || !isIPv4(remoto.address)) return;
     let dato;
     try { dato = JSON.parse(buffer); } catch (_e) { return; }
-    if (dato?.grupoId !== grupoId || !nodoValido(dato.nodoId) || dato.nodoId === nodoId ||
-        typeof dato.nonce !== "string" || !/^[a-f0-9]{32}$/.test(dato.nonce) || !mensajeAutentico(dato, clave)) return;
+    if (dato?.grupoId !== grupoId || !nonceValido(dato.nonce)) return;
+    if (dato.tipo === CONSULTA_ACCESO) {
+      const llave = firmaAcceso?.();
+      const { http, https } = puertos();
+      const nombreTls = nombre().toLowerCase();
+      if (!llave || !puertoValido(http) || !puertoValido(https) || !nombreValido(nombreTls)) return;
+      const ips = Object.values(red()).flat().filter(i => i?.family === "IPv4" && !i.internal).map(i => i.address);
+      const ubicacion = { tipo: RESPUESTA_ACCESO, grupoId, nodoId, nonce: dato.nonce, nombreTls, ips, http, https };
+      const firma = crypto.sign(null, Buffer.from(JSON.stringify(ubicacion)), llave).toString("base64");
+      socket.send(Buffer.from(JSON.stringify({ ubicacion, firma })), remoto.port, remoto.address, () => {});
+      return;
+    }
+    if (!nodoValido(dato.nodoId) || dato.nodoId === nodoId || !mensajeAutentico(dato, clave)) return;
     if (dato.tipo === CONSULTA) {
       const { https, raft } = puertos();
       const nombreTls = nombre().toLowerCase();
@@ -90,6 +104,39 @@ function crearUbicacionLan({ grupoId, nodoId, claveDatos, puertos, log = () => {
   };
 }
 
+function buscarAccesoLan({ grupoId, clavePublica, red = os.networkInterfaces, esperaMs = 350 }) {
+  return new Promise(resolve => {
+    const nonce = crypto.randomBytes(16).toString("hex");
+    const socket = dgram.createSocket("udp4"), equipos = new Map();
+    let finalizado = false;
+    const terminar = () => {
+      if (finalizado) return;
+      finalizado = true;
+      clearTimeout(timer);
+      try { socket.close(); } catch (_e) { /* todavía sin abrir */ }
+      resolve(equipos);
+    };
+    const timer = setTimeout(terminar, esperaMs);
+    socket.on("error", terminar);
+    socket.on("message", (buffer, remoto) => {
+      if (buffer.length > 2048 || remoto.port !== PUERTO || !isIPv4(remoto.address)) return;
+      try {
+        const { ubicacion: u, firma } = JSON.parse(buffer);
+        if (u?.tipo !== RESPUESTA_ACCESO || u.grupoId !== grupoId || u.nonce !== nonce || !nodoValido(u.nodoId) ||
+            !nombreValido(u.nombreTls) || !puertoValido(u.http) || !puertoValido(u.https) || !Array.isArray(u.ips) ||
+            !u.ips.includes(remoto.address) || equipos.size >= 20 || !crypto.verify(null, Buffer.from(JSON.stringify(u)), clavePublica, Buffer.from(firma, "base64"))) return;
+        equipos.set(u.nodoId, { ip: remoto.address, http: u.http, https: u.https, nombreTls: u.nombreTls });
+      } catch (_e) { /* anuncio ajeno o inválido */ }
+    });
+    socket.bind(0, "0.0.0.0", () => {
+      if (finalizado) return;
+      socket.setBroadcast(true);
+      const consulta = Buffer.from(JSON.stringify({ tipo: CONSULTA_ACCESO, grupoId, nonce }));
+      for (const ip of destinosBroadcast(red())) socket.send(consulta, PUERTO, ip, () => {});
+    });
+  });
+}
+
 function conectarMiembro(miembro, ubicacion) {
   const e = ubicacion?.equipo(miembro.id);
   const original = { url: miembro.url, ca: miembro.caPublica };
@@ -101,4 +148,4 @@ function conectarMiembro(miembro, ubicacion) {
   return { url: url.origin, ca: miembro.caPublica, servername: e.nombreTls };
 }
 
-module.exports = { crearUbicacionLan, conectarMiembro };
+module.exports = { crearUbicacionLan, buscarAccesoLan, conectarMiembro };

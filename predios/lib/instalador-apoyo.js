@@ -29,7 +29,14 @@ async function armarInstaladorApoyo({ base, dirApp, version, configInicial, conf
   try { fs.readSync(fd, firma, 0, 2, 0); } finally { fs.closeSync(fd); }
   if (firma.toString() !== "MZ") throw new Error("El runtime actual no es un ejecutable de Windows");
   if (!base || !dirApp || typeof version !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9.+_-]{0,100}$/.test(version) || version.includes("..")) throw new Error("Falta una versión actual válida para el instalador");
-  if (!configInicial || !["Testigo", "Respaldo", "Acceso"].includes(configInicial.rolInstalacion) || !configInicial.grupoId || !/^[a-f0-9]{64}$/.test(configInicial.incorporacion?.clave || "") || !configInicial.incorporacion?.id) throw new Error("El instalador necesita una incorporación de un solo uso");
+  const accesoQuorum = configInicial?.rolInstalacion === "Acceso" && configInicial.accesoQuorum === true;
+  if (!configInicial || !["Testigo", "Respaldo", "Acceso"].includes(configInicial.rolInstalacion) || !configInicial.grupoId ||
+      (!accesoQuorum && (!/^[a-f0-9]{64}$/.test(configInicial.incorporacion?.clave || "") || !configInicial.incorporacion?.id))) {
+    throw new Error("El instalador necesita una incorporación de un solo uso");
+  }
+  if (accesoQuorum && (configInicial.incorporacion || !configInicial.clavePublicaTestigo || !configInicial.miembros?.length)) {
+    throw new Error("El acceso de caja necesita la configuración pública del grupo");
+  }
   const padre = fs.mkdtempSync(path.join(os.tmpdir(), "ajb-instalar-apoyo-"));
   try {
     proteger(padre);

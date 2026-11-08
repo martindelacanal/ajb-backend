@@ -69,6 +69,40 @@ test("onboarding mantiene legacy hasta activación, registros privados y respues
   assert.equal(fs.existsSync(path.join(s.base, "predio-ha.json")), false);
 });
 
+test("el acceso del grupo automático lleva sólo datos públicos y la baja se replica antes de retirar el voto", async t => {
+  const s = await escenario(t);
+  const grupoId = "quorum_fixture";
+  const miembros = [
+    { id: PRINCIPAL, nombre: "principal", url: "https://principal:8443", preferido: true, caPublica: CA, clave: "a".repeat(64) },
+    { id: RESPALDO, nombre: "caja", url: "https://caja:8443", caPublica: CA, clave: "b".repeat(64) },
+  ];
+  const leerRegistro = () => JSON.parse(s.db.conexion.prepare("SELECT valor FROM predio_meta WHERE clave='ha_admin_json'").get().valor);
+  escribirMeta(s.db, "ha_admin_json", JSON.stringify({ formato: 1, grupoId, principalId: PRINCIPAL, claveDatos: "c".repeat(64),
+    miembros, quorum: { publica: "firma-publica" }, pendientes: [{ usadoPor: RESPALDO }] }));
+  let completar = false;
+  const grupo = s.abrir({ haActual: () => ({ habilitado: true, escritor: true }),
+    consultarQuorum: async () => ({ escritor: PRINCIPAL, miembros: miembros.map(({ clave, ...m }) => m) }),
+    revisarRetiro: async id => { assert.equal(id, RESPALDO); assert.equal(leerRegistro().miembros.length, 2); },
+    retirarQuorum: async id => {
+      assert.equal(id, RESPALDO);
+      const r = leerRegistro();
+      assert.equal(r.miembros.some(m => m.id === id), false);
+      assert.deepEqual(r.quorum.retiros, [id]);
+      if (!completar) throw new Error("Red interrumpida");
+    },
+  });
+  await grupo.instaladorAcceso();
+  const c = s.paquetes.at(-1).configInicial;
+  assert.deepEqual(Object.keys(c).sort(), ["accesoQuorum", "clavePublicaTestigo", "grupoId", "habilitado", "miembros", "rolInstalacion"]);
+  assert.ok(c.miembros.every(m => m.caPublica && !m.clave));
+  assert.equal(leerRegistro().miembros.length, 2);
+  await assert.rejects(grupo.quitarRespaldo(PRINCIPAL), /PC de origen/);
+  assert.deepEqual(await grupo.quitarRespaldo(RESPALDO), { retirado: false, pendiente: true });
+  assert.equal(leerRegistro().pendientes.length, 0);
+  completar = true;
+  assert.deepEqual(await grupo.quitarRespaldo(RESPALDO), { retirado: true });
+});
+
 test("copia inicial se toma tras congelar y tras ventas posteriores a preparar instaladores, antes de sembrar testigo", async (t) => {
   const s = await escenario(t); await s.prepararGrupo();
   await s.db.run("INSERT INTO predio_producto(predio_id,id,nombre,destino,activo) VALUES(1,1,'Venta posterior a preparar PCs','VENTA_DIRECTA',1)");

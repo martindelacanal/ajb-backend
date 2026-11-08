@@ -383,6 +383,32 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
       if (m && Number(m[1]) < disco.confirmada.indice - conservar + 1) fs.unlinkSync(path.join(dir, f));
     }
   }
+  async function replicarQuorum(packet, termino) {
+    const w = await testigo("estado");
+    if (w.escritor !== c.nodoId || w.termino !== termino || !igual(w.ultimo, disco.confirmada) || !w.votantes?.includes(c.nodoId)) {
+      throw error("La mayoría ya no acredita a esta PC para confirmar la operación");
+    }
+    const votos = new Set(w.votantes), necesarias = Math.floor(votos.size / 2);
+    const peticiones = otros.map(m => ({
+      vota: votos.has(m.id),
+      acuse: Promise.resolve().then(() => transporte.replicar(m, packet)),
+    }));
+    const votantes = peticiones.filter(p => p.vota).map(p => p.acuse);
+    for (const p of peticiones) if (!p.vota) p.acuse.catch(() => {});
+    if (!necesarias) return [];
+    return new Promise((resolve, reject) => {
+      const acuses = [];
+      let pendientes = votantes.length;
+      const contar = acuse => {
+        pendientes--;
+        if (acuse) acuses.push(acuse);
+        if (acuses.length === necesarias) resolve(acuses.slice());
+        else if (acuses.length + pendientes < necesarias) reject(error("Falta guardar la operación en una mayoría de PCs"));
+      };
+      if (pendientes < necesarias) reject(error("Faltan PCs con voto para confirmar la operación"));
+      for (const p of votantes) p.then(contar, () => contar());
+    });
+  }
   async function despuesTransaccion() {
     try {
       if (!enCurso) throw error("La transacción no estaba acreditada por el testigo");
@@ -395,7 +421,8 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
       disco.pendiente = revision(packet.manifest); guardar();
       await asegurarPermiso();
       let acks = [], degradado = Boolean(c.relevoManual && c.nodoId === c.relevoManual.cajaId && disco.degradado);
-      if (otros.length && !degradado) {
+      if (c.quorum) acks = await replicarQuorum(packet, termino);
+      else if (otros.length && !degradado) {
         try { acks = [await Promise.any(otros.map(async miembro => {
           if (typeof transporte.replicar !== "function") throw error("No hay transporte de réplicas LAN");
           return transporte.replicar(miembro, packet);
@@ -524,7 +551,7 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
       miembros: c.miembros.map(({ id, nombre, url, preferido, caPublica }) => ({ id, nombre, url, preferido, ...(caPublica ? { caPublica } : {}) })) };
   }
   return {
-    estado, antesTransaccion, antesCommit, despuesTransaccion, abortarTransaccion, recibirInicial, recibirSnapshot, recibirCopiaQuorum, obtenerSnapshot, consultarCopia, registrarInicial, sondear, drenar,
+    estado, antesTransaccion, antesCommit, despuesTransaccion, abortarTransaccion, recibirInicial, recibirSnapshot, recibirCopiaQuorum, obtenerSnapshot, copiaDelEscritor, consultarCopia, registrarInicial, sondear, drenar,
     iniciar() { if (!timer) timer = setInterval(() => sondear().catch(e => log(e.message)), 1500); timer.unref?.(); return sondear(); },
     detener() { detenido = true; permiso = null; clearInterval(timer); timer = null; },
     prepararInicial: () => db.exclusivo(() => snapshot({ indice: 0, termino: 0, nodoId: c.nodoId })),

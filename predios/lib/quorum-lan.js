@@ -134,7 +134,10 @@ function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
       escritor: actual ? { id: actual.id, nombre: actual.nombre, url: actual.url } : null,
       ultimo: registro.ultimo, ultimo_commit: registro.ultimoCommit || null, preferido_id: registro.preferidoId,
       revision_miembros: Math.max(lectura.configuration, lectura.register.version), degradado: false, emitido_ms: fecha, vence_ms: fecha + USO_MS, desafio,
-      ...(compacto ? { compacto: true, miembro_autorizado: !!actual } : { candidato: lectura.leader, miembros: registro.miembros.map(publico) }) };
+      ...(compacto ? { compacto: true, miembro_autorizado: !!actual } : {
+        candidato: lectura.leader, miembros: registro.miembros.map(publico), retirados: registro.retirados || [],
+        votantes: lectura.members.filter(m => m.Suffrage === 0).map(m => m.ID),
+      }) };
     return { estado, firma: crypto.sign(null, Buffer.from(JSON.stringify(estado)), llave).toString("base64"), clave_publica: config.clavePublicaTestigo };
   }
   async function operar(lectura, accion, cuerpo, actor) {
@@ -171,15 +174,53 @@ function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
     return consenso.pedir("/member", { id: miembro.id, address: direccionRaft(miembro.id, config.quorum.puerto), voter,
       expected: lectura.register.version, term: lectura.term, configuration: lectura.configuration });
   }
+  function revisarRetiro(lectura, id) {
+    if (!/^[a-f0-9]{64}$/.test(id) || id === registro.preferidoId || id === lectura.leader) {
+      throw error("La PC de origen y la PC en servicio deben permanecer en el grupo", 409);
+    }
+    const objetivo = lectura.members.find(m => m.ID === id);
+    const votantes = lectura.members.filter(m => m.Suffrage === 0 && m.ID !== id);
+    if (objetivo?.Suffrage === 0 && votantes.length < 3) {
+      throw error("Incorporá otro respaldo y esperá a que esté listo antes de quitar esta PC. El grupo automático necesita al menos tres votantes.", 409);
+    }
+    return { objetivo, votantes };
+  }
   return {
     miembros() { return exclusivo(async () => (await leer()).members); },
+    revisarRetiro(id) { return exclusivo(async () => {
+      const lectura = await leer();
+      if (registro.retirados?.includes(id)) return null;
+      const { objetivo, votantes } = revisarRetiro(lectura, id);
+      return { ultimo: registro.ultimo, requiereCopias: objetivo?.Suffrage === 0, miembros: registro.miembros.filter(m => votantes.some(v => v.ID === m.id)) };
+    }); },
+    quitarMiembro(id, revision, acuses) { return exclusivo(async () => {
+      let lectura = await leer();
+      if (registro.retirados?.includes(id)) return;
+      const { objetivo, votantes } = revisarRetiro(lectura, id);
+      if (objetivo?.Suffrage === 0) {
+        if (!misma(registro.ultimo, revision)) throw error("Cambió la copia que debe quedar en los respaldos");
+        const restantes = new Set(votantes.map(m => m.ID));
+        const copias = new Set(acuses.map(acuse => verificarAckReplica(acuse, { grupoId: config.grupoId, escritorId: lectura.leader,
+          termino: lectura.term, ...revision, miembros: registro.miembros })));
+        if (1 + [...copias].filter(nodo => restantes.has(nodo)).length <= restantes.size / 2) {
+          throw error("Esperando que una mayoría de las PCs que quedan guarde la última copia");
+        }
+      }
+      if (objetivo) {
+        await consenso.pedir("/member", { id, remove: true, expected: lectura.register.version, term: lectura.term, configuration: lectura.configuration });
+        lectura = await leer();
+      }
+      await guardar(lectura, { ...registro, miembros: registro.miembros.filter(m => m.id !== id), retirados: [...(registro.retirados || []), id] });
+    }); },
     prepararMiembro(miembro) { return exclusivo(async () => {
       const lectura = await leer();
+      if (registro.retirados?.includes(miembro.id)) throw error("Esta PC fue retirada del grupo", 409);
       if (!registro.miembros.some(m => m.id === miembro.id)) await guardar(lectura, { ...registro, miembros: [...registro.miembros, miembro] });
       return { ultimo: registro.ultimo, version: lectura.register.version };
     }); },
     unirMiembro(miembro, revision, versionRemota) { return exclusivo(async () => {
       const lectura = await leer();
+      if (registro.retirados?.includes(miembro.id)) throw error("Esta PC fue retirada del grupo", 409);
       if (!misma(registro.ultimo, revision)) throw error("La copia del equipo cambió mientras se incorporaba");
       const actual = lectura.members.find(m => m.ID === miembro.id);
       if (!actual) await cambiarMembresia(lectura, miembro, false);

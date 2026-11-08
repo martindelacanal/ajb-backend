@@ -10,6 +10,7 @@ const https = require("node:https");
 const net = require("node:net");
 const dns = require("node:dns").promises;
 const { Transform } = require("node:stream");
+const { buscarAccesoLan, conectarMiembro } = require("./ubicacion-lan");
 
 const HOP = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "proxy-connection"]);
 const METODOS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]);
@@ -55,13 +56,14 @@ function cabecerasSinSalto(headers) {
   return salida;
 }
 
-function normalizarMiembros(lista) {
+function normalizarMiembros(lista, accesoQuorum = false) {
   if (!Array.isArray(lista) || !lista.length) throw new Error("El acceso LAN necesita miembros permitidos");
   const ids = new Set(), urls = new Set();
   return lista.map(m => {
     if (!m || typeof m.id !== "string" || !m.id || m.id.length > 128 || ids.has(m.id)) throw new Error("Miembros LAN inválidos o duplicados");
     const url = origenPermitido(m.url);
-    if (urls.has(url)) throw new Error("Dos miembros no pueden compartir la misma dirección");
+    if (urls.has(url) && !accesoQuorum) throw new Error("Dos miembros no pueden compartir la misma dirección");
+    if (accesoQuorum && (!url.startsWith("https:") || !m.caPublica)) throw new Error("Falta el certificado de una PC del grupo");
     ids.add(m.id); urls.add(url);
     const salida = { id: m.id, nombre: typeof m.nombre === "string" ? m.nombre : m.id, url, preferido: m.preferido === true };
     if (m.caPublica !== undefined) {
@@ -94,7 +96,7 @@ function guardarAtomico(archivo, datos) {
   }
 }
 
-function cargarEstado(archivo, grupoId) {
+function cargarEstado(archivo, grupoId, accesoQuorum) {
   let datos;
   try { datos = JSON.parse(fs.readFileSync(archivo, "utf8")); }
   catch (e) { if (e.code === "ENOENT") return { grupoId, termino: -1, escritor: null, indice: -1, sha256: null, revision_miembros: 0, miembros: null }; throw new Error("No se puede leer el estado persistente del acceso LAN"); }
@@ -102,21 +104,22 @@ function cargarEstado(archivo, grupoId) {
     || !(datos.escritor === null || typeof datos.escritor === "string") || typeof datos.sha256 !== "string") throw new Error("El estado persistente del acceso LAN no es válido");
   datos.revision_miembros = datos.revision_miembros ?? 0;
   if (!Number.isSafeInteger(datos.revision_miembros) || datos.revision_miembros < 0) throw new Error("La revisión de miembros persistente no es válida");
-  if (datos.miembros) datos.miembros = normalizarMiembros(datos.miembros);
+  if (datos.miembros) datos.miembros = normalizarMiembros(datos.miembros, accesoQuorum);
   return datos;
 }
 
 function crearAccesoLan({ config, base = process.cwd(), archivoEstado = path.join(base, "datos", "acceso-lan.json"), resolver = dns.lookup,
   timeoutMs = 300000, timeoutEstadoMs = 2500, maxSolicitud = 300 * 1024 * 1024, maxRespuesta = 300 * 1024 * 1024, maxEstado = 2 * 1024 * 1024,
-  verificarEstado, guardarEstado = guardarAtomico, log = () => {} } = {}) {
+  verificarEstado, buscarEnRed = buscarAccesoLan, guardarEstado = guardarAtomico, log = () => {} } = {}) {
   if (!config || config.habilitado !== true || !config.grupoId || !config.clavePublicaTestigo || !Array.isArray(config.miembros)) throw new Error("Falta la configuración del acceso LAN y la clave pública fijada del testigo");
   const clave = crypto.createPublicKey(config.clavePublicaTestigo);
   if (clave.asymmetricKeyType !== "ed25519") throw new Error("La clave del testigo debe ser Ed25519");
-  const testigo = origenPermitido(config.testigo?.url);
-  let persistido = cargarEstado(archivoEstado, config.grupoId);
-  let roster = persistido.miembros || normalizarMiembros(config.miembros);
+  const accesoQuorum = config.accesoQuorum === true;
+  const testigo = accesoQuorum ? null : origenPermitido(config.testigo?.url);
+  let persistido = cargarEstado(archivoEstado, config.grupoId, accesoQuorum);
+  let roster = persistido.miembros || normalizarMiembros(config.miembros, accesoQuorum);
   let miembros = new Map(roster.map(m => [m.id, m]));
-  let errorDisco = false, consulta = null;
+  let errorDisco = false, consulta = null, rutaActual = null;
   const verificar = verificarEstado || ((sobre, opciones) => require("./protocolo-lan").verificarEstadoFirmado(sobre, opciones));
 
   function aceptarEstado(estado) {
@@ -128,7 +131,7 @@ function crearAccesoLan({ config, base = process.cwd(), archivoEstado = path.joi
     let candidato = roster, revision = persistido.revision_miembros;
     if (estado.miembros !== undefined) {
       if (!Number.isSafeInteger(estado.revision_miembros) || estado.revision_miembros < 1 || estado.revision_miembros < revision) throw new Error("La revisión de miembros del testigo retrocedió");
-      candidato = normalizarMiembros(estado.miembros);
+      candidato = normalizarMiembros(estado.miembros, accesoQuorum);
       if (revision === estado.revision_miembros && JSON.stringify(candidato) !== JSON.stringify(roster)) throw new Error("La lista de miembros cambió sin una nueva revisión");
       revision = estado.revision_miembros;
     }
@@ -146,25 +149,51 @@ function crearAccesoLan({ config, base = process.cwd(), archivoEstado = path.joi
     return miembros.get(id);
   }
 
+  async function pedirEstado(url, ruta, ca) {
+    const destino = await destinoPrivado(url, resolver);
+    return new Promise((resolve, reject) => {
+      const pedir = destino.url.protocol === "https:" ? https.request : http.request;
+      const req = pedir(new URL(ruta, url), { method: "GET", lookup: destino.lookup, agent: false, ca, headers: { Accept: "application/json" } }, res => {
+        if (res.statusCode !== 200) { res.resume(); reject(new Error("El testigo no está disponible")); return; }
+        const partes = []; let bytes = 0;
+        res.on("data", b => { bytes += b.length; if (bytes > maxEstado) { res.destroy(); reject(new Error("Estado del testigo demasiado grande")); } else partes.push(b); });
+        res.on("error", reject);
+        res.on("end", () => { try { resolve(JSON.parse(Buffer.concat(partes).toString("utf8"))); } catch (e) { reject(e); } });
+      });
+      const timer = setTimeout(() => req.destroy(new Error("El testigo no respondió a tiempo")), timeoutEstadoMs);
+      req.once("close", () => clearTimeout(timer)); req.on("error", reject); req.end();
+    });
+  }
+
   async function descubrir() {
     if (errorDisco) throw new Error("El acceso LAN requiere reparar su estado en disco");
+    if (rutaActual?.vence > performance.now()) return rutaActual.miembro;
     if (consulta) return consulta;
     consulta = (async () => {
-      const desafio = crypto.randomBytes(24).toString("hex");
-      const destino = await destinoPrivado(testigo, resolver);
-      const sobre = await new Promise((resolve, reject) => {
-        const pedir = destino.url.protocol === "https:" ? https.request : http.request;
-        const req = pedir(new URL(`/lan/testigo/estado?desafio=${desafio}`, testigo), { method: "GET", lookup: destino.lookup, agent: false, headers: { Accept: "application/json" } }, res => {
-          if (res.statusCode !== 200) { res.resume(); reject(new Error("El testigo no está disponible")); return; }
-          const partes = []; let bytes = 0;
-          res.on("data", b => { bytes += b.length; if (bytes > maxEstado) { res.destroy(); reject(new Error("Estado del testigo demasiado grande")); } else partes.push(b); });
-          res.on("error", reject);
-          res.on("end", () => { try { resolve(JSON.parse(Buffer.concat(partes).toString("utf8"))); } catch (e) { reject(e); } });
-        });
-        const timer = setTimeout(() => req.destroy(new Error("El testigo no respondió a tiempo")), timeoutEstadoMs);
-        req.once("close", () => clearTimeout(timer)); req.on("error", reject); req.end();
-      });
-      return aceptarEstado(verificar(sobre, { clavePublica: config.clavePublicaTestigo, grupoId: config.grupoId, desafio }));
+      const desafio = crypto.randomBytes(24).toString("hex"), inicio = performance.now();
+      const opciones = { clavePublica: config.clavePublicaTestigo, grupoId: config.grupoId, desafio };
+      const ruta = `/lan/${accesoQuorum ? "quorum" : "testigo"}/estado?desafio=${desafio}`;
+      const pedir = async (url, ca) => {
+        const estado = verificar(await pedirEstado(url, ruta, ca), opciones);
+        if (accesoQuorum && (!estado.escritor || estado.termino < persistido.termino || estado.ultimo?.indice < persistido.indice)) {
+          throw new Error("La PC todavía no acredita al servidor actual");
+        }
+        return estado;
+      };
+      if (!accesoQuorum) return aceptarEstado(await pedir(testigo));
+      const porLan = async () => {
+        const mapa = await buscarEnRed({ grupoId: config.grupoId, clavePublica: clave });
+        const estado = await Promise.any([...mapa.values()].map(u => pedir(`http://${u.ip}:${u.http}`)));
+        return { estado, ubicacion: { equipo: id => mapa.get(id) } };
+      };
+      const { estado, ubicacion } = await Promise.any([porLan(), ...roster.map(async m => ({ estado: await pedir(m.url, m.caPublica) }))]);
+      const restante = estado.vence_ms - estado.emitido_ms - (performance.now() - inicio);
+      if (restante <= 0) throw new Error("Venció la autorización del servidor");
+      const miembro = aceptarEstado(estado);
+      const destino = conectarMiembro(miembro, ubicacion);
+      const remoto = { ...miembro, url: destino.url, servername: destino.servername };
+      rutaActual = { miembro: remoto, vence: performance.now() + Math.min(900, restante) };
+      return remoto;
     })().finally(() => { consulta = null; });
     return consulta;
   }
@@ -175,10 +204,23 @@ function crearAccesoLan({ config, base = process.cwd(), archivoEstado = path.joi
     res.end(JSON.stringify({ mensaje, codigo }));
   }
 
+  function esPortada(req) {
+    return accesoQuorum && req.method === "GET" && req.url === "/" && /\btext\/html\b/.test(req.headers.accept || "");
+  }
+
+  function esperando(res) {
+    res.writeHead(503, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
+    res.end('<!doctype html><html lang="es"><meta charset="utf-8"><meta http-equiv="refresh" content="2"><title>Sistema del Camping</title><p role="status">Buscando el servidor del camping en la red local…</p></html>');
+  }
+
   async function reenviar(req, res, intento = 0) {
     let origen, destino, miembro;
     try { miembro = await descubrir(); origen = miembro.url; destino = await destinoPrivado(origen, resolver); }
-    catch (_e) { responder(res, 503, "No se puede acreditar un servidor del predio. Revisá el testigo y las PCs de respaldo.", "ESCRITOR_NO_DISPONIBLE"); return; }
+    catch (_e) {
+      if (esPortada(req)) esperando(res);
+      else responder(res, 503, "Esperando al servidor del predio. Revisá que las PCs de respaldo estén conectadas.", "ESCRITOR_NO_DISPONIBLE");
+      return;
+    }
     if (req.destroyed || res.destroyed) return;
     const seguro = req.method === "GET" || req.method === "HEAD";
     const headers = cabecerasSinSalto(req.headers);
@@ -186,7 +228,12 @@ function crearAccesoLan({ config, base = process.cwd(), archivoEstado = path.joi
     const pedir = destino.url.protocol === "https:" ? https.request : http.request;
     let fallo = false, recibidos = 0;
     const upstream = pedir(new URL(req.url, origen), { method: req.method, headers, lookup: destino.lookup, agent: false,
-      ...(destino.url.protocol === "https:" ? { ca: miembro.caPublica || undefined, rejectUnauthorized: true } : {}) }, respuesta => {
+      ...(destino.url.protocol === "https:" ? { ca: miembro.caPublica || undefined, servername: miembro.servername, rejectUnauthorized: true } : {}) }, respuesta => {
+      if (respuesta.statusCode === 503 && esPortada(req)) {
+        rutaActual = null;
+        respuesta.resume();
+        return esperando(res);
+      }
       const salida = cabecerasSinSalto(respuesta.headers);
       if (salida.location) {
         let redireccion;
@@ -206,6 +253,7 @@ function crearAccesoLan({ config, base = process.cwd(), archivoEstado = path.joi
     function fallar() {
       if (fallo || res.destroyed) return;
       fallo = true;
+      rutaActual = null;
       if (seguro && intento === 0 && !res.headersSent) { reenviar(req, res, 1).catch(() => responder(res, 502, "El servidor no respondió.", "SERVIDOR_NO_DISPONIBLE")); return; }
       responder(res, 502, seguro ? "El servidor no respondió. Volvé a intentar." : "No se pudo confirmar el resultado. Revisá la operación antes de volver a enviarla.", seguro ? "SERVIDOR_NO_DISPONIBLE" : "RESULTADO_INCIERTO");
     }
@@ -257,7 +305,7 @@ if (require.main === module) {
     if (config.equipoId !== require("./control-equipo").identidadEquipo()) throw new Error("Esta configuración de acceso está vinculada a otra PC");
     // El proceso de acceso no necesita conservar secretos del testigo cuando
     // ambos componentes comparten la misma instalación protegida de Windows.
-    const publica = { habilitado: config.habilitado, grupoId: config.grupoId, clavePublicaTestigo: config.clavePublicaTestigo,
+    const publica = { habilitado: config.habilitado, grupoId: config.grupoId, accesoQuorum: config.accesoQuorum, clavePublicaTestigo: config.clavePublicaTestigo,
       testigo: { url: config.testigo?.url }, miembros: (config.miembros || []).map(m => ({ id: m.id, nombre: m.nombre, url: m.url, preferido: m.preferido, ...(m.caPublica ? { caPublica: m.caPublica } : {}) })) };
     const acceso = crearAccesoLan({ config: publica, base, log: console.log });
     acceso.escuchar().then(url => console.log(`Acceso local del predio: ${url}`)).catch(e => { console.error(e.message); process.exitCode = 1; });

@@ -87,6 +87,20 @@ test("los instaladores se descargan sólo por acción explícita con el rol corr
   assert.match(s.panel.textContent, /INSTALAR-APOYO\.bat/); assert.equal(s.escrituras.length, 0);
 });
 
+test("un grupo automático ofrece acceso de caja y permite quitar un respaldo con confirmación", async () => {
+  const s = pantalla(); await resolver();
+  s.cambiar({ modo: "quorum", habilitado: true, estado: "EN_MARCHA", puedePrepararAcceso: true,
+    miembros: [{ id: "b", nombre: "Caja", puedeQuitar: true }] });
+  await s.actualizar();
+  s.boton("Descargar acceso de caja").click(); await resolver();
+  assert.equal(s.descargas.at(-1).ruta, "/sistema/grupo-local/acceso-caja");
+  s.boton("Quitar respaldo").click(); await resolver();
+  assert.equal(s.escrituras.length, 0);
+  s.aceptar(true); s.boton("Quitar respaldo").click(); await resolver();
+  assert.equal(s.escrituras.at(-1).ruta, "/sistema/grupo-local/quitar-respaldo");
+  assert.equal(s.escrituras.at(-1).body.equipoId, "b");
+});
+
 test("el sondeo sin cambios conserva los nodos y el foco y termina al salir", async () => {
   const s = pantalla(); await resolver();
   const boton = s.boton("Instalar testigo en una PC de caja"); boton.focus();

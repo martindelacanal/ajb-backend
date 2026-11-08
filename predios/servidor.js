@@ -115,7 +115,8 @@ let preparandoHttps = null;
 
 function ubicarGrupo({ grupoId, claveDatos }) {
   ubicacionGrupo ??= crearUbicacionLan({ grupoId, claveDatos, nodoId: controlEquipo.equipoId, log,
-    puertos: () => ({ https: tlsCargado?.puerto, raft: configHa?.quorum?.puerto }) });
+    firmaAcceso: () => configHa?.quorum?.clavePrivada,
+    puertos: () => ({ http: config.puerto, https: tlsCargado?.puerto, raft: configHa?.quorum?.puerto }) });
   return ubicacionGrupo;
 }
 
@@ -203,6 +204,8 @@ servicios.agente = agente;
 const grupoLocal = crearGrupoLocal({ base: BASE, dirApp: DIR_APP, version: VERSION, config, db,
   equipoId: controlEquipo.equipoId, haActual: () => ha?.estado(), configuracionHa: () => configHa, log,
   ubicarGrupo, consultarQuorum: () => ha?.consultarQuorum(),
+  revisarRetiro: id => ha?.revisarRetiro(id),
+  retirarQuorum: id => ha?.retirarQuorum(id),
   promoverQuorum: (r, disponibles, haQuorum, pedirEquipo) => ha.promoverQuorum(r, disponibles, haQuorum, pedirEquipo),
   bloquearEscritura() {
     const archivo = path.join(BASE, "ha-activacion-pendiente.json");
@@ -403,6 +406,17 @@ async function rutaSistema(ctx, metodo, ruta, req, res) {
     if (!seguro.activo) throw U.error("No se pudo preparar la conexión interna entre las PCs", 409);
     const paquete = await grupoLocal.instalador("Respaldo", { equipo: true, ip, direccion: req.socket.localAddress });
     return { archivo: paquete.buffer, nombreArchivo: "AJB-Incorporar-esta-PC.zip", tipo: "application/zip" };
+  }
+  if (metodo === "POST" && ruta === "/sistema/grupo-local/acceso-caja") {
+    controlEquipo.comprobar();
+    await leerCuerpo(req, 1000);
+    const paquete = await grupoLocal.instaladorAcceso();
+    return { archivo: paquete.buffer, nombreArchivo: "AJB-Acceso-de-caja.zip", tipo: "application/zip" };
+  }
+  if (metodo === "POST" && ruta === "/sistema/grupo-local/quitar-respaldo") {
+    controlEquipo.comprobar();
+    const { equipoId } = await leerCuerpo(req, 1000);
+    return grupoLocal.quitarRespaldo(equipoId);
   }
   if (metodo === "POST" && ruta === "/sistema/grupo-local/instalador") {
     controlEquipo.comprobar();
@@ -668,6 +682,9 @@ async function manejar(req, res) {
     } catch (e) { return LAN.respuesta(res, e.status || 403, { mensaje: e.message }); }
   }
   if (ruta.startsWith("/lan/")) {
+    if (ruta === "/lan/quorum/estado" && !req.socket.encrypted && ipDe(req) !== "127.0.0.1" && !esIpLocal(ipDe(req))) {
+      return LAN.respuesta(res, 403, { mensaje: "Esta consulta está disponible en la red local del predio" });
+    }
     if (ha && await ha.manejar(req, res)) return;
     return LAN.respuesta(res, 404, { mensaje: "No encontramos esa operación" });
   }

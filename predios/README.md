@@ -318,6 +318,16 @@ encontrarse, los equipos intercambian mensajes autenticados por UDP 39879 en
 la red local. La actualización prepara esa regla en Windows. El navegador
 puede usar HTTP. La incorporación y la réplica usan certificados internos.
 
+En un grupo automático activo, desde una PC que sólo va a vender entrá como
+administrador en **Sistema → PCs de respaldo → Descargar acceso de caja**.
+Extraé el ZIP y ejecutá `INSTALAR-APOYO.bat`. El acceso de escritorio busca
+al servidor en la LAN, conserva la dirección local y no suma un voto al grupo.
+
+Desde el mismo panel, **Quitar respaldo** retira una PC del grupo. La baja se
+confirma cuando la mayoría de los votantes que quedan tiene la última copia.
+La PC de origen y la PC en servicio se conservan. Si quedan tres votantes,
+primero incorporá otro respaldo y esperá a que vote para poder quitar uno.
+
 Con una principal y una sola caja, incorporá la caja y elegí **Configurar relevo
 manual con dos PCs** en **Sistema → PCs de respaldo**. Mantené las dos conectadas
 para que cada venta que confirme la principal quede guardada en ambas. Si se

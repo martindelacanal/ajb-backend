@@ -25,7 +25,7 @@ async function cerrar(s) {
   if (s.listening) await new Promise(resolve => { s.close(resolve); s.closeAllConnections(); });
 }
 
-test("tres coordinadores recuperan el grupo con todas las IP nuevas y relevan al servidor conservando la última escritura", {
+test("un grupo retira un respaldo y los tres restantes relevan al servidor tras cambiar de IP sin perder la última escritura", {
   skip: !ejecutable, timeout: 120000,
 }, async t => {
   const raiz = fs.mkdtempSync(path.join(os.tmpdir(), "ajb-quorum-"));
@@ -55,12 +55,12 @@ test("tres coordinadores recuperan el grupo con todas las IP nuevas y relevan al
     asegurarEsquema(n.db);
   };
   const puertosReservados = [];
-  for (const letra of ["a", "b", "c"]) {
+  for (const letra of ["a", "b", "c", "d"]) {
     const base = path.join(raiz, letra);
     fs.mkdirSync(path.join(base, "datos"), { recursive: true });
     const n = { id: letra.repeat(64), base, disponible: true, ip: `127.0.0.${nodos.length + 2}` };
     n.http = http.createServer(async (req, res) => {
-      // El protocolo Raft entre los tres ejecutables usa TLS real. Aquí se
+      // El protocolo Raft entre los ejecutables usa TLS real. Aquí se
       // sustituye sólo el certificado HTTP del servidor de prueba.
       req.socket.encrypted = true;
       if (!n.disponible) return respuesta(res, 503, { mensaje: "PC desconectada" });
@@ -126,7 +126,20 @@ test("tres coordinadores recuperan el grupo con todas las IP nuevas y relevan al
   }
   const escribir = (n, valor) => n.db.tx(t => t.run("INSERT INTO predio_config(predio_id,id,clave,valor) VALUES(1,1,'ultima_venta',?) ON CONFLICT(predio_id,id) DO UPDATE SET valor=excluded.valor", [String(valor)]));
   const leer = n => n.db.conexion.prepare("SELECT valor FROM predio_config WHERE clave='ultima_venta'").get()?.valor;
-  await escribir(await lider(), 101);
+  const activo = await lider();
+  await escribir(activo, 101);
+  const baja = nodos.find(n => n !== activo && n.id !== inicial.preferidoId);
+  baja.disponible = false;
+  baja.servicio.detener();
+  await activo.servicio.retirarQuorum(baja.id);
+  const registro = await activo.servicio.consultarQuorum();
+  assert.ok(registro.retirados.includes(baja.id));
+  assert.equal(registro.miembros.some(m => m.id === baja.id), false);
+  const otro = nodos.find(n => n.disponible && n !== activo && n.id !== inicial.preferidoId);
+  await assert.rejects(activo.servicio.revisarRetiro(otro.id), /tres votantes/);
+  await cerrar(baja.http);
+  baja.db.cerrar();
+  nodos.splice(nodos.indexOf(baja), 1);
   const anteriores = nodos.map(n => ({ ip: n.ip, http: n.http.address().port, raft: n.puerto }));
   await Promise.all(nodos.map(async n => {
     n.servicio.detener();

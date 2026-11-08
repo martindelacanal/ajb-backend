@@ -19,6 +19,7 @@ const U = require("../lib/util");
 const { crearTestigo } = require("../lib/testigo-lan");
 const { crearServidorTestigo } = require("../lib/servidor-testigo");
 const { crearServicioLan } = require("../lib/servicio-lan");
+const { crearAccesoLan } = require("../lib/acceso-lan");
 const { firmarPeticion } = require("../lib/protocolo-lan");
 const { descifrarJson, pedir: pedirLan } = require("../lib/http-lan");
 const { conectarMiembro } = require("../lib/ubicacion-lan");
@@ -265,6 +266,58 @@ test("dos PCs confirman la copia, la caja espera autorización tras el corte y l
   await escritor(s, origenId);
   assert.equal(buscar(s, "Producto durante el relevo"), "Producto durante el relevo");
   assert.equal((await grupo(s)).json.manualActivo, false);
+});
+
+test("el acceso sin voto sigue al nuevo escritor por LAN aunque no sirvan las direcciones originales", {
+  skip: process.platform !== "win32", timeout: 30000,
+}, async t => {
+  const s = await preparar(t, true);
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  const clavePublicaTestigo = publicKey.export({ type: "spki", format: "pem" });
+  const grupoId = "acceso_quorum_fixture";
+  const miembros = ["a", "b", "c"].map((letra, i) => ({
+    id: letra.repeat(64), nombre: letra, url: `https://127.0.0.1:${i + 1}`, caPublica: s.raiz,
+  }));
+  let elegido = miembros[0], termino = 1;
+  const ubicaciones = new Map(), recibidos = [];
+  const servidores = [];
+  for (const m of miembros.slice(0, 2)) {
+    const seguro = https.createServer(s.tlsConfig, (req, res) => {
+      recibidos.push({ id: m.id, auth: req.headers.authorization });
+      res.end(m.nombre);
+    });
+    const publico = http.createServer((req, res) => {
+      const u = new URL(req.url, "http://local");
+      assert.equal(u.pathname, "/lan/quorum/estado");
+      assert.equal(req.headers.authorization, undefined);
+      if (elegido !== m) { res.writeHead(503).end(); return; }
+      const emitido = Date.now();
+      const estado = { tipo: "AJB_TESTIGO_ESTADO", formato: 1, grupo_id: grupoId, desafio: u.searchParams.get("desafio"),
+        escritor: { id: m.id, url: m.url }, ultimo: { indice: termino, sha256: "f".repeat(64) },
+        termino, revision_miembros: 1, miembros, emitido_ms: emitido, vence_ms: emitido + 5000 };
+      const firma = crypto.sign(null, Buffer.from(JSON.stringify(estado)), privateKey).toString("base64");
+      res.end(JSON.stringify({ estado, firma }));
+    });
+    servidores.push({ seguro, publico });
+    s.limpiezas.push(() => Promise.all([cerrar(seguro), cerrar(publico)]));
+    await Promise.all([seguro, publico].map(p => new Promise(resolve => p.listen(0, "127.0.0.2", resolve))));
+    ubicaciones.set(m.id, { ip: "127.0.0.2", https: seguro.address().port, http: publico.address().port, nombreTls: "localhost" });
+  }
+  const acceso = crearAccesoLan({ base: s.base, config: { habilitado: true, accesoQuorum: true, grupoId, clavePublicaTestigo, miembros },
+    buscarEnRed: async () => new Map(ubicaciones), timeoutEstadoMs: 800 });
+  const url = await acceso.escuchar(0);
+  s.limpiezas.push(acceso.cerrar);
+  assert.equal((await pedir(url, "/", { token: "fixture" })).buffer.toString(), "a");
+  await Promise.all(Object.values(servidores[0]).map(cerrar));
+  ubicaciones.delete(miembros[0].id);
+  elegido = null;
+  const enEspera = await pedir(url, "/", { headers: { Accept: "text/html" } });
+  assert.equal(enEspera.status, 503);
+  assert.match(enEspera.buffer.toString(), /http-equiv="refresh"/);
+  elegido = miembros[1]; termino++;
+  assert.equal((await pedir(url, "/", { token: "fixture" })).buffer.toString(), "b");
+  assert.deepEqual(recibidos.map(r => r.auth), ["Bearer fixture", "Bearer fixture"]);
+  assert.equal(acceso.estado().escritor, elegido.id);
 });
 
 test("la IP descubierta usa el certificado de la misma PC por su nombre", { skip: process.platform !== "win32", timeout: 30000 }, async t => {

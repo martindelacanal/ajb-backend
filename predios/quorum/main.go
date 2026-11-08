@@ -307,13 +307,9 @@ func (c *consensus) serve(key string) http.Handler {
 			var request struct {
 				peer
 				Expected, Term, Configuration uint64
-				Voter                         bool
+				Voter, Remove                 bool
 			}
 			if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&request) != nil || !identifier.MatchString(request.ID) {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			if _, _, err := net.SplitHostPort(request.Address); err != nil {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
@@ -322,16 +318,29 @@ func (c *consensus) serve(key string) http.Handler {
 				return
 			}
 			var change raft.IndexFuture
-			if request.Voter {
-				change = c.raft.AddVoter(raft.ServerID(request.ID), raft.ServerAddress(request.Address), peers.Index(), wait)
+			id := raft.ServerID(request.ID)
+			if request.Remove {
+				if id == leader {
+					w.WriteHeader(http.StatusConflict)
+					return
+				}
+				change = c.raft.RemoveServer(id, peers.Index(), wait)
 			} else {
-				change = c.raft.AddNonvoter(raft.ServerID(request.ID), raft.ServerAddress(request.Address), peers.Index(), wait)
+				if _, _, err := net.SplitHostPort(request.Address); err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if request.Voter {
+					change = c.raft.AddVoter(id, raft.ServerAddress(request.Address), peers.Index(), wait)
+				} else {
+					change = c.raft.AddNonvoter(id, raft.ServerAddress(request.Address), peers.Index(), wait)
+				}
 			}
 			if err := change.Error(); err != nil {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				return
 			}
-			c.locations.remember(raft.ServerID(request.ID), request.Address)
+			c.locations.remember(id, request.Address)
 			_ = json.NewEncoder(w).Encode(true)
 		default:
 			w.WriteHeader(http.StatusNotFound)

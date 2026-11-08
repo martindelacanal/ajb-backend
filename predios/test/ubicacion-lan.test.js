@@ -6,7 +6,7 @@ const crypto = require("node:crypto");
 const dgram = require("node:dgram");
 const { EventEmitter, once } = require("node:events");
 const { firmarMensaje } = require("../lib/descubrimiento");
-const { crearUbicacionLan, conectarMiembro } = require("../lib/ubicacion-lan");
+const { crearUbicacionLan, buscarAccesoLan, conectarMiembro } = require("../lib/ubicacion-lan");
 
 test("el descubrimiento acepta la nueva IP sólo con respuesta autenticada y desafío reciente", async t => {
   const socket = new EventEmitter();
@@ -43,4 +43,31 @@ test("el descubrimiento acepta la nueva IP sólo con respuesta autenticada y des
   assert.deepEqual(conectarMiembro(miembro, ubicacion), { url: "https://192.168.8.5:8443", ca: "CA del equipo", servername: "caja-2" });
   tiempo += 13000;
   assert.deepEqual(ubicacion.direccionesRaft(), {});
+});
+
+test("la caja descubre un servidor con la clave pública sin recibir claves de réplica", async t => {
+  const grupoId = "camping", nodoId = "b".repeat(64), ip = "192.168.1.21";
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
+  const sockets = [];
+  t.mock.method(dgram, "createSocket", () => {
+    const s = new EventEmitter();
+    s.bind = (_puerto, _host, listo) => listo();
+    s.unref = s.setBroadcast = s.close = () => {};
+    s.send = sockets.length ? buffer => sockets[0].emit("message", buffer, { address: "192.168.1.25", port: 48000 }) : () => {};
+    sockets.push(s);
+    return s;
+  });
+  const red = () => ({ lan: [{ family: "IPv4", address: ip, netmask: "255.255.255.0", internal: false }] });
+  const servidor = crearUbicacionLan({ grupoId, nodoId, claveDatos: "a".repeat(64), red,
+    nombre: () => "servidor", firmaAcceso: () => privateKey, puertos: () => ({ http: 8080, https: 8443 }) });
+  t.after(servidor.detener);
+  sockets[0].send = (buffer, puerto) => {
+    const firmado = JSON.parse(buffer);
+    if (!firmado.ubicacion) return;
+    assert.equal(puerto, 48000);
+    assert.equal(firmado.ubicacion.nonce.length, 32);
+    sockets[1].emit("message", buffer, { address: ip, port: 39879 });
+  };
+  const ubicaciones = await buscarAccesoLan({ grupoId, clavePublica: publicKey, red, esperaMs: 20 });
+  assert.deepEqual(ubicaciones.get(nodoId), { ip, http: 8080, https: 8443, nombreTls: "servidor" });
 });

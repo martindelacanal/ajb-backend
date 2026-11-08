@@ -22,6 +22,8 @@
     var testigo = botonInstalador("Instalar testigo en una PC de caja", "Testigo");
     var respaldo = botonInstalador("Agregar PC de respaldo", "Respaldo");
     var acceso = botonInstalador("Preparar acceso de caja", "Acceso");
+    var accesoQuorum = P.btn("Descargar acceso de caja", { tipo: "secundario", icono: "descargar", onclick: descargarAcceso });
+    var ayudaAcceso = h("p.texto-3.chico", { hidden: true }, "Para una PC que sólo va a vender, descargá el acceso de caja desde esa misma PC. El acceso encuentra el servidor en servicio y la caja no participa en la votación.");
     var equipo = P.btn("Incorporar esta PC", { tipo: "primario", icono: "descargar", deshabilitado: true, onclick: incorporarEquipo });
     equipo.hidden = true;
     var activar = P.btn("Activar reemplazo automático", { tipo: "primario", icono: "check", deshabilitado: true, onclick: activarGrupo });
@@ -42,7 +44,7 @@
       mensaje, problema, reducida,
       pasos, ayudaEquipo, ayudaManual,
       equipos, sinEquipos, retorno,
-      h("div.fila", equipo, testigo, respaldo, acceso, activar, configurarManual), ayudaCaja,
+      h("div.fila", equipo, testigo, respaldo, acceso, accesoQuorum, activar, configurarManual), ayudaCaja, ayudaAcceso,
       aviso, h("div.fila", revisar));
 
     function actualizarControles() {
@@ -57,11 +59,42 @@
       testigo.disabled = ocupado || !datos.puedePrepararTestigo;
       respaldo.disabled = ocupado || !datos.puedePrepararRespaldo;
       acceso.disabled = ocupado || !datos.testigo;
+      accesoQuorum.hidden = ayudaAcceso.hidden = !datos?.puedePrepararAcceso;
+      accesoQuorum.disabled = ocupado;
       activar.disabled = ocupado || !datos.puedeActivar;
       activar.hidden = unificado || (!!datos && (datos.estado === "EN_MARCHA" || datos.estado === "SIN_TESTIGO"));
       configurarManual.hidden = !datos || !datos.puedeConfigurarManual;
       configurarManual.disabled = ocupado || configurarManual.hidden;
       revisar.disabled = consultando || activando;
+    }
+    function descargarAcceso() {
+      if (trabajando || cerrado) return;
+      trabajando = true; actualizarControles();
+      P.ejecutar(accesoQuorum, function () {
+        return P.descargarPost("/sistema/grupo-local/acceso-caja", {}, "AJB-Acceso-de-caja.zip").then(function () {
+          if (cerrado) return;
+          aviso.textContent = "Extraé el ZIP y ejecutá INSTALAR-APOYO.bat en esta caja. Después abrí «Sistema del Camping - Caja» desde el escritorio.";
+          aviso.hidden = false;
+        });
+      }).catch(function () {}).finally(function () { trabajando = false; if (!cerrado) actualizarControles(); });
+    }
+    function quitarRespaldo(m, boton) {
+      if (trabajando || confirmando || activando || cerrado) return;
+      confirmando = true; actualizarControles();
+      P.confirmar("La PC " + m.nombre + " dejará de contar para la mayoría cuando el grupo confirme la baja.",
+        { titulo: "¿Quitar este respaldo?", aceptar: "Quitar respaldo", peligro: true }).then(function (ok) {
+        confirmando = false;
+        if (!ok || cerrado) { if (!cerrado) actualizarControles(); return; }
+        trabajando = true; actualizarControles();
+        return P.ejecutar(boton, function () {
+          return P.post("/sistema/grupo-local/quitar-respaldo", { equipoId: m.id }).then(function (r) {
+            if (cerrado) return;
+            aviso.textContent = r.pendiente ? "La baja está pendiente. El grupo espera a que las PCs que quedan guarden la última copia."
+              : "La PC fue retirada del grupo de respaldos.";
+            aviso.hidden = false;
+          });
+        }).catch(function () {}).finally(function () { trabajando = false; if (!cerrado) { actualizarControles(); cargar(); } });
+      }).catch(function (e) { confirmando = false; if (!cerrado) { actualizarControles(); P.error(e); } });
     }
     function incorporarEquipo() {
       if (trabajando || cerrado) return;
@@ -121,9 +154,10 @@
         equipos.hidden = !otras.length; sinEquipos.hidden = !!otras.length;
         P.reemplazar(equipos, otras.map(function (m) {
           var atendiendo = d.escritor && m.id === d.escritor.id;
-          var texto = atendiendo ? "En servicio" : d.estado === "PREPARANDO" ? "Incorporada" : m.actualizado === true ? "Copia actualizada" : m.actualizado === false ? "Actualizando copia" : "Esperando confirmación";
+          var texto = atendiendo ? "En servicio" : m.retirando ? "Baja pendiente" : d.estado === "PREPARANDO" ? "Incorporada" : m.actualizado === true ? "Copia actualizada" : m.actualizado === false ? "Actualizando copia" : "Esperando confirmación";
+          var quitar = m.puedeQuitar && !m.retirando ? P.btn("Quitar respaldo", { tipo: "texto", chico: true, onclick: function () { quitarRespaldo(m, quitar); } }) : null;
           return h("li", h("div", h("strong", m.nombre || "PC de respaldo"), m.preferido ? h("div.texto-3.chico", "PC preferida") : null),
-            P.chip(texto, atendiendo || m.actualizado === true ? "CONFIRMADA" : "PENDIENTE"));
+            h("div.fila", P.chip(texto, atendiendo || (m.actualizado === true && !m.retirando) ? "CONFIRMADA" : "PENDIENTE"), quitar));
         }));
       }
       problema.hidden = true;
