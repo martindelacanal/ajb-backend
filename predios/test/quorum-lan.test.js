@@ -25,7 +25,7 @@ async function cerrar(s) {
   if (s.listening) await new Promise(resolve => { s.close(resolve); s.closeAllConnections(); });
 }
 
-test("el grupo releva tras cambiar las IP y permite un apagado previsto con la principal en servicio", {
+test("el grupo releva tras cambiar las IP y se reactiva solo cuando vuelven los respaldos", {
   skip: !ejecutable, timeout: 150000,
 }, async t => {
   const raiz = fs.mkdtempSync(path.join(os.tmpdir(), "ajb-quorum-"));
@@ -67,6 +67,10 @@ test("el grupo releva tras cambiar las IP y permite un apagado previsto con la p
       if (n.sinRetorno && req.url === "/lan/retorno") {
         n.intentoRetorno = true;
         return respuesta(res, 404, { mensaje: "El respaldo todavía no se actualizó" });
+      }
+      if (n.sinCopia && req.method === "POST" && req.url === "/lan/replica") {
+        n.intentoCopia = true;
+        return respuesta(res, 503, { mensaje: "Copia todavía no disponible" });
       }
       if (!await n.servicio.manejar(req, res)) {
         if (!n.servicio.estado().escritor) return n.servicio.reenviar(req, res);
@@ -232,7 +236,11 @@ test("el grupo releva tras cambiar las IP y permite un apagado previsto con la p
   assert.deepEqual(await configurarModo(true), { soloPrincipal: true });
   const modoSolo = await principal.servicio.consultarQuorum();
   assert.equal(modoSolo.solo_principal, true);
+  assert.equal(modoSolo.regreso_automatico, true);
   assert.deepEqual(modoSolo.votantes, [principal.id]);
+  const sondearRegreso = () => principal.servicio.promoverQuorum({ quorum: {}, miembros }, async () => []);
+  await sondearRegreso();
+  assert.equal((await principal.servicio.consultarQuorum()).solo_principal, true, "no reactivar antes de apagar los respaldos");
   caja.disponible = false; caja.servicio.detener();
   segundo.disponible = false; segundo.servicio.detener();
   await escribir(principal, 205);
@@ -249,7 +257,7 @@ test("el grupo releva tras cambiar las IP y permite un apagado previsto con la p
   await lider(principal);
   assert.equal(leer(principal), "205");
   await escribir(principal, 206);
-  for (const n of [caja, segundo]) {
+  async function volver(n) {
     await n.db.exclusivo(() => {});
     n.db.cerrar();
     aplicarPendiente({ base: n.base, config: n.config });
@@ -258,7 +266,23 @@ test("el grupo releva tras cambiar las IP y permite un apagado previsto con la p
     n.disponible = true;
     n.servicio.iniciar().catch(e => logs.push(e.message));
   }
-  assert.deepEqual(await configurarModo(false), { soloPrincipal: false });
+  await volver(caja);
+  await sondearRegreso();
+  assert.equal((await principal.servicio.consultarQuorum()).solo_principal, true, "un respaldo encendido todavía no basta");
+  segundo.sinCopia = true;
+  await volver(segundo);
+  async function sondearHasta(condicion) {
+    for (const limite = Date.now() + 12000; Date.now() < limite;) {
+      await sondearRegreso();
+      if (await condicion()) return;
+      await esperar(250);
+    }
+    assert.fail("El relevo no avanzó: " + logs.join("\n"));
+  }
+  await sondearHasta(() => segundo.intentoCopia);
+  assert.equal((await principal.servicio.consultarQuorum()).solo_principal, true, "sin la última copia no se reactiva");
+  segundo.sinCopia = false;
+  await sondearHasta(async () => !(await principal.servicio.consultarQuorum()).solo_principal);
   const modoNormal = await principal.servicio.consultarQuorum();
   assert.equal(modoNormal.solo_principal, false);
   assert.equal(modoNormal.votantes.length, 3);

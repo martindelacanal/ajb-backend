@@ -149,6 +149,7 @@ function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
         candidato: lectura.leader, miembros: registro.miembros.map(publico), retirados: registro.retirados || [],
         votantes: lectura.members.filter(m => m.Suffrage === 0).map(m => m.ID),
         solo_principal: Boolean(registro.soloPrincipal),
+        regreso_automatico: Boolean(registro.soloPrincipal && registro.arranquesSoloPrincipal),
       }) };
     return { estado, firma: crypto.sign(null, Buffer.from(JSON.stringify(estado)), llave).toString("base64"), clave_publica: config.clavePublicaTestigo };
   }
@@ -216,16 +217,19 @@ function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
       if (!registro.soloPrincipal && respaldos.length < 2) throw error("La mayoría todavía no está lista para preparar el apagado", 409);
       return { version: lectura.register.version, miembros: registro.miembros.filter(m => (registro.soloPrincipal || respaldos).includes(m.id)) };
     }); },
-    dejarSoloPrincipal(version) { return exclusivo(async () => {
+    dejarSoloPrincipal(version, arranques) { return exclusivo(async () => {
       let lectura = await leer();
       verificarPrincipal(lectura);
       if (lectura.register.version !== version) throw error("Cambió el grupo. Volvé a intentar el cambio", 409);
       const respaldos = lectura.members.filter(m => m.Suffrage === 0 && m.ID !== config.nodoId).map(m => m.ID);
       // Guardar la intención primero. Si se corta la operación, el coordinador
       // no vuelve a promover por su cuenta a un equipo ya apartado.
-      if (!registro.soloPrincipal) {
-        if (respaldos.length < 2) throw error("La mayoría todavía no está lista para preparar el apagado", 409);
-        await guardar(lectura, { ...registro, soloPrincipal: respaldos });
+      if (!registro.arranquesSoloPrincipal) {
+        const previstos = registro.soloPrincipal || respaldos;
+        if (previstos.length < 2) throw error("La mayoría todavía no está lista para preparar el apagado", 409);
+        if (!previstos.every(id => /^[a-f0-9]{32}$/.test(arranques?.[id] || ""))) throw error("Esperá a que todos los respaldos estén actualizados", 409);
+        await guardar(lectura, { ...registro, soloPrincipal: previstos,
+          arranquesSoloPrincipal: Object.fromEntries(previstos.map(id => [id, arranques[id]])) });
       }
       for (const id of respaldos) {
         await consenso.pedir("/member", { id, demote: true, expected: lectura.register.version, term: lectura.term, configuration: lectura.configuration });
@@ -239,7 +243,7 @@ function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
       const lectura = await leer();
       verificarPrincipal(lectura);
       if (!registro.soloPrincipal) return null;
-      return { ultimo: registro.ultimo, version: lectura.register.version,
+      return { ultimo: registro.ultimo, version: lectura.register.version, arranques: registro.arranquesSoloPrincipal,
         miembros: registro.miembros.filter(m => registro.soloPrincipal.includes(m.id)) };
     }); },
     reactivarRespaldos(rev, version, acuses) { return exclusivo(async () => {
@@ -259,6 +263,7 @@ function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
       }
       const restaurado = { ...registro };
       delete restaurado.soloPrincipal;
+      delete restaurado.arranquesSoloPrincipal;
       await guardar(lectura, restaurado);
       return { soloPrincipal: false };
     }); },

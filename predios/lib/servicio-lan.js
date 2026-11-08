@@ -4,6 +4,7 @@
 // en respaldo-lan; esta capa no elige un escritor por falta de respuesta.
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const http = require("node:http");
 const https = require("node:https");
 const { Transform } = require("node:stream");
@@ -35,6 +36,7 @@ function extraerPaquete(buffer) {
 }
 function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQuorum, ubicarGrupo, puertoHttps, log = () => {}, alEstado = () => {} }) {
   const c = ha;
+  const arranque = crypto.randomBytes(16).toString("hex");
   let core, ultimoEstado = null, detenido = false, avisando = false;
   let consenso, autoridad, cliente, ubicacion, relevo;
   const colaAvisos = [];
@@ -118,6 +120,43 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
       await autoridad.quitarMiembro(id, retiro.ultimo, acuses);
     });
   }
+  function volvioDeUnArranque(m, listo, plan) {
+    return listo?.equipo === m.id && listo.consenso && /^[a-f0-9]{32}$/.test(listo.arranque || "") &&
+      Boolean(plan.arranques?.[m.id]) && listo.arranque !== plan.arranques[m.id];
+  }
+  async function confirmarReactivacion(plan, automatico) {
+    const copia = core.copiaDelEscritor(plan.ultimo);
+    const acuses = await Promise.all(plan.miembros.map(async m => {
+      try {
+        const acuse = await transporte.replicar(m, copia);
+        const listo = await pedirMiembro(m, "/lan/quorum/listo", { cuerpo: {} });
+        if (listo.equipo !== m.id || !listo.consenso || listo.version !== plan.version ||
+            (automatico && !volvioDeUnArranque(m, listo, plan))) throw new Error("El respaldo todavía no está listo");
+        return acuse;
+      } catch (_e) {
+        throw Object.assign(new Error(`Encendé ${m.nombre} y esperá a que reciba la última copia antes de reactivar el relevo`), { status: 409 });
+      }
+    }));
+    return autoridad.reactivarRespaldos(plan.ultimo, plan.version, acuses);
+  }
+  async function comprobarRegresoRespaldos() {
+    const plan = await autoridad.prepararReactivacion();
+    if (!plan?.arranques) return;
+    // Buscar los respaldos fuera del candado de la base: una PC apagada
+    // no debe frenar las ventas mientras se agota el plazo de la consulta.
+    const respuestas = await Promise.all(plan.miembros.map(async m => [
+      m.id, await pedirMiembro(m, "/lan/quorum/listo", { cuerpo: {}, timeout: 1800 }).catch(() => null),
+    ]));
+    const porId = new Map(respuestas);
+    if (!plan.miembros.every(m => volvioDeUnArranque(m, porId.get(m.id), plan))) return;
+    await db.exclusivo(async () => {
+      if (!core.estado().escritor) return;
+      const vigente = await autoridad.prepararReactivacion();
+      if (!vigente?.arranques || !vigente.miembros.every(m => volvioDeUnArranque(m, porId.get(m.id), vigente))) return;
+      await confirmarReactivacion(vigente, true);
+      log("Relevo automático reactivado: los respaldos confirmaron la última copia");
+    });
+  }
   const adaptador = {
     ...core, configuracion: c, transporte,
     origenIncorporacion(cabecera, ip) { return cliente ? origenAcreditado(cabecera, c, miembros(), ip, ubicacion) : null; },
@@ -128,28 +167,18 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
         if (activo) {
           const plan = await autoridad.prepararModoPrincipal();
           if (!plan) return { soloPrincipal: true };
-          await Promise.all(plan.miembros.map(async m => {
+          const arranques = await Promise.all(plan.miembros.map(async m => {
             const listo = await pedirMiembro(m, "/lan/quorum/listo", { cuerpo: {} }).catch(() => null);
             if (listo?.equipo !== m.id || !listo.consenso || listo.version !== plan.version) {
               throw Object.assign(new Error(`Dejá ${m.nombre} encendida y esperá a que se conecte antes de preparar el apagado`), { status: 409 });
             }
+            if (!/^[a-f0-9]{32}$/.test(listo.arranque || "")) throw Object.assign(new Error(`Esperá a que ${m.nombre} se actualice antes de preparar el apagado`), { status: 409 });
+            return [m.id, listo.arranque];
           }));
-          return autoridad.dejarSoloPrincipal(plan.version);
+          return autoridad.dejarSoloPrincipal(plan.version, Object.fromEntries(arranques));
         }
         const plan = await autoridad.prepararReactivacion();
-        if (!plan) return { soloPrincipal: false };
-        const copia = core.copiaDelEscritor(plan.ultimo);
-        const acuses = await Promise.all(plan.miembros.map(async m => {
-          try {
-            const acuse = await transporte.replicar(m, copia);
-            const listo = await pedirMiembro(m, "/lan/quorum/listo", { cuerpo: {} });
-            if (listo.equipo !== m.id || !listo.consenso || listo.version !== plan.version) throw new Error("El registro todavía no se actualizó");
-            return acuse;
-          } catch (_e) {
-            throw Object.assign(new Error(`Encendé ${m.nombre} y esperá a que reciba la última copia antes de reactivar el relevo`), { status: 409 });
-          }
-        }));
-        return autoridad.reactivarRespaldos(plan.ultimo, plan.version, acuses);
+        return plan ? confirmarReactivacion(plan, false) : { soloPrincipal: false };
       });
     },
     revisarRetiro,
@@ -174,7 +203,10 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
     async promoverQuorum(r, disponibles, haQuorum, pedirEquipo) {
       if (!autoridad || !core.estado().escritor) return;
       const miembrosRaft = await autoridad.miembrosParaIncorporar();
-      if (!miembrosRaft) return;
+      if (!miembrosRaft) {
+        if (c.rolInstalacion === "Principal") await comprobarRegresoRespaldos().catch(e => log("Regreso de respaldos: " + e.message));
+        return;
+      }
       for (const id of r.quorum.retiros || []) {
         if (!ultimoEstado?.retirados?.includes(id)) await retirarQuorum(id);
       }
@@ -227,7 +259,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
           const buffer = await H.leer(req, 4096);
           verificar({ metodo: req.method, ruta: req.url, cuerpo: buffer, cabeceras: req.headers });
           const local = consenso ? await consenso.pedir("/local") : null;
-          H.respuesta(res, 200, { equipo: c.nodoId, semilla: c.quorum.inicial?.ultimo.sha256 || null, confirmada: core.estado().confirmada, consenso: !!local, version: local?.version });
+          H.respuesta(res, 200, { equipo: c.nodoId, arranque, semilla: c.quorum.inicial?.ultimo.sha256 || null, confirmada: core.estado().confirmada, consenso: !!local, version: local?.version });
         } catch (e) { H.respuesta(res, e.status || 403, { mensaje: e.message }); }
         return true;
       }

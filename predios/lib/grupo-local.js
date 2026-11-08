@@ -113,7 +113,7 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
       return { modo: manual ? "manual" : "quorum", puedeIncorporarEquipo: !soloPrincipal && !manual && !congelado && (!actual.habilitado || !!vivo?.escritor),
         puedePrepararAcceso: !manual && !!vivo?.escritor && !congelado,
         puedeConfigurarManual: !manual && !congelado && !actual.habilitado && r.principalId === equipoId && miembros.length === 2,
-        soloPrincipal, soloPrincipalListo,
+        soloPrincipal, soloPrincipalListo, regresoAutomatico: vivo?.regreso_automatico === true,
         puedeConfigurarSoloPrincipal: !manual && !congelado && vivo?.escritor === principal.id && (soloPrincipal || vivo.votantes?.length >= 3),
         manualActivo: vivo?.manual_activo === true, degradado: vivo?.degradado === true, habilitado: !!actual.habilitado && !congelado,
         estado: congelado ? "ACTIVANDO" : vivo?.escritor ? "EN_MARCHA" : actual.habilitado ? "SIN_MAYORIA" : "PREPARANDO",

@@ -29,7 +29,7 @@
     var activar = P.btn("Activar reemplazo automático", { tipo: "primario", icono: "check", deshabilitado: true, onclick: activarGrupo });
     var configurarManual = P.btn("Configurar relevo manual con dos PCs", { tipo: "secundario", icono: "check", deshabilitado: true, onclick: function () { activarGrupo(true); } });
     var soloPrincipal = P.btn("Dejar solo la notebook", { tipo: "secundario", onclick: function () { configurarSoloPrincipal(true); } });
-    var restaurarRelevo = P.btn("Reactivar relevo automático", { tipo: "secundario", onclick: function () { configurarSoloPrincipal(false); } });
+    var restaurarRelevo = P.btn("Reactivar relevo ahora", { tipo: "secundario", onclick: function () { configurarSoloPrincipal(false); } });
     var estadoSoloPrincipal = h("p.texto-3", { role: "status", hidden: true, style: { margin: 0 } });
     var revisar = P.btn("Actualizar estado", { tipo: "texto", icono: "refrescar", onclick: function () { cargar(); } });
     var pasos = h("ol", { style: { margin: 0, paddingLeft: "22px" } },
@@ -168,7 +168,7 @@
       var nueva = JSON.stringify({ habilitado: d.habilitado, grupoId: d.grupoId, principal: d.principal, testigo: d.testigo, miembros: lista,
         escritor: d.escritor, degradado: d.degradado, estado: d.estado, puedeActivar: d.puedeActivar, manualActivo: d.manualActivo,
         puedePrepararTestigo: d.puedePrepararTestigo, puedePrepararRespaldo: d.puedePrepararRespaldo, modo: d.modo, mensaje: d.mensaje,
-        soloPrincipal: d.soloPrincipal, soloPrincipalListo: d.soloPrincipalListo });
+        soloPrincipal: d.soloPrincipal, soloPrincipalListo: d.soloPrincipalListo, regresoAutomatico: d.regresoAutomatico });
       if (huella !== nueva) {
         huella = nueva;
         var visible = estadoVisible(d);
@@ -181,9 +181,13 @@
         reducida.hidden = !d.degradado;
         retorno.hidden = !d.habilitado || d.soloPrincipal === true;
         estadoSoloPrincipal.hidden = !d.soloPrincipal;
-        if (!estadoSoloPrincipal.hidden) estadoSoloPrincipal.textContent = d.soloPrincipalListo
-          ? "Podés apagar los respaldos. Mientras esté activo este modo, las cajas dependen de la notebook."
-          : "Dejá las PCs encendidas y completá el cambio antes de apagar los respaldos.";
+        if (!estadoSoloPrincipal.hidden) {
+          estadoSoloPrincipal.textContent = d.soloPrincipalListo
+            ? "Podés apagar los respaldos. Mientras esté activo este modo, las cajas dependen de la notebook."
+            : "Dejá las PCs encendidas y completá el cambio antes de apagar los respaldos.";
+          if (d.soloPrincipalListo && d.regresoAutomatico) estadoSoloPrincipal.textContent +=
+            " El relevo se reactivará solo cuando vuelvas a encender los respaldos y reciban la última copia.";
+        }
         var otras = lista.filter(function (m) { return !d.principal || m.id !== d.principal.id; });
         equipos.hidden = !otras.length; sinEquipos.hidden = !!otras.length;
         P.reemplazar(equipos, otras.map(function (m) {
