@@ -101,16 +101,20 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
       }
       const copias = new Set(vivo?.ultimo_commit?.replicas || []);
       const manual = Boolean(r.quorum.manual);
+      const soloPrincipal = vivo?.solo_principal === true;
+      const soloPrincipalListo = soloPrincipal && vivo.votantes?.length === 1 && vivo.votantes[0] === principal.id;
       if (vivo?.miembros) {
         const porId = new Map([...miembros, ...vivo.miembros].map(m => [m.id, m]));
         for (const id of vivo.retirados || []) porId.delete(id);
         miembros = [...porId.values()].map(m => ({ ...m, actualizado: m.id === vivo.escritor || copias.has(m.id) }));
       }
       miembros = miembros.map(m => ({ ...m, retirando: r.quorum.retiros?.includes(m.id) === true,
-        puedeQuitar: !manual && !congelado && m.id !== principal.id && m.id !== vivo?.escritor && (!actual.habilitado || !!vivo?.escritor) }));
-      return { modo: manual ? "manual" : "quorum", puedeIncorporarEquipo: !manual && !congelado && (!actual.habilitado || !!vivo?.escritor),
+        puedeQuitar: !soloPrincipal && !manual && !congelado && m.id !== principal.id && m.id !== vivo?.escritor && (!actual.habilitado || !!vivo?.escritor) }));
+      return { modo: manual ? "manual" : "quorum", puedeIncorporarEquipo: !soloPrincipal && !manual && !congelado && (!actual.habilitado || !!vivo?.escritor),
         puedePrepararAcceso: !manual && !!vivo?.escritor && !congelado,
         puedeConfigurarManual: !manual && !congelado && !actual.habilitado && r.principalId === equipoId && miembros.length === 2,
+        soloPrincipal, soloPrincipalListo,
+        puedeConfigurarSoloPrincipal: !manual && !congelado && vivo?.escritor === principal.id && (soloPrincipal || vivo.votantes?.length >= 3),
         manualActivo: vivo?.manual_activo === true, degradado: vivo?.degradado === true, habilitado: !!actual.habilitado && !congelado,
         estado: congelado ? "ACTIVANDO" : vivo?.escritor ? "EN_MARCHA" : actual.habilitado ? "SIN_MAYORIA" : "PREPARANDO",
         principal, miembros, escritor: vivo ? miembros.find(m => m.id === vivo.escritor) || null : !actual.habilitado && !congelado ? principal : null };

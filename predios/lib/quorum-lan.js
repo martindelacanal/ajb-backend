@@ -148,6 +148,7 @@ function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
       ...(compacto ? { compacto: true, miembro_autorizado: !!actual } : {
         candidato: lectura.leader, miembros: registro.miembros.map(publico), retirados: registro.retirados || [],
         votantes: lectura.members.filter(m => m.Suffrage === 0).map(m => m.ID),
+        solo_principal: Boolean(registro.soloPrincipal),
       }) };
     return { estado, firma: crypto.sign(null, Buffer.from(JSON.stringify(estado)), llave).toString("base64"), clave_publica: config.clavePublicaTestigo };
   }
@@ -186,6 +187,7 @@ function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
       expected: lectura.register.version, term: lectura.term, configuration: lectura.configuration });
   }
   function revisarRetiro(lectura, id) {
+    if (registro.soloPrincipal) throw error("Reactivá los respaldos antes de cambiar el grupo", 409);
     if (!/^[a-f0-9]{64}$/.test(id) || id === registro.preferidoId || id === lectura.leader) {
       throw error("La PC de origen y la PC en servicio deben permanecer en el grupo", 409);
     }
@@ -196,8 +198,70 @@ function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
     }
     return { objetivo, votantes };
   }
+  function verificarPrincipal(lectura) {
+    if (escritor(lectura)?.id !== registro.preferidoId || config.nodoId !== registro.preferidoId) {
+      throw error("Esperá a que la notebook principal esté en servicio y tenga la última copia", 409);
+    }
+  }
   return {
-    miembros() { return exclusivo(async () => (await leer()).members); },
+    miembrosParaIncorporar() { return exclusivo(async () => {
+      const lectura = await leer();
+      return registro.soloPrincipal ? null : lectura.members;
+    }); },
+    prepararModoPrincipal() { return exclusivo(async () => {
+      const lectura = await leer();
+      verificarPrincipal(lectura);
+      const respaldos = lectura.members.filter(m => m.Suffrage === 0 && m.ID !== config.nodoId).map(m => m.ID);
+      if (registro.soloPrincipal && !respaldos.length) return null;
+      if (!registro.soloPrincipal && respaldos.length < 2) throw error("La mayoría todavía no está lista para preparar el apagado", 409);
+      return { version: lectura.register.version, miembros: registro.miembros.filter(m => (registro.soloPrincipal || respaldos).includes(m.id)) };
+    }); },
+    dejarSoloPrincipal(version) { return exclusivo(async () => {
+      let lectura = await leer();
+      verificarPrincipal(lectura);
+      if (lectura.register.version !== version) throw error("Cambió el grupo. Volvé a intentar el cambio", 409);
+      const respaldos = lectura.members.filter(m => m.Suffrage === 0 && m.ID !== config.nodoId).map(m => m.ID);
+      // Guardar la intención primero. Si se corta la operación, el coordinador
+      // no vuelve a promover por su cuenta a un equipo ya apartado.
+      if (!registro.soloPrincipal) {
+        if (respaldos.length < 2) throw error("La mayoría todavía no está lista para preparar el apagado", 409);
+        await guardar(lectura, { ...registro, soloPrincipal: respaldos });
+      }
+      for (const id of respaldos) {
+        await consenso.pedir("/member", { id, demote: true, expected: lectura.register.version, term: lectura.term, configuration: lectura.configuration });
+        lectura = await leer();
+        verificarPrincipal(lectura);
+      }
+      if (lectura.members.some(m => m.Suffrage === 0 && m.ID !== config.nodoId)) throw error("Esperá la confirmación del grupo antes de apagar los respaldos");
+      return { soloPrincipal: true };
+    }); },
+    prepararReactivacion() { return exclusivo(async () => {
+      const lectura = await leer();
+      verificarPrincipal(lectura);
+      if (!registro.soloPrincipal) return null;
+      return { ultimo: registro.ultimo, version: lectura.register.version,
+        miembros: registro.miembros.filter(m => registro.soloPrincipal.includes(m.id)) };
+    }); },
+    reactivarRespaldos(rev, version, acuses) { return exclusivo(async () => {
+      let lectura = await leer();
+      verificarPrincipal(lectura);
+      if (!registro.soloPrincipal) return { soloPrincipal: false };
+      if (!misma(registro.ultimo, rev) || lectura.register.version !== version) throw error("Cambió la copia confirmada. Volvé a intentar la reactivación", 409);
+      const listos = new Set(acuses.map(acuse => verificarAckReplica(acuse, { grupoId: config.grupoId, escritorId: config.nodoId,
+        termino: lectura.term, ...registro.ultimo, miembros: registro.miembros })));
+      if (!registro.soloPrincipal.every(id => listos.has(id))) throw error("Esperá a que los respaldos tengan la última copia", 409);
+      for (const id of registro.soloPrincipal) {
+        if (lectura.members.some(m => m.ID === id && m.Suffrage === 0)) continue;
+        const miembro = registro.miembros.find(m => m.id === id);
+        await cambiarMembresia(lectura, miembro, true);
+        lectura = await leer();
+        verificarPrincipal(lectura);
+      }
+      const restaurado = { ...registro };
+      delete restaurado.soloPrincipal;
+      await guardar(lectura, restaurado);
+      return { soloPrincipal: false };
+    }); },
     transferirAlPrincipal(id, rev, termino, acuse) { return exclusivo(async () => {
       const lectura = await leer();
       if (id !== registro.preferidoId || escritor(lectura)?.id !== config.nodoId ||
@@ -236,12 +300,14 @@ function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
     }); },
     prepararMiembro(miembro) { return exclusivo(async () => {
       const lectura = await leer();
+      if (registro.soloPrincipal) throw error("Reactivá los respaldos antes de cambiar el grupo", 409);
       if (registro.retirados?.includes(miembro.id)) throw error("Esta PC fue retirada del grupo", 409);
       if (!registro.miembros.some(m => m.id === miembro.id)) await guardar(lectura, { ...registro, miembros: [...registro.miembros, miembro] });
       return { ultimo: registro.ultimo, version: lectura.register.version };
     }); },
     unirMiembro(miembro, revision, versionRemota) { return exclusivo(async () => {
       const lectura = await leer();
+      if (registro.soloPrincipal) throw error("Reactivá los respaldos antes de cambiar el grupo", 409);
       if (registro.retirados?.includes(miembro.id)) throw error("Esta PC fue retirada del grupo", 409);
       if (!misma(registro.ultimo, revision)) throw error("La copia del equipo cambió mientras se incorporaba");
       const actual = lectura.members.find(m => m.ID === miembro.id);

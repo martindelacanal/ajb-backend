@@ -416,6 +416,13 @@ function rutaGaleria(req, res, rutaApi) {
 async function rutaSistema(ctx, metodo, ruta, req, res) {
   if (ctx.usuario?.rol !== "ADMIN") throw U.error("Esta sección es del administrador", 403);
   if (metodo === "GET" && ruta === "/sistema/grupo-local") return grupoLocal.estado();
+  if (metodo === "POST" && ruta === "/sistema/grupo-local/solo-principal") {
+    controlEquipo.comprobar();
+    if (!configHa?.quorum || !ha) throw U.error("Esta opción requiere un grupo con relevo automático", 409);
+    const { activo } = await leerCuerpo(req, 1000);
+    if (typeof activo !== "boolean") throw U.error("Elegí si la notebook queda como único servidor", 400);
+    return ha.configurarSoloPrincipal(activo);
+  }
   if (metodo === "POST" && ruta === "/sistema/grupo-local/incorporar-equipo") {
     controlEquipo.comprobar();
     // El botón puede usarse desde HTTP en la LAN. La transferencia de datos

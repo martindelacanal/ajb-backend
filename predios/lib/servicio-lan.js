@@ -122,6 +122,36 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
     ...core, configuracion: c, transporte,
     origenIncorporacion(cabecera, ip) { return cliente ? origenAcreditado(cabecera, c, miembros(), ip, ubicacion) : null; },
     consultarQuorum: estadoTestigo,
+    configurarSoloPrincipal(activo) {
+      return db.exclusivo(async () => {
+        if (!autoridad || !core.estado().escritor) throw Object.assign(new Error("La notebook principal debe estar en servicio"), { status: 409 });
+        if (activo) {
+          const plan = await autoridad.prepararModoPrincipal();
+          if (!plan) return { soloPrincipal: true };
+          await Promise.all(plan.miembros.map(async m => {
+            const listo = await pedirMiembro(m, "/lan/quorum/listo", { cuerpo: {} }).catch(() => null);
+            if (listo?.equipo !== m.id || !listo.consenso || listo.version !== plan.version) {
+              throw Object.assign(new Error(`Dejá ${m.nombre} encendida y esperá a que se conecte antes de preparar el apagado`), { status: 409 });
+            }
+          }));
+          return autoridad.dejarSoloPrincipal(plan.version);
+        }
+        const plan = await autoridad.prepararReactivacion();
+        if (!plan) return { soloPrincipal: false };
+        const copia = core.copiaDelEscritor(plan.ultimo);
+        const acuses = await Promise.all(plan.miembros.map(async m => {
+          try {
+            const acuse = await transporte.replicar(m, copia);
+            const listo = await pedirMiembro(m, "/lan/quorum/listo", { cuerpo: {} });
+            if (listo.equipo !== m.id || !listo.consenso || listo.version !== plan.version) throw new Error("El registro todavía no se actualizó");
+            return acuse;
+          } catch (_e) {
+            throw Object.assign(new Error(`Encendé ${m.nombre} y esperá a que reciba la última copia antes de reactivar el relevo`), { status: 409 });
+          }
+        }));
+        return autoridad.reactivarRespaldos(plan.ultimo, plan.version, acuses);
+      });
+    },
     revisarRetiro,
     retirarQuorum,
     async iniciar() {
@@ -143,10 +173,12 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
     },
     async promoverQuorum(r, disponibles, haQuorum, pedirEquipo) {
       if (!autoridad || !core.estado().escritor) return;
+      const miembrosRaft = await autoridad.miembrosParaIncorporar();
+      if (!miembrosRaft) return;
       for (const id of r.quorum.retiros || []) {
         if (!ultimoEstado?.retirados?.includes(id)) await retirarQuorum(id);
       }
-      const votantes = new Set((await autoridad.miembros()).filter(m => m.Suffrage === 0).map(m => m.ID));
+      const votantes = new Set(miembrosRaft.filter(m => m.Suffrage === 0).map(m => m.ID));
       for (const m of await disponibles({ ...r, miembros: r.miembros.filter(n => !votantes.has(n.id)) })) {
         await db.exclusivo(async () => {
           if (!core.estado().escritor) return;

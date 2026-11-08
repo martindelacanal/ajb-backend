@@ -391,7 +391,13 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
     const votos = new Set(w.votantes), necesarias = Math.floor(votos.size / 2);
     const peticiones = otros.map(m => ({
       vota: votos.has(m.id),
-      acuse: Promise.resolve().then(() => transporte.replicar(m, packet)),
+      acuse: Promise.resolve().then(async () => {
+        const acuse = await transporte.replicar(m, packet);
+        // Una dirección anterior puede responder desde otra PC tras un cambio
+        // de IP. Esperar al votante pedido antes de contar esa copia.
+        if (acuse?.ack?.nodo_id !== m.id) throw error("La copia respondió desde otra PC");
+        return acuse;
+      }),
     }));
     const votantes = peticiones.filter(p => p.vota).map(p => p.acuse);
     for (const p of peticiones) if (!p.vota) p.acuse.catch(() => {});

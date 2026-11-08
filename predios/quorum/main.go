@@ -334,7 +334,7 @@ func (c *consensus) serve(key string) http.Handler {
 			var request struct {
 				peer
 				Expected, Term, Configuration uint64
-				Voter, Remove                 bool
+				Voter, Remove, Demote         bool
 			}
 			if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&request) != nil || !identifier.MatchString(request.ID) {
 				w.WriteHeader(http.StatusBadRequest)
@@ -346,7 +346,29 @@ func (c *consensus) serve(key string) http.Handler {
 			}
 			var change raft.IndexFuture
 			id := raft.ServerID(request.ID)
-			if request.Remove {
+			if request.Demote {
+				var group struct {
+					PreferidoID   string
+					SoloPrincipal []string
+				}
+				if id == leader || request.Remove || request.Voter ||
+					json.Unmarshal(current.Data, &group) != nil || group.PreferidoID != string(leader) {
+					w.WriteHeader(http.StatusConflict)
+					return
+				}
+				autorizado := false
+				for _, backup := range group.SoloPrincipal {
+					if backup == request.ID {
+						autorizado = true
+						break
+					}
+				}
+				if !autorizado {
+					w.WriteHeader(http.StatusConflict)
+					return
+				}
+				change = c.raft.DemoteVoter(id, peers.Index(), wait)
+			} else if request.Remove {
 				if id == leader {
 					w.WriteHeader(http.StatusConflict)
 					return

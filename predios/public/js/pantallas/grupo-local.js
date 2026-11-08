@@ -28,6 +28,9 @@
     equipo.hidden = true;
     var activar = P.btn("Activar reemplazo automático", { tipo: "primario", icono: "check", deshabilitado: true, onclick: activarGrupo });
     var configurarManual = P.btn("Configurar relevo manual con dos PCs", { tipo: "secundario", icono: "check", deshabilitado: true, onclick: function () { activarGrupo(true); } });
+    var soloPrincipal = P.btn("Dejar solo la notebook", { tipo: "secundario", onclick: function () { configurarSoloPrincipal(true); } });
+    var restaurarRelevo = P.btn("Reactivar relevo automático", { tipo: "secundario", onclick: function () { configurarSoloPrincipal(false); } });
+    var estadoSoloPrincipal = h("p.texto-3", { role: "status", hidden: true, style: { margin: 0 } });
     var revisar = P.btn("Actualizar estado", { tipo: "texto", icono: "refrescar", onclick: function () { cargar(); } });
     var pasos = h("ol", { style: { margin: 0, paddingLeft: "22px" } },
       h("li", "Instalá el testigo en una PC de caja que permanezca encendida. Es liviano y no guarda la base de ventas ni stock."),
@@ -39,12 +42,13 @@
     var datosTestigo = h("div.dato", h("span", "Testigo en la red"), pcTestigo);
     var panel = h("section.hoja.hoja-cuerpo.columna", { "aria-label": "PCs de respaldo del predio" },
       h("div.fila-separada", h("h2.seccion-titulo", "PCs de respaldo"), estado),
-      h("p.texto-3", { style: { margin: 0 } }, "Podés seguir trabajando con una sola PC. Si agregás respaldos, otra PC puede continuar atendiendo las cajas cuando falle la que está en servicio."),
+      h("p.texto-3", { style: { margin: 0 } }, "Los respaldos permiten que las cajas sigan atendiendo si falla la PC en servicio."),
       h("div.datos", h("div.dato", h("span", "PC en servicio"), pcServicio), h("div.dato", h("span", "PC de origen"), preferida), datosTestigo),
       mensaje, problema, reducida,
       pasos, ayudaEquipo, ayudaManual,
       equipos, sinEquipos, retorno,
       h("div.fila", equipo, testigo, respaldo, acceso, accesoQuorum, activar, configurarManual), ayudaCaja, ayudaAcceso,
+      estadoSoloPrincipal, h("div.fila", soloPrincipal, restaurarRelevo),
       aviso, h("div.fila", revisar));
 
     function actualizarControles() {
@@ -65,7 +69,31 @@
       activar.hidden = unificado || (!!datos && (datos.estado === "EN_MARCHA" || datos.estado === "SIN_TESTIGO"));
       configurarManual.hidden = !datos || !datos.puedeConfigurarManual;
       configurarManual.disabled = ocupado || configurarManual.hidden;
+      var grupoActivo = datos?.habilitado && datos.modo === "quorum";
+      soloPrincipal.hidden = !grupoActivo || datos.soloPrincipalListo === true;
+      restaurarRelevo.hidden = !grupoActivo || datos.soloPrincipal !== true;
+      soloPrincipal.disabled = restaurarRelevo.disabled = ocupado || !datos?.puedeConfigurarSoloPrincipal;
       revisar.disabled = consultando || activando;
+    }
+    function configurarSoloPrincipal(activo) {
+      if (trabajando || confirmando || activando || cerrado || !datos?.puedeConfigurarSoloPrincipal) return;
+      var boton = activo ? soloPrincipal : restaurarRelevo;
+      confirmando = true; actualizarControles();
+      P.confirmar(activo
+        ? "Dejá los respaldos encendidos hasta que el sistema confirme el cambio. Desde entonces, la notebook podrá atender sola. Si se apaga, las cajas quedan sin servicio hasta que vuelva."
+        : "Encendé los respaldos y mantenelos en la misma red. El relevo automático vuelve cuando reciban la última copia.",
+        { titulo: activo ? "¿Dejar solo la notebook?" : "¿Reactivar el relevo automático?", aceptar: activo ? "Dejar solo la notebook" : "Reactivar relevo" }).then(function (ok) {
+        confirmando = false;
+        if (!ok || cerrado) { if (!cerrado) actualizarControles(); return; }
+        trabajando = true; actualizarControles();
+        return P.ejecutar(boton, function () {
+          return P.post("/sistema/grupo-local/solo-principal", { activo: activo }).then(function () {
+            if (cerrado) return;
+            aviso.textContent = activo ? "La notebook quedó como único servidor. Ya podés apagar los respaldos." : "El relevo automático volvió a quedar activo.";
+            aviso.hidden = false;
+          });
+        }).catch(function () {}).finally(function () { trabajando = false; if (!cerrado) { actualizarControles(); cargar(); } });
+      }).catch(function (e) { confirmando = false; if (!cerrado) { actualizarControles(); P.error(e); } });
     }
     function descargarAcceso() {
       if (trabajando || cerrado) return;
@@ -123,6 +151,7 @@
     }
     function estadoVisible(d) {
       if (d.modo === "manual" && d.estado === "EN_MARCHA") return [d.manualActivo ? "Caja en relevo manual" : "Relevo manual preparado", "CONFIRMADA"];
+      if (d.soloPrincipal) return d.soloPrincipalListo ? ["Notebook como único servidor", "PENDIENTE"] : ["Cambio pendiente", "PENDIENTE"];
       var estados = {
         SIN_CONFIGURAR: ["Una sola PC", "CONFIRMADA"],
         PREPARANDO: ["Preparando las PCs", "PENDIENTE"],
@@ -138,7 +167,8 @@
       var lista = (d.miembros || []).slice().sort(function (a, b) { return String(a.id).localeCompare(String(b.id)); });
       var nueva = JSON.stringify({ habilitado: d.habilitado, grupoId: d.grupoId, principal: d.principal, testigo: d.testigo, miembros: lista,
         escritor: d.escritor, degradado: d.degradado, estado: d.estado, puedeActivar: d.puedeActivar, manualActivo: d.manualActivo,
-        puedePrepararTestigo: d.puedePrepararTestigo, puedePrepararRespaldo: d.puedePrepararRespaldo, modo: d.modo, mensaje: d.mensaje });
+        puedePrepararTestigo: d.puedePrepararTestigo, puedePrepararRespaldo: d.puedePrepararRespaldo, modo: d.modo, mensaje: d.mensaje,
+        soloPrincipal: d.soloPrincipal, soloPrincipalListo: d.soloPrincipalListo });
       if (huella !== nueva) {
         huella = nueva;
         var visible = estadoVisible(d);
@@ -149,7 +179,11 @@
         mensaje.hidden = !d.mensaje && d.estado !== "SIN_TESTIGO";
         if (!mensaje.hidden) P.reemplazar(mensaje, P.mensaje(d.mensaje || "Encendé la PC testigo y verificá que esté conectada a la red del predio.", d.estado === "SIN_TESTIGO" ? "aviso" : "info"));
         reducida.hidden = !d.degradado;
-        retorno.hidden = !d.habilitado;
+        retorno.hidden = !d.habilitado || d.soloPrincipal === true;
+        estadoSoloPrincipal.hidden = !d.soloPrincipal;
+        if (!estadoSoloPrincipal.hidden) estadoSoloPrincipal.textContent = d.soloPrincipalListo
+          ? "Podés apagar los respaldos. Mientras esté activo este modo, las cajas dependen de la notebook."
+          : "Dejá las PCs encendidas y completá el cambio antes de apagar los respaldos.";
         var otras = lista.filter(function (m) { return !d.principal || m.id !== d.principal.id; });
         equipos.hidden = !otras.length; sinEquipos.hidden = !!otras.length;
         P.reemplazar(equipos, otras.map(function (m) {

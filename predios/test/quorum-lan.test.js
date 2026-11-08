@@ -25,8 +25,8 @@ async function cerrar(s) {
   if (s.listening) await new Promise(resolve => { s.close(resolve); s.closeAllConnections(); });
 }
 
-test("el grupo releva tras cambiar las IP y devuelve el servicio a la principal con las ventas del respaldo", {
-  skip: !ejecutable, timeout: 120000,
+test("el grupo releva tras cambiar las IP y permite un apagado previsto con la principal en servicio", {
+  skip: !ejecutable, timeout: 150000,
 }, async t => {
   const raiz = fs.mkdtempSync(path.join(os.tmpdir(), "ajb-quorum-"));
   const grupoId = "quorum_fixture", claveDatos = "f".repeat(64), secreto = "e".repeat(64);
@@ -221,10 +221,55 @@ test("el grupo releva tras cambiar las IP y devuelve el servicio a la principal 
   assert.equal(leer(principal), "203");
   await comprobarAcceso(segundo, principal);
   await escribir(principal, 204);
+  async function configurarModo(activo) {
+    let ultimoError;
+    for (const limite = Date.now() + 10000; Date.now() < limite;) {
+      try { return await principal.servicio.configurarSoloPrincipal(activo); }
+      catch (e) { ultimoError = e; await esperar(200); }
+    }
+    throw ultimoError;
+  }
+  assert.deepEqual(await configurarModo(true), { soloPrincipal: true });
+  const modoSolo = await principal.servicio.consultarQuorum();
+  assert.equal(modoSolo.solo_principal, true);
+  assert.deepEqual(modoSolo.votantes, [principal.id]);
   caja.disponible = false; caja.servicio.detener();
   segundo.disponible = false; segundo.servicio.detener();
-  await assert.rejects(escribir(principal, 303));
-  assert.equal(principal.servicio.estado().escritor, false);
+  await escribir(principal, 205);
+  await assert.rejects(principal.servicio.configurarSoloPrincipal(false), /Encendé/);
+  // Incluso tras reiniciar la notebook sola, el grupo conserva su decisión y
+  // la venta que se confirmó sin respaldos conectados.
+  principal.servicio.detener();
+  await principal.db.exclusivo(() => {});
+  principal.db.cerrar();
+  aplicarPendiente({ base: principal.base, config: principal.config });
+  abrirDB(principal); abrir(principal);
+  principal.db.configurarTransacciones(principal.servicio);
+  principal.servicio.iniciar().catch(e => logs.push(e.message));
+  await lider(principal);
+  assert.equal(leer(principal), "205");
+  await escribir(principal, 206);
+  for (const n of [caja, segundo]) {
+    await n.db.exclusivo(() => {});
+    n.db.cerrar();
+    aplicarPendiente({ base: n.base, config: n.config });
+    abrirDB(n); abrir(n);
+    n.db.configurarTransacciones(n.servicio);
+    n.disponible = true;
+    n.servicio.iniciar().catch(e => logs.push(e.message));
+  }
+  assert.deepEqual(await configurarModo(false), { soloPrincipal: false });
+  const modoNormal = await principal.servicio.consultarQuorum();
+  assert.equal(modoNormal.solo_principal, false);
+  assert.equal(modoNormal.votantes.length, 3);
+  principal.disponible = false; principal.servicio.detener();
+  const respaldoActivo = await lider();
+  assert.notEqual(respaldoActivo, principal);
+  assert.equal(leer(respaldoActivo), "206", "el respaldo recupera la venta confirmada cuando la notebook operaba sola");
+  const otroRespaldo = respaldoActivo === caja ? segundo : caja;
+  otroRespaldo.disponible = false; otroRespaldo.servicio.detener();
+  await assert.rejects(escribir(respaldoActivo, 303));
+  assert.equal(respaldoActivo.servicio.estado().escritor, false);
 });
 
 test("el coordinador incorpora un equipo como votante después de replicarle el registro", { skip: !ejecutable, timeout: 30000 }, async t => {
