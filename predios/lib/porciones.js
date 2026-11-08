@@ -63,4 +63,4 @@ async function guardar(t, ctx, id, destino, receta) {
   await N.guardarConfig(t, ctx, PREFIJO_RINDE + id, String(rendimiento));
 }
 
-module.exports = { joinStockVenta, stockVentaSql, porcionesDisponiblesSql, leer, guardar, quitar, esInsumo, disponibles, consumo };
+module.exports = { joinReceta, joinStockVenta, stockVentaSql, porcionesDisponiblesSql, leer, guardar, quitar, esInsumo, disponibles, consumo };

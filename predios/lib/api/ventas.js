@@ -7,6 +7,7 @@ const U = require("../util");
 const { verificarOperador } = require("../turnos-caja");
 const N = require("../negocio");
 const Porciones = require("../porciones");
+const Balanza = require("../../public/js/balanza");
 const { productoEnBoca, bloquearPrecios } = require("../precio-boca");
 const { emitirAviso } = require("../avisos");
 const { autorizacionDescuento } = require("../autorizacion-descuento");
@@ -120,6 +121,8 @@ async function crearVenta(ctx) {
 
   const agrupados = new Map();
   const preciosEsperados = new Map();
+  // Etiquetas de balanza por producto: el peso de cada una es la cantidad de su renglón.
+  const etiquetas = new Map();
   for (const it of items) {
     if (!it || typeof it !== "object") throw U.error("Revisá los productos de la venta.");
     const productoId = U.id(it.producto_id, "El producto");
@@ -131,6 +134,11 @@ async function crearVenta(ctx) {
     }
     const cantidad = U.numero(it.cantidad, { min: 0.001, max: 99999, decimales: 3, campo: "La cantidad" });
     agrupados.set(productoId, U.redondear((agrupados.get(productoId) || 0) + cantidad, 3));
+    if (it.etiqueta !== undefined && it.etiqueta !== null && it.etiqueta !== "") {
+      const codigo = String(it.etiqueta).trim();
+      if (!/^\d{13}$/.test(codigo)) throw U.error("La etiqueta de balanza no es válida. Volvé a escanearla.", 400, { codigo: "ETIQUETA_INVALIDA" });
+      etiquetas.set(productoId, [...(etiquetas.get(productoId) || []), { codigo, kg: cantidad }]);
+    }
   }
 
   return ctx.db.tx(async (t) => {
@@ -168,6 +176,19 @@ async function crearVenta(ctx) {
       const p = await productoEnBoca(t, ctx, productoId, caja.boca_id, { bloquear: true });
       if (!p) throw U.error("Uno de los productos no existe", 404);
       productos.set(productoId, p);
+    }
+    if (etiquetas.size) {
+      // La etiqueta tiene que ser de ese producto (mismo código) y traer exactamente ese peso.
+      const config = await N.leerConfig(t, ctx);
+      for (const [productoId, lista] of etiquetas) {
+        const p = productos.get(productoId);
+        for (const e of lista) {
+          const leida = Balanza.leer(e.codigo, config);
+          if (!leida || p.unidad !== "KG" || leida.codigo !== String(p.codigo || "") || Math.abs(leida.kg - e.kg) > 0.0005) {
+            throw U.error(`La etiqueta ${e.codigo} no corresponde a «${p.nombre}» o a ese peso. Sacá el renglón y volvé a escanearla.`, 409, { codigo: "ETIQUETA_INVALIDA" });
+          }
+        }
+      }
     }
     for (const [productoId, cantidad] of agrupados) {
       const p = productos.get(productoId);
@@ -252,6 +273,8 @@ async function crearVenta(ctx) {
       await N.insertar(t, ctx, "predio_venta_item", {
         venta_id: ventaId, producto_id: l.producto.id, descripcion: l.producto.nombre, codigo: l.producto.codigo,
         cantidad: l.cantidad, precio_unitario: l.precio, subtotal: l.subtotal, destino: l.producto.destino,
+        unidad: l.producto.unidad === "KG" ? "KG" : null,
+        etiquetas: etiquetas.has(Number(l.producto.id)) ? JSON.stringify(etiquetas.get(Number(l.producto.id))) : null,
       });
       if (l.producto.destino !== "ALQUILER") {
         await N.moverStock(t, ctx, {

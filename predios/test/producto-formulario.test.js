@@ -81,7 +81,7 @@ async function pantalla(t, { nuevo = false, producto = {}, fechas } = {}) {
     h,
     ruta: { registrar() {} },
     f: {
-      numero: v => numero.format(Number(v) || 0), pesos: v => "$ " + numero.format(Number(v) || 0), pct: v => numero.format(v) + " %",
+      numero: v => numero.format(Number(v) || 0), cantidad: (v, unidad) => numero.format(Number(v) || 0) + (unidad === "KG" ? " kg" : ""), pesos: v => "$ " + numero.format(Number(v) || 0), pct: v => numero.format(v) + " %",
       fechaHora(v) {
         if (!v) return "";
         const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(String(v));
@@ -113,7 +113,13 @@ async function pantalla(t, { nuevo = false, producto = {}, fechas } = {}) {
       label.input = input;
       return label;
     },
-    segmentado: () => h("nav"),
+    segmentado: (_opciones, valor) => {
+      const el = h("nav");
+      el.valor = () => valor;
+      el.fijar = (v) => { valor = v; };
+      return el;
+    },
+    balanza: require("../public/js/balanza"),
     btn: (texto, op) => h("button", { onclick: op.onclick }, texto),
     modal(op) { modal = op; return { cerrar() {} }; },
     get: ruta => llamar("GET", ruta),

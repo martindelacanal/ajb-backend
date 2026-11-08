@@ -23,6 +23,8 @@ const modulos = [
   require("./caja"),
   require("./afiliados"),
   require("./permisos"),
+  require("./conteo"),
+  require("./pesables"),
 ];
 
 async function metaListado(ctx) {
@@ -31,6 +33,8 @@ async function metaListado(ctx) {
 
 async function verListado(ctx) {
   const nombre = ctx.params.nombre;
+  // Mientras el cajero cuenta a ciegas no puede mirar lo que dice el sistema.
+  if (["stock", "movimientos", "productos"].includes(nombre)) await require("./conteo").exigirSinConteo(ctx.db, ctx);
   if (nombre === "productos") {
     const almacen = await N.bocaAlmacen(ctx.db, ctx);
     ctx.almacenId = almacen && (!esSupervisor(ctx) || bocasDe(ctx).includes(Number(almacen.id))) ? almacen.id : null;

@@ -90,7 +90,7 @@
           return P.get("/productos/buscar" + P.qs({ q: busqueda, contexto: "aviso", boca_id: puesto.boca_id })).then(function (productos) {
             return productos.map(function (p) {
               return { valor: p.id, texto: p.nombre, codigo: p.codigo, exacto: p.exacto, requiereEleccion: !!p.sugerido, dato: p, busqueda: busqueda,
-                detalle: [p.codigo ? "Código " + p.codigo : null, "Stock: " + P.f.numero(p.stock_boca), Number(p.precio_venta) > 0 ? null : "Sin precio", p.destino === "USO_INTERNO" ? "Uso interno" : null].filter(Boolean).join(" · "),
+                detalle: [p.codigo ? "Código " + p.codigo : null, p.stock_oculto ? null : "Stock: " + P.f.cantidad(p.stock_boca, p.unidad), Number(p.precio_venta) > 0 ? null : "Sin precio", p.destino === "USO_INTERNO" ? "Uso interno" : null].filter(Boolean).join(" · "),
                 lado: Number(p.precio_venta) > 0 ? P.f.pesos(p.precio_venta) : "Sin precio" };
             });
           });
@@ -132,7 +132,7 @@
         P.reemplazar(enviar, P.icono(disponible ? "mas" : soloInformar() ? "check" : "mensaje"), disponible ? "Agregar a la venta" : soloInformar() ? "Entendido" : "Enviar aviso");
         enviar.disabled = enviando || (!p && buscador.input.value.trim().length < 2);
         P.reemplazar(informacion,
-          p ? h("div.datos", P.dato("Producto", p.nombre), P.dato("Código de barras", p.codigo), P.dato("Stock en la boca", P.f.numero(p.stock_boca))) : null,
+          p ? h("div.datos", P.dato("Producto", p.nombre), P.dato("Código de barras", p.codigo), p.stock_oculto ? null : P.dato("Stock en la boca", P.f.cantidad(p.stock_boca, p.unidad))) : null,
           P.mensaje(interno ? "Este producto es de uso interno y no se vende. Su ficha se muestra sólo para consultar."
             : sinPrecio
             ? "«" + p.nombre + "» no tiene precio de venta cargado. Pedile al administrador que lo cargue antes de venderlo."
@@ -193,12 +193,82 @@
       if (!p) return;
       if (p.destino === "USO_INTERNO") { P.aviso("«" + p.nombre + "» es de uso interno y no se vende", "error"); return; }
       if (!(Number(p.precio_venta) > 0)) { P.aviso("«" + p.nombre + "» no tiene precio de venta: pedile al administrador que lo cargue", "error"); combo.foco(); return; }
-      var existente = estado.items.filter(function (i) { return i.producto.id === p.id; })[0];
+      var pesable = p.unidad === "KG";
+      // Etiqueta de balanza: cada paquete es un renglón con el peso de la etiqueta.
+      if (p.etiqueta && pesable) {
+        var repetida = estado.items.some(function (i) { return i.etiqueta === p.etiqueta; });
+        var sumarEtiqueta = function () {
+          estado.items.push({ producto: p, cantidad: P.redondear(p.peso, 3), etiqueta: p.etiqueta });
+          estado.resaltar = p.id;
+          pintarTodo();
+          combo.foco();
+        };
+        if (!repetida) { sumarEtiqueta(); return; }
+        P.confirmar("Esta etiqueta (" + P.f.kilos(p.peso) + " de «" + p.nombre + "») ya está en la venta. ¿Es otro paquete con el mismo peso?", { titulo: "Etiqueta repetida", aceptar: "Sí, es otro paquete" })
+          .then(function (ok) { if (ok) sumarEtiqueta(); else combo.foco(); });
+        return;
+      }
+      if (p.etiqueta) P.aviso("La etiqueta de balanza trae " + P.f.kilos(p.peso) + ", pero «" + p.nombre + "» se vende por unidad: se sumó 1. Revisá la cantidad.", "info", 7000);
+      // Pesable sin etiqueta (no se pudo leer o se pesó en otra balanza): se escribe el peso.
+      if (pesable) {
+        pedirPeso(p).then(function (kg) {
+          if (kg) {
+            var manual = estado.items.filter(function (i) { return i.producto.id === p.id && !i.etiqueta; })[0];
+            if (manual) manual.cantidad = P.redondear(manual.cantidad + kg, 3);
+            else estado.items.push({ producto: p, cantidad: kg });
+            estado.resaltar = p.id;
+            pintarTodo();
+          }
+          combo.foco();
+        });
+        return;
+      }
+      var existente = estado.items.filter(function (i) { return i.producto.id === p.id && !i.etiqueta; })[0];
       if (existente) existente.cantidad = P.redondear(existente.cantidad + 1, 3);
       else { existente = { producto: p, cantidad: 1 }; estado.items.push(existente); }
       estado.resaltar = p.id;
       pintarTodo();
       combo.foco();
+    }
+
+    // Peso de un producto que se vende por kilo, en kilos o en gramos, con el importe a la vista.
+    function pedirPeso(p) {
+      return new Promise(function (resolver) {
+        var unidad = "kg";
+        var listo = null;
+        var valor = P.input({ inputmode: "decimal", placeholder: "Ej.: 0,250", autofocus: true });
+        var importe = h("p.texto-3", { "aria-live": "polite" }, "Precio: " + P.f.pesos(p.precio_venta) + " por kilo.");
+        var selector = P.segmentado([{ valor: "kg", texto: "Kilos" }, { valor: "g", texto: "Gramos" }], unidad, function (v) {
+          unidad = v;
+          valor.placeholder = v === "g" ? "Ej.: 250" : "Ej.: 0,250";
+          calcular();
+          valor.focus();
+        });
+        function kilos() {
+          var n = P.numeroDe(valor.value);
+          if (!(n > 0)) return null;
+          return P.redondear(unidad === "g" ? n / 1000 : n, 3);
+        }
+        function calcular() {
+          var kg = kilos();
+          importe.textContent = kg ? P.f.kilos(kg) + " × " + P.f.pesos(p.precio_venta) + "/kg = " + P.f.pesos(P.redondear(p.precio_venta * kg, 2)) : "Precio: " + P.f.pesos(p.precio_venta) + " por kilo.";
+        }
+        valor.addEventListener("input", calcular);
+        var aceptar = P.btn("Agregar", { tipo: "primario", icono: "mas", onclick: function () {
+          var kg = kilos();
+          if (!kg || kg > 99.999) { valor.classList.add("invalido"); valor.focus(); P.aviso("Escribí el peso (hasta 99,999 kg)", "error"); return; }
+          listo = kg;
+          m.cerrar();
+        } });
+        valor.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); aceptar.click(); } });
+        var m = P.modal({
+          titulo: "¿Cuánto pesa?", subtitulo: p.nombre + (p.codigo ? " · Código " + p.codigo : ""),
+          contenido: h("div.columna", P.campo("Peso", h("div.fila", valor, selector)), importe,
+            h("p.texto-3.chico", { style: { margin: 0 } }, "Si tenés la etiqueta de la balanza, escaneala: carga el peso sola y queda registrada.")),
+          acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), aceptar],
+          alCerrar: function () { resolver(listo); },
+        });
+      });
     }
 
     function pintarItems() {
@@ -211,9 +281,39 @@
           h("span.chico", "También podés buscarlo por nombre y elegirlo en la lista. Un código completo que coincide se carga con Enter.")));
         return;
       }
+      // Cuánto se pide de cada producto entre todos sus renglones (varias etiquetas del mismo fiambre).
+      var pedidoPorProducto = {};
+      estado.items.forEach(function (it) { pedidoPorProducto[it.producto.id] = P.redondear((pedidoPorProducto[it.producto.id] || 0) + it.cantidad, 3); });
       var filas = estado.items.map(function (it, i) {
-        var cant = h("input.campo-control", { value: P.f.numero(it.cantidad), inputmode: "decimal", "aria-label": "Cantidad de " + it.producto.nombre });
+        var pesable = it.producto.unidad === "KG";
+        var sinStock = !it.producto.stock_oculto && it.producto.stock_boca < pedidoPorProducto[it.producto.id];
+        var quitar = h("td.acciones", P.btn("", { tipo: "texto", chico: true, icono: "cerrar", etiqueta: "Quitar", onclick: function () { estado.items.splice(i, 1); pintarTodo(); combo.foco(); } }));
+        var detalle = h("div.texto-3.chico", [it.producto.codigo, it.etiqueta ? "Etiqueta " + it.etiqueta : (pesable ? "Peso cargado a mano" : null),
+          sinStock ? "Stock en la boca: " + P.f.cantidad(it.producto.stock_boca, it.producto.unidad) : null].filter(Boolean).join(" · "));
+        var importe = h("td.der.dinero", P.f.pesos(it.producto.precio_venta) + (pesable ? "/kg" : ""));
+        if (it.etiqueta) {
+          // El peso de la etiqueta no se edita: si está mal, se quita el renglón y se vuelve a pesar.
+          camposCantidad[i] = null;
+          return h("tr" + (estado.resaltar === it.producto.id ? ".nuevo" : ""),
+            h("td", h("div.cant.cant-balanza", { title: "Peso de la etiqueta de balanza" }, P.icono("candado"), h("strong.numero", P.f.kilos(it.cantidad)))),
+            h("td", h("strong", it.producto.nombre), detalle), importe,
+            h("td.der.dinero.fuerte", P.f.pesos(subtotal(it))), quitar);
+        }
+        var cant = h("input.campo-control", { value: P.f.numero(it.cantidad), inputmode: "decimal", "aria-label": (pesable ? "Kilos de " : "Cantidad de ") + it.producto.nombre });
         camposCantidad[i] = cant;
+        if (pesable) {
+          cant.addEventListener("change", function () {
+            var n = P.numeroDe(cant.value);
+            if (!(n > 0)) { cant.value = P.f.numero(it.cantidad); return; }
+            it.cantidad = P.redondear(n, 3);
+            pintarTodo();
+          });
+          cant.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); cant.blur(); combo.foco(); } });
+          return h("tr" + (estado.resaltar === it.producto.id ? ".nuevo" : ""),
+            h("td", h("div.cant.cant-peso", cant, h("span.cant-unidad", "kg"))),
+            h("td", h("strong", it.producto.nombre), detalle), importe,
+            h("td.der.dinero.fuerte", P.f.pesos(subtotal(it))), quitar);
+        }
         cant.addEventListener("change", function () {
           var n = P.numeroDe(cant.value);
           if (!(n > 0)) { cant.value = P.f.numero(it.cantidad); return; }
@@ -221,16 +321,13 @@
           pintarTodo();
         });
         cant.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); cant.blur(); combo.foco(); } });
-        var sinStock = it.producto.stock_boca < it.cantidad;
         return h("tr" + (estado.resaltar === it.producto.id ? ".nuevo" : ""),
           h("td", h("div.cant",
             P.btn("", { tipo: "texto", chico: true, icono: "menos", etiqueta: "Restar uno", onclick: function () { if (it.cantidad > 1) { it.cantidad = P.redondear(it.cantidad - 1, 3); pintarTodo(); } } }),
             cant,
             P.btn("", { tipo: "texto", chico: true, icono: "mas", etiqueta: "Sumar uno", onclick: function () { it.cantidad = P.redondear(it.cantidad + 1, 3); pintarTodo(); } }))),
-          h("td", h("strong", it.producto.nombre), h("div.texto-3.chico", [it.producto.codigo, sinStock ? "Stock en la boca: " + P.f.numero(it.producto.stock_boca) : null].filter(Boolean).join(" · "))),
-          h("td.der.dinero", P.f.pesos(it.producto.precio_venta)),
-          h("td.der.dinero.fuerte", P.f.pesos(subtotal(it))),
-          h("td.acciones", P.btn("", { tipo: "texto", chico: true, icono: "cerrar", etiqueta: "Quitar", onclick: function () { estado.items.splice(i, 1); pintarTodo(); combo.foco(); } })));
+          h("td", h("strong", it.producto.nombre), detalle), importe,
+          h("td.der.dinero.fuerte", P.f.pesos(subtotal(it))), quitar);
       });
       var vaciarItems = P.btn("", { tipo: "texto", chico: true, icono: "borrar", etiqueta: "Vaciar lista de productos", onclick: function () {
         P.confirmar("¿Sacar todos los productos de la venta en curso?", { aceptar: "Vaciar", peligro: true }).then(function (ok) {
@@ -426,6 +523,7 @@
     }
     P.continuidad.guardarPantalla(function () {
       var items = estado.items.map(function (it, i) {
+        if (!camposCantidad[i]) return it;
         var valor = camposCantidad[i].value;
         if (valor === P.f.numero(it.cantidad)) return it;
         var cantidad = P.redondear(P.numeroDe(valor), 3);
@@ -454,7 +552,7 @@
       if (cobrando || botonCobrar.disabled || !estado.items.length) return;
       cobrando = true;
       var cuerpo = {
-        items: estado.items.map(function (it) { return { producto_id: it.producto.id, cantidad: it.cantidad, precio_unitario: it.producto.precio_venta }; }),
+        items: estado.items.map(function (it) { return { producto_id: it.producto.id, cantidad: it.cantidad, precio_unitario: it.producto.precio_venta, etiqueta: it.etiqueta || undefined }; }),
         forma_pago: estado.segunda ? "MIXTO" : estado.forma,
         pagos: partes(),
         recibido: (estado.forma === "EFECTIVO" || estado.segunda === "EFECTIVO") && estado.recibido ? P.importeDe(estado.recibido) : null,
@@ -473,8 +571,7 @@
       }).catch(function (e) {
         if (e.codigo === "PRECIOS_CAMBIARON" && Array.isArray(e.datos.precios)) {
           e.datos.precios.forEach(function (p) {
-            var it = estado.items.find(function (linea) { return Number(linea.producto.id) === Number(p.producto_id); });
-            if (it) it.producto.precio_venta = p.precio_venta;
+            estado.items.forEach(function (linea) { if (Number(linea.producto.id) === Number(p.producto_id)) linea.producto.precio_venta = p.precio_venta; });
           });
           pintarTodo();
         } else if (usaSaldo() && e.status === 409) {

@@ -144,7 +144,17 @@
     });
   }
 
+  // Cierre de caja. Si Administración activó el conteo de stock al cerrar, el cajero
+  // primero cuenta (a ciegas) los productos que pide el sistema y después hace el temporal.
   P.cerrarCaja = function (cajaId, alTerminar) {
+    if (P.puedeGestionarCajas()) return abrirCierre(cajaId, alTerminar);
+    return P.get("/caja/cierre/previa" + P.qs({ caja_id: cajaId })).then(function (r) {
+      if (!r.puede_temporal) { P.aviso("El cierre temporal se hace desde tu turno.", "info"); return; }
+      return P.conteoDeCierre(cajaId).then(function (seguir) { if (seguir) return abrirCierre(cajaId, alTerminar); });
+    }).catch(P.error);
+  };
+
+  function abrirCierre(cajaId, alTerminar) {
     var definitivo = P.puedeGestionarCajas();
     return P.get("/caja/cierre/previa" + P.qs({ caja_id: cajaId })).then(function (r) {
       if (!definitivo && !r.puede_temporal) { P.aviso("El cierre temporal se hace desde tu turno.", "info"); return; }
@@ -230,7 +240,7 @@
         acciones: [P.btn("Cancelar", { onclick: function () { m.cerrar(); } }), botonCierre],
       });
     }).catch(P.error);
-  };
+  }
 
   // Recepción de bolsas y confirmación de un cierre temporal.
   P.recibirTemporal = function (c, alTerminar) {

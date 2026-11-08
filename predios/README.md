@@ -209,6 +209,42 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
   con la anticipación configurada en el producto (7 días por defecto). A los
   administradores de Mi AJB se les avisa con un mes calendario de anticipación.
 
+## Balanza, venta por peso y conteo de stock al cerrar
+
+- **Productos por peso** (Gestión → producto → «Se vende: Por peso (kg)»): stock, compras,
+  traspasos y ventas en kilos (tres decimales = gramos) y precios por kilo. El «Número en la
+  balanza (PLU)» arma el código del producto: PLU 14 → `2000140`.
+- **Etiquetas de balanza** (`public/js/balanza.js`, lo usan el servidor y las pantallas): EAN-13
+  `2` + PLU de 5 dígitos + `0` + gramos (5 dígitos) + verificador. `2000140004850` = producto
+  `2000140` (jamón cocido), 485 g. Al escanearla la caja agrega un renglón con ese peso
+  bloqueado y el precio por kilo; si la misma etiqueta ya está, pregunta si es otro paquete.
+  Un pesable sin etiqueta pide el peso en kilos o gramos. El servidor comprueba que cada
+  etiqueta sea del producto y traiga ese peso, y la guarda en `predio_venta_item.etiquetas`
+  (`unidad = 'KG'`). El ticket imprime `0,485 KG  22.000,00/KG`. Prefijo y largo del código
+  se cambian en Sistema → Configuración, con un probador de etiquetas.
+- El sistema anterior dejó los productos de balanza (código `2000XXX`) con precio **por gramo**
+  (jamón $22). En Gestión → Productos, filtro «Se vende: Código de balanza todavía por unidad»,
+  elegirlos y «Vender por kilo» → «Está por gramo»: precios × 1.000 y stock/stock mínimo ÷ 1.000
+  (movimiento «Paso a kilos», historial de precios y auditoría). `POST /productos/peso[/previa]`.
+- **Traspasos y pedidos entre bocas**: los pesables se pasan en kilos o gramos (o escaneando la
+  etiqueta). Un compuesto que sale de un insumo (Café → paquete de café) se pide en porciones y
+  se mueve el insumo equivalente; la observación y la auditoría guardan la conversión.
+- **Conteo de stock al cerrar la caja** (`lib/api/conteo.js`, tablas `predio_conteo` y
+  `predio_conteo_item`): opcional, lo activa Administración en Sistema → Configuración con el
+  porcentaje del stock de la boca por cierre y la tolerancia en pesables. Antes del cierre
+  temporal el cajero cuenta a ciegas: la lista no trae lo que dice el sistema y, mientras el
+  conteo está abierto, el stock, los movimientos y el disponible le responden 423
+  `CONTEO_EN_CURSO` (la caja sigue vendiendo sin mostrar cantidades). Cada boca recorre todo su
+  stock en rondas: no se repite un producto hasta contar todos. Las diferencias avisan
+  (`CONTEO_DIFERENCIA`) a Administración —también en Mi AJB— y a Supervisión de la boca, que en
+  Gestión → Productos y stock → Más → Conteos de stock ajusta cada una al conteo (movimiento
+  `AJUSTE_CONTEO` por la diferencia) o la mantiene con motivo. El cierre temporal exige el
+  conteo enviado (409 `CONTEO_PENDIENTE`); si el turno se cierra sin contar, queda ANULADO.
+- **Stock mínimo**: el aviso es para Administración y Supervisión de la boca; los cajeros ya
+  no lo reciben (los avisos que tenían se cierran al volver a evaluar).
+- Capacidad remota `conteo-balanza-v1`: Mi AJB retiene las órdenes de conteos, venta por kilo,
+  unidad de producto y configuración de balanza/conteo hasta que la notebook se actualiza.
+
 ## Precios, compras y recordatorios
 
 - Cada compra ingresa en la boca marcada como **proveeduría** en Gestión → Bocas y

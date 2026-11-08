@@ -9,6 +9,8 @@ const U = require("../util");
 const N = require("../negocio");
 const Porciones = require("../porciones");
 const PB = require("../precio-boca");
+const Balanza = require("../../public/js/balanza");
+const Conteo = require("./conteo");
 const { DESTINOS } = require("../listados");
 const { gtinValido, proximidadCodigo } = require("../codigo-barras");
 const { resolverRevisionProducto } = require("../precios");
@@ -93,7 +95,37 @@ async function opciones(ctx) {
 
 // ------------------------------------------------------------------ productos
 
+// Etiqueta de balanza leída por el escáner (null si el texto no tiene ese formato).
+async function etiquetaDe(db, ctx, texto) {
+  if (!/^\d{13}$/.test(String(texto || ""))) return null;
+  return Balanza.leer(texto, await N.leerConfig(db, ctx));
+}
+
+function presentarBusqueda(f, { q, costos, catalogoAviso, ocultarStock, etiqueta }) {
+  const exacto = etiqueta ? true : !!q && f.codigo === q;
+  const aproximado = !etiqueta && !!q && f.codigo !== q && proximidadCodigo(f.codigo, q) !== null;
+  const stock = Number(f.stock_boca || 0);
+  const peso = etiqueta && f.unidad === "KG" ? etiqueta.kg : null;
+  return {
+    id: f.id, nombre: f.nombre, codigo: f.codigo, precio_venta: Number(f.precio_venta || 0),
+    ultimo_costo: costos ? (f.ultimo_costo == null ? null : Number(f.ultimo_costo)) : undefined,
+    precio_compra: costos ? Number(f.precio_compra || 0) : undefined, margen: costos ? Number(f.margen || 0) : undefined, destino: f.destino,
+    unidad: f.unidad === "KG" ? "KG" : null,
+    perecedero: !!Number(f.perecedero), fecha_caducidad: f.fecha_caducidad,
+    // Mientras el cajero cuenta a ciegas, el servidor sigue filtrando lo vendible pero no dice cuánto hay.
+    stock_boca: ocultarStock ? null : stock, stock_oculto: ocultarStock || undefined,
+    receta: f.insumo_id ? { insumo_id: Number(f.insumo_id), nombre: f.insumo_nombre, rendimiento: Number(f.rendimiento), unidad: f.insumo_unidad === "KG" ? "KG" : null } : undefined,
+    etiqueta: etiqueta ? etiqueta.etiqueta : undefined, peso: etiqueta ? etiqueta.kg : undefined,
+    exacto,
+    sugerido: aproximado,
+    coincidencia: exacto ? (etiqueta ? "ETIQUETA" : "EXACTA") : (aproximado ? "CODIGO_APROXIMADO" : "TEXTO"),
+    estado_venta: catalogoAviso ? (f.destino === "USO_INTERNO" ? "USO_INTERNO" : Number(f.precio_venta || 0) <= 0 ? "SIN_PRECIO"
+      : stock <= 0 || (peso && stock < peso) ? "SIN_STOCK" : "DISPONIBLE") : undefined,
+  };
+}
+
 // Búsqueda rápida para los desplegables con escáner: el código exacto va primero.
+// Una etiqueta de balanza (2 + código del producto + gramos) trae el producto y su peso.
 async function buscarProductos(ctx) {
   const q = String(ctx.query.q || "").trim().slice(0, 80);
   let bocaId = Number(ctx.query.boca_id) || null;
@@ -119,19 +151,33 @@ async function buscarProductos(ctx) {
   const enCaja = soloVenta || catalogoAviso;
   const stockSql = enCaja ? Porciones.stockVentaSql : "COALESCE(s.cantidad, 0)";
   const uniones = `LEFT JOIN predio_boca b ON b.predio_id = p.predio_id AND b.id = ?
-    ${PB.joinMargenSql} ${enCaja ? Porciones.joinStockVenta : "LEFT JOIN predio_stock s ON s.predio_id = p.predio_id AND s.producto_id = p.id AND s.boca_id = b.id"}`;
+    ${PB.joinMargenSql} ${enCaja ? Porciones.joinStockVenta : `${Porciones.joinReceta}
+    LEFT JOIN predio_stock s ON s.predio_id = p.predio_id AND s.producto_id = p.id AND s.boca_id = b.id`}`;
   const costos = await veCostos(db, ctx);
+  const ocultarStock = !!(await Conteo.conteoEnCurso(db, ctx));
   const ultimoCosto = costos && !soloVenta && !catalogoAviso
     ? `(SELECT ci.precio_unitario FROM predio_compra_item ci JOIN predio_compra c ON c.predio_id = ci.predio_id AND c.id = ci.compra_id
         WHERE ci.predio_id = p.predio_id AND ci.producto_id = p.id AND c.estado = 'CARGADA' ORDER BY ci.id DESC LIMIT 1)` : "NULL";
   const columnas = `p.id, p.nombre, p.codigo, ${PB.precioBocaSql} AS precio_venta, p.precio_compra, ${ultimoCosto} AS ultimo_costo,
-    p.margen, p.destino, p.perecedero, p.fecha_caducidad, ${stockSql} AS stock_boca`;
+    p.margen, p.destino, p.unidad, p.perecedero, p.fecha_caducidad, ${stockSql} AS stock_boca,
+    ri.valor + 0 AS insumo_id, rr.valor + 0 AS rendimiento, ins.nombre AS insumo_nombre, ins.unidad AS insumo_unidad`;
   let where = "p.predio_id = ? AND p.activo = 1";
   if (soloVenta) {
     where += ` AND p.destino <> 'USO_INTERNO' AND (${PB.precioBocaSql}) > 0`;
     where += ` AND (${stockSql}) > 0`;
   }
   const baseWhere = where;
+  const opcionesPresentar = { q, costos, catalogoAviso, ocultarStock };
+  // Etiqueta de balanza: si ningún producto tiene esos 13 dígitos como código, se busca el
+  // producto por el código de la etiqueta. Nunca se ofrece «corregir» el código con la etiqueta.
+  const etiqueta = q ? await etiquetaDe(db, ctx, q) : null;
+  if (etiqueta && !(await db.get("SELECT id FROM predio_producto WHERE predio_id = ? AND activo = 1 AND codigo = ? LIMIT 1", [ctx.pid, q]))) {
+    const filas = await db.all(`SELECT ${columnas} FROM predio_producto p ${uniones} WHERE ${baseWhere} AND p.codigo = ? ORDER BY p.nombre LIMIT 2`,
+      [...params, etiqueta.codigo]);
+    // Dos productos con el mismo código: se muestran los dos para elegir, sin cargar ninguno solo.
+    const unico = filas.length === 1;
+    return filas.map((f) => presentarBusqueda(f, { ...opcionesPresentar, q: unico ? q : "", etiqueta: unico ? etiqueta : null }));
+  }
   let orden = "p.nombre";
   if (q) {
     const palabras = q.split(/\s+/).slice(0, 5);
@@ -159,33 +205,36 @@ async function buscarProductos(ctx) {
       .slice(0, 8).map((f) => f.fila);
     filas.push(...cercanos);
   }
-  return filas.slice(0, 30).map((f) => ({
-    id: f.id, nombre: f.nombre, codigo: f.codigo, precio_venta: Number(f.precio_venta || 0),
-    ultimo_costo: costos ? (f.ultimo_costo == null ? null : Number(f.ultimo_costo)) : undefined,
-    precio_compra: costos ? Number(f.precio_compra || 0) : undefined, margen: costos ? Number(f.margen || 0) : undefined, destino: f.destino,
-    perecedero: !!Number(f.perecedero), fecha_caducidad: f.fecha_caducidad, stock_boca: Number(f.stock_boca || 0),
-    exacto: !!q && f.codigo === q,
-    sugerido: !!q && f.codigo !== q && proximidadCodigo(f.codigo, q) !== null,
-    coincidencia: !!q && f.codigo === q ? "EXACTA" : (proximidadCodigo(f.codigo, q) !== null ? "CODIGO_APROXIMADO" : "TEXTO"),
-    estado_venta: catalogoAviso ? (f.destino === "USO_INTERNO" ? "USO_INTERNO" : Number(f.precio_venta || 0) <= 0 ? "SIN_PRECIO" : Number(f.stock_boca || 0) <= 0 ? "SIN_STOCK" : "DISPONIBLE") : undefined,
-  }));
+  return filas.slice(0, 30).map((f) => presentarBusqueda(f, opcionesPresentar));
 }
 
 // Diagnóstico puntual del código leído, sin enumerar los productos excluidos.
+// Una etiqueta de balanza se resuelve por el código del producto y trae el peso.
 async function consultarCodigo(ctx) {
   const puesto = exigirPuesto(ctx);
   exigirBoca(ctx, puesto.boca_id);
   const codigo = U.texto(ctx.query.codigo, { max: 60, requerido: true, campo: "El código escaneado" });
-  const filas = await ctx.db.all(
-    `SELECT p.id, p.nombre, p.codigo, ${PB.precioBocaSql} AS precio_venta, p.destino, ${Porciones.stockVentaSql} AS stock_boca
+  const consultar = (c) => ctx.db.all(
+    `SELECT p.id, p.nombre, p.codigo, ${PB.precioBocaSql} AS precio_venta, p.destino, p.unidad, ${Porciones.stockVentaSql} AS stock_boca
      FROM predio_producto p JOIN predio_boca b ON b.predio_id = p.predio_id AND b.id = ? ${PB.joinMargenSql}
      ${Porciones.joinStockVenta}
-     WHERE p.predio_id = ? AND p.activo = 1 AND p.destino <> 'USO_INTERNO' AND p.codigo = ? LIMIT 2`, [puesto.boca_id, ctx.pid, codigo]);
+     WHERE p.predio_id = ? AND p.activo = 1 AND p.destino <> 'USO_INTERNO' AND p.codigo = ? LIMIT 2`, [puesto.boca_id, ctx.pid, c]);
+  let filas = await consultar(codigo);
+  let etiqueta = null;
+  if (!filas.length) {
+    etiqueta = await etiquetaDe(ctx.db, ctx, codigo);
+    if (etiqueta) filas = await consultar(etiqueta.codigo);
+  }
   if (filas.length !== 1) return { producto: null, estado: filas.length ? "CODIGO_DUPLICADO" : "NO_ENCONTRADO" };
   const p = filas[0];
   p.precio_venta = Number(p.precio_venta || 0);
   p.stock_boca = Number(p.stock_boca || 0);
-  return { producto: p, estado: p.precio_venta <= 0 ? "SIN_PRECIO" : (p.stock_boca <= 0 ? "SIN_STOCK" : "DISPONIBLE") };
+  p.unidad = p.unidad === "KG" ? "KG" : null;
+  const peso = etiqueta && p.unidad === "KG" ? etiqueta.kg : null;
+  if (etiqueta) Object.assign(p, { etiqueta: etiqueta.etiqueta, peso: etiqueta.kg });
+  const estado = p.precio_venta <= 0 ? "SIN_PRECIO" : (p.stock_boca <= 0 || (peso && p.stock_boca < peso) ? "SIN_STOCK" : "DISPONIBLE");
+  if (await Conteo.conteoEnCurso(ctx.db, ctx)) { p.stock_boca = null; p.stock_oculto = true; }
+  return { producto: p, estado };
 }
 
 // Serializa todas las altas/ediciones de códigos del catálogo en los dos motores.
@@ -266,7 +315,8 @@ function validarProducto(body, { parcial = false } = {}) {
   if (!parcial || body.perecedero !== undefined) datos.perecedero = U.bool(body.perecedero);
   if (!parcial || body.fecha_caducidad !== undefined) datos.fecha_caducidad = U.fecha(body.fecha_caducidad, { campo: "La fecha de caducidad" });
   if (!parcial || body.stock_minimo !== undefined) datos.stock_minimo = U.numero(body.stock_minimo ?? 0, { min: 0, max: 9999999, decimales: 3, campo: "El stock mínimo" });
-  if (!parcial || body.unidad !== undefined) datos.unidad = U.texto(body.unidad, { max: 20 });
+  // KG = se vende por peso: stock, compras, traspasos y ventas en kilos y precios por kilo.
+  if (!parcial || body.unidad !== undefined) datos.unidad = String(body.unidad || "").trim().toUpperCase() === "KG" ? "KG" : null;
   if (!parcial || body.dias_aviso_vencimiento !== undefined) {
     const valor = body.dias_aviso_vencimiento;
     if (valor != null && valor !== "" && !/^\d{1,3}$/.test(String(valor))) throw U.error("Ingresá una cantidad entera de días entre 0 y 365");
@@ -651,14 +701,29 @@ async function verConfig(ctx) {
   return { config };
 }
 
+// Claves con formato propio: conteo de stock al cerrar y etiquetas de balanza.
+const VALIDAR_CONFIG = {
+  conteo_cierre_activo: (v) => U.bool(v) ? "1" : "0",
+  conteo_cierre_porcentaje: (v) => String(U.entero(v, { min: 1, max: 100, campo: "El porcentaje de productos a contar" })),
+  conteo_tolerancia_peso: (v) => String(U.numero(v, { min: 0, max: 50, decimales: 1, campo: "La tolerancia de los pesables" })),
+  balanza_activa: (v) => U.bool(v) ? "1" : "0",
+  balanza_prefijo: (v) => {
+    const s = String(v ?? "").trim();
+    if (!/^\d{1,2}$/.test(s)) throw U.error("El prefijo de las etiquetas de balanza es de 1 o 2 dígitos (normalmente 2)");
+    return s;
+  },
+  balanza_digitos_codigo: (v) => String(U.entero(v, { min: 3, max: 8, campo: "Los dígitos del código del producto" })),
+};
+const CLAVES_CONFIG_TODAS = [...CLAVES_CONFIG, ...Object.keys(VALIDAR_CONFIG)];
+
 async function guardarConfigApi(ctx) {
   exigirAdmin(ctx);
   return ctx.db.tx(async (t) => {
     const antes = await N.leerConfig(t, ctx);
     const cambios = {};
-    for (const clave of CLAVES_CONFIG) {
+    for (const clave of CLAVES_CONFIG_TODAS) {
       if (ctx.body[clave] === undefined) continue;
-      const valor = String(ctx.body[clave] ?? "").slice(0, 2000);
+      const valor = VALIDAR_CONFIG[clave] ? VALIDAR_CONFIG[clave](ctx.body[clave]) : String(ctx.body[clave] ?? "").slice(0, 2000);
       if (valor !== String(antes[clave] ?? "")) {
         await N.guardarConfig(t, ctx, clave, valor);
         cambios[clave] = { antes: antes[clave], despues: valor };

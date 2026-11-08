@@ -114,7 +114,10 @@
     p.separar();
     (datos.items || []).forEach(function (it) {
       p.texto(it.descripcion);
-      columnasProducto(p, imprimible(P.f.numero(it.cantidad)), importeDetalle(it.precio_unitario), importeDetalle(it.subtotal));
+      // Los pesables salen en kilos con precio por kilo (0,485 KG  22.000,00/KG  10.670,00).
+      var kg = it.unidad === "KG";
+      columnasProducto(p, imprimible(kg ? P.f.kilos(it.cantidad).toUpperCase() : P.f.numero(it.cantidad)),
+        importeDetalle(it.precio_unitario) + (kg ? "/KG" : ""), importeDetalle(it.subtotal));
     });
     p.separar();
     p.par("IMPORTE TOTAL", P.f.pesos(v.total));

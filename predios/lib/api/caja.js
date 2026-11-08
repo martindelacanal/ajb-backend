@@ -346,6 +346,8 @@ async function asentarCierre(t, ctx, { caja, turno, r, contado, queda, observaci
   }
   await t.run("UPDATE predio_caja_movimiento SET cierre_id = ? WHERE predio_id = ? AND caja_id = ? AND cierre_id IS NULL", [cierreId, ctx.pid, cajaId]);
   const ultimaVenta = await t.get("SELECT COALESCE(MAX(id),0) AS id FROM predio_venta WHERE predio_id=? AND caja_id=?", [ctx.pid, cajaId]);
+  // Un conteo de stock que quedó sin enviar ya no se puede completar después del cierre.
+  await require("./conteo").anularPendientes(t, ctx, { cajaId });
   // Las instalaciones anteriores podían tener turnos superpuestos en una caja.
   // Un único cierre contable libera todos sus turnos y tokens asociados.
   await t.run("UPDATE predio_turno SET fin=?, estado='CERRADO' WHERE predio_id=? AND caja_id=? AND estado='ABIERTO'", [ahora, ctx.pid, cajaId]);
@@ -411,6 +413,9 @@ async function cerrarTemporal(ctx) {
     comprobarCorte(ctx, turno, r.ultimo_cierre);
     comprobarRevision(ctx, r);
     await exigirSinAnulacionesPendientes(t, ctx, cajaId, r.ultimo_cierre);
+    // Si Administración activó el conteo de stock al cerrar, primero hay que enviarlo.
+    const Conteo = require("./conteo");
+    await Conteo.exigirConteoDelTurno(t, ctx, turno);
     const contado = U.redondear(enVentas + enCambio, 2);
     const autorizacion = { metodo: "TEMPORAL", cajero_id: ctx.usuario.id, cajero: N.nombreActor(ctx) };
     // Todo el efectivo se va en las bolsas: la caja queda en cero para el próximo cajero.
@@ -418,6 +423,9 @@ async function cerrarTemporal(ctx) {
       caja, turno, r, contado, queda: 0, observaciones, temporal: true, autorizacion,
       datos: () => ({ efectivo_ventas: enVentas, efectivo_cambio: enCambio }),
     });
+    const conteo = turno ? await t.get("SELECT id FROM predio_conteo WHERE predio_id = ? AND turno_id = ? AND estado <> 'ANULADO' ORDER BY id DESC LIMIT 1",
+      [ctx.pid, turno.id]) : null;
+    if (conteo) await N.actualizar(t, ctx, "predio_conteo", conteo.id, { cierre_id: c.cierreId });
     const boca = await N.obtener(t, ctx, "predio_boca", caja.boca_id);
     await emitirAviso(t, ctx, {
       tipo: "CIERRE_TEMPORAL",

@@ -149,11 +149,16 @@
   var fmtPesos = new Intl.NumberFormat("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 2, maximumFractionDigits: 2 });
   var fmtNumero = new Intl.NumberFormat("es-AR", { maximumFractionDigits: 3 });
   var fmtEntero = new Intl.NumberFormat("es-AR", { maximumFractionDigits: 0 });
+  var fmtKilos = new Intl.NumberFormat("es-AR", { minimumFractionDigits: 3, maximumFractionDigits: 3 });
   P.f = {
     pesos: function (v) { return fmtPesos.format(Number(v) || 0).replace(/ /g, " "); },
     numero: function (v) { return fmtNumero.format(Number(v) || 0); },
     entero: function (v) { return fmtEntero.format(Number(v) || 0); },
     pct: function (v) { return fmtNumero.format(Number(v) || 0) + " %"; },
+    // Pesables: siempre con tres decimales (gramos) y la unidad. 0.485 → "0,485 kg".
+    kilos: function (v) { return fmtKilos.format(Number(v) || 0) + " kg"; },
+    // Cantidad con su unidad: "0,485 kg" para pesables, "3" para unidades.
+    cantidad: function (v, unidad) { return unidad === "KG" ? fmtKilos.format(Number(v) || 0) + " kg" : fmtNumero.format(Number(v) || 0); },
     fecha: function (v) {
       if (!v) return "";
       var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(v));

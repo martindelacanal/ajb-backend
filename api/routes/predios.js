@@ -141,6 +141,13 @@ function prepararOrden(actor, ruta, cuerpo, cuenta) {
   if (cuenta?.rol === "SUPERVISOR" || /^\/usuarios(?:\/\d+)?$/.test(ruta) && datos.rol === "SUPERVISOR") {
     actor.capacidad = "supervisor-predio-v1";
   }
+  // Conteos de stock, venta por peso y configuración de balanza/conteo: una notebook anterior
+  // no los conoce (ignoraría las claves nuevas de configuración sin avisar).
+  if (/^\/conteos\//.test(ruta) || ruta === "/productos/peso"
+    || (ruta === "/config" && Object.keys(datos).some((k) => /^(conteo_|balanza_)/.test(k)))
+    || (/^\/productos(?:\/\d+)?$/.test(ruta) && datos.unidad !== undefined)) {
+    actor.capacidad = "conteo-balanza-v1";
+  }
   for (const secreto of ["clave", "admin_usuario", "admin_password"]) delete datos[secreto];
   if (ruta === "/sesion/clave") {
     actor.hash_clave_validada = clavesUsuario.hashDeCambio(cuenta, String(datos.actual || ""), datos.nueva);
@@ -474,6 +481,7 @@ function crearRouterAdmin() {
         comandos_contable: serializadas.filter(c => c.actor?.capacidad === "contable-v1"),
         comandos_caja_temporal: serializadas.filter(c => c.actor?.capacidad === "caja-temporal-v1"),
         comandos_supervisor: serializadas.filter(c => c.actor?.capacidad === "supervisor-predio-v1"),
+        comandos_conteo: serializadas.filter(c => c.actor?.capacidad === "conteo-balanza-v1"),
       };
       if (req.query.codigo === "1") {
         const paquete = C.paqueteCodigo();
@@ -702,13 +710,15 @@ function crearRouterSync() {
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'contable-v1')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'caja-temporal-v1')
              AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'supervisor-predio-v1')
+             AND (? = 1 OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(actor, '$.capacidad')), '') <> 'conteo-balanza-v1')
            ORDER BY id LIMIT 20`, [p.id, capacidades.includes("cuentas-predio-v1") ? 1 : 0,
              capacidades.includes("precios-boca-v1") ? 1 : 0, capacidades.includes("stock-predio-v2") ? 1 : 0,
              capacidades.includes("operacion-predio-v2") ? 1 : 0, capacidades.includes("recepcion-alquileres-v1") ? 1 : 0,
              capacidades.includes("cierre-clave-dia-v1") ? 1 : 0, capacidades.includes("recepcion-salidas-v1") ? 1 : 0,
              capacidades.includes("recepcion-adicionales-v2") ? 1 : 0, capacidades.includes("recepcion-estadia-v3") ? 1 : 0,
              capacidades.includes("contable-v1") ? 1 : 0,
-             capacidades.includes("caja-temporal-v1") ? 1 : 0, capacidades.includes("supervisor-predio-v1") ? 1 : 0]);
+             capacidades.includes("caja-temporal-v1") ? 1 : 0, capacidades.includes("supervisor-predio-v1") ? 1 : 0,
+             capacidades.includes("conteo-balanza-v1") ? 1 : 0]);
         if (filas.length) {
           await conexion.query(`UPDATE predio_comando SET estado = 'ENTREGADO', entregado_en = NOW(), intentos = intentos + 1 WHERE id IN (?)`, [filas.map(c => c.id)]);
         }

@@ -58,7 +58,11 @@ const TIPOS_MOVIMIENTO = [
   { valor: "TRASPASO_ENTRADA", texto: "Traspaso (entrada)" },
   { valor: "BAJA", texto: "Baja" },
   { valor: "AJUSTE", texto: "Ajuste manual" },
+  { valor: "AJUSTE_CONTEO", texto: "Ajuste por conteo" },
+  { valor: "CONVERSION_UNIDAD", texto: "Paso a kilos" },
 ];
+const UNIDADES = [{ valor: "KG", texto: "Por peso (kg)" }, { valor: "U", texto: "Por unidad" }];
+const ESTADOS_CONTEO = require("./api/conteo").ESTADOS;
 const CONCEPTOS_CAJA = [
   { valor: "SALDO_APERTURA", texto: "Saldo de apertura" },
   { valor: "VENTA", texto: "Venta en efectivo" },
@@ -164,6 +168,7 @@ L.productos = {
     { clave: "fecha_revision_precio", titulo: "Última revisión de precio", expr: FECHA_REVISION, tipo: "dt", oculta: true },
     { clave: "stock", titulo: "Stock", expr: "COALESCE(st.total, 0)", tipo: "qty" },
     { clave: "destino", titulo: "Destino", expr: "p.destino", tipo: "opcion", opciones: DESTINOS },
+    { clave: "unidad", titulo: "Se vende", expr: "CASE WHEN p.unidad = 'KG' THEN 'KG' ELSE 'U' END", tipo: "opcion", opciones: UNIDADES },
     { clave: "perecedero", titulo: "Perecedero", expr: "p.perecedero", tipo: "bool" },
     { clave: "fecha_caducidad", titulo: "Caducidad", expr: "p.fecha_caducidad", tipo: "date" },
     { clave: "dias_aviso_vencimiento", titulo: "Días de aviso", expr: "COALESCE(p.dias_aviso_vencimiento, 7)", tipo: "int", oculta: true },
@@ -176,6 +181,15 @@ L.productos = {
       { valor: "vigente", texto: "Con stock y precio revisado", sql: `p.activo = 1 AND COALESCE(st.positivo, 0) > 0 AND ${FECHA_REVISION} >= pl.fecha` },
     ] },
     { clave: "destino", titulo: "Destino", tipo: "opciones", expr: "p.destino", opciones: DESTINOS },
+    {
+      // Los de la balanza del sistema anterior: código 2 + PLU + 0 (2000140 = jamón cocido, PLU 14).
+      clave: "unidad", titulo: "Se vende", tipo: "opciones",
+      opciones: [
+        { valor: "KG", texto: "Por peso (kg)", sql: "p.unidad = 'KG'" },
+        { valor: "U", texto: "Por unidad", sql: "COALESCE(p.unidad, '') <> 'KG'" },
+        { valor: "balanza", texto: "Código de balanza (2000…) todavía por unidad", sql: "COALESCE(p.unidad, '') <> 'KG' AND p.codigo LIKE '2000___'" },
+      ],
+    },
     { clave: "perecedero", titulo: "Perecedero", tipo: "opciones", expr: "p.perecedero", opciones: SI_NO },
     {
       clave: "stock", titulo: "Stock", tipo: "opciones",
@@ -255,6 +269,7 @@ L.stock = {
     { clave: "producto", titulo: "Producto", expr: "p.nombre", buscar: true },
     { clave: "codigo", titulo: "Código", expr: "p.codigo", buscar: true },
     { clave: "cantidad", titulo: "Cantidad física", expr: "COALESCE(fis.cantidad, 0)", tipo: "qty" },
+    { clave: "unidad", titulo: "Unidad", expr: "CASE WHEN p.unidad = 'KG' THEN 'KG' ELSE 'U' END", tipo: "opcion", opciones: UNIDADES, oculta: true },
     { clave: "porciones_disponibles", titulo: "Porciones disponibles (estimadas)", expr: Porciones.porcionesDisponiblesSql, tipo: "int", oculta: true },
     { clave: "precio_venta", titulo: "Precio de venta", expr: precioBocaSql, tipo: "money" },
     { clave: "valor", titulo: "Valor a costo", expr: "COALESCE(fis.cantidad, 0) * COALESCE(p.precio_compra, 0)", tipo: "money", soloAdmin: true },
@@ -858,6 +873,36 @@ L.caja = {
       { titulo: "Egresos", expr: "SUM(CASE WHEN m.tipo = 'EGRESO' THEN m.importe ELSE 0 END)", tipo: "money" },
     ],
   },
+};
+
+L.conteos = {
+  roles: ROLES_GESTION,
+  titulo: "Conteos de stock",
+  from: `predio_conteo c
+    JOIN predio_boca b ON b.predio_id = c.predio_id AND b.id = c.boca_id
+    LEFT JOIN predio_caja ca ON ca.predio_id = c.predio_id AND ca.id = c.caja_id`,
+  where: "c.predio_id = :pid",
+  alcance: alcanceBocas("c.boca_id"),
+  columnas: [
+    { clave: "id", titulo: "N°", expr: "c.id", tipo: "int" },
+    { clave: "fecha", titulo: "Fecha", expr: "COALESCE(c.fecha_fin, c.fecha_inicio)", tipo: "dt" },
+    { clave: "boca", titulo: "Boca", expr: "b.nombre" },
+    { clave: "caja", titulo: "Caja", expr: "ca.nombre", oculta: true },
+    { clave: "usuario_nombre", titulo: "Contó", expr: "c.usuario_nombre", buscar: true },
+    { clave: "productos", titulo: "Productos", expr: "c.productos", tipo: "int" },
+    { clave: "diferencias", titulo: "Diferencias", expr: "c.diferencias", tipo: "int" },
+    { clave: "estado", titulo: "Estado", expr: "c.estado", tipo: "opcion", opciones: ESTADOS_CONTEO },
+    { clave: "revisado_por", titulo: "Revisó", expr: "c.revisado_por", buscar: true },
+    { clave: "cierre_id", titulo: "Cierre", expr: "c.cierre_id", tipo: "int", oculta: true },
+  ],
+  filtros: [
+    { clave: "boca", titulo: "Boca", tipo: "id", expr: "c.boca_id", fuente: "bocas_venta" },
+    { clave: "estado", titulo: "Estado", tipo: "opciones", expr: "c.estado", opciones: ESTADOS_CONTEO },
+    { clave: "desde", titulo: "Desde", tipo: "desde", expr: "COALESCE(c.fecha_fin, c.fecha_inicio)" },
+    { clave: "hasta", titulo: "Hasta", tipo: "hasta", expr: "COALESCE(c.fecha_fin, c.fecha_inicio)" },
+  ],
+  orden: { clave: "id", dir: "desc" },
+  totales: [{ clave: "productos", expr: "SUM(c.productos)" }, { clave: "diferencias", expr: "SUM(c.diferencias)" }],
 };
 
 L.cierres = {

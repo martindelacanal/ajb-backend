@@ -113,6 +113,8 @@
     CONFIRMADA: "ok", CARGADA: "ok", RECIBIDA: "ok", APROBADO: "ok", PAGADA: "ok", CORRECTO: "ok", OK: "ok", ABIERTO: "curso",
     ANULADA: "error", RECHAZADA: "error", RECHAZADO: "error", NO_COINCIDE: "error", ERROR: "error",
     PENDIENTE: "accion", DESPACHADA: "curso", ENTREGADO: "curso", USADO: "anillo", VENCIDO: "anillo", CANCELADO: "anillo", CERRADO: "anillo",
+    // Conteos de stock al cerrar la caja.
+    COMPLETO: "ok", CON_DIFERENCIAS: "error", REVISADO: "anillo", ANULADO: "anillo", DIFERENCIA: "error", AJUSTADO: "ok", DESCARTADO: "anillo",
   };
   P.chip = function (texto, valor) {
     var tipo = CHIPS[valor] || (valor === true ? "ok" : valor === false ? "anillo" : "");
@@ -422,13 +424,19 @@
       buscar: function (texto) {
         return P.get("/productos/buscar" + P.qs({ q: texto, boca_id: opciones.bocaId ? opciones.bocaId() : null, venta: opciones.venta ? 1 : null })).then(function (r) {
           return r.filter(function (p) {
-            return !opciones.venta || (Number(p.precio_venta) > 0 && p.destino !== "USO_INTERNO" && Number(p.stock_boca) > 0);
+            // Con el stock oculto (conteo a ciegas en curso) el servidor ya filtró lo vendible.
+            return !opciones.venta || (Number(p.precio_venta) > 0 && p.destino !== "USO_INTERNO" && (p.stock_oculto || Number(p.stock_boca) > 0));
           }).map(function (p) {
+            var porKilo = p.unidad === "KG" ? "/kg" : "";
             return {
               valor: p.id, texto: p.nombre, codigo: p.codigo, exacto: p.exacto, dato: p, busqueda: texto,
               requiereEleccion: !!p.sugerido,
-              detalle: [p.sugerido ? "Código aproximado: revisá el envase" : null, p.codigo ? "Código " + p.codigo : null, opciones.mostrarStock && opciones.bocaId && opciones.bocaId() ? "Stock en la boca: " + P.f.numero(p.stock_boca) : null].filter(Boolean).join(" · "),
-              lado: opciones.ladoCompra ? P.f.pesos(p.precio_compra) : P.f.pesos(p.precio_venta),
+              detalle: [p.sugerido ? "Código aproximado: revisá el envase" : null,
+                p.etiqueta ? "Etiqueta de balanza: " + (p.unidad === "KG" ? P.f.kilos(p.peso) : "se vende por unidad") : null,
+                p.codigo ? "Código " + p.codigo : null,
+                p.receta ? "Sale de " + p.receta.nombre : null,
+                opciones.mostrarStock && opciones.bocaId && opciones.bocaId() && !p.stock_oculto ? "Stock en la boca: " + P.f.cantidad(p.stock_boca, p.unidad) : null].filter(Boolean).join(" · "),
+              lado: (opciones.ladoCompra ? P.f.pesos(p.precio_compra) : P.f.pesos(p.precio_venta)) + porKilo,
             };
           });
         });

@@ -162,6 +162,7 @@
       items.push({ texto: x.boca + " · " + x.caja + ": el saldo de apertura no coincide", icono: "alerta", accion: function () { P.ruta.ir("/caja"); } });
     });
     if (a.cierres_temporales) items.push({ texto: a.cierres_temporales + (a.cierres_temporales === 1 ? " cierre temporal espera" : " cierres temporales esperan") + " el cierre definitivo", icono: "caja", accion: function () { P.ruta.ir("/caja"); } });
+    if (a.conteos_diferencia) items.push({ texto: a.conteos_diferencia + (a.conteos_diferencia === 1 ? " conteo de stock tiene" : " conteos de stock tienen") + " diferencias para revisar", icono: "stock", accion: function () { P.ruta.ir("/gestion/conteos?estado=CON_DIFERENCIAS"); } });
     if (a.solicitudes_despachar) items.push({ texto: a.solicitudes_despachar + " solicitud(es) para despachar", icono: "despachar", accion: function () { P.ruta.ir(P.puedeGestionarCajas() ? "/gestion/solicitudes" : "/solicitudes"); } });
     if (a.solicitudes_recibir) items.push({ texto: a.solicitudes_recibir + " solicitud(es) para recibir", icono: "recibir", accion: function () { P.ruta.ir(P.puedeGestionarCajas() ? "/gestion/solicitudes" : "/solicitudes"); } });
     if (a.vencimientos) items.push({ texto: a.vencimientos + " producto(s) vencidos o por vencer", icono: "reloj", accion: function () { P.cache["tabla:productos"] = { filtros: { vencimiento: "aviso" } }; P.ruta.ir("/gestion/productos"); } });
@@ -202,6 +203,7 @@
         P.btn("Cerrar", { onclick: function () { m.cerrar(); } }),
         n.tipo === "CIERRE_TEMPORAL" && d.caja_id && P.puedeGestionarCajas() ? P.btn("Cargar cambio", { tipo: "suave", icono: "efectivo", onclick: function () { m.cerrar(); P.cargarApertura(d.caja_id); } }) : null,
         n.tipo === "CIERRE_TEMPORAL" && d.cierre_id && P.puedeGestionarCajas() ? P.btn("Ver el cierre", { tipo: "secundario", icono: "caja", onclick: function () { m.cerrar(); P.verCierre(d.cierre_id); } }) : null,
+        n.tipo === "CONTEO_DIFERENCIA" && d.conteo_id && P.puedeGestionarCajas() ? P.btn("Revisar el conteo", { tipo: "primario", icono: "stock", onclick: function () { m.cerrar(); P.verConteo(d.conteo_id); } }) : null,
         !n.leido ? P.btn("Marcar como leída", { tipo: "primario", onclick: function (ev) {
           P.ejecutar(ev.currentTarget, function () {
             return P.post("/avisos/" + n.id + "/leer", {}).then(function (r) {

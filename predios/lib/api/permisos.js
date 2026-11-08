@@ -145,6 +145,11 @@ async function avisos(ctx) {
       `SELECT COUNT(*) AS n FROM predio_cierre WHERE predio_id = ? AND tipo = 'TEMPORAL' AND estado = 'PENDIENTE'${alcanceTemporales.sql}`,
       [pid, ...alcanceTemporales.params]);
     salida.cierres_temporales = Number(temporales.n);
+    const alcanceConteos = alcanceCajas(ctx, "boca_id");
+    const conteos = await db.get(
+      `SELECT COUNT(*) AS n FROM predio_conteo WHERE predio_id = ? AND estado = 'CON_DIFERENCIAS'${alcanceConteos.sql}`,
+      [pid, ...alcanceConteos.params]);
+    salida.conteos_diferencia = Number(conteos?.n || 0);
   }
   if (esAdmin(ctx)) {
     const d = await db.get("SELECT COUNT(*) AS n FROM predio_solicitud WHERE predio_id = ? AND estado = 'PENDIENTE'", [pid]);

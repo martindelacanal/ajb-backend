@@ -449,8 +449,36 @@ const TABLAS = {
       precio_unitario: "money!",
       subtotal: "money!",
       destino: "str:20",
+      // KG = se vendió por peso (cantidad en kilos, precio por kilo). NULL = unidades.
+      unidad: "str:10",
+      // Etiquetas de balanza escaneadas (JSON: [{ codigo, kg }]). Lo que no figura acá se pesó a mano.
+      etiquetas: "text",
     },
     indices: [["venta_id"], ["producto_id"]],
+  },
+  // Conteo de stock a ciegas que hace el cajero al cerrar su turno (ver lib/api/conteo.js).
+  // Cada boca recorre todo su stock en «rondas»: un producto no se vuelve a pedir hasta
+  // que se contaron todos los demás. Estados: PENDIENTE → COMPLETO (sin diferencias) o
+  // CON_DIFERENCIAS → REVISADO (Supervisión o Administración ajustó o mantuvo cada una);
+  // ANULADO si el turno se cerró sin contar.
+  predio_conteo: {
+    columnas: {
+      boca_id: "int!", caja_id: "int", turno_id: "int", usuario_id: "int", usuario_nombre: "str:120",
+      fecha_inicio: "dt!", fecha_fin: "dt", estado: "str:16!", porcentaje: "pct", universo: "int",
+      productos: "int", diferencias: "int", cierre_id: "int", revisado_fecha: "dt", revisado_por: "str:120",
+    },
+    indices: [["boca_id", "estado"], ["usuario_id", "estado"], ["turno_id"]],
+  },
+  // Un renglón por producto pedido. `cantidad_sistema` es el stock en el momento de enviar el
+  // conteo; la diferencia (contado − sistema) es lo que se ajusta si Supervisión lo aprueba.
+  predio_conteo_item: {
+    columnas: {
+      conteo_id: "int!", boca_id: "int!", producto_id: "int!", ronda: "int!", orden: "int", unidad: "str:10",
+      cantidad_sistema: "qty", cantidad_contada: "qty", diferencia: "qty", ingreso: "str:40",
+      estado: "str:12!", resuelto_fecha: "dt", resuelto_por: "str:120", resolucion_motivo: "str:255",
+    },
+    unicos: [["conteo_id", "producto_id"]],
+    indices: [["boca_id", "ronda"], ["producto_id"]],
   },
   predio_liquidacion: {
     auditoria: true,
