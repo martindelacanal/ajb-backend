@@ -33,6 +33,7 @@ const { bloquearInstalacion } = require("./lib/bloqueo-local");
 const { aplicarPendiente } = require("./lib/respaldo-lan");
 const { leerConfiguracionLan, crearServicioLan } = require("./lib/servicio-lan");
 const { crearGrupoLocal, escribirHa } = require("./lib/grupo-local");
+const { prepararRedQuorum } = require("./lib/quorum-lan");
 const LAN = require("./lib/http-lan");
 
 const DIR_APP = __dirname;
@@ -833,6 +834,9 @@ servidor.listen(config.puerto, "0.0.0.0", () => {
   respaldoDiario();
   setInterval(respaldoDiario, 3 * 3600 * 1000).unref();
   migrarRuntime(BASE, DIR_APP, log).then(async (portable) => {
+    if (portable && configHa?.quorum) {
+      await prepararRedQuorum(DIR_APP, configHa.quorum.puerto).catch(e => log("Firewall de coordinación LAN: " + e.message));
+    }
     const seguro = await actualizarHttps();
     if (portable) {
       const direccion = seguro.activo ? "https://localhost:" + seguro.puerto : "http://localhost:" + config.puerto;

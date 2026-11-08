@@ -4,7 +4,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { isIPv4 } = require("node:net");
-const { spawn } = require("node:child_process");
+const { spawn, execFile } = require("node:child_process");
 const H = require("./http-lan");
 const { crearVerificador, verificarAckReplica, verificarEstadoFirmado } = require("./protocolo-lan");
 const { protegerCarpetaTestigo } = require("./testigo-lan");
@@ -17,6 +17,17 @@ const publico = ({ id, nombre, url, caPublica, preferido }) => ({ id, nombre, ur
 const error = (mensaje, status = 503) => Object.assign(new Error(mensaje), { status });
 const RUTA_ALTA = "/api/sistema/grupo-local/incorporar-equipo";
 const direccionRaft = (id, puerto) => `${id.slice(0, 32)}.${id.slice(32)}.raft.predio.ajb:${puerto}`;
+
+async function prepararRedQuorum(dirApp, puerto) {
+  if (process.platform !== "win32") return;
+  if (!Number.isInteger(puerto) || puerto < 1 || puerto > 65535) throw error("Puerto de coordinación LAN inválido");
+  await new Promise((resolve, reject) => execFile("powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(dirApp, "windows", "configurar-coordinacion-lan.ps1"), "-Puerto", String(puerto)],
+    { windowsHide: true, timeout: 20000 }, (e, _salida, errores) => {
+      if (e) reject(new Error(String(errores || e.message).trim().slice(0, 240)));
+      else resolve();
+    }));
+}
 
 function acreditarOrigen(ip, c) {
   const datos = Buffer.from(JSON.stringify({ ip, nodo: c.nodoId, fecha: Date.now() })).toString("base64url");
@@ -292,4 +303,4 @@ function clienteQuorum(c, { ubicacion, miembrosLocales, puertoHttps } = {}) {
   };
 }
 
-module.exports = { iniciarConsenso, crearAutoridadQuorum, clienteQuorum, direccionRaft, RUTA_ALTA, acreditarOrigen, origenAcreditado };
+module.exports = { prepararRedQuorum, iniciarConsenso, crearAutoridadQuorum, clienteQuorum, direccionRaft, RUTA_ALTA, acreditarOrigen, origenAcreditado };

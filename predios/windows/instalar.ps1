@@ -140,11 +140,19 @@ Ok "Node.js $versionNode listo en $nodeDir"
 
 # --- Firewall
 Paso "Abriendo el puerto $Puerto para las PCs del camping"
-Get-NetFirewallRule -DisplayName "AJB Predio*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+Get-NetFirewallRule -DisplayName 'AJB Predio (puerto *)', 'AJB Predio (nombre en la red)', 'AJB Predio (detectar servidor local)' -ErrorAction SilentlyContinue |
+  Remove-NetFirewallRule
 New-NetFirewallRule -DisplayName "AJB Predio (puerto $Puerto)" -Direction Inbound -Protocol TCP -LocalPort $Puerto -Action Allow -Profile Any | Out-Null
 # Para que las PCs encuentren la notebook por su nombre (http://nombre:puerto): NetBIOS, mDNS y LLMNR.
 New-NetFirewallRule -DisplayName "AJB Predio (nombre en la red)" -Direction Inbound -Protocol UDP -LocalPort 137,5353,5355 -Action Allow -Profile Any | Out-Null
 New-NetFirewallRule -DisplayName "AJB Predio (detectar servidor local)" -Direction Inbound -Protocol UDP -LocalPort 39876 -RemoteAddress LocalSubnet -Action Allow -Profile Any | Out-Null
+$archivoGrupo = Join-Path $Destino 'predio-ha.json'
+if (Test-Path -LiteralPath $archivoGrupo -PathType Leaf) {
+  $grupo = Get-Content -LiteralPath $archivoGrupo -Raw -Encoding UTF8 | ConvertFrom-Json
+  if ($grupo.habilitado -and $grupo.quorum) {
+    & (Join-Path $Destino 'herramientas\configurar-coordinacion-lan.ps1') -Puerto ([int]$grupo.quorum.puerto)
+  }
+}
 Ok "Reglas de firewall creadas"
 
 # --- Energía: la notebook no se suspende ni se apaga al cerrar la tapa
@@ -182,13 +190,19 @@ Ok ('Servidor iniciado. Arranque automatico: ' + $ArranqueAutomatico)
 Paso "Esperando que el sistema arranque"
 $url = "http://localhost:$Puerto"
 $listo = $false
+$esperandoGrupo = $false
 for ($i = 0; $i -lt 40; $i++) {
   try {
     $r = Invoke-WebRequest -Uri "$url/api/estado-publico" -UseBasicParsing -TimeoutSec 3
     if ($r.StatusCode -eq 200) { $listo = $true; break }
-  } catch { Start-Sleep -Seconds 2 }
+  } catch {
+    $esperandoGrupo = $_.ErrorDetails.Message -match 'SERVIDOR_CAMBIANDO'
+    Start-Sleep -Seconds 2
+  }
 }
-if ($listo) { Ok "El sistema responde en $url" } else { Aviso "Todavia no responde. Revisa la carpeta $Destino\logs si no abre en un minuto." }
+if ($listo) { Ok "El sistema responde en $url" }
+elseif ($esperandoGrupo) { Aviso 'El servidor arranco y espera al grupo. Deja encendidas las PCs de respaldo en la misma red.' }
+else { Aviso "Todavia no responde. Revisa la carpeta $Destino\logs si no abre en un minuto." }
 
 # --- Direcciones para las PCs de las bocas
 $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -227,7 +241,8 @@ Set-Content (Join-Path $escritorio "Sistema del Camping.url") -Value "[InternetS
 
 Write-Host ""
 Write-Host "==========================================================" -ForegroundColor Green
-Write-Host ("  Listo. El sistema queda funcionando. Arranque automatico: " + $ArranqueAutomatico) -ForegroundColor Green
+if ($listo) { Ok ('El sistema esta funcionando. Arranque automatico: ' + $ArranqueAutomatico) }
+else { Aviso ('La instalacion termino. El sistema todavia no esta disponible. Arranque automatico: ' + $ArranqueAutomatico) }
 Write-Host "==========================================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "  En las PCs del camping entra a:" -ForegroundColor White
@@ -236,4 +251,4 @@ Write-Host ""
 Write-Host "  (Quedo anotado en el escritorio: 'Sistema del Camping - direcciones.txt')" -ForegroundColor Gray
 Write-Host ""
 & (Join-Path $Destino 'herramientas\configurar-acceso-caja.ps1') -Direccion $url
-Start-Process "$url/"
+if ($listo) { Start-Process "$url/" }

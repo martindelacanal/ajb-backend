@@ -16,10 +16,10 @@ function powershell(codigo, entorno = {}) {
   }).trim();
 }
 
-test("los scripts HTTPS son compatibles con el parser de Windows PowerShell 5.1", { skip: !WINDOWS }, () => {
+test("los scripts de red son compatibles con el parser de Windows PowerShell 5.1", { skip: !WINDOWS }, () => {
   const salida = powershell(`
     $ErrorActionPreference = 'Stop'
-    foreach ($archivo in @('preparar-https.ps1', 'confiar-certificado.ps1', 'configurar-acceso-caja.ps1')) {
+    foreach ($archivo in @('preparar-https.ps1', 'confiar-certificado.ps1', 'configurar-acceso-caja.ps1', 'instalar.ps1', 'configurar-coordinacion-lan.ps1')) {
       $tokens = $null; $errores = $null
       [Management.Automation.Language.Parser]::ParseFile((Join-Path $env:AJB_HTTPS_SCRIPTS $archivo), [ref]$tokens, [ref]$errores) | Out-Null
       if ($errores.Count) { throw ($errores | Out-String) }
@@ -27,6 +27,61 @@ test("los scripts HTTPS son compatibles con el parser de Windows PowerShell 5.1"
     Write-Output 'AST_OK'
   `);
   assert.equal(salida, "AST_OK");
+});
+
+test("reinstalar conserva las reglas de respaldo y repara TCP y descubrimiento del grupo existente", { skip: !WINDOWS }, t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ajb-reglas-lan-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, "herramientas"));
+  fs.copyFileSync(path.join(SCRIPTS, "configurar-coordinacion-lan.ps1"), path.join(dir, "herramientas", "configurar-coordinacion-lan.ps1"));
+  fs.writeFileSync(path.join(dir, "predio-ha.json"), JSON.stringify({ habilitado: true, quorum: { puerto: 39878 } }));
+  const salida = powershell(`
+    $ErrorActionPreference = 'Stop'
+    $Destino = $env:AJB_REGLAS_FIXTURE
+    $Puerto = 8080
+    function Paso($texto) {}
+    function Ok($texto) {}
+    $reglas = @{
+      respaldo = @{ Name = 'respaldo'; DisplayName = 'AJB Predio Respaldo 39878 (grupo)' }
+      webVieja = @{ Name = 'webVieja'; DisplayName = 'AJB Predio (puerto 8081)' }
+      'AJB-Predio-Ubicacion-Quorum' = @{ Name = 'AJB-Predio-Ubicacion-Quorum'; DisplayName = 'AJB Predio Ubicacion LAN'; Enabled = 'False' }
+    }
+    function Get-NetFirewallRule($Name, $DisplayName, $ErrorAction) {
+      if ($Name) { return $reglas[$Name] }
+      foreach ($r in $reglas.Values) {
+        if (@($DisplayName | Where-Object { $r.DisplayName -like $_ }).Count) { $r }
+      }
+    }
+    function Remove-NetFirewallRule {
+      begin { $bajas = @() }
+      process { $bajas += $_.Name }
+      end { foreach ($baja in $bajas) { $reglas.Remove($baja) } }
+    }
+    function New-NetFirewallRule($Name, $DisplayName, $Direction, $Protocol, $LocalPort, $RemoteAddress, $Action, $Profile, $Enabled) {
+      if (-not $Name) { $Name = $DisplayName }
+      if ($reglas.ContainsKey($Name)) { throw "Regla duplicada: $Name" }
+      $reglas[$Name] = $PSBoundParameters + @{ NombreInterno = $Name }
+      $reglas[$Name]['Name'] = $Name
+    }
+    function Set-NetFirewallRule($Name, $Direction, $Protocol, $LocalPort, $RemoteAddress, $Action, $Profile, $Enabled) {
+      $etiqueta = $reglas[$Name].DisplayName
+      $reglas.Remove($Name)
+      New-NetFirewallRule @PSBoundParameters -DisplayName $etiqueta
+    }
+    $instalador = Get-Content -LiteralPath (Join-Path $env:AJB_HTTPS_SCRIPTS 'instalar.ps1') -Raw
+    $fragmento = [regex]::Match($instalador, '(?ms)^# --- Firewall\r?\n(.*?)^# --- Energ').Groups[1].Value
+    if (-not $fragmento) { throw 'No se encontro la preparacion de firewall' }
+    $configurar = [ScriptBlock]::Create($fragmento)
+    & $configurar
+    & $configurar
+    $reglas | ConvertTo-Json -Compress
+  `, { AJB_REGLAS_FIXTURE: dir });
+  const reglas = JSON.parse(salida);
+  assert.ok(reglas.respaldo);
+  assert.equal(reglas.webVieja, undefined);
+  const tcp = reglas["AJB-Predio-Coordinacion-LAN"], udp = reglas["AJB-Predio-Ubicacion-Quorum"];
+  assert.deepEqual([tcp.Protocol, tcp.LocalPort, tcp.RemoteAddress, tcp.Enabled], ["TCP", 39878, "LocalSubnet", "True"]);
+  assert.deepEqual([udp.Protocol, udp.LocalPort, udp.RemoteAddress, udp.Enabled], ["UDP", 39879, "LocalSubnet", "True"]);
 });
 
 test("la preparación instala y actualiza el acceso compartido sin abrir el navegador del instalador", { skip: !WINDOWS }, t => {

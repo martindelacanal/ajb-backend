@@ -12,7 +12,7 @@ const { armarInstaladorApoyo } = require("./instalador-apoyo");
 const { crearSnapshotDirecta } = require("./respaldo-lan");
 const httpLan = require("./http-lan");
 const { crearVerificador } = require("./protocolo-lan");
-const { direccionRaft } = require("./quorum-lan");
+const { direccionRaft, prepararRedQuorum } = require("./quorum-lan");
 const { conectarMiembro } = require("./ubicacion-lan");
 const META = "ha_admin_json";
 const PUERTO_QUORUM = 39878;
@@ -242,9 +242,7 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
     const manual = Boolean(r.quorum.manual);
     const otros = intento ? intento.otros.map(id => r.miembros.find(m => m.id === id)) : await disponibles(r);
     if (manual ? otros.length !== 1 || otros[0].id !== r.quorum.manual : otros.length < 2) return;
-    if (!manual && process.platform === "win32") execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-      `if (-not (Get-NetFirewallRule -Name 'AJB-Predio-Coordinacion' -ErrorAction SilentlyContinue)) { New-NetFirewallRule -Name 'AJB-Predio-Coordinacion' -DisplayName 'AJB Predio Coordinacion' -Direction Inbound -Protocol TCP -LocalPort ${PUERTO_QUORUM} -RemoteAddress LocalSubnet -Action Allow -Profile Any -ErrorAction Stop | Out-Null }`],
-    { windowsHide: true, timeout: 20000 });
+    if (!manual) await prepararRedQuorum(dirApp, PUERTO_QUORUM);
     bloquearEscritura(); congelado = true;
     return db.exclusivo(async () => {
       let packet;
