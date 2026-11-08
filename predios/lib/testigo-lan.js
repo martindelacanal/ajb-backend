@@ -60,13 +60,15 @@ function validarConfig(config) {
       try { if (typeof m.caPublica !== "string" || m.caPublica.length > 32768 || !m.caPublica.includes("-----BEGIN CERTIFICATE-----") || !new crypto.X509Certificate(m.caPublica).ca || m.caPublica.includes("PRIVATE KEY")) throw new Error(); }
       catch (_e) { throw new Error("La autoridad HTTPS pública de un miembro no es válida"); }
     }
-    if (typeof m.id !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(m.id) || ids.has(m.id) || typeof m.nombre !== "string" || !m.nombre.trim() || typeof m.clave !== "string" || m.clave.length < 16 || claves.has(m.clave) || !["http:", "https:"].includes(url.protocol) || url.username || url.password || url.hash || url.search || (url.pathname !== "/" && url.pathname !== "") || urls.has(url.origin)) throw new Error("Los miembros del testigo deben tener identidades, URLs y credenciales únicas");
+    if (typeof m.id !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(m.id) || ids.has(m.id) || typeof m.nombre !== "string" || !m.nombre.trim() || typeof m.clave !== "string" || m.clave.length < 16 || claves.has(m.clave) || !["http:", "https:"].includes(url.protocol) || url.username || url.password || url.hash || url.search || (url.pathname !== "/" && url.pathname !== "") || (urls.has(url.origin) && !config.manualCaja)) throw new Error("Los miembros del testigo deben tener identidades, URLs y credenciales válidas");
     ids.add(m.id); urls.add(url.origin); claves.add(m.clave);
   }
   if (config.miembros.filter((m) => m.preferido).length > 1) throw new Error("Sólo puede haber un equipo preferido");
 }
-function crearTestigo({ base, config, ahora = Date.now, monotono = () => Number(process.hrtime.bigint() / 1000000n) }) {
+function crearTestigo({ base, config, firmaInicial, exigirExistente = false, ahora = Date.now, monotono = () => Number(process.hrtime.bigint() / 1000000n) }) {
   validarConfig(config);
+  const caja = config.manualCaja;
+  if (caja && (config.miembros.length !== 2 || !config.miembros.some(m => m.id === caja && !m.preferido) || !config.miembros.some(m => m.preferido))) throw new Error("El relevo manual requiere una principal y una caja");
   if (typeof base !== "string" || !base.trim()) throw new Error("Falta la carpeta privada del testigo");
   base = path.resolve(base); proteger(base);
   const cerrarCandado = tomarCandado(base);
@@ -78,18 +80,24 @@ function crearTestigo({ base, config, ahora = Date.now, monotono = () => Number(
     function huellaConfiguracion(lista, favorito, degradado) { return crypto.createHash("sha256").update(JSON.stringify({ grupoId: config.grupoId, miembros: lista.map(({ id, nombre, url, clave, caPublica }) => ({ id, nombre, url, caPublica: caPublica || null, clave_hash: crypto.createHash("sha256").update(clave).digest("hex") })), preferido: favorito, permitirDegradado: degradado })).digest("hex"); }
     let durable;
     const existiaEstado = fs.existsSync(archivo);
+    if (exigirExistente && !existiaEstado) throw new Error("Falta el registro de la última copia confirmada. Revisá el disco de la caja.");
+    if (!existiaEstado && firmaInicial && !fs.existsSync(firmaArchivo)) {
+      const publica = crypto.createPublicKey(firmaInicial).export({ type: "spki", format: "pem" });
+      persistir(firmaArchivo, { privada: firmaInicial, publica });
+    }
     if (existiaEstado) {
       durable = JSON.parse(fs.readFileSync(archivo, "utf8"));
       if (!Array.isArray(durable.miembros)) throw new Error("Falta la membresía durable del testigo");
-      validarConfig({ grupoId: config.grupoId, miembros: durable.miembros, revisionInicial: durable.ultimo });
+      validarConfig({ grupoId: config.grupoId, miembros: durable.miembros, revisionInicial: durable.ultimo, manualCaja: caja });
       miembros = durable.miembros.map((m) => ({ ...m })); preferido = durable.preferido; permitirDegradado = durable.permitirDegradado === true;
       if (durable.formato !== 1 || durable.grupoId !== config.grupoId || !miembros.some((m) => m.id === preferido) || durable.configuracion !== huellaConfiguracion(miembros, preferido, permitirDegradado) || !Number.isSafeInteger(durable.termino) || durable.termino < 0 || !revisionValida(durable.ultimo) || (durable.escritor !== null && !miembros.some((m) => m.id === durable.escritor))) throw new Error("El estado durable del testigo no coincide con el grupo configurado");
-    } else { durable = { formato: 1, grupoId: config.grupoId, configuracion: huellaConfiguracion(miembros, preferido, permitirDegradado), miembros, preferido, permitirDegradado, revision_miembros: 1, termino: 0, escritor: null, ultimo_escritor: null, ultimo: { ...config.revisionInicial }, degradado: false, ultimo_commit: null }; persistir(archivo, durable); }
+      if (durable.manualCaja !== caja) throw new Error("El modo del testigo guardado no coincide con el configurado");
+    } else { durable = { formato: 1, grupoId: config.grupoId, configuracion: huellaConfiguracion(miembros, preferido, permitirDegradado), miembros, preferido, permitirDegradado, revision_miembros: 1, termino: 0, escritor: null, ultimo_escritor: null, ultimo: { ...config.revisionInicial }, degradado: false, ultimo_commit: null, manualCaja: caja }; persistir(archivo, durable); }
     let par;
     if (fs.existsSync(firmaArchivo)) par = JSON.parse(fs.readFileSync(firmaArchivo, "utf8"));
     else { if (existiaEstado) throw new Error("Falta la identidad de firma del testigo existente: no se reemplaza automáticamente"); const p = crypto.generateKeyPairSync("ed25519"); par = { privada: p.privateKey.export({ type: "pkcs8", format: "pem" }), publica: p.publicKey.export({ type: "spki", format: "pem" }) }; persistir(firmaArchivo, par); }
     const privada = crypto.createPrivateKey(par.privada), publica = crypto.createPublicKey(privada).export({ type: "spki", format: "pem" });
-    if (privada.asymmetricKeyType !== "ed25519" || publica !== par.publica) throw new Error("La identidad de firma del testigo no coincide");
+    if (privada.asymmetricKeyType !== "ed25519" || publica !== par.publica || (config.clavePublicaTestigo && config.clavePublicaTestigo !== publica)) throw new Error("La identidad de firma del testigo no coincide");
     let ultimoMono = monotono(), inicio = ultimoMono, leaseHasta = 0, cerrado = false, falloReloj = false, falloDisco = false, retorno = null;
     const autenticar = crearVerificador({ grupoId: config.grupoId, miembros: () => miembros, ahora });
     function configuracionPublica() { return { grupoId: config.grupoId, preferidoId: preferido, permitirDegradado, revisionMiembros: durable.revision_miembros || 1, miembros: miembros.map(({ id, nombre, url, caPublica }) => ({ id, nombre, url, preferido: id === preferido, ...(caPublica ? { caPublica } : {}) })) }; }
@@ -103,8 +111,17 @@ function crearTestigo({ base, config, ahora = Date.now, monotono = () => Number(
     return {
       estado({ desafio = null, compacto = false } = {}) { const n = reloj(), r = respuesta(n); const m = r.escritor ? miembro(r.escritor) : null, fecha = ahora();
         const estado = { tipo: "AJB_TESTIGO_ESTADO", formato: 1, grupo_id: config.grupoId, termino: r.termino, escritor: m ? { id: m.id, nombre: m.nombre, url: m.url } : null, ultimo_escritor: durable.ultimo_escritor, ultimo: r.ultimo, preferido_id: preferido, drenar: r.drenar, hacia_preferido: r.hacia_preferido, cuarentena_ms: r.cuarentena_ms, bloqueado: r.bloqueado, degradado: r.degradado, ultimo_commit: durable.ultimo_commit, revision_miembros: durable.revision_miembros || 1, miembros: configuracionPublica().miembros, emitido_ms: fecha, vence_ms: fecha + (m ? Math.min(USO_MS, r.vence_en_ms) : USO_MS), desafio };
+        if (caja) estado.manual_activo = durable.manualActivo === true;
         if (compacto === true) { delete estado.miembros; estado.compacto = true; estado.miembro_autorizado = !!m; }
         return { estado, firma: crypto.sign(null, Buffer.from(JSON.stringify(estado)), privada).toString("base64"), clave_publica: publica };
+      },
+      habilitarRelevo(revision) {
+        const n = reloj();
+        if (!caja || falloReloj || falloDisco || n - inicio < CUARENTENA_MS || activo(n) || !misma(revision, durable.ultimo)) {
+          throw Object.assign(new Error("Esperá a que venza el permiso de la principal y volvé a verificar la última copia."), { status: 409 });
+        }
+        if (!durable.manualActivo) guardar({ manualActivo: true, escritor: null });
+        retorno = null;
       },
       solicitar({ nodoId, revision }) { const n = reloj(); miembro(nodoId); if (!revisionValida(revision)) throw new Error("La revisión del equipo no es válida");
         if (falloReloj || falloDisco || n - inicio < CUARENTENA_MS || !misma(revision, durable.ultimo)) return respuesta(n);
@@ -113,6 +130,7 @@ function crearTestigo({ base, config, ahora = Date.now, monotono = () => Number(
           if (nodoId === preferido) retorno = { revision: { ...revision }, hasta: n + 30000 };
           return respuesta(n);
         }
+        if (caja && nodoId !== (durable.manualActivo ? caja : preferido)) return respuesta(n);
         if (retornoListo(n) && nodoId !== preferido) return respuesta(n);
         guardar({ termino: durable.termino + 1, escritor: nodoId, ultimo_escritor: nodoId }); leaseHasta = n + LEASE_MS; retorno = null;
         return respuesta(n, true);
@@ -127,7 +145,8 @@ function crearTestigo({ base, config, ahora = Date.now, monotono = () => Number(
           if (durable.degradado && copias.size) guardar({ degradado: false, ultimo_commit: { ...durable.ultimo_commit, replicas: [...copias], degradado: false, recuperado_ms: ahora() } });
           return { ...respuesta(n, true), confirmado: true };
         }
-        if (miembros.length > 1 && !copias.size && !(permitirDegradado && modoDegradado === true)) throw new Error("Falta la copia durable de un respaldo antes de confirmar");
+        const degradadoAutorizado = caja ? nodoId === caja && durable.manualActivo : permitirDegradado;
+        if (miembros.length > 1 && !copias.size && !(degradadoAutorizado && modoDegradado === true)) throw new Error("Falta la copia durable de un respaldo antes de confirmar");
         const degradado = miembros.length > 1 && !copias.size;
         guardar({ ultimo: revision, degradado, ultimo_commit: { ...revision, escritor: nodoId, termino, replicas: [...copias], degradado, confirmado_ms: ahora() } }); return { ...respuesta(n, true), confirmado: true };
       },
@@ -147,7 +166,11 @@ function crearTestigo({ base, config, ahora = Date.now, monotono = () => Number(
         guardar({ miembros: nuevos, revision_miembros: (durable.revision_miembros || 1) + 1, configuracion: huellaConfiguracion(nuevos, preferido, permitirDegradado) }); miembros = nuevos;
         return configuracionPublica();
       },
-      liberar({ nodoId, termino }) { const n = reloj(); exigirEscritor(nodoId, termino, n); guardar({ escritor: null }); leaseHasta = 0; return respuesta(n); },
+      liberar({ nodoId, termino, replica }) { const n = reloj(); exigirEscritor(nodoId, termino, n);
+        if (caja && (nodoId !== caja || durable.degradado || verificarAckReplica(replica, { grupoId: config.grupoId, escritorId: caja, termino, ...durable.ultimo, miembros }) !== preferido)) {
+          throw new Error("La principal debe confirmar la última copia antes de retomar el servicio");
+        }
+        guardar(caja ? { escritor: null, manualActivo: false } : { escritor: null }); leaseHasta = 0; return respuesta(n); },
       cerrar() { if (!cerrado) { cerrado = true; leaseHasta = 0; cerrarCandado(); } },
     };
   } catch (e) { cerrarCandado(); throw e; }

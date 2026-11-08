@@ -50,9 +50,10 @@ async function pedir(urlBase, ruta, { grupoId, nodoId, clave, metodo = "POST", c
   if (r.status !== 200) { let m = "No respondió el equipo de la red local"; try { m = JSON.parse(r.buffer.toString("utf8")).mensaje || m; } catch (_e) {} throw Object.assign(new Error(m), { status: r.status }); }
   return binario ? r : JSON.parse(r.buffer.toString("utf8"));
 }
-async function estadoTestigo(c, { compacto = false } = {}) {
+async function estadoTestigo(c, { compacto = false, destino, arbitro, ruta = "/lan/testigo/estado" } = {}) {
   const desafio = crypto.randomBytes(20).toString("hex"), inicio = performance.now();
-  const sobre = await pedir(c.testigo.url, "/lan/testigo/estado?desafio=" + desafio + (compacto ? "&compacto=1" : ""), { metodo: "GET", timeout: 3000 });
+  const sobre = arbitro ? arbitro.estado({ desafio, compacto })
+    : await pedir(destino?.url || c.testigo.url, ruta + "?desafio=" + desafio + (compacto ? "&compacto=1" : ""), { ...destino, metodo: "GET", timeout: 3000 });
   const estado = verificarEstadoFirmado(sobre, { clavePublica: c.clavePublicaTestigo, grupoId: c.grupoId, desafio });
   const transcurrido = performance.now() - inicio;
   if (transcurrido >= 5000) throw new Error("La respuesta del testigo llegó tarde");

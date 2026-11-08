@@ -25,12 +25,14 @@
     var equipo = P.btn("Incorporar esta PC", { tipo: "primario", icono: "descargar", deshabilitado: true, onclick: incorporarEquipo });
     equipo.hidden = true;
     var activar = P.btn("Activar reemplazo automático", { tipo: "primario", icono: "check", deshabilitado: true, onclick: activarGrupo });
+    var configurarManual = P.btn("Configurar relevo manual con dos PCs", { tipo: "secundario", icono: "check", deshabilitado: true, onclick: function () { activarGrupo(true); } });
     var revisar = P.btn("Actualizar estado", { tipo: "texto", icono: "refrescar", onclick: function () { cargar(); } });
     var pasos = h("ol", { style: { margin: 0, paddingLeft: "22px" } },
       h("li", "Instalá el testigo en una PC de caja que permanezca encendida. Es liviano y no guarda la base de ventas ni stock."),
       h("li", "Agregá las PCs de respaldo que necesites y completá su incorporación."),
       h("li", "Activá el reemplazo automático y prepará el acceso de cada caja."));
-    var ayudaEquipo = h("p.texto-3", { hidden: true }, "Abrí esta pantalla en cada PC del camping y ejecutá el instalador que descargues ahí. El reemplazo se activa solo cuando hay tres PCs listas, contando la principal.");
+    var ayudaEquipo = h("p.texto-3", { hidden: true }, "Incorporá la PC de caja desde esa misma PC. Con dos equipos podés configurar el relevo manual. El relevo automático se activa con tres equipos listos.");
+    var ayudaManual = h("p.texto-3", { hidden: true }, "Mantené las dos PCs conectadas para confirmar cada venta en ambas. Si se apaga la principal, volvé a abrir el acceso de caja en su escritorio y autorizá el relevo con una cuenta de administrador.");
     var ayudaCaja = h("p.texto-3.chico", { style: { margin: 0 } }, "En las cajas, usá «Sistema del Camping - Caja»: abre localhost:8091 y encuentra la PC en servicio.");
     var datosTestigo = h("div.dato", h("span", "Testigo en la red"), pcTestigo);
     var panel = h("section.hoja.hoja-cuerpo.columna", { "aria-label": "PCs de respaldo del predio" },
@@ -38,23 +40,27 @@
       h("p.texto-3", { style: { margin: 0 } }, "Podés seguir trabajando con una sola PC. Si agregás respaldos, otra PC puede continuar atendiendo las cajas cuando falle la que está en servicio."),
       h("div.datos", h("div.dato", h("span", "PC en servicio"), pcServicio), h("div.dato", h("span", "PC de origen"), preferida), datosTestigo),
       mensaje, problema, reducida,
-      pasos, ayudaEquipo,
+      pasos, ayudaEquipo, ayudaManual,
       equipos, sinEquipos, retorno,
-      h("div.fila", equipo, testigo, respaldo, acceso, activar), ayudaCaja,
+      h("div.fila", equipo, testigo, respaldo, acceso, activar, configurarManual), ayudaCaja,
       aviso, h("div.fila", revisar));
 
     function actualizarControles() {
       var ocupado = trabajando || confirmando || activando || !datos;
-      var unificado = !!datos && (datos.modo === "quorum" || datos.puedeIncorporarEquipo);
-      equipo.hidden = !unificado;
+      var manual = datos && datos.modo === "manual";
+      var unificado = !!datos && (manual || datos.modo === "quorum" || datos.puedeIncorporarEquipo);
+      equipo.hidden = !unificado || manual;
       equipo.disabled = ocupado || !datos.puedeIncorporarEquipo;
       pasos.hidden = ayudaCaja.hidden = datosTestigo.hidden = testigo.hidden = respaldo.hidden = acceso.hidden = unificado;
-      ayudaEquipo.hidden = !unificado;
+      ayudaEquipo.hidden = !unificado || manual;
+      ayudaManual.hidden = !manual;
       testigo.disabled = ocupado || !datos.puedePrepararTestigo;
       respaldo.disabled = ocupado || !datos.puedePrepararRespaldo;
       acceso.disabled = ocupado || !datos.testigo;
       activar.disabled = ocupado || !datos.puedeActivar;
       activar.hidden = unificado || (!!datos && (datos.estado === "EN_MARCHA" || datos.estado === "SIN_TESTIGO"));
+      configurarManual.hidden = !datos || !datos.puedeConfigurarManual;
+      configurarManual.disabled = ocupado || configurarManual.hidden;
       revisar.disabled = consultando || activando;
     }
     function incorporarEquipo() {
@@ -83,6 +89,7 @@
       return boton;
     }
     function estadoVisible(d) {
+      if (d.modo === "manual" && d.estado === "EN_MARCHA") return [d.manualActivo ? "Caja en relevo manual" : "Relevo manual preparado", "CONFIRMADA"];
       var estados = {
         SIN_CONFIGURAR: ["Una sola PC", "CONFIRMADA"],
         PREPARANDO: ["Preparando las PCs", "PENDIENTE"],
@@ -97,7 +104,7 @@
       datos = d;
       var lista = (d.miembros || []).slice().sort(function (a, b) { return String(a.id).localeCompare(String(b.id)); });
       var nueva = JSON.stringify({ habilitado: d.habilitado, grupoId: d.grupoId, principal: d.principal, testigo: d.testigo, miembros: lista,
-        escritor: d.escritor, degradado: d.degradado, estado: d.estado, puedeActivar: d.puedeActivar,
+        escritor: d.escritor, degradado: d.degradado, estado: d.estado, puedeActivar: d.puedeActivar, manualActivo: d.manualActivo,
         puedePrepararTestigo: d.puedePrepararTestigo, puedePrepararRespaldo: d.puedePrepararRespaldo, modo: d.modo, mensaje: d.mensaje });
       if (huella !== nueva) {
         huella = nueva;
@@ -139,7 +146,8 @@
           if (cerrado) return;
           if (d.estado !== "EN_MARCHA" && d.estado !== "SIN_TESTIGO") throw new Error("El servidor todavía está preparando el reemplazo");
           activando = false; mostrar(d);
-          aviso.textContent = d.estado === "EN_MARCHA" ? "El reemplazo automático está activo. Mantené encendida la PC testigo." : "El servidor volvió. Encendé la PC testigo para habilitar el reemplazo automático.";
+          aviso.textContent = d.modo === "manual" ? "El relevo manual está preparado. La caja recibe una copia de cada venta confirmada."
+            : d.estado === "EN_MARCHA" ? "El reemplazo automático está activo. Mantené encendida la PC testigo." : "El servidor volvió. Encendé la PC testigo para habilitar el reemplazo automático.";
           aviso.hidden = false;
         }).catch(function () {
           if (cerrado) return;
@@ -150,17 +158,19 @@
         });
       }, 2000);
     }
-    function activarGrupo() {
-      if (cerrado || confirmando || trabajando || activando || !datos || !datos.puedeActivar) return;
+    function activarGrupo(manual) {
+      manual = manual === true;
+      if (cerrado || confirmando || trabajando || activando || !datos || !(manual ? datos.puedeConfigurarManual : datos.puedeActivar)) return;
       confirmando = true; actualizarControles();
-      P.confirmar("El servidor se reiniciará y las cajas tendrán una interrupción breve. Mantené encendida y conectada a la red la PC que cumple la función de testigo.", {
-        titulo: "¿Activar el reemplazo automático?", aceptar: "Activar y reiniciar",
+      P.confirmar(manual ? "La principal se reiniciará después de enviar la copia inicial a la caja. A partir de ahí, cada venta normal se confirma cuando las dos PCs guardaron los datos."
+        : "El servidor se reiniciará y las cajas tendrán una interrupción breve. Mantené encendida y conectada a la red la PC que cumple la función de testigo.", {
+        titulo: manual ? "¿Configurar el relevo manual?" : "¿Activar el reemplazo automático?", aceptar: "Activar y reiniciar",
       }).then(function (ok) {
         confirmando = false;
         if (!ok || cerrado) { if (!cerrado) actualizarControles(); return; }
         activando = true; actualizarControles();
-        P.ejecutar(activar, function () {
-          return P.post("/sistema/grupo-local/activar", {}).then(function () {
+        P.ejecutar(manual ? configurarManual : activar, function () {
+          return P.post(manual ? "/sistema/grupo-local/configurar-relevo-manual" : "/sistema/grupo-local/activar", {}).then(function () {
             if (cerrado) return;
             P.reemplazar(estado, P.chip("Esperando el reinicio", "PENDIENTE"));
             aviso.textContent = "Activación solicitada. Esperando que el servidor vuelva a responder…";

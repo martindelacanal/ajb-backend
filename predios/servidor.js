@@ -190,7 +190,7 @@ const servicios = { version: VERSION };
 const agente = crearAgente({
   db, config, base: BASE, version: VERSION, log,
   controlEquipo,
-  grupoLocal: () => ha?.estado() || { habilitado: congelado, escritor: false },
+  grupoLocal: () => ha ? { ...ha.estado(), relevoManual: !!configHa?.relevoManual } : { habilitado: congelado, escritor: false },
   pruebaHa: () => ha.pruebaCentral(),
   api: { ejecutarRemoto },
   alActualizar: () => apagar(75),
@@ -415,6 +415,11 @@ async function rutaSistema(ctx, metodo, ruta, req, res) {
     await leerCuerpo(req, 1000);
     return grupoLocal.activar();
   }
+  if (metodo === "POST" && ruta === "/sistema/grupo-local/configurar-relevo-manual") {
+    controlEquipo.comprobar();
+    await leerCuerpo(req, 1000);
+    return grupoLocal.configurarManual();
+  }
   if (metodo === "GET" && ruta === "/sistema/estado") {
     const respaldos = listarRespaldos(path.join(BASE, "datos", "respaldos")).map(({ nombre, tamano }) => ({ nombre, tamano }));
     const tamano = fs.existsSync(db.archivo) ? fs.statSync(db.archivo).size : 0;
@@ -601,6 +606,56 @@ function esIpLocal(ip) {
   });
 }
 
+function origenCajaLocal(req) {
+  const host = req.headers.host || "";
+  if (!["127.0.0.1", "::1"].includes(ipDe(req)) ||
+      !/^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?$/i.test(host)) return null;
+  let origen;
+  try { origen = new URL((req.socket.encrypted ? "https://" : "http://") + host); } catch (_e) { return null; }
+  if (Number(origen.port || (req.socket.encrypted ? 443 : 80)) !== req.socket.localPort) return null;
+  return origen.origin;
+}
+
+async function pantallaRelevo(req, res) {
+  const origen = origenCajaLocal(req);
+  if (!origen || !["GET", "POST"].includes(req.method)) return enviar(req, res, 403, { mensaje: "Abrí el relevo en la PC de caja" });
+  const seguro = texto => String(texto).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+  let estado, mensaje, status = 200, activado = false;
+  try {
+    estado = ha.relevoLocal();
+    if (req.method === "POST") {
+      if (req.headers.origin !== origen || !/^application\/x-www-form-urlencoded(?:;|$)/i.test(req.headers["content-type"] || "")) {
+        return enviar(req, res, 403, { mensaje: "Abrí el formulario desde la PC de caja" });
+      }
+      const datos = new URLSearchParams((await leerCuerpo(req, 4096, true)).toString("utf8"));
+      if (datos.get("principalApagada") !== "si") throw U.error("Confirmá que la principal está apagada", 400);
+      const revision = await ha.habilitarRelevo({ usuario: datos.get("usuario"), password: datos.get("password") });
+      mensaje = `Relevo autorizado con la revisión ${revision.indice}. Esperá unos segundos y volvé al sistema.`;
+      activado = true;
+    }
+  } catch (e) {
+    status = e.status || 503;
+    mensaje = e.message;
+  }
+  const disponible = estado && !estado.escritor && !estado.cuarentena_ms && !estado.bloqueado && !estado.manual_activo && !activado;
+  const texto = mensaje || (estado?.manual_activo ? "El relevo está autorizado. Volvé al sistema cuando termine de preparar la copia."
+    : estado?.escritor ? "Todavía hay una PC autorizada. Si apagaste la principal, esperá unos segundos y actualizá esta página."
+    : estado?.cuarentena_ms ? "La caja está arrancando. Esperá unos segundos y actualizá esta página."
+    : estado?.bloqueado || !estado ? "La caja todavía no puede verificar la última copia." : "Usá la cuenta de un administrador del predio.");
+  const formulario = disponible ? `<form method="post" action="/relevo-manual">
+    <label>Usuario o DNI <input name="usuario" autocomplete="username" required maxlength="100"></label>
+    <label>Contraseña <input name="password" type="password" autocomplete="current-password" required maxlength="200"></label>
+    <label><input type="checkbox" name="principalApagada" value="si" required> Confirmo que la PC principal está apagada.</label>
+    <button type="submit">Tomar el relevo con la última copia</button>
+  </form>` : "";
+  return enviar(req, res, status, `<!doctype html><html lang="es"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Relevo manual del camping</title><style>body{font:1rem system-ui;max-width:36rem;margin:3rem auto;padding:0 1rem;line-height:1.5}
+    label{display:block;margin:1rem 0}input,button{font:inherit}a{margin-right:1rem}</style>
+    <main><h1>Relevo manual del camping</h1><p role="status">${seguro(texto)}</p>${formulario}
+    <p><a href="/">Volver al sistema</a><a href="/relevo-manual">Actualizar estado</a></p></main></html>`,
+  "text/html; charset=utf-8", { "Cache-Control": "no-store" });
+}
+
 async function manejar(req, res) {
   cabecerasSeguridad(res);
   const url = new URL(req.url, "http://local");
@@ -616,7 +671,12 @@ async function manejar(req, res) {
     if (ha && await ha.manejar(req, res)) return;
     return LAN.respuesta(res, 404, { mensaje: "No encontramos esa operación" });
   }
-  if (ha && !congelado && !ha.estado().escritor) return ha.reenviar(req, res);
+  const cajaRelevo = configHa?.relevoManual?.cajaId === controlEquipo.equipoId;
+  if (cajaRelevo && ruta === "/relevo-manual") return pantallaRelevo(req, res);
+  if (ha && !congelado && !ha.estado().escritor) {
+    const accesoCaja = cajaRelevo && req.method === "GET" && ruta === "/" && origenCajaLocal(req);
+    return ha.reenviar(req, res, accesoCaja ? () => enviar(req, res, 303, "", "text/plain", { Location: "/relevo-manual", "Cache-Control": "no-store" }) : undefined);
+  }
   if (!ruta.startsWith("/api/")) {
     if (req.method !== "GET" && req.method !== "HEAD") return enviar(req, res, 405, { mensaje: "Método no permitido" });
     return servirEstatico(req, res, ruta);

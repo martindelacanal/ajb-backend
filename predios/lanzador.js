@@ -110,6 +110,7 @@ function carpetaCompatible(carpeta) {
     const quorum = config?.quorum || config?.quorumPendiente || fs.existsSync(path.join(BASE, "ha", "activacion-quorum.json"));
     return fs.statSync(path.join(carpeta, "servidor.js")).isFile()
       && (!requiereControlLan() || fs.statSync(path.join(carpeta, "lib", "servicio-lan.js")).isFile())
+      && (!config?.relevoManual || fs.statSync(path.join(carpeta, "lib", "relevo-manual.js")).isFile())
       && (!quorum || fs.statSync(path.join(carpeta, "windows", "ajb-quorum.exe")).isFile());
   } catch (_e) { return false; }
 }

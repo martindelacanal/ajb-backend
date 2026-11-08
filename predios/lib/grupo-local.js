@@ -71,6 +71,20 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
     } else resultado.quorumPendiente = true;
     return resultado;
   }
+  function haManual(r, miembro, inicial) {
+    const ha = haQuorum(r, miembro);
+    delete ha.quorumPendiente;
+    const cajaId = r.quorum.manual;
+    ha.testigo = publico(r.miembros.find(m => m.id === cajaId));
+    ha.permitirDegradado = miembro.id === cajaId;
+    ha.relevoManual = { cajaId, inicial };
+    if (miembro.id === cajaId) {
+      ha.relevoManual.miembros = r.miembros;
+      ha.relevoManual.firmaInicial = JSON.parse(fs.readFileSync(archivoClaves, "utf8")).clavePrivada;
+      if (!ha.relevoManual.firmaInicial) throw new Error("Falta la firma del grupo de relevo");
+    }
+    return ha;
+  }
   async function adminTestigo(r, accion, datos) { return d.pedir(r.testigo.url, "/lan/testigo/" + accion, { grupoId: r.grupoId, nodoId: "administracion", clave: r.claveAdministracion, buffer: httpLan.cifrarJson(datos, r.claveAdministracion), timeout: 30000 }); }
   async function estado() {
     const r = leer(), actual = haActual() || {};
@@ -86,7 +100,10 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
       }
       const copias = new Set(vivo?.ultimo_commit?.replicas || []);
       if (vivo) miembros = miembros.map(m => ({ ...m, actualizado: m.id === vivo.escritor || copias.has(m.id) }));
-      return { modo: "quorum", puedeIncorporarEquipo: !congelado && (!actual.habilitado || !!vivo?.escritor), habilitado: !!actual.habilitado && !congelado,
+      const manual = Boolean(r.quorum.manual);
+      return { modo: manual ? "manual" : "quorum", puedeIncorporarEquipo: !manual && !congelado && (!actual.habilitado || !!vivo?.escritor),
+        puedeConfigurarManual: !manual && !congelado && !actual.habilitado && r.principalId === equipoId && miembros.length === 2,
+        manualActivo: vivo?.manual_activo === true, degradado: vivo?.degradado === true, habilitado: !!actual.habilitado && !congelado,
         estado: congelado ? "ACTIVANDO" : vivo?.escritor ? "EN_MARCHA" : actual.habilitado ? "SIN_MAYORIA" : "PREPARANDO",
         principal, miembros, escritor: vivo ? miembros.find(m => m.id === vivo.escritor) || null : !actual.habilitado && !congelado ? principal : null };
     }
@@ -101,7 +118,7 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
   function instalador(rol, { equipo = false, ip, direccion } = {}) { return exclusivo(async () => {
     if (!["Testigo", "Respaldo", "Acceso"].includes(rol)) throw new Error("Elegí un rol de apoyo válido");
     let r = leer();
-    if (equipo && (!tieneCoordinador() || congelado || (!r?.quorum && !admiteGrupoNuevo(r)))) throw new Error("Este servidor todavía no está listo para incorporar equipos con votación");
+    if (equipo && (!tieneCoordinador() || congelado || r?.quorum?.manual || (!r?.quorum && !admiteGrupoNuevo(r)))) throw new Error("Este servidor todavía no está listo para incorporar equipos con votación");
     const yo = equipo && r?.quorum && r.miembros.find(m => m.id === equipoId) || await propia(equipo ? direccion : null);
     if (r?.quorum && !equipo) throw new Error("Usá Incorporar esta PC para agregar equipos a este grupo");
     if (!r) {
@@ -152,6 +169,7 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
     const huella = crypto.createHash("sha256").update(cuerpo).digest("hex");
     if (p.usadoPor && (p.usadoPor !== nodo || p.solicitud !== huella)) throw new Error("Este permiso ya fue usado por otra incorporación");
     if (p.respuesta) return Buffer.from(p.respuesta, "base64");
+    if (r.quorum?.manual) throw new Error("Este grupo de relevo manual ya tiene sus dos PCs");
     if (p.vence <= d.ahora()) throw new Error("El permiso de incorporación venció; prepará un instalador nuevo");
     if (!p.usadoPor && (nodo === equipoId || r.miembros.some((m) => m.id === nodo) || r.testigo?.id === nodo)) throw new Error("Ese equipo ya tiene un rol dentro del grupo");
     p.usadoPor = nodo; p.solicitud = huella;
@@ -201,9 +219,10 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
     const archivoPacket = path.join(base, "ha", "activacion-quorum.ajblan");
     let intento = fs.existsSync(archivoIntento) ? JSON.parse(fs.readFileSync(archivoIntento, "utf8")) : null;
     if (intento && intento.grupoId !== r.grupoId) throw new Error("La activación guardada pertenece a otro grupo");
+    const manual = Boolean(r.quorum.manual);
     const otros = intento ? intento.otros.map(id => r.miembros.find(m => m.id === id)) : await disponibles(r);
-    if (otros.length < 2) return;
-    if (process.platform === "win32") execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+    if (manual ? otros.length !== 1 || otros[0].id !== r.quorum.manual : otros.length < 2) return;
+    if (!manual && process.platform === "win32") execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
       `if (-not (Get-NetFirewallRule -Name 'AJB-Predio-Coordinacion' -ErrorAction SilentlyContinue)) { New-NetFirewallRule -Name 'AJB-Predio-Coordinacion' -DisplayName 'AJB Predio Coordinacion' -Direction Inbound -Protocol TCP -LocalPort ${PUERTO_QUORUM} -RemoteAddress LocalSubnet -Action Allow -Profile Any -ErrorAction Stop | Out-Null }`],
     { windowsHide: true, timeout: 20000 });
     bloquearEscritura(); congelado = true;
@@ -223,7 +242,7 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
       const miembros = [yo, ...otros];
       const inicial = { bootstrap: miembros.map(m => ({ id: m.id, address: direccionRaft(m.id, PUERTO_QUORUM) })),
         inicial: { grupoId: r.grupoId, termino: 0, preferidoId: r.principalId, ultimo, miembros, ultimoCommit: { ...ultimo, replicas: otros.map(m => m.id) } } };
-      const activa = haQuorum(r, yo, inicial);
+      const activa = manual ? haManual(r, yo, ultimo) : haQuorum(r, yo, inicial);
       escribirHa(base, activa);
       await activarLocal({ ha: activa, packet });
       await Promise.all(otros.map(async m => {
@@ -231,10 +250,11 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
         if (listo.semilla === ultimo.sha256) return;
         const ack = await pedirEquipo(r, m, "/lan/replica/inicial", packet.buffer);
         if (!ack?.guardado || ack.revision?.sha256 !== ultimo.sha256) throw new Error(`La PC ${m.nombre} todavía no confirmó la copia inicial`);
-        const preparado = await pedirEquipo(r, m, "/lan/quorum/preparar", haQuorum(r, m, inicial));
+        const preparado = await pedirEquipo(r, m, "/lan/quorum/preparar", manual ? haManual(r, m, ultimo) : haQuorum(r, m, inicial));
         if (preparado?.equipo !== m.id) throw new Error(`La PC ${m.nombre} todavía no confirmó la configuración`);
       }));
       await reiniciar();
+      congelado = false;
       return { activado: true, reiniciando: true };
     });
   }
@@ -244,7 +264,7 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
       if (!r?.quorum) return;
       const actual = haActual() || {};
       if (congelado || !actual.habilitado) return activarQuorum(r);
-      if (actual.escritor && promoverQuorum) return promoverQuorum(r, disponibles, haQuorum, pedirEquipo);
+      if (!r.quorum.manual && actual.escritor && promoverQuorum) return promoverQuorum(r, disponibles, haQuorum, pedirEquipo);
     }).finally(() => { actualizandoQuorum = null; });
     return actualizandoQuorum;
   }
@@ -294,8 +314,22 @@ function crearGrupoLocal({ base, dirApp, version, config, db, equipoId, haActual
       return { activado: true, reiniciando: true, revision: { indice: 0, sha256: packet.manifest.sha256 } };
     });
   }
+  const configurarManual = () => exclusivo(async () => {
+    const r = leer();
+    if (!r?.quorum || r.principalId !== equipoId || r.miembros.length !== 2 || congelado || haActual()?.habilitado) {
+      throw Object.assign(new Error("El relevo manual se configura desde la principal cuando hay exactamente dos PCs incorporadas y el grupo todavía está en preparación"), { status: 409 });
+    }
+    const caja = r.miembros.find(m => m.id !== equipoId);
+    const lista = await pedirEquipo(r, caja, "/lan/quorum/listo", {});
+    if (lista?.equipo !== caja.id || !lista.manual) {
+      throw Object.assign(new Error("Encendé y actualizá la PC de caja antes de configurar el relevo manual"), { status: 409 });
+    }
+    r.quorum.manual = caja.id;
+    await guardar(r);
+    return activarQuorum(r);
+  });
   const activar = () => exclusivo(() => activarInterno());
   const reanudarActivacion = () => exclusivo(() => activarInterno({ reanudar: true }));
-  return { estado, instalador, incorporar, activar, reanudarActivacion, actualizarQuorum };
+  return { estado, instalador, incorporar, activar, configurarManual, reanudarActivacion, actualizarQuorum };
 }
 module.exports = { crearGrupoLocal, escribirHa };

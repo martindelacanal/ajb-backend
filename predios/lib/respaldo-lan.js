@@ -271,6 +271,23 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
     return { manifest, buffer: cifrar(decoded.data, manifest, c) };
   }
   function tiene(rev) { try { obtenerSnapshot(rev); return true; } catch (_e) { return false; } }
+  async function consultarCopia(rev, consultar) {
+    let packet;
+    try { packet = obtenerSnapshot(rev); }
+    catch (_e) { throw error("La caja no puede leer la última copia confirmada. El relevo sigue bloqueado."); }
+    exigirModelo(rev);
+    const archivo = path.join(carpeta(base), "relevo-manual", ".consultar-" + crypto.randomBytes(12).toString("hex") + ".db");
+    const { DatabaseSync } = require("node:sqlite");
+    let copia;
+    try {
+      escribirDurable(archivo, abrir(packet.buffer, c).data);
+      copia = new DatabaseSync(archivo, { readOnly: true });
+      return await consultar({ get: (sql, parametros) => copia.prepare(sql).get(...parametros), tx: async () => {} });
+    } finally {
+      copia?.close();
+      fs.rmSync(archivo, { force: true });
+    }
+  }
   function confirmarLocal(rev) {
     if (!tiene(rev)) throw error("Falta la copia durable exacta de la revisión del testigo");
     if (disco.confirmada && (rev.indice < disco.confirmada.indice || (rev.indice === disco.confirmada.indice && rev.sha256 !== disco.confirmada.sha256))) throw error("La revisión confirmada del nodo no puede retroceder ni cambiar de hash");
@@ -313,7 +330,13 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
     if (remitenteId && (!c.miembros.some(n => n.id === remitenteId) || (!actual && remitenteId !== m.nodoId))) throw error("El remitente no coincide con el escritor acreditado de la copia");
     if (!actual && (m.indice !== w.ultimo.indice + 1 || m.termino !== w.termino || m.nodoId !== w.escritor || Number(w.vence_en_ms) <= 0)) throw error("El testigo no acredita ese escritor, término e índice");
     custodiar(packet);
-    if (actual) confirmarLocal(m); else { disco.pendiente = revision(m); guardar(); }
+    if (actual) confirmarLocal(m); else {
+      if (c.relevoManual && tiene(w.ultimo)) confirmarLocal(w.ultimo);
+      disco.pendiente = revision(m); guardar();
+    }
+    if (c.relevoManual && disco.confirmada) {
+      try { limpiarCopias(); } catch (e) { log("No se pudo limpiar una copia antigua: " + e.message); }
+    }
     if (m.termino < 1) return { guardado: true, revision: revision(m) };
     const { firmarAckReplica } = require("./protocolo-lan");
     return firmarAckReplica({ grupoId: c.grupoId, nodoId: c.nodoId, escritorId: m.nodoId, termino: m.termino, indice: m.indice, sha256: m.sha256 }, c.clave);
@@ -371,8 +394,8 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
       custodiar(packet);
       disco.pendiente = revision(packet.manifest); guardar();
       await asegurarPermiso();
-      let acks = [], degradado = false;
-      if (otros.length) {
+      let acks = [], degradado = Boolean(c.relevoManual && c.nodoId === c.relevoManual.cajaId && disco.degradado);
+      if (otros.length && !degradado) {
         try { acks = [await Promise.any(otros.map(async miembro => {
           if (typeof transporte.replicar !== "function") throw error("No hay transporte de réplicas LAN");
           return transporte.replicar(miembro, packet);
@@ -422,7 +445,9 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
     if (vivo() && w.escritor === c.nodoId && permiso.termino === w.termino) {
       if (!igual(w.ultimo, disco.confirmada)) throw bloquear(error("La revisión del testigo cambió fuera del escritor"));
       await pedirPermiso("renovar", disco.confirmada);
-      if ((w.degradado || disco.degradado) && otros.length && typeof transporte.replicar === "function") {
+      // En relevo manual la principal solicita la copia al volver y acredita
+      // su recepción durante el traspaso. La caja no espera una PC apagada.
+      if (!c.relevoManual && (w.degradado || disco.degradado) && otros.length && typeof transporte.replicar === "function") {
         let ack;
         try { ack = await Promise.any(otros.map(m => transporte.replicar(m, copiaDelEscritor(w.ultimo)))); }
         catch (_e) { return; } // Sigue explícitamente degradado, sin falsificar copias.
@@ -449,6 +474,7 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
       await prepararActivacion(w.ultimo, w);
       return;
     }
+    if (c.relevoManual && w.manual_activo !== (c.nodoId === c.relevoManual.cajaId)) return;
     const concedido = await pedirPermiso("solicitar", w.ultimo);
     if (!igual(disco.instalada, w.ultimo)) { await prepararActivacion(w.ultimo, concedido); return; }
     errorActual = null;
@@ -478,7 +504,7 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
           disco.degradado = false; guardar(); emitir("REDUNDANCIA_RESTABLECIDA", { revision: w.ultimo });
         }
         exigir();
-        const liberado = await testigo("liberar", { nodoId: c.nodoId, termino: permiso.termino });
+        const liberado = await testigo("liberar", { nodoId: c.nodoId, termino: permiso.termino, ...(c.relevoManual ? { replica: ack } : {}) });
         if (liberado.escritor !== null || !igual(liberado.ultimo, w.ultimo)) throw error("El testigo no liberó al escritor");
         permiso = null;
         emitir("CONTROL_ENTREGADO", { haciaId, revision: w.ultimo });
@@ -498,7 +524,7 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
       miembros: c.miembros.map(({ id, nombre, url, preferido, caPublica }) => ({ id, nombre, url, preferido, ...(caPublica ? { caPublica } : {}) })) };
   }
   return {
-    estado, antesTransaccion, antesCommit, despuesTransaccion, abortarTransaccion, recibirInicial, recibirSnapshot, recibirCopiaQuorum, obtenerSnapshot, registrarInicial, sondear, drenar,
+    estado, antesTransaccion, antesCommit, despuesTransaccion, abortarTransaccion, recibirInicial, recibirSnapshot, recibirCopiaQuorum, obtenerSnapshot, consultarCopia, registrarInicial, sondear, drenar,
     iniciar() { if (!timer) timer = setInterval(() => sondear().catch(e => log(e.message)), 1500); timer.unref?.(); return sondear(); },
     detener() { detenido = true; permiso = null; clearInterval(timer); timer = null; },
     prepararInicial: () => db.exclusivo(() => snapshot({ indice: 0, termino: 0, nodoId: c.nodoId })),

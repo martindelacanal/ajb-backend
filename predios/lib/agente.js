@@ -420,6 +420,9 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
 
   function instalarActualizacion(buffer) {
     const datos = leerPaquete(buffer);
+    if (grupoLocal().relevoManual && !datos.archivos.some(a => a.ruta === "lib/relevo-manual.js")) {
+      throw U.error("La actualización no incluye el relevo manual de esta PC", 409);
+    }
     if (grupoLocal().habilitado && !datos.archivos.some(a => a.ruta === "lib/servicio-lan.js")) throw U.error("Esa versión es anterior al respaldo automático. No se instala sobre un grupo activo.", 409);
     if (grupoLocal().habilitado) {
       const esquema = datos.archivos.find(a => a.ruta === "lib/esquema.js");

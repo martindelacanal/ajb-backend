@@ -318,6 +318,15 @@ encontrarse, los equipos intercambian mensajes autenticados por UDP 39879 en
 la red local. La actualización prepara esa regla en Windows. El navegador
 puede usar HTTP. La incorporación y la réplica usan certificados internos.
 
+Con una principal y una sola caja, incorporá la caja y elegí **Configurar relevo
+manual con dos PCs** en **Sistema → PCs de respaldo**. Mantené las dos conectadas
+para que cada venta que confirme la principal quede guardada en ambas. Si se
+apaga la principal, volvé a abrir **Sistema del Camping - Caja** en la PC de
+caja. Confirmá que la principal está apagada y autorizá el relevo con un
+administrador del predio. La caja usa la última copia confirmada y puede
+vender sin internet. Mientras esté sola, las operaciones se guardan en la
+caja. La principal recibe esa copia antes de volver a atender.
+
 El permiso de un ZIP vence en una hora y se usa en la PC donde se solicitó.
 Si se interrumpe la instalación, usá `CONTINUAR-INSTALACION.bat` en la carpeta
 que se creó en esa PC. Si había un servidor suelto del mismo predio en la ruta

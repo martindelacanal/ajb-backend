@@ -15,6 +15,7 @@ const { cabecerasSinSalto, origenPermitido } = require("./acceso-lan");
 const { emitirAviso } = require("./avisos");
 const { iniciarConsenso, crearAutoridadQuorum, clienteQuorum, RUTA_ALTA, acreditarOrigen, origenAcreditado } = require("./quorum-lan");
 const { conectarMiembro } = require("./ubicacion-lan");
+const { abrirAutoridadManual, crearRelevoManual, RUTA: RUTA_RELEVO } = require("./relevo-manual");
 
 function leerConfiguracionLan(base, equipoId = identidadEquipo()) {
   const archivo = path.join(base, "predio-ha.json");
@@ -35,13 +36,13 @@ function extraerPaquete(buffer) {
 function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQuorum, ubicarGrupo, puertoHttps, log = () => {}, alEstado = () => {} }) {
   const c = ha;
   let core, ultimoEstado = null, detenido = false, avisando = false;
-  let consenso, autoridad, cliente, ubicacion;
+  let consenso, autoridad, cliente, ubicacion, relevo;
   const colaAvisos = [];
   function miembros() { return ultimoEstado?.miembros || core?.estado().miembros || c.miembros; }
   const verificar = crearVerificador({ grupoId: c.grupoId, miembros: () => miembros().map(m => ({ id: m.id, clave: c.claveDatos })) });
   async function estadoTestigo(opciones) {
-    if (c.quorumPendiente || (c.quorum && !cliente)) throw new Error("La PC espera la activación del grupo");
-    const w = await (cliente ? cliente.estado(opciones) : H.estadoTestigo(c, opciones));
+    if (c.quorumPendiente || (c.quorum && !cliente) || (c.relevoManual && !relevo)) throw new Error("La PC espera la activación del grupo");
+    const w = await (cliente ? cliente.estado(opciones) : relevo ? relevo.estado(opciones) : H.estadoTestigo(c, opciones));
     if (!opciones?.compacto) ultimoEstado = w;
     return w;
   }
@@ -54,6 +55,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
     testigo(accion, payload) {
       if (accion === "estado") return estadoTestigo();
       if (cliente) return cliente.pedir(accion, payload);
+      if (relevo) return relevo.pedir(accion, payload);
       return H.pedir(c.testigo.url, "/lan/testigo/" + accion, { grupoId: c.grupoId, nodoId: c.nodoId, clave: c.clave, cuerpo: payload });
     },
     replicar: (m, packet) => pedirMiembro(m, "/lan/replica", { buffer: packet.buffer, timeout: 4000 }),
@@ -102,14 +104,21 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
     origenIncorporacion(cabecera, ip) { return cliente ? origenAcreditado(cabecera, c, miembros(), ip, ubicacion) : null; },
     consultarQuorum: estadoTestigo,
     async iniciar() {
-      if (c.quorum || c.quorumPendiente) ubicacion ??= ubicarGrupo?.(c);
+      if (c.quorum || c.quorumPendiente || c.relevoManual) ubicacion ??= ubicarGrupo?.(c);
       if (c.quorumPendiente) return Promise.resolve();
+      if (c.relevoManual) relevo ??= crearRelevoManual({ base, config, c, core, ubicacion });
       if (c.quorum && !autoridad) {
         consenso = iniciarConsenso({ base, dirApp, config: c, log, ubicacion });
         cliente = clienteQuorum(c, { ubicacion, puertoHttps, miembrosLocales: async () => (await consenso.pedir("/local")).data?.miembros || [] });
         autoridad = crearAutoridadQuorum({ config: c, consenso });
       }
       return core.iniciar();
+    },
+    relevoLocal: () => relevo?.estadoLocal(),
+    async habilitarRelevo(datos) {
+      const revision = await relevo.habilitar(datos);
+      core.sondear().catch(e => log("Relevo manual: " + e.message));
+      return revision;
     },
     async promoverQuorum(r, disponibles, haQuorum, pedirEquipo) {
       if (!autoridad || !core.estado().escritor) return;
@@ -140,6 +149,22 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
     },
     async manejar(req, res) {
       const u = new URL(req.url, "http://local");
+      if (c.relevoManual && u.pathname.startsWith(RUTA_RELEVO)) {
+        try {
+          if (!relevo) throw new Error("La PC de caja todavía está preparando el relevo");
+          await relevo.manejar(req, res, u);
+        } catch (e) { if (!res.headersSent && !res.destroyed) H.respuesta(res, e.status || 503, { mensaje: e.message }); }
+        return true;
+      }
+      if (u.pathname === "/lan/quorum/listo" && c.relevoManual) {
+        try {
+          if (!req.socket.encrypted || req.method !== "POST") throw new Error("La consulta requiere la conexión interna autenticada");
+          const buffer = await H.leer(req, 4096);
+          verificar({ metodo: req.method, ruta: req.url, cuerpo: buffer, cabeceras: req.headers });
+          H.respuesta(res, 200, { equipo: c.nodoId, manual: true, semilla: relevo ? c.relevoManual.inicial.sha256 : null });
+        } catch (e) { H.respuesta(res, e.status || 403, { mensaje: e.message }); }
+        return true;
+      }
       if (u.pathname === "/lan/quorum/listo" && c.quorum) {
         try {
           if (!req.socket.encrypted || req.method !== "POST") throw new Error("La consulta requiere la conexión interna autenticada");
@@ -162,7 +187,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
           if (!req.socket.encrypted || req.method !== "POST") throw new Error("La preparación requiere la conexión interna autenticada");
           const buffer = await H.leer(req, 301 * 1024 * 1024);
           const actor = verificar({ metodo: req.method, ruta: req.url, cuerpo: buffer, cabeceras: req.headers });
-          if (u.pathname === "/lan/quorum/listo") H.respuesta(res, 200, { equipo: c.nodoId });
+          if (u.pathname === "/lan/quorum/listo") H.respuesta(res, 200, { equipo: c.nodoId, manual: true });
           else if (u.pathname === "/lan/replica/inicial") {
             H.respuesta(res, 200, await core.recibirInicial(extraerPaquete(buffer), { remitenteId: actor.nodoId }));
           } else if (u.pathname === "/lan/quorum/copia") {
@@ -172,10 +197,10 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
             H.respuesta(res, 200, { equipo: c.nodoId, confirmada: w.ultimo });
           } else {
             const nueva = JSON.parse(buffer.toString("utf8"));
-            if (!nueva.quorum || nueva.quorumPendiente || nueva.grupoId !== c.grupoId || nueva.nodoId !== c.nodoId || nueva.equipoId !== c.equipoId ||
+            if ((!nueva.quorum && !nueva.relevoManual) || nueva.quorumPendiente || nueva.grupoId !== c.grupoId || nueva.nodoId !== c.nodoId || nueva.equipoId !== c.equipoId ||
                 nueva.claveDatos !== c.claveDatos || nueva.clave !== c.clave || nueva.clavePublicaTestigo !== c.clavePublicaTestigo) throw new Error("La configuración de activación no corresponde a esta PC");
-            const ultimo = nueva.quorum.inicial?.ultimo || nueva.quorum.revisionArranque;
-            if (nueva.quorum.inicial) {
+            const ultimo = nueva.relevoManual?.inicial || nueva.quorum?.inicial?.ultimo || nueva.quorum?.revisionArranque;
+            if (nueva.relevoManual || nueva.quorum.inicial) {
               if (actor.nodoId !== c.miembros.find(m => m.preferido)?.id) throw new Error("La primera activación corresponde a la PC principal");
             } else {
               const w = await clienteQuorum(c, { ubicacion }).estado();
@@ -184,6 +209,13 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
               }
             }
             core.obtenerSnapshot(ultimo);
+            if (nueva.relevoManual) {
+              if (ultimo.indice !== 0 || typeof nueva.relevoManual.firmaInicial !== "string" || !nueva.relevoManual.firmaInicial) {
+                throw new Error("Faltan la copia inicial o la firma del relevo manual");
+              }
+              abrirAutoridadManual(base, nueva, nueva.relevoManual.firmaInicial);
+              delete nueva.relevoManual.firmaInicial;
+            }
             await prepararQuorum(nueva);
             H.respuesta(res, 200, { equipo: c.nodoId });
             alReiniciar?.();
@@ -213,7 +245,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
       } catch (e) { if (!res.headersSent && !res.destroyed) H.respuesta(res, e.status || 403, { mensaje: e.message }); }
       return true;
     },
-    async reenviar(req, res) {
+    async reenviar(req, res, alNoDisponible) {
       try {
         const w = await estadoTestigo(), m = w.miembros?.find(n => n.id === w.escritor);
         if (!m || m.id === c.nodoId || w.vence_en_ms <= 0 || m.url !== w.escritorDatos?.url) throw new Error("Esperando un servidor actualizado y autorizado por el testigo.");
@@ -237,9 +269,13 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
           const limite = new Transform({ transform(b, _e, cb) { bytes += b.length; cb(bytes > 301 * 1024 * 1024 ? new Error("Solicitud demasiado grande") : null, b); } });
           limite.on("error", e => upstream.destroy(e)); req.pipe(limite).pipe(upstream);
         });
-      } catch (e) { if (!res.headersSent) H.respuesta(res, 503, { mensaje: e.message, codigo: "SERVIDOR_CAMBIANDO" }); else res.destroy(); }
+      } catch (e) {
+        if (res.headersSent) res.destroy();
+        else if (alNoDisponible) alNoDisponible();
+        else H.respuesta(res, 503, { mensaje: e.message, codigo: "SERVIDOR_CAMBIANDO" });
+      }
     },
-    detener() { detenido = true; core.detener(); consenso?.detener(); },
+    detener() { detenido = true; core.detener(); consenso?.detener(); relevo?.detener(); },
     estadoTestigo: () => ultimoEstado,
     publicarAvisos,
   };
