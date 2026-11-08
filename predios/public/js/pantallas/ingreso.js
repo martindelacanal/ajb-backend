@@ -29,7 +29,7 @@
 
   function chipConexion(estado) {
     var enLinea = estado && estado.en_linea;
-    var texto = enLinea ? "Conectado al sistema general" : (estado && estado.vinculado ? "Sin internet: funciona igual" : "Red del camping");
+    var texto = enLinea ? "Conectado con Mi AJB" : (estado && estado.vinculado ? "Sin conexión con Mi AJB" : "Red del camping");
     return h("span.conexion.lg-conexion" + (enLinea ? ".en-linea" : ".sin-linea"), { title: texto }, h("i"), h("span", texto));
   }
 

@@ -74,11 +74,11 @@
     } else if (!c || !c.vinculado) { texto = "Red local"; }
     else {
       el.classList.add(c.en_linea ? "en-linea" : "sin-linea");
-      texto = c.en_linea ? "Sincronizado" : "Sin internet";
+      texto = c.en_linea ? "Sincronizado" : "Sin conexión con Mi AJB";
     }
     el.lastChild.textContent = texto;
     el.title = P.modo === "remoto" ? "Último contacto del camping: " + P.f.relativo((P.estado.remoto || {}).ultima_conexion)
-      : c && c.vinculado ? (c.en_linea ? "Conectado al sistema general" : "Sin conexión con el sistema general: todo queda guardado y se sube solo cuando vuelve internet") : "Sin vincular al sistema general";
+      : c && c.vinculado ? (c.en_linea ? "Conectado con Mi AJB" : "Las operaciones se guardan en el camping y se suben al restablecerse la comunicación con Mi AJB.") : "Sin vincular al sistema general";
   }
 
   function menuUsuario(boton) {
