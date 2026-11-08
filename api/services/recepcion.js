@@ -80,14 +80,17 @@ async function familia(c, q, pid, soloDni = false) {
   };
 }
 async function detalle(c, codigos, id, lock = false) {
-  const r = await uno(c, `SELECT r.id,r.usuario_id,r.servicio_id,r.recurso_id,r.regimen_id,r.fecha_inicio,r.fecha_fin,r.precio_total,r.observaciones,r.numero_parcela,r.bloque_fecha_id,r.sorteo_id,r.estado_reserva_id,er.nombre AS estado,s.nombre AS servicio,rec.nombre AS recurso,
+  const fila = await uno(c, `SELECT r.id,r.usuario_id,r.servicio_id,r.recurso_id,r.regimen_id,r.fecha_inicio,r.fecha_fin,r.precio_total,r.observaciones,r.numero_parcela,r.bloque_fecha_id,r.sorteo_id,r.estado_reserva_id,er.nombre AS estado,s.nombre AS servicio,rec.nombre AS recurso,
     u.documento AS titular_dni,CONCAT_WS(', ',u.apellido,u.nombre) AS titular_nombre,u.legajo AS titular_legajo,(u.rol_id=2 AND u.habilitado='Y') AS afiliado,
     dep.nombre AS titular_departamental,u.direccion AS titular_direccion,
-    (ts.codigo='CUPO_NUMERADO') AS es_parcela
+    (ts.codigo='CUPO_NUMERADO') AS es_parcela,
+    rd.codigo AS cupon_codigo,rd.nombre AS cupon_nombre,rd.importe_descuento AS cupon_importe
     FROM reserva r JOIN servicio s ON s.id=r.servicio_id JOIN tipo_servicio ts ON ts.id=s.tipo_servicio_id
     JOIN usuario u ON u.id=r.usuario_id LEFT JOIN departamental dep ON dep.id=u.departamental_id LEFT JOIN recurso rec ON rec.id=r.recurso_id
+    LEFT JOIN reserva_descuento rd ON rd.reserva_id=r.id AND rd.tipo='CUPON'
     JOIN estado_reserva er ON er.id=r.estado_reserva_id WHERE r.id=? AND s.codigo IN (?)${lock ? " FOR UPDATE OF r" : ""}`, [id, codigos]);
-  if (!r) throw U.error("No se encontró esa reserva entre los servicios asignados al predio.", 404);
+  if (!fila) throw U.error("No se encontró esa reserva entre los servicios asignados al predio.", 404);
+  const { cupon_codigo, cupon_nombre, cupon_importe, ...r } = fila;
   await cargarRecursos(c, [r], lock);
   const ev = await ultimo(c, id, lock),
     ext = ev ? JSON.parse(ev.actual) : {};
@@ -129,6 +132,7 @@ async function detalle(c, codigos, id, lock = false) {
     tramos,
     personas,
     adicionales,
+    ...(cupon_codigo ? { cupon: { codigo: cupon_codigo, nombre: cupon_nombre, importe: Number(cupon_importe) } } : {}),
     adicionales_vigentes: Array.isArray(seleccion)
       ? adicionales.filter(a => a.fecha_desde || seleccion.some(x => Number(x.adicional_id) === Number(a.adicional_id)))
       : adicionales,
@@ -166,6 +170,8 @@ function resumenCambios(a, b) {
   })) {
     if (String(a?.[k] ?? "") !== String(b[k] ?? "")) cambios.push([l, a?.[k], b[k]]);
   }
+  const cupon = r => r?.cupon ? `#${r.cupon.codigo} · ${r.cupon.nombre} · $${r.cupon.importe}` : null;
+  if (cupon(a) !== cupon(b)) cambios.push(["Cupón de descuento", cupon(a), cupon(b)]);
   const vehiculos = r => new Map(VEHICULOS.vehiculosDe(r).map(v => [VEHICULOS.placa(v.patente), VEHICULOS.describirVehiculo(v)]));
   const vAntes = vehiculos(a), vDespues = vehiculos(b);
   for (const k of new Set([...vAntes.keys(), ...vDespues.keys()])) {
@@ -478,11 +484,11 @@ function prepararFechas(b, anterior, tipo, inicio, finSolicitado) {
   return { fechas, fin, finAcordado };
 }
 
-function diferencialesPorPersona(anterior, personas, total, manual, tarifaFija) {
+function diferencialesPorPersona(anterior, personas, total, manual, tarifaFija, pesosAlojamiento) {
   const previas = anterior?.personas || [];
   const cuotasPrevias = repartir(Number(anterior?.precio_total || 0), previas.map(p => manual || tarifaFija ? 1 : Number(p.precio ?? 0)));
   const anteriores = new Map(previas.map((p, i) => [String(p.dni), p.salida ? null : (anterior.cuotas_alojamiento?.[p.dni] ?? cuotasPrevias[i])]));
-  const actuales = repartir(total, personas.map(p => manual ? 1 : p.peso_alojamiento));
+  const actuales = repartir(total, pesosAlojamiento);
   const cuotas = Object.fromEntries(personas.map((p, i) => [String(p.dni), actuales[i]]));
   const items = personas.flatMap(p => {
     const dni = String(p.dni), anterior = anteriores.get(dni);
@@ -746,29 +752,56 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     temporada,
     departamentalId: titular.departamental_id
   });
-  const descuentos = await T.aplicarDescuentosReserva(c, {
+  if (b.cupon_codigo != null && typeof b.cupon_codigo !== "string") throw U.error("El código del cupón no es válido.");
+  const cuponCodigo = b.cupon_codigo === undefined ? undefined : U.texto(b.cupon_codigo, { max: 64, campo: "El cupón" });
+  const manual = b.manual == null || b.manual === "" ? null : dinero(b.manual);
+  const contextoDescuento = {
     cabecera: {
       rol: "predio"
     },
+    cuponCodigo,
     servicioId: servicio.id,
     usuarioTitular: titular,
     tarifaBase: cot,
     adicionalesTotal: cot.extras.total,
     reservaId: anterior?.id
-  });
-  const subtotalAutomatico = cot.total + cot.extras.total - Number(descuentos.total_descuento || 0);
+  };
+  const descuentosAutomaticos = await T.aplicarDescuentosReserva(c, contextoDescuento);
+  const subtotalAutomatico = cot.total + cot.extras.total - descuentosAutomaticos.total_descuento;
   const automatico = Math.max(0, cot.extras.alquileres ? U.redondear(subtotalAutomatico) : Math.round(subtotalAutomatico));
-  const manual = b.manual == null || b.manual === "" ? null : dinero(b.manual);
+  const usarBaseManual = manual !== null && descuentosAutomaticos.items.some(x => x.tipo === "CUPON");
+  const cuotasManuales = manual !== null ? repartir(manual, personas.map(() => 1)) : [];
+  const descuentos = usarBaseManual ? await T.aplicarDescuentosReserva(c, {
+    ...contextoDescuento,
+    tarifaBase: { personas: cot.personas.map((p, i) => ({ ...p,
+      tarifa_individual: cuotasManuales[i], tarifa_original_individual: cuotasManuales[i]
+    })) },
+    adicionalesTotal: cot.extras.alquileres
+  }) : descuentosAutomaticos;
+  const itemCupon = descuentos.items.find(x => x.tipo === "CUPON");
+  const cupon = itemCupon ? { codigo: itemCupon.codigo, nombre: itemCupon.nombre, importe: itemCupon.importe_descuento,
+    aplicado: itemCupon.aplicado, motivo: itemCupon.motivo_no_aplicado } : null;
+  if (cuponCodigo && cupon && !cupon.aplicado && usarBaseManual) throw U.error(cupon.motivo, 422);
   const motivo = U.texto(b.motivo, {
     max: 255
   });
   if (tipo !== "GENERAL" && manual === null) throw U.error("Indicá el precio acordado. Puede ser cero.");
-  const total = manual === null ? automatico : U.redondear(manual + cot.extras.alquileres);
+  const total = manual === null ? automatico : U.redondear(manual + cot.extras.alquileres - (usarBaseManual ? descuentos.total_descuento : 0));
   if (tipo === "GENERAL" && manual !== null && total !== automatico && !motivo && (anterior?.manual == null || Number(anterior.manual) !== manual)) throw U.error("Justificá el cambio de precio en la observación.");
   const diferencia = U.redondear(total - Number(anterior?.precio_total || 0));
   const tarifaFija = servicio.modelo_tarifa === "PRECIO_UNICO" ||
     ["POR_ESTADIA", "POR_RECURSO_NOCHE", "POR_RECURSO_DIA"].includes(servicio.unidad_cobro);
-  const { items: diferenciales, cuotas: cuotasAlojamiento } = diferencialesPorPersona(anterior, cot.personas, total, manual !== null, tarifaFija);
+  const pesosAlojamiento = cot.personas.map(p => manual === null ? p.peso_alojamiento : 1);
+  if (cupon?.aplicado && (usarBaseManual || !tarifaFija)) {
+    const rebajas = cot.personas.map(() => 0);
+    for (const item of descuentos.aplicados) {
+      for (const p of item.detalle.personas) rebajas[p.indice] += p.descuento;
+    }
+    cot.personas.forEach((p, i) => {
+      pesosAlojamiento[i] = Math.max(0, (usarBaseManual ? cuotasManuales[i] : p.peso_alojamiento) - rebajas[i]);
+    });
+  }
+  const { items: diferenciales, cuotas: cuotasAlojamiento } = diferencialesPorPersona(anterior, cot.personas, total, manual !== null, tarifaFija, pesosAlojamiento);
   const cotizacion = {
     automatico,
     total,
@@ -786,7 +819,8 @@ async function guardar(c, predio, actor, b, codigos, previa) {
       return { adicional_id: a.adicional_id, nombre: item.nombre_adicional, cantidad: a.cantidad,
         dias: item.dias, fecha_desde: a.fecha_desde, fecha_hasta: a.fecha_hasta, subtotal: item.subtotal };
     }),
-    descuentos: descuentos.total_descuento
+    descuentos: descuentos.total_descuento,
+    ...(b.cupon_codigo !== undefined && cupon ? { cupon } : {})
   };
   if (salida) {
     cotizacion.salida = salida;
@@ -822,7 +856,7 @@ async function guardar(c, predio, actor, b, codigos, previa) {
     });
   }
   if (tramos.length) tramos.at(-1).numero_parcela = parcela;
-  if (previa) return { ...cotizacion, cotizacion_esperada: huellaCotizacion };
+  if (previa) return { ...cotizacion, cupon, cotizacion_esperada: huellaCotizacion };
   const obs = U.texto(b.observaciones, {
     max: 250
   });

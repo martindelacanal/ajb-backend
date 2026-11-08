@@ -10005,6 +10005,7 @@ async function asegurarDescuentoSaludHabilitado(connection, servicioId) {
 async function aplicarDescuentosReserva(connection, {
   cabecera,
   descuentos,
+  cuponCodigo,
   servicioId,
   usuarioTitular,
   tarifaBase,
@@ -10021,7 +10022,7 @@ async function aplicarDescuentosReserva(connection, {
     };
   }
   const { reglas } = await resolverDescuentosSolicitados(connection, {
-    cuponCodigo: solicitados?.cupon_codigo || null,
+    cuponCodigo: cuponCodigo === undefined ? solicitados?.cupon_codigo || null : cuponCodigo,
     tipoViajeId: solicitados?.tipo_viaje_id || null,
     departamentalId: normalizarIdPositivo(usuarioTitular?.departamental_id),
     servicioId,

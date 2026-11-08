@@ -180,10 +180,9 @@ solicitudes, bajas o movimientos se da de baja para no romper el historial (`lib
 - Cada caja tiene un responsable hasta el cierre. Si se interrumpe la conexión,
   al volver a ingresar recupera su turno. El panel de cajas muestra quién atiende.
   Un turno que cruza la medianoche conserva su apertura y se cierra a la hora real.
-- El **cierre definitivo** lo hace siempre un administrador: desde su cuenta o, en la PC
-  del cajero, escribiendo su usuario (o DNI, si es del sistema general) y su contraseña.
-  Cinco intentos fallidos bloquean la aprobación en esa PC durante diez minutos.
-- Si el cajero se va y no hay un administrador, hace un **cierre temporal**: separa el
+- El **cierre definitivo** lo hace siempre un administrador desde su propia cuenta.
+  Si atiende una caja, puede cerrarla directamente desde su turno.
+- Cuando el cajero termina su turno, hace un **cierre temporal** y separa el
   efectivo en dos bolsas (recaudación = ventas y cobros; cambio = saldo inicial y
   agregados) y se imprimen el resumen marcado «CIERRE TEMPORAL» y un ticket para cada
   bolsa. La caja queda en cero (movimiento «Cierre temporal») y libre; el siguiente

@@ -215,7 +215,7 @@
     }
     var salir = P.btn("Cerrar sesión", { tipo: "texto", onclick: cerrar });
     var tarjeta = h("section.lg-tarjeta", form, salir);
-    P.reemplazar(app, h("main.lg", h("div.lg-escenario", h("div.lg-interior", tarjeta))));
+    P.reemplazar(app, h("main.lg", h("div.lg-escenario", h("div.lg-interior.lg-interior-centrado", tarjeta))));
     (actual || nueva).focus();
     form.addEventListener("submit", function (ev) {
       ev.preventDefault();
@@ -251,7 +251,7 @@
       h("h1.titulo-pagina", P.esAdmin() ? "Trabajar en una caja" : "¿Dónde trabajás hoy?"),
       h("p.subtitulo", P.esAdmin() ? "Elegí la caja para vender o cerrar caja como administrador." : "Elegí tu boca y caja. Al cerrar tu turno, la caja queda disponible para el relevo."))));
     if (P.puesto() && P.puesto().caja_id) {
-      contenedor.appendChild(P.btn("Cerrar " + P.puesto().caja, { tipo: "primario", icono: "candado", onclick: function () { P.cerrarCaja(P.puesto().caja_id); } }));
+      contenedor.appendChild(P.btn(P.esAdmin() ? "Cerrar " + P.puesto().caja : "Cierre temporal", { tipo: "primario", icono: "candado", onclick: function () { P.cerrarCaja(P.puesto().caja_id); } }));
       return;
     }
     if (!puestos.length) {

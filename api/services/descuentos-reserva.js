@@ -400,7 +400,7 @@ async function obtenerReglaPorCodigo(db, tipo, codigo) {
   return regla;
 }
 
-async function contarUsosRegla(db, reglaId, { usuarioId = null, excluirReservaId = null } = {}) {
+async function contarUsosRegla(db, reglaId, { usuarioId = null, excluirReservaId = null, bloquear = false } = {}) {
   const params = [reglaId, ...ESTADOS_RESERVA_NO_CONSUMEN];
   let sql = `
     SELECT COUNT(*) AS total
@@ -417,8 +417,18 @@ async function contarUsosRegla(db, reglaId, { usuarioId = null, excluirReservaId
     sql += " AND rd.reserva_id <> ?";
     params.push(excluirReservaId);
   }
-  const [[fila]] = await db.query(sql, params);
-  return Number(fila.total || 0);
+  // El conteo ve los usos recién confirmados. Si otra edición ya bloqueó la
+  // reserva, se puede reintentar sin que las dos transacciones se esperen.
+  if (bloquear) sql += " FOR SHARE OF rd, r NOWAIT";
+  try {
+    const [[fila]] = await db.query(sql, params);
+    return Number(fila.total || 0);
+  } catch (error) {
+    if (bloquear && error.code === "ER_LOCK_NOWAIT") {
+      throw crearError("Otra operación está usando este descuento. Volvé a intentar.", 409, "DESCUENTO_EN_USO");
+    }
+    throw error;
+  }
 }
 
 /**
@@ -479,13 +489,13 @@ async function evaluarReglaParaContexto(db, regla, {
     await db.query("SELECT id FROM descuento_regla WHERE id = ? FOR UPDATE", [regla.id]);
   }
   if (regla.usos_maximos !== null && regla.usos_maximos !== undefined) {
-    const usos = await contarUsosRegla(db, regla.id, { excluirReservaId });
+    const usos = await contarUsosRegla(db, regla.id, { excluirReservaId, bloquear });
     if (usos >= Number(regla.usos_maximos)) {
       return { aplicable: false, motivo: "El descuento agotó su cantidad de usos", codigo: "DESCUENTO_AGOTADO" };
     }
   }
   if (regla.usos_por_afiliado !== null && regla.usos_por_afiliado !== undefined && usuarioId) {
-    const usosAfiliado = await contarUsosRegla(db, regla.id, { usuarioId, excluirReservaId });
+    const usosAfiliado = await contarUsosRegla(db, regla.id, { usuarioId, excluirReservaId, bloquear });
     if (usosAfiliado >= Number(regla.usos_por_afiliado)) {
       return { aplicable: false, motivo: "Ya usaste este descuento la cantidad máxima de veces", codigo: "DESCUENTO_AGOTADO_AFILIADO" };
     }

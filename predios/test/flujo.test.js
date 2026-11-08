@@ -193,20 +193,13 @@ test("flujo completo del camping", async () => {
   await ok("POST", "/caja/ajuste", { token: admin, cuerpo: { caja_id: cajaProv, concepto: "RETIRO_DINERO", tipo: "EGRESO", importe: 1000, recibo: "R-9" } });
   const previa = await ok("GET", "/caja/cierre/previa", { token: cajero });
   assert.equal(previa.resumen.saldo_esperado, 5600);
-  // El cajero no hace el cierre definitivo solo; con una contraseña equivocada tampoco.
+  // El cierre definitivo solo se admite desde una sesión de administrador.
   const soloCajero = await api("POST", "/caja/cierre", { token: cajero, cuerpo: { efectivo_contado: 5500 } });
   assert.equal(soloCajero.status, 403);
   assert.equal(soloCajero.json.codigo, "CIERRE_SOLO_ADMIN");
-  const intentoCierre = await api("POST", "/caja/cierre", { token: cajero, operacion: "cierre-admin-invalido", cuerpo: { efectivo_contado: 5500, admin_usuario: "admin", admin_password: "no-es" } });
+  const intentoCierre = await api("POST", "/caja/cierre", { token: cajero, operacion: "cierre-cajero-403", cuerpo: { efectivo_contado: 5500, admin_usuario: "admin", admin_password: "secreto1" } });
   assert.equal(intentoCierre.status, 403);
-  let auditoriaCierre;
-  for (let i = 0; i < 20; i++) {
-    auditoriaCierre = await ok("GET", "/listados/auditoria", { token: admin });
-    if (auditoriaCierre.filas.some(f => f.accion === "Contraseña del administrador incorrecta")) break;
-    await new Promise(r => setTimeout(r, 50));
-  }
-  assert.ok(auditoriaCierre.filas.some(f => f.accion === "Contraseña del administrador incorrecta"));
-  assert.ok(!auditoriaCierre.filas.some(f => /no-es/.test(f.detalle || "")), "la contraseña no queda en la auditoría");
+  assert.equal(intentoCierre.json.codigo, "CIERRE_SOLO_ADMIN");
   const cierre = await ok("POST", "/caja/cierre", { token: admin, cuerpo: { caja_id: cajaProv, efectivo_contado: 5500, queda_en_caja: 500 } });
   assert.equal(cierre.diferencia, -100);
   const { caja } = await ok("GET", `/cajas/${cajaProv}`, { token: admin });

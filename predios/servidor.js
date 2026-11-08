@@ -620,7 +620,7 @@ async function manejar(req, res) {
     if (ha && encontrada?.ruta.escritura && ctx.usuario && !operacionId) throw U.error("Actualizá la pantalla antes de registrar la operación", 409, { codigo: "OPERACION_SIN_IDENTIFICADOR" });
     if (operacionId && ctx.usuario && !["GET", "HEAD"].includes(req.method) && ctx.db.dialecto === "sqlite") {
       // Los intentos fallidos con la contraseña del administrador se auditan aunque la petición se revierta.
-      if (["/caja/cierre", "/permisos/presencial"].includes(encontrada?.ruta.p)) ctx.dbAuditoria = db;
+      if (encontrada?.ruta.p === "/permisos/presencial") ctx.dbAuditoria = db;
       const r = await ejecutarPeticion(ctx, { id: operacionId, metodo: req.method, ruta: rutaApi }, (contexto) => api.ejecutar(contexto, req.method, rutaApi));
       return enviar(req, res, r.status, r.respuesta);
     }

@@ -51,18 +51,14 @@
     // ---------------------------------------------------------------- cabecera
     c.appendChild(h("div.vender-cabecera",
       h("div.vender-titulo", h("h1.titulo-pagina", "Vender"),
-        P.btn("Cerrar caja", { tipo: "secundario", icono: "candado", onclick: function () { P.cerrarCaja(puesto.caja_id); } }))));
+        P.btn(P.esAdmin() ? "Cerrar caja" : "Cierre temporal", { tipo: "secundario", icono: "candado", onclick: function () { P.cerrarCaja(puesto.caja_id); } }))));
     c.appendChild(h("nav.vender-acciones", { "aria-label": "Acciones de caja" },
       P.btn("Reimprimir último", { tipo: "suave", chico: true, icono: "imprimir", onclick: function () {
         if (!ultimaVenta) { P.aviso("Todavía no hiciste ventas en esta caja desde esta PC. Buscalas en Caja > Mis ventas.", "error"); return; }
         P.reimprimirVenta(ultimaVenta);
       } }),
       P.btn("Stock", { tipo: "suave", chico: true, icono: "stock", onclick: function () { P.ruta.ir("/stock"); } }),
-      P.btn("Caja", { tipo: "suave", chico: true, icono: "caja", onclick: function () { P.ruta.ir("/mi-caja"); } }),
-        P.btn("Vaciar", { tipo: "texto", chico: true, icono: "borrar", onclick: function () {
-          if (!estado.items.length) return;
-          P.confirmar("¿Sacar todos los productos de la venta en curso?", { aceptar: "Vaciar", peligro: true }).then(function (ok) { if (ok) { estado = vacia(); pintarTodo(); combo.foco(); } });
-        } })));
+      P.btn("Caja", { tipo: "suave", chico: true, icono: "caja", onclick: function () { P.ruta.ir("/mi-caja"); } })));
 
     // ---------------------------------------------------------------- productos
     var combo = P.comboProducto({
@@ -236,8 +232,17 @@
           h("td.der.dinero.fuerte", P.f.pesos(subtotal(it))),
           h("td.acciones", P.btn("", { tipo: "texto", chico: true, icono: "cerrar", etiqueta: "Quitar", onclick: function () { estado.items.splice(i, 1); pintarTodo(); combo.foco(); } })));
       });
+      var vaciarItems = P.btn("", { tipo: "texto", chico: true, icono: "borrar", etiqueta: "Vaciar lista de productos", onclick: function () {
+        P.confirmar("¿Sacar todos los productos de la venta en curso?", { aceptar: "Vaciar", peligro: true }).then(function (ok) {
+          if (!ok) return;
+          estado = vacia();
+          pintarTodo();
+          combo.foco();
+        });
+      } });
       tablaItems.appendChild(h("div.tabla-desplazable", h("table.tabla.items",
-        h("thead", h("tr", h("th", "Cantidad"), h("th", "Producto"), h("th.der", "Importe"), h("th.der", "Subtotal"), h("th"))),
+        h("thead", h("tr", h("th", "Cantidad"), h("th", "Producto"), h("th.der", "Importe"), h("th.der", "Subtotal"),
+          h("th.acciones", { scope: "col" }, vaciarItems))),
         h("tbody", filas))));
       estado.resaltar = null;
     }
@@ -281,6 +286,14 @@
 
     var zonaAfiliado = h("div.cuenta-bloque");
     var zonaFormas = h("div.cuenta-bloque");
+    var dividir = P.check("Dividir entre dos formas de pago", !!estado.segunda, null, function (marcado) {
+      estado.segunda = marcado ? (estado.forma === "EFECTIVO" ? "QR" : "EFECTIVO") : null;
+      estado.parte = "";
+      estado.recibido = "";
+      pintarTodo();
+      if (marcado) document.getElementById("parte-pago").focus();
+    });
+    dividir.input.id = "dividir-pago";
     var zonaPago = h("div");
     var zonaTotal = h("div");
     var botonCobrar = P.btn("Cobrar", { tipo: "primario", grande: true, icono: "check", tecla: "F9", onclick: function () { cobrar(); } });
@@ -333,10 +346,7 @@
 
     function pintarPago() {
       P.vaciar(zonaPago);
-      var dividir = P.check("Dividir entre dos formas de pago",!!estado.segunda,null,function(v){
-        estado.segunda=v?(estado.forma==="EFECTIVO"?"QR":"EFECTIVO"):null;estado.parte="";estado.recibido="";pintarTodo();document.getElementById(v?"parte-pago":"dividir-pago").focus();});
-      dividir.input.id="dividir-pago";
-      zonaPago.appendChild(dividir);
+      dividir.input.checked = !!estado.segunda;
       if(estado.segunda){
         var segundo = P.select(FORMAS.filter(function (f) { return f.valor !== estado.forma; }), estado.segunda, {
           alCambiar: function (v) {
@@ -401,6 +411,7 @@
     }
 
     cuenta.appendChild(zonaFormas);
+    cuenta.appendChild(dividir);
     cuenta.appendChild(zonaAfiliado);
     cuenta.appendChild(zonaPago);
     cuenta.appendChild(zonaTotal);

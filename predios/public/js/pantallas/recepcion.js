@@ -461,6 +461,11 @@
     var campoUbicacion = P.campo("Ubicación en la parcela (opcional)", ubic, {
       clase: "rec-campo-ubicacion", ayuda: "Dónde arman la carpa. Se puede completar ahora, al ingresar o después desde el QR." });
     var manual = P.dinero({ valor: r.manual == null ? "" : P.f.numero(r.manual) });
+    var cupon = input(r.cupon ? "#" + r.cupon.codigo : "");
+    cupon.maxLength = 64;
+    cupon.autocomplete = "off";
+    cupon.autocapitalize = "characters";
+    cupon.spellcheck = false;
     var motivo = input(""),
       obs = input(r.observaciones),
       base = h("div.rec-formulario"),
@@ -476,7 +481,7 @@
     var selectFamilia = sel([], null, "Familiares y acompañantes"),
       selectExtra = sel([], null, "Elegí un artículo");
     var campos = { tipo: tipo, servicio: serv, regimen: reg, inicio: inicio, fin: fin, entidad: entidad, cantidad: cantidad,
-      traslado: traslado, dni: dni, nombre: nom, apellido: ape, nacimiento: nac, ubicacion: ubic, precio: manual, motivo: motivo, observaciones: obs };
+      traslado: traslado, dni: dni, nombre: nom, apellido: ape, nacimiento: nac, ubicacion: ubic, precio: manual, cupon: cupon, motivo: motivo, observaciones: obs };
     function esParcela() { return esParcelaServicio(o, serv.value); }
     function algunaPresente() { return viajeros.some(function (p) { return p.entrada && !p.salida; }); }
     function inicioAlquiler() {
@@ -804,6 +809,7 @@
         }),
         adicionales: seleccion,
         manual: precio,
+        cupon_codigo: checkout || editarFechas ? undefined : cupon.value.trim() || null,
         motivo: motivo.value,
         observaciones: obs.value
       };
@@ -845,9 +851,11 @@
         h("h3", checkout ? "Liquidación de salida" : "Revisión del importe"),
         h("div.rec-grid.rec-cifras",
           P.dato("Precio final de la reserva", pesos(x.total)),
+          x.cupon && x.cupon.aplicado ? P.dato("Cupón #" + x.cupon.codigo, "−" + pesos(x.cupon.importe) + " · " + x.cupon.nombre) : null,
           x.adicionales ? P.dato("Incluye artículos", pesos(x.adicionales)) : null,
           r.id ? P.dato(x.diferencia < 0 ? "Disminución del precio" : "Aumento del precio", pesos(Math.abs(x.diferencia))) : null,
           x.fecha_fin && x.fecha_fin !== b.fecha_fin ? P.dato("Nueva fecha de fin de la reserva", fecha(x.fecha_fin)) : null),
+        x.cupon && !x.cupon.aplicado ? P.mensaje("Cupón #" + x.cupon.codigo + " sin aplicar. " + x.cupon.motivo + ".", "aviso") : null,
         x.personas.length > 1 || x.personas.some(function (p) { return Number(p.precio); }) ? h("p.texto-3.chico", x.personas.map(function (p) { return p.nombre + ": " + pesos(p.precio); }).join(" · ")) : null,
         // La cuenta completa se muestra cuando no queda nadie: en una salida parcial manda la liquidación por persona.
         r.id && salenTodos ? liquidacion({ total: x.total, diferencia: x.diferencia, adicionales: articulos, cuenta: saldo, manual: b.manual,
@@ -926,7 +934,9 @@
       tabla(["Patente", "Vehículo", "Estacionamiento"], enPredio.map(function (v) { return [h("strong", v.patente), [v.marca, v.color].filter(Boolean).join(" · "), texto(v.sector)]; }))));
     if (!editarFechas) base.appendChild(gExtra);
     base.appendChild(grupo(checkout ? "Liquidación" : "Importe y observaciones", null, h("div.columna", h("div.rec-grid", !checkout && !editarFechas ? P.campo("Precio acordado ($)", manual, {
-      ayuda: "En General, vacío usa la tarifa. En las otras modalidades es obligatorio; cero es gratuidad. Los alquileres se suman aparte."
+      ayuda: "En General, vacío usa la tarifa. En las otras modalidades es obligatorio. Cero es gratuidad. Los alquileres se suman aparte."
+    }) : null, !checkout && !editarFechas ? P.campo("Cupón de descuento o promoción", cupon, {
+      ayuda: "Ingresá el código de Mi AJB con o sin #. Si cargás un precio acordado, el cupón se calcula sobre ese precio según sus condiciones."
     }) : null, P.campo(checkout ? "Observación de la salida" : "Motivo del cambio", motivo), !checkout && !editarFechas ? P.campo("Observaciones de la reserva", obs) : null),
       h("div.rec-pie-acciones", guardar), pre)));
     if (previo) {
@@ -1277,6 +1287,7 @@
                 puedeAjustar(r) ? btn(r.ubicacion ? "Cambiar" : "Indicar ubicación", function () { editarUbicacion(r, cargar); }, "texto", { chico: true, icono: "editar" }) : null) : null,
               P.dato("Ingreso", fecha(r.fecha_inicio)), salidaReal ? P.dato("Salida", fecha(salidaReal) + (salidaReal !== r.fecha_fin ? " (prevista " + fecha(r.fecha_fin) + ")" : "")) : P.dato("Salida prevista", fecha(r.fecha_fin)),
               P.dato("Tipo", TIPOS[r.tipo] || r.tipo), P.dato("Personas", r.cantidad),
+              r.cupon ? P.dato("Cupón #" + r.cupon.codigo, "−" + pesos(r.cupon.importe) + " · " + r.cupon.nombre) : null,
               r.entidad ? P.dato("Entidad", r.entidad) : null),
             r.observaciones ? h("p.rec-observaciones", h("strong", "Observaciones: "), r.observaciones) : null)),
           (r.vehiculos || []).length || puedeAjustar(r) ? grupo((r.vehiculos || []).length === 1 ? "Vehículo" : "Vehículos",

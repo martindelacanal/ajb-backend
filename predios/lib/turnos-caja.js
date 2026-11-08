@@ -11,8 +11,9 @@ async function turnoUsuario(db, pid, usuarioId) {
   return db.get("SELECT * FROM predio_turno WHERE predio_id=? AND usuario_id=? AND estado='ABIERTO' ORDER BY id DESC LIMIT 1", [pid, usuarioId]);
 }
 
-function exigirCierre() {
-  throw U.error("Tu turno tiene ventas o movimientos de caja: hacé el cierre (temporal o definitivo) antes de salir.", 409, { codigo: "TURNO_ABIERTO" });
+function exigirCierre(ctx) {
+  const cierre = ctx.usuario.rol === "ADMIN" ? "el cierre de caja" : "un cierre temporal";
+  throw U.error(`Tu turno tiene ventas o movimientos de caja. Hacé ${cierre} antes de salir.`, 409, { codigo: "TURNO_ABIERTO" });
 }
 
 // Un turno sin ventas ni movimientos de caja no tiene nada que contar: al salir o
@@ -32,7 +33,7 @@ async function liberarTurnoVacio(t, ctx, turno) {
 
 // Para salir: libera el turno propio si está vacío; si tiene movimientos, pide el cierre.
 async function exigirCierreOLiberar(t, ctx, turno) {
-  if (turno && !(await liberarTurnoVacio(t, ctx, turno))) exigirCierre();
+  if (turno && !(await liberarTurnoVacio(t, ctx, turno))) exigirCierre(ctx);
 }
 
 // Revalidar dentro de la transacción: el cierre o un nuevo ingreso pueden

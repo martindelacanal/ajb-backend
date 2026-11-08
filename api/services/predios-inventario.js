@@ -19,15 +19,56 @@ async function entregar(c, admins, clave, aviso) {
   }
 }
 
+async function pendientesDeEntrega(c, admins, clave) {
+  const [previos] = await c.query("SELECT usuario_id FROM predio_inventario_envio WHERE clave = ?", [clave]);
+  const enviados = new Set(previos.map(f => Number(f.usuario_id)));
+  return admins.filter(a => !enviados.has(Number(a.id)));
+}
+
+async function avisarCobrosExcepcionales(c, admins, { periodo, desde, hasta }) {
+  const clave = "cobros/" + periodo;
+  const pendientes = await pendientesDeEntrega(c, admins, clave);
+  if (!pendientes.length) return;
+  const precios = `tipo VARCHAR(20) PATH '$.tipo', manual DECIMAL(15,2) PATH '$.manual',
+    precio_total DECIMAL(15,2) PATH '$.precio_total', automatico DECIMAL(15,2) PATH '$.automatico'`;
+  // Las modalidades con precio acordado no tienen tarifa de alojamiento automática.
+  // La revisión anterior permite omitir ingresos, salidas y otras ediciones sin cambios de precio.
+  const [operaciones] = await c.query(`SELECT e.id, e.reserva_id, p.nombre AS predio, e.actor, e.motivo,
+      DATE_FORMAT(e.fecha, '%d/%m/%Y %H:%i') AS fecha,
+      actual.precio_total AS importe,
+      CASE WHEN COALESCE(actual.tipo, 'GENERAL') = 'GENERAL' THEN actual.automatico END AS tarifa_sistema
+    FROM recepcion_reserva_evento e JOIN predio p ON p.id = e.predio_id
+    JOIN JSON_TABLE(e.actual, '$' COLUMNS (${precios})) AS actual
+    JOIN JSON_TABLE(COALESCE(e.anterior, '{}'), '$' COLUMNS (${precios})) AS anterior
+    WHERE e.fecha >= ? AND e.fecha < ? AND e.empleado_id IS NOT NULL
+      AND actual.manual IS NOT NULL AND actual.precio_total IS NOT NULL
+      AND (actual.tipo IN ('PASA_EL_DIA', 'CONTINGENTE', 'FEDERACION') OR actual.precio_total <> actual.automatico)
+      AND NOT (COALESCE(actual.tipo, 'GENERAL') = COALESCE(anterior.tipo, 'GENERAL') AND actual.manual <=> anterior.manual
+        AND actual.precio_total <=> anterior.precio_total AND actual.automatico <=> anterior.automatico)
+    ORDER BY p.nombre, p.id, e.fecha, e.id`, [desde, hasta]);
+  if (!operaciones.length) return;
+  const cantidad = operaciones.length;
+  await entregar(c, pendientes, clave, {
+    tipo: "PREDIO_RESUMEN_COBROS",
+    titulo: "Cobros excepcionales de los predios · " + periodo,
+    mensaje: cantidad === 1 ? "Una operación con un importe excepcional o acordado en el mes."
+      : `${cantidad} operaciones con importes excepcionales o acordados en el mes.`,
+    payload: { operaciones: operaciones.map(operacion => ({
+      ...operacion,
+      importe: Number(operacion.importe),
+      tarifa_sistema: operacion.tarifa_sistema === null ? null : Number(operacion.tarifa_sistema),
+    })) },
+  });
+}
+
 async function avisosGenerales(c, hoy) {
   const [admins] = await c.query(`SELECT u.id FROM usuario u JOIN rol r ON r.id = u.rol_id
     WHERE r.nombre = 'admin' AND UPPER(COALESCE(u.habilitado,'S')) NOT IN ('N','NO','0','FALSE') ORDER BY u.id`);
   if (!admins.length) return;
-  const { periodo, desde, hasta } = mesAnterior(hoy);
+  const mes = mesAnterior(hoy);
+  const { periodo, desde, hasta } = mes;
   const clave = "ajustes/" + periodo;
-  const [previos] = await c.query("SELECT usuario_id FROM predio_inventario_envio WHERE clave = ?", [clave]);
-  const enviados = new Set(previos.map(f => Number(f.usuario_id)));
-  const pendientes = admins.filter(a => !enviados.has(Number(a.id)));
+  const pendientes = await pendientesDeEntrega(c, admins, clave);
   if (pendientes.length) {
     const [filas] = await c.query(`SELECT p.codigo, p.nombre,
         COUNT(CASE WHEN m.cantidad > 0 THEN 1 END) AS altas, COUNT(CASE WHEN m.cantidad < 0 THEN 1 END) AS bajas,
@@ -42,6 +83,7 @@ async function avisosGenerales(c, hoy) {
       payload: { periodo, predios: filas },
     });
   }
+  await avisarCobrosExcepcionales(c, admins, mes);
   // Se resta un mes calendario a la fecha del producto, incluso para fin de mes.
   const [productos] = await c.query(`SELECT p.id AS predio_id, p.nombre AS predio, p.codigo, x.id, x.nombre,
       DATE_FORMAT(x.fecha_caducidad, '%Y-%m-%d') AS fecha FROM predio_producto x JOIN predio p ON p.id = x.predio_id

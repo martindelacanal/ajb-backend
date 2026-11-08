@@ -139,16 +139,12 @@ test("dos usuarios compiten por una caja, el titular retoma su turno y el relevo
   await db.run("UPDATE predio_usuario SET puede_cerrar_caja=1 WHERE id=?", [responsable.usuario.id]);
   const delegado = await autenticar(reingreso.token);
   await assert.rejects(llamar(delegado, "POST", "/caja/cierre", { efectivo_contado: 15 }), { codigo: "CIERRE_SOLO_ADMIN" });
-  // Con el administrador en la PC: escribe su usuario y su contraseña.
-  await db.run("UPDATE predio_usuario SET password_hash=? WHERE usuario='admin'", [U.hashPassword("Admin-presente1")]);
-  await assert.rejects(llamar(delegado, "POST", "/caja/cierre", { efectivo_contado: 15, admin_usuario: "admin", admin_password: "otra" }), { codigo: "ADMIN_INCORRECTO" });
-  await assert.rejects(llamar(delegado, "POST", "/caja/cierre", { efectivo_contado: 15, admin_usuario: usuarios[otro], admin_password: clave }), { codigo: "ADMIN_INCORRECTO" });
   const original = U.fechaHora;
   t.mock.method(U, "fechaHora", fecha => fecha ? original(fecha) : madrugada);
-  const cierre = await llamar(delegado, "POST", "/caja/cierre", { efectivo_contado: 15, queda_en_caja: 15, admin_usuario: " ADMIN ", admin_password: "Admin-presente1" });
+  const cierre = await llamar(ctx, "POST", "/caja/cierre", { caja_id: caja.id, efectivo_contado: 15, queda_en_caja: 15 });
   assert.equal(cierre.diferencia, 0);
   const asentado = await db.get("SELECT tipo, estado, usuario_nombre, definitivo_usuario_nombre, autorizacion FROM predio_cierre WHERE id=?", [cierre.id]);
-  assert.deepEqual({ ...asentado }, { tipo: "DEFINITIVO", estado: "CERRADO", usuario_nombre: usuarios[i], definitivo_usuario_nombre: "Admin", autorizacion: "ADMIN_PRESENTE" });
+  assert.deepEqual({ ...asentado }, { tipo: "DEFINITIVO", estado: "CERRADO", usuario_nombre: "Admin", definitivo_usuario_nombre: "Admin", autorizacion: "ADMIN" });
   assert.equal((await db.get("SELECT fin FROM predio_turno WHERE id=?", [turno])).fin, madrugada);
   const siguiente = await llamar(actores[otro], "POST", "/sesion/puesto", puesto);
   assert.notEqual(siguiente.puesto.turno_id, turno);
