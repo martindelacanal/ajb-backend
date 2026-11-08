@@ -159,7 +159,8 @@
       return;
     }
     var zona = h("div.columna", P.cargando());
-    c.appendChild(h("div.columna.sistema-estado", P.panelGrupoLocal ? P.panelGrupoLocal() : null, zona));
+    var relevo = P.avisoRelevoLan();
+    c.appendChild(h("div.columna.sistema-estado", relevo.elemento, P.panelGrupoLocal ? P.panelGrupoLocal() : null, zona));
     var accionServidor = false;
     var temporizadorReinicio = null;
     var inicioServidor = null;
@@ -198,6 +199,7 @@
         inicioAntesDeReiniciar = inicioServidor;
         P.ejecutar(boton, function () {
           return P.post("/sistema/servidor/" + accion, {}).then(function () {
+            relevo.actualizar(null);
             if (detener) { servidorDetenido(); return; }
             P.reemplazar(zona, h("div.hoja.hoja-cuerpo", P.cargando("Reiniciando el servidor. Esperando que vuelva a responder…")));
             temporizadorReinicio = setTimeout(function () { esperarReinicio(0); }, 2500);
@@ -230,6 +232,7 @@
     function cargar() {
       if (accionServidor) return Promise.resolve();
       return P.get("/sistema/estado").then(function (d) {
+        relevo.actualizar(d.relevo_lan);
         inicioServidor = d.servidor.iniciado;
         var s = d.sincronizacion;
         var versionInstalada = String(s.version || "").split("+")[0];
@@ -316,7 +319,7 @@
               return h("li", h("span", x.nombre), h("div.fila", h("span.texto-3.chico", tamano(x.tamano)),
                 P.btn("", { tipo: "texto", chico: true, icono: "descargar", etiqueta: "Descargar", onclick: function () { P.descargar("/sistema/respaldos/" + encodeURIComponent(x.nombre), x.nombre).catch(P.error); } })));
             })) : h("p.texto-3", "Todavía no hay respaldos.")));
-      }).catch(function (e) { P.reemplazar(zona, P.mensaje(e.message, "error")); });
+      }).catch(function (e) { relevo.actualizar(null); P.reemplazar(zona, P.mensaje(e.message, "error")); });
     }
     P.intervalo(function () { cargar(); }, 15000);
     return cargar();

@@ -98,6 +98,35 @@
   P.mensaje = function (texto, tipo, icono) {
     return h("div.mensaje" + (tipo ? ".mensaje-" + tipo : ""), P.icono(icono || (tipo === "error" || tipo === "aviso" ? "alerta" : tipo === "ok" ? "check" : "info")), h("div", texto));
   };
+  P.avisoRelevoLan = function () {
+    var elemento = h("div.aviso-relevo-lan", { hidden: true, "aria-live": "polite" });
+    var urlActual = "";
+    function actualizar(datos) {
+      var url = datos && datos.url || "";
+      if (url === urlActual) return;
+      urlActual = url;
+      elemento.hidden = !url;
+      if (!url) { P.vaciar(elemento); return; }
+      var campo = h("input.campo-control.relevo-lan-url", { type: "text", readonly: true, value: url, "aria-label": "Dirección del servidor de respaldo" });
+      function copiada() { P.aviso("Dirección copiada.", "ok"); }
+      function copiarEnHttp() {
+        campo.focus();
+        campo.select();
+        var ok = false;
+        try { ok = document.execCommand("copy"); } catch (_e) { /* se puede copiar la selección */ }
+        if (ok) copiada();
+        else P.aviso("Dirección seleccionada. Presioná Ctrl+C para copiarla.", "info");
+      }
+      P.reemplazar(elemento, P.mensaje(h("div.columna",
+        h("strong", "Servidor de respaldo en servicio"),
+        h("span", "Compartí esta dirección con las cajas para que la abran en el navegador."),
+        h("div.fila", campo, P.btn("Copiar dirección", { tipo: "secundario", onclick: function () {
+          if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(url).then(copiada, copiarEnHttp);
+          else copiarEnHttp();
+        } }))), "aviso"));
+    }
+    return { elemento: elemento, actualizar: actualizar };
+  };
   P.cargando = function (texto) { return h("div.cargando", h("div.girando"), texto || "Cargando…"); };
   P.vacio = function (icono, titulo, texto, accion) {
     return h("div.tabla-vacia", h("div.medallon", P.icono(icono || "lista")), h("div.seccion-titulo", titulo), texto ? h("p", { style: { margin: "6px 0 0" } }, texto) : null,

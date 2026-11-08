@@ -47,8 +47,10 @@ async function preparar(t, conTls, equipoId) {
     const ctx = { pid: 1, usuario: { nombre: "Fixture" } };
     await N.insertar(tr, ctx, "predio_usuario", { usuario: "admin", nombre: "Admin", rol: "ADMIN", activo: 1, password_hash: U.hashPassword("fixture-admin") });
     await N.insertar(tr, ctx, "predio_usuario", { usuario: "caja", nombre: "Caja", rol: "CAJERO", activo: 1, password_hash: U.hashPassword("fixture-caja") });
+    const supervisor = await N.insertar(tr, ctx, "predio_usuario", { usuario: "supervisor", nombre: "Supervisor", rol: "SUPERVISOR", activo: 1, password_hash: U.hashPassword("fixture-supervisor") });
     const boca = await N.insertar(tr, ctx, "predio_boca", { nombre: "Boca fixture", activo: 1 });
     await N.insertar(tr, ctx, "predio_usuario_boca", { boca_id: boca, usuario_id: 2 });
+    await N.insertar(tr, ctx, "predio_usuario_boca", { boca_id: boca, usuario_id: supervisor });
   }); db.cerrar();
   let tlsConfig = null, raiz = null;
   if (conTls) {
@@ -227,6 +229,12 @@ test("dos PCs confirman la copia, la caja espera autorización tras el corte y l
   const origenId = JSON.parse(fs.readFileSync(path.join(s.base, "predio-ha.json"))).nodoId;
   await escritor(s, origenId);
   assert.equal((await grupo(s)).json.modo, "manual");
+  async function aviso(origen, ruta, sesion = token) {
+    const r = await pedir(origen, ruta, { token: sesion });
+    assert.equal(r.status, 200, r.json?.mensaje);
+    return r.json.relevo_lan;
+  }
+  assert.equal(await aviso(origen, "/api/inicio"), null);
   async function producto(n, nombre) {
     const r = await pedir(n.http, "/api/productos", { metodo: "POST", token, headers: { "X-AJB-Operacion": crypto.randomUUID() },
       cuerpo: { nombre, precio_venta_manual: 100, destino: "VENTA_DIRECTA" } });
@@ -254,6 +262,11 @@ test("dos PCs confirman la copia, la caja espera autorización tras el corte y l
   assert.match(autorizado.buffer.toString(), /Relevo autorizado con la revisión [1-9]/);
   await reiniciar(caja);
   await escritor(caja, respaldoId);
+  const supervisor = await pedir(cajaLan, "/api/login", { metodo: "POST", cuerpo: { usuario: "supervisor", password: "fixture-supervisor" } });
+  assert.equal(supervisor.status, 200, supervisor.json?.mensaje);
+  assert.deepEqual(await aviso(cajaLan, "/api/inicio", supervisor.json.token), { url: cajaLan });
+  assert.deepEqual(await aviso(cajaLan, "/api/inicio"), { url: cajaLan });
+  assert.deepEqual(await aviso(caja.http, "/api/sistema/estado"), { url: cajaLan });
   const buscar = (n, nombre) => {
     const db = crearSqlite(path.join(n.base, "datos", "predio.db"), { predioId: 1 });
     try { return db.conexion.prepare("SELECT nombre FROM predio_producto WHERE nombre=?").get(nombre)?.nombre; }
@@ -266,6 +279,7 @@ test("dos PCs confirman la copia, la caja espera autorización tras el corte y l
   await escritor(s, origenId);
   assert.equal(buscar(s, "Producto durante el relevo"), "Producto durante el relevo");
   assert.equal((await grupo(s)).json.manualActivo, false);
+  assert.equal(await aviso(origen, "/api/sistema/estado"), null);
 });
 
 test("el acceso sin voto sigue al nuevo escritor por LAN aunque no sirvan las direcciones originales", {

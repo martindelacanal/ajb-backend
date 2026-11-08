@@ -269,14 +269,34 @@ function respaldoDiario() {
 
 // ------------------------------------------------------------------ rutas de sistema (sólo administradores)
 
-function direccionesLan() {
+function direccionesLan(interfaces = os.networkInterfaces()) {
   const salida = [];
-  for (const [nombre, lista] of Object.entries(os.networkInterfaces())) {
+  for (const [nombre, lista] of Object.entries(interfaces)) {
     for (const d of lista || []) {
       if (d.family === "IPv4" && !d.internal) salida.push({ interfaz: nombre, ip: d.address, url: `http://${d.address}${config.puerto === 80 ? "" : `:${config.puerto}`}` });
     }
   }
   return salida;
+}
+
+function relevoLan(req, estado = ha?.estado()) {
+  if (congelado || !estado?.escritor) return null;
+  const principal = estado.testigo?.preferido_id || estado.miembros.find(m => m.preferido)?.id;
+  if (!principal || estado.nodoId === principal) return null;
+
+  const interfaces = os.networkInterfaces();
+  const direcciones = direccionesLan(interfaces).filter(d => !d.ip.startsWith("169.254."));
+  const entrada = String(req.socket.localAddress || "").replace(/^::ffff:/, "");
+  let elegida = direcciones.find(d => d.ip === entrada);
+  if (!elegida) {
+    // En localhost, priorizar la interfaz que comparte red con los equipos del grupo.
+    const deSubred = ips => direcciones.find(d => interfaces[d.interfaz].some(i =>
+      i.address === d.ip && ips.some(ip => mismaSubred(ip, i))));
+    const ipsDetectadas = estado.miembros.filter(m => m.id !== estado.nodoId)
+      .map(m => ubicacionGrupo?.equipo(m.id)?.ip).filter(Boolean);
+    elegida = deSubred(ipsDetectadas) || deSubred(estado.miembros.map(m => new URL(m.url).hostname)) || direcciones[0];
+  }
+  return elegida ? { url: elegida.url } : null;
 }
 
 // ------------------------------------------------------------------ nombre de la notebook en la red
@@ -437,12 +457,14 @@ async function rutaSistema(ctx, metodo, ruta, req, res) {
   if (metodo === "GET" && ruta === "/sistema/estado") {
     const respaldos = listarRespaldos(path.join(BASE, "datos", "respaldos")).map(({ nombre, tamano }) => ({ nombre, tamano }));
     const tamano = fs.existsSync(db.archivo) ? fs.statSync(db.archivo).size : 0;
+    const estadoGrupo = ha?.estado() || null;
     return {
       sincronizacion: agente.estadoPublico(),
       equipo: { nombre: os.hostname(), sistema: `${os.type()} ${os.release()}`, node: process.version, memoria_libre: os.freemem(), memoria_total: os.totalmem(), encendido_hace: Math.round(os.uptime()) },
       servidor: { puerto: config.puerto, direcciones: direccionesLan(), base: BASE, version: VERSION, iniciado: servidorIniciado },
       red: estadoRed(),
-      runtime: runtimePublico(), escritura: controlEquipo.estado(), https: estadoHttps(), grupo_local: ha?.estado() || null,
+      runtime: runtimePublico(), escritura: controlEquipo.estado(), https: estadoHttps(), grupo_local: estadoGrupo,
+      relevo_lan: relevoLan(req, estadoGrupo),
       base_datos: { archivo: db.archivo, tamano },
       respaldos,
     };
@@ -610,14 +632,15 @@ function servirEstatico(req, res, ruta) {
 function ipDe(req) {
   return String(req.socket.remoteAddress || "").replace(/^::ffff:/, "");
 }
-function esIpLocal(ip) {
+function mismaSubred(ip, i) {
+  if (i.internal || i.family !== "IPv4" || !i.netmask) return false;
   const octetos = ip.split(".").map(Number);
   if (octetos.length !== 4 || octetos.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return false;
-  return Object.values(os.networkInterfaces()).flat().some(i => {
-    if (i.internal || i.family !== "IPv4" || !i.netmask) return false;
-    const propia = i.address.split(".").map(Number), mascara = i.netmask.split(".").map(Number);
-    return octetos.every((n, j) => (n & mascara[j]) === (propia[j] & mascara[j]));
-  });
+  const propia = i.address.split(".").map(Number), mascara = i.netmask.split(".").map(Number);
+  return octetos.every((n, j) => (n & mascara[j]) === (propia[j] & mascara[j]));
+}
+function esIpLocal(ip) {
+  return Object.values(os.networkInterfaces()).flat().some(i => mismaSubred(ip, i));
 }
 
 function origenCajaLocal(req) {
@@ -736,6 +759,7 @@ async function manejar(req, res) {
     }
     const resultado = await api.ejecutar(ctx, req.method === "HEAD" ? "GET" : req.method, rutaApi);
     if (rutaApi === "/estado-publico" && resultado) resultado.escritura = controlEquipo.estado();
+    if (rutaApi === "/inicio" && resultado && ["ADMIN", "SUPERVISOR"].includes(ctx.usuario?.rol)) resultado.relevo_lan = relevoLan(req);
     if (resultado && resultado.csv !== undefined) {
       return enviar(req, res, 200, resultado.csv, "text/csv; charset=utf-8", { "Content-Disposition": `attachment; filename="${resultado.nombreArchivo}"` });
     }

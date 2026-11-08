@@ -16,6 +16,8 @@
     var ses = P.estado.sesion;
     var nombre = String(ses.usuario.nombre || "").replace(" (sistema general)", "").split(" ")[0];
     c.appendChild(h("div.pagina-cabecera", h("h1.titulo-pagina", P.saludo() + ", " + nombre)));
+    var relevo = P.avisoRelevoLan();
+    c.appendChild(relevo.elemento);
     c.appendChild(h("div#inicio-estadias-vencidas", { hidden: !P.estado.estadiasVencidas },
       P.mensaje(h("div.fila", h("strong", P.textoEstadiasVencidas()),
         P.btn("Ver estadías", { tipo: "secundario", chico: true, onclick: function () { P.ruta.ir("/recepcion?ocupacion=VENCIDA"); } })), "aviso")));
@@ -29,7 +31,11 @@
     cifras.appendChild(P.cargando());
 
     function cargar() {
-      return Promise.all([P.get("/inicio"), P.get("/caja/panel"), P.get("/avisos")]).then(function (r) {
+      var inicio = P.get("/inicio").then(function (d) {
+        relevo.actualizar(d.relevo_lan);
+        return d;
+      }, function (e) { relevo.actualizar(null); throw e; });
+      return Promise.all([inicio, P.get("/caja/panel"), P.get("/avisos")]).then(function (r) {
         var d = r[0], panel = r[1], avisos = r[2];
         P.reemplazar(cifras,
           P.cifra("Ventas de hoy", P.f.entero(d.hoy.ventas)),

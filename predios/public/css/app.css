@@ -630,6 +630,9 @@ table.tabla { width: 100%; border-collapse: separate; border-spacing: 0; font-si
 .lista-simple li { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 11px 0; border-bottom: 1px solid var(--linea); }
 .lista-simple li:last-child { border-bottom: 0; }
 .sistema-estado .btn { max-width: 100%; white-space: normal; }
+.aviso-relevo-lan .mensaje > div { min-width: 0; }
+.relevo-lan-url { width: 31ch; max-width: 100%; }
+.pagina-cabecera + .aviso-relevo-lan { margin-bottom: 14px; }
 .inicio-cifras { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .inicio-cuerpo { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 16px; }
 .inicio-cuerpo > section, .inicio-cifras > div { min-width: 0; overflow-wrap: anywhere; }
