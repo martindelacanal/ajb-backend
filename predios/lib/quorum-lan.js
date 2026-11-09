@@ -47,18 +47,62 @@ function origenAcreditado(cabecera, c, miembros, ipPar, ubicacion) {
   return null;
 }
 
-function iniciarConsenso({ base, dirApp, config, log, ubicacion, crearProceso = spawn }) {
+function iniciarConsenso({ base, dirApp, config, log, ubicacion, crearProceso = spawn,
+  intervaloVigilancia = 5000, esperaVigilancia = 4500 }) {
   const q = config.quorum;
   const ejecutable = path.join(dirApp, "windows", "ajb-quorum.exe");
   if (!fs.existsSync(ejecutable)) throw error("La versión instalada no incluye el coordinador del grupo de PCs");
   const carpeta = path.join(base, "ha", "quorum");
   protegerCarpetaTestigo(carpeta);
   let sesion, reinicio, detenido = false, fallos = 0;
+  const disponible = actual => !detenido && sesion === actual && !actual.cerrado && !actual.recuperando;
+  function cancelarVigilancia(actual) {
+    clearTimeout(actual.vigilancia);
+    actual.comprobacion?.abort();
+  }
+  function programarVigilancia(actual) {
+    if (!disponible(actual)) return;
+    actual.vigilancia = setTimeout(() => vigilar(actual), intervaloVigilancia);
+    actual.vigilancia.unref?.();
+  }
+  async function vigilar(actual) {
+    if (!disponible(actual)) return;
+    const comprobacion = actual.comprobacion = new AbortController();
+    const limite = setTimeout(() => comprobacion.abort(), esperaVigilancia);
+    limite.unref?.();
+    try {
+      // /local no espera una mayoría ni toma el candado de las operaciones Raft.
+      // Cualquier respuesta HTTP completa acredita que el proceso sigue vivo;
+      // los 409/503 de las operaciones normales nunca provocan un reinicio.
+      const respuesta = await fetch(actual.direccion + "/local", {
+        signal: comprobacion.signal, headers: { Authorization: "Bearer " + actual.localKey },
+      });
+      await respuesta.arrayBuffer();
+      actual.fallosVigilancia = 0;
+    } catch (_e) {
+      if (!disponible(actual)) return;
+      if (++actual.fallosVigilancia >= 3) {
+        actual.recuperando = true;
+        log("El coordinador LAN dejó de responder; se reiniciará conservando su registro");
+        // close es el único que habilita otro proceso: nunca abrir dos diarios.
+        try {
+          if (!actual.proceso.kill()) actual.recuperando = false;
+        } catch (e) {
+          actual.recuperando = false;
+          log("No se pudo detener el coordinador LAN: " + e.message);
+        }
+      }
+    } finally {
+      clearTimeout(limite);
+      if (actual.comprobacion === comprobacion) actual.comprobacion = null;
+      programarVigilancia(actual);
+    }
+  }
   function arrancar() {
     if (detenido) return;
     const proceso = crearProceso(ejecutable, [], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     const actual = sesion = { proceso, localKey: crypto.randomBytes(32).toString("hex"), cerrado: false,
-      inicio: performance.now(), publicadas: "{}" };
+      inicio: performance.now(), publicadas: "{}", fallosVigilancia: 0, recuperando: false };
     actual.url = new Promise((resolve, reject) => {
       let salida = "";
       actual.limite = setTimeout(() => {
@@ -67,11 +111,16 @@ function iniciarConsenso({ base, dirApp, config, log, ubicacion, crearProceso = 
       }, 10000);
       actual.limite.unref?.();
       proceso.stdout.on("data", b => {
+        if (actual.direccion) return;
         salida += b;
         if (salida.includes("\n")) {
           clearTimeout(actual.limite);
           const direccion = salida.trim();
-          if (/^127\.0\.0\.1:\d{1,5}$/.test(direccion)) resolve("http://" + direccion);
+          if (/^127\.0\.0\.1:\d{1,5}$/.test(direccion)) {
+            actual.direccion = "http://" + direccion;
+            resolve(actual.direccion);
+            programarVigilancia(actual);
+          }
           else { reject(error("El coordinador devolvió una dirección inválida")); proceso.kill(); }
         }
       });
@@ -80,6 +129,7 @@ function iniciarConsenso({ base, dirApp, config, log, ubicacion, crearProceso = 
       proceso.once("close", () => {
         actual.cerrado = true;
         clearTimeout(actual.limite);
+        cancelarVigilancia(actual);
         reject(error("El coordinador del grupo se detuvo"));
         if (detenido || sesion !== actual) return;
         if (performance.now() - actual.inicio >= 30000) fallos = 0;
@@ -100,9 +150,9 @@ function iniciarConsenso({ base, dirApp, config, log, ubicacion, crearProceso = 
 
   async function pedir(ruta, cuerpo) {
     const actual = sesion;
-    if (detenido || actual.cerrado) throw error("El coordinador del grupo se está recuperando");
+    if (!disponible(actual)) throw error("El coordinador del grupo se está recuperando");
     const destino = await actual.url;
-    if (detenido || actual.cerrado) throw error("El coordinador del grupo se está recuperando");
+    if (!disponible(actual)) throw error("El coordinador del grupo se está recuperando");
     const r = await fetch(destino + ruta, { method: cuerpo ? "POST" : "GET", signal: AbortSignal.timeout(4500),
       headers: { Authorization: "Bearer " + actual.localKey, "Content-Type": "application/json" }, body: cuerpo && JSON.stringify(cuerpo) });
     if (!r.ok) throw error(r.status === 409 ? "Cambió la configuración del grupo" : "Esta PC espera a la mayoría del grupo", r.status);
@@ -127,6 +177,7 @@ function iniciarConsenso({ base, dirApp, config, log, ubicacion, crearProceso = 
     clearInterval(timer);
     clearTimeout(reinicio);
     clearTimeout(sesion.limite);
+    cancelarVigilancia(sesion);
     if (!sesion.cerrado) sesion.proceso.stdin.end();
   } };
 }
