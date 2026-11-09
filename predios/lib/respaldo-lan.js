@@ -348,13 +348,18 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
   }
   async function recuperar(rev) {
     if (tiene(rev)) return;
+    const fallos = [];
     if (typeof transporte.obtenerSnapshot === "function") {
-      for (const miembro of otros) {
+      // El escritor que acaba de responder conserva esta revisión. Consultarlo
+      // primero evita esperar una PC apagada mientras siguen entrando ventas.
+      const escritor = otros.find(m => m.id === ultimoTestigo?.escritor);
+      const fuentes = escritor ? [escritor, ...otros.filter(m => m !== escritor)] : otros;
+      for (const miembro of fuentes) {
         try {
           const packet = await transporte.obtenerSnapshot(miembro, rev);
           const m = custodiar(packet);
           if (igual(m, rev)) return;
-        } catch (_e) { /* probar otra copia explícitamente registrada */ }
+        } catch (e) { fallos.push(`${miembro.nombre || miembro.id}: ${e.message}`); }
       }
     }
     // Primer arranque del escritor original: el grupo debe haberse creado con
@@ -363,7 +368,7 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
       const packet = await snapshot({ indice: 0, termino: 0, nodoId: c.nodoId });
       if (igual(packet.manifest, rev)) { custodiar(packet); disco.instalada = revision(rev); guardar(); return; }
     }
-    throw error("Este respaldo está atrasado: falta la última copia confirmada por el testigo");
+    throw error("Este respaldo está atrasado: falta la última copia confirmada por el testigo" + (fallos.length ? ". " + fallos.join("; ") : ""));
   }
   async function antesTransaccion() {
     if (enCurso || drenando || fenced || detenido || activando) throw error("El servidor LAN no está disponible para iniciar otra escritura");
@@ -465,6 +470,8 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
         const resultado = db.reabrirConCopia(() => aplicarPendiente({ base, config }));
         if (!resultado.aplicado || !igual(resultado.revision, rev)) throw error("No se instaló la revisión elegida por el grupo");
         disco = leerEstado(base, c);
+        fenced = false;
+        errorActual = null;
         activando = false;
         return;
       } catch (e) { log("No se pudo abrir la copia sin reiniciar: " + e.message); }
@@ -481,7 +488,7 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
       await recuperar(w.ultimo);
       confirmarLocal(w.ultimo);
       exigirModelo(w.ultimo);
-      await prepararActivacion(w.ultimo, w);
+      await prepararActivacion(w.ultimo, w, Boolean(c.quorum));
       return;
     }
     if (vivo() && w.escritor === c.nodoId && permiso.termino === w.termino) {
@@ -542,11 +549,19 @@ function crearRespaldoLan({ base, config, db, transporte = {}, alActivar = () =>
     const hacia = c.miembros.find(m => m.id === haciaId && m.id !== c.nodoId && m.preferido === true);
     if (!hacia) throw error("La entrega automática sólo corresponde al equipo preferido configurado");
     if (c.quorum) return db.exclusivo(async () => {
-      if (fenced || detenido || activando || drenando || !vivo() || !igual(recibida, disco.confirmada)) {
+      if (fenced || detenido || activando || drenando || !permiso) {
         throw error("La PC principal todavía no tiene la última revisión confirmada");
       }
       drenando = true;
       try {
+        await asegurarPermiso();
+        // Puede haber entrado otra venta desde que la principal consultó la
+        // revisión. Con las escrituras pausadas, entregarle esa última copia
+        // evita perseguir una revisión que cambia continuamente en una LAN lenta.
+        if (!igual(recibida, disco.confirmada)) {
+          acuse = await transporte.replicar(hacia, copiaDelEscritor(disco.confirmada));
+          await asegurarPermiso();
+        }
         await transporte.transferirAlPrincipal(haciaId, disco.confirmada, permiso.termino, acuse);
         permiso = null;
         emitir("CONTROL_ENTREGADO", { haciaId, revision: disco.confirmada });

@@ -28,7 +28,7 @@ function copiaOtroModelo(s, escritorId) {
   return { manifest, buffer: Buffer.concat([aad, iv, cifrador.getAuthTag(), cifrado]) };
 }
 
-async function escenario(t, { permitirDegradado = false, inicialCero = false } = {}) {
+async function escenario(t, { permitirDegradado = false, inicialCero = false, quorum = false } = {}) {
   const raiz = fs.mkdtempSync(path.join(os.tmpdir(), "predio-lan-"));
   const miembros = [
     { id: "equipoA", nombre: "Principal", url: "http://192.168.1.10:8080", clave: "a".repeat(64), preferido: true },
@@ -36,10 +36,10 @@ async function escenario(t, { permitirDegradado = false, inicialCero = false } =
   ];
   const grupoId = "grupo_camping", claveDatos = "c".repeat(64);
   let reloj = 0, witness, falloReplica = false, falloObtener = false, perderAck = false, demoraPermiso = 0, replicaExtra = null, demoraSnapshot = 0, falloTestigo = false;
-  const nodos = {}, eventos = [], activaciones = [];
+  const nodos = {}, eventos = [], activaciones = [], consultasCopia = [];
   function config(id) { return { predio_id: 1, predio_codigo: "MIRAMAR", token: "credencial propia " + id, respaldo_lan: {
     habilitado: true, grupoId, nodoId: id, clave: miembros.find(m => m.id === id).clave, claveDatos, permitirDegradado,
-    miembros: miembros.map(({ clave, ...m }) => m),
+    miembros: miembros.map(({ clave, ...m }) => m), ...(quorum ? { quorum: {} } : {}),
   } }; }
   function abrir(id) {
     const n = nodos[id], archivo = path.join(n.base, "datos", "predio.db");
@@ -54,7 +54,11 @@ async function escenario(t, { permitirDegradado = false, inicialCero = false } =
       transporte: {
         async testigo(accion, payload) {
           if (falloTestigo) throw new Error("Timeout del testigo");
-          if (accion === "estado") return witness.estado();
+          if (accion === "estado") {
+            const r = witness.estado();
+            if (quorum) r.estado.votantes = miembros.map(m => m.id);
+            return r;
+          }
           const r = witness[accion](payload);
           if (demoraPermiso && ["solicitar", "renovar"].includes(accion)) reloj += demoraPermiso;
           if (accion === "confirmar" && perderAck) { perderAck = false; throw new Error("Respuesta del commit perdida"); }
@@ -66,6 +70,7 @@ async function escenario(t, { permitirDegradado = false, inicialCero = false } =
           return nodos[m.id].coordinador.recibirSnapshot(packet, { remitenteId: id });
         },
         async obtenerSnapshot(m, rev) {
+          consultasCopia.push(m.id);
           if (falloObtener) throw new Error("Copia no disponible");
           return nodos[m.id].coordinador.obtenerSnapshot(rev);
         },
@@ -131,7 +136,7 @@ async function escenario(t, { permitirDegradado = false, inicialCero = false } =
     abrir(id); return r;
   }
   const valor = id => nodos[id].db.conexion.prepare("SELECT valor FROM predio_config WHERE clave='venta_confirmada'").get()?.valor;
-  return { nodos, miembros, eventos, activaciones, inicial, escribir, reiniciar, valor, replicaExtra: fn => { replicaExtra = fn; },
+  return { nodos, miembros, eventos, activaciones, consultasCopia, inicial, escribir, reiniciar, valor, replicaExtra: fn => { replicaExtra = fn; },
     avanzar: ms => { reloj += ms; }, witness: () => witness, setReplica: v => { falloReplica = v; }, setObtener: v => { falloObtener = v; }, perderAck: () => { perderAck = true; }, demorar: ms => { demoraPermiso = ms; },
     demorarSnapshot: ms => { demoraSnapshot = ms; }, setTestigo: v => { falloTestigo = v; } };
 }
@@ -279,6 +284,23 @@ test("bootstrap registra la copia de la base congelada sin anidar exclusivo y no
   assert.throws(() => a.coordinador.registrarInicial(s.inicial), /reinicializar/);
 });
 
+test("la principal recupera la copia del escritor antes de intentar un respaldo apagado", async t => {
+  const s = await escenario(t, { permitirDegradado: true }), a = s.nodos.equipoA, b = s.nodos.equipoB;
+  await a.coordinador.sondear();
+  await s.escribir("equipoA", 101);
+  a.coordinador.detener(); s.avanzar(15001);
+  await b.coordinador.sondear(); await s.reiniciar("equipoB"); await b.coordinador.sondear();
+  s.setReplica(true);
+  await s.escribir("equipoB", 202);
+  const tercero = { id: "equipoC", nombre: "Apagada", url: "http://192.168.1.12:8080", clave: "d".repeat(64) };
+  s.witness().actualizarMiembros([s.miembros[0], tercero, s.miembros[1]]);
+  await s.reiniciar("equipoA");
+  s.consultasCopia.length = 0;
+  s.setReplica(false);
+  await a.coordinador.sondear();
+  assert.deepEqual(s.consultasCopia, ["equipoB"]);
+});
+
 test("los hooks del adaptador SQLite confirman réplica después de COMMIT sin volver a tomar el candado", { timeout: 5000 }, async t => {
   const s = await escenario(t), a = s.nodos.equipoA;
   await a.coordinador.sondear();
@@ -365,6 +387,27 @@ test("tras fallo postCOMMIT sondear espera al testigo y reinicia con la revisió
   await s.reiniciar("equipoA"); await a.coordinador.sondear();
   assert.equal(s.valor("equipoA"), undefined);
   assert.equal(await s.escribir("equipoA", 1601), 1601);
+});
+
+test("la recuperación quorum abre la copia confirmada sin reiniciar la elección ni conservar el bloqueo", async t => {
+  for (const confirmada of [false, true]) await t.test(confirmada ? "acuse perdido" : "copia fallida", async sub => {
+    const s = await escenario(sub, { quorum: true }), a = s.nodos.equipoA;
+    await a.coordinador.sondear();
+    if (confirmada) s.perderAck(); else s.setReplica(true);
+    await assert.rejects(s.escribir("equipoA", 1600), /no se confirmó/);
+    assert.equal(a.coordinador.estado().bloqueado, true);
+    s.setTestigo(true);
+    await assert.rejects(a.coordinador.sondear(), /Timeout/);
+    assert.equal(a.coordinador.estado().escritor, false);
+    s.setTestigo(false); s.setReplica(false);
+    await a.coordinador.sondear();
+    assert.equal(s.activaciones.length, 0, "el coordinador conserva su elección durante la recuperación");
+    assert.equal(a.coordinador.estado().bloqueado, false);
+    assert.equal(a.coordinador.estado().activando, false);
+    assert.equal(s.valor("equipoA"), confirmada ? "1600" : undefined);
+    await a.coordinador.sondear();
+    assert.equal(await s.escribir("equipoA", 1601), 1601);
+  });
 });
 
 test("seed inicial sólo se admite antes del primer grant y no marca instalada una base abierta diferente", async t => {

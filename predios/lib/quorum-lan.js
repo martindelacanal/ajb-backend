@@ -47,57 +47,88 @@ function origenAcreditado(cabecera, c, miembros, ipPar, ubicacion) {
   return null;
 }
 
-function iniciarConsenso({ base, dirApp, config, log, ubicacion }) {
+function iniciarConsenso({ base, dirApp, config, log, ubicacion, crearProceso = spawn }) {
   const q = config.quorum;
   const ejecutable = path.join(dirApp, "windows", "ajb-quorum.exe");
   if (!fs.existsSync(ejecutable)) throw error("La versión instalada no incluye el coordinador del grupo de PCs");
   const carpeta = path.join(base, "ha", "quorum");
   protegerCarpetaTestigo(carpeta);
-  const localKey = crypto.randomBytes(32).toString("hex");
-  const proceso = spawn(ejecutable, [], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
-  let cerrado = false, timer;
-  const url = new Promise((resolve, reject) => {
-    let salida = "";
-    proceso.stdout.on("data", b => {
-      salida += b;
-      if (salida.includes("\n")) {
-        const direccion = salida.trim();
-        if (/^127\.0\.0\.1:\d{1,5}$/.test(direccion)) resolve("http://" + direccion);
-        else reject(error("El coordinador devolvió una dirección inválida"));
-      }
+  let sesion, reinicio, detenido = false, fallos = 0;
+  function arrancar() {
+    if (detenido) return;
+    const proceso = crearProceso(ejecutable, [], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    const actual = sesion = { proceso, localKey: crypto.randomBytes(32).toString("hex"), cerrado: false,
+      inicio: performance.now(), publicadas: "{}" };
+    actual.url = new Promise((resolve, reject) => {
+      let salida = "";
+      actual.limite = setTimeout(() => {
+        reject(error("El coordinador no terminó de arrancar; se volverá a iniciar"));
+        proceso.kill();
+      }, 10000);
+      actual.limite.unref?.();
+      proceso.stdout.on("data", b => {
+        salida += b;
+        if (salida.includes("\n")) {
+          clearTimeout(actual.limite);
+          const direccion = salida.trim();
+          if (/^127\.0\.0\.1:\d{1,5}$/.test(direccion)) resolve("http://" + direccion);
+          else { reject(error("El coordinador devolvió una dirección inválida")); proceso.kill(); }
+        }
+      });
+      proceso.once("error", reject);
+      // Esperar close asegura que el proceso anterior liberó su puerto y diario.
+      proceso.once("close", () => {
+        actual.cerrado = true;
+        clearTimeout(actual.limite);
+        reject(error("El coordinador del grupo se detuvo"));
+        if (detenido || sesion !== actual) return;
+        if (performance.now() - actual.inicio >= 30000) fallos = 0;
+        const demora = Math.min(10000, 1000 * 2 ** Math.min(fallos++, 4));
+        log("El coordinador LAN se detuvo; se recuperará automáticamente");
+        reinicio = setTimeout(arrancar, demora);
+        reinicio.unref?.();
+      });
     });
-    proceso.once("error", reject);
-    proceso.once("exit", () => { cerrado = true; clearInterval(timer); reject(error("El coordinador del grupo se detuvo")); });
-  });
-  // Startup can fail before the first election poll has attached a waiter.
-  url.catch(e => log(e.message));
-  proceso.stdin.on("error", e => log("Coordinación LAN: " + e.message));
-  proceso.stderr.on("data", b => log("Coordinación LAN: " + String(b).trim()));
-  proceso.stdin.write(JSON.stringify({ id: config.nodoId, listen: `0.0.0.0:${q.puerto}`, advertise: q.direccion,
-    directory: carpeta, secret: q.secreto, localKey, bootstrap: q.bootstrap }) + "\n");
+    // Un fallo de arranque puede ocurrir antes del primer sondeo.
+    actual.url.catch(e => { if (!detenido) log(e.message); });
+    proceso.stdin.on("error", e => { if (!detenido) log("Coordinación LAN: " + e.message); });
+    proceso.stderr.on("data", b => log("Coordinación LAN: " + String(b).trim()));
+    proceso.stdin.write(JSON.stringify({ id: config.nodoId, listen: `0.0.0.0:${q.puerto}`, advertise: q.direccion,
+      directory: carpeta, secret: q.secreto, localKey: actual.localKey, bootstrap: q.bootstrap }) + "\n");
+  }
+  arrancar();
 
   async function pedir(ruta, cuerpo) {
-    if (cerrado) throw error("El coordinador del grupo se detuvo");
-    const destino = await url;
+    const actual = sesion;
+    if (detenido || actual.cerrado) throw error("El coordinador del grupo se está recuperando");
+    const destino = await actual.url;
+    if (detenido || actual.cerrado) throw error("El coordinador del grupo se está recuperando");
     const r = await fetch(destino + ruta, { method: cuerpo ? "POST" : "GET", signal: AbortSignal.timeout(4500),
-      headers: { Authorization: "Bearer " + localKey, "Content-Type": "application/json" }, body: cuerpo && JSON.stringify(cuerpo) });
+      headers: { Authorization: "Bearer " + actual.localKey, "Content-Type": "application/json" }, body: cuerpo && JSON.stringify(cuerpo) });
     if (!r.ok) throw error(r.status === 409 ? "Cambió la configuración del grupo" : "Esta PC espera a la mayoría del grupo", r.status);
     return r.json();
   }
-  let publicadas = "{}", enviando = false;
+  let enviando = false;
   async function publicar() {
+    const actual = sesion;
     const direcciones = ubicacion.direccionesRaft();
-    const actual = JSON.stringify(direcciones);
-    if (cerrado || enviando || actual === publicadas) return;
+    const serializadas = JSON.stringify(direcciones);
+    if (detenido || actual.cerrado || enviando || serializadas === actual.publicadas) return;
     enviando = true;
-    try { await pedir("/locations", direcciones); publicadas = actual; }
-    catch (e) { if (!cerrado) log("Ubicación del grupo: " + e.message); }
+    try { await pedir("/locations", direcciones); if (sesion === actual) actual.publicadas = serializadas; }
+    catch (e) { if (!detenido && !actual.cerrado) log("Ubicación del grupo: " + e.message); }
     finally { enviando = false; }
   }
-  timer = ubicacion ? setInterval(publicar, 1000) : null;
+  const timer = ubicacion ? setInterval(publicar, 1000) : null;
   timer?.unref();
   if (ubicacion) publicar();
-  return { pedir, detener() { clearInterval(timer); if (!cerrado) proceso.stdin.end(); } };
+  return { pedir, detener() {
+    detenido = true;
+    clearInterval(timer);
+    clearTimeout(reinicio);
+    clearTimeout(sesion.limite);
+    if (!sesion.cerrado) sesion.proceso.stdin.end();
+  } };
 }
 
 function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {

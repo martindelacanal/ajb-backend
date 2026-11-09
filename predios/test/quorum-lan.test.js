@@ -68,6 +68,10 @@ test("el grupo releva tras cambiar las IP y se reactiva solo cuando vuelven los 
         n.intentoRetorno = true;
         return respuesta(res, 404, { mensaje: "El respaldo todavía no se actualizó" });
       }
+      if (n.escribirDuranteRetorno && req.url === "/lan/retorno") {
+        n.ventasDuranteRetorno = (n.ventasDuranteRetorno || 0) + 1;
+        await escribir(n, 203 + n.ventasDuranteRetorno);
+      }
       if (n.sinCopia && req.method === "POST" && req.url === "/lan/replica") {
         n.intentoCopia = true;
         return respuesta(res, 503, { mensaje: "Copia todavía no disponible" });
@@ -219,10 +223,13 @@ test("el grupo releva tras cambiar las IP y se reactiva solo cuando vuelven los 
   assert.equal(segundo.intentoRetorno, true);
   assert.equal(segundo.servicio.estado().escritor, true, "un respaldo todavía sin actualizar sigue en servicio");
   await escribir(segundo, 203);
+  segundo.escribirDuranteRetorno = true;
   segundo.sinRetorno = false;
   assert.equal(await lider(principal), principal);
   assert.equal(principal.reinicios, reiniciosPrevios, "recupera la copia sin perder su elección al reiniciar");
-  assert.equal(leer(principal), "203");
+  assert.ok(segundo.ventasDuranteRetorno > 0);
+  assert.equal(leer(principal), String(203 + segundo.ventasDuranteRetorno));
+  segundo.escribirDuranteRetorno = false;
   await comprobarAcceso(segundo, principal);
   await escribir(principal, 204);
   async function configurarModo(activo) {
