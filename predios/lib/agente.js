@@ -295,7 +295,7 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
   }
 
   async function ejecutarComando(c) {
-    const soloDatos = c.tipo !== "SISTEMA" || ["CORREGIR_CODIGOS_VERIFICADOS", "SINCRONIZAR_TODO", "TRASLADAR_EJEMPLOS_MIRAMAR", "REINICIAR_USUARIOS_PREDIO"].includes(c.ruta);
+    const soloDatos = c.tipo !== "SISTEMA" || ["CORREGIR_CODIGOS_VERIFICADOS", "SINCRONIZAR_TODO", "TRASLADAR_EJEMPLOS_MIRAMAR"].includes(c.ruta);
     if (soloDatos) {
       // Negocio, outbox y deduplicación comparten el mismo COMMIT. Un corte
       // previo al registro revierte el negocio; otro envío no puede duplicarlo.
@@ -341,7 +341,6 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
 
   async function comandoSistema(c, ejecutor = db) {
     const accion = c.ruta;
-    if (accion === "REINICIAR_USUARIOS_PREDIO") return require("./reinicio-usuarios").reiniciarUsuariosPredio(ejecutor, pid, c.cuerpo);
     if (accion === "CORREGIR_CODIGOS_VERIFICADOS") return corregirCodigosVerificados(ejecutor, pid, c.cuerpo);
     if (accion === "TRASLADAR_EJEMPLOS_MIRAMAR") {
       return require("./traslado-ejemplos-miramar").trasladarEjemplosMiramar(ejecutor, config, c.cuerpo);
