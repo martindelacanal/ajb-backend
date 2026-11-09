@@ -17,6 +17,7 @@ const { crearServidorTestigo } = require("../lib/servidor-testigo");
 const { verificarEstadoFirmado } = require("../lib/protocolo-lan");
 const { listarAvisos } = require("../lib/avisos");
 const { bloquearInstalacion } = require("../lib/bloqueo-local");
+const { paginaRecuperacion } = require("../lib/pantalla-recuperacion-lan");
 const H = require("../lib/http-lan");
 
 async function escuchar(servidor) {
@@ -52,6 +53,7 @@ async function grupoHttp(t) {
       if (!await n.servicio.manejar(req, res)) {
         n.recibidas.push({ ruta: req.url, cabeceras: req.headers, cuerpo: (await H.leer(req)).toString() });
         if (n.perderRespuesta) return res.destroy();
+        if (n.responder) return n.responder(req, res);
         H.respuesta(res, 200, { desde: n.id });
       }
     });
@@ -186,6 +188,50 @@ test("el proxy sólo dirige al escritor firmado, limpia cabeceras y nunca reinte
   });
   assert.equal(estado, 503);
   assert.equal(externas, 0, "un request-target absoluto no puede cambiar el destino firmado");
+});
+
+test("el proxy recupera la navegación ante JSON503 de una PC vieja sin alterar API, POST ni HTML", { timeout: 15000 }, async t => {
+  const s = await grupoHttp(t), a = s.nodos.A, b = s.nodos.B;
+  await a.servicio.sondear(); await s.avisos("A");
+  let recuperaciones = 0;
+  const proxy = http.createServer((req, res) => b.servicio.reenviar(req, res, e => {
+    recuperaciones++;
+    res.writeHead(503, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(paginaRecuperacion({ mensaje: e.message }));
+  }));
+  const origen = await escuchar(proxy); t.after(() => cerrar(proxy));
+  a.responder = (_req, res) => H.respuesta(res, 503, { mensaje: "Esperando una mayoría <remota>", codigo: "SERVIDOR_CAMBIANDO" });
+  const inicio = await fetch(origen);
+  assert.equal(inicio.status, 503);
+  assert.match(inicio.headers.get("content-type"), /text\/html/);
+  assert.match(await inicio.text(), /Esperando una mayoría &lt;remota&gt;/);
+  assert.equal(recuperaciones, 1);
+  for (const [ruta, method] of [["/", "POST"], ["/api/ventas", "GET"]]) {
+    const r = await fetch(origen + ruta, { method, headers: { Accept: "text/html" } });
+    assert.equal(r.status, 503);
+    assert.equal((await r.json()).codigo, "SERVIDOR_CAMBIANDO");
+  }
+  a.responder = (_req, res) => { res.writeHead(503, { "Content-Type": "text/html" }); res.end("<h1>Recuperación remota</h1>"); };
+  assert.equal(await (await fetch(origen)).text(), "<h1>Recuperación remota</h1>");
+  assert.equal(recuperaciones, 1, "las respuestas de API, POST y la pantalla nueva se conservan");
+  a.responder = (_req, res) => H.respuesta(res, 503, { mensaje: "x".repeat(17000) });
+  assert.match(await (await fetch(origen)).text(), /El paquete supera el límite permitido/);
+  assert.equal(recuperaciones, 2, "el diagnóstico remoto tiene un límite de tamaño");
+});
+
+test("una navegación vuelve al diagnóstico local a los ocho segundos si el escritor no responde", { timeout: 15000 }, async t => {
+  const s = await grupoHttp(t), a = s.nodos.A, b = s.nodos.B;
+  await a.servicio.sondear(); await s.avisos("A");
+  a.responder = () => {};
+  const proxy = http.createServer((req, res) => b.servicio.reenviar(req, res, e => {
+    res.writeHead(503, { "Content-Type": "text/html" }); res.end(paginaRecuperacion({ mensaje: e.message }));
+  }));
+  const origen = await escuchar(proxy); t.after(() => cerrar(proxy));
+  const inicio = Date.now(), r = await fetch(origen);
+  assert.equal(r.status, 503);
+  assert.match(await r.text(), /El servidor actual no respondió/);
+  assert.ok(Date.now() - inicio < 12000, "la navegación no conserva la espera de 120 segundos de las operaciones");
+  assert.equal(a.recibidas.length, 1, "el timeout no reenvía la petición");
 });
 
 test("el candado de instalación excluye otro proceso y el sistema operativo lo libera tras una caída", { timeout: 12000 }, async t => {

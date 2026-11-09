@@ -34,6 +34,7 @@ const { aplicarPendiente } = require("./lib/respaldo-lan");
 const { leerConfiguracionLan, crearServicioLan } = require("./lib/servicio-lan");
 const { crearGrupoLocal, escribirHa } = require("./lib/grupo-local");
 const { prepararRedQuorum } = require("./lib/quorum-lan");
+const { esNavegacion, paginaRecuperacion } = require("./lib/pantalla-recuperacion-lan");
 const LAN = require("./lib/http-lan");
 
 const DIR_APP = __dirname;
@@ -723,7 +724,14 @@ async function manejar(req, res) {
   if (cajaRelevo && ruta === "/relevo-manual") return pantallaRelevo(req, res);
   if (ha && !congelado && !ha.estado().escritor) {
     const accesoCaja = cajaRelevo && req.method === "GET" && ruta === "/" && origenCajaLocal(req);
-    return ha.reenviar(req, res, accesoCaja ? () => enviar(req, res, 303, "", "text/plain", { Location: "/relevo-manual", "Cache-Control": "no-store" }) : undefined);
+    let alNoDisponible;
+    if (accesoCaja) {
+      alNoDisponible = () => enviar(req, res, 303, "", "text/plain", { Location: "/relevo-manual", "Cache-Control": "no-store" });
+    } else if (esNavegacion(req, ruta)) {
+      alNoDisponible = e => enviar(req, res, 503, paginaRecuperacion({ estado: ha.estado(), mensaje: e.message }),
+        "text/html; charset=utf-8", { "Cache-Control": "no-store", "Retry-After": "5" });
+    }
+    return ha.reenviar(req, res, alNoDisponible);
   }
   if (!ruta.startsWith("/api/")) {
     if (req.method !== "GET" && req.method !== "HEAD") return enviar(req, res, 405, { mensaje: "Método no permitido" });

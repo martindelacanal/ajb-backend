@@ -104,6 +104,30 @@ function leerZip(archivo) {
   return { ha: JSON.parse(r.ha), nombres: r.nombres.map((n) => n.replace(/\\/g, "/")) };
 }
 
+test("el navegador conserva acceso al diagnóstico local mientras el grupo espera autoridad", { timeout: 30000 }, async t => {
+  const id = "a".repeat(64);
+  const s = await preparar(t, false, id);
+  fs.writeFileSync(path.join(s.base, "predio-ha.json"), JSON.stringify({
+    habilitado: true, grupoId: "grupo_diagnostico", nodoId: id, equipoId: id, rolInstalacion: "Principal",
+    clave: "1".repeat(64), claveDatos: "2".repeat(64), quorumPendiente: true,
+    miembros: ["a", "b", "c"].map(letra => ({ id: letra.repeat(64), nombre: "PC " + letra, url: s.http, preferido: letra === "a" })),
+  }));
+  await s.iniciar();
+  const pagina = await pedir(s.http, "/", { headers: { Accept: "text/html" } });
+  assert.equal(pagina.status, 503);
+  assert.match(pagina.headers["content-type"], /text\/html/);
+  assert.equal(pagina.headers["retry-after"], "5");
+  assert.match(pagina.buffer.toString(), /El sistema está recuperando la conexión/);
+  assert.match(pagina.buffer.toString(), /La PC espera la activación del grupo/);
+  assert.match(pagina.buffer.toString(), /Reintentar ahora/);
+  const estado = await pedir(s.http, "/api/estado-publico", { headers: { Accept: "text/html" } });
+  assert.equal(estado.status, 503);
+  assert.equal(estado.json.codigo, "SERVIDOR_CAMBIANDO");
+  const venta = await pedir(s.http, "/api/ventas", { metodo: "POST", cuerpo: { total: 123 } });
+  assert.equal(venta.status, 503);
+  assert.equal(venta.json.codigo, "SERVIDOR_CAMBIANDO");
+});
+
 test("un administrador descarga desde HTTP el paquete unificado para la misma PC", {
   skip: process.platform !== "win32" || !ipLan || !fs.existsSync(path.join(RAIZ, "windows", "ajb-quorum.exe")), timeout: 120000,
 }, async t => {

@@ -25,7 +25,7 @@ async function cerrar(s) {
   if (s.listening) await new Promise(resolve => { s.close(resolve); s.closeAllConnections(); });
 }
 
-test("el grupo releva tras cambiar las IP y se reactiva solo cuando vuelven los respaldos", {
+test("el grupo recupera el apagado total, releva tras cambiar las IP y reactiva los respaldos actualizados", {
   skip: !ejecutable, timeout: 150000,
 }, async t => {
   const raiz = fs.mkdtempSync(path.join(os.tmpdir(), "ajb-quorum-"));
@@ -293,10 +293,34 @@ test("el grupo releva tras cambiar las IP y se reactiva solo cuando vuelven los 
   const modoNormal = await principal.servicio.consultarQuorum();
   assert.equal(modoNormal.solo_principal, false);
   assert.equal(modoNormal.votantes.length, 3);
+  // Corte total: desaparecen los tres procesos y luego vuelven sólo los dos
+  // respaldos. Deben elegir con el registro durable, sin necesitar que la
+  // notebook esté encendida ni promover un respaldo que todavía está solo.
+  for (const n of nodos) { n.disponible = false; n.servicio.detener(); }
+  await esperar(500);
+  await volver(principal);
+  await esperar(6000);
+  assert.equal(principal.servicio.estado().escritor, false, "en modo normal la notebook sola espera mayoría; sólo el modo preparado permite operar sola");
+  await assert.rejects(escribir(principal, 998));
+  principal.disponible = false; principal.servicio.detener();
+  await esperar(500);
+  await volver(caja);
+  await esperar(6000);
+  assert.equal(caja.servicio.estado().escritor, false, "un respaldo solo no se activa automáticamente después del apagón");
+  await assert.rejects(escribir(caja, 999));
+  await volver(segundo);
+  const despuesDelApagon = await lider();
+  assert.notEqual(despuesDelApagon, principal);
+  assert.equal(leer(despuesDelApagon), "206", "el arranque en frío conserva la última venta confirmada");
+  await escribir(despuesDelApagon, 207);
+  await comprobarAcceso(despuesDelApagon === caja ? segundo : caja, despuesDelApagon);
+  await volver(principal);
+  assert.equal(await lider(principal), principal);
+  assert.equal(leer(principal), "207", "la notebook recupera la venta posterior al apagón antes de volver al servicio");
   principal.disponible = false; principal.servicio.detener();
   const respaldoActivo = await lider();
   assert.notEqual(respaldoActivo, principal);
-  assert.equal(leer(respaldoActivo), "206", "el respaldo recupera la venta confirmada cuando la notebook operaba sola");
+  assert.equal(leer(respaldoActivo), "207", "un nuevo relevo conserva la última venta tras el regreso de la notebook");
   const otroRespaldo = respaldoActivo === caja ? segundo : caja;
   otroRespaldo.disponible = false; otroRespaldo.servicio.detener();
   await assert.rejects(escribir(respaldoActivo, 303));

@@ -17,6 +17,7 @@ const { emitirAviso } = require("./avisos");
 const { iniciarConsenso, crearAutoridadQuorum, clienteQuorum, RUTA_ALTA, acreditarOrigen, origenAcreditado } = require("./quorum-lan");
 const { conectarMiembro } = require("./ubicacion-lan");
 const { abrirAutoridadManual, crearRelevoManual, RUTA: RUTA_RELEVO } = require("./relevo-manual");
+const { esNavegacion } = require("./pantalla-recuperacion-lan");
 
 function leerConfiguracionLan(base, equipoId = identidadEquipo()) {
   const archivo = path.join(base, "predio-ha.json");
@@ -345,6 +346,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
         const destino = conectarMiembro(m, ubicacion);
         const origen = origenPermitido(destino.url), url = new URL(req.url, origen), headers = cabecerasSinSalto(req.headers);
         if (url.origin !== origen || url.username || url.password) throw new Error("La solicitud no corresponde al servidor autorizado");
+        const recuperarNavegacion = alNoDisponible && esNavegacion(req, url.pathname);
         for (const k of ["forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto"]) delete headers[k];
         delete headers["x-ajb-origen"];
         if (cliente && req.method === "POST" && url.pathname === RUTA_ALTA) {
@@ -353,9 +355,22 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
         }
         await new Promise((resolve, reject) => {
           const upstream = (url.protocol === "https:" ? https : http).request(url, { method: req.method, headers, ca: destino.ca, servername: destino.servername, rejectUnauthorized: true }, r => {
+            // Una PC todavía sin actualizar puede devolver JSON incluso al abrir
+            // el inicio. Conserva el diagnóstico local antes de enviar cabeceras.
+            if (recuperarNavegacion && r.statusCode === 503 && /^application\/json\b/i.test(r.headers["content-type"] || "")) {
+              H.leer(r, 16 * 1024).then(buffer => {
+                let mensaje = "El servidor actual todavía no está disponible.";
+                try {
+                  const error = JSON.parse(buffer.toString("utf8"));
+                  if (typeof error?.mensaje === "string" && error.mensaje.trim()) mensaje = error.mensaje;
+                } catch (_e) { /* el error remoto no contiene JSON válido */ }
+                reject(new Error(mensaje));
+              }, reject);
+              return;
+            }
             const h = cabecerasSinSalto(r.headers); res.writeHead(r.statusCode, h); r.pipe(res); r.on("end", resolve); r.on("error", reject);
           });
-          const timer = setTimeout(() => upstream.destroy(new Error("El servidor actual no respondió")), 120000);
+          const timer = setTimeout(() => upstream.destroy(new Error("El servidor actual no respondió")), recuperarNavegacion ? 8000 : 120000);
           upstream.once("close", () => clearTimeout(timer)); upstream.on("error", reject);
           req.once("aborted", () => upstream.destroy()); res.once("close", () => { if (!res.writableEnded) upstream.destroy(); });
           let bytes = 0;
@@ -364,7 +379,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
         });
       } catch (e) {
         if (res.headersSent) res.destroy();
-        else if (alNoDisponible) alNoDisponible();
+        else if (alNoDisponible) alNoDisponible(e);
         else H.respuesta(res, 503, { mensaje: e.message, codigo: "SERVIDOR_CAMBIANDO" });
       }
     },
