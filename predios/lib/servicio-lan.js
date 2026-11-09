@@ -245,7 +245,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
         try {
           if (!relevo) throw new Error("La PC de caja todavía está preparando el relevo");
           await relevo.manejar(req, res, u);
-        } catch (e) { if (!res.headersSent && !res.destroyed) H.respuesta(res, e.status || 503, { mensaje: e.message }); }
+        } catch (e) { if (!res.headersSent && !res.destroyed) H.respuestaError(res, e, 503); }
         return true;
       }
       if (u.pathname === "/lan/quorum/listo" && c.relevoManual) {
@@ -254,7 +254,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
           const buffer = await H.leer(req, 4096);
           verificar({ metodo: req.method, ruta: req.url, cuerpo: buffer, cabeceras: req.headers });
           H.respuesta(res, 200, { equipo: c.nodoId, manual: true, semilla: relevo ? c.relevoManual.inicial.sha256 : null });
-        } catch (e) { H.respuesta(res, e.status || 403, { mensaje: e.message }); }
+        } catch (e) { H.respuestaError(res, e); }
         return true;
       }
       if (u.pathname === "/lan/quorum/listo" && c.quorum) {
@@ -264,7 +264,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
           verificar({ metodo: req.method, ruta: req.url, cuerpo: buffer, cabeceras: req.headers });
           const local = consenso ? await consenso.pedir("/local") : null;
           H.respuesta(res, 200, { equipo: c.nodoId, arranque, semilla: c.quorum.inicial?.ultimo.sha256 || null, confirmada: core.estado().confirmada, consenso: !!local, version: local?.version });
-        } catch (e) { H.respuesta(res, e.status || 403, { mensaje: e.message }); }
+        } catch (e) { H.respuestaError(res, e); }
         return true;
       }
       if (u.pathname.startsWith("/lan/quorum/") && u.pathname !== "/lan/quorum/preparar" && c.quorum) {
@@ -272,7 +272,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
           const estadoPublico = req.method === "GET" && u.pathname === "/lan/quorum/estado";
           if ((!req.socket.encrypted && !estadoPublico) || !autoridad) throw new Error("La coordinación LAN todavía no está disponible");
           await autoridad.manejar(req, res);
-        } catch (e) { if (!res.headersSent && !res.destroyed) H.respuesta(res, e.status || 503, { mensaje: e.message }); }
+        } catch (e) { if (!res.headersSent && !res.destroyed) H.respuestaError(res, e, 503); }
         return true;
       }
       if (c.quorumPendiente && ["/lan/quorum/preparar", "/lan/quorum/listo", "/lan/quorum/copia", "/lan/replica/inicial"].includes(u.pathname)) {
@@ -313,7 +313,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
             H.respuesta(res, 200, { equipo: c.nodoId });
             alReiniciar?.();
           }
-        } catch (e) { if (!res.headersSent && !res.destroyed) H.respuesta(res, e.status || 403, { mensaje: e.message }); }
+        } catch (e) { if (!res.headersSent && !res.destroyed) H.respuestaError(res, e); }
         return true;
       }
       if (!["/lan/replica", "/lan/replica/inicial", "/lan/drenar", "/lan/retorno", "/lan/estado"].includes(u.pathname)) return false;
@@ -335,7 +335,7 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
           H.respuesta(res, 200, await core.drenar(datos));
         } else if (req.method === "GET" && u.pathname === "/lan/estado") H.respuesta(res, 200, core.estado());
         else H.respuesta(res, 405, { mensaje: "Método no permitido" });
-      } catch (e) { if (!res.headersSent && !res.destroyed) H.respuesta(res, e.status || 403, { mensaje: e.message }); }
+      } catch (e) { if (!res.headersSent && !res.destroyed) H.respuestaError(res, e); }
       return true;
     },
     async reenviar(req, res, alNoDisponible) {

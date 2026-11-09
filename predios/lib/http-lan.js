@@ -4,12 +4,16 @@ const crypto = require("node:crypto");
 const http = require("node:http");
 const https = require("node:https");
 const { performance } = require("node:perf_hooks");
-const { firmarPeticion, verificarEstadoFirmado } = require("./protocolo-lan");
+const { firmarPeticion, verificarEstadoFirmado, leerRelojRemoto, TTL_MS } = require("./protocolo-lan");
 
 function respuesta(res, status, datos, cabeceras = {}) {
   const buffer = Buffer.isBuffer(datos) ? datos : Buffer.from(JSON.stringify(datos));
   res.writeHead(status, { "Content-Type": Buffer.isBuffer(datos) ? "application/octet-stream" : "application/json; charset=utf-8", "Content-Length": buffer.length, "Cache-Control": "no-store", ...cabeceras });
   res.end(buffer);
+}
+function respuestaError(res, e, status = 403) {
+  respuesta(res, e.status || status, { mensaje: e.message,
+    ...(e.relojLan ? { codigo: e.codigo, relojLan: e.relojLan } : {}) });
 }
 function leer(req, maximo = 2 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
@@ -32,23 +36,44 @@ async function pedir(urlBase, ruta, { grupoId, nodoId, clave, metodo = "POST", c
   const url = new URL(ruta, urlBase);
   if (url.origin !== new URL(urlBase).origin || !["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("La dirección LAN no es válida");
   const datos = buffer || (cuerpo === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(cuerpo)));
-  const headers = clave ? firmarPeticion({ grupoId, nodoId, clave, metodo, ruta: url.pathname + url.search, cuerpo: datos }) : {};
-  if (metodo !== "GET") headers["Content-Type"] = buffer ? "application/octet-stream" : "application/json";
-  if (metodo !== "GET") headers["Content-Length"] = datos.length;
-  const r = await new Promise((resolve, reject) => {
-    const req = (url.protocol === "https:" ? https : http).request(url, { method: metodo, headers, ca, servername, rejectUnauthorized: true }, (res) => {
-      const partes = []; let total = 0;
-      const limite = binario && res.statusCode === 200 ? 300 * 1024 * 1024 + 16384 : 2 * 1024 * 1024;
-      res.on("data", (p) => { total += p.length; if (total > limite) req.destroy(new Error("La respuesta LAN supera el tamaño permitido")); else partes.push(p); });
-      res.on("error", reject);
-      res.on("end", () => { clearTimeout(timer); resolve({ status: res.statusCode, buffer: Buffer.concat(partes), headers: res.headers }); });
+  const inicio = performance.now();
+  let fecha;
+  for (let intento = 0; intento < 2; intento++) {
+    const headers = clave ? firmarPeticion({ grupoId, nodoId, clave, metodo, ruta: url.pathname + url.search, cuerpo: datos, ahora: fecha }) : {};
+    if (metodo !== "GET") headers["Content-Type"] = buffer ? "application/octet-stream" : "application/json";
+    if (metodo !== "GET") headers["Content-Length"] = datos.length;
+    const r = await new Promise((resolve, reject) => {
+      const req = (url.protocol === "https:" ? https : http).request(url, { method: metodo, headers, ca, servername, rejectUnauthorized: true }, (res) => {
+        const partes = []; let total = 0;
+        const limite = binario && res.statusCode === 200 ? 300 * 1024 * 1024 + 16384 : 2 * 1024 * 1024;
+        res.on("data", (p) => { total += p.length; if (total > limite) req.destroy(new Error("La respuesta LAN supera el tamaño permitido")); else partes.push(p); });
+        res.on("error", reject);
+        res.on("end", () => { clearTimeout(timer); resolve({ status: res.statusCode, buffer: Buffer.concat(partes), headers: res.headers }); });
+      });
+      const timer = setTimeout(() => req.destroy(new Error("Se agotó el tiempo de espera del equipo LAN")), Math.max(1, timeout - (performance.now() - inicio)));
+      req.on("error", (e) => { clearTimeout(timer); reject(e); });
+      req.end(metodo === "GET" ? undefined : datos);
     });
-    const timer = setTimeout(() => req.destroy(new Error("Se agotó el tiempo de espera del equipo LAN")), timeout);
-    req.on("error", (e) => { clearTimeout(timer); reject(e); });
-    req.end(metodo === "GET" ? undefined : datos);
-  });
-  if (r.status !== 200) { let m = "No respondió el equipo de la red local"; try { m = JSON.parse(r.buffer.toString("utf8")).mensaje || m; } catch (_e) {} throw Object.assign(new Error(m), { status: r.status }); }
-  return binario ? r : JSON.parse(r.buffer.toString("utf8"));
+    if (r.status !== 200) {
+      let fallo = {};
+      try {
+        const valor = JSON.parse(r.buffer.toString("utf8"));
+        if (valor && typeof valor === "object") fallo = valor;
+      } catch (_e) { /* respuesta sin JSON */ }
+      const transcurrido = performance.now() - inicio;
+      if (!intento && clave && r.status === 409 && fallo.codigo === "RELOJ_LAN_DESAJUSTADO" && transcurrido < Math.min(timeout, TTL_MS)) {
+        const remoto = leerRelojRemoto(fallo.relojLan, headers, clave);
+        if (remoto !== null) {
+          // El receptor firmó que rechazó esta petición antes de ejecutarla.
+          // La segunda firma lleva otro nonce y conserva el plazo total original.
+          fecha = remoto + Math.ceil(transcurrido);
+          continue;
+        }
+      }
+      throw Object.assign(new Error(fallo.mensaje || "No respondió el equipo de la red local"), { status: r.status, codigo: fallo.codigo });
+    }
+    return binario ? r : JSON.parse(r.buffer.toString("utf8"));
+  }
 }
 async function estadoTestigo(c, { compacto = false, destino, arbitro, ruta = "/lan/testigo/estado" } = {}) {
   const desafio = crypto.randomBytes(20).toString("hex"), inicio = performance.now();
@@ -60,4 +85,4 @@ async function estadoTestigo(c, { compacto = false, destino, arbitro, ruta = "/l
   return { ...estado, escritor: estado.escritor?.id || null, escritorDatos: estado.escritor, vence_en_ms: Math.max(0, estado.vence_ms - estado.emitido_ms - transcurrido), sobre };
 }
 
-module.exports = { respuesta, leer, cifrarJson, descifrarJson, pedir, estadoTestigo };
+module.exports = { respuesta, respuestaError, leer, cifrarJson, descifrarJson, pedir, estadoTestigo };

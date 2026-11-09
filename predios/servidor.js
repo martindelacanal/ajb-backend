@@ -710,7 +710,7 @@ async function manejar(req, res) {
     try {
       const cuerpo = await LAN.leer(req, 128 * 1024);
       return LAN.respuesta(res, 200, await grupoLocal.incorporar({ metodo: req.method, ruta: req.url, cabeceras: req.headers, cuerpo, ip: ipDe(req) }));
-    } catch (e) { return LAN.respuesta(res, e.status || 403, { mensaje: e.message }); }
+    } catch (e) { return LAN.respuestaError(res, e); }
   }
   if (ruta.startsWith("/lan/")) {
     if (ruta === "/lan/quorum/estado" && !req.socket.encrypted && ipDe(req) !== "127.0.0.1" && !esIpLocal(ipDe(req))) {

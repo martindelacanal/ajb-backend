@@ -6,7 +6,7 @@ const http = require("node:http");
 const { crearTestigo } = require("./testigo-lan");
 const { crearVerificador } = require("./protocolo-lan");
 const { identidadEquipo } = require("./control-equipo");
-const { respuesta, leer, descifrarJson } = require("./http-lan");
+const { respuesta, respuestaError, leer, descifrarJson } = require("./http-lan");
 
 function crearServidorTestigo({ base, config, testigo: arbitro }) {
   if (config.equipoId && config.equipoId !== identidadEquipo()) throw new Error("Esta carpeta del testigo pertenece a otra PC; no se inicia una segunda autoridad");
@@ -34,7 +34,7 @@ function crearServidorTestigo({ base, config, testigo: arbitro }) {
       const datos = JSON.parse(buffer.toString("utf8"));
       if (datos.nodoId !== actor.nodoId || !["solicitar", "renovar", "confirmar", "liberar"].includes(accion)) throw new Error("La operación no corresponde a ese equipo");
       return respuesta(res, 200, testigo[accion](datos));
-    } catch (e) { if (!res.headersSent && !res.destroyed) respuesta(res, e.status || 403, { mensaje: e.message }); }
+    } catch (e) { if (!res.headersSent && !res.destroyed) respuestaError(res, e); }
   });
   return { servidor, testigo, cerrar: () => new Promise((resolve) => { servidor.close(() => { testigo.cerrar(); resolve(); }); }) };
 }

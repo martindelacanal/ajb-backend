@@ -20,16 +20,31 @@ function crearVerificador({ grupoId, miembros, ahora = Date.now, ttlMs = TTL_MS 
     const claves = new Map((typeof miembros === "function" ? miembros() : miembros).map((m) => [m.id, m.clave]));
     const h = Object.fromEntries(Object.entries(cabeceras || {}).map(([k, v]) => [k.toLowerCase(), String(v)]));
     const nodo = h["x-ajb-nodo"], nonce = h["x-ajb-nonce"], fecha = Number(h["x-ajb-fecha"]), reloj = ahora();
-    if (h["x-ajb-grupo"] !== grupoId || !claves.has(nodo) || !/^[a-f0-9]{32,128}$/.test(nonce || "") || !Number.isSafeInteger(fecha) || Math.abs(reloj - fecha) > Math.min(ttlMs, TTL_MS)) throw new Error("La petición LAN no está autenticada o venció");
+    if (h["x-ajb-grupo"] !== grupoId || !claves.has(nodo) || !/^[a-f0-9]{32,128}$/.test(nonce || "") || !Number.isSafeInteger(fecha)) throw new Error("La petición LAN no está autenticada o venció");
     for (const [k, vence] of usados) if (vence < reloj) usados.delete(k);
     const esperado = firmarPeticion({ grupoId, nodoId: nodo, metodo, ruta, cuerpo, clave: claves.get(nodo), ahora: fecha, nonce });
     if (!igual(esperado["x-ajb-firma"], h["x-ajb-firma"])) throw new Error("La firma LAN no coincide");
     const k = `${nodo}:${nonce}`;
     if (usados.has(k)) throw new Error("La petición LAN ya fue utilizada");
+    if (Math.abs(reloj - fecha) > Math.min(ttlMs, TTL_MS)) {
+      const datos = { tipo: "AJB_LAN_RELOJ_1", grupoId, nodoId: nodo, nonce, fecha,
+        peticionFirma: h["x-ajb-firma"], servidorMs: reloj };
+      throw Object.assign(new Error("La petición LAN venció porque los relojes de las PCs difieren"), {
+        status: 409, codigo: "RELOJ_LAN_DESAJUSTADO", relojLan: { datos, firma: hmac(JSON.stringify(datos), claves.get(nodo)) },
+      });
+    }
     if (usados.size >= 50000) throw new Error("Demasiadas peticiones LAN pendientes de vencimiento");
     usados.set(k, fecha + Math.min(ttlMs, TTL_MS));
     return { nodoId: nodo };
   };
+}
+function leerRelojRemoto(sobre, cabeceras, clave) {
+  const d = sobre?.datos;
+  if (!d || d.tipo !== "AJB_LAN_RELOJ_1" || d.grupoId !== cabeceras["x-ajb-grupo"] || d.nodoId !== cabeceras["x-ajb-nodo"]
+    || d.nonce !== cabeceras["x-ajb-nonce"] || d.fecha !== Number(cabeceras["x-ajb-fecha"])
+    || d.peticionFirma !== cabeceras["x-ajb-firma"] || !Number.isSafeInteger(d.servidorMs)
+    || !igual(hmac(JSON.stringify(d), clave), sobre.firma)) return null;
+  return d.servidorMs;
 }
 function firmarAckReplica({ grupoId, nodoId, escritorId, termino, indice, sha256: huella }, clave, { nonce = crypto.randomBytes(24).toString("hex") } = {}) {
   const ack = { tipo: "AJB_ACK_REPLICA", formato: 1, grupo_id: grupoId, nodo_id: nodoId, escritor_id: escritorId, termino, indice, sha256: huella, nonce };
@@ -52,4 +67,4 @@ function verificarEstadoFirmado(sobre, { clavePublica, grupoId, desafio, ahora =
   if (Math.abs(reloj - e.emitido_ms) <= TTL_MS && reloj > e.vence_ms) throw new Error("El estado firmado del testigo venció");
   return e;
 }
-module.exports = { firmarPeticion, crearVerificador, firmarAckReplica, verificarAckReplica, verificarEstadoFirmado, TTL_MS };
+module.exports = { firmarPeticion, crearVerificador, leerRelojRemoto, firmarAckReplica, verificarAckReplica, verificarEstadoFirmado, TTL_MS };
