@@ -10,8 +10,12 @@ const instalador = path.resolve(__dirname, "../windows/configurar-mantenimiento-
 const reconexion = path.resolve(__dirname, "../windows/mantener-tunel-ssh.ps1");
 const literal = s => `'${s.replace(/'/g, "''")}'`;
 function powershell(script) {
+  const env = { ...process.env };
+  // Si node se lanza desde pwsh 7, su PSModulePath puede cargar modulos
+  // incompatibles en Windows PowerShell 5.1. Permitir que 5.1 use sus rutas.
+  for (const k of Object.keys(env)) if (k.toLowerCase() === "psmodulepath") delete env[k];
   return execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
-    { encoding: "utf8", windowsHide: true, timeout: 15000 }).trim();
+    { encoding: "utf8", windowsHide: true, timeout: 15000, env }).trim();
 }
 
 test("scripts de mantenimiento conservan sintaxis de Windows PowerShell 5.1", { skip: !windows }, () => {
@@ -61,4 +65,22 @@ test("plan OpenSSH rechaza servicing activo y estados pendientes antes de instal
     'OK'
   `);
   assert.equal(salida, "OK");
+});
+
+test("alta de cuenta usa parametros aceptados por New-LocalUser en PowerShell 5.1", { skip: !windows }, () => {
+  const salida = powershell(`
+    $ErrorActionPreference = 'Stop'
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(${literal(instalador)}, [ref]$null, [ref]$null)
+    $comando = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'New-LocalUser' }, $true)
+    if (-not $comando) { throw 'Falta el comando de alta de usuario' }
+    $usuarioNombre = 'ajbmantenimiento'
+    $password = ConvertTo-SecureString 'A9!a_ParametroSoloWhatIf_NoSeCreaCuenta' -AsPlainText -Force
+    try {
+      # WhatIf valida el comando real sin crear ni modificar ninguna cuenta.
+      $WhatIfPreference = $true
+      Invoke-Expression ($comando.Extent.Text + ' -WhatIf -ErrorAction Stop') | Out-Null
+    } finally { $password.Dispose() }
+    'PARAMETROS_VALIDOS'
+  `);
+  assert.match(salida, /PARAMETROS_VALIDOS$/);
 });

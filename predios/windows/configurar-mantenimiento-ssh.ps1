@@ -228,7 +228,7 @@ try {
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($aleatorio) } finally { $rng.Dispose() }
     $password = ConvertTo-SecureString ('A9!a' + [Convert]::ToBase64String($aleatorio)) -AsPlainText -Force
-    New-LocalUser -Name $usuarioNombre -Password $password -FullName 'Mantenimiento tecnico AJB' -Description 'Acceso SSH autorizado de AJB; autenticacion solo con clave publica.' -PasswordNeverExpires -UserMayNotChangePassword -AccountNeverExpires | Out-Null
+    New-LocalUser -Name $usuarioNombre -Password $password -FullName 'Mantenimiento tecnico AJB' -Description 'Mantenimiento SSH AJB con clave publica' -PasswordNeverExpires -UserMayNotChangePassword -AccountNeverExpires | Out-Null
     $password.Dispose()
     [Array]::Clear($aleatorio, 0, $aleatorio.Length)
   }
