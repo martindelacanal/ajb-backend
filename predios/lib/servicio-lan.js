@@ -168,15 +168,13 @@ function crearServicioLan({ base, dirApp, config, db, ha, alReiniciar, prepararQ
         if (activo) {
           const plan = await autoridad.prepararModoPrincipal();
           if (!plan) return { soloPrincipal: true };
-          const arranques = await Promise.all(plan.miembros.map(async m => {
+          await Promise.all(plan.miembros.map(async m => {
             const listo = await pedirMiembro(m, "/lan/quorum/listo", { cuerpo: {} }).catch(() => null);
             if (listo?.equipo !== m.id || !listo.consenso || listo.version !== plan.version) {
               throw Object.assign(new Error(`Dejá ${m.nombre} encendida y esperá a que se conecte antes de preparar el apagado`), { status: 409 });
             }
-            if (!/^[a-f0-9]{32}$/.test(listo.arranque || "")) throw Object.assign(new Error(`Esperá a que ${m.nombre} se actualice antes de preparar el apagado`), { status: 409 });
-            return [m.id, listo.arranque];
           }));
-          return autoridad.dejarSoloPrincipal(plan.version, Object.fromEntries(arranques));
+          return autoridad.dejarSoloPrincipal(plan.version);
         }
         const plan = await autoridad.prepararReactivacion();
         return plan ? confirmarReactivacion(plan, false) : { soloPrincipal: false };

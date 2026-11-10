@@ -295,23 +295,27 @@ function crearAutoridadQuorum({ config, consenso, ahora = Date.now }) {
       const lectura = await leer();
       verificarPrincipal(lectura);
       const respaldos = lectura.members.filter(m => m.Suffrage === 0 && m.ID !== config.nodoId).map(m => m.ID);
-      if (registro.soloPrincipal && !respaldos.length) return null;
+      if (registro.soloPrincipal && !respaldos.length && !registro.arranquesSoloPrincipal) return null;
       if (!registro.soloPrincipal && respaldos.length < 2) throw error("La mayoría todavía no está lista para preparar el apagado", 409);
-      return { version: lectura.register.version, miembros: registro.miembros.filter(m => (registro.soloPrincipal || respaldos).includes(m.id)) };
+      // Un modo anterior con regreso automático puede fijarse sin volver a
+      // encender los respaldos: ya no tienen voto en la configuración vigente.
+      return { version: lectura.register.version, miembros: registro.miembros.filter(m => respaldos.includes(m.id)) };
     }); },
-    dejarSoloPrincipal(version, arranques) { return exclusivo(async () => {
+    dejarSoloPrincipal(version) { return exclusivo(async () => {
       let lectura = await leer();
       verificarPrincipal(lectura);
       if (lectura.register.version !== version) throw error("Cambió el grupo. Volvé a intentar el cambio", 409);
       const respaldos = lectura.members.filter(m => m.Suffrage === 0 && m.ID !== config.nodoId).map(m => m.ID);
       // Guardar la intención primero. Si se corta la operación, el coordinador
       // no vuelve a promover por su cuenta a un equipo ya apartado.
-      if (!registro.arranquesSoloPrincipal) {
+      if (!registro.soloPrincipal || registro.arranquesSoloPrincipal) {
         const previstos = registro.soloPrincipal || respaldos;
         if (previstos.length < 2) throw error("La mayoría todavía no está lista para preparar el apagado", 409);
-        if (!previstos.every(id => /^[a-f0-9]{32}$/.test(arranques?.[id] || ""))) throw error("Esperá a que todos los respaldos estén actualizados", 409);
-        await guardar(lectura, { ...registro, soloPrincipal: previstos,
-          arranquesSoloPrincipal: Object.fromEntries(previstos.map(id => [id, arranques[id]])) });
+        const permanente = { ...registro, soloPrincipal: previstos };
+        // La ausencia también impide el regreso automático en versiones previas.
+        // Sólo una reactivación manual con las copias al día devuelve los votos.
+        delete permanente.arranquesSoloPrincipal;
+        await guardar(lectura, permanente);
       }
       for (const id of respaldos) {
         await consenso.pedir("/member", { id, demote: true, expected: lectura.register.version, term: lectura.term, configuration: lectura.configuration });

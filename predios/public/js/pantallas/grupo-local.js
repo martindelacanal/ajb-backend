@@ -70,7 +70,7 @@
       configurarManual.hidden = !datos || !datos.puedeConfigurarManual;
       configurarManual.disabled = ocupado || configurarManual.hidden;
       var grupoActivo = datos?.habilitado && datos.modo === "quorum";
-      soloPrincipal.hidden = !grupoActivo || datos.soloPrincipalListo === true;
+      soloPrincipal.hidden = !grupoActivo || (datos.soloPrincipalListo === true && !datos.regresoAutomatico);
       restaurarRelevo.hidden = !grupoActivo || datos.soloPrincipal !== true;
       soloPrincipal.disabled = restaurarRelevo.disabled = ocupado || !datos?.puedeConfigurarSoloPrincipal;
       revisar.disabled = consultando || activando;
@@ -78,9 +78,12 @@
     function configurarSoloPrincipal(activo) {
       if (trabajando || confirmando || activando || cerrado || !datos?.puedeConfigurarSoloPrincipal) return;
       var boton = activo ? soloPrincipal : restaurarRelevo;
+      var avisoPrincipal = (datos.soloPrincipalListo ? "La notebook seguirá siendo el único servidor. "
+        : "Dejá los respaldos encendidos hasta que el sistema confirme el cambio. Desde entonces, la notebook podrá atender sola. ")
+        + "Si se apaga, las cajas quedan sin servicio hasta que vuelva. Los respaldos seguirán desactivados hasta que elijas reactivar el relevo.";
       confirmando = true; actualizarControles();
       P.confirmar(activo
-        ? "Dejá los respaldos encendidos hasta que el sistema confirme el cambio. Desde entonces, la notebook podrá atender sola. Si se apaga, las cajas quedan sin servicio hasta que vuelva."
+        ? avisoPrincipal
         : "Encendé los respaldos y mantenelos en la misma red. El relevo automático vuelve cuando reciban la última copia.",
         { titulo: activo ? "¿Dejar solo la notebook?" : "¿Reactivar el relevo automático?", aceptar: activo ? "Dejar solo la notebook" : "Reactivar relevo" }).then(function (ok) {
         confirmando = false;
@@ -89,7 +92,7 @@
         return P.ejecutar(boton, function () {
           return P.post("/sistema/grupo-local/solo-principal", { activo: activo }).then(function () {
             if (cerrado) return;
-            aviso.textContent = activo ? "La notebook quedó como único servidor. Ya podés apagar los respaldos." : "El relevo automático volvió a quedar activo.";
+            aviso.textContent = activo ? "La notebook quedó como único servidor. Los respaldos seguirán desactivados hasta que elijas reactivar el relevo." : "El relevo automático volvió a quedar activo.";
             aviso.hidden = false;
           });
         }).catch(function () {}).finally(function () { trabajando = false; if (!cerrado) { actualizarControles(); cargar(); } });
@@ -187,6 +190,8 @@
             : "Dejá las PCs encendidas y completá el cambio antes de apagar los respaldos.";
           if (d.soloPrincipalListo && d.regresoAutomatico) estadoSoloPrincipal.textContent +=
             " El relevo se reactivará solo cuando vuelvas a encender los respaldos y reciban la última copia.";
+          else if (d.soloPrincipalListo) estadoSoloPrincipal.textContent +=
+            " Los respaldos seguirán desactivados aunque se reinicien. Para volver a usarlos, elegí «Reactivar relevo ahora».";
         }
         var otras = lista.filter(function (m) { return !d.principal || m.id !== d.principal.id; });
         equipos.hidden = !otras.length; sinEquipos.hidden = !!otras.length;

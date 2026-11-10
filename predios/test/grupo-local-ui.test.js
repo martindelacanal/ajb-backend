@@ -147,6 +147,24 @@ test("el panel remoto sólo indica cómo abrirlo en la LAN y no consulta ni desc
   assert.equal(s.solicitudes.length, 0); assert.equal(s.descargas.length, 0); assert.equal(s.intervalos.length, 0);
 });
 
+test("dejar solo la notebook explica la pausa persistente y permite convertir un modo temporal anterior", async () => {
+  const s = pantalla(); await resolver();
+  s.cambiar({ modo: "quorum", habilitado: true, estado: "EN_MARCHA", puedeConfigurarSoloPrincipal: true,
+    soloPrincipal: true, soloPrincipalListo: true, regresoAutomatico: true });
+  await s.actualizar();
+  assert.equal(s.boton("Dejar solo la notebook").hidden, false, "el modo temporal anterior se puede fijar");
+  s.aceptar(true); s.boton("Dejar solo la notebook").click(); await resolver();
+  assert.equal(s.escrituras.at(-1).ruta, "/sistema/grupo-local/solo-principal");
+  assert.equal(s.escrituras.at(-1).body.activo, true);
+  assert.match(s.confirmaciones.at(-1).texto, /seguirán desactivados hasta que elijas reactivar/);
+  assert.doesNotMatch(s.confirmaciones.at(-1).texto, /Dejá los respaldos encendidos/);
+  s.cambiar({ regresoAutomatico: false }); await s.actualizar();
+  assert.equal(s.boton("Dejar solo la notebook").hidden, true);
+  assert.equal(s.boton("Reactivar relevo ahora").hidden, false);
+  assert.match(s.panel.textContent, /seguirán desactivados aunque se reinicien/);
+  assert.doesNotMatch(s.panel.textContent, /se reactivará solo/);
+});
+
 test("antes de activar muestra respaldos incorporados sin pedir una copia que todavía no se crea", async () => {
   const s = pantalla(); await resolver();
   s.cambiar({ estado: "PREPARANDO", miembros: [...s.datos.miembros, { id: "b", nombre: "Administración", actualizado: false }] });
