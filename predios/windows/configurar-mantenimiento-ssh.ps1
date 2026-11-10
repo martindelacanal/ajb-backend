@@ -8,6 +8,8 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $WarningPreference = 'SilentlyContinue'
 $fase = 'VALIDACION'
+$instalacionMutex = $null
+$bloqueoAdquirido = $false
 try {
 $identidad = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not ([Security.Principal.WindowsPrincipal]::new($identidad)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -28,6 +30,9 @@ $sha = [Security.Cryptography.SHA256]::Create()
 try { $equipo = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes('ajb-predio-equipo:' + $guid.ToLowerInvariant())))).Replace('-', '').ToLowerInvariant() }
 finally { $sha.Dispose() }
 if ($equipo -ne $policy.equipoId) { throw 'Esta autorizacion pertenece a otra PC.' }
+$instalacionMutex = New-Object Threading.Mutex($false, 'Global\AJB-Mantenimiento-SSH-Instalacion')
+try { $bloqueoAdquirido = $instalacionMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $bloqueoAdquirido = $true }
+if (-not $bloqueoAdquirido) { throw [Runtime.InteropServices.COMException]::new('Ya hay una preparacion SSH de AJB en curso.', -2147023278) }
 
 function Clave-Publica([string]$Valor) {
   if ($Valor -notmatch '^ssh-ed25519 ([A-Za-z0-9+/]+={0,2})(?: [^\r\n]*)?$') { throw 'Se requiere una clave publica Ed25519.' }
@@ -146,6 +151,27 @@ function Crear-Clave([string]$Archivo, [string]$Comentario) {
   Proteger ($Archivo + '.pub')
   return Clave-Publica ([IO.File]::ReadAllText($Archivo + '.pub').Trim())
 }
+function Plan-CapacidadesOpenSsh([object[]]$Estados, [string[]]$ProcesosActivos = @()) {
+  # HRESULT_FROM_WIN32(ERROR_INSTALL_ALREADY_RUNNING): no esperar otra instalacion.
+  if (@($ProcesosActivos | Where-Object { $_ -match '^(?i:TiWorker|dism|dismhost)\.exe$' }).Count) {
+    throw [Runtime.InteropServices.COMException]::new('Windows tiene una operacion de servicing activa; no se inicia otra instalacion.', -2147023278)
+  }
+  $instalar = [Collections.Generic.List[string]]::new()
+  foreach ($estado in $Estados) {
+    if ($estado.Name -notin @('OpenSSH.Client~~~~0.0.1.0', 'OpenSSH.Server~~~~0.0.1.0')) { throw 'Windows devolvio una capacidad no prevista.' }
+    switch ([string]$estado.State) {
+      'Installed' { }
+      'NotPresent' { $instalar.Add([string]$estado.Name) }
+      'Staged' { $instalar.Add([string]$estado.Name) }
+      { $_ -match 'Pending$' -or $_ -eq 'PartiallyInstalled' } {
+        # HRESULT_FROM_WIN32(ERROR_SUCCESS_REBOOT_REQUIRED). No repetir Add-Capability.
+        throw [Runtime.InteropServices.COMException]::new('OpenSSH tiene una instalacion pendiente; completar el servicing/reinicio de Windows antes de repetir.', -2147021886)
+      }
+      default { throw 'Windows devolvio un estado de OpenSSH no admitido; se requiere diagnostico.' }
+    }
+  }
+  return $instalar.ToArray()
+}
 
 New-Item -ItemType Directory -Path $Root -Force | Out-Null
 Proteger $Root -Carpeta
@@ -161,14 +187,30 @@ if (-not $marca) {
 try {
   Escribir-Log 'Preparando OpenSSH para mantenimiento autorizado.'
   $fase = 'CAPACIDAD_OPENSSH'
+  # Consulta liviana antes de cualquier llamada a DISM. TiWorker puede estar
+  # ocioso: se prefiere pedir un reintento posterior a competir con Windows Update.
+  $servicingActivo = @(Get-CimInstance Win32_Process -Filter "Name='TiWorker.exe' OR Name='dism.exe' OR Name='dismhost.exe'" | ForEach-Object { [string]$_.Name })
+  Plan-CapacidadesOpenSsh @() $servicingActivo | Out-Null
   $firewallExistia = [bool](Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)
-  foreach ($capacidad in @('OpenSSH.Client~~~~0.0.1.0', 'OpenSSH.Server~~~~0.0.1.0')) {
-    $estado = Get-WindowsCapability -Online -Name $capacidad
-    if ($estado.State -ne 'Installed') {
-      Escribir-Log ('Instalando capacidad de Windows: ' + $capacidad)
-      $instalado = Add-WindowsCapability -Online -Name $capacidad
-      if ($instalado.RestartNeeded) { throw 'Windows requiere reiniciar para completar OpenSSH; la instalacion puede repetirse despues.' }
+  # Evaluar ambas capacidades antes de modificar cualquiera: un servidor Pending
+  # tampoco debe provocar una instalacion nueva del cliente.
+  $estadosCapacidades = @(foreach ($capacidad in @('OpenSSH.Client~~~~0.0.1.0', 'OpenSSH.Server~~~~0.0.1.0')) {
+    Get-WindowsCapability -Online -Name $capacidad
+  })
+  if ($estadosCapacidades.Count -ne 2) { throw 'Windows no devolvio el estado completo de OpenSSH.' }
+  $capacidadesAInstalar = @(Plan-CapacidadesOpenSsh $estadosCapacidades)
+  foreach ($capacidad in $capacidadesAInstalar) {
+    Escribir-Log ('Instalando capacidad de Windows: ' + $capacidad)
+    try {
+      # Nunca iniciar otra busqueda/descarga en Windows Update desde el bootstrap.
+      # Si falta el payload, se debe proporcionar FoD oficial de la misma version.
+      $instalado = Add-WindowsCapability -Online -Name $capacidad -LimitAccess
+      if (-not $instalado) { throw 'Windows no confirmo la instalacion desde la fuente local.' }
+    } catch {
+      Escribir-Log 'Fallo de instalacion con fuente local. Revisar la necesidad de FoD oficial de la misma version de Windows; no se consulto Windows Update.'
+      throw
     }
+    if ($instalado.RestartNeeded) { throw [Runtime.InteropServices.COMException]::new('Windows requiere reiniciar para completar OpenSSH; la instalacion puede repetirse despues.', -2147021886) }
   }
   # No se abre SSH a la LAN: el unico listener de mantenimiento es loopback.
   # Solo se deshabilita la regla que acaba de crear la instalacion de Windows.
@@ -286,4 +328,7 @@ Subsystem sftp "$directorioSsh/sftp-server.exe"
   # El agente transmite solo estas etiquetas fijas. El detalle queda en el log
   # protegido de la notebook y nunca viaja en stdout ni en la respuesta remota.
   [ordered]@{ estado = 'ERROR'; fase = $fase; codigo = [int]$_.Exception.HResult } | ConvertTo-Json -Compress
+} finally {
+  if ($bloqueoAdquirido) { $instalacionMutex.ReleaseMutex() }
+  if ($instalacionMutex) { $instalacionMutex.Dispose() }
 }
