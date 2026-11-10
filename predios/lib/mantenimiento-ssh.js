@@ -10,8 +10,9 @@ const U = require("./util");
 const { leerMeta } = require("./db-sqlite");
 
 const ACCION = "PREPARAR_ACCESO_SSH";
+const DIAGNOSTICO = "DIAGNOSTICAR_ACCESO_SSH";
 const CAMPOS = ["version", "accion", "equipoId", "instanciaId", "predioCodigo", "operadorPublicKey", "relayHost", "relayPort", "relayUser", "relayHostKey", "reversePort", "sshPort", "usuarioWindows", "expiresAt", "nonce"];
-const FIJOS = { version: 1, accion: ACCION, relayHost: "52.67.192.228", relayPort: 22222,
+const FIJOS = { version: 1, relayHost: "52.67.192.228", relayPort: 22222,
   relayUser: "ajb-miramar-tunnel", reversePort: 22099, sshPort: 2222, usuarioWindows: "ajbmantenimiento" };
 const MAX_VIGENCIA = 24 * 60 * 60 * 1000;
 const FASES_INSTALADOR = new Set(["VALIDACION", "CAPACIDAD_OPENSSH", "CUENTA_WINDOWS", "CLAVES", "CONFIGURACION_SSH", "SERVICIO_SSH", "TUNEL", "VERIFICACION"]);
@@ -53,6 +54,7 @@ function validarSolicitud(cuerpo, { config, equipoId, instanciaId, propietarioId
   if (!solicitud || typeof solicitud !== "object" || Array.isArray(solicitud) ||
       Object.keys(solicitud).sort().join(",") !== [...CAMPOS].sort().join(",")) rechazar("La autorización SSH contiene campos no permitidos");
   for (const [campo, valor] of Object.entries(FIJOS)) if (solicitud[campo] !== valor) rechazar("El destino SSH no corresponde al acceso de mantenimiento autorizado");
+  if (![ACCION, DIAGNOSTICO].includes(solicitud.accion)) rechazar("La acción SSH no corresponde al mantenimiento autorizado");
   if (solicitud.equipoId !== equipoId || solicitud.instanciaId !== instanciaId ||
       !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(instanciaId || "") ||
       solicitud.predioCodigo !== config.predio_codigo || solicitud.predioCodigo !== "MIRAMAR") rechazar("La autorización SSH pertenece a otro equipo o predio");
@@ -90,11 +92,61 @@ function resultadoPublico(stdout, solicitud) {
   return publico;
 }
 
+function resultadoDiagnostico(stdout) {
+  const invalido = () => { throw U.error("El diagnóstico SSH no devolvió un resultado verificable", 500); };
+  let r;
+  try { r = JSON.parse(String(stdout).replace(/^\uFEFF/, "").trim()); } catch (_e) { return invalido(); }
+  const entero = n => Number.isSafeInteger(n) && n >= 0 && n <= 0xffffffff;
+  const fecha = v => typeof v === "string" && /^\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:\.\d{1,7})?Z?$/.test(v);
+  const enumValor = (v, opciones) => { if (!opciones.includes(v)) invalido(); return v; };
+  const filas = (v, max, convertir) => { if (!Array.isArray(v) || v.length > max) invalido(); return v.map(convertir); };
+  if (!r || r.estado !== "DIAGNOSTICO" || !fecha(r.fecha) || typeof r.hostname !== "string" || !/^[a-zA-Z0-9_.-]{1,64}$/.test(r.hostname) || typeof r.usuarioExiste !== "boolean" || !(r.reinicioPendiente === null || typeof r.reinicioPendiente === "boolean")) invalido();
+  const publico = { estado: "DIAGNOSTICO", fecha: r.fecha, hostname: r.hostname, usuarioExiste: r.usuarioExiste, reinicioPendiente: r.reinicioPendiente,
+    marca: enumValor(r.marca, ["AUSENTE", "INSTALANDO", "ACTIVO", "DESCONOCIDO"]),
+    archivos: filas(r.archivos, 16, f => {
+      if (typeof f?.existe !== "boolean" || !entero(f.tamano)) invalido();
+      return { nombre: enumValor(f.nombre, ["DIRECTORIO", "MARCA", "INSTALACION_LOG", "SSHD", "SSH", "SSH_KEYGEN", "CONFIG_SSH", "TUNEL_PUBLICA", "HOST_PUBLICA", "DESHABILITADO"]), existe: f.existe, tamano: f.tamano };
+    }),
+    servicios: filas(r.servicios, 3, s => ({ nombre: enumValor(s?.nombre, ["sshd", "TrustedInstaller", "wuauserv"]),
+      estado: enumValor(s.estado, ["AUSENTE", "Stopped", "StartPending", "StopPending", "Running", "ContinuePending", "PausePending", "Paused"]),
+      inicio: enumValor(s.inicio, ["AUSENTE", "Automatic", "Manual", "Disabled", "Boot", "System"]) })),
+    tareas: filas(r.tareas, 2, t => ({ nombre: enumValor(t?.nombre, ["AJB Predio", "AJB Mantenimiento SSH Tunel"]),
+      estado: enumValor(t.estado, ["AUSENTE", "Unknown", "Disabled", "Queued", "Ready", "Running"]) })),
+    procesos: filas(r.procesos, 64, p => {
+      if (!entero(p?.pid) || !entero(p.padre)) invalido();
+      return { nombre: enumValor(p.nombre, ["node.exe", "powershell.exe", "dism.exe", "dismhost.exe", "tiworker.exe", "trustedinstaller.exe", "msmpeng.exe", "ssh.exe", "sshd.exe"]), pid: p.pid, padre: p.padre };
+    }),
+    capacidades: filas(r.capacidades, 32, c => {
+      if (typeof c?.paquete !== "string" || !/^[a-zA-Z0-9_.~+-]{1,256}$/.test(c.paquete) || !/openssh/i.test(c.paquete) || !(c.codigoEstado === null || entero(c.codigoEstado))) invalido();
+      return { paquete: c.paquete, codigoEstado: c.codigoEstado };
+    }),
+    eventos: filas(r.eventos, 40, e => {
+      if (!e || !(e.fecha === null || fecha(e.fecha)) || !(e.codigo === null || (typeof e.codigo === "string" && /^0x[0-9a-fA-F]{8}$/.test(e.codigo)))) invalido();
+      return { origen: enumValor(e.origen, ["INSTALACION", "DISM"]),
+        evento: enumValor(e.evento, ["INICIO", "INSTALANDO_CLIENTE", "INSTALANDO_SERVIDOR", "PREPARADO", "ERROR_REINICIO", "ERROR_CONFIG_SSH", "ERROR_CLAVES", "ERROR_CAPACIDAD", "ERROR_PERMISOS", "ERROR_OTRO", "ERROR_DISM"]), fecha: e.fecha, codigo: e.codigo };
+    }),
+    erroresLectura: filas(r.erroresLectura, 12, v => enumValor(v, ["ARCHIVOS", "SERVICIOS", "TAREAS", "PROCESOS", "CAPACIDADES", "MARCA", "LOG_INSTALACION", "LOG_DISM", "CLAVES", "USUARIO", "REINICIO"])) };
+  for (const k of ["tunnelPublicKey", "sshHostPublicKey"]) {
+    if (r[k] !== undefined && r[k] !== null) { if (!esClaveSshPublica(r[k])) invalido(); publico[k] = r[k]; }
+  }
+  return publico;
+}
+
 async function prepararAccesoSsh({ cuerpo, config, db, base, equipoId, instanciaId }, deps = {}) {
   const solicitud = validarSolicitud(cuerpo, { config, equipoId, instanciaId,
     propietarioId: leerMeta(db, "equipo_propietario_id"), restauracionPendiente: Boolean(leerMeta(db, "restauracion_pendiente")),
     plataforma: deps.plataforma || process.platform, ahora: deps.ahora === undefined ? Date.now() : deps.ahora });
   const ejecutar = deps.ejecutarArchivo || ejecutarArchivo;
+  if (solicitud.accion === DIAGNOSTICO) {
+    try {
+      const script = path.join(__dirname, "..", "windows", "diagnosticar-mantenimiento-ssh.ps1");
+      const stdout = await ejecutar("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script], { timeout: 90000 });
+      return resultadoDiagnostico(stdout);
+    } catch (e) {
+      if (e.status) throw e;
+      throw U.error("No se pudo completar el diagnóstico SSH en la notebook", 500);
+    }
+  }
   const carpeta = path.join(path.resolve(base), "mantenimiento-ssh");
   if (fs.existsSync(carpeta) && (!fs.lstatSync(carpeta).isDirectory() || fs.lstatSync(carpeta).isSymbolicLink())) throw U.error("La carpeta de mantenimiento SSH no es una carpeta local segura", 500);
   fs.mkdirSync(carpeta, { recursive: true, mode: 0o700 });
@@ -120,4 +172,4 @@ async function prepararAccesoSsh({ cuerpo, config, db, base, equipoId, instancia
   }
 }
 
-module.exports = { validarSolicitud, prepararAccesoSsh, resultadoPublico, esClaveSshPublica };
+module.exports = { validarSolicitud, prepararAccesoSsh, resultadoPublico, resultadoDiagnostico, esClaveSshPublica };

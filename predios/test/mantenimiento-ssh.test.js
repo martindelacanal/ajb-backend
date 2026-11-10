@@ -7,7 +7,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const zlib = require("node:zlib");
-const { validarSolicitud, prepararAccesoSsh, resultadoPublico } = require("../lib/mantenimiento-ssh");
+const { validarSolicitud, prepararAccesoSsh, resultadoPublico, resultadoDiagnostico } = require("../lib/mantenimiento-ssh");
+const { execFileSync } = require("node:child_process");
 const { generarPar, firmar } = require("../lib/firma");
 const { crearSqlite, asegurarEsquema, escribirMeta } = require("../lib/db-sqlite");
 const { crearAgente } = require("../lib/agente");
@@ -34,6 +35,87 @@ function escenario() {
     tunnelPublicKey: claveSsh(), sshHostPublicKey: claveSsh(), hostname: "ajbmiramar", carpeta: "C:\\ProgramData\\AJB\\Mantenimiento" };
   return { claves, solicitud, config, contexto, sobre, salida, ahora };
 }
+
+function diagnostico() {
+  return { estado: "DIAGNOSTICO", fecha: "2026-11-10T19:01:47.1234567Z", hostname: "AJBMIRAMAR", usuarioExiste: false, reinicioPendiente: false, marca: "INSTALANDO",
+    archivos: [{ nombre: "SSHD", existe: false, tamano: 0 }],
+    servicios: [{ nombre: "TrustedInstaller", estado: "Running", inicio: "Manual" }],
+    tareas: [{ nombre: "AJB Predio", estado: "Running" }],
+    procesos: [{ nombre: "tiworker.exe", pid: 100, padre: 200 }],
+    capacidades: [{ paquete: "Microsoft-Windows-OpenSSH-Server-Package~31bf3856ad364e35~amd64~~10.0.26100.1", codigoEstado: 112 }],
+    eventos: [{ origen: "DISM", evento: "ERROR_DISM", fecha: "2026-11-10 19:01:47", codigo: "0x800f0954" }],
+    erroresLectura: [] };
+}
+
+test("el diagnóstico exige su acción firmada y ejecuta sólo la lectura fija sin alterar archivos ni SQLite", async t => {
+  const s = escenario(), db = crearSqlite(":memory:", { predioId: 1 }); asegurarEsquema(db); t.after(() => db.cerrar());
+  const base = path.join(os.tmpdir(), "ajb-ssh-no-escribir-" + crypto.randomUUID());
+  assert.equal(fs.existsSync(base), false);
+  const cambios = db.conexion.prepare("SELECT total_changes() AS n").get().n;
+  let llamadas = 0;
+  const deps = { plataforma: "win32", ahora: s.ahora, async ejecutarArchivo(exe, args, opciones) {
+    llamadas++;
+    assert.equal(exe, "powershell.exe");
+    assert.deepEqual(args, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+      path.resolve(__dirname, "../windows/diagnosticar-mantenimiento-ssh.ps1")]);
+    assert.equal(opciones.timeout, 90000);
+    return JSON.stringify(diagnostico());
+  } };
+  const sobre = s.sobre({ accion: "DIAGNOSTICAR_ACCESO_SSH" });
+  const parametros = { cuerpo: sobre, config: s.config, db, base, equipoId: s.solicitud.equipoId, instanciaId: s.solicitud.instanciaId };
+  assert.deepEqual(await prepararAccesoSsh(parametros, deps), diagnostico());
+  const adulterado = s.sobre();
+  adulterado.solicitud = sobre.solicitud;
+  for (const cuerpo of [adulterado, s.sobre({ accion: "DIAGNOSTICAR_ACCESO_SSH", equipoId: "c".repeat(64) }),
+    s.sobre({ accion: "DIAGNOSTICAR_ACCESO_SSH", expiresAt: "2026-11-10T17:00:00.000Z" }),
+    s.sobre({ accion: "DIAGNOSTICAR_ACCESO_SSH", script: "comando ajeno" })]) {
+    await assert.rejects(prepararAccesoSsh({ ...parametros, cuerpo }, deps), e => e.status === 403);
+  }
+  assert.equal(llamadas, 1, "una firma, destino, vigencia o esquema inválidos no ejecutan el script");
+  assert.equal(db.conexion.prepare("SELECT total_changes() AS n").get().n, cambios);
+  assert.equal(fs.existsSync(base), false, "el diagnóstico no crea staging ni cambia ACL");
+  await assert.rejects(prepararAccesoSsh(parametros, { ...deps, ejecutarArchivo: async () => { throw Error("PRIVATE KEY inesperada en stderr"); } }),
+    e => e.status === 500 && e.message === "No se pudo completar el diagnóstico SSH en la notebook");
+});
+
+test("el diagnóstico limita listas y tipos y no transmite líneas de logs, comandos o secretos", () => {
+  const r = diagnostico(), secreta = "PRIVATE_KEY_NO_PUBLICAR";
+  const datos = { ...r, stdout: secreta, privateKey: secreta,
+    procesos: [{ ...r.procesos[0], CommandLine: secreta }], eventos: [{ ...r.eventos[0], mensaje: secreta }] };
+  const publicos = resultadoDiagnostico(JSON.stringify(datos));
+  assert.deepEqual(publicos, r);
+  assert.ok(!JSON.stringify(publicos).includes(secreta));
+  for (const cambio of [{ estado: "ACTIVO" }, { eventos: [null] }, { eventos: [{ ...r.eventos[0], codigo: ["0x800f0954"] }] },
+    { eventos: [{ ...r.eventos[0], evento: secreta }] }, { eventos: [{ ...r.eventos[0], codigo: secreta }] },
+    { archivos: [{ ...r.archivos[0], nombre: "C:\\secreto" }] }, { procesos: [{ ...r.procesos[0], nombre: "cmd.exe" }] },
+    { procesos: [{ ...r.procesos[0], pid: -1 }] }, { capacidades: [{ ...r.capacidades[0], paquete: "../../secreto" }] },
+    { procesos: Array(65).fill(r.procesos[0]) }, { tunnelPublicKey: secreta }, { erroresLectura: [secreta] }, { reinicioPendiente: "true" }]) {
+    assert.throws(() => resultadoDiagnostico(JSON.stringify({ ...r, ...cambio })),
+      e => e.status === 500 && e.message === "El diagnóstico SSH no devolvió un resultado verificable");
+  }
+  const publicKey = claveSsh();
+  assert.equal(resultadoDiagnostico(JSON.stringify({ ...r, tunnelPublicKey: publicKey })).tunnelPublicKey, publicKey);
+});
+
+test("el clasificador PowerShell devuelve sólo etiquetas y códigos sin el texto del log", { skip: process.platform !== "win32" }, () => {
+  const script = path.resolve(__dirname, "../windows/diagnosticar-mantenimiento-ssh.ps1").replace(/'/g, "''");
+  const comando = `$ProgressPreference='SilentlyContinue'; $tokens=$null; $errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile('${script}',[ref]$tokens,[ref]$errors)
+if($errors.Count){throw 'El diagnostico no es sintaxis valida de Windows PowerShell'}
+$funcion=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Evento-Seguro'},$true)
+. ([scriptblock]::Create($funcion.Extent.Text))
+if ($null -ne (Evento-Seguro '2026-11-10 19:01:47 HRESULT=0x00000000' 'DISM')) { throw 'HRESULT de exito clasificado como error' }
+if ($null -ne (Evento-Seguro '2026-11-10 19:01:47 HRESULT=0x00000001' 'DISM')) { throw 'S_FALSE clasificado como error' }
+@((Evento-Seguro '2026-11-10T19:01:47.1234567Z ERROR: access is denied PRIVATE_KEY_NO_PUBLICAR 0x80070005' 'INSTALACION'),(Evento-Seguro '2026-11-10 19:01:47 Failed PASSWORD_NO_PUBLICAR 0x800f0954' 'DISM'),(Evento-Seguro '2026-11-10 19:01:47 HRESULT=0x80070005' 'DISM')) | ConvertTo-Json -Compress`;
+  const salida = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(comando, "utf16le").toString("base64")],
+    { encoding: "utf8", windowsHide: true, timeout: 15000 });
+  assert.deepEqual(JSON.parse(salida), [
+    { origen: "INSTALACION", evento: "ERROR_PERMISOS", fecha: "2026-11-10T19:01:47.1234567Z", codigo: "0x80070005" },
+    { origen: "DISM", evento: "ERROR_DISM", fecha: "2026-11-10 19:01:47", codigo: "0x800f0954" },
+    { origen: "DISM", evento: "ERROR_DISM", fecha: "2026-11-10 19:01:47", codigo: "0x80070005" },
+  ]);
+  assert.ok(!salida.includes("NO_PUBLICAR"));
+});
 
 test("la autorización SSH verifica exactamente los bytes firmados y las identidades fijadas", () => {
   const s = escenario();
