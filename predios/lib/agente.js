@@ -341,6 +341,9 @@ function crearAgente({ db, config, base, version, log, api, alActualizar, alRein
 
   async function comandoSistema(c, ejecutor = db) {
     const accion = c.ruta;
+    if (accion === "PREPARAR_ACCESO_SSH") {
+      return require("./mantenimiento-ssh").prepararAccesoSsh({ cuerpo: c.cuerpo, config, db, base, equipoId, instanciaId: instancia });
+    }
     if (accion === "CORREGIR_CODIGOS_VERIFICADOS") return corregirCodigosVerificados(ejecutor, pid, c.cuerpo);
     if (accion === "TRASLADAR_EJEMPLOS_MIRAMAR") {
       return require("./traslado-ejemplos-miramar").trasladarEjemplosMiramar(ejecutor, config, c.cuerpo);
