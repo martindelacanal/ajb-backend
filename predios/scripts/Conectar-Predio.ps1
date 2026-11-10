@@ -12,6 +12,7 @@ if ($Estado) {
     if ($Comando.Count) { throw 'Usar -Estado o un comando, no ambos.' }
     $consulta = @'
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 $s = Get-Service sshd
 $t = Get-ScheduledTask -TaskName 'AJB Mantenimiento SSH Tunel'
 $app = Get-ScheduledTask -TaskName 'AJB Predio'
