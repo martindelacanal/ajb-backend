@@ -2,6 +2,19 @@
 
 Preparación: 10 de noviembre de 2026. Solicitado por Martín para poder administrar la notebook y acceder a servicios de la LAN sin controlar el escritorio con RustDesk.
 
+## Estado verificado de la preparación
+
+**10/11/2026, 16:35 ART: conexión SSH a la notebook pendiente. No considerar este documento prueba de instalación completada.** Las secciones siguientes describen la configuración preparada y su uso previsto; todavía no se verificaron las rutas de acceso a Windows ni a las otras PCs.
+
+- AWS: servicio `ajb-miramar-relay` instalado, activo y habilitado; listener 22222 restringido al usuario de túnel y al reenvío remoto `127.0.0.1:22099`. La lista de claves autorizadas sigue vacía. La regla EC2 es `sgr-02ba3581e1b4bc7d7`, grupo `sg-0b5c02df518400a6e`. El acceso administrativo SSH22 existente sigue funcionando.
+- PC de Martín: clave de operador y configuración SSH creadas fuera de Git; identidad AWS verificada. Falta fijar la clave pública de host de la notebook en `ajb_predio_known_hosts`.
+- Notebook: paquete `1.1.0+43490e7c85` instalado. La orden central 25 `PREPARAR_ACCESO_SSH`, iniciada aproximadamente a las 16:01 ART, no devolvió resultado. Se canceló en la central para impedir reentrega. No se confirmó qué fase de OpenSSH alcanzó. No iniciar otro DISM sin comprobar los procesos y registros existentes.
+- Durante la preparación se observó CPU 97–99% con Windows Update/Defender y respuestas intermitentes de la aplicación. Se reinició solamente `servidor.js` (PID612 a PID9264), conservando su supervisor. HTTPS volvió a escuchar a las 16:26:38; el último heartbeat central observado fue 16:30:04, sin pendientes. El diagnóstico público aún no respondió de forma verificable desde el escritorio.
+- Los logs confirman que la notebook conserva el único voto y las otras dos PCs son `Nonvoter`. No reactivar respaldos para resolver el mantenimiento SSH. El resultado de `SUBIR_LOGS` 26 fue OK; extracto local en `output/diagnostico-servidor-26.json` desde la raíz del proyecto.
+- El control de escritorio se detuvo por una restricción de la herramienta al no poder identificar con certeza la URL del navegador. RustDesk queda abierto. Se había cambiado temporalmente su modo de teclado a **Modo heredado**; el modo original era **Modo mapa**.
+
+Para continuar: verificar salud local y carga de Windows; leer `C:\ProgramData\AJB\Mantenimiento\instalacion.log`, estado de OpenSSH/sshd/tarea y procesos de servicing sin lanzar otra instalación; terminar la preparación idempotente si procede; autorizar sólo la clave pública del túnel en AWS; fijar la clave pública del host Windows obtenida por canal confiable; probar `hostname`, estado del sistema, acceso LAN y reconexión. No declarar operativo el acceso antes de estas comprobaciones.
+
 ## Conectarse desde la PC de Martín
 
 El proyecto raíz tiene `Conectar-Predio.ps1`. La configuración privada de conexión está en `C:\Users\marti\.ssh\ajb_predio_config` y usa el alias `ajb-miramar`.
@@ -13,6 +26,8 @@ ssh.exe -F "$env:USERPROFILE\.ssh\ajb_predio_config" ajb-miramar
 ```
 
 La sesión remota es Windows. Para comandos de PowerShell complejos usar `powershell.exe -NoProfile -NonInteractive -EncodedCommand <base64 UTF-16LE>`; así se evita que `cmd.exe` interprete comillas o variables. `Conectar-Predio.ps1 -Estado` sirve de ejemplo. No imprimir contraseñas, tokens de la aplicación, claves privadas ni archivos de configuración completos.
+
+Las identidades verificadas se guardan en `C:\Users\marti\.ssh\ajb_predio_known_hosts`. La notebook usa `HostKeyAlias ajb-miramar-mantenimiento`; AWS usa `52.67.192.228`. El fingerprint Ed25519 de AWS es `SHA256:jTJ6QfY3IC5JukhgRg+ObYsDGuO74cQdGJqI5EoPlHs`. No aceptar un resultado de `ssh-keyscan` sin cotejarlo con un canal previamente confiable.
 
 Claves privadas, fuera de Git:
 
@@ -40,7 +55,7 @@ La notebook sale hacia `52.67.192.228:22222` como `ajb-miramar-tunnel`. Ese usua
 
 El servidor Windows escucha exclusivamente en `127.0.0.1:2222`, admite sólo `ajbmantenimiento` y autentica con claves. Esta cuenta es administradora de la notebook. Tiene una contraseña aleatoria que no se guarda ni se usa para el acceso. El usuario SSH de AWS no obtiene por sí solo acceso administrativo a Windows.
 
-La tarea SYSTEM `AJB Mantenimiento SSH Tunel` inicia al arrancar Windows, reintenta las conexiones y tiene una comprobación periódica. El servicio `sshd` arranca automáticamente. Ambos son independientes de `AJB Predio`. La notebook debe estar encendida, despierta y con Internet para acceder desde fuera. Una caída de Internet no cambia el funcionamiento local del sistema del predio.
+La tarea SYSTEM `AJB Mantenimiento SSH Tunel` inicia al arrancar Windows, reintenta 10 segundos después de terminar una conexión y vuelve a lanzarse cada 5 minutos si terminó. SSH comprueba la conexión cada 30 segundos y tolera tres respuestas perdidas. El servicio `sshd` arranca automáticamente; el supervisor del túnel no lo reinicia. Ambos son independientes de `AJB Predio`. La notebook debe estar encendida, despierta y con Internet para acceder desde fuera. Una caída de Internet no cambia el funcionamiento local del sistema del predio.
 
 ## Equipos conocidos y acceso a la LAN
 
@@ -93,9 +108,11 @@ Si SSH22 no responde desde esta PC, comprobar la IP pública actual contra el gr
 
 Para revocar desde la notebook, crear el archivo `C:\ProgramData\AJB\Mantenimiento\DESHABILITADO`, deshabilitar y detener la tarea `AJB Mantenimiento SSH Tunel`, y detener `sshd`. Finalizar también el cliente SSH del túnel si sigue vivo; identificarlo por su línea de comandos y no detener otros procesos SSH indiscriminadamente. El archivo evita reconexiones futuras; no corta por sí solo una sesión ya establecida. Deshabilitar la cuenta `ajbmantenimiento` si se quiere revocar también la identidad Windows.
 
-Para cortar inmediatamente desde AWS, detener y deshabilitar `ajb-miramar-relay.service`; las sesiones del servicio también deben terminar. Quitar la regla de entrada TCP22222 y la clave pública autorizada si se retira definitivamente. No borrar las claves del predio ni cambiar `soloPrincipal`: mantenimiento y relevo son mecanismos independientes.
+Para cortar inmediatamente desde AWS, ejecutar `sudo systemctl disable --now ajb-miramar-relay.service`. Su configuración `KillMode=control-group` termina también las sesiones hijas. Quitar la regla de entrada TCP22222 y la clave pública autorizada si se retira definitivamente. No borrar las claves del predio ni cambiar `soloPrincipal`: mantenimiento y relevo son mecanismos independientes.
 
-Para reactivar, revisar las claves autorizadas, retirar deliberadamente `DESHABILITADO`, habilitar la cuenta/servicio/tarea y comprobar los fingerprints. Nunca usar `StrictHostKeyChecking=no` ante un cambio de identidad.
+Para reactivar Windows, revisar las claves autorizadas, retirar deliberadamente `DESHABILITADO`, habilitar la cuenta/servicio/tarea y comprobar los fingerprints. En AWS, restaurar la clave pública con `configurar-relay-mantenimiento.sh --authorize-key <archivo.pub>`, comprobar UFW y la regla TCP22222 del SG, y ejecutar `sudo systemctl enable --now ajb-miramar-relay.service`. Después verificar `Conectar-Predio.ps1 -Estado` y un forward. Nunca usar `StrictHostKeyChecking=no` ante un cambio de identidad.
+
+Repetir el instalador con otra clave pública de operador agrega esa clave a `authorized_keys`; no revoca la anterior. Una rotación requiere retirar explícitamente la línea anterior y terminar las sesiones correspondientes.
 
 ## Cómo se instaló
 
