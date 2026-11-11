@@ -2,9 +2,11 @@
 
 // El paquete de mantenimiento instala este módulo junto a protocolo-lan y http-lan.
 const os = require("node:os");
+const path = require("node:path");
 const http = require("node:http");
 const dns = require("node:dns/promises");
 const { randomBytes } = require("node:crypto");
+const { execFile } = require("node:child_process");
 
 const RUTA = "/lan/diagnostico-acceso-miramar";
 const NOMBRE = "ajbmiramar";
@@ -14,6 +16,30 @@ const RESPALDOS = new Set(["desktop-mn7m56l", "dm"]);
 const INTENTOS = 5;
 const ESPERA_MS = 8000;
 const LIMITE_MS = 5000;
+
+function configurarAccesoDirecto(dirApp) {
+  const script = path.join(dirApp, "windows", "configurar-acceso-directo-miramar.ps1");
+  const argumentos = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script];
+  return new Promise((resolve, reject) => {
+    execFile("powershell.exe", argumentos, { windowsHide: true, timeout: 45000, maxBuffer: 16384 }, (error, salida) => {
+      if (error) return reject(error);
+      try {
+        const resultado = JSON.parse(salida.trim());
+        const campos = ["comunes_actualizados", "personales_encontrados", "personales_verificados", "personales_actualizados"];
+        if (typeof resultado.comun_verificado !== "boolean" || !Array.isArray(resultado.errores) ||
+            campos.some(campo => !Number.isSafeInteger(resultado[campo]) || resultado[campo] < 0)) {
+          throw new Error("Informe de acceso directo inválido");
+        }
+        resolve({
+          destino: `http://${NOMBRE}:${PUERTO}`,
+          comun_verificado: resultado.comun_verificado,
+          ...Object.fromEntries(campos.map(campo => [campo, resultado[campo]])),
+          errores: resultado.errores.filter(codigo => typeof codigo === "string" && /^[A-Z0-9_]{1,48}$/.test(codigo)).slice(0, 12),
+        });
+      } catch (e) { reject(e); }
+    });
+  });
+}
 
 function resolver(nombre) {
   let timer;
@@ -129,6 +155,7 @@ function crearDiagnosticoAccesoMiramar({ config, ha }) {
   const verificar = crearVerificador({ grupoId: ha.grupoId, miembros: [{ id: principal.id, clave: ha.claveDatos }] });
   const inicio = new Date().toISOString();
   let resultado = { equipo, inicio, fecha: null, intento: 0, finalizado: false, corto: null, alternativo: null };
+  let accesoDirecto = { estado: "PENDIENTE" };
 
   async function ejecutar(intento) {
     const corto = await probar(NOMBRE, principal, ha, verificarEstadoFirmado);
@@ -148,6 +175,20 @@ function crearDiagnosticoAccesoMiramar({ config, ha }) {
 
   programar(1);
   return {
+    async aplicarAccesoDirecto({ dirApp }) {
+      try {
+        const verificacion = await configurarAccesoDirecto(dirApp);
+        const hayAcceso = verificacion.comun_verificado || verificacion.personales_verificados > 0;
+        accesoDirecto = {
+          ...verificacion,
+          estado: hayAcceso && verificacion.personales_encontrados === verificacion.personales_verificados && !verificacion.errores.length
+            ? "VERIFICADO" : "REVISAR",
+          fecha: new Date().toISOString(),
+        };
+      } catch (_e) {
+        accesoDirecto = { estado: "ERROR_EJECUCION", fecha: new Date().toISOString() };
+      }
+    },
     manejar(req, res, ruta, ip) {
       if (ruta !== RUTA) return false;
       if (ip !== IP || req.method !== "GET" || req.url !== RUTA || req.headers["transfer-encoding"] ||
@@ -157,7 +198,7 @@ function crearDiagnosticoAccesoMiramar({ config, ha }) {
       }
       try {
         verificar({ metodo: "GET", ruta: RUTA, cuerpo: Buffer.alloc(0), cabeceras: req.headers });
-        respuesta(res, 200, resultado);
+        respuesta(res, 200, { ...resultado, acceso_directo: accesoDirecto });
       } catch (error) {
         if (error.codigo === "RELOJ_LAN_DESAJUSTADO") respuestaError(res, error);
         else respuesta(res, 403, { codigo: "DIAGNOSTICO_NO_AUTORIZADO" });

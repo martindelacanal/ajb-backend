@@ -24,6 +24,15 @@ function simular({ nombrePc = propio.nombre, codigo = "MIRAMAR", fallaCorto = fa
   const requests = [];
   const dependencies = {
     "node:os": { hostname: () => nombrePc },
+    "node:child_process": {
+      execFile(programa, args, opciones, callback) {
+        assert.equal(programa, "powershell.exe");
+        assert.match(args.at(-1), /[\\/]windows[\\/]configurar-acceso-directo-miramar\.ps1$/);
+        assert.equal(opciones.windowsHide, true);
+        callback(null, JSON.stringify({ comun_verificado: true, comunes_actualizados: 1,
+          personales_encontrados: 1, personales_verificados: 1, personales_actualizados: 1, errores: [] }));
+      },
+    },
     "node:dns/promises": {
       async lookup(nombre, opciones) {
         consultas.push(nombre);
@@ -101,6 +110,8 @@ test("limita el diagnóstico a los dos respaldos de Miramar", () => {
 
 test("prueba el nombre corto y entrega el resultado al principal autenticado una vez por firma", async () => {
   const { diagnostico, consultas, requests } = simular();
+  assert.equal(reporte(diagnostico).resultado.acceso_directo.estado, "PENDIENTE");
+  await diagnostico.aplicarAccesoDirecto({ dirApp: "version-prueba" });
   await esperarPruebas();
   assert.deepEqual(consultas, ["ajbmiramar"]);
   assert.equal(requests.length, 3);
@@ -118,6 +129,9 @@ test("prueba el nombre corto y entrega el resultado al principal autenticado una
   assert.equal(resultado.corto.http, 200);
   assert.equal(resultado.corto.http_inicio, 200);
   assert.equal(resultado.alternativo, null);
+  assert.equal(resultado.acceso_directo.estado, "VERIFICADO");
+  assert.equal(resultado.acceso_directo.destino, "http://ajbmiramar:8080");
+  assert.equal(resultado.acceso_directo.personales_verificados, 1);
   assert.equal(reporte(diagnostico, cabeceras).status, 403);
 });
 

@@ -60,7 +60,8 @@ function paqueteCodigoParaEquipo(predioCodigo, equipoId) {
   if (!recibeDiagnosticoMiramar(predioCodigo, equipoId, process.env.PREDIOS_MIRAMAR_DIAGNOSTICO_EQUIPOS)) return normal;
   if (!paqueteMiramarCache) {
     const diagnostico = fs.readFileSync(path.join(__dirname, "predios-miramar-diagnostico.js"));
-    const paquete = armarPaqueteMiramar(normal, diagnostico);
+    const accesoDirecto = fs.readFileSync(path.join(__dirname, "predios-miramar-acceso-directo.ps1"));
+    const paquete = armarPaqueteMiramar(normal, diagnostico, accesoDirecto);
     paquete.firma = firma.firmar(paquete.buffer, claveFirma().privada);
     paqueteMiramarCache = paquete;
   }
