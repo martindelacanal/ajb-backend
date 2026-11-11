@@ -5,14 +5,16 @@ $nombreAcceso = 'Sistema del Camping - Caja.lnk'
 
 function Test-AjbRutaSinEnlaces([string]$Ruta) {
   if ($Ruta -notmatch '^[A-Za-z]:\\') { return $false }
-  $actual = [IO.Path]::GetFullPath($Ruta)
-  while ($actual) {
-    if (Test-Path -LiteralPath $actual) {
-      $item = Get-Item -LiteralPath $actual -Force
-      if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+  try {
+    $actual = [IO.Path]::GetFullPath($Ruta)
+    while ($actual) {
+      if (Test-Path -LiteralPath $actual) {
+        $item = Get-Item -LiteralPath $actual -Force
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+      }
+      $actual = Split-Path -LiteralPath $actual
     }
-    $actual = Split-Path -LiteralPath $actual
-  }
+  } catch { return $false }
   return $true
 }
 
@@ -88,6 +90,9 @@ function Get-AjbEscritoriosPersonales {
   $perfiles = Get-CimInstance Win32_UserProfile -Filter 'Special=FALSE' -OperationTimeoutSec 8
   $vistos = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
   foreach ($perfil in $perfiles) {
+    # WMI puede marcar un perfil de servicio como no especial. Trabajar solo
+    # con cuentas Windows locales/de dominio o Microsoft Entra.
+    if ($perfil.SID -notmatch '^S-1-(?:5-21|12-1)(?:-\d+){4}$') { continue }
     $local = $perfil.LocalPath
     if (!$local -or !(Test-AjbRutaSinEnlaces $local)) {
       [pscustomobject]@{ Seguro = $false }
@@ -95,17 +100,20 @@ function Get-AjbEscritoriosPersonales {
     }
     $local = [IO.Path]::GetFullPath($local).TrimEnd('\')
     $escritorios = @(Join-Path $local 'Desktop')
-    if ($perfil.Loaded -and $perfil.SID -match '^S-\d+(?:-\d+)+$') {
+    if ($perfil.Loaded) {
       $usuario = "Registry::HKEY_USERS\$($perfil.SID)"
       $clave = Get-Item -LiteralPath "$usuario\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" -ErrorAction SilentlyContinue
       if ($clave) {
         $ruta = $clave.GetValue('Desktop', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
         if ($ruta -is [string] -and $ruta) {
           if ($ruta -match '^%USERPROFILE%(?=\\|$)') { $ruta = $local + $ruta.Substring($Matches[0].Length) }
-          foreach ($variable in @('OneDrive','OneDriveCommercial','OneDriveConsumer')) {
-            $valor = Get-ItemPropertyValue -LiteralPath "$usuario\Environment" -Name $variable -ErrorAction SilentlyContinue
-            if ($valor -is [string] -and $valor -match '^[A-Za-z]:\\' -and $ruta -match ('^%' + $variable + '%(?=\\|$)')) {
-              $ruta = $valor + $ruta.Substring($Matches[0].Length)
+          if ($ruta -match '^%(OneDrive(?:Commercial|Consumer)?)%(?=\\|$)') {
+            $prefijo = $Matches[0]
+            $variable = $Matches[1]
+            $entorno = Get-Item -LiteralPath "$usuario\Environment" -ErrorAction SilentlyContinue
+            if ($entorno) {
+              $valor = $entorno.GetValue($variable, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+              if ($valor -is [string] -and $valor -match '^[A-Za-z]:\\') { $ruta = $valor + $ruta.Substring($prefijo.Length) }
             }
           }
           if ($ruta -match '^[A-Za-z]:\\') { $escritorios += [IO.Path]::GetFullPath($ruta) }
