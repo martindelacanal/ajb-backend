@@ -816,13 +816,13 @@ function crearRouterSync() {
     } catch (e) { responderError(res, e); }
   });
 
-  router.get("/version", (_req, res) => {
-    const p = C.paqueteCodigo();
+  router.get("/version", (req, res) => {
+    const p = C.paqueteCodigoParaEquipo(req.predio.codigo, req.get("X-Predio-Equipo"));
     res.json({ version: p.version, sha256: p.sha256, tamano: p.tamano, firma: p.firma });
   });
 
-  router.get("/codigo", (_req, res) => {
-    const p = C.paqueteCodigo();
+  router.get("/codigo", (req, res) => {
+    const p = C.paqueteCodigoParaEquipo(req.predio.codigo, req.get("X-Predio-Equipo"));
     res.setHeader("Content-Type", "application/octet-stream");
     res.setHeader("X-Firma", p.firma);
     res.send(p.buffer);

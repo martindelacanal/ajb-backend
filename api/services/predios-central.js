@@ -19,6 +19,7 @@ const { sembrarPredio, PREDIOS } = require("../../predios/lib/semilla");
 const firma = require("../../predios/lib/firma");
 const { nuevosAvisos, entregarAvisos } = require("./predios-avisos");
 const { exigirPropietario } = require("./predios-propietario");
+const { recibeDiagnosticoMiramar, armarPaqueteMiramar } = require("./predios-miramar-paquete");
 
 // Estados de reserva que NO cuentan como estadía (rechazada, solicitud de sorteo,
 // no adjudicada, convenio rechazado, cancelada).
@@ -41,6 +42,7 @@ function claveFirma() {
 }
 
 let paqueteCache = null;
+let paqueteMiramarCache = null;
 function claveLan(predioId) {
   return crypto.createHmac("sha256", claveFirma().privada).update(`predio-lan:${Number(predioId)}`).digest("hex");
 }
@@ -51,6 +53,18 @@ function paqueteCodigo() {
     paqueteCache.firma = firma.firmar(paqueteCache.buffer, claveFirma().privada);
   }
   return paqueteCache;
+}
+
+function paqueteCodigoParaEquipo(predioCodigo, equipoId) {
+  const normal = paqueteCodigo();
+  if (!recibeDiagnosticoMiramar(predioCodigo, equipoId, process.env.PREDIOS_MIRAMAR_DIAGNOSTICO_EQUIPOS)) return normal;
+  if (!paqueteMiramarCache) {
+    const diagnostico = fs.readFileSync(path.join(__dirname, "predios-miramar-diagnostico.js"));
+    const paquete = armarPaqueteMiramar(normal, diagnostico);
+    paquete.firma = firma.firmar(paquete.buffer, claveFirma().privada);
+    paqueteMiramarCache = paquete;
+  }
+  return paqueteMiramarCache;
 }
 
 // Envuelve un paquete para pendrive con la firma del sistema general.
@@ -405,6 +419,7 @@ function nuevoToken() {
 module.exports = {
   DIR_PREDIOS,
   paqueteCodigo,
+  paqueteCodigoParaEquipo,
   paqueteFirmado,
   claveFirma,
   claveLan,
