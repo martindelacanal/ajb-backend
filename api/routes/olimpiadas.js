@@ -69,6 +69,7 @@ const {
   notificarStaffOlimpiadas,
   // olimpiada / bonos
   obtenerOlimpiada,
+  listarNombresDisciplinas,
   sembrarContenidoInicialOlimpiada,
   calcularBonosAcompaniante,
   resumenBonosInscripcion,
@@ -1133,12 +1134,15 @@ router.get("/olimpiadas/ediciones", verifyToken, async (req, res) => {
     const porOlimpiada = new Map();
     for (const inscripcion of mias) porOlimpiada.set(Number(inscripcion.olimpiada_id), { id: inscripcion.id, estado: inscripcion.estado });
     const hoy = fechaHoyBuenosAires();
+    // Los nombres de las disciplinas de cada edición: el banner dibuja esos deportes
+    const disciplinas = await listarNombresDisciplinas(db, olimpiadas.map((o) => o.id));
     res.status(200).json(olimpiadas.map((o) => ({
       ...o,
       fotos: Number(o.fotos) || 0,
       novedades: Number(o.novedades) || 0,
       estado: calcularEstadoEdicion(o, hoy),
       mi_inscripcion: porOlimpiada.get(Number(o.id)) || null,
+      disciplinas: disciplinas.get(Number(o.id)) || [],
     })));
   } catch (error) {
     registrarErrorRuta(error);

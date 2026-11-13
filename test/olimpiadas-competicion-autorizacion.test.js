@@ -42,7 +42,7 @@ async function servidor(t, opciones = {}) {
       if (asignadas) assert.match(sql, /p\.disciplina_id IN \(\?\)/);
       return [contexto.partidos.filter((p) => !asignadas || asignadas.includes(p.disciplina_id))];
     }
-    if (/FROM olimpiada_disciplina_config c/.test(sql)) return [[{ id: 4, nombre: "Vóley", tipo_id: 1 }, { id: 5, nombre: "Fútbol", tipo_id: 1 }]];
+    if (/FROM olimpiada_disciplina_config c/.test(sql)) return [[{ id: 4, olimpiada_id: 7, nombre: "Vóley", tipo_id: 1 }, { id: 5, olimpiada_id: 7, nombre: "Fútbol", tipo_id: 1 }]];
     if (/FROM olimpiada_torneo t/.test(sql)) return [[]];
     if (/SELECT id, logo_archivo FROM departamental/.test(sql)) return [[]];
     assert.fail(`Consulta no prevista: ${sql}`);
@@ -176,6 +176,8 @@ test("público: las ediciones pasadas figuran en el índice y se abren sin sesi�
   const ediciones = await listado.json();
   assert.deepEqual(ediciones.map(e => e.id), [7]);
   assert.equal(ediciones[0].estado, "FINALIZADA");
+  // el banner dibuja los deportes de la edición: viajan sólo los nombres
+  assert.deepEqual(ediciones[0].disciplinas, ["Vóley", "Fútbol"]);
   for (const ruta of ["portal", "fixture"]) {
     const response = await pedir(`/olimpiadas/publico/7/${ruta}`, { anonimo: true });
     assert.equal(response.status, 200);
@@ -186,6 +188,7 @@ test("público: las ediciones pasadas figuran en el índice y se abren sin sesi�
     assert.equal(body.olimpiada.dni, undefined);
     assert.equal(body.olimpiada.certificado_archivo, undefined);
     if (ruta === "portal") {
+      assert.deepEqual(body.olimpiada.disciplinas, ["Vóley", "Fútbol"]);
       assert.equal(body.mi_inscripcion, null);
       assert.deepEqual(body.hoteles_mi_departamental, []);
       assert.equal(body.departamental_id, null);

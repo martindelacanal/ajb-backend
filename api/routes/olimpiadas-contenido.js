@@ -33,6 +33,7 @@ const {
   registrarHistorial,
   notificarInscriptosOlimpiada,
   obtenerOlimpiada,
+  listarNombresDisciplinas,
   firmarSeguro,
   subirImagenOptimizada,
   eliminarObjetosS3Seguro,
@@ -648,6 +649,7 @@ router.get("/olimpiadas/:id(\\d+)/portal", verifyToken, async (req, res) => {
       hotelesMiDepartamental = hoteles;
     }
     const conteosNumericos = Object.fromEntries(Object.entries(conteos).map(([clave, valor]) => [clave, Number(valor) || 0]));
+    const disciplinas = (await listarNombresDisciplinas(db, olimpiadaId)).get(olimpiadaId) || [];
     res.status(200).json({
       olimpiada: {
         id: olimpiada.id,
@@ -666,6 +668,8 @@ router.get("/olimpiadas/:id(\\d+)/portal", verifyToken, async (req, res) => {
         fecha_sorteo: olimpiada.fecha_sorteo,
         sorteo_publicado: Number(olimpiada.sorteo_publicado) || 0,
         videos,
+        // Nombres de las disciplinas de la edición: el banner dibuja esos deportes
+        disciplinas,
       },
       mi_inscripcion: inscripciones[0] ? { id: inscripciones[0].id, estado: inscripciones[0].estado } : null,
       conteos: conteosNumericos,
