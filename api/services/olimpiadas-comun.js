@@ -116,19 +116,20 @@ function detectarMimeArchivo(buffer, { permitePdf = false } = {}) {
   return null;
 }
 
+// PDF sólo en los campos pensados para documentos: el certificado médico y el reglamento de una disciplina.
 function permitePdfEnSlot(fieldname) {
-  return String(fieldname || "").toUpperCase() === "CERTIFICADO";
+  return ["CERTIFICADO", "REGLAMENTO"].includes(String(fieldname || "").toUpperCase());
 }
 
-function validarContenidoArchivo(file) {
-  if (!file || !Buffer.isBuffer(file.buffer) || file.buffer.length === 0 || file.buffer.length > MAX_ARCHIVO_OLIMPIADAS_BYTES) {
-    return { error: "El archivo está vacío o supera el máximo de 10 MB" };
+function validarContenidoArchivo(file, { maxBytes = MAX_ARCHIVO_OLIMPIADAS_BYTES } = {}) {
+  if (!file || !Buffer.isBuffer(file.buffer) || file.buffer.length === 0 || file.buffer.length > maxBytes) {
+    return { error: `El archivo está vacío o supera el máximo de ${Math.floor(maxBytes / 1024 / 1024)} MB` };
   }
   const permitePdf = permitePdfEnSlot(file.fieldname);
   const mimeDetectado = detectarMimeArchivo(file.buffer, { permitePdf });
   const mimeDeclarado = file.mimetype === "image/jpg" ? "image/jpeg" : file.mimetype;
   if (!mimeDetectado || (!MIME_IMAGEN_PERMITIDO.has(mimeDetectado) && !(permitePdf && mimeDetectado === "application/pdf"))) {
-    return { error: permitePdf ? "El certificado debe ser JPEG, PNG, WebP, HEIC o PDF" : "El archivo debe ser JPEG, PNG, WebP o HEIC" };
+    return { error: permitePdf ? "El archivo debe ser JPEG, PNG, WebP, HEIC o PDF" : "El archivo debe ser JPEG, PNG, WebP o HEIC" };
   }
   if (mimeDetectado !== mimeDeclarado) return { error: "El contenido del archivo no coincide con el tipo declarado" };
   file.mimetype = mimeDetectado;
@@ -157,8 +158,8 @@ function claveAleatoria(prefijo, extension) {
 }
 
 // Sube el archivo tal cual (certificados, firmas, íconos). Devuelve la key.
-async function subirArchivoOlimpiadas(file, prefijo) {
-  const validacion = validarContenidoArchivo(file);
+async function subirArchivoOlimpiadas(file, prefijo, { maxBytes } = {}) {
+  const validacion = validarContenidoArchivo(file, maxBytes ? { maxBytes } : undefined);
   if (validacion.error) throw crearErrorHttp(validacion.error, 400);
   const extension = extensionSegura(file.originalname, file.mimetype);
   const key = claveAleatoria(prefijo, extension);
@@ -197,8 +198,8 @@ async function procesarImagenWeb(buffer, { anchoMaximo = 1600, calidad = 82 } = 
  * Sube una imagen optimizada (WebP, ancho máximo) y devuelve { key, ancho, alto, mime }.
  * Con `miniatura: true` sube además una versión chica y devuelve también { miniatura_key }.
  */
-async function subirImagenOptimizada(file, prefijo, { anchoMaximo = 1600, miniatura = false, anchoMiniatura = 420 } = {}) {
-  const validacion = validarContenidoArchivo(file);
+async function subirImagenOptimizada(file, prefijo, { anchoMaximo = 1600, miniatura = false, anchoMiniatura = 420, maxBytes = file?.maxBytesPermitidos } = {}) {
+  const validacion = validarContenidoArchivo(file, maxBytes ? { maxBytes } : undefined);
   if (validacion.error) throw crearErrorHttp(validacion.error, 400);
   if (!file.mimetype.startsWith("image/")) throw crearErrorHttp("El archivo debe ser una imagen", 400);
   const web = await procesarImagenWeb(file.buffer, { anchoMaximo });
@@ -224,15 +225,16 @@ async function subirImagenOptimizada(file, prefijo, { anchoMaximo = 1600, miniat
 // ---------------------------------------------------------------------------
 // Multer (memoria). Cualquier slot; el contenido se valida por magic bytes.
 // ---------------------------------------------------------------------------
-function crearUploadOlimpiadas({ maxFiles = 4, maxTotalBytes = MAX_TOTAL_OLIMPIADAS_BYTES } = {}) {
+function crearUploadOlimpiadas({ maxFiles = 4, maxTotalBytes = MAX_TOTAL_OLIMPIADAS_BYTES, maxFileBytes = MAX_ARCHIVO_OLIMPIADAS_BYTES } = {}) {
+  const megas = Math.floor(maxFileBytes / 1024 / 1024);
   const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { files: maxFiles, fileSize: MAX_ARCHIVO_OLIMPIADAS_BYTES, fieldSize: Math.ceil(MAX_FIRMA_BYTES / 3) * 4 + 256 },
+    limits: { files: maxFiles, fileSize: maxFileBytes, fieldSize: Math.ceil(MAX_FIRMA_BYTES / 3) * 4 + 256 },
     fileFilter: (req, file, cb) => {
       const mime = file.mimetype === "image/jpg" ? "image/jpeg" : file.mimetype;
       const esImagen = MIME_IMAGEN_PERMITIDO.has(mime);
       const esPdf = permitePdfEnSlot(file.fieldname) && file.mimetype === "application/pdf";
-      if (!esImagen && !esPdf) return cb(new Error("Solo se permiten JPEG, PNG, WebP, HEIC y PDF únicamente para certificados"));
+      if (!esImagen && !esPdf) return cb(new Error("Solo se permiten JPEG, PNG, WebP, HEIC y PDF únicamente para certificados y reglamentos"));
       return cb(null, true);
     },
   });
@@ -240,7 +242,7 @@ function crearUploadOlimpiadas({ maxFiles = 4, maxTotalBytes = MAX_TOTAL_OLIMPIA
     upload.any()(req, res, (error) => {
       if (error) {
         if (error.code === "LIMIT_FILE_COUNT") return res.status(400).json(`Se pueden subir hasta ${maxFiles} archivos por vez`);
-        if (error.code === "LIMIT_FILE_SIZE") return res.status(400).json("Cada archivo puede pesar hasta 10 MB");
+        if (error.code === "LIMIT_FILE_SIZE") return res.status(400).json(`Cada archivo puede pesar hasta ${megas} MB`);
         return res.status(400).json(error.message || "No se pudieron procesar los archivos");
       }
       const totalBytes = (req.files || []).reduce((total, file) => total + (file.buffer?.length || 0), 0);
@@ -248,8 +250,9 @@ function crearUploadOlimpiadas({ maxFiles = 4, maxTotalBytes = MAX_TOTAL_OLIMPIA
         return res.status(400).json(`Los archivos superan el máximo total de ${Math.floor(maxTotalBytes / 1024 / 1024)} MB`);
       }
       for (const file of req.files || []) {
-        const validacion = validarContenidoArchivo(file);
+        const validacion = validarContenidoArchivo(file, { maxBytes: maxFileBytes });
         if (validacion.error) return res.status(400).json(validacion.error);
+        file.maxBytesPermitidos = maxFileBytes;
       }
       return next();
     });

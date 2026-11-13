@@ -93,16 +93,35 @@ test("voluntarios sólo escriben durante el evento; después conservan lectura y
   assert.equal(puedeEditarEdicion({ ...edicion, habilitado: "N" }, "2026-10-14"), false);
 });
 
+test("la administración puede abrir la carga de veedores fuera de las fechas del evento", async () => {
+  const abierta = { ...edicion, veedores_carga_abierta: 1 };
+  assert.equal(puedeEditarEdicion(abierta, "2026-01-01"), true);
+  assert.equal(puedeEditarEdicion({ ...abierta, habilitado: "N" }, "2026-01-01"), false);
+  assert.equal(puedeEditarEdicion({ ...abierta, eliminado: 1 }, "2026-01-01"), false);
+  const db = { query: async () => [[{ ...abierta, disciplina_id: 4 }]] };
+  assert.deepEqual(await exigirDisciplinaVoluntario({ db, cabecera, olimpiadaId: 7, disciplinaId: 4, escritura: true, hoy: "2026-01-01" }), [4]);
+});
+
 test("quitar la asignación o deshabilitar cuenta elimina incluso el acceso de lectura", async () => {
   const db = { query: async () => [[]] };
   await assert.rejects(exigirDisciplinaVoluntario({ db, cabecera, olimpiadaId: 7, disciplinaId: 4 }), { statusCode: 403 });
 });
 
-test("validaciones de alta no permiten claves débiles, emails múltiples ni usuario ambiguo", () => {
+test("validaciones de alta: clave simple y correo opcional, sin emails múltiples ni usuario ambiguo", () => {
   const cuenta = { nombre: "Ana", usuario: "ana.voley", email: "ana@example.org", password: "Nueva-clave2026!" };
   assert.equal(__test.normalizarCuenta(cuenta).usuario, "ana.voley");
+  // A pedido de la organización, la clave de un veedor invitado puede ser de un solo carácter.
+  for (const password of ["1", "a", "123"]) assert.equal(__test.normalizarCuenta({ ...cuenta, password }).usuario, "ana.voley");
+  // Sin correo, la cuenta queda con una dirección interna que no recibe mensajes ni se muestra.
+  const sinCorreo = __test.normalizarCuenta({ ...cuenta, email: "" });
+  assert.equal(sinCorreo.email, "veedor-ana.voley@cuentas.internas.invalid");
+  assert.equal(__test.cuentaPublica({ id: 3, ...sinCorreo }).email, "");
+  assert.equal(__test.normalizarCuenta({ nombre: "Ana" }, { ...sinCorreo, id: 3 }).email, sinCorreo.email);
   for (const body of [
-    { ...cuenta, password: "password123" },
+    { ...cuenta, password: "" },
+    { ...cuenta, password: "   " },
+    { ...cuenta, password: "x".repeat(73) },
+    { ...cuenta, email: "alguien@cuentas.internas.invalid" },
     { ...cuenta, email: "ana@example.org,otra@example.org" },
     { ...cuenta, usuario: "ana@example.org" },
     { ...cuenta, habilitado: "quizas" },
@@ -180,13 +199,13 @@ function baseCorreo() {
   return { db: { getConnection: async () => connection }, consultas, estado };
 }
 
-test("bienvenida rota clave sólo al enviar, registra auditoría sin secretos y usa el enlace de colaboradores", async () => {
+test("bienvenida rota clave sólo al enviar, registra auditoría sin secretos y usa el enlace de veedores", async () => {
   const { db, consultas, estado } = baseCorreo();
   let correo;
   const result = await __test.enviarBienvenida({ db, voluntarioId: 12, olimpiada: edicion, cabecera: { id: 1, rol: "admin" }, enviar: async (datos) => { correo = datos; return { enviado: true }; } });
   assert.equal(result.enviado, true);
   assert.equal(correo.autenticacion, true);
-  assert.match(correo.boton.url, /\/olimpiadas-colaboradores$/);
+  assert.match(correo.boton.url, /\/olimpiadas-veedores$/);
   const password = correo.datos.find((d) => d.etiqueta === "Nueva contraseña").valor;
   const update = consultas.find((q) => /UPDATE olimpiada_voluntario/.test(q.sql));
   assert.ok(await bcrypt.compare(password, update.params[0]));

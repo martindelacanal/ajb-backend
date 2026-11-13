@@ -110,18 +110,18 @@ test("contenido: fechas flexibles (dd/mm/yy, dd/mm/yyyy, ISO) y columnas", () =>
 // ---------------------------------------------------------------------------
 // Medallero
 // ---------------------------------------------------------------------------
-test("contenido: el oro compartido entre dos departamentales vale 5 puntos y una medalla para cada una", () => {
+test("contenido: el oro de un equipo interdepartamental de dos vale 5 puntos y una medalla para cada una", () => {
   const medallas = [
-    { disciplina_id: 2, puesto: 1, departamental_id: 1, nombre: "La Plata" },
-    { disciplina_id: 2, puesto: 1, departamental_id: 4, nombre: "Mercedes" },
+    { disciplina_id: 2, puesto: 1, departamental_id: 1, nombre: "La Plata", equipo_id: 30 },
+    { disciplina_id: 2, puesto: 1, departamental_id: 4, nombre: "Mercedes", equipo_id: 30 },
     { disciplina_id: 2, puesto: 2, departamental_id: 7, nombre: "Bahía Blanca" },
     { disciplina_id: 2, puesto: 3, departamental_id: 9, nombre: "Mar del Plata" },
     { disciplina_id: 3, puesto: 1, departamental_id: 7, nombre: "Bahía Blanca" },
   ];
   const tabla = calcularTablaMedallero(medallas, { oro: 10, plata: 5, bronce: 4 });
   const fila = (id) => tabla.find((f) => f.departamental_id === id);
-  assert.deepEqual(fila(1), { departamental_id: 1, nombre: "La Plata", oro: 1, plata: 0, bronce: 0, puntos: 5 });
-  assert.deepEqual(fila(4), { departamental_id: 4, nombre: "Mercedes", oro: 1, plata: 0, bronce: 0, puntos: 5 });
+  assert.deepEqual(fila(1), { departamental_id: 1, nombre: "La Plata", oro: 1, plata: 0, bronce: 0, otros: 0, puntos: 5 });
+  assert.deepEqual(fila(4), { departamental_id: 4, nombre: "Mercedes", oro: 1, plata: 0, bronce: 0, otros: 0, puntos: 5 });
   // Bahía Blanca: oro entero (10) + plata (5) = 15 → primera
   assert.equal(tabla[0].departamental_id, 7);
   assert.equal(tabla[0].puntos, 15);
@@ -130,8 +130,8 @@ test("contenido: el oro compartido entre dos departamentales vale 5 puntos y una
   assert.deepEqual(tabla.slice(1, 3).map((f) => f.nombre), ["La Plata", "Mercedes"]);
 });
 
-test("contenido: puntos compartidos entre tres se redondean a dos decimales y el detalle trae los tres puestos", () => {
-  const medallas = [1, 4, 7].map((id) => ({ disciplina_id: 5, disciplina_nombre: "Truco", puesto: 3, departamental_id: id, nombre: `D${id}` }));
+test("contenido: puntos de un equipo de tres se redondean a dos decimales y el detalle trae los tres puestos", () => {
+  const medallas = [1, 4, 7].map((id) => ({ disciplina_id: 5, disciplina_nombre: "Truco", puesto: 3, departamental_id: id, nombre: `D${id}`, equipo_id: 31 }));
   const tabla = calcularTablaMedallero(medallas, { oro: 10, plata: 5, bronce: 4 });
   assert.equal(tabla.length, 3);
   for (const fila of tabla) assert.equal(fila.puntos, 1.33);

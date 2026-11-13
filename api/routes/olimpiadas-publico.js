@@ -4,7 +4,7 @@ const express = require('express');
 const db = require('../connection/connection').promise();
 const { normalizarFechaCivil } = require('../services/valores-dominio');
 const { crearErrorHttp, responderError, obtenerOlimpiada, listarNombresDisciplinas, firmarSeguro, fechaHoyBuenosAires, estaVentanaInscripcionAbierta, calcularGanadores } = require('../services/olimpiadas-comun');
-const { partidoPublico, calcularPosiciones, listarTorneos, filtroId } = require('../services/olimpiadas-competicion');
+const { partidoPublico, calcularPosiciones, listarTorneos, listarEquipos, filtroId } = require('../services/olimpiadas-competicion');
 const lectura = require('./olimpiadas-contenido').lecturasPublicas;
 const router = express.Router();
 
@@ -13,7 +13,8 @@ function edicionPublica(o) {
     fecha_inicio: o.fecha_inicio, fecha_fin: o.fecha_fin, fecha_inicio_inscripcion: o.fecha_inicio_inscripcion,
     fecha_fin_inscripcion: o.fecha_fin_inscripcion, estado: lectura.estadoEdicion(o), inscripcion_abierta: estaVentanaInscripcionAbierta(o),
     valor_bono: Number(o.valor_bono) || 0, bonos_afiliado: Number(o.bonos_afiliado) || 0,
-    fecha_sorteo: o.fecha_sorteo, sorteo_publicado: Number(o.sorteo_publicado) || 0 };
+    fecha_sorteo: o.fecha_sorteo, sorteo_publicado: Number(o.sorteo_publicado) || 0,
+    medallero_publicado: Number(o.medallero_publicado) || 0, posiciones_publicas: Number(o.posiciones_publicas) || 0 };
 }
 
 const endpoint = (fn, obtener = obtenerOlimpiada) => async (req, res) => {
@@ -30,6 +31,7 @@ router.get('/olimpiadas/publico/ediciones', async (req, res) => {
   try {
     const [rows] = await db.query(`SELECT o.id, o.nombre, o.edicion, o.localidad, o.descripcion, o.fecha_inicio, o.fecha_fin,
       o.fecha_inicio_inscripcion, o.fecha_fin_inscripcion, o.valor_bono, o.bonos_afiliado, o.fecha_sorteo, o.sorteo_publicado,
+      o.medallero_publicado, o.posiciones_publicas,
       (SELECT COUNT(*) FROM olimpiada_foto f WHERE f.olimpiada_id = o.id AND f.eliminado = 0) AS fotos,
       (SELECT COUNT(*) FROM olimpiada_novedad n WHERE n.olimpiada_id = o.id AND n.eliminado = 0 AND n.publicada = 1 AND n.fecha_publicacion <= NOW()) AS novedades
       FROM olimpiada o WHERE o.eliminado = 0 AND o.habilitado = 'Y' AND o.publicada_publico = 1 ORDER BY o.fecha_inicio DESC, o.id DESC`);
@@ -51,10 +53,12 @@ ruta('portal', async (req, o) => {
     hoteles: ['olimpiada_sede', "eliminado = 0 AND tipo = 'HOTEL'"], contactos: ['olimpiada_contacto', 'eliminado = 0'],
     premios: ['olimpiada_premio', '1 = 1'], enlaces: ['olimpiada_enlace', 'eliminado = 0'],
     secciones_reglamento: ['olimpiada_seccion', "eliminado = 0 AND visible = 1 AND ubicacion = 'REGLAMENTO'"],
+    videos_propios: ['olimpiada_video', "eliminado = 0 AND estado = 'LISTO'"],
   };
   const sql = Object.entries(especificaciones).map(([nombre, [tabla, condicion]]) => `(SELECT COUNT(*) FROM ${tabla} WHERE olimpiada_id = ? AND ${condicion}) AS ${nombre}`).join(', ');
   const [[counts]] = await db.query(`SELECT ${sql}`, Object.keys(especificaciones).map(() => o.id));
   for (const nombre of Object.keys(especificaciones)) conteos[nombre] = Number(counts[nombre]) || 0;
+  if (Number(o.medallero_publicado) !== 1) conteos.medallas = 0;
   const [videos] = await db.query("SELECT id, titulo, url FROM olimpiada_enlace WHERE olimpiada_id = ? AND eliminado = 0 AND tipo = 'VIDEOS' ORDER BY orden, id", [o.id]);
   const disciplinas = (await listarNombresDisciplinas(db, o.id)).get(Number(o.id)) || [];
   return { olimpiada: { ...edicionPublica(o), videos, disciplinas }, conteos, mi_inscripcion: null, hoteles_mi_departamental: [], departamental_id: null };
@@ -66,24 +70,35 @@ async function partidosFiltrados(req, o) {
   return lectura.consultarPartidos(db, { condiciones, params });
 }
 async function conLogos(tabla) {
-  if (!tabla.length) return tabla;
-  const [rows] = await db.query('SELECT id, logo_archivo FROM departamental WHERE id IN (?)', [tabla.map(d => d.departamental_id)]);
+  const ids = tabla.map(d => d.departamental_id).filter(Boolean);
+  if (!ids.length) return tabla;
+  const [rows] = await db.query('SELECT id, logo_archivo FROM departamental WHERE id IN (?)', [ids]);
   const logos = new Map(await Promise.all(rows.map(async d => [Number(d.id), await firmarSeguro(d.logo_archivo)])));
   return tabla.map(d => ({ ...d, logo_url: logos.get(Number(d.departamental_id)) || null }));
 }
+const posicionesPublicas = o => Number(o.posiciones_publicas) === 1;
 ruta('fixture', async (req, o) => {
-  const [disciplinas, partidos, torneos] = await Promise.all([lectura.listarDisciplinasFixture(db, o.id), partidosFiltrados(req, o), listarTorneos(db, o.id)]);
-  return { olimpiada: edicionPublica(o), puede_editar: false, disciplinas, partidos: partidos.map(partidoPublico), torneos,
-    posiciones: await conLogos(calcularPosiciones(partidos)) };
+  const [disciplinas, partidos, torneos, equipos, escudos] = await Promise.all([lectura.listarDisciplinasFixture(db, o.id), partidosFiltrados(req, o),
+    listarTorneos(db, o.id), listarEquipos(db, o.id), lectura.listarEscudos(db)]);
+  return { olimpiada: edicionPublica(o), puede_editar: false, disciplinas, partidos: partidos.map(partidoPublico), torneos, equipos, ...escudos,
+    posiciones: posicionesPublicas(o) ? await conLogos(calcularPosiciones(partidos)) : [] };
 });
 ruta('torneos', (req, o) => listarTorneos(db, o.id, filtroId(req.query, 'disciplina_id') ? [filtroId(req.query, 'disciplina_id')] : null));
-ruta('posiciones', async (req, o) => ({ tabla: await conLogos(calcularPosiciones(await partidosFiltrados(req, o))), criterio: 'Victoria 3 puntos · empate 1 punto' }));
-ruta('medallero', async (req, o) => { const medallero = await lectura.armarMedallero(db, o); return { ...medallero, tabla: await conLogos(medallero.tabla) }; });
+ruta('posiciones', async (req, o) => (posicionesPublicas(o)
+  ? { tabla: await conLogos(calcularPosiciones(await partidosFiltrados(req, o))), criterio: 'Victoria 3 puntos · empate 1 punto' }
+  : { tabla: [], criterio: '', reservado: true }));
+// El medallero se reserva hasta que la organización lo publica.
+ruta('medallero', async (req, o) => {
+  if (!lectura.puedeVerMedallero(null, o)) return lectura.medalleroReservado(o);
+  const medallero = await lectura.armarMedallero(db, o);
+  return { ...medallero, tabla: await conLogos(medallero.tabla) };
+});
+ruta('videos', (req, o) => lectura.listarVideos(db, o.id));
 ruta('en-vivo', async (req, o) => {
   const partidos = await partidosFiltrados(req, o), hoy = fechaHoyBuenosAires();
-  return { actualizado: new Date().toISOString(), en_juego: partidos.filter(p => p.estado === 'EN_JUEGO').map(partidoPublico),
+  return { actualizado: new Date().toISOString(), en_juego: partidos.filter(p => p.en_vivo).map(partidoPublico),
     recientes: partidos.filter(p => p.estado === 'FINALIZADO').sort((a, b) => new Date(b.fecha_modificacion) - new Date(a.fecha_modificacion)).slice(0, 20).map(partidoPublico),
-    proximos: partidos.filter(p => p.estado === 'PROGRAMADO' && normalizarFechaCivil(p.fecha) >= hoy).slice(0, 20).map(partidoPublico) };
+    proximos: partidos.filter(p => p.estado === 'PROGRAMADO' && !p.en_vivo && normalizarFechaCivil(p.fecha) >= hoy).slice(0, 20).map(partidoPublico) };
 });
 ruta('novedades', async (req, o) => {
   const [rows] = await db.query(`SELECT id, titulo, cuerpo, imagen_archivo, fijada, fecha_publicacion, fecha_modificacion FROM olimpiada_novedad

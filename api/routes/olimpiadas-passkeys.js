@@ -55,7 +55,7 @@ function registrarPasskeysVoluntarios({router,db,jwtSecret,manejar,limitador,aut
     const cuenta=await cargarCuentaVoluntario(db,auth.voluntario_id);
     const [existentes]=await db.query("SELECT credential_id,transportes,rp_id FROM olimpiada_voluntario_passkey WHERE voluntario_id=?",[cuenta.id]);
     if(existentes.length>=10) throw crearErrorHttp("Ya registraste diez claves de acceso. Eliminá una para agregar otra.",409);
-    const opciones=await webauthnLib.generateRegistrationOptions({rpName:"Mi AJB · Colaboradores de Olimpiadas",rpID:ctx.rpID,
+    const opciones=await webauthnLib.generateRegistrationOptions({rpName:"Mi AJB · Veedores de Olimpiadas",rpID:ctx.rpID,
       userID:Buffer.from(`miajb-olimpiadas:${cuenta.id}`,"utf8"),userName:cuenta.usuario,userDisplayName:cuenta.nombre,
       timeout:300000,attestationType:"none",supportedAlgorithmIDs:[-7,-257],
       excludeCredentials:existentes.filter(c=>c.rp_id===ctx.rpID).map(c=>({id:c.credential_id,transports:transportes(c.transportes)})),
