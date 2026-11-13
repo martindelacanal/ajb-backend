@@ -546,6 +546,24 @@ async function obtenerOlimpiada(db, olimpiadaId, { forUpdate = false } = {}) {
   return rows[0] || null;
 }
 
+// Nombres de las disciplinas habilitadas de cada edición, en orden alfabético. Los usa el banner del portal para
+// dibujar los deportes de esa edición: sólo el nombre, sin cupos ni datos de inscripción.
+async function listarNombresDisciplinas(db, olimpiadaIds) {
+  const ids = [...new Set([].concat(olimpiadaIds).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+  const porOlimpiada = new Map(ids.map((id) => [id, []]));
+  if (ids.length === 0) return porOlimpiada;
+  const [filas] = await db.query(
+    `SELECT c.olimpiada_id, d.nombre
+     FROM olimpiada_disciplina_config c
+     INNER JOIN olimpiada_disciplina d ON d.id = c.disciplina_id
+     WHERE c.olimpiada_id IN (?) AND d.habilitado = 'Y'
+     ORDER BY d.nombre ASC`,
+    [ids]
+  );
+  for (const fila of filas) porOlimpiada.get(Number(fila.olimpiada_id))?.push(fila.nombre);
+  return porOlimpiada;
+}
+
 // Al crear una olimpiada: tramos de bonos por edad y secciones informativas de base (editables).
 async function sembrarContenidoInicialOlimpiada(connection, olimpiadaId) {
   for (const [indice, tramo] of TRAMOS_BONOS_INICIALES.entries()) {
@@ -824,6 +842,7 @@ module.exports = {
   notificarInscriptosOlimpiada,
   // olimpiada
   obtenerOlimpiada,
+  listarNombresDisciplinas,
   sembrarContenidoInicialOlimpiada,
   // bonos
   calcularEdad,

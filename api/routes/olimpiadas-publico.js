@@ -3,7 +3,7 @@
 const express = require('express');
 const db = require('../connection/connection').promise();
 const { normalizarFechaCivil } = require('../services/valores-dominio');
-const { crearErrorHttp, responderError, obtenerOlimpiada, firmarSeguro, fechaHoyBuenosAires, estaVentanaInscripcionAbierta, calcularGanadores } = require('../services/olimpiadas-comun');
+const { crearErrorHttp, responderError, obtenerOlimpiada, listarNombresDisciplinas, firmarSeguro, fechaHoyBuenosAires, estaVentanaInscripcionAbierta, calcularGanadores } = require('../services/olimpiadas-comun');
 const { partidoPublico, calcularPosiciones, listarTorneos, filtroId } = require('../services/olimpiadas-competicion');
 const lectura = require('./olimpiadas-contenido').lecturasPublicas;
 const router = express.Router();
@@ -33,8 +33,11 @@ router.get('/olimpiadas/publico/ediciones', async (req, res) => {
       (SELECT COUNT(*) FROM olimpiada_foto f WHERE f.olimpiada_id = o.id AND f.eliminado = 0) AS fotos,
       (SELECT COUNT(*) FROM olimpiada_novedad n WHERE n.olimpiada_id = o.id AND n.eliminado = 0 AND n.publicada = 1 AND n.fecha_publicacion <= NOW()) AS novedades
       FROM olimpiada o WHERE o.eliminado = 0 AND o.habilitado = 'Y' AND o.publicada_publico = 1 ORDER BY o.fecha_inicio DESC, o.id DESC`);
+    // Los nombres de las disciplinas de cada edición: el banner dibuja esos deportes
+    const disciplinas = await listarNombresDisciplinas(db, rows.map(o => o.id));
     res.set('Cache-Control', 'no-store');
-    res.json(rows.map(o => ({ ...edicionPublica(o), fotos: Number(o.fotos), novedades: Number(o.novedades), mi_inscripcion: null })));
+    res.json(rows.map(o => ({ ...edicionPublica(o), fotos: Number(o.fotos), novedades: Number(o.novedades), mi_inscripcion: null,
+      disciplinas: disciplinas.get(Number(o.id)) || [] })));
   } catch (error) { responderError(res, error, 'No se pudieron cargar las ediciones públicas'); }
 });
 
@@ -53,7 +56,8 @@ ruta('portal', async (req, o) => {
   const [[counts]] = await db.query(`SELECT ${sql}`, Object.keys(especificaciones).map(() => o.id));
   for (const nombre of Object.keys(especificaciones)) conteos[nombre] = Number(counts[nombre]) || 0;
   const [videos] = await db.query("SELECT id, titulo, url FROM olimpiada_enlace WHERE olimpiada_id = ? AND eliminado = 0 AND tipo = 'VIDEOS' ORDER BY orden, id", [o.id]);
-  return { olimpiada: { ...edicionPublica(o), videos }, conteos, mi_inscripcion: null, hoteles_mi_departamental: [], departamental_id: null };
+  const disciplinas = (await listarNombresDisciplinas(db, o.id)).get(Number(o.id)) || [];
+  return { olimpiada: { ...edicionPublica(o), videos, disciplinas }, conteos, mi_inscripcion: null, hoteles_mi_departamental: [], departamental_id: null };
 });
 
 async function partidosFiltrados(req, o) {
