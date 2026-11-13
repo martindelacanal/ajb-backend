@@ -1,6 +1,7 @@
 const express = require('express');
 const mysqlConnection = require('../connection/connection');
-const { generarGafetes } = require('../services/olimpiadas-gafetes');
+const { generarGafetes, leerCodigoGafete } = require('../services/olimpiadas-gafetes');
+const { urlAplicacion } = require('../services/correo');
 const { verifyToken, getCabecera, esStaff, esSuperior, puedeVerInscripcion, normalizarIdPositivo, getObjectBufferFromS3, registrarHistorial, responderError } = require('../services/olimpiadas-comun');
 const router = express.Router();
 const SELECT_GAFETE = `SELECT i.id, i.usuario_id, i.olimpiada_id, i.departamental_id, i.estado,
@@ -17,7 +18,10 @@ async function enviarPdf(db, res, registros, cabecera) {
   const ids = registros.map(r => r.id);
   const [disciplinas] = await db.query(`SELECT x.inscripcion_id,d.nombre FROM olimpiada_inscripcion_disciplina x JOIN olimpiada_disciplina d ON d.id=x.disciplina_id WHERE x.inscripcion_id IN (?) ORDER BY d.nombre`, [ids]);
   registros.forEach(r => { r.disciplinas = disciplinas.filter(d => Number(d.inscripcion_id) === Number(r.id)).map(d => d.nombre); });
-  const buffer = await generarGafetes(registros, { cargarFoto: async key => (await getObjectBufferFromS3(key))?.buffer });
+  const buffer = await generarGafetes(registros, {
+    cargarFoto: async key => (await getObjectBufferFromS3(key))?.buffer,
+    urlVerificacion: codigo => urlAplicacion(`/olimpiadas-publicas/gafete/${codigo}`),
+  });
   await registrarHistorial(db, { entidad: 'INSCRIPCION', entidad_id: ids.length === 1 ? ids[0] : null,
     olimpiada_id: registros[0].olimpiada_id, inscripcion_id: ids.length === 1 ? ids[0] : null,
     usuario_id: cabecera.id, usuario_rol: cabecera.rol, tipo_operacion: 'PDF',
@@ -65,6 +69,28 @@ router.get('/olimpiadas/:id(\\d+)/gafetes.pdf', verifyToken, async (req, res) =>
     if (rows.length > 100) return res.status(422).json('El lote supera 100 gafetes. Filtrá por departamental, disciplina o elegí inscripciones');
     return await enviarPdf(db, res, rows, cabecera);
   } catch (error) { responderError(res, error, 'No se pudieron generar los gafetes'); }
+});
+
+// Lo que abre el QR del gafete: sin sesión, sólo lo mismo que el gafete lleva impreso y si sigue vigente.
+// El código incluye una firma: no se puede recorrer inscripciones cambiando el número.
+router.get('/olimpiadas/publico/gafete/:codigo', async (req, res) => {
+  try {
+    const id = leerCodigoGafete(req.params.codigo);
+    res.set('Cache-Control', 'no-store');
+    if (!id) return res.status(404).json('El código del gafete no es válido');
+    const db = mysqlConnection.promise();
+    const [rows] = await db.query(`${SELECT_GAFETE} AND i.id=?`, [id]);
+    const r = rows[0];
+    if (!r) return res.status(404).json('La inscripción de este gafete ya no existe');
+    const [disciplinas] = await db.query(`SELECT d.nombre FROM olimpiada_inscripcion_disciplina x JOIN olimpiada_disciplina d ON d.id=x.disciplina_id WHERE x.inscripcion_id=? ORDER BY d.nombre`, [id]);
+    return res.json({
+      vigente: r.estado === 'VALIDADO', numero: r.id,
+      nombre: r.afiliado_nombre, apellido: r.afiliado_apellido,
+      departamental: r.departamental_nombre || null, categoria: r.categoria_nombre || null,
+      disciplinas: disciplinas.map(d => d.nombre),
+      olimpiada: { nombre: r.olimpiada_nombre, localidad: r.olimpiada_localidad, fecha_inicio: r.fecha_inicio, fecha_fin: r.fecha_fin },
+    });
+  } catch (error) { responderError(res, error, 'No se pudo verificar el gafete'); }
 });
 
 router.__test = { SELECT_GAFETE, enviarPdf };

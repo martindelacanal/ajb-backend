@@ -11,6 +11,7 @@ const { leerPartido, leerOrigen, leerCoordenadas, leerPuestosPuntos, mensajeConE
 const { validarPasswordVeedor, esCorreoInterno } = require("../api/security/olimpiadas-voluntarios");
 const { detectarVideo, partesTotales, TAMANO_PARTE } = require("../api/routes/olimpiadas-videos");
 const { tipoMarcadorSugerido } = require("../scripts/migrar-olimpiadas-veedores");
+const { codigoGafete, leerCodigoGafete, generarGafetes } = require("../api/services/olimpiadas-gafetes");
 
 // ---------------------------------------------------------------------------
 // Resultados por deporte
@@ -307,4 +308,19 @@ test("videos: sólo entran contenedores de video reales y la subida se parte en 
   assert.equal(partesTotales(1), 1);
   assert.equal(partesTotales(TAMANO_PARTE), 1);
   assert.equal(partesTotales(TAMANO_PARTE + 1), 2);
+});
+
+test("gafetes: el código del QR lleva una firma y no sirve para consultar otra inscripción", async () => {
+  const codigo = codigoGafete(12, "secreto");
+  assert.match(codigo, /^12-[a-f0-9]{20}$/);
+  assert.equal(leerCodigoGafete(codigo, "secreto"), 12);
+  // Cambiar el número, la firma o el secreto invalida el código.
+  assert.equal(leerCodigoGafete(`13-${codigo.split("-")[1]}`, "secreto"), null);
+  assert.equal(leerCodigoGafete(codigo, "otro-secreto"), null);
+  for (const basura of ["", "12", "12-xyz", "0-" + "a".repeat(20), null]) assert.equal(leerCodigoGafete(basura, "secreto"), null);
+  const direcciones = [];
+  const pdf = await generarGafetes([{ id: 12, afiliado_nombre: "Rosa", afiliado_apellido: "Benítez", disciplinas: ["Truco"] }],
+    { urlVerificacion: (c) => { direcciones.push(c); return `https://ejemplo.test/olimpiadas-publicas/gafete/${c}`; } });
+  assert.equal(pdf.subarray(0, 5).toString(), "%PDF-");
+  assert.deepEqual(direcciones, [codigoGafete(12)]);
 });
