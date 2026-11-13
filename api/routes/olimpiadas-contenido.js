@@ -571,7 +571,7 @@ router.get("/olimpiadas/:id(\\d+)/portal", verifyToken, async (req, res) => {
     // El medallero se reserva hasta que la organización lo publica: sin eso, ni el conteo sale de la gestión.
     if (!esSuperior(cabecera) && Number(olimpiada.medallero_publicado) !== 1) conteos.medallas = 0;
     const [videos] = await db.query(
-      "SELECT id, titulo, url FROM olimpiada_enlace WHERE olimpiada_id = ? AND eliminado = 0 AND tipo = 'VIDEOS' ORDER BY orden, id",
+      "SELECT id, titulo, url, descripcion FROM olimpiada_enlace WHERE olimpiada_id = ? AND eliminado = 0 AND tipo = 'VIDEOS' ORDER BY orden, id",
       [olimpiadaId]
     );
     const [inscripciones] = await db.query(

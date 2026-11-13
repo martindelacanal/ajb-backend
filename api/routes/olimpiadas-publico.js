@@ -59,7 +59,7 @@ ruta('portal', async (req, o) => {
   const [[counts]] = await db.query(`SELECT ${sql}`, Object.keys(especificaciones).map(() => o.id));
   for (const nombre of Object.keys(especificaciones)) conteos[nombre] = Number(counts[nombre]) || 0;
   if (Number(o.medallero_publicado) !== 1) conteos.medallas = 0;
-  const [videos] = await db.query("SELECT id, titulo, url FROM olimpiada_enlace WHERE olimpiada_id = ? AND eliminado = 0 AND tipo = 'VIDEOS' ORDER BY orden, id", [o.id]);
+  const [videos] = await db.query("SELECT id, titulo, url, descripcion FROM olimpiada_enlace WHERE olimpiada_id = ? AND eliminado = 0 AND tipo = 'VIDEOS' ORDER BY orden, id", [o.id]);
   const disciplinas = (await listarNombresDisciplinas(db, o.id)).get(Number(o.id)) || [];
   return { olimpiada: { ...edicionPublica(o), videos, disciplinas }, conteos, mi_inscripcion: null, hoteles_mi_departamental: [], departamental_id: null };
 });
