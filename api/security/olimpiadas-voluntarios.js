@@ -11,6 +11,21 @@ const { exigirAccesoCuenta, exigirOperacionCuenta } = require("./restricciones-c
 
 const AUDIENCIA = "ajb:olimpiadas:voluntarios";
 const ROL = "olimpiadas-voluntario";
+// Las cuentas de invitados sin correo guardan una dirección interna que nunca recibe mensajes.
+const DOMINIO_INTERNO = "@cuentas.internas.invalid";
+
+function esCorreoInterno(email) { return String(email || "").toLowerCase().endsWith(DOMINIO_INTERNO); }
+
+/**
+ * Contraseña de una cuenta de veedor invitado. A pedido de la organización alcanza con un solo
+ * carácter (los veedores usan el teléfono y la cuenta dura lo que dura el evento): el acceso se
+ * limita a los resultados de sus disciplinas y cada cambio queda en el historial.
+ */
+function validarPasswordVeedor(password) {
+  if (typeof password !== "string" || password.trim() === "" || Buffer.byteLength(password, "utf8") > 72) {
+    throw Object.assign(new Error("Ingresá una contraseña (puede ser corta, hasta 72 caracteres)."), { statusCode: 400 });
+  }
+}
 
 // Un token de colaboración nunca verifica con JWT_SECRET: incluso los handlers
 // legados que sólo verifican una firma quedan fuera de este acceso limitado.
@@ -38,9 +53,9 @@ async function cargarCuentaVoluntario(db, id, bloquear = false) {
       FROM usuario u INNER JOIN rol r ON r.id=u.rol_id WHERE u.id=? LIMIT 1${bloquear ? " FOR UPDATE" : ""}`, [v.usuario_sistema_id]);
     const u = usuarios[0];
     if (!u || !usuarioHabilitado(u.habilitado) || Number(u.rol_id) === 4
-      || String(u.rol).toLowerCase() === "invitado") throw crearErrorHttp("La cuenta del sistema vinculada ya no tiene acceso de colaboración", 401);
+      || String(u.rol).toLowerCase() === "invitado") throw crearErrorHttp("La cuenta de Mi AJB vinculada ya no tiene acceso de veedor", 401);
     exigirAccesoCuenta(u);
-    if (Number(u.requiere_cambio_clave) === 1) throw crearErrorHttp("Ingresá a Mi AJB para actualizar tu contraseña habitual antes de colaborar.", 403);
+    if (Number(u.requiere_cambio_clave) === 1) throw crearErrorHttp("Ingresá a Mi AJB para actualizar tu contraseña habitual antes de entrar como veedor.", 403);
     if (bloquear) {
       // Orden compartido con vinculación: usuario habitual, después colaboración.
       [rows] = await db.query(`${consulta} FOR UPDATE`, [id]);
@@ -55,11 +70,14 @@ async function cargarCuentaVoluntario(db, id, bloquear = false) {
 
 function esVoluntario(cabecera) { return cabecera?.rol === ROL; }
 
+// Los veedores cargan durante las fechas del evento; la administración puede abrir la carga antes
+// (para precargar o probar) con «veedores_carga_abierta».
 function puedeEditarEdicion(olimpiada, hoy = fechaHoyBuenosAires()) {
+  if (Number(olimpiada?.eliminado || 0) !== 0 || olimpiada?.habilitado !== "Y") return false;
+  if (Number(olimpiada?.veedores_carga_abierta) === 1) return true;
   const inicio = normalizarFechaCivil(olimpiada?.fecha_inicio);
   const fin = normalizarFechaCivil(olimpiada?.fecha_fin);
-  return Boolean(inicio && fin && inicio <= hoy && hoy <= fin
-    && Number(olimpiada?.eliminado || 0) === 0 && olimpiada?.habilitado === "Y");
+  return Boolean(inicio && fin && inicio <= hoy && hoy <= fin);
 }
 
 async function autenticarVoluntario({ token, db, jwtSecret = process.env.JWT_SECRET }) {
@@ -68,14 +86,14 @@ async function autenticarVoluntario({ token, db, jwtSecret = process.env.JWT_SEC
     payload = jwt.verify(token, secretoVoluntarios(jwtSecret), {
       algorithms: ["HS256"], audience: AUDIENCIA, issuer: "mi-ajb",
     });
-  } catch (_error) { throw crearErrorHttp("Tu sesión de colaboración venció o no es válida. Volvé a ingresar.", 401); }
+  } catch (_error) { throw crearErrorHttp("Tu sesión de veedor venció o no es válida. Volvé a ingresar.", 401); }
   const id = normalizarIdPositivo(payload.sub);
   if (!id || payload.tipo !== ROL || !Number.isSafeInteger(payload.version)) {
-    throw crearErrorHttp("La sesión de colaboración no es válida", 401);
+    throw crearErrorHttp("La sesión de veedor no es válida", 401);
   }
   const v = await cargarCuentaVoluntario(db, id);
   if (!v || Number(v.habilitado) !== 1 || Number(v.sesion_version) !== payload.version) {
-    throw crearErrorHttp("Tu acceso de colaboración fue actualizado o deshabilitado. Volvé a ingresar.", 401);
+    throw crearErrorHttp("Tu acceso de veedor fue actualizado o deshabilitado. Volvé a ingresar.", 401);
   }
   if (payload.sid) {
     if (!/^[a-f0-9-]{36}$/.test(payload.sid)) throw crearErrorHttp("La sesión no es válida", 401);
@@ -102,7 +120,7 @@ function crearVerificadorCompeticion({ db = mysqlConnection.promise(), jwtSecret
       req.data = { data: JSON.stringify(cabecera) };
       return next();
     } catch (error) {
-      return res.status(error.statusCode || 503).json(error.statusCode ? error.message : "No pudimos verificar el acceso de colaboración");
+      return res.status(error.statusCode || 503).json(error.statusCode ? error.message : "No pudimos verificar el acceso de veedor");
     }
   };
 }
@@ -112,7 +130,7 @@ async function exigirEdicionVoluntario({ db, cabecera, olimpiadaId, escritura = 
   const id = normalizarIdPositivo(olimpiadaId);
   const voluntarioId = normalizarIdPositivo(cabecera.voluntario_id);
   if (!id || !voluntarioId) throw crearErrorHttp("No tenés acceso a esta olimpiada", 403);
-  const [rows] = await db.query(`SELECT a.disciplina_id, o.fecha_inicio, o.fecha_fin, o.habilitado, o.eliminado
+  const [rows] = await db.query(`SELECT a.disciplina_id, o.fecha_inicio, o.fecha_fin, o.habilitado, o.eliminado, o.veedores_carga_abierta
     FROM olimpiada_voluntario_disciplina a
     INNER JOIN olimpiada_voluntario v ON v.id = a.voluntario_id AND v.habilitado = 1
     INNER JOIN olimpiada o ON o.id = a.olimpiada_id AND o.eliminado = 0 AND o.habilitado = 'Y'
@@ -120,7 +138,7 @@ async function exigirEdicionVoluntario({ db, cabecera, olimpiadaId, escritura = 
     WHERE a.voluntario_id = ? AND a.olimpiada_id = ?`, [voluntarioId, id]);
   if (!rows.length) throw crearErrorHttp("No tenés disciplinas asignadas en esta olimpiada", 403);
   if (escritura && !puedeEditarEdicion(rows[0], hoy)) {
-    throw crearErrorHttp("La carga de resultados sólo está habilitada durante las fechas de la olimpiada. Conservás el acceso de lectura.", 403);
+    throw crearErrorHttp("La carga de resultados se habilita durante las fechas de la olimpiada. Mientras tanto podés consultar tus partidos.", 403);
   }
   return [...new Set(rows.map((r) => Number(r.disciplina_id)))];
 }
@@ -128,7 +146,7 @@ async function exigirEdicionVoluntario({ db, cabecera, olimpiadaId, escritura = 
 async function exigirDisciplinaVoluntario(opciones) {
   const ids = await exigirEdicionVoluntario(opciones);
   if (ids !== null && !ids.includes(normalizarIdPositivo(opciones.disciplinaId))) {
-    throw crearErrorHttp("Esta disciplina no está asignada a tu usuario de colaboración", 403);
+    throw crearErrorHttp("Esta disciplina no está asignada a tu usuario de veedor", 403);
   }
   return ids;
 }
@@ -138,4 +156,5 @@ module.exports = {
   cargarCuentaVoluntario,
   crearVerificadorCompeticion, verificarAccesoCompeticion: crearVerificadorCompeticion(),
   esVoluntario, puedeEditarEdicion, exigirEdicionVoluntario, exigirDisciplinaVoluntario,
+  DOMINIO_INTERNO, esCorreoInterno, validarPasswordVeedor,
 };

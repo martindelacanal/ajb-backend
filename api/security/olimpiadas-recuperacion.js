@@ -130,7 +130,7 @@ function crearServicioRecuperacionExterna({ db, jwtSecret = process.env.JWT_SECR
       if (!row || !usuario || !usuarioHabilitado(usuario.habilitado)
         || !igualesSeguros(row.password_version, huellaPassword(usuario.password, jwtSecret))
         || !igualesSeguros(row.correo_hash, huella(usuario.email.trim().toLowerCase(), "oli-reset-email", jwtSecret))) throw new ErrorRecuperacion(MENSAJE_CODIGO);
-      validarPassword(password, "personal");
+      require("./olimpiadas-voluntarios").validarPasswordVeedor(password);
       const passwordHash = await bcrypt.hash(password, 12);
       await connection.query("UPDATE olimpiada_voluntario SET password_hash = ?, sesion_version=sesion_version+1 WHERE id = ? AND usuario_sistema_id IS NULL", [passwordHash, usuario.id]);
       await connection.query("UPDATE olimpiada_voluntario_recuperacion SET consumido_en = NOW(6), reset_hash = NULL, codigo_hash = NULL WHERE usuario_id = ?", [usuario.id]);

@@ -1,10 +1,10 @@
 /* Registers competition management on the content router, sharing its validation and audit helpers. */
 const { verificarAccesoCompeticion, exigirEdicionVoluntario, exigirDisciplinaVoluntario, esVoluntario } = require('../security/olimpiadas-voluntarios');
 const { getCabecera, esSuperior, crearErrorHttp, responderError, normalizarIds, normalizarIdPositivo, firmarSeguro } = require('../services/olimpiadas-comun');
-const { calcularPosiciones, listarTorneos, filtroId } = require('../services/olimpiadas-competicion');
+const { calcularPosiciones, listarTorneos, listarEquipos, filtroId } = require('../services/olimpiadas-competicion');
 
 module.exports = function registrarTorneos(router, helpers) {
-  const { db, cargarOlimpiada, enTransaccion, historial, historialCambios, leerTexto, leerIdOpcional, leerEnum, leerEntero, leerUrl, validarDisciplinaDeOlimpiada, consultarPartidos, bloquearSinCambios } = helpers;
+  const { db, cargarOlimpiada, enTransaccion, historial, historialCambios, leerTexto, leerIdOpcional, leerEnum, leerEntero, leerUrl, leerCoordenadas, validarDisciplinaDeOlimpiada, consultarPartidos, bloquearSinCambios, puedeVerPosiciones } = helpers;
   const idRuta = valor => { const id = normalizarIdPositivo(valor); if (!id) throw crearErrorHttp('ID inválido'); return id; };
   function soloGestion(cabecera) { if (!esSuperior(cabecera) && !esVoluntario(cabecera)) throw crearErrorHttp('No autorizado', 403); }
   function soloSuperior(cabecera) { if (!esSuperior(cabecera)) throw crearErrorHttp('No autorizado', 403); }
@@ -23,16 +23,19 @@ module.exports = function registrarTorneos(router, helpers) {
     if (asignadas) { condiciones.push('d.disciplina_id IN (?)'); params.push(asignadas.length ? asignadas : [0]); }
     if (disciplinaId) { condiciones.push('d.disciplina_id = ?'); params.push(disciplinaId); }
     const [[lugares], [instancias], [departamentales], [participantes], [sedes]] = await Promise.all([
-      db.query('SELECT id, nombre, predio, direccion, url_mapa, descripcion FROM olimpiada_lugar WHERE eliminado = 0 ORDER BY predio, nombre'),
+      db.query('SELECT id, nombre, predio, direccion, url_mapa, descripcion, lat, lng FROM olimpiada_lugar WHERE eliminado = 0 ORDER BY predio, nombre'),
       db.query('SELECT id, nombre, orden FROM olimpiada_instancia WHERE eliminado = 0 ORDER BY orden, nombre'),
       db.query('SELECT id, nombre, logo_archivo FROM departamental ORDER BY nombre'),
       db.query(`SELECT i.id, u.nombre, u.apellido, i.departamental_id, dep.nombre AS departamental_nombre, d.disciplina_id
         FROM olimpiada_inscripcion i INNER JOIN usuario u ON u.id = i.usuario_id
         INNER JOIN olimpiada_inscripcion_disciplina d ON d.inscripcion_id = i.id
         LEFT JOIN departamental dep ON dep.id = i.departamental_id WHERE ${condiciones.join(' AND ')} ORDER BY u.apellido, u.nombre`, params),
-      db.query("SELECT id, nombre, direccion FROM olimpiada_sede WHERE olimpiada_id = ? AND eliminado = 0 AND tipo <> 'HOTEL' ORDER BY nombre", [olimpiadaId]),
+      db.query("SELECT id, nombre, direccion, url_mapa, lat, lng FROM olimpiada_sede WHERE olimpiada_id = ? AND eliminado = 0 AND tipo <> 'HOTEL' ORDER BY nombre", [olimpiadaId]),
     ]);
-    return { lugares, instancias, participantes, sedes, departamentales: await Promise.all(departamentales.map(async ({ logo_archivo, ...dep }) => ({ ...dep, logo_url: await firmarSeguro(logo_archivo) }))) };
+    const numero = valor => (valor === null || valor === undefined ? null : Number(valor));
+    for (const fila of [...lugares, ...sedes]) { fila.lat = numero(fila.lat); fila.lng = numero(fila.lng); }
+    const equipos = await listarEquipos(db, olimpiadaId, disciplinaId ? [disciplinaId] : asignadas);
+    return { lugares, instancias, participantes, sedes, equipos, departamentales: await Promise.all(departamentales.map(async ({ logo_archivo, ...dep }) => ({ ...dep, logo_url: await firmarSeguro(logo_archivo) }))) };
   }
 
   router.get('/olimpiadas/:id(\\d+)/competicion/catalogos', verificarAccesoCompeticion, endpoint(async (req, res) => res.json(await catalogos(req))));
@@ -52,7 +55,7 @@ module.exports = function registrarTorneos(router, helpers) {
       if (id) { const [[fila]] = await db.query(`SELECT * FROM ${tabla} WHERE id = ? AND eliminado = 0`, [id]); if (!fila) throw crearErrorHttp('El registro no existe', 404); actual = fila; }
       const body = req.body || {};
       const datos = { nombre: leerTexto(body, 'nombre', actual, { requerido: true, maximo: tipo === 'lugares' ? 160 : 60 }) };
-      if (tipo === 'lugares') Object.assign(datos, { predio: leerTexto(body, 'predio', actual, { maximo: 160 }), direccion: leerTexto(body, 'direccion', actual, { maximo: 200 }), url_mapa: leerUrl(body, 'url_mapa', actual, { maximo: 400 }), descripcion: leerTexto(body, 'descripcion', actual, { maximo: 400 }) });
+      if (tipo === 'lugares') Object.assign(datos, { predio: leerTexto(body, 'predio', actual, { maximo: 160 }), direccion: leerTexto(body, 'direccion', actual, { maximo: 200 }), url_mapa: leerUrl(body, 'url_mapa', actual, { maximo: 400 }), descripcion: leerTexto(body, 'descripcion', actual, { maximo: 400 }), ...leerCoordenadas(body, actual) });
       else datos.orden = leerEntero(body, 'orden', actual);
       const nuevoId = await enTransaccion(async connection => {
         let entidadId = id;
@@ -143,12 +146,14 @@ module.exports = function registrarTorneos(router, helpers) {
 
   router.get('/olimpiadas/:id(\\d+)/posiciones', verificarAccesoCompeticion, endpoint(async (req, res) => {
     const cabecera = getCabecera(req), olimpiadaId = idRuta(req.params.id);
-    await cargarOlimpiada(db, olimpiadaId, cabecera);
+    const olimpiada = await cargarOlimpiada(db, olimpiadaId, cabecera);
     const asignadas = await exigirEdicionVoluntario({ db, cabecera, olimpiadaId });
     const condiciones = ['p.olimpiada_id = ?'], params = [olimpiadaId];
     if (asignadas) { condiciones.push('p.disciplina_id IN (?)'); params.push(asignadas.length ? asignadas : [0]); }
     for (const campo of ['disciplina_id', 'torneo_id']) { const id = filtroId(req.query, campo); if (id) { if (campo === 'disciplina_id') await exigirDisciplinaVoluntario({ db, cabecera, olimpiadaId, disciplinaId: id }); condiciones.push(`p.${campo} = ?`); params.push(id); } }
     res.set('Cache-Control', 'no-store');
+    // Fuera de la gestión, las posiciones sólo se ven si la organización las publicó.
+    if (!puedeVerPosiciones(cabecera, olimpiada)) return res.json({ tabla: [], criterio: '', reservado: true });
     res.json({ tabla: calcularPosiciones(await consultarPartidos(db, { condiciones, params })), criterio: 'Victoria 3 puntos · empate 1 punto' });
   }));
 
@@ -158,11 +163,14 @@ module.exports = function registrarTorneos(router, helpers) {
     await cargarOlimpiada(db, olimpiadaId, cabecera);
     const page = filtroId(req.query, 'page') || 1;
     if (page > 100000) throw crearErrorHttp('La página es inválida');
-    const condiciones = ["h.olimpiada_id = ?", "h.entidad IN ('PARTIDO', 'TORNEO', 'DISCIPLINA_INFO')"], params = [olimpiadaId];
-    const disciplinaId = filtroId(req.query, 'disciplina_id');
+    // «medallero»: cambios de medallas, puntos y ajustes de publicación. Sólo la administración provincial.
+    const ambitoMedallero = req.query.ambito === 'medallero';
+    if (ambitoMedallero) soloSuperior(cabecera);
+    const condiciones = ["h.olimpiada_id = ?", ambitoMedallero ? "h.entidad IN ('MEDALLA', 'AJUSTE')" : "h.entidad IN ('PARTIDO', 'TORNEO', 'DISCIPLINA_INFO', 'EQUIPO')"], params = [olimpiadaId];
+    const disciplinaId = ambitoMedallero ? null : filtroId(req.query, 'disciplina_id');
     if (disciplinaId) await exigirDisciplinaVoluntario({ db, cabecera, olimpiadaId, disciplinaId });
-    if (asignadas || disciplinaId) { condiciones.push('COALESCE(p.disciplina_id, t.disciplina_id, IF(h.entidad = \'DISCIPLINA_INFO\', h.entidad_id, NULL)) IN (?)'); params.push(disciplinaId ? [disciplinaId] : asignadas.length ? asignadas : [0]); }
-    const from = `FROM olimpiada_historial h LEFT JOIN usuario u ON u.id = h.usuario_id LEFT JOIN olimpiada_partido p ON h.entidad = 'PARTIDO' AND p.id = h.entidad_id LEFT JOIN olimpiada_torneo t ON h.entidad = 'TORNEO' AND t.id = h.entidad_id WHERE ${condiciones.join(' AND ')}`;
+    if (asignadas || disciplinaId) { condiciones.push('COALESCE(p.disciplina_id, t.disciplina_id, e.disciplina_id, IF(h.entidad = \'DISCIPLINA_INFO\', h.entidad_id, NULL)) IN (?)'); params.push(disciplinaId ? [disciplinaId] : asignadas.length ? asignadas : [0]); }
+    const from = `FROM olimpiada_historial h LEFT JOIN usuario u ON u.id = h.usuario_id LEFT JOIN olimpiada_partido p ON h.entidad = 'PARTIDO' AND p.id = h.entidad_id LEFT JOIN olimpiada_torneo t ON h.entidad = 'TORNEO' AND t.id = h.entidad_id LEFT JOIN olimpiada_equipo e ON h.entidad = 'EQUIPO' AND e.id = h.entidad_id WHERE ${condiciones.join(' AND ')}`;
     const [[count]] = await db.query(`SELECT COUNT(*) AS cantidad ${from}`, params);
     const [rows] = await db.query(`SELECT h.*, u.nombre AS usuario_nombre, u.apellido AS usuario_apellido ${from} ORDER BY h.id DESC LIMIT 50 OFFSET ?`, [...params, (page - 1) * 50]);
     res.json({ results: rows, totalItems: Number(count.cantidad), page, pageSize: 50 });

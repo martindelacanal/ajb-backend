@@ -1,6 +1,6 @@
 "use strict";
 const bcrypt = require("bcryptjs");
-const { autenticarVoluntario, cargarCuentaVoluntario } = require("../security/olimpiadas-voluntarios");
+const { autenticarVoluntario, cargarCuentaVoluntario, validarPasswordVeedor, esCorreoInterno } = require("../security/olimpiadas-voluntarios");
 const { buscarCuentaVoluntario, crearSesionVoluntario, renovarSesionVoluntario, cerrarSesionVoluntario } = require("../security/olimpiadas-acceso");
 const { crearServicioRecuperacion, MENSAJE_SOLICITUD } = require("../security/recuperacion-password");
 const { crearServicioRecuperacionExterna } = require("../security/olimpiadas-recuperacion");
@@ -53,16 +53,17 @@ function registrarAccesoVoluntarios({ router, db, jwtSecret, enviar, manejar, li
       if (!cuenta || Number(cuenta.habilitado)!==1 || Number(cuenta.sesion_version)!==auth.sesion_version) throw crearErrorHttp("Volvé a ingresar", 401);
       if (cuenta.usuario_sistema_id) throw crearErrorHttp("Tus datos y tu contraseña se administran desde la configuración de tu cuenta habitual de Mi AJB.", 409);
       const nombre = String(req.body?.nombre ?? cuenta.nombre).trim();
-      const email = String(req.body?.email ?? cuenta.email).trim().toLowerCase();
+      // Sin correo, la cuenta conserva su dirección interna (no recibe mensajes).
+      const email = (String(req.body?.email ?? "").trim() || cuenta.email).toLowerCase();
       if (!nombre || nombre.length>160) throw crearErrorHttp("Ingresá un nombre de hasta 160 caracteres");
-      if (!esCorreoValido(email) || email.length>254 || /[,;\r\n]/.test(email)) throw crearErrorHttp("Ingresá un correo válido");
+      if (!esCorreoInterno(email) && (!esCorreoValido(email) || email.length>254 || /[,;\r\n]/.test(email))) throw crearErrorHttp("Ingresá un correo válido");
       const cambiaClave = req.body?.password !== undefined && req.body.password !== "";
       const revocar = cambiaClave || email!==cuenta.email.trim().toLowerCase();
       if (revocar) {
         await limitador(db, `voluntarios:perfil:cuenta:${cuenta.id}`, 10, 900, jwtSecret);
         if (typeof req.body?.password_actual!=="string" || Buffer.byteLength(req.body.password_actual)>72 || !await bcrypt.compare(req.body.password_actual, cuenta.password_hash)) throw crearErrorHttp("La contraseña actual no es correcta", 400);
       }
-      if (cambiaClave) validarPassword(req.body.password, "personal");
+      if (cambiaClave) validarPasswordVeedor(req.body.password);
       const hash = cambiaClave ? await bcrypt.hash(req.body.password, 12) : cuenta.password_hash;
       await cx.query("UPDATE olimpiada_voluntario SET nombre=?,email=?,password_hash=?,sesion_version=sesion_version+? WHERE id=? AND usuario_sistema_id IS NULL", [nombre,email,hash,revocar?1:0,cuenta.id]);
       if (revocar) {
@@ -74,7 +75,7 @@ function registrarAccesoVoluntarios({ router, db, jwtSecret, enviar, manejar, li
     } catch (e) { await cx.rollback(); throw e; } finally { cx.release(); }
   }));
   const enviarCodigo = ({para,codigo}) => enviar({ para, autenticacion:true,
-    asunto:"Tu código de acceso al equipo de Olimpiadas", titulo:"Recuperá tu acceso de colaboración", saludo:"Hola,",
+    asunto:"Tu código de acceso como veedor de Olimpiadas", titulo:"Recuperá tu acceso de veedor", saludo:"Hola,",
     parrafos:["Usá este código para elegir una nueva contraseña. Vence en diez minutos y sólo se puede usar una vez.","Si no pediste recuperar tu cuenta, ignorá este correo."],
     datos:[{etiqueta:"Código de seguridad",valor:codigo}] });
   const externo = crearServicioRecuperacionExterna({ db,jwtSecret,enviarCodigo });

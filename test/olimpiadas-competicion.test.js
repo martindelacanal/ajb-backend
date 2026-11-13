@@ -84,8 +84,15 @@ test('partidos: no admite torneos de otra edición o disciplina ni ciclos de cua
   const datos = leerPartido({ disciplina_id: 2, torneo_id: 7, participante1: 'A', participante2: 'B' }, {});
   await assert.rejects(validarReferenciasPartido(dbParticipantes({ torneoValido: false }), 3, datos), /torneo no pertenece/);
   const dbSinEscritura = { query() { assert.fail('No debe guardar una referencia cíclica'); } };
-  await assert.rejects(guardarExtrasPartido(dbSinEscritura, 4, { partido_origen1_id: 4 }), /antes/);
-  await assert.rejects(guardarExtrasPartido(dbSinEscritura, 4, { partido_origen2_id: 7 }), /antes/);
+  await assert.rejects(guardarExtrasPartido(dbSinEscritura, 4, { partido_origen1_id: 4 }), /sí mismo/);
+  // El partido 7 ya depende del 4: que el 4 venga del 7 cerraría un círculo.
+  const escrituras = [];
+  const dbCuadro = vecinos => ({ async query(sql) { if (/SELECT id, partido_origen1_id/.test(sql)) return [vecinos]; escrituras.push(sql); return [{ affectedRows: 1 }]; } });
+  await assert.rejects(guardarExtrasPartido(dbCuadro([{ id: 4 }, { id: 7, partido_origen1_id: 4 }]), 4, { partido_origen2_id: 7 }), /depende de este partido/);
+  assert.equal(escrituras.length, 0);
+  // Sin círculo, el origen puede haberse cargado después (ya no importa el orden de carga).
+  await guardarExtrasPartido(dbCuadro([{ id: 4 }, { id: 7 }]), 4, { partido_origen2_id: 7 });
+  assert.equal(escrituras.length, 1);
 });
 
 function respuesta() {

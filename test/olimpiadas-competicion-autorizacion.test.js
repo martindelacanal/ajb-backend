@@ -45,6 +45,10 @@ async function servidor(t, opciones = {}) {
     if (/FROM olimpiada_disciplina_config c/.test(sql)) return [[{ id: 4, olimpiada_id: 7, nombre: "Vóley", tipo_id: 1 }, { id: 5, olimpiada_id: 7, nombre: "Fútbol", tipo_id: 1 }]];
     if (/FROM olimpiada_torneo t/.test(sql)) return [[]];
     if (/SELECT id, logo_archivo FROM departamental/.test(sql)) return [[]];
+    // Equipos interdepartamentales y escudos que acompañan al fixture.
+    if (/FROM olimpiada_equipo e/.test(sql)) return [[]];
+    if (/SELECT id, nombre, logo_archivo FROM departamental/.test(sql)) return [[]];
+    if (/FROM olimpiada_config WHERE id = 1/.test(sql)) return [[]];
     assert.fail(`Consulta no prevista: ${sql}`);
   };
   const app = express(); app.use(express.json()); app.use(publico); app.use(privado);

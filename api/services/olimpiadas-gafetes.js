@@ -1,10 +1,47 @@
+const crypto = require('crypto');
 const PDFDocument = require('pdfkit');
 const sharp = require('sharp');
+// Generador de QR sin dependencias (el mismo que usa Predios): el despliegue no instala paquetes nuevos.
+const qrcode = require('../vendor/qrcode-generator-1.4.4.min.js');
 
 const MM = 72 / 25.4;
 const ANCHO = 90 * MM;
 const ALTO = 120 * MM;
 const AZUL = '#07517a';
+
+const QR_LADO = 58;
+
+// Código del gafete: número de inscripción + firma. Sin la firma no se puede consultar otra inscripción.
+function firmaGafete(id, secret = process.env.JWT_SECRET) {
+  if (!secret) throw new Error('Falta JWT_SECRET');
+  return crypto.createHmac('sha256', secret).update(`ajb:olimpiadas:gafete:v1:${Number(id)}`).digest('hex').slice(0, 20);
+}
+function codigoGafete(id, secret) { return `${Number(id)}-${firmaGafete(id, secret)}`; }
+function leerCodigoGafete(codigo, secret) {
+  const match = /^([1-9]\d{0,9})-([a-f0-9]{20})$/.exec(String(codigo || ''));
+  if (!match) return null;
+  const esperado = Buffer.from(firmaGafete(match[1], secret));
+  const recibido = Buffer.from(match[2]);
+  return esperado.length === recibido.length && crypto.timingSafeEqual(esperado, recibido) ? Number(match[1]) : null;
+}
+
+// Dibuja el QR módulo por módulo (vectorial: se imprime nítido a cualquier tamaño).
+function dibujarQr(doc, texto, x, y, lado) {
+  const qr = qrcode(0, 'M');
+  qr.addData(texto);
+  qr.make();
+  const modulos = qr.getModuleCount();
+  const paso = lado / modulos;
+  doc.save();
+  doc.rect(x - 3, y - 3, lado + 6, lado + 6).fill('#ffffff');
+  doc.fillColor('#000000');
+  for (let fila = 0; fila < modulos; fila++) {
+    for (let columna = 0; columna < modulos; columna++) {
+      if (qr.isDark(fila, columna)) doc.rect(x + columna * paso, y + fila * paso, paso + 0.05, paso + 0.05).fill();
+    }
+  }
+  doc.restore();
+}
 
 function textoAjustado(doc, texto, x, y, ancho, alto, tamano = 14) {
   const contenido = String(texto || '').replace(/[\x00-\x1f]/g, ' ').trim();
@@ -14,7 +51,11 @@ function textoAjustado(doc, texto, x, y, ancho, alto, tamano = 14) {
   doc.text(contenido, x, y, { width: ancho, height: alto, ellipsis: true, lineGap: 1 });
 }
 
-async function generarGafetes(registros, { cargarFoto = async () => null } = {}) {
+/**
+ * `urlVerificacion(codigo)` arma la dirección que lleva el QR: quien lo escanea (el veedor en la mesa)
+ * ve si la inscripción sigue aprobada y en qué disciplinas. Sin esa función el gafete sale sin QR.
+ */
+async function generarGafetes(registros, { cargarFoto = async () => null, urlVerificacion = null } = {}) {
   const doc = new PDFDocument({ size: 'A4', margin: 0, autoFirstPage: false, info: {
     Title: 'Credenciales de Olimpiadas - AJB', Author: 'Asociación Judicial Bonaerense',
   } });
@@ -62,14 +103,18 @@ async function generarGafetes(registros, { cargarFoto = async () => null } = {})
     doc.strokeColor('#cad8e2').moveTo(x + 13, y + 185).lineTo(x + ANCHO - 13, y + 185).stroke();
     doc.font('Helvetica-Bold').fontSize(9).fillColor(AZUL).text('DISCIPLINAS / ACTIVIDADES', x + 13, y + 195);
     doc.font('Helvetica').fillColor('#132b3c');
-    textoAjustado(doc, (r.disciplinas || []).join(' · ') || 'Sin disciplinas asignadas', x + 13, y + 214, ANCHO - 26, 70, 11);
+    // Con QR, el pie deja libre la esquina inferior derecha.
+    const conQr = typeof urlVerificacion === 'function';
+    const anchoPie = conQr ? ANCHO - 26 - QR_LADO - 12 : ANCHO - 26;
+    textoAjustado(doc, (r.disciplinas || []).join(' · ') || 'Sin disciplinas asignadas', x + 13, y + 214, ANCHO - 26, conQr ? 46 : 70, 11);
     doc.font('Helvetica').fontSize(8).fillColor('#526477');
-    textoAjustado(doc, [r.olimpiada_localidad, r.fecha_inicio, r.fecha_fin && r.fecha_fin !== r.fecha_inicio ? `al ${r.fecha_fin}` : ''].filter(Boolean).join(' · '), x + 13, y + 292, ANCHO - 26, 22, 8);
-    doc.font('Helvetica-Bold').fillColor(AZUL).fontSize(9).text(`INSCRIPCIÓN APROBADA · Nº ${String(r.id).padStart(3, '0')}`, x + 13, y + ALTO - 23, { width: ANCHO - 26 });
+    textoAjustado(doc, [r.olimpiada_localidad, r.fecha_inicio, r.fecha_fin && r.fecha_fin !== r.fecha_inicio ? `al ${r.fecha_fin}` : ''].filter(Boolean).join(' · '), x + 13, y + (conQr ? 278 : 292), anchoPie, 22, 8);
+    doc.font('Helvetica-Bold').fillColor(AZUL).fontSize(9).text(`INSCRIPCIÓN APROBADA · Nº ${String(r.id).padStart(3, '0')}`, x + 13, y + ALTO - (conQr ? 30 : 23), { width: anchoPie });
+    if (conQr) dibujarQr(doc, urlVerificacion(codigoGafete(r.id)), x + ANCHO - 13 - QR_LADO, y + ALTO - 13 - QR_LADO, QR_LADO);
     doc.restore();
   }
   doc.end();
   return terminado;
 }
 
-module.exports = { generarGafetes, textoAjustado };
+module.exports = { generarGafetes, textoAjustado, codigoGafete, leerCodigoGafete, dibujarQr };
