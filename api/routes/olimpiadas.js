@@ -1435,12 +1435,16 @@ function validarDatosOlimpiada(body, { nueva = false } = {}) {
   const fechaFin = normalizarFechaCivil(body.fecha_fin);
   const inscInicio = normalizarFechaCivil(body.fecha_inicio_inscripcion);
   const inscFin = normalizarFechaCivil(body.fecha_fin_inscripcion);
-  if (!nombre || !fechaInicio || !fechaFin || !inscInicio || !inscFin) {
-    return { error: "Nombre y las cuatro fechas civiles válidas (YYYY-MM-DD) son obligatorios" };
+  if (!nombre || !fechaInicio || !fechaFin) {
+    return { error: "El nombre y las fechas del evento (YYYY-MM-DD) son obligatorios" };
+  }
+  const sinInscripcion = body.fecha_inicio_inscripcion === null && body.fecha_fin_inscripcion === null;
+  if (!sinInscripcion && (!inscInicio || !inscFin)) {
+    return { error: "Ingresá apertura y cierre de inscripción válidos (YYYY-MM-DD) o dejá ambas fechas en null" };
   }
   if (fechaFin < fechaInicio) return { error: "La fecha de fin no puede ser anterior a la de inicio" };
-  if (inscFin < inscInicio) return { error: "El cierre de inscripción no puede ser anterior a su apertura" };
-  if (inscFin > fechaInicio) return { error: "La inscripción debe cerrar antes o el mismo día de inicio de la olimpiada" };
+  if (!sinInscripcion && inscFin < inscInicio) return { error: "El cierre de inscripción no puede ser anterior a su apertura" };
+  if (!sinInscripcion && inscFin > fechaInicio) return { error: "La inscripción debe cerrar antes o el mismo día de inicio de la olimpiada" };
   const disciplinas = Array.isArray(body.disciplinas) ? body.disciplinas : parseJsonSeguro(body.disciplinas, []);
   if (!Array.isArray(disciplinas) || disciplinas.length === 0) {
     return { error: "Elegí al menos una disciplina para la olimpiada" };

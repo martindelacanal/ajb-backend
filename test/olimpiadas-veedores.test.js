@@ -72,7 +72,8 @@ test("público: un equipo interdepartamental se muestra con su nombre combinado"
   assert.equal(publico.participante2, "Bahía Blanca");
   assert.equal(publico.equipo1_id, 3);
   // El lugar que todavía depende de otro resultado muestra el texto que arma el sistema, nunca un nombre cargado a mano.
-  const pendiente = partidoPublico({ participante1: "Ganador de Semifinal A", origen1_tipo: "GANADOR", partido_origen1_id: 4, participante2: "Persona", origen2_tipo: null });
+  const pendiente = partidoPublico({ participante1: "Ganador de Semifinal A", origen1_tipo: "GANADOR", partido_origen1_id: 4, participante2: "Persona", origen2_tipo: null },
+    new Map([[4, { instancia_nombre: "Semifinal", etiqueta: "A" }]]));
   assert.equal(pendiente.participante1, "Ganador de Semifinal A");
   assert.equal(pendiente.participante2, "A confirmar");
 });

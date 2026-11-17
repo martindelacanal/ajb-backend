@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 process.env.JWT_SECRET ||= 'test-only-secret';
-const { partidoPublico, calcularPosiciones } = require('../api/services/olimpiadas-competicion');
+const { partidoPublico, partidosPublicos, conEnVivo, calcularPosiciones } = require('../api/services/olimpiadas-competicion');
 const { leerPartido, validarReferenciasPartido, guardarExtrasPartido, bloquearSinCambios } = require('../api/routes/olimpiadas-contenido').__test;
 const { endpoint } = require('../api/routes/olimpiadas-publico').__test;
 
@@ -24,6 +24,31 @@ test('público: un partido legado sin departamental nunca usa el nombre privado 
   const publico = partidoPublico({ participante1: 'Nombre privado', participante2: 'Otro nombre privado', partido_origen2_id: 15 });
   assert.equal(publico.participante1, 'A confirmar');
   assert.equal(publico.participante2, 'Ganador del partido 15');
+});
+
+test('llaves: las posiciones manuales son públicas sólo mientras ocupan el casillero', () => {
+  for (const rotulo of ['1° Ganador', '2.º Perdedor', 'Mejor Perdedor (1)', 'Peor Ganador', 'Perdedor (2)', 'Ganador A']) {
+    const partido = { participante1: rotulo, participante2: rotulo + ' Ana Pérez' };
+    const publico = partidoPublico(partido);
+    assert.deepEqual([publico.participante1, publico.clasificacion1_manual], [rotulo, true]);
+    assert.deepEqual([publico.participante2, publico.clasificacion2_manual], ['A confirmar', false]);
+    assert.equal(conEnVivo([partido])[0].clasificacion1_manual, true);
+    const definido = partidoPublico({ ...partido, departamental1_id: 4, departamental1_nombre: 'Azul' });
+    assert.deepEqual([definido.participante1, definido.clasificacion1_manual], ['Azul', false]);
+  }
+});
+
+test('llaves: el origen público se describe con la ronda y nunca con los nombres libres de los partidos', () => {
+  const partidos = partidosPublicos([
+    { id: 10, etiqueta: 'A', instancia_nombre: 'Semifinal', participante1: 'Nombre privado' },
+    { id: 11, participante1: 'Nombre privado', origen1_tipo: 'PERDEDOR', partido_origen1_id: 10,
+      participante2: 'Otro nombre privado', origen2_tipo: 'POSICION', origen2_zona: 'B', origen2_posicion: 1 },
+    { id: 12, participante1: 'Otro nombre privado', origen1_tipo: 'GANADOR', partido_origen1_id: 11 },
+  ]);
+  assert.equal(partidos[1].participante1, 'Perdedor de Semifinal A');
+  assert.equal(partidos[1].participante2, '1.º de Zona B');
+  assert.equal(partidos[2].participante1, 'Ganador del partido 11');
+  assert.doesNotMatch(JSON.stringify(partidos), /nombre privado/i);
 });
 
 test('posiciones: resultados corregidos, empates y W.O. se recalculan sin contar encuentros abiertos', () => {

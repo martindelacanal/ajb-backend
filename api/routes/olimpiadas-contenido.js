@@ -863,7 +863,7 @@ router.post("/olimpiadas/novedades/:novedadId(\\d+)/notificar", verifyToken, asy
 // ---------------------------------------------------------------------------
 const SELECT_EVENTO = `
   SELECT e.id, e.olimpiada_id, e.tipo, e.fecha, e.hora_inicio, e.hora_fin, e.titulo, e.descripcion, e.lugar,
-         e.sede_id, s.nombre AS sede_nombre, e.imagen_archivo, e.orden, e.fecha_modificacion
+         e.sede_id, s.nombre AS sede_nombre, e.bloque, e.imagen_archivo, e.orden, e.fecha_modificacion
   FROM olimpiada_evento e
   LEFT JOIN olimpiada_sede s ON s.id = e.sede_id AND s.eliminado = 0`;
 
@@ -878,6 +878,7 @@ async function serializarEvento(fila) {
     titulo: fila.titulo,
     descripcion: fila.descripcion,
     lugar: fila.lugar,
+    bloque: fila.bloque ?? null,
     sede_id: fila.sede_id,
     sede_nombre: fila.sede_nombre || null,
     imagen_url: await firmarSeguro(fila.imagen_archivo),
@@ -1600,7 +1601,7 @@ router.delete("/olimpiadas/enlaces/:enlaceId(\\d+)", verifyToken, async (req, re
 // La sede que se muestra es la del partido y, si no tiene, la de la disciplina (con su mapa).
 const SELECT_PARTIDO = `
   SELECT p.id, p.olimpiada_id, p.disciplina_id, d.nombre AS disciplina_nombre, d.tipo_marcador, p.fecha, p.hora_inicio, p.hora_fin,
-         p.etiqueta, p.fase, p.zona, p.participante1, p.participante2, p.departamental1_id, p.departamental2_id,
+         p.etiqueta, p.fase, p.zona, p.bloque, p.participante1, p.participante2, p.departamental1_id, p.departamental2_id,
          p.equipo1_id, p.equipo2_id, eq1.nombre AS equipo1_nombre, eq2.nombre AS equipo2_nombre,
          p.resultado1, p.resultado2, p.sets, p.ganador, p.estado, p.sede_id,
          IF(s.id IS NULL, sd.nombre, s.nombre) AS sede_nombre, IF(s.id IS NULL, sd.direccion, s.direccion) AS sede_direccion,

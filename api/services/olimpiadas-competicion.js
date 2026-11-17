@@ -90,7 +90,8 @@ function estaEnVivo(partido, ahora = ahoraBuenosAires()) {
 }
 
 function conEnVivo(partidos, ahora = ahoraBuenosAires()) {
-  return (partidos || []).map(p => ({ ...p, sets: leerSets(p.sets), en_vivo: estaEnVivo(p, ahora) }));
+  return (partidos || []).map(p => ({ ...p, sets: leerSets(p.sets), en_vivo: estaEnVivo(p, ahora),
+    clasificacion1_manual: !!rotuloManual(p, 1), clasificacion2_manual: !!rotuloManual(p, 2) }));
 }
 
 // ---------------------------------------------------------------------------
@@ -99,22 +100,54 @@ function conEnVivo(partidos, ahora = ahoraBuenosAires()) {
 
 // Public responses deliberately use an allowlist: registration IDs and free-text notes
 // must never become public merely because another column is added to the private query.
-function partidoPublico(p) {
+// Sólo estos casilleros describen una clasificación sin identificar a una persona.
+const ROTULOS_MANUALES = [
+  /^\d{1,2}\.?[º°] (?:ganador|perdedor)$/i,
+  /^(?:mejor|peor) (?:ganador|perdedor)(?: \(\d{1,2}\))?$/i,
+  /^(?:ganador|perdedor) (?:[a-z]|\(\d{1,2}\))$/i,
+];
+
+function rotuloManual(p, lado) {
+  if (p[`inscripcion${lado}_id`] || p[`departamental${lado}_id`] || p[`equipo${lado}_id`]
+      || p[`origen${lado}_tipo`] || p[`partido_origen${lado}_id`]) return null;
+  const texto = String(p[`participante${lado}`] || '').trim();
+  return ROTULOS_MANUALES.some(formato => formato.test(texto)) ? texto : null;
+}
+
+function rotuloAutomaticoPublico(p, lado, porId) {
+  const tipo = p[`origen${lado}_tipo`];
+  const id = normalizarIdPositivo(p[`partido_origen${lado}_id`]);
+  if (id) {
+    const origen = porId?.get(id);
+    const ronda = [origen?.instancia_nombre || origen?.fase, origen?.etiqueta].filter(Boolean).join(' ');
+    const puesto = tipo === 'PERDEDOR' ? 'Perdedor' : 'Ganador';
+    return ronda ? `${puesto} de ${ronda}` : `${puesto} del partido ${id}`;
+  }
+  const zona = p[`origen${lado}_zona`], posicion = normalizarIdPositivo(p[`origen${lado}_posicion`]);
+  if (tipo === 'POSICION' && zona && posicion) return `${posicion}.º de ${nombreZona(zona)}`;
+  return null;
+}
+
+function partidosPublicos(partidos) {
+  const porId = new Map(partidos.map(p => [Number(p.id), p]));
+  return partidos.map(p => partidoPublico(p, porId));
+}
+
+function partidoPublico(p, porId) {
   const campos = ['id', 'olimpiada_id', 'disciplina_id', 'disciplina_nombre', 'fecha', 'hora_inicio', 'hora_fin', 'etiqueta', 'fase',
     'departamental1_id', 'departamental2_id', 'departamental1_nombre', 'departamental2_nombre', 'resultado1', 'resultado2',
     'ganador', 'estado', 'sede_id', 'sede_nombre', 'orden', 'fecha_modificacion', 'torneo_id', 'torneo_nombre', 'instancia_id',
     'instancia_nombre', 'instancia_orden', 'lugar_id', 'lugar_nombre', 'lugar_predio', 'lugar_direccion', 'lugar_url_mapa',
     'partido_origen1_id', 'partido_origen2_id',
-    'equipo1_id', 'equipo2_id', 'equipo1_nombre', 'equipo2_nombre', 'zona', 'sets', 'en_vivo',
+    'equipo1_id', 'equipo2_id', 'equipo1_nombre', 'equipo2_nombre', 'zona', 'bloque', 'sets', 'en_vivo',
     'origen1_tipo', 'origen2_tipo', 'sede_direccion', 'sede_url_mapa', 'sede_lat', 'sede_lng', 'lugar_lat', 'lugar_lng'];
   const salida = Object.fromEntries(campos.filter(c => p[c] !== undefined).map(c => [c, p[c]]));
   for (const lado of [1, 2]) {
+    const manual = rotuloManual(p, lado);
+    salida[`clasificacion${lado}_manual`] = !!manual;
     if (Number(p.mostrar_nombres_publico) === 1) { salida[`participante${lado}`] = p[`participante${lado}`]; continue; }
-    const origen = p[`partido_origen${lado}_id`];
-    // El texto de un lugar todavía sin definir («Ganador de…», «1.º de Zona A») lo arma el sistema: no trae datos personales.
-    const pendiente = p[`origen${lado}_tipo`] && !p[`inscripcion${lado}_id`] ? p[`participante${lado}`] : null;
-    salida[`participante${lado}`] = p[`equipo${lado}_nombre`] || p[`departamental${lado}_nombre`] || pendiente
-      || (origen ? `Ganador del partido ${origen}` : 'A confirmar');
+    salida[`participante${lado}`] = p[`equipo${lado}_nombre`] || p[`departamental${lado}_nombre`]
+      || manual || rotuloAutomaticoPublico(p, lado, porId) || 'A confirmar';
   }
   return salida;
 }
@@ -488,7 +521,7 @@ function filtroId(query, campo) {
 
 module.exports = {
   CAMPOS_PARTIDO_EXTRA, TIPOS_ORIGEN, TIPOS_MARCADOR, REGLAS_DIVISION, MAX_SETS, MAX_PUESTOS,
-  partidoPublico, marcadorNumerico, calcularPosiciones, listarTorneos, listarEquipos, filtroId,
+  partidoPublico, partidosPublicos, marcadorNumerico, calcularPosiciones, listarTorneos, listarEquipos, filtroId,
   normalizarSets, leerSets, contarSets, ahoraBuenosAires, estaEnVivo, conEnVivo, fechaCivil,
   normalizarNombre, competidorDe, resolverClasificacion, hayCiclo, nombreZona,
   nombrePuesto, repartirPuntos, calcularTablaMedallero, agruparMedallasPorDisciplina, puestosSegunResultados,

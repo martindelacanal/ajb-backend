@@ -4,7 +4,7 @@ const express = require('express');
 const db = require('../connection/connection').promise();
 const { normalizarFechaCivil } = require('../services/valores-dominio');
 const { crearErrorHttp, responderError, obtenerOlimpiada, listarNombresDisciplinas, firmarSeguro, fechaHoyBuenosAires, estaVentanaInscripcionAbierta, calcularGanadores } = require('../services/olimpiadas-comun');
-const { partidoPublico, calcularPosiciones, listarTorneos, listarEquipos, filtroId } = require('../services/olimpiadas-competicion');
+const { partidosPublicos, calcularPosiciones, listarTorneos, listarEquipos, filtroId } = require('../services/olimpiadas-competicion');
 const lectura = require('./olimpiadas-contenido').lecturasPublicas;
 const router = express.Router();
 
@@ -80,7 +80,7 @@ const posicionesPublicas = o => Number(o.posiciones_publicas) === 1;
 ruta('fixture', async (req, o) => {
   const [disciplinas, partidos, torneos, equipos, escudos] = await Promise.all([lectura.listarDisciplinasFixture(db, o.id), partidosFiltrados(req, o),
     listarTorneos(db, o.id), listarEquipos(db, o.id), lectura.listarEscudos(db)]);
-  return { olimpiada: edicionPublica(o), puede_editar: false, disciplinas, partidos: partidos.map(partidoPublico), torneos, equipos, ...escudos,
+  return { olimpiada: edicionPublica(o), puede_editar: false, disciplinas, partidos: partidosPublicos(partidos), torneos, equipos, ...escudos,
     posiciones: posicionesPublicas(o) ? await conLogos(calcularPosiciones(partidos)) : [] };
 });
 ruta('torneos', (req, o) => listarTorneos(db, o.id, filtroId(req.query, 'disciplina_id') ? [filtroId(req.query, 'disciplina_id')] : null));
@@ -95,10 +95,10 @@ ruta('medallero', async (req, o) => {
 });
 ruta('videos', (req, o) => lectura.listarVideos(db, o.id));
 ruta('en-vivo', async (req, o) => {
-  const partidos = await partidosFiltrados(req, o), hoy = fechaHoyBuenosAires();
-  return { actualizado: new Date().toISOString(), en_juego: partidos.filter(p => p.en_vivo).map(partidoPublico),
-    recientes: partidos.filter(p => p.estado === 'FINALIZADO').sort((a, b) => new Date(b.fecha_modificacion) - new Date(a.fecha_modificacion)).slice(0, 20).map(partidoPublico),
-    proximos: partidos.filter(p => p.estado === 'PROGRAMADO' && !p.en_vivo && normalizarFechaCivil(p.fecha) >= hoy).slice(0, 20).map(partidoPublico) };
+  const partidos = partidosPublicos(await partidosFiltrados(req, o)), hoy = fechaHoyBuenosAires();
+  return { actualizado: new Date().toISOString(), en_juego: partidos.filter(p => p.en_vivo),
+    recientes: partidos.filter(p => p.estado === 'FINALIZADO').sort((a, b) => new Date(b.fecha_modificacion) - new Date(a.fecha_modificacion)).slice(0, 20),
+    proximos: partidos.filter(p => p.estado === 'PROGRAMADO' && !p.en_vivo && normalizarFechaCivil(p.fecha) >= hoy).slice(0, 20) };
 });
 ruta('novedades', async (req, o) => {
   const [rows] = await db.query(`SELECT id, titulo, cuerpo, imagen_archivo, fijada, fecha_publicacion, fecha_modificacion FROM olimpiada_novedad

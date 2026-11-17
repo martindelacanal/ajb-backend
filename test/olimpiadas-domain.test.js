@@ -44,6 +44,16 @@ test("olimpiadas valida fechas civiles y cronología completa", () => {
   assert.match(validarDatosOlimpiada(datosOlimpiada({ fecha_inicio_inscripcion: "2027-09-01", fecha_fin_inscripcion: "2027-08-31" })).error, /cierre/);
 });
 
+test("una edición puede publicar el programa sin abrir inscripciones", () => {
+  const sinFechas = { fecha_inicio_inscripcion: null, fecha_fin_inscripcion: null };
+  const { value } = validarDatosOlimpiada(datosOlimpiada(sinFechas));
+  assert.equal(value.fecha_inicio_inscripcion, null);
+  assert.equal(value.fecha_fin_inscripcion, null);
+  assert.equal(estaVentanaInscripcionAbierta(value, "2027-10-09"), false);
+  assert.ok(validarDatosOlimpiada(datosOlimpiada({ fecha_fin_inscripcion: null })).error);
+  assert.ok(validarDatosOlimpiada(datosOlimpiada({ fecha_inicio_inscripcion: "inválida", fecha_fin_inscripcion: null })).error);
+});
+
 test("olimpiadas exige cupos enteros y disciplinas únicas", () => {
   assert.ok(normalizarCupo("0").error);
   assert.deepEqual(normalizarCupo("25"), { value: 25 });

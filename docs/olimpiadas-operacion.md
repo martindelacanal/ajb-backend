@@ -128,6 +128,21 @@ Los listados de competición admiten `disciplina_id`; fixture y posiciones admit
 
 ## Migración e importación
 
+### Programa de Miramar 2026
+
+Antes de desplegar la API que lee los bloques del programa, aplicar los cambios de esquema en cada entorno. El primer comando admite ediciones sin período de inscripción. El segundo agrega `bloque` en partidos y eventos. La opción `--solo-esquema` permite preparar una base de desarrollo conservando sus ediciones.
+
+```powershell
+node scripts/migrar-olimpiadas-inscripcion-opcional.js --target=develop --apply --confirm=OLIMPIADAS_INSCRIPCION_OPCIONAL
+node scripts/importar-olimpiadas-miramar-2026.js --target=develop --apply --solo-esquema --confirm=CARGAR_MIRAMAR_2026
+```
+
+Para producción se usa `--target=production --allow-production` con la conexión TLS administrativa. El importador permite revisar el plan con `--check`. Después de preparar el esquema, `--apply --confirm=CARGAR_MIRAMAR_2026` crea la edición XXVII, carga la programación y archiva la edición Demo en la misma transacción. La marca en `ajb_schema_migration` conserva el estado previo de la Demo y evita que una nueva ejecución duplique datos o revierta ediciones posteriores.
+
+El programa proviene de las hojas **Cronograma 2026** y **Observaciones** de `Cronograma_Olimpiadas_2026.xlsx`. Las referencias a un ganador o perdedor de un partido con letra se completan al cargar el resultado. Los casilleros ordenados como «4° Perdedor» quedan para resolución de la organización. La sección oculta «Observaciones de organización» conserva las 19 notas de la planilla. La numeración y las fechas coinciden con la [convocatoria de la AJB](https://ajb.org.ar/se-vienen-las-xxvii-olimpiadas-judiciales-de-la-ajb/).
+
+### Migraciones anteriores
+
 Ejecutar desde `BACKEND` con los entornos administrativos configurados. La cuenta de ejecución de la API no debe recibir permisos DDL. La operación consolidada utiliza un bloqueo de MySQL, respalda el catálogo previo en `output/olimpiadas-migracion`, crea el esquema faltante, otorga los permisos DML necesarios a las cuentas `miajb_runtime` existentes e importa datos de forma aditiva. Los logos se guardan localmente en `output/olimpiadas-legado` y se suben a S3; no se reemplaza un logo ya asignado.
 
 ```powershell
