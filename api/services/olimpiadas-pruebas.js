@@ -21,6 +21,9 @@ const FORMATOS = ['PARTIDOS', 'TIEMPO', 'PESCA', 'MESAS'];
 const FORMATOS_POR_CATEGORIAS = ['TIEMPO', 'PESCA', 'MESAS'];
 const ESTADOS_PRUEBA = ['PROGRAMADA', 'EN_JUEGO', 'FINALIZADA'];
 const MEDALLAS = ['ORO', 'PLATA', 'BRONCE'];
+// Qué le suma una categoría al medallero por departamental (olimpiada_prueba.suma_medallero).
+// PIEZAS y PESO sólo valen en pesca, que premia dos cosas por categoría.
+const OPCIONES_MEDALLERO = ['TODO', 'PIEZAS', 'PESO', 'NADA'];
 
 const MAX_TIEMPO_MS = 100 * 3600 * 1000 - 1;
 const MAX_PIEZAS = 9999;
@@ -206,6 +209,78 @@ function clasificar(formato, participantes) {
 }
 
 // ---------------------------------------------------------------------------
+// Medallero por departamental
+// ---------------------------------------------------------------------------
+
+// Lee qué suma una categoría al medallero. undefined = no vino.
+function leerSumaMedallero(valor, formato) {
+  if (valor === undefined || valor === null || valor === '') return undefined;
+  const opcion = String(valor).trim().toUpperCase();
+  const validas = formato === 'PESCA' ? OPCIONES_MEDALLERO : ['TODO', 'NADA'];
+  if (!validas.includes(opcion)) throw crearErrorHttp('La opción del medallero es inválida');
+  return opcion;
+}
+
+/**
+ * Las medallas que estas disciplinas le suman solas al medallero: los primeros puestos de cada
+ * categoría (por tiempo), de cada una de las dos tablas de pesca, o los ganadores elegidos en póker.
+ * Cada fila es de UNA persona: dos corredores de la misma departamental en el podio son dos medallas.
+ * Sin departamental no hay medalla (el medallero es por departamental).
+ *
+ * `maxPuesto`: hasta qué puesto reparte puntos la edición (como mínimo los tres primeros).
+ * Devuelve [{ puesto, departamental_id, nombre, prueba_id, participante_id, criterio, clave_origen, detalle }].
+ */
+function medallasDeDisciplina(formato, pruebas, participantes, { maxPuesto = 3 } = {}) {
+  const tope = Math.max(3, Number(maxPuesto) || 3);
+  const medallas = [];
+  const agregar = (p, puesto, prueba, criterio) => {
+    if (!puesto || puesto > tope || !p.departamental_id) return;
+    medallas.push({
+      puesto, departamental_id: Number(p.departamental_id), nombre: p.departamental_nombre || null,
+      prueba_id: prueba ? Number(prueba.id) : null, participante_id: Number(p.id), criterio: criterio || null,
+      clave_origen: `P${Number(p.id)}${criterio ? `:${criterio}` : ''}`,
+      detalle: [prueba?.nombre, criterio === 'PIEZAS' ? 'piezas' : criterio === 'PESO' ? 'peso' : null, p.nombre].filter(Boolean).join(' · '),
+    });
+  };
+  if (formato === 'MESAS') {
+    for (const p of participantes) agregar(p, MEDALLAS[Number(p.puesto) - 1] ? Number(p.puesto) : null, null, null);
+  } else {
+    for (const prueba of [...pruebas].sort(porOrden)) {
+      const suma = OPCIONES_MEDALLERO.includes(prueba.suma_medallero) ? prueba.suma_medallero : 'TODO';
+      if (suma === 'NADA') continue;
+      const propios = participantes.filter(p => Number(p.prueba_id) === Number(prueba.id));
+      if (formato === 'TIEMPO') {
+        for (const p of clasificarTiempo(propios)) agregar(p, p.puesto, prueba, null);
+      } else if (formato === 'PESCA') {
+        const lista = clasificarPesca(propios);
+        if (suma !== 'PESO') for (const p of lista) if (Number(p.piezas) > 0) agregar(p, p.puesto_piezas, prueba, 'PIEZAS');
+        if (suma !== 'PIEZAS') for (const p of lista) if (Number(p.peso_gramos) > 0) agregar(p, p.puesto_peso, prueba, 'PESO');
+      }
+    }
+  }
+  return medallas.sort((a, b) => a.puesto - b.puesto || String(a.nombre).localeCompare(String(b.nombre), 'es') || a.participante_id - b.participante_id);
+}
+
+// El lugar que ocupa una medalla: la categoría, la tabla (en pesca) y el puesto.
+function lugarDeMedalla(medalla) {
+  return `${Number(medalla.prueba_id) || 0}:${medalla.criterio || ''}:${Number(medalla.puesto)}`;
+}
+
+/**
+ * Un ajuste de puntos hecho a mano (por ejemplo «0» para que una categoría no sume) es del lugar,
+ * no de la persona: si después cambia quién quedó primero, el oro de esa categoría sigue valiendo
+ * lo que la administración dejó. Devuelve las medallas nuevas con su `puntos_manual`.
+ */
+function heredarAjustes(anteriores, nuevas) {
+  const ajustes = new Map();
+  for (const medalla of anteriores || []) {
+    if (medalla.puntos_manual === null || medalla.puntos_manual === undefined) continue;
+    if (!ajustes.has(lugarDeMedalla(medalla))) ajustes.set(lugarDeMedalla(medalla), Number(medalla.puntos_manual));
+  }
+  return (nuevas || []).map(medalla => ({ ...medalla, puntos_manual: ajustes.has(lugarDeMedalla(medalla)) ? ajustes.get(lugarDeMedalla(medalla)) : null }));
+}
+
+// ---------------------------------------------------------------------------
 // Lo que sale de la API
 // ---------------------------------------------------------------------------
 const CAMPOS_POR_FORMATO = {
@@ -242,6 +317,8 @@ function armarDisciplina(disciplina, pruebas, participantes, { gestion = false }
       return {
         id: Number(prueba.id), nombre: prueba.nombre, descripcion: prueba.descripcion || null, fecha: prueba.fecha || null,
         hora_inicio: prueba.hora_inicio || null, estado: prueba.estado, orden: Number(prueba.orden) || 0,
+        // Qué le suma al medallero (sólo le sirve a quien carga)
+        ...(gestion && formato !== 'MESAS' ? { suma_medallero: OPCIONES_MEDALLERO.includes(prueba.suma_medallero) ? prueba.suma_medallero : 'TODO' } : {}),
         participantes: lista,
         con_resultado: lista.filter(p => (formato === 'TIEMPO' ? p.tiempo_ms !== null : formato === 'PESCA' ? p.piezas !== null || p.peso_gramos !== null : false)).length,
       };
@@ -265,10 +342,11 @@ function armarDisciplina(disciplina, pruebas, participantes, { gestion = false }
 }
 
 module.exports = {
-  FORMATOS, FORMATOS_POR_CATEGORIAS, ESTADOS_PRUEBA, MEDALLAS,
+  FORMATOS, FORMATOS_POR_CATEGORIAS, ESTADOS_PRUEBA, MEDALLAS, OPCIONES_MEDALLERO,
   MAX_TIEMPO_MS, MAX_PIEZAS, MAX_PESO_GRAMOS, MAX_JUGADORES_MESA, MAX_PRUEBAS_DISCIPLINA, MAX_PARTICIPANTES_CARGA, MAX_PARTICIPANTES_DISCIPLINA,
   formatoSugerido, esPorCategorias, nombreGrupo, sinAcentos,
   leerTiempo, formatearTiempo, leerPiezas, leerPeso, formatearPeso,
   puestosSegun, medallaDe, clasificarTiempo, clasificarPesca, clasificarMesa, clasificar,
+  leerSumaMedallero, medallasDeDisciplina, lugarDeMedalla, heredarAjustes,
   participantePublico, armarDisciplina,
 };

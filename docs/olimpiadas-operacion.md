@@ -55,7 +55,15 @@ Cada categoría o mesa es una fila de `olimpiada_prueba` (nombre, aclaración, d
 
 **En vivo.** Una categoría o una mesa `EN_JUEGO` cuenta como «en vivo»: suma en `conteos.en_vivo` del portal, en `en_vivo` de la disciplina y sale en `pruebas_en_juego` de `…/en-vivo`.
 
-**Medallero.** El medallero por departamental no cambia: para estas disciplinas se sigue cargando a mano en Fixture › Medallero. Las medallas que se ven junto a cada participante son las de su categoría.
+**Medallero.** Estas disciplinas suman solas al medallero por departamental, igual que las de partidos, y todo se puede modificar:
+
+- Cada categoría aporta sus primeros puestos (oro, plata y bronce, y los siguientes si la edición les asigna puntos). En pesca aportan las dos tablas de cada categoría (piezas y peso). En póker, los tres ganadores elegidos. Son medallas `origen = 'AUTO'` y se recalculan con cada resultado, categoría o ganador que cambia.
+- Cada medalla es de una persona: dos corredores de la misma departamental en el podio son dos medallas, y una departamental puede ganar el oro de dos categorías. `olimpiada_medalla` guarda de dónde salió cada una (`prueba_id`, `participante_id`, `criterio`, `clave_origen`) y su clave única incluye ese origen. Un empate reparte dos medallas iguales con los puntos completos. Sin departamental no hay medalla.
+- **Que una categoría no sume.** `olimpiada_prueba.suma_medallero`: `TODO` (por defecto), `NADA` o, en pesca, `PIEZAS` / `PESO` para que sume una sola de las dos tablas. Lo decide la administración al crear o editar la categoría; un veedor no lo cambia.
+- **Cambiar los puntos de una medalla.** Como en cualquier disciplina, en Fixture › Medallero (`PUT /olimpiadas/medallas/:medallaId/puntos`; `0` para que no sume, vacío para volver al cálculo). El ajuste queda en el lugar —esa categoría, esa tabla y ese puesto—: si después cambia quién lo ocupa, sigue valiendo lo que se dejó.
+- **Cargar la disciplina a mano.** También como en cualquier disciplina: desde ese momento no se recalcula hasta elegir «volver al cálculo automático». A mano, una departamental ocupa cada puesto una sola vez.
+
+Las medallas que se ven junto a cada participante son siempre las de su categoría, sume o no al medallero.
 
 El servidor funciona aunque la migración todavía no se haya aplicado: mientras falten la columna o las tablas, ninguna disciplina figura por categorías y las escrituras responden 503. Vuelve a comprobarlo solo (cada 30 segundos), sin reiniciar.
 
@@ -203,7 +211,7 @@ node scripts/migrar-olimpiadas-veedores.js --apply --target=production --allow-p
 
 Sin `--target` usa las variables `DB_*` del entorno (así se corre en el servidor). La primera vez también asigna a cada disciplina su forma de cargar el resultado, marca las categorías que no son deporte y convierte los puestos compartidos ya cargados en equipos interdepartamentales.
 
-Las disciplinas por categorías y mesas requieren `migrar-olimpiadas-pruebas.js` (idempotente; agrega `olimpiada_disciplina.formato_competencia` y las tablas `olimpiada_prueba` y `olimpiada_prueba_participante`, con sus permisos DML para `miajb_runtime`). La primera vez asigna el formato por el nombre de la disciplina: maratón y natación por tiempo, pesca y póker con los suyos. Conviene aplicarla antes de desplegar el código; si se despliega primero, todo sigue funcionando como antes hasta que se aplique:
+Las disciplinas por categorías y mesas requieren `migrar-olimpiadas-pruebas.js` (idempotente; agrega `olimpiada_disciplina.formato_competencia`, las tablas `olimpiada_prueba` y `olimpiada_prueba_participante` con sus permisos DML para `miajb_runtime`, y lo que usa el medallero: cuatro columnas en `olimpiada_medalla` y su clave única `uq_oli_medalla_origen`, que reemplaza a `uq_oli_medalla`). La primera vez asigna el formato por el nombre de la disciplina: maratón y natación por tiempo, pesca y póker con los suyos. Se puede volver a correr sobre una base que ya tenía la primera versión: agrega sólo lo del medallero. Conviene aplicarla antes de desplegar el código; si se despliega primero, todo sigue funcionando como antes hasta que se aplique (y con sólo la primera versión aplicada, las categorías funcionan pero no pasan sus medallas al medallero):
 
 ```powershell
 node scripts/migrar-olimpiadas-pruebas.js --check --target=develop

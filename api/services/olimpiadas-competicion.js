@@ -416,7 +416,8 @@ function agruparMedallasPorDisciplina(disciplinas, medallas, { puntos = null, di
     if (!ganador) {
       ganador = equipoId
         ? { tipo: 'EQUIPO', equipo_id: equipoId, departamental_id: null, nombre: medalla.equipo_nombre || '', departamentales: [] }
-        : { tipo: 'DEPARTAMENTAL', equipo_id: null, departamental_id: departamental.id, nombre: departamental.nombre, departamentales: [] };
+        // `detalle`: en las disciplinas por categorías, de qué categoría es la medalla y quién la ganó
+        : { tipo: 'DEPARTAMENTAL', equipo_id: null, departamental_id: departamental.id, nombre: departamental.nombre, detalle: medalla.detalle || null, departamentales: [] };
       puesto.ganadores.push(ganador);
     }
     ganador.departamentales.push(detalle);

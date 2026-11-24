@@ -3,9 +3,12 @@
 /**
  * Olimpiadas · disciplinas que no se juegan 1 contra 1 (maratón, natación, pesca, póker).
  *
- * Agrega cómo se compite en cada disciplina (`olimpiada_disciplina.formato_competencia`) y las
+ * Agrega cómo se compite en cada disciplina (`olimpiada_disciplina.formato_competencia`), las
  * tablas de categorías / mesas (`olimpiada_prueba`) y de sus participantes
- * (`olimpiada_prueba_participante`).
+ * (`olimpiada_prueba_participante`), y lo que necesita el medallero para sumar solo las medallas
+ * de cada categoría (columnas de `olimpiada_medalla` y su clave única).
+ *
+ * Se puede volver a correr sobre una base que ya tenía la primera versión: agrega sólo lo que falta.
  *
  * Idempotente. Por defecto sólo informa lo pendiente (check); con --apply lo aplica.
  *
@@ -30,7 +33,18 @@ const CHARSET = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_c
 const COLUMNAS = [
   ["olimpiada_disciplina", "formato_competencia",
     "ENUM('PARTIDOS','TIEMPO','PESCA','MESAS') NOT NULL DEFAULT 'PARTIDOS' COMMENT 'PARTIDOS = 1 contra 1; TIEMPO = categorías por tiempo; PESCA = categorías por piezas y peso; MESAS = póker'"],
+  ["olimpiada_prueba", "suma_medallero",
+    "ENUM('TODO','PIEZAS','PESO','NADA') NOT NULL DEFAULT 'TODO' COMMENT 'Qué le suma la categoría al medallero (PIEZAS y PESO: sólo una de las dos tablas de pesca)'"],
+  // Una medalla que salió de una categoría: de quién es y de cuál de las tablas (pesca)
+  ["olimpiada_medalla", "prueba_id", "INT NULL COMMENT 'Categoría de la que salió la medalla (disciplinas por categorías)'"],
+  ["olimpiada_medalla", "participante_id", "INT NULL COMMENT 'Participante que la ganó (olimpiada_prueba_participante)'"],
+  ["olimpiada_medalla", "criterio", "ENUM('PIEZAS','PESO') NULL COMMENT 'Pesca: de cuál de las dos tablas salió'"],
+  ["olimpiada_medalla", "clave_origen", "VARCHAR(40) NOT NULL DEFAULT '' COMMENT 'Distingue medallas del mismo puesto y departamental que vienen de categorías o personas distintas'"],
 ];
+
+// Con varias categorías, una departamental puede ganar dos oros en la misma disciplina: la clave
+// única pasa a incluir de dónde salió cada medalla (para las de partidos y las manuales queda vacía).
+const INDICE_MEDALLA = { nuevo: "uq_oli_medalla_origen", anterior: "uq_oli_medalla", columnas: "(olimpiada_id, disciplina_id, puesto, departamental_id, clave_origen)" };
 
 const TABLAS = {
   olimpiada_prueba: `CREATE TABLE IF NOT EXISTS olimpiada_prueba (
@@ -42,6 +56,7 @@ const TABLAS = {
     fecha DATE NULL,
     hora_inicio TIME NULL,
     estado ENUM('PROGRAMADA','EN_JUEGO','FINALIZADA') NOT NULL DEFAULT 'PROGRAMADA',
+    suma_medallero ENUM('TODO','PIEZAS','PESO','NADA') NOT NULL DEFAULT 'TODO' COMMENT 'Qué le suma la categoría al medallero (PIEZAS y PESO: sólo una de las dos tablas de pesca)',
     orden INT NOT NULL DEFAULT 0,
     eliminado TINYINT(1) NOT NULL DEFAULT 0,
     fecha_creacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -88,24 +103,45 @@ async function existeTabla(db, tabla) {
   return rows.length > 0;
 }
 
+async function existeIndice(db, tabla, indice) {
+  const [rows] = await db.query(
+    "SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1",
+    [tabla, indice]
+  );
+  return rows.length > 0;
+}
+
 async function migrar(db, aplicar = false, { otorgar = true } = {}) {
   const pendientes = [];
   const informe = [];
 
+  // Primero las tablas: una base nueva las crea ya con todas sus columnas.
+  const tablasNuevas = new Set();
+  for (const [tabla, ddl] of Object.entries(TABLAS)) {
+    if (await existeTabla(db, tabla)) continue;
+    pendientes.push(`Crear ${tabla}`);
+    tablasNuevas.add(tabla);
+    if (aplicar) await db.query(ddl);
+  }
+
   const columnasNuevas = new Set();
   for (const [tabla, columna, definicion] of COLUMNAS) {
-    if (await existeColumna(db, tabla, columna)) continue;
+    // La tabla recién creada (o por crear) ya trae la columna
+    if (tablasNuevas.has(tabla) || await existeColumna(db, tabla, columna)) continue;
     pendientes.push(`Agregar ${tabla}.${columna}`);
     columnasNuevas.add(`${tabla}.${columna}`);
     if (aplicar) await db.query(`ALTER TABLE \`${tabla}\` ADD COLUMN \`${columna}\` ${definicion}`);
   }
 
-  const tablasNuevas = [];
-  for (const [tabla, ddl] of Object.entries(TABLAS)) {
-    if (await existeTabla(db, tabla)) continue;
-    pendientes.push(`Crear ${tabla}`);
-    tablasNuevas.push(tabla);
-    if (aplicar) await db.query(ddl);
+  // La clave única del medallero: se agrega la nueva y se quita la anterior en el mismo paso.
+  if (!(await existeIndice(db, "olimpiada_medalla", INDICE_MEDALLA.nuevo))) {
+    const quitar = await existeIndice(db, "olimpiada_medalla", INDICE_MEDALLA.anterior);
+    pendientes.push(`Clave única de olimpiada_medalla con el origen de cada medalla${quitar ? " (reemplaza a la anterior)" : ""}`);
+    if (aplicar) {
+      await db.query(
+        `ALTER TABLE olimpiada_medalla ADD UNIQUE KEY \`${INDICE_MEDALLA.nuevo}\` ${INDICE_MEDALLA.columnas}${quitar ? `, DROP INDEX \`${INDICE_MEDALLA.anterior}\`` : ""}`
+      );
+    }
   }
 
   // Sólo la primera vez: después manda lo que la administración elija en la ficha de la disciplina.
@@ -194,4 +230,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { migrar, COLUMNAS, TABLAS, CONFIRMACION };
+module.exports = { migrar, COLUMNAS, TABLAS, INDICE_MEDALLA, CONFIRMACION };
