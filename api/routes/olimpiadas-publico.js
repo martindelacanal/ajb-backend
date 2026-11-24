@@ -73,6 +73,8 @@ ruta('portal', async (req, o) => {
   const [[counts]] = await db.query(`SELECT ${sql}`, Object.keys(especificaciones).map(() => o.id));
   for (const nombre of Object.keys(especificaciones)) conteos[nombre] = Number(counts[nombre]) || 0;
   if (Number(o.medallero_publicado) !== 1) conteos.medallas = 0;
+  // Las categorías y mesas que se están disputando también cuentan como «en vivo»
+  conteos.en_vivo += (await lectura.pruebasEnJuego(db, o.id)).length;
   const [videos] = await db.query("SELECT id, titulo, url, descripcion FROM olimpiada_enlace WHERE olimpiada_id = ? AND eliminado = 0 AND tipo = 'VIDEOS' ORDER BY orden, id", [o.id]);
   const disciplinas = (await listarNombresDisciplinas(db, o.id)).get(Number(o.id)) || [];
   return { olimpiada: { ...edicionPublica(o), videos, disciplinas }, conteos, mi_inscripcion: null, hoteles_mi_departamental: [], departamental_id: null };
@@ -97,6 +99,14 @@ ruta('fixture', async (req, o) => {
   return { olimpiada: edicionPublica(o), puede_editar: false, disciplinas, partidos: partidosPublicos(partidos), torneos, equipos, ...escudos,
     posiciones: posicionesPublicas(o) ? await conLogos(calcularPosiciones(partidos)) : [] };
 });
+// Disciplinas que no se juegan 1 contra 1 (maratón, natación, pesca, póker): categorías o mesas con
+// sus participantes. Los nombres se publican: es lo que se muestra en la premiación.
+ruta('pruebas', async (req, o) => {
+  const disciplinaId = filtroId(req.query, 'disciplina_id');
+  const [disciplinas, escudos] = await Promise.all([
+    lectura.listarPruebas(db, o.id, { disciplinaIds: disciplinaId ? [disciplinaId] : null }), lectura.listarEscudos(db)]);
+  return { puede_editar: false, disciplinas, departamentales: escudos.departamentales };
+});
 ruta('torneos', (req, o) => listarTorneos(db, o.id, filtroId(req.query, 'disciplina_id') ? [filtroId(req.query, 'disciplina_id')] : null));
 ruta('posiciones', async (req, o) => (posicionesPublicas(o)
   ? { tabla: await conLogos(calcularPosiciones(await partidosFiltrados(req, o))), criterio: 'Victoria 3 puntos · empate 1 punto' }
@@ -110,7 +120,7 @@ ruta('medallero', async (req, o) => {
 ruta('videos', (req, o) => lectura.listarVideos(db, o.id));
 ruta('en-vivo', async (req, o) => {
   const partidos = partidosPublicos(await partidosFiltrados(req, o)), hoy = fechaHoyBuenosAires();
-  return { actualizado: new Date().toISOString(), en_juego: partidos.filter(p => p.en_vivo),
+  return { actualizado: new Date().toISOString(), en_juego: partidos.filter(p => p.en_vivo), pruebas_en_juego: await lectura.pruebasEnJuego(db, o.id),
     recientes: partidos.filter(p => p.estado === 'FINALIZADO').sort((a, b) => new Date(b.fecha_modificacion) - new Date(a.fecha_modificacion)).slice(0, 20),
     proximos: partidos.filter(p => p.estado === 'PROGRAMADO' && !p.en_vivo && normalizarFechaCivil(p.fecha) >= hoy).slice(0, 20) };
 });

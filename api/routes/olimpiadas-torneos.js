@@ -2,6 +2,8 @@
 const { verificarAccesoCompeticion, exigirEdicionVoluntario, exigirDisciplinaVoluntario, esVoluntario } = require('../security/olimpiadas-voluntarios');
 const { getCabecera, esSuperior, crearErrorHttp, responderError, normalizarIds, normalizarIdPositivo, firmarSeguro } = require('../services/olimpiadas-comun');
 const { calcularPosiciones, listarTorneos, listarEquipos, filtroId } = require('../services/olimpiadas-competicion');
+// Se pide al usarlo: este archivo y el de las categorías se cargan desde el mismo router de contenido.
+const esquemaPruebas = conexion => require('./olimpiadas-pruebas').esquemaDisponible(conexion);
 
 module.exports = function registrarTorneos(router, helpers) {
   const { db, cargarOlimpiada, enTransaccion, historial, historialCambios, leerTexto, leerIdOpcional, leerEnum, leerEntero, validarDisciplinaDeOlimpiada, consultarPartidos, bloquearSinCambios, puedeVerPosiciones } = helpers;
@@ -164,11 +166,15 @@ module.exports = function registrarTorneos(router, helpers) {
     // «medallero»: cambios de medallas, puntos y ajustes de publicación. Sólo la administración provincial.
     const ambitoMedallero = req.query.ambito === 'medallero';
     if (ambitoMedallero) soloSuperior(cabecera);
-    const condiciones = ["h.olimpiada_id = ?", ambitoMedallero ? "h.entidad IN ('MEDALLA', 'AJUSTE')" : "h.entidad IN ('PARTIDO', 'TORNEO', 'DISCIPLINA_INFO', 'EQUIPO')"], params = [olimpiadaId];
+    // Las categorías, mesas y participantes de las disciplinas que no se juegan 1 contra 1 (si el servidor ya las tiene)
+    const conPruebas = !ambitoMedallero && await esquemaPruebas(db);
+    const entidades = ['PARTIDO', 'TORNEO', 'DISCIPLINA_INFO', 'EQUIPO', ...(conPruebas ? ['PRUEBA', 'PRUEBA_PARTICIPANTE'] : [])].map(e => `'${e}'`).join(', ');
+    const condiciones = ["h.olimpiada_id = ?", ambitoMedallero ? "h.entidad IN ('MEDALLA', 'AJUSTE')" : `h.entidad IN (${entidades})`], params = [olimpiadaId];
     const disciplinaId = ambitoMedallero ? null : filtroId(req.query, 'disciplina_id');
     if (disciplinaId) await exigirDisciplinaVoluntario({ db, cabecera, olimpiadaId, disciplinaId });
-    if (asignadas || disciplinaId) { condiciones.push('COALESCE(p.disciplina_id, t.disciplina_id, e.disciplina_id, IF(h.entidad = \'DISCIPLINA_INFO\', h.entidad_id, NULL)) IN (?)'); params.push(disciplinaId ? [disciplinaId] : asignadas.length ? asignadas : [0]); }
-    const from = `FROM olimpiada_historial h LEFT JOIN usuario u ON u.id = h.usuario_id LEFT JOIN olimpiada_partido p ON h.entidad = 'PARTIDO' AND p.id = h.entidad_id LEFT JOIN olimpiada_torneo t ON h.entidad = 'TORNEO' AND t.id = h.entidad_id LEFT JOIN olimpiada_equipo e ON h.entidad = 'EQUIPO' AND e.id = h.entidad_id WHERE ${condiciones.join(' AND ')}`;
+    if (asignadas || disciplinaId) { condiciones.push(`COALESCE(p.disciplina_id, t.disciplina_id, e.disciplina_id, ${conPruebas ? 'pr.disciplina_id, pp.disciplina_id, ' : ''}IF(h.entidad = 'DISCIPLINA_INFO', h.entidad_id, NULL)) IN (?)`); params.push(disciplinaId ? [disciplinaId] : asignadas.length ? asignadas : [0]); }
+    const uniones = conPruebas ? " LEFT JOIN olimpiada_prueba pr ON h.entidad = 'PRUEBA' AND pr.id = h.entidad_id LEFT JOIN olimpiada_prueba_participante pp ON h.entidad = 'PRUEBA_PARTICIPANTE' AND pp.id = h.entidad_id" : '';
+    const from = `FROM olimpiada_historial h LEFT JOIN usuario u ON u.id = h.usuario_id LEFT JOIN olimpiada_partido p ON h.entidad = 'PARTIDO' AND p.id = h.entidad_id LEFT JOIN olimpiada_torneo t ON h.entidad = 'TORNEO' AND t.id = h.entidad_id LEFT JOIN olimpiada_equipo e ON h.entidad = 'EQUIPO' AND e.id = h.entidad_id${uniones} WHERE ${condiciones.join(' AND ')}`;
     const [[count]] = await db.query(`SELECT COUNT(*) AS cantidad ${from}`, params);
     const [rows] = await db.query(`SELECT h.*, u.nombre AS usuario_nombre, u.apellido AS usuario_apellido ${from} ORDER BY h.id DESC LIMIT 50 OFFSET ?`, [...params, (page - 1) * 50]);
     res.json({ results: rows, totalItems: Number(count.cantidad), page, pageSize: 50 });
