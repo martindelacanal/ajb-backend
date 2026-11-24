@@ -36,6 +36,18 @@ function datosOlimpiada(overrides = {}) {
   };
 }
 
+test("la ruta pública es opcional, admite borrado y protege rutas y formatos inválidos", () => {
+  const validar = ruta_publica => validarDatosOlimpiada(datosOlimpiada({ ruta_publica }));
+  assert.equal("ruta_publica" in validar(undefined).value.opcionales, false);
+  for (const vacio of ["", null]) assert.equal(validar(vacio).value.opcionales.ruta_publica, null);
+  for (const ruta of ["x", "olimpiadas2026", "miramar-2026", "a".repeat(80)]) {
+    assert.equal(validar(ruta).value.opcionales.ruta_publica, ruta);
+  }
+  for (const ruta of ["login", "api", "assets", "olimpiadas", "turismo", "/miramar", "MIRAMAR", "a--b", "a-", "-a", "á", "a ", "a".repeat(81), 26, {}]) {
+    assert.ok(validar(ruta).error);
+  }
+});
+
 test("olimpiadas valida fechas civiles y cronología completa", () => {
   assert.equal(validarDatosOlimpiada(datosOlimpiada()).error, undefined);
   assert.match(validarDatosOlimpiada(datosOlimpiada({ fecha_inicio: "2027-10-10T00:00:00Z" })).error, /YYYY-MM-DD/);

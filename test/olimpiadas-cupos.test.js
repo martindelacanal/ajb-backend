@@ -53,6 +53,7 @@ async function servidor(t, actor) {
   };
   contexto.query = async (sql, params = []) => {
     contexto.consultas.push({ sql, params });
+    if (sql === "SELECT id FROM olimpiada WHERE ruta_publica = ?") return [params[0] === "miramar" ? [{ id: 7 }] : []];
     if (/u\.\*, r\.nombre AS rol_nombre/.test(sql)) return [AFILIADOS[params[0]] ? [{ ...AFILIADOS[params[0]] }] : []];
     if (/FROM usuario u[\s\S]+INNER JOIN rol r/.test(sql)) return [[{ ...contexto.actor }]];
     if (/SELECT \* FROM olimpiada WHERE id = \?/.test(sql)) return [Number(params[0]) === 7 ? [{ ...OLIMPIADA }] : []];
@@ -91,6 +92,18 @@ async function servidor(t, actor) {
 }
 
 const consultaOcupacion = (contexto) => contexto.consultas.find((c) => /FROM olimpiada_disciplina_config c/.test(c.sql));
+
+test("disponibilidad de ruta distingue propia, ocupada, libre y reservada para administración", async t => {
+  const base = "/olimpiadas/ruta-publica/disponibilidad?ruta=";
+  const admin = await servidor(t, { id: 1, rol: "admin" });
+  assert.equal((await admin.pedir(base + "miramar&id=7")).body.disponible, true);
+  assert.equal((await admin.pedir(base + "miramar&id=8")).body.disponible, false);
+  assert.equal((await admin.pedir(base + "miramar")).body.disponible, false);
+  assert.equal((await admin.pedir(base + "disponible")).body.disponible, true);
+  assert.equal((await admin.pedir(base + "login")).body.disponible, false);
+  const afiliado = await servidor(t, { id: 20, rol: "afiliado" });
+  assert.equal((await afiliado.pedir(base + "miramar")).status, 401);
+});
 
 test("cupos: sin persona ni inscripción pide elegir al afiliado", async (t) => {
   const { pedir, contexto } = await servidor(t, { id: 1, rol: "admin" });

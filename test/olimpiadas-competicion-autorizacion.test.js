@@ -27,6 +27,11 @@ async function servidor(t, opciones = {}) {
     contexto.consultas.push({ sql, params });
     if (/FROM olimpiada_voluntario WHERE/.test(sql)) return [[contexto.cuenta]];
     if (/FROM olimpiada_voluntario_disciplina a/.test(sql)) return [Number(params[1]) === 7 ? contexto.asignadas.map((disciplina_id) => ({ ...contexto.edicion, disciplina_id })) : []];
+    if (/FROM olimpiada WHERE ruta_publica/.test(sql)) {
+      assert.match(sql, /eliminado = 0 AND habilitado = 'Y' AND publicada_publico = 1/);
+      const e = contexto.edicion;
+      return [params[0] === e.ruta_publica && !e.eliminado && e.habilitado === "Y" && e.publicada_publico === 1 ? [e] : []];
+    }
     if (/FROM olimpiada WHERE/.test(sql)) return [contexto.edicion.eliminado ? [] : [{ ...contexto.edicion, id: Number(params[0]) }]];
     if (/FROM olimpiada o WHERE/.test(sql)) {
       assert.match(sql, /o\.eliminado = 0 AND o\.habilitado = 'Y' AND o\.publicada_publico = 1/);
@@ -202,13 +207,20 @@ test("público: las ediciones pasadas figuran en el índice y se abren sin sesi�
 });
 
 test("público: ocultar, deshabilitar o eliminar una edición pasada bloquea índice y enlace compartido", async (t) => {
-  const { pedir, contexto } = await servidor(t, { edicion: { fecha_inicio: "2020-09-23", fecha_fin: "2020-09-26" } });
+  const { pedir, contexto } = await servidor(t, { edicion: { fecha_inicio: "2020-09-23", fecha_fin: "2020-09-26", ruta_publica: "miramar" } });
+  const enlace = () => pedir("/olimpiadas/publico/ruta/miramar", { anonimo: true });
+  const encontrada = await enlace();
+  assert.equal(encontrada.status, 200);
+  assert.equal(encontrada.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await encontrada.json(), { id: 7 });
+  assert.equal((await pedir("/olimpiadas/publico/ruta/otra", { anonimo: true })).status, 404);
   for (const estado of [
     { publicada_publico: 0, habilitado: "Y", eliminado: 0 },
     { publicada_publico: 1, habilitado: "N", eliminado: 0 },
     { publicada_publico: 1, habilitado: "Y", eliminado: 1 },
   ]) {
     Object.assign(contexto.edicion, estado);
+    assert.equal((await enlace()).status, 404);
     assert.deepEqual(await (await pedir("/olimpiadas/publico/ediciones", { anonimo: true })).json(), []);
     assert.equal((await pedir("/olimpiadas/publico/7/portal", { anonimo: true })).status, 404);
     assert.equal((await pedir("/olimpiadas/publico/7/fixture", { anonimo: true })).status, 404);

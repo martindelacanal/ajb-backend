@@ -3,6 +3,7 @@
 const express = require('express');
 const db = require('../connection/connection').promise();
 const { normalizarFechaCivil } = require('../services/valores-dominio');
+const { validarRutaPublica } = require('../services/olimpiadas-ruta-publica');
 const { crearErrorHttp, responderError, obtenerOlimpiada, listarNombresDisciplinas, firmarSeguro, fechaHoyBuenosAires, estaVentanaInscripcionAbierta, calcularGanadores } = require('../services/olimpiadas-comun');
 const { partidosPublicos, calcularPosiciones, listarTorneos, listarEquipos, filtroId } = require('../services/olimpiadas-competicion');
 const lectura = require('./olimpiadas-contenido').lecturasPublicas;
@@ -26,6 +27,19 @@ const endpoint = (fn, obtener = obtenerOlimpiada) => async (req, res) => {
   } catch (error) { responderError(res, error, 'No se pudo cargar la olimpiada pública'); }
 };
 const ruta = (sufijo, fn) => router.get(`/olimpiadas/publico/:id(\\d+)/${sufijo}`, endpoint(fn));
+
+router.get('/olimpiadas/publico/ruta/:ruta', async (req, res) => {
+  try {
+    res.set('Cache-Control', 'no-store');
+    const { value: ruta } = validarRutaPublica(req.params.ruta);
+    if (ruta) {
+      const [[edicion]] = await db.query(`SELECT id FROM olimpiada WHERE ruta_publica = ?
+        AND eliminado = 0 AND habilitado = 'Y' AND publicada_publico = 1`, [ruta]);
+      if (edicion) return res.json({ id: edicion.id });
+    }
+    res.status(404).json('La olimpiada no está publicada');
+  } catch (error) { responderError(res, error, 'No se pudo cargar la olimpiada pública'); }
+});
 
 router.get('/olimpiadas/publico/ediciones', async (req, res) => {
   try {

@@ -25,6 +25,7 @@ const router = express.Router();
 const mysqlConnection = require("../connection/connection");
 const { registrarErrorRuta } = require("../services/errores");
 const { normalizarFechaCivil } = require("../services/valores-dominio");
+const { validarRutaPublica, esRutaDuplicada, MENSAJE_OCUPADA } = require("../services/olimpiadas-ruta-publica");
 const {
   // archivos / S3
   firmarSeguro,
@@ -1287,7 +1288,7 @@ router.get("/olimpiadas", verifyToken, async (req, res) => {
               o.fecha_inicio, o.fecha_fin, o.fecha_inicio_inscripcion, o.fecha_fin_inscripcion,
               o.texto_licencia, o.habilitado, o.fecha_creacion,
               o.valor_bono, o.bonos_afiliado, o.exigir_bonos_para_validar,
-              o.fecha_sorteo, o.sorteo_publicado, o.publicada_publico,
+              o.fecha_sorteo, o.sorteo_publicado, o.publicada_publico, o.ruta_publica,
               (SELECT COUNT(*) FROM olimpiada_inscripcion i
                WHERE i.olimpiada_id = o.id AND i.eliminado = 0
                  AND (? IS NULL OR i.departamental_id = ?)) AS inscriptos,
@@ -1403,9 +1404,30 @@ router.get("/olimpiadas/:id(\\d+)/cupos", verifyToken, async (req, res) => {
   }
 });
 
-// Campos opcionales de la edición (bonos y flujo). Sólo se devuelven los que vinieron informados.
+router.get("/olimpiadas/ruta-publica/disponibilidad", verifyToken, async (req, res) => {
+  try {
+    if (!esSuperior(getCabecera(req))) return res.status(401).json("No autorizado");
+    res.set("Cache-Control", "no-store");
+    const id = normalizarIdPositivo(req.query.id);
+    if (req.query.id !== undefined && !id) return res.status(400).json("ID de olimpiada inválido");
+    const { value: ruta, error } = validarRutaPublica(req.query.ruta);
+    if (error || !ruta) return res.json({ disponible: false, ruta: null, mensaje: error || "Ingresá una ruta." });
+    const [[ocupante]] = await mysqlConnection.promise().query("SELECT id FROM olimpiada WHERE ruta_publica = ?", [ruta]);
+    const disponible = !ocupante || Number(ocupante.id) === id;
+    res.json({ disponible, ruta, mensaje: disponible ? "Ruta disponible." : MENSAJE_OCUPADA });
+  } catch (error) {
+    responderError(res, error, "No se pudo verificar la ruta pública");
+  }
+});
+
+// Sólo se devuelven los opcionales informados, para preservar ediciones desde clientes anteriores.
 function normalizarOpcionalesOlimpiada(body) {
   const opcionales = {};
+  if (body.ruta_publica !== undefined) {
+    const ruta = validarRutaPublica(body.ruta_publica);
+    if (ruta.error) return ruta;
+    opcionales.ruta_publica = ruta.value;
+  }
   if (valorInformado(body.valor_bono)) {
     const valor = normalizarMonto(body.valor_bono);
     if (valor === null) return { error: "El valor del bono debe ser un monto válido (hasta 2 decimales)" };
@@ -1535,6 +1557,7 @@ router.post("/olimpiadas", verifyToken, async (req, res) => {
     res.status(201).json({ success: true, id: olimpiadaId, message: "Olimpiada creada" });
   } catch (error) {
     if (connection) await connection.rollback();
+    if (esRutaDuplicada(error)) return res.status(409).json(MENSAJE_OCUPADA);
     responderError(res, error, "Error al crear la olimpiada");
   } finally {
     if (connection) connection.release();
@@ -1607,7 +1630,8 @@ router.put("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
       ["texto_licencia", anterior.texto_licencia, datos.texto_licencia],
     ];
     for (const [campo, valor] of Object.entries(datos.opcionales)) {
-      camposComparables.push([campo, String(Number(anterior[campo]) || 0), String(valor)]);
+      if (campo === "ruta_publica") camposComparables.push([campo, anterior[campo], valor]);
+      else camposComparables.push([campo, String(Number(anterior[campo]) || 0), String(valor)]);
     }
     for (const [campo, valorAnterior, valorNuevo] of camposComparables) {
       if ((valorAnterior ?? "") !== (valorNuevo ?? "")) {
@@ -1632,6 +1656,7 @@ router.put("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
     res.status(200).json({ success: true, message: "Olimpiada actualizada" });
   } catch (error) {
     if (connection) await connection.rollback();
+    if (esRutaDuplicada(error)) return res.status(409).json(MENSAJE_OCUPADA);
     responderError(res, error, "Error al actualizar la olimpiada");
   } finally {
     if (connection) connection.release();
@@ -1650,7 +1675,7 @@ router.delete("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
     await connection.beginTransaction();
     const olimpiada = await bloquearOlimpiada(connection, olimpiadaId);
     if (!olimpiada) throw crearErrorHttp("Olimpiada no encontrada", 404);
-    await connection.query("UPDATE olimpiada SET eliminado = 1 WHERE id = ? AND eliminado = 0", [olimpiadaId]);
+    await connection.query("UPDATE olimpiada SET eliminado = 1, ruta_publica = NULL WHERE id = ? AND eliminado = 0", [olimpiadaId]);
     await registrarHistorial(connection, {
       entidad: "OLIMPIADA", entidad_id: olimpiadaId, olimpiada_id: olimpiadaId,
       usuario_id: cabecera.id, usuario_rol: cabecera.rol,
