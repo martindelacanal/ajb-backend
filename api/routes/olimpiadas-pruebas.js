@@ -310,7 +310,7 @@ function registrarPruebas(router, helpers) {
       }
       await connection.query('UPDATE olimpiada_prueba SET eliminado = 1 WHERE id = ?', [pruebaId]);
       await historial(connection, cabecera, {
-        entidad: 'PRUEBA', entidad_id: pruebaId, olimpiada_id: actual.olimpiada_id, tipo_operacion: 'DELETE', campo_modificado: disciplina.nombre,
+        entidad: 'PRUEBA', entidad_id: pruebaId, olimpiada_id: actual.olimpiada_id, tipo_operacion: 'DELETE',
         valor_anterior: actual.nombre, observacion: cantidad ? `Tenía ${cantidad} participante(s)` : null,
       });
     });
