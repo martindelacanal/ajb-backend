@@ -2905,6 +2905,7 @@ async function procesarLoteFotos(
         olimpiada_id: olimpiadaId,
         archivo: imagen.key,
         miniatura_archivo: imagen.miniatura_key,
+        mime: imagen.mime,
         ancho: imagen.ancho,
         alto: imagen.alto,
         epigrafe: comunes.epigrafe ?? null,

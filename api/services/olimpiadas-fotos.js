@@ -30,18 +30,25 @@ const TABLA_ETIQUETAS = `JSON_TABLE(${ETIQUETAS_SQL}, '$[*]' COLUMNS (
   etiqueta VARCHAR(60) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci PATH '$'
 )) AS tag`;
 
-const SELECT_FOTO = `SELECT f.id, f.olimpiada_id, f.archivo, f.miniatura_archivo, f.ancho, f.alto, f.epigrafe,
+const SELECT_FOTO = `SELECT f.id, f.olimpiada_id, f.archivo, f.miniatura_archivo, f.mime, f.ancho, f.alto, f.epigrafe,
   f.disciplina_id, d.nombre AS disciplina_nombre, p.id AS partido_id, f.fecha, f.etiqueta, f.etiquetas, f.orden, f.fecha_creacion
   FROM olimpiada_foto f
   LEFT JOIN olimpiada_disciplina d ON d.id = f.disciplina_id
   LEFT JOIN olimpiada_partido p ON p.id = f.partido_id AND p.eliminado = 0 AND p.olimpiada_id = f.olimpiada_id`;
 
 async function serializarFoto(fila, partidoNombre = null) {
-  const [url, miniatura] = await Promise.all([firmarSeguro(fila.archivo), firmarSeguro(fila.miniatura_archivo)]);
+  const extensionGuardada = /\.(webp|jpe?g|png|heic|heif|avif|gif)$/i.exec(fila.archivo)?.[1];
+  const formato = /^image\/(webp|jpe?g|png|heic|heif|avif|gif)$/i.exec(fila.mime)?.[1];
+  const extension = extensionGuardada?.toLowerCase() || formato?.toLowerCase().replace('jpeg', 'jpg');
+  const nombre = `olimpiadas-${fila.olimpiada_id}-foto-${fila.id}${extension ? '.' + extension : ''}`;
+  const [url, miniatura, descargaUrl] = await Promise.all([
+    firmarSeguro(fila.archivo), firmarSeguro(fila.miniatura_archivo),
+    firmarSeguro(fila.archivo, undefined, `attachment; filename="${nombre}"`),
+  ]);
   const etiquetas = fila.etiquetas == null ? (fila.etiqueta ? [fila.etiqueta] : [])
     : Array.isArray(fila.etiquetas) ? fila.etiquetas : JSON.parse(fila.etiquetas);
   return {
-    id: fila.id, olimpiada_id: fila.olimpiada_id, url, url_miniatura: miniatura, ancho: fila.ancho, alto: fila.alto,
+    id: fila.id, olimpiada_id: fila.olimpiada_id, url, url_miniatura: miniatura, descarga_url: descargaUrl, ancho: fila.ancho, alto: fila.alto,
     epigrafe: fila.epigrafe, disciplina_id: fila.disciplina_id, disciplina_nombre: fila.disciplina_nombre || null,
     partido_id: fila.partido_id ?? null, partido_nombre: partidoNombre, fecha: fila.fecha,
     etiquetas, etiqueta: etiquetas.join(', ') || null, orden: fila.orden, fecha_creacion: fila.fecha_creacion,
