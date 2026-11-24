@@ -32,6 +32,33 @@ Cada disciplina dice cómo se carga su resultado (`olimpiada_disciplina.tipo_mar
 
 El reglamento de una disciplina es texto y, opcionalmente, un PDF (`reglamento_archivo`, campo `REGLAMENTO`).
 
+### Disciplinas que no se juegan 1 contra 1
+
+Maratón, natación, pesca y póker no tienen llaves ni partidos. `olimpiada_disciplina.formato_competencia` dice cómo se compite (propio del deporte, se cambia en la ficha de la disciplina con «Cómo se compite»):
+
+| Valor | Disciplinas | Cómo se organiza | Qué se carga |
+| --- | --- | --- | --- |
+| `PARTIDOS` | el resto | torneos y partidos (lo de siempre) | resultado de cada partido |
+| `TIEMPO` | maratón, natación | categorías (rango de edad, sexo, estilo, distancia) | el tiempo de cada participante |
+| `PESCA` | pesca | categorías o modalidades | cantidad de piezas y peso total |
+| `MESAS` | póker | mesas | quién se sienta en cada mesa y los tres ganadores |
+
+Cada categoría o mesa es una fila de `olimpiada_prueba` (nombre, aclaración, día y hora opcionales, estado `PROGRAMADA` / `EN_JUEGO` / `FINALIZADA`) y cada persona una fila de `olimpiada_prueba_participante` (nombre, departamental y, si se eligió entre las inscripciones aprobadas, `inscripcion_id`). La carga previa de participantes es opcional: se los puede agregar junto con su resultado.
+
+- **Por tiempo.** El tiempo se guarda en milésimas (`tiempo_ms`); la API lo acepta en milésimas o como texto («1:02:03», «32:05,48»). La lista se ordena sola de menor a mayor; los tres primeros llevan oro, plata y bronce. Un empate comparte el puesto y la medalla, y el puesto siguiente salta (1.º, 2.º, 2.º, 4.º). Quien no tiene tiempo queda al final, sin puesto.
+- **Pesca.** Se cargan `piezas` y `peso_gramos` (la API también acepta `peso_kg` con coma o punto). Son dos tablas y dos podios por categoría: mayor cantidad de piezas y mayor peso total. El empate en una se define por la otra. Sin piezas (o sin peso) no hay medalla.
+- **Póker.** Los jugadores se cargan en la disciplina; mientras no tengan mesa quedan «sin mesa» (`prueba_id` en `NULL`). Cada mesa admite hasta 14. Levantar a un ausente de la mesa lo deja sin mesa; eliminarlo lo saca del torneo. Los tres ganadores se eligen a mano (`puesto` 1, 2 o 3), sin llevar fichas ni puntos. Eliminar una mesa no elimina a sus jugadores.
+
+**Qué se publica.** Estas disciplinas muestran nombre y apellido, departamental y resultado de cada participante en el portal, sin iniciar sesión: es la premiación. No se publica ningún otro dato de la inscripción. Con mesas armadas el portal muestra sólo a los jugadores sentados.
+
+**Quién carga.** La administración provincial y los veedores de la disciplina (con la carga abierta, igual que los resultados de los partidos): categorías y mesas, participantes, resultados, estado y ganadores. Sólo la administración cambia cómo se compite, y no se puede cambiar mientras la edición tenga cargados partidos (o categorías y participantes) de esa disciplina. Cada cambio queda en el historial de la disciplina (entidades `PRUEBA` y `PRUEBA_PARTICIPANTE`).
+
+**En vivo.** Una categoría o una mesa `EN_JUEGO` cuenta como «en vivo»: suma en `conteos.en_vivo` del portal, en `en_vivo` de la disciplina y sale en `pruebas_en_juego` de `…/en-vivo`.
+
+**Medallero.** El medallero por departamental no cambia: para estas disciplinas se sigue cargando a mano en Fixture › Medallero. Las medallas que se ven junto a cada participante son las de su categoría.
+
+El servidor funciona aunque la migración todavía no se haya aplicado: mientras falten la columna o las tablas, ninguna disciplina figura por categorías y las escrituras responden 503. Vuelve a comprobarlo solo (cada 30 segundos), sin reiniciar.
+
 ## Torneos, lugares e instancias
 
 `olimpiada_lugar` y `olimpiada_instancia` son catálogos reutilizables entre ediciones. Los lugares distinguen predio, nombre del espacio/cancha, dirección y mapa. Los datos importados de Miramar 2025 son referencias históricas: verificar disponibilidad para cada nueva edición. Crear una disciplina en el catálogo no la habilita automáticamente para una edición.
@@ -116,6 +143,10 @@ Todas las rutas siguientes están bajo `/api`.
 | Partidos | `POST /olimpiadas/:id/partidos`, `POST /olimpiadas/:id/partidos/importar`, `PUT/DELETE /olimpiadas/partidos/:partidoId`, `PUT /olimpiadas/partidos/:partidoId/resultado` |
 | Catálogos, sólo administración | `GET/POST /olimpiadas/competicion/{lugares,instancias}`, `PUT /olimpiadas/competicion/{lugares,instancias}/:catalogoId` |
 | Equipos interdepartamentales | `GET/POST /olimpiadas/:id/equipos`, `PUT/DELETE /olimpiadas/equipos/:equipoId` |
+| Categorías y mesas (lectura) | `GET /olimpiadas/:id/pruebas`, `GET /olimpiadas/publico/:id/pruebas` (admiten `disciplina_id`) |
+| Categorías y mesas, administración y veedores | `POST /olimpiadas/:id/pruebas`, `PUT/DELETE /olimpiadas/pruebas/:pruebaId` (`?con_participantes=1` confirma eliminar una categoría con gente cargada) |
+| Participantes, administración y veedores | `POST /olimpiadas/:id/pruebas/participantes` (uno o varios, hasta 200), `PUT/DELETE /olimpiadas/pruebas/participantes/:participanteId` |
+| Ganadores de póker, administración y veedores | `PUT /olimpiadas/:id/disciplinas/:disciplinaId/podio` (`puestos: [1.º, 2.º, 3.º]`) |
 | Ajustes de la competencia, sólo administración | `PUT /olimpiadas/:id/competicion/ajustes` (`veedores_carga_abierta`, `medallero_publicado`, `posiciones_publicas`, `medallero_division`) |
 | Medallero, sólo administración | `PUT /olimpiadas/:id/medallero/puntos`, `PUT /olimpiadas/:id/medallero/:disciplinaId`, `POST /olimpiadas/:id/medallero/:disciplinaId/automatico`, `PUT /olimpiadas/medallas/:medallaId/puntos` |
 | Escudos, sólo administración | `GET /olimpiadas/escudos`, `PUT /olimpiadas/escudos/departamentales/:id`, `PUT/DELETE /olimpiadas/escudos/interdepartamental` |
@@ -172,6 +203,15 @@ node scripts/migrar-olimpiadas-veedores.js --apply --target=production --allow-p
 
 Sin `--target` usa las variables `DB_*` del entorno (así se corre en el servidor). La primera vez también asigna a cada disciplina su forma de cargar el resultado, marca las categorías que no son deporte y convierte los puestos compartidos ya cargados en equipos interdepartamentales.
 
+Las disciplinas por categorías y mesas requieren `migrar-olimpiadas-pruebas.js` (idempotente; agrega `olimpiada_disciplina.formato_competencia` y las tablas `olimpiada_prueba` y `olimpiada_prueba_participante`, con sus permisos DML para `miajb_runtime`). La primera vez asigna el formato por el nombre de la disciplina: maratón y natación por tiempo, pesca y póker con los suyos. Conviene aplicarla antes de desplegar el código; si se despliega primero, todo sigue funcionando como antes hasta que se aplique:
+
+```powershell
+node scripts/migrar-olimpiadas-pruebas.js --check --target=develop
+node scripts/migrar-olimpiadas-pruebas.js --apply --target=develop --confirm=APLICAR_OLIMPIADAS_PRUEBAS
+node scripts/migrar-olimpiadas-pruebas.js --check --target=production --allow-production
+node scripts/migrar-olimpiadas-pruebas.js --apply --target=production --allow-production --confirm=APLICAR_OLIMPIADAS_PRUEBAS
+```
+
 Para adoptar la publicación por defecto, ejecutar con la cuenta administrativa:
 
 ```powershell
@@ -193,5 +233,5 @@ node scripts/ajustar-icono-tejo.js --apply --target=all --allow-production
 ```
 
 ```powershell
-node --test test/olimpiadas-competicion.test.js test/olimpiadas-contenido.test.js test/olimpiadas-voluntarios.test.js test/olimpiadas-veedores.test.js test/olimpiadas-inscripciones.test.js test/olimpiadas-gafetes-autorizacion.test.js
+node --test test/olimpiadas-competicion.test.js test/olimpiadas-pruebas.test.js test/olimpiadas-contenido.test.js test/olimpiadas-voluntarios.test.js test/olimpiadas-veedores.test.js test/olimpiadas-inscripciones.test.js test/olimpiadas-gafetes-autorizacion.test.js
 ```

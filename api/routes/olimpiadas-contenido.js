@@ -13,6 +13,8 @@ const { registrarErrorRuta } = require("../services/errores");
 const { normalizarFechaCivil } = require("../services/valores-dominio");
 const { leerEtiquetas, opcionesPartidos, SELECT_FOTO, serializarFoto, listarFotos } = require("../services/olimpiadas-fotos");
 const { SECCIONES_INICIALES } = require("../data/olimpiadas-plantillas");
+const pruebasLectura = require("./olimpiadas-pruebas");
+const { FORMATOS: FORMATOS_COMPETENCIA } = require("../services/olimpiadas-pruebas");
 const { verificarAccesoCompeticion, exigirDisciplinaVoluntario, exigirEdicionVoluntario, esVoluntario, puedeEditarEdicion } = require('../security/olimpiadas-voluntarios');
 const {
   CAMPOS_PARTIDO_EXTRA, TIPOS_ORIGEN, TIPOS_MARCADOR, REGLAS_DIVISION, MAX_PUESTOS, calcularPosiciones, listarTorneos, listarEquipos, filtroId,
@@ -597,6 +599,8 @@ router.get("/olimpiadas/:id(\\d+)/portal", verifyToken, async (req, res) => {
       hotelesMiDepartamental = hoteles;
     }
     const conteosNumericos = Object.fromEntries(Object.entries(conteos).map(([clave, valor]) => [clave, Number(valor) || 0]));
+    // Las categorías y mesas que se están disputando también cuentan como «en vivo»
+    conteosNumericos.en_vivo += (await pruebasLectura.pruebasEnJuego(db, olimpiadaId)).length;
     const disciplinas = (await listarNombresDisciplinas(db, olimpiadaId)).get(olimpiadaId) || [];
     res.status(200).json({
       olimpiada: {
@@ -1691,6 +1695,8 @@ async function listarDisciplinasFixture(conexion, olimpiadaId) {
        WHERE a.olimpiada_id = ? ORDER BY nombre`,
     [olimpiadaId]
   );
+  // Cómo se compite en cada una (partidos, categorías por tiempo, pesca o mesas) y cuántas categorías tiene
+  const porCategorias = await pruebasLectura.resumenDisciplinas(conexion, olimpiadaId);
   return Promise.all(
     rows.map(async (fila) => ({
       id: fila.id,
@@ -1698,6 +1704,8 @@ async function listarDisciplinasFixture(conexion, olimpiadaId) {
       tipo_id: fila.tipo_id,
       tipo_nombre: fila.tipo_nombre || null,
       tipo_marcador: fila.tipo_marcador || "TANTOS",
+      formato_competencia: porCategorias.get(Number(fila.id))?.formato || "PARTIDOS",
+      pruebas: porCategorias.get(Number(fila.id))?.pruebas || 0,
       icono_url: await firmarSeguro(fila.icono_archivo),
       sede_id: fila.sede_id,
       sede_nombre: fila.sede_nombre || null,
@@ -1712,7 +1720,7 @@ async function listarDisciplinasFixture(conexion, olimpiadaId) {
       reglamento_url: await firmarSeguro(fila.reglamento_archivo),
       reglamento_archivo_nombre: fila.reglamento_archivo ? fila.reglamento_archivo_nombre || "Reglamento.pdf" : null,
       partidos: Number(fila.partidos) || 0,
-      en_vivo: Number(fila.en_vivo) || 0,
+      en_vivo: (Number(fila.en_vivo) || 0) + (porCategorias.get(Number(fila.id))?.en_juego || 0),
     }))
   );
 }
@@ -1799,6 +1807,9 @@ router.put("/olimpiadas/:id(\\d+)/disciplinas/:disciplinaId(\\d+)/info", verifyT
     // Cómo se carga el resultado es propio del deporte: vale para todas las ediciones.
     const tipoMarcador = body.tipo_marcador === undefined ? null
       : leerEnum(body, "tipo_marcador", actual, TIPOS_MARCADOR, { porDefecto: "TANTOS", etiqueta: "la forma de cargar el resultado" });
+    // Cómo se compite (partidos 1 contra 1, categorías por tiempo, pesca o mesas): también es propio del deporte.
+    const formato = body.formato_competencia === undefined || body.formato_competencia === null ? null
+      : await leerFormatoCompetencia(db, olimpiadaId, disciplinaId, body, actual.nombre);
     await validarSedeDeOlimpiada(db, olimpiadaId, datos.sede_id);
     await enTransaccion(async (connection) => {
       await connection.query(
@@ -1806,6 +1817,13 @@ router.put("/olimpiadas/:id(\\d+)/disciplinas/:disciplinaId(\\d+)/info", verifyT
         [datos.sede_id, datos.veedor, datos.reglamento, olimpiadaId, disciplinaId]
       );
       if (tipoMarcador) await connection.query("UPDATE olimpiada_disciplina SET tipo_marcador = ? WHERE id = ?", [tipoMarcador, disciplinaId]);
+      if (formato && formato.nuevo !== formato.anterior) {
+        await connection.query("UPDATE olimpiada_disciplina SET formato_competencia = ? WHERE id = ?", [formato.nuevo, disciplinaId]);
+        await historial(connection, cabecera, {
+          entidad: "DISCIPLINA_INFO", entidad_id: disciplinaId, olimpiada_id: olimpiadaId, tipo_operacion: "UPDATE",
+          campo_modificado: "formato_competencia", valor_anterior: formato.anterior, valor_nuevo: formato.nuevo,
+        });
+      }
       await historialCambios(
         connection,
         cabecera,
@@ -1820,6 +1838,32 @@ router.put("/olimpiadas/:id(\\d+)/disciplinas/:disciplinaId(\\d+)/info", verifyT
     responderError(res, error, "No se pudo guardar la información de la disciplina");
   }
 });
+
+/**
+ * Cambio de la forma de competir de una disciplina. No se puede cambiar mientras la edición tenga
+ * cargado lo del formato anterior (partidos, o categorías y participantes): quedaría fuera de la vista.
+ */
+async function leerFormatoCompetencia(conexion, olimpiadaId, disciplinaId, body, nombre) {
+  if (!(await pruebasLectura.esquemaDisponible(conexion))) throw crearErrorHttp("Las disciplinas por categorías todavía no están habilitadas en este servidor", 503);
+  const nuevo = String(body.formato_competencia).trim().toUpperCase();
+  if (!FORMATOS_COMPETENCIA.includes(nuevo)) throw crearErrorHttp("La forma de competir es inválida");
+  const [[fila]] = await conexion.query("SELECT formato_competencia AS formato FROM olimpiada_disciplina WHERE id = ?", [disciplinaId]);
+  const anterior = fila?.formato || "PARTIDOS";
+  if (nuevo === anterior) return { anterior, nuevo };
+  const [[uso]] = await conexion.query(
+    `SELECT (SELECT COUNT(*) FROM olimpiada_partido WHERE olimpiada_id = ? AND disciplina_id = ? AND eliminado = 0) AS partidos,
+            (SELECT COUNT(*) FROM olimpiada_prueba WHERE olimpiada_id = ? AND disciplina_id = ? AND eliminado = 0) AS pruebas,
+            (SELECT COUNT(*) FROM olimpiada_prueba_participante WHERE olimpiada_id = ? AND disciplina_id = ? AND eliminado = 0) AS participantes`,
+    [olimpiadaId, disciplinaId, olimpiadaId, disciplinaId, olimpiadaId, disciplinaId]
+  );
+  if (anterior === "PARTIDOS" && Number(uso.partidos)) {
+    throw crearErrorHttp(`${nombre} tiene ${uso.partidos} partido(s) cargados en esta edición: quitalos antes de cambiar cómo se compite`, 409);
+  }
+  if (anterior !== "PARTIDOS" && (Number(uso.pruebas) || Number(uso.participantes))) {
+    throw crearErrorHttp(`${nombre} ya tiene categorías, mesas o participantes cargados en esta edición: quitalos antes de cambiar cómo se compite`, 409);
+  }
+  return { anterior, nuevo };
+}
 
 // Reglamento de la disciplina como archivo PDF (además del texto de la ficha).
 router.post("/olimpiadas/:id(\\d+)/disciplinas/:disciplinaId(\\d+)/reglamento-archivo", verifyToken, soloSuperior, manejarUploadOlimpiadas, async (req, res) => {
@@ -2527,6 +2571,7 @@ router.get("/olimpiadas/:id(\\d+)/en-vivo", verificarAccesoCompeticion, async (r
     const asignadas = await exigirEdicionVoluntario({ db, cabecera, olimpiadaId });
     const enVivo = await armarEnVivo(db, olimpiadaId, asignadas
       ? { condicionExtra: 'p.disciplina_id IN (?)', paramsExtra: [asignadas.length ? asignadas : [0]] } : {});
+    enVivo.pruebas_en_juego = await pruebasLectura.pruebasEnJuego(db, olimpiadaId, asignadas);
     res.set("Cache-Control", "no-store");
     res.status(200).json(enVivo);
   } catch (error) {
@@ -3135,18 +3180,20 @@ router.delete("/olimpiadas/fotos/:fotoId(\\d+)", verifyToken, async (req, res) =
 
 // ---------------------------------------------------------------------------
 const ayudantes = {
-  db, cargarOlimpiada, enTransaccion, historial, historialCambios, leerTexto, leerIdOpcional, leerEnum, leerEntero, leerUrl, leerFecha, leerCoordenadas,
+  db, cargarOlimpiada, enTransaccion, historial, historialCambios, leerTexto, leerIdOpcional, leerEnum, leerEntero, leerUrl, leerFecha, leerHora, leerCoordenadas,
   validarDisciplinaDeOlimpiada, validarDepartamentales, consultarPartidos, bloquearSinCambios, exigirSuperior, soloSuperior, idDeRuta,
   archivoDeSlot, aplicarEfectosCompeticion, puedeVerPosiciones, listarEscudos,
 };
 require('./olimpiadas-torneos')(router, ayudantes);
 require('./olimpiadas-canchas')(router, ayudantes);
 require('./olimpiadas-equipos')(router, ayudantes);
+pruebasLectura(router, ayudantes);
 const videos = require('./olimpiadas-videos')(router, { ...ayudantes, verifyTokenMultimedia, soloGestionMultimedia });
 
 router.lecturasPublicas = Object.freeze({
   estadoEdicion, consultarPartidos, listarDisciplinasFixture, listarSedes, armarMedallero, serializarNovedad, serializarEvento, SELECT_EVENTO,
   armarEnVivo, listarEscudos, puedeVerMedallero, medalleroReservado, listarVideos: videos.listarVideos,
+  listarPruebas: pruebasLectura.listarPruebas, pruebasEnJuego: pruebasLectura.pruebasEnJuego,
   listarFotos: (conexion, id, filtros) => listarFotos(conexion, id, filtros, consultarPartidos),
 });
 
