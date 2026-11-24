@@ -34,6 +34,9 @@ const {
   subirArchivoOlimpiadas,
   subirFirmaBase64,
   manejarUploadOlimpiadas,
+  crearUploadOlimpiadas,
+  obtenerUrlAvisoPublico,
+  guardarAvisoPublico,
   decodificarFirmaBase64,
   detectarMimeArchivo,
   validarContenidoArchivo,
@@ -1338,6 +1341,7 @@ router.get("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
     );
     res.status(200).json({
       ...olimpiada,
+      popup_imagen_url: await obtenerUrlAvisoPublico(olimpiadaId),
       requiere_aprobacion: 1, // fijo: la aprobación del afiliado es obligatoria (la columna ya no se lee)
       estado_edicion: calcularEstadoEdicion(olimpiada),
       disciplinas,
@@ -1348,6 +1352,38 @@ router.get("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
     res.status(500).json("Error al obtener la olimpiada");
   }
 });
+
+const rutaImagenAviso = "/olimpiadas/:id(\\d+)/popup-imagen";
+async function autorizarEdicionAviso(req, res, next) {
+  if (!esSuperior(getCabecera(req))) return res.status(401).json("No autorizado");
+  try {
+    if (!await obtenerOlimpiada(mysqlConnection.promise(), Number(req.params.id))) {
+      return res.status(404).json("Olimpiada no encontrada");
+    }
+    next();
+  } catch (error) { responderError(res, error, "Error al consultar la olimpiada"); }
+}
+
+async function actualizarImagenAviso(req, res) {
+  const edicion = Number(req.params.id);
+  const archivo = req.files?.find(f => f.fieldname === "IMAGEN");
+  if (req.method === "PUT" && !archivo) return res.status(400).json("Seleccioná una imagen para el aviso");
+  try {
+    const url = await guardarAvisoPublico(edicion, archivo);
+    const cabecera = getCabecera(req);
+    try {
+      await registrarHistorial(mysqlConnection.promise(), {
+        entidad: "OLIMPIADA", entidad_id: edicion, olimpiada_id: edicion,
+        usuario_id: cabecera.id, usuario_rol: cabecera.rol, tipo_operacion: "UPDATE",
+        campo_modificado: "popup_imagen", valor_nuevo: archivo ? "Imagen actualizada" : "Imagen retirada",
+      });
+    } catch (error) { registrarErrorRuta(error, "olimpiadas:historial-aviso"); }
+    res.json({ success: true, message: archivo ? "Imagen del aviso guardada" : "Aviso retirado", popup_imagen_url: url });
+  } catch (error) { responderError(res, error, "No se pudo guardar la imagen del aviso"); }
+}
+
+router.put(rutaImagenAviso, verifyToken, autorizarEdicionAviso, crearUploadOlimpiadas({ maxFiles: 1 }), actualizarImagenAviso);
+router.delete(rutaImagenAviso, verifyToken, autorizarEdicionAviso, actualizarImagenAviso);
 
 /**
  * Cupos para el formulario de inscripción. La departamental la decide el servidor:

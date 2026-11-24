@@ -11,7 +11,7 @@ const { crearNotificacion } = require("./notificaciones");
 const crypto = require("crypto");
 const multer = require("../security/multipart");
 const sharp = require("sharp");
-const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const mysqlConnection = require("../connection/connection");
 const { registrarErrorRuta } = require("./errores");
@@ -34,7 +34,7 @@ const S3_SIGNED_URL_EXPIRES_SECONDS = Number.parseInt(process.env.S3_SIGNED_URL_
 const EXPIRACION_FIRMA = Number.isFinite(S3_SIGNED_URL_EXPIRES_SECONDS) ? S3_SIGNED_URL_EXPIRES_SECONDS : 3600;
 
 async function uploadBufferToS3({ key, buffer, contentType, cacheControl }) {
-  await s3.send(new PutObjectCommand({
+  return s3.send(new PutObjectCommand({
     Bucket: bucketName,
     Key: key,
     Body: buffer,
@@ -222,6 +222,38 @@ async function subirImagenOptimizada(file, prefijo, { anchoMaximo = 1600, miniat
     await eliminarObjetosS3Seguro(subidas);
     throw error;
   }
+}
+
+function claveAvisoPublico(olimpiadaId) {
+  return `olimpiadas/ediciones/${olimpiadaId}/aviso-publico`;
+}
+
+function firmarAvisoPublico(key, etag, mime) {
+  const version = (etag || "").replace(/[^a-zA-Z0-9-]/g, "");
+  const extension = EXTENSION_POR_MIME[mime] || "webp";
+  return getSignedFileUrlFromS3(key, EXPIRACION_FIRMA, `inline; filename="aviso-${version}.${extension}"`);
+}
+
+async function obtenerUrlAvisoPublico(olimpiadaId) {
+  const key = claveAvisoPublico(olimpiadaId);
+  try {
+    const meta = await s3.send(new HeadObjectCommand({ Bucket: bucketName, Key: key }), { abortSignal: AbortSignal.timeout(2500) });
+    return meta.ContentLength > 0 ? await firmarAvisoPublico(key, meta.ETag, meta.ContentType) : null;
+  } catch (error) {
+    // Si el usuario de S3 carece de ListBucket, S3 responde 403 para una clave inexistente.
+    if (![403, 404].includes(error?.$metadata?.httpStatusCode)) registrarErrorRuta(error, "olimpiadas:leer-aviso");
+    return null;
+  }
+}
+
+async function guardarAvisoPublico(olimpiadaId, archivo) {
+  const key = claveAvisoPublico(olimpiadaId);
+  // El objeto vacío recuerda que la organización retiró el aviso. Una precarga
+  // inicial con If-None-Match: * tampoco debe reponerlo en un reintento.
+  const imagen = archivo ? await procesarImagenWeb(archivo.buffer) : null;
+  const resultado = await uploadBufferToS3({ key, buffer: imagen?.buffer || Buffer.alloc(0),
+    contentType: imagen?.mime || "application/octet-stream", cacheControl: "no-cache, max-age=0, must-revalidate" });
+  return imagen ? firmarAvisoPublico(key, resultado.ETag, imagen.mime) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +847,8 @@ module.exports = {
   subirFirmaBase64,
   procesarImagenWeb,
   subirImagenOptimizada,
+  obtenerUrlAvisoPublico,
+  guardarAvisoPublico,
   crearUploadOlimpiadas,
   manejarUploadOlimpiadas,
   MIME_IMAGEN_PERMITIDO,
