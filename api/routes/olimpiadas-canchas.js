@@ -41,7 +41,8 @@ module.exports = function registrarCanchas(router, { enTransaccion, historial, l
         await historial(connection, getCabecera(req), auditoria);
         return auditoria.entidad_id;
       });
-      res.status(operacion === 'CREATE' ? 201 : 200).json({ success: true, id });
+      const mensajes = { CREATE: 'Cancha creada', UPDATE: 'Cancha actualizada', DELETE: 'Cancha eliminada' };
+      res.status(operacion === 'CREATE' ? 201 : 200).json({ success: true, id, message: mensajes[operacion] });
     } catch (error) { responderError(res, error, 'No se pudo guardar el cambio en la cancha'); }
   };
   router.post(ruta, verifyToken, soloSuperior, gestionar('CREATE'));

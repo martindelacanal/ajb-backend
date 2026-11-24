@@ -2851,29 +2851,55 @@ async function validarPartidoFoto(conexion, cambios, olimpiadas) {
  * Sube las fotos de a una (sharp + S3 + INSERT). Si una falla se limpia lo subido de esa foto y se
  * sigue con la siguiente; el resultado trae las que entraron y un error por archivo fallido.
  */
+function leerIdsCarga(valor, cantidad) {
+  if (valor == null) return [];
+  let ids;
+  try { ids = JSON.parse(valor); } catch { /* Validar junto con el resto del campo multipart. */ }
+  const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+  if (!Array.isArray(ids) || ids.length !== cantidad || ids.some(id => typeof id !== 'string' || !uuid.test(id))) {
+    throw crearErrorHttp("Cada foto debe tener un identificador de carga válido");
+  }
+  const normalizados = ids.map(id => id.toLowerCase());
+  if (new Set(normalizados).size !== cantidad) throw crearErrorHttp("Hay identificadores de carga repetidos");
+  return normalizados;
+}
+
 async function procesarLoteFotos(
-  { archivos, olimpiadaId, comunes, usuarioId, ordenInicial = 0 },
+  { archivos, olimpiadaId, comunes, usuarioId, ordenInicial = 0, idsCarga = [] },
   { subirImagen = subirImagenOptimizada, conexion = db, eliminarObjetos = eliminarObjetosS3Seguro } = {}
 ) {
   const fotos = [];
   const errores = [];
+  let nuevas = 0;
+  async function buscarCarga(cargaId) {
+    const [[existente]] = await conexion.query(
+      `${SELECT_FOTO} WHERE f.olimpiada_id = ? AND f.usuario_id = ? AND f.carga_id = ? AND f.eliminado = 0`,
+      [olimpiadaId, usuarioId, cargaId]);
+    return existente;
+  }
   let orden = Number(ordenInicial) || 0;
   for (const [indice, archivo] of (archivos || []).entries()) {
     const nombre = archivo?.originalname || `foto ${indice + 1}`;
+    const cargaId = idsCarga[indice] || null;
     let imagen = null;
     try {
+      if (cargaId) {
+        const existente = await buscarCarga(cargaId);
+        if (existente) { fotos.push(existente); continue; }
+      }
       imagen = await subirImagen(archivo, `fotos/${olimpiadaId}/foto`, { anchoMaximo: 1600, miniatura: true, anchoMiniatura: 420 });
       // El orden sólo avanza cuando la foto entró (una fallida no deja huecos).
       const ordenFoto = orden + 1;
       const [insert] = await conexion.query(
-        `INSERT INTO olimpiada_foto (olimpiada_id, archivo, miniatura_archivo, ancho, alto, mime, epigrafe, disciplina_id, fecha, etiqueta, orden, usuario_id, etiquetas, partido_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO olimpiada_foto (olimpiada_id, archivo, miniatura_archivo, ancho, alto, mime, epigrafe, disciplina_id, fecha, etiqueta, orden, usuario_id, etiquetas, partido_id, carga_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           olimpiadaId, imagen.key, imagen.miniatura_key, imagen.ancho, imagen.alto, imagen.mime,
-          comunes.epigrafe ?? null, comunes.disciplina_id ?? null, comunes.fecha ?? null, comunes.etiqueta ?? null, ordenFoto, usuarioId, comunes.etiquetas ?? null, comunes.partido_id ?? null,
+          comunes.epigrafe ?? null, comunes.disciplina_id ?? null, comunes.fecha ?? null, comunes.etiqueta ?? null, ordenFoto, usuarioId, comunes.etiquetas ?? null, comunes.partido_id ?? null, cargaId,
         ]
       );
       orden = ordenFoto;
+      nuevas++;
       fotos.push({
         id: insert.insertId,
         olimpiada_id: olimpiadaId,
@@ -2892,12 +2918,21 @@ async function procesarLoteFotos(
         fecha_creacion: new Date(),
       });
     } catch (error) {
+      if (cargaId && imagen) {
+        // Si dos envíos se superponen o se perdió la confirmación SQL, comprobar quién conservó el archivo.
+        const guardada = await buscarCarga(cargaId);
+        if (guardada) {
+          if (guardada.archivo !== imagen.key) await eliminarObjetos(imagen.keys);
+          fotos.push(guardada);
+          continue;
+        }
+      }
       if (imagen) await eliminarObjetos(imagen.keys);
       registrarErrorRuta(error, `olimpiadas-contenido:foto ${nombre}`);
-      errores.push({ archivo: nombre, error: error?.statusCode ? error.message : "No se pudo guardar la foto" });
+      errores.push({ archivo: nombre, ...(cargaId ? { carga_id: cargaId } : {}), error: error?.statusCode ? error.message : "No se pudo guardar la foto" });
     }
   }
-  return { fotos, errores };
+  return { fotos, errores, nuevas };
 }
 
 router.get("/olimpiadas/:id(\\d+)/fotos", verifyTokenMultimedia, async (req, res) => {
@@ -2932,8 +2967,9 @@ router.post("/olimpiadas/:id(\\d+)/fotos", verifyTokenMultimedia, soloGestionMul
     const disciplina = await validarDisciplinaCatalogo(db, comunes.disciplina_id);
     if (disciplina) comunes.disciplina_nombre = disciplina.nombre;
     const [[ultimo]] = await db.query("SELECT COALESCE(MAX(orden), 0) AS orden FROM olimpiada_foto WHERE olimpiada_id = ?", [olimpiadaId]);
-    const { fotos, errores } = await procesarLoteFotos({
+    const { fotos, errores, nuevas } = await procesarLoteFotos({
       archivos,
+      idsCarga: leerIdsCarga(req.body?.carga_ids, archivos.length),
       olimpiadaId,
       comunes,
       usuarioId: cabecera.id,
@@ -2943,11 +2979,11 @@ router.post("/olimpiadas/:id(\\d+)/fotos", verifyTokenMultimedia, soloGestionMul
       const detalle = errores.map((e) => `${e.archivo}: ${e.error}`).join("; ");
       return res.status(400).json(`No se pudo subir ninguna foto${detalle ? ` (${detalle})` : ""}`);
     }
-    await historial(db, cabecera, {
+    if (nuevas) await historial(db, cabecera, {
       entidad: "FOTO",
       olimpiada_id: olimpiadaId,
       tipo_operacion: "CREATE",
-      valor_nuevo: `${fotos.length} fotos subidas${comunes.etiqueta ? ` (${comunes.etiqueta})` : ""}${errores.length ? `, ${errores.length} con error` : ""}`,
+      valor_nuevo: `${nuevas} fotos subidas${comunes.etiqueta ? ` (${comunes.etiqueta})` : ""}${errores.length ? `, ${errores.length} con error` : ""}`,
     });
     res.status(201).json({
       success: true,

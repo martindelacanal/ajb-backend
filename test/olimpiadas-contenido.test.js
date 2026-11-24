@@ -264,6 +264,41 @@ test("contenido: el lote de fotos procesa de a una, sigue ante un archivo roto y
   assert.deepEqual(eliminadas, ["olimpiadas/fotos/1/foto_falla-bd.jpg.webp", "olimpiadas/fotos/1/foto_min_falla-bd.jpg.webp"]);
 });
 
+test("fotos: un reintento concurrente o posterior conserva una sola foto y sus objetos", async () => {
+  const idCarga = "e7e8bc18-727e-4af1-ae70-001122334455";
+  const lote = { archivos: [{ originalname: "imagen.jpg" }], olimpiadaId: 1, usuarioId: 2, comunes: {}, idsCarga: [idCarga] };
+  let guardada, subidas = 0;
+  const eliminadas = [];
+  const servicios = {
+    subirImagen: async () => {
+      const key = "imagen-" + ++subidas;
+      return { key, keys: [key] };
+    },
+    eliminarObjetos: async keys => eliminadas.push(...keys),
+    conexion: { async query(sql, params) {
+      if (sql.startsWith("SELECT")) {
+        assert.deepEqual(params, [1, 2, idCarga]);
+        return [guardada ? [guardada] : []];
+      }
+      assert.match(sql, /INSERT INTO olimpiada_foto/);
+      assert.equal(params.at(-1), idCarga);
+      if (guardada) throw Object.assign(new Error("Carga duplicada"), { code: "ER_DUP_ENTRY" });
+      guardada = { id: 9, archivo: params[1] };
+      return [{ insertId: 9 }];
+    } },
+  };
+  const primeros = await Promise.all([procesarLoteFotos(lote, servicios), procesarLoteFotos(lote, servicios)]);
+  assert.deepEqual(primeros.map(r => r.fotos[0].id), [9, 9]);
+  assert.equal(primeros.reduce((n, r) => n + r.nuevas, 0), 1);
+  assert.equal(subidas, 2);
+  assert.equal(eliminadas.length, 1);
+  assert.notEqual(eliminadas[0], guardada.archivo);
+  const repetida = await procesarLoteFotos(lote, servicios);
+  assert.equal(repetida.nuevas, 0);
+  assert.equal(repetida.fotos[0].id, 9);
+  assert.equal(subidas, 2);
+});
+
 test("contenido: la miniatura y la versión web respetan el ancho máximo (sharp)", async () => {
   const original = await jpegDePrueba(2400, 1600);
   const web = await procesarImagenWeb(original, { anchoMaximo: 1600 });

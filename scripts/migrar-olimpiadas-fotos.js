@@ -7,12 +7,18 @@ const { parsearArgumentos, obtenerEntornos, crearOpcionesConexion } = require('.
 const { leerEtiquetas } = require('../api/services/olimpiadas-fotos');
 
 async function migrar(db, aplicar) {
-  const [columnas] = await db.query("SHOW COLUMNS FROM olimpiada_foto WHERE Field IN ('etiquetas','partido_id')");
+  const [columnas] = await db.query("SHOW COLUMNS FROM olimpiada_foto WHERE Field IN ('etiquetas','partido_id','carga_id')");
   const tipos = new Map(columnas.map(c => [c.Field, c.Type]));
   const cambios = [];
-  for (const [campo, tipo] of [['etiquetas', 'json'], ['partido_id', 'int']]) {
+  for (const [campo, tipo] of [['etiquetas', 'json'], ['partido_id', 'int'], ['carga_id', 'char(36)']]) {
     if (!tipos.has(campo)) cambios.push(`ADD COLUMN ${campo} ${tipo} NULL`);
     else if (tipos.get(campo) !== tipo) throw new Error(`Tipo inesperado en olimpiada_foto.${campo}`);
+  }
+  const [indiceCarga] = await db.query("SHOW INDEX FROM olimpiada_foto WHERE Key_name = 'uq_oli_foto_carga'");
+  if (!indiceCarga.length) cambios.push('ADD UNIQUE INDEX uq_oli_foto_carga (olimpiada_id, usuario_id, carga_id)');
+  else if (indiceCarga.some(i => Number(i.Non_unique) !== 0) ||
+      indiceCarga.sort((a, b) => a.Seq_in_index - b.Seq_in_index).map(i => i.Column_name).join(',') !== 'olimpiada_id,usuario_id,carga_id') {
+    throw new Error('El índice de cargas de fotos existente es incompatible');
   }
   const [claves] = await db.query(`SELECT k.REFERENCED_TABLE_NAME AS tabla, k.REFERENCED_COLUMN_NAME AS columna, r.DELETE_RULE AS alBorrar
     FROM information_schema.KEY_COLUMN_USAGE k JOIN information_schema.REFERENTIAL_CONSTRAINTS r
