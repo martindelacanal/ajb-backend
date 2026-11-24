@@ -7,7 +7,7 @@ const {
   normalizarSets, contarSets, estaEnVivo, partidoPublico, calcularPosiciones, resolverClasificacion, hayCiclo,
   repartirPuntos, calcularTablaMedallero, agruparMedallasPorDisciplina, puestosSegunResultados,
 } = require("../api/services/olimpiadas-competicion");
-const { leerPartido, leerOrigen, leerCoordenadas, leerPuestosPuntos, mensajeConEfectos } = require("../api/routes/olimpiadas-contenido").__test;
+const { leerPartido, leerOrigen, camposEdicionPartidoVeedor, leerCoordenadas, leerPuestosPuntos, mensajeConEfectos } = require("../api/routes/olimpiadas-contenido").__test;
 const { validarPasswordVeedor, esCorreoInterno } = require("../api/security/olimpiadas-voluntarios");
 const { detectarVideo, partesTotales, TAMANO_PARTE } = require("../api/routes/olimpiadas-videos");
 const { tipoMarcadorSugerido } = require("../scripts/migrar-olimpiadas-veedores");
@@ -44,27 +44,32 @@ test("migración: cada deporte arranca con la forma de carga que le corresponde"
 });
 
 // ---------------------------------------------------------------------------
-// En vivo según el horario
+// Inicio manual
 // ---------------------------------------------------------------------------
-test("en vivo: un partido programado figura en vivo mientras dura su horario", () => {
-  const ahora = { fecha: "2026-11-26", minutos: 15 * 60 };
-  const base = { estado: "PROGRAMADO", fecha: "2026-11-26", hora_inicio: "14:30:00", hora_fin: "16:00:00" };
-  assert.equal(estaEnVivo(base, ahora), true);
-  assert.equal(estaEnVivo({ ...base, hora_inicio: "15:01:00" }, ahora), false);
-  assert.equal(estaEnVivo({ ...base, hora_fin: "15:00:00" }, ahora), false);
-  assert.equal(estaEnVivo({ ...base, fecha: "2026-11-27" }, ahora), false);
-  // Sin hora de fin se asume una duración estándar de hora y media.
-  assert.equal(estaEnVivo({ ...base, hora_inicio: "13:45:00", hora_fin: null }, ahora), true);
-  assert.equal(estaEnVivo({ ...base, hora_inicio: "13:00:00", hora_fin: null }, ahora), false);
-  // Lo que marca la organización manda: en juego siempre, finalizado o suspendido nunca.
-  assert.equal(estaEnVivo({ ...base, estado: "EN_JUEGO", fecha: null, hora_inicio: null }, ahora), true);
-  assert.equal(estaEnVivo({ ...base, estado: "FINALIZADO" }, ahora), false);
-  assert.equal(estaEnVivo({ ...base, estado: "SUSPENDIDO" }, ahora), false);
+test("en vivo: sólo los partidos iniciados expresamente figuran en juego", () => {
+  for (const horario of [
+    { fecha: "2026-11-26", hora_inicio: "14:30:00", hora_fin: "16:00:00" },
+    { fecha: "2026-11-26", hora_inicio: "14:30:00", hora_fin: null },
+    { fecha: null, hora_inicio: null, hora_fin: null },
+  ]) {
+    for (const estado of ["PROGRAMADO", "SUSPENDIDO", "FINALIZADO", "EN_JUEGO"]) {
+      assert.equal(estaEnVivo({ ...horario, estado }), estado === "EN_JUEGO");
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------
 // Equipos interdepartamentales
 // ---------------------------------------------------------------------------
+test("veedor: corregir el horario o el equipo directo no reescribe la llave del otro lado", () => {
+  const partido = { disciplina_id: 4, participante1: "La Plata", participante2: "A confirmar", partido_origen2_id: 12 };
+  const datosAnteriores = { disciplina_id: 4, participante1: "La Plata", participante2: "A confirmar" };
+  assert.deepEqual(camposEdicionPartidoVeedor({ ...datosAnteriores, fecha: "2026-11-27" }, partido), ["fecha"]);
+  assert.deepEqual(camposEdicionPartidoVeedor({ equipo1_id: 3, origen1_tipo: null }, partido),
+    ["participante1", "equipo1_id", "departamental1_id", "inscripcion1_id"]);
+  assert.throws(() => camposEdicionPartidoVeedor({ equipo2_id: 3 }, partido), { statusCode: 403 });
+});
+
 test("público: un equipo interdepartamental se muestra con su nombre combinado", () => {
   const publico = partidoPublico({ id: 1, participante1: "Dolores + Mar del Plata", equipo1_id: 3, equipo1_nombre: "Dolores + Mar del Plata",
     participante2: "Nombre privado", departamental2_id: 7, departamental2_nombre: "Bahía Blanca", inscripcion2_id: 9 });

@@ -15,7 +15,7 @@ const { SECCIONES_INICIALES } = require("../data/olimpiadas-plantillas");
 const { verificarAccesoCompeticion, exigirDisciplinaVoluntario, exigirEdicionVoluntario, esVoluntario, puedeEditarEdicion } = require('../security/olimpiadas-voluntarios');
 const {
   CAMPOS_PARTIDO_EXTRA, TIPOS_ORIGEN, TIPOS_MARCADOR, REGLAS_DIVISION, MAX_PUESTOS, calcularPosiciones, listarTorneos, listarEquipos, filtroId,
-  normalizarSets, contarSets, ahoraBuenosAires, estaEnVivo, conEnVivo, normalizarNombre, resolverClasificacion, hayCiclo,
+  normalizarSets, contarSets, conEnVivo, normalizarNombre, resolverClasificacion, hayCiclo,
   nombrePuesto, calcularTablaMedallero, agruparMedallasPorDisciplina, puestosSegunResultados,
 } = require('../services/olimpiadas-competicion');
 const {
@@ -1630,8 +1630,8 @@ const ORDEN_PARTIDOS = "p.fecha IS NULL, p.fecha, p.hora_inicio IS NULL, p.hora_
 const COORDENADAS_PARTIDO = ["sede_lat", "sede_lng", "lugar_lat", "lugar_lng"];
 
 // Cada partido sale con sus sets ya leídos, las coordenadas como número y si está en vivo ahora.
-function decorarPartidos(rows, ahora = ahoraBuenosAires()) {
-  return conEnVivo(rows, ahora).map((partido) => {
+function decorarPartidos(rows) {
+  return conEnVivo(rows).map((partido) => {
     for (const campo of COORDENADAS_PARTIDO) {
       if (partido[campo] !== undefined) partido[campo] = partido[campo] === null ? null : Number(partido[campo]);
     }
@@ -1658,7 +1658,8 @@ async function listarDisciplinasFixture(conexion, olimpiadaId) {
     `SELECT d.id, d.nombre, d.tipo_id, t.nombre AS tipo_nombre, d.icono_archivo, d.tipo_marcador,
             c.sede_id, s.nombre AS sede_nombre, s.direccion AS sede_direccion, s.url_mapa AS sede_url_mapa, s.lat AS sede_lat, s.lng AS sede_lng,
             c.veedor, c.reglamento, c.reglamento_archivo, c.reglamento_archivo_nombre,
-            (SELECT COUNT(*) FROM olimpiada_partido p WHERE p.olimpiada_id = c.olimpiada_id AND p.disciplina_id = d.id AND p.eliminado = 0) AS partidos
+            (SELECT COUNT(*) FROM olimpiada_partido p WHERE p.olimpiada_id = c.olimpiada_id AND p.disciplina_id = d.id AND p.eliminado = 0) AS partidos,
+            (SELECT COUNT(*) FROM olimpiada_partido p WHERE p.olimpiada_id = c.olimpiada_id AND p.disciplina_id = d.id AND p.eliminado = 0 AND p.estado = 'EN_JUEGO') AS en_vivo
      FROM olimpiada_disciplina_config c
      INNER JOIN olimpiada_disciplina d ON d.id = c.disciplina_id
      LEFT JOIN olimpiada_disciplina_tipo t ON t.id = d.tipo_id
@@ -1667,27 +1668,14 @@ async function listarDisciplinasFixture(conexion, olimpiadaId) {
      ORDER BY d.nombre`,
     [olimpiadaId]
   );
-  const hoy = fechaHoyBuenosAires();
-  const [[candidatos], [veedores]] = await Promise.all([
-    conexion.query(
-      `SELECT p.id, p.disciplina_id, p.estado, p.fecha, p.hora_inicio, p.hora_fin FROM olimpiada_partido p
-       WHERE p.olimpiada_id = ? AND p.eliminado = 0 AND (p.estado = 'EN_JUEGO' OR (p.estado = 'PROGRAMADO' AND p.fecha = ?))`,
-      [olimpiadaId, hoy]
-    ),
-    conexion.query(
-      `SELECT a.disciplina_id, TRIM(CASE WHEN u.id IS NULL THEN v.nombre ELSE CONCAT_WS(' ', u.nombre, u.apellido) END) AS nombre
+  const [veedores] = await conexion.query(
+    `SELECT a.disciplina_id, TRIM(CASE WHEN u.id IS NULL THEN v.nombre ELSE CONCAT_WS(' ', u.nombre, u.apellido) END) AS nombre
        FROM olimpiada_voluntario_disciplina a
        INNER JOIN olimpiada_voluntario v ON v.id = a.voluntario_id AND v.habilitado = 1
        LEFT JOIN usuario u ON u.id = v.usuario_sistema_id
        WHERE a.olimpiada_id = ? ORDER BY nombre`,
-      [olimpiadaId]
-    ),
-  ]);
-  const ahora = ahoraBuenosAires();
-  const enVivoPor = new Map();
-  for (const partido of candidatos) {
-    if (estaEnVivo(partido, ahora)) enVivoPor.set(Number(partido.disciplina_id), (enVivoPor.get(Number(partido.disciplina_id)) || 0) + 1);
-  }
+    [olimpiadaId]
+  );
   return Promise.all(
     rows.map(async (fila) => ({
       id: fila.id,
@@ -1709,7 +1697,7 @@ async function listarDisciplinasFixture(conexion, olimpiadaId) {
       reglamento_url: await firmarSeguro(fila.reglamento_archivo),
       reglamento_archivo_nombre: fila.reglamento_archivo ? fila.reglamento_archivo_nombre || "Reglamento.pdf" : null,
       partidos: Number(fila.partidos) || 0,
-      en_vivo: enVivoPor.get(Number(fila.id)) || 0,
+      en_vivo: Number(fila.en_vivo) || 0,
     }))
   );
 }
@@ -2014,10 +2002,35 @@ async function validarReferenciasPartido(conexion, olimpiadaId, datos) {
   }
 }
 
-async function autorizarPartido(cabecera, olimpiadaId, disciplinaId, datos = null, actual = null) {
+function soloAdministracionFixture(req, res, next) {
+  if (!esSuperior(getCabecera(req))) return res.status(403).json("El armado del fixture corresponde a la administración.");
+  next();
+}
+
+async function autorizarPartido(cabecera, olimpiadaId, disciplinaId) {
   if (!esSuperior(cabecera) && !esVoluntario(cabecera)) throw crearErrorHttp('No autorizado', 403);
   await exigirDisciplinaVoluntario({ db, cabecera, olimpiadaId, disciplinaId, escritura: true });
-  if (esVoluntario(cabecera) && datos && Number(datos.mostrar_nombres_publico) !== Number(actual?.mostrar_nombres_publico || 0)) throw crearErrorHttp('La publicación de nombres la decide la administración', 403);
+}
+
+function camposEdicionPartidoVeedor(body, actual) {
+  const horario = ['fecha', 'hora_inicio', 'hora_fin'];
+  const permitidos = new Set(horario);
+  const editar = horario.filter(campo => Object.hasOwn(body, campo));
+  // Las versiones anteriores del panel reenvían estos datos al cambiar el horario o un equipo.
+  if (Number(body.disciplina_id) === Number(actual.disciplina_id)) permitidos.add('disciplina_id');
+  for (const lado of [1, 2]) {
+    const nombre = `participante${lado}`;
+    if (body[nombre] === actual[nombre]) permitidos.add(nombre);
+    if (actual[`origen${lado}_tipo`] || actual[`partido_origen${lado}_id`]) continue;
+    const equipo = [nombre, `equipo${lado}_id`, `departamental${lado}_id`, `inscripcion${lado}_id`];
+    for (const campo of equipo) permitidos.add(campo);
+    if (equipo.some(campo => Object.hasOwn(body, campo) && textoComparable(body[campo]) !== textoComparable(actual[campo]))) editar.push(...equipo);
+    if (body[`origen${lado}_tipo`] === null) permitidos.add(`origen${lado}_tipo`);
+  }
+  if (Object.keys(body).some(campo => !permitidos.has(campo))) {
+    throw crearErrorHttp('Como veedor podés cambiar el horario y los equipos de lados sin clasificación automática. La administración define las fases y los cruces.', 403);
+  }
+  return editar;
 }
 
 async function guardarExtrasPartido(connection, partidoId, datos) {
@@ -2203,13 +2216,12 @@ async function prepararVinculacionPorNombre(conexion, olimpiadaId, disciplinaId)
   };
 }
 
-router.post("/olimpiadas/:id(\\d+)/partidos", verificarAccesoCompeticion, async (req, res) => {
+router.post("/olimpiadas/:id(\\d+)/partidos", verificarAccesoCompeticion, soloAdministracionFixture, async (req, res) => {
   const cabecera = getCabecera(req);
   try {
     const olimpiadaId = idDeRuta(req.params.id);
     await cargarOlimpiada(db, olimpiadaId, cabecera);
     const datos = leerPartido(req.body || {}, {});
-    await autorizarPartido(cabecera, olimpiadaId, datos.disciplina_id, datos);
     await validarReferenciasPartido(db, olimpiadaId, datos);
     let efectos = null;
     const partidoId = await enTransaccion(async (connection) => {
@@ -2241,7 +2253,7 @@ router.post("/olimpiadas/:id(\\d+)/partidos", verificarAccesoCompeticion, async 
   }
 });
 
-router.post("/olimpiadas/:id(\\d+)/partidos/importar", verificarAccesoCompeticion, async (req, res) => {
+router.post("/olimpiadas/:id(\\d+)/partidos/importar", verificarAccesoCompeticion, soloAdministracionFixture, async (req, res) => {
   const cabecera = getCabecera(req);
   try {
     const olimpiadaId = idDeRuta(req.params.id);
@@ -2249,7 +2261,6 @@ router.post("/olimpiadas/:id(\\d+)/partidos/importar", verificarAccesoCompeticio
     const body = req.body || {};
     const disciplinaId = normalizarIdPositivo(body.disciplina_id);
     if (!disciplinaId) return res.status(400).json("Elegí la disciplina a la que pertenecen los partidos");
-    await autorizarPartido(cabecera, olimpiadaId, disciplinaId);
     const disciplina = await validarDisciplinaDeOlimpiada(db, olimpiadaId, disciplinaId);
     const texto = typeof body.texto === "string" ? body.texto : "";
     if (!texto.trim()) return res.status(400).json("Pegá los partidos en el cuadro de texto");
@@ -2309,9 +2320,9 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)", verificarAccesoCompeticion, 
     const partidoId = idDeRuta(req.params.partidoId);
     const actual = await exigirFila(db, "olimpiada_partido", partidoId, "El partido no existe");
     const body = req.body || {};
+    await autorizarPartido(cabecera, actual.olimpiada_id, actual.disciplina_id);
+    const camposVeedor = esVoluntario(cabecera) ? camposEdicionPartidoVeedor(body, actual) : null;
     const datos = leerPartido(body, actual, { completo: true });
-    await autorizarPartido(cabecera, actual.olimpiada_id, actual.disciplina_id, datos, actual);
-    await autorizarPartido(cabecera, actual.olimpiada_id, datos.disciplina_id, datos, actual);
     if ((body.resultado1 !== undefined || body.resultado2 !== undefined || body.sets !== undefined) && body.ganador === undefined) datos.ganador = null;
     // Finalizado sin ganador definido y con marcador numérico → se calcula (igual que /resultado).
     if (datos.estado === "FINALIZADO" && datos.ganador === null) {
@@ -2322,30 +2333,23 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)", verificarAccesoCompeticion, 
     let efectos = null;
     await enTransaccion(async (connection) => {
       await bloquearSinCambios(connection, 'olimpiada_partido', actual);
-      await connection.query(
-        `UPDATE olimpiada_partido
-         SET disciplina_id = ?, fecha = ?, hora_inicio = ?, hora_fin = ?, etiqueta = ?, fase = ?, participante1 = ?, participante2 = ?,
-             departamental1_id = ?, departamental2_id = ?, sede_id = ?, observacion = ?, orden = ?,
-             estado = ?, resultado1 = ?, resultado2 = ?, ganador = ?, sets = ?
-         WHERE id = ?`,
-        [
-          datos.disciplina_id, datos.fecha, datos.hora_inicio, datos.hora_fin, datos.etiqueta, datos.fase, datos.participante1,
-          datos.participante2, datos.departamental1_id, datos.departamental2_id, datos.sede_id, datos.observacion, datos.orden,
-          datos.estado, datos.resultado1, datos.resultado2, datos.ganador, datos.sets, partidoId,
-        ]
-      );
-      await guardarExtrasPartido(connection, partidoId, datos);
+      const campos = camposVeedor || [
+        "disciplina_id", "fecha", "hora_inicio", "hora_fin", "etiqueta", "fase", "participante1", "participante2",
+        "departamental1_id", "departamental2_id", "sede_id", "observacion", "orden",
+        "estado", "resultado1", "resultado2", "ganador", "sets",
+      ];
+      if (campos.length) {
+        const cambios = Object.fromEntries(campos.map(campo => [campo, datos[campo]]));
+        await connection.query("UPDATE olimpiada_partido SET ? WHERE id = ?", [cambios, partidoId]);
+      }
+      if (!camposVeedor) await guardarExtrasPartido(connection, partidoId, datos);
       await historialCambios(
         connection,
         cabecera,
         { entidad: "PARTIDO", entidad_id: partidoId, olimpiada_id: actual.olimpiada_id },
         actual,
         datos,
-        [
-          "disciplina_id", "fecha", "hora_inicio", "hora_fin", "etiqueta", "fase", "participante1", "participante2",
-          "departamental1_id", "departamental2_id", "sede_id", "observacion", "orden", "estado", "resultado1", "resultado2", "ganador", "sets",
-          ...CAMPOS_PARTIDO_EXTRA,
-        ]
+        camposVeedor || [...campos, ...CAMPOS_PARTIDO_EXTRA]
       );
       efectos = await aplicarEfectosCompeticion(connection, cabecera, actual.olimpiada_id, datos.disciplina_id);
       if (Number(actual.disciplina_id) !== Number(datos.disciplina_id)) {
@@ -2365,6 +2369,8 @@ const MENSAJE_RESULTADO = {
   SUSPENDIDO: "Partido suspendido.",
 };
 
+const CAMPOS_RESULTADO = ['estado', 'resultado1', 'resultado2', 'sets', 'ganador'];
+
 router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCompeticion, async (req, res) => {
   const cabecera = getCabecera(req);
   try {
@@ -2374,6 +2380,13 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCom
     const body = req.body || {};
     if (body.estado === undefined) return res.status(400).json("Indicá el estado del partido");
     const estado = leerEnum(body, "estado", {}, ESTADOS_PARTIDO, { etiqueta: "el estado" });
+    if (esVoluntario(cabecera)) {
+      const campos = Object.keys(body);
+      if (campos.some(campo => !CAMPOS_RESULTADO.includes(campo))) return res.status(403).json("Esta operación sólo permite cargar el estado y el marcador.");
+      if (estado === "EN_JUEGO" && actual.estado !== "EN_JUEGO" && campos.length > 1) {
+        return res.status(409).json("Marcá el inicio del partido antes de cargar un resultado parcial.");
+      }
+    }
     let resultado1 = leerTexto(body, "resultado1", actual, { maximo: 20, etiqueta: "el resultado 1" });
     let resultado2 = leerTexto(body, "resultado2", actual, { maximo: 20, etiqueta: "el resultado 2" });
     // Por sets: el resultado global (2 a 0) sale de contar los sets ganados por cada lado.
@@ -2425,12 +2438,11 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCom
   }
 });
 
-router.delete("/olimpiadas/partidos/:partidoId(\\d+)", verificarAccesoCompeticion, async (req, res) => {
+router.delete("/olimpiadas/partidos/:partidoId(\\d+)", verificarAccesoCompeticion, soloAdministracionFixture, async (req, res) => {
   const cabecera = getCabecera(req);
   try {
     const partidoId = idDeRuta(req.params.partidoId);
     const actual = await exigirFila(db, "olimpiada_partido", partidoId, "El partido no existe");
-    await autorizarPartido(cabecera, actual.olimpiada_id, actual.disciplina_id);
     const [[referencias]] = await db.query('SELECT COUNT(*) AS cantidad FROM olimpiada_partido WHERE eliminado = 0 AND (partido_origen1_id = ? OR partido_origen2_id = ?)', [partidoId, partidoId]);
     if (Number(referencias.cantidad)) throw crearErrorHttp('Primero quitá este partido como origen de los partidos siguientes');
     await enTransaccion(async (connection) => {
@@ -2454,14 +2466,13 @@ router.delete("/olimpiadas/partidos/:partidoId(\\d+)", verificarAccesoCompeticio
 // ---------------------------------------------------------------------------
 // En vivo
 // ---------------------------------------------------------------------------
-// «En juego» junta los partidos que alguien marcó en juego y los que están en su horario.
 async function armarEnVivo(conexion, olimpiadaId, { condicionExtra = null, paramsExtra = [] } = {}) {
   const consultar = (opciones) => consultarPartidos(conexion, condicionExtra ? {
     ...opciones, condiciones: [...opciones.condiciones, condicionExtra], params: [...opciones.params, ...paramsExtra],
   } : opciones);
   const hoy = fechaHoyBuenosAires();
-  const [candidatos, recientes, programados] = await Promise.all([
-    consultar({ condiciones: ["p.olimpiada_id = ?", "(p.estado = 'EN_JUEGO' OR (p.estado = 'PROGRAMADO' AND p.fecha = ?))"], params: [olimpiadaId, hoy] }),
+  const [enJuego, recientes, proximos] = await Promise.all([
+    consultar({ condiciones: ["p.olimpiada_id = ?", "p.estado = 'EN_JUEGO'"], params: [olimpiadaId] }),
     consultar({
       condiciones: ["p.olimpiada_id = ?", "p.estado = 'FINALIZADO'"],
       params: [olimpiadaId],
@@ -2472,14 +2483,14 @@ async function armarEnVivo(conexion, olimpiadaId, { condicionExtra = null, param
       condiciones: ["p.olimpiada_id = ?", "p.estado = 'PROGRAMADO'", "p.fecha >= ?"],
       params: [olimpiadaId, hoy],
       orden: "p.fecha, p.hora_inicio IS NULL, p.hora_inicio, p.orden, p.id",
-      limite: 40,
+      limite: 20,
     }),
   ]);
   return {
     actualizado: new Date().toISOString(),
-    en_juego: candidatos.filter(p => p.en_vivo),
+    en_juego: enJuego,
     recientes,
-    proximos: programados.filter(p => !p.en_vivo).slice(0, 20),
+    proximos,
   };
 }
 
@@ -3150,6 +3161,7 @@ router.__test = Object.freeze({
   leerEnlace,
   leerPartido,
   leerOrigen,
+  camposEdicionPartidoVeedor,
   leerCoordenadas,
   validarReferenciasPartido,
   guardarExtrasPartido,

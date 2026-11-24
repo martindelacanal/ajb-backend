@@ -7,7 +7,6 @@ const TIPOS_MARCADOR = ['TANTOS', 'SETS', 'GANADOR'];
 const REGLAS_DIVISION = ['EXACTA', 'REDONDEO', 'ABAJO', 'ARRIBA', 'COMPLETO'];
 const MAX_SETS = 7;
 const MAX_PUESTOS = 10;
-const DURACION_PARTIDO_MINUTOS = 90;
 
 // ---------------------------------------------------------------------------
 // Sets (vóley, pádel, tenis…)
@@ -49,48 +48,14 @@ function contarSets(sets) {
 }
 
 // ---------------------------------------------------------------------------
-// En vivo según el horario
+// Estado del encuentro
 // ---------------------------------------------------------------------------
-function ahoraBuenosAires(fecha = new Date()) {
-  const partes = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'America/Argentina/Buenos_Aires', year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-  }).formatToParts(fecha);
-  const p = Object.fromEntries(partes.map(parte => [parte.type, parte.value]));
-  return { fecha: `${p.year}-${p.month}-${p.day}`, minutos: Number(p.hour) * 60 + Number(p.minute) };
+function estaEnVivo(partido) {
+  return partido?.estado === 'EN_JUEGO';
 }
 
-function fechaCivil(valor) {
-  if (!valor) return null;
-  if (valor instanceof Date) {
-    if (Number.isNaN(valor.getTime())) return null;
-    return `${valor.getFullYear()}-${String(valor.getMonth() + 1).padStart(2, '0')}-${String(valor.getDate()).padStart(2, '0')}`;
-  }
-  const texto = String(valor).slice(0, 10);
-  return /^\d{4}-\d{2}-\d{2}$/.test(texto) ? texto : null;
-}
-
-function minutosDe(hora) {
-  const match = /^(\d{1,2}):(\d{2})/.exec(String(hora || ''));
-  return match ? Number(match[1]) * 60 + Number(match[2]) : null;
-}
-
-/**
- * Un partido está «en vivo» si lo marcaron en juego o si, estando programado, la hora actual cae
- * dentro de su horario (sin hora de fin se asume una duración estándar). Finalizados y suspendidos nunca.
- */
-function estaEnVivo(partido, ahora = ahoraBuenosAires()) {
-  if (!partido) return false;
-  if (partido.estado === 'EN_JUEGO') return true;
-  if (partido.estado !== 'PROGRAMADO') return false;
-  const inicio = minutosDe(partido.hora_inicio);
-  if (inicio === null || fechaCivil(partido.fecha) !== ahora.fecha) return false;
-  const fin = minutosDe(partido.hora_fin) ?? inicio + DURACION_PARTIDO_MINUTOS;
-  return ahora.minutos >= inicio && ahora.minutos < Math.max(fin, inicio + 1);
-}
-
-function conEnVivo(partidos, ahora = ahoraBuenosAires()) {
-  return (partidos || []).map(p => ({ ...p, sets: leerSets(p.sets), en_vivo: estaEnVivo(p, ahora),
+function conEnVivo(partidos) {
+  return (partidos || []).map(p => ({ ...p, sets: leerSets(p.sets), en_vivo: estaEnVivo(p),
     clasificacion1_manual: !!rotuloManual(p, 1), clasificacion2_manual: !!rotuloManual(p, 2) }));
 }
 
@@ -522,7 +487,7 @@ function filtroId(query, campo) {
 module.exports = {
   CAMPOS_PARTIDO_EXTRA, TIPOS_ORIGEN, TIPOS_MARCADOR, REGLAS_DIVISION, MAX_SETS, MAX_PUESTOS,
   partidoPublico, partidosPublicos, marcadorNumerico, calcularPosiciones, listarTorneos, listarEquipos, filtroId,
-  normalizarSets, leerSets, contarSets, ahoraBuenosAires, estaEnVivo, conEnVivo, fechaCivil,
+  normalizarSets, leerSets, contarSets, estaEnVivo, conEnVivo,
   normalizarNombre, competidorDe, resolverClasificacion, hayCiclo, nombreZona,
   nombrePuesto, repartirPuntos, calcularTablaMedallero, agruparMedallasPorDisciplina, puestosSegunResultados,
 };

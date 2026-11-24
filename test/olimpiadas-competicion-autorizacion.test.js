@@ -5,7 +5,7 @@ const express = require("express");
 process.env.JWT_SECRET = "competicion-authorization-test-only";
 
 let contexto;
-const pool = { query: (...args) => contexto.query(...args), getConnection: () => assert.fail("Una petición no autorizada nunca inicia una escritura") };
+const pool = { query: (...args) => contexto.query(...args), getConnection: () => contexto.conexion ?? assert.fail("Una petición no autorizada nunca inicia una escritura") };
 const connectionPath = require.resolve("../api/connection/connection");
 require.cache[connectionPath] = { id: connectionPath, filename: connectionPath, loaded: true, exports: { promise: () => pool } };
 const privado = require("../api/routes/olimpiadas-contenido");
@@ -40,7 +40,7 @@ async function servidor(t, opciones = {}) {
     }
     if (/SELECT \(SELECT COUNT/.test(sql)) return [[{}]];
     if (/FROM olimpiada_enlace WHERE/.test(sql)) return [[]];
-    if (/SELECT \* FROM olimpiada_partido WHERE/.test(sql)) return [[{ ...partido, id: Number(params[0]), disciplina_id: Number(params[0]) === 55 ? 5 : 4 }]];
+    if (/SELECT \* FROM olimpiada_partido WHERE/.test(sql)) return [[{ ...(contexto.partidos.find(p => p.id === Number(params[0])) || partido), id: Number(params[0]), disciplina_id: Number(params[0]) === 55 ? 5 : 4 }]];
     if (/SELECT \* FROM olimpiada_torneo WHERE/.test(sql)) return [[{ id: Number(params[0]), olimpiada_id: 7, disciplina_id: Number(params[0]) === 55 ? 5 : 4, nombre: "Torneo", formato: "LIGA" }]];
     if (/FROM olimpiada_partido p/.test(sql) && /SELECT p\.id/.test(sql)) {
       const asignadas = params.find((p) => Array.isArray(p));
@@ -116,6 +116,54 @@ test("competición: al terminar el evento conserva fixture pero bloquea partidos
     ["PUT", "/olimpiadas/torneos/44", { nombre: "Torneo editado" }],
     ["DELETE", "/olimpiadas/torneos/44"],
   ]) assert.equal((await pedir(ruta, { method, body })).status, 403, `${method} ${ruta}`);
+});
+
+test("veedor: la estructura de su propia disciplina también queda reservada a la administración", async (t) => {
+  const { pedir } = await servidor(t, { partidos: [{ ...partido, partido_origen2_id: 32 }] });
+  const ruta = "/olimpiadas/partidos/44";
+  for (const [method, url, body] of [
+    ["POST", "/olimpiadas/7/partidos", { disciplina_id: 4, participante1: "A", participante2: "B" }],
+    ["POST", "/olimpiadas/7/partidos/importar", { disciplina_id: 4, texto: "A | B" }],
+    ["DELETE", ruta],
+    ["PUT", ruta, { fase: "Final", fecha: fechaHoyBuenosAires() }],
+    ["PUT", ruta, { instancia_id: 2 }], ["PUT", ruta, { torneo_id: 4 }], ["PUT", ruta, { zona: "B" }],
+    ["PUT", ruta, { partido_origen2_id: null }], ["PUT", ruta, { equipo2_id: 8 }],
+    ["PUT", ruta, { participante2: "Otro" }], ["PUT", ruta, { estado: "EN_JUEGO" }],
+    ["PUT", ruta + "/resultado", { estado: "EN_JUEGO", origen1_tipo: "PERDEDOR" }],
+    ["POST", "/olimpiadas/7/torneos", { disciplina_id: 4, nombre: "Nuevo" }],
+    ["PUT", "/olimpiadas/torneos/44", { formato: "LIGA", instancia_ids: [1, 2] }],
+    ["DELETE", "/olimpiadas/torneos/44"],
+  ]) assert.equal((await pedir(url, { method, body })).status, 403, `${method} ${url} ${JSON.stringify(body)}`);
+});
+
+test("veedor: un partido sólo sale en vivo al iniciar, conserva los sets al suspender y permite reanudar", async (t) => {
+  const encuentro = { ...partido, hora_inicio: "00:00:00", hora_fin: "23:59:00" };
+  const { pedir, contexto } = await servidor(t, { partidos: [encuentro] });
+  contexto.conexion = {
+    beginTransaction() {}, commit() {}, rollback() {}, release() {},
+    async query(sql, params) {
+      if (sql.includes("UPDATE olimpiada_partido SET estado = ?")) {
+        [encuentro.estado, encuentro.resultado1, encuentro.resultado2, encuentro.ganador, encuentro.sets] = params;
+        return [{ affectedRows: 1 }];
+      }
+      if (sql.includes("INSERT INTO olimpiada_historial")) return [{ insertId: 1 }];
+      if (sql.includes("FROM olimpiada_medalla m")) return [[]];
+      return contexto.query(sql, params);
+    },
+  };
+  const guardar = body => pedir("/olimpiadas/partidos/44/resultado", { method: "PUT", body });
+  const enJuego = async () => (await (await pedir("/olimpiadas/publico/7/en-vivo", { anonimo: true })).json()).en_juego.map(p => p.id);
+  assert.deepEqual(await enJuego(), []);
+  assert.equal((await guardar({ estado: "EN_JUEGO", sets: [[25, 19]] })).status, 409);
+  assert.equal((await guardar({ estado: "EN_JUEGO" })).status, 200);
+  assert.deepEqual(await enJuego(), [44]);
+  assert.equal((await guardar({ estado: "EN_JUEGO", sets: [[25, 19]] })).status, 200);
+  assert.equal((await guardar({ estado: "SUSPENDIDO" })).status, 200);
+  assert.deepEqual(await enJuego(), []);
+  assert.deepEqual([encuentro.resultado1, encuentro.resultado2, encuentro.sets], ["1", "0", "[[25,19]]"]);
+  assert.equal((await guardar({ estado: "EN_JUEGO" })).status, 200);
+  assert.deepEqual(await enJuego(), [44]);
+  assert.equal(encuentro.sets, "[[25,19]]");
 });
 
 test("competición: sólo administración puede publicar nombres, gestionar catálogos o leer el portal privado", async (t) => {

@@ -82,7 +82,7 @@ module.exports = function registrarTorneos(router, helpers) {
   }));
 
   const guardarTorneo = async (req, res) => {
-    const cabecera = getCabecera(req); soloGestion(cabecera);
+    const cabecera = getCabecera(req); soloSuperior(cabecera);
     const id = req.params.torneoId ? idRuta(req.params.torneoId) : null;
     let actual = {};
     if (id) { const [[fila]] = await db.query('SELECT * FROM olimpiada_torneo WHERE id = ? AND eliminado = 0', [id]); if (!fila) throw crearErrorHttp('El torneo no existe', 404); actual = fila; }
@@ -95,8 +95,6 @@ module.exports = function registrarTorneos(router, helpers) {
       descripcion: leerTexto(body, 'descripcion', actual, { maximo: 1000 }),
     };
     if (!datos.disciplina_id) throw crearErrorHttp('Elegí una disciplina');
-    if (id) await exigirDisciplinaVoluntario({ db, cabecera, olimpiadaId, disciplinaId: actual.disciplina_id, escritura: true });
-    await exigirDisciplinaVoluntario({ db, cabecera, olimpiadaId, disciplinaId: datos.disciplina_id, escritura: true });
     await validarDisciplinaDeOlimpiada(db, olimpiadaId, datos.disciplina_id);
     let instanciaIds = null;
     if (body.instancia_ids !== undefined) { instanciaIds = normalizarIds(body.instancia_ids); if (!instanciaIds || !instanciaIds.length || instanciaIds.length > 32) throw crearErrorHttp('Elegí entre 1 y 32 instancias'); }
@@ -129,11 +127,10 @@ module.exports = function registrarTorneos(router, helpers) {
   router.post('/olimpiadas/:id(\\d+)/torneos', verificarAccesoCompeticion, endpoint(guardarTorneo));
   router.put('/olimpiadas/torneos/:torneoId(\\d+)', verificarAccesoCompeticion, endpoint(guardarTorneo));
   router.delete('/olimpiadas/torneos/:torneoId(\\d+)', verificarAccesoCompeticion, endpoint(async (req, res) => {
-    const cabecera = getCabecera(req); soloGestion(cabecera);
+    const cabecera = getCabecera(req); soloSuperior(cabecera);
     const id = idRuta(req.params.torneoId);
     const [[torneo]] = await db.query('SELECT * FROM olimpiada_torneo WHERE id = ? AND eliminado = 0', [id]);
     if (!torneo) throw crearErrorHttp('El torneo no existe', 404);
-    await exigirDisciplinaVoluntario({ db, cabecera, olimpiadaId: torneo.olimpiada_id, disciplinaId: torneo.disciplina_id, escritura: true });
     await enTransaccion(async connection => {
       await bloquearSinCambios(connection, 'olimpiada_torneo', torneo);
       const [[cuenta]] = await connection.query('SELECT COUNT(*) AS cantidad FROM olimpiada_partido WHERE torneo_id = ? AND eliminado = 0', [id]);

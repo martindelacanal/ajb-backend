@@ -134,7 +134,7 @@ async function enviarBienvenida({ db, voluntarioId, olimpiada, cabecera, enviar 
       parrafos: [
         `Te damos la bienvenida al equipo de veedores de ${olimpiada.nombre}.`,
         "Vas a ver sólo los partidos de tus disciplinas. Durante las fechas del evento cargás los resultados desde el teléfono; antes y después podés consultarlos.",
-        v.usuario_sistema_id ? "Entrá a Mi AJB con tu documento y tu contraseña de siempre, andá a Olimpiadas y presioná el botón «Veedor»." : "Esta es tu nueva contraseña de acceso; reemplaza cualquier contraseña anterior.",
+        v.usuario_sistema_id ? "Abrí el enlace de veedores e ingresá con tu documento y tu contraseña habitual." : "Esta es tu nueva contraseña de acceso; reemplaza cualquier contraseña anterior.",
       ],
       datos: [
         { etiqueta: "Usuario", valor: v.usuario }, { etiqueta: "Correo", valor: v.email },
@@ -142,7 +142,7 @@ async function enviarBienvenida({ db, voluntarioId, olimpiada, cabecera, enviar 
         { etiqueta: "Disciplinas asignadas", valor: asignacion.disciplinas.map((d) => d.nombre).join(", ") },
         { etiqueta: "Fechas del evento", valor: `${String(olimpiada.fecha_inicio).slice(0, 10)} al ${String(olimpiada.fecha_fin).slice(0, 10)}` },
       ],
-      boton: { texto: "Ingresar como veedor", url: urlAplicacion("/olimpiadas-veedores") },
+      boton: { texto: "Ingresar como veedor", url: urlAplicacion("/olimpiadas-veedores/ingresar") },
     });
     if (!respuesta?.enviado) throw crearErrorHttp("No se pudo enviar el correo. La contraseña anterior sigue vigente.", 503);
     if (v.usuario_sistema_id) await connection.query("UPDATE olimpiada_voluntario SET ultimo_correo_en=NOW() WHERE id=?", [voluntarioId]);

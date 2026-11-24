@@ -42,7 +42,9 @@ Un torneo pertenece a una edición y disciplina; admite formato `ELIMINACION`, `
 
 Cada partido admite fecha, hora de inicio y fin, sede, lugar específico, fase, zona, torneo, disciplina y dos rivales. Cada rival es una departamental, un **equipo interdepartamental**, una inscripción aprobada en esa misma edición y disciplina, o un lugar que se completa solo (ver más abajo). El sistema deriva nombre y departamental desde la inscripción, evitando referencias mezcladas. El marcador acepta valores numéricos y también texto como «W.O.»; para resultados no numéricos debe elegirse el ganador expresamente.
 
-Un partido figura **en vivo** si alguien lo marcó «en juego» o si, estando programado, la hora actual (Buenos Aires) cae dentro de su horario; sin hora de fin se asume una hora y media. El servidor lo calcula en cada respuesta (`partido.en_vivo`, `disciplina.en_vivo`).
+Un partido figura **en vivo** desde que se confirma su inicio y pasa a `EN_JUEGO`. La hora programada sirve para consultar el cronograma. Al suspender un encuentro, pasa a `SUSPENDIDO`, sale del listado en vivo y conserva el marcador y los sets cargados. La suspensión registra una interrupción del encuentro, por ejemplo por lluvia. El sistema no lleva un cronómetro de juego.
+
+La administración define el formato del torneo, crea los partidos y edita sus fases y cruces. El veedor puede corregir el horario, elegir participantes para los lados sin clasificación automática y cargar los resultados de su disciplina.
 
 ### Equipos interdepartamentales
 
@@ -79,7 +81,7 @@ Las cuentas de veedor se guardan en `olimpiada_voluntario` (el nombre de las tab
 
 La **escritura** de un veedor se habilita entre las fechas de inicio y fin de la edición inclusive (fecha civil de Buenos Aires) o cuando la administración activa `olimpiada.veedores_carga_abierta` (para precargar o probar antes del evento). Fuera de eso conserva sólo lectura de sus disciplinas. La administración siempre puede corregir información histórica con auditoría.
 
-El envío de bienvenida es una acción explícita, individual o por selección de cuentas. **Para cuentas invitadas con correo, cada envío exitoso genera una nueva contraseña, la comunica por correo y revoca las sesiones previas de esa cuenta.** Un envío fallido no reemplaza la contraseña. Para cuentas vinculadas, la bienvenida indica que entren por Mi AJB con sus credenciales habituales. Una cuenta sin correo no admite bienvenida.
+El envío de bienvenida es una acción explícita, individual o por selección de cuentas. **Para cuentas invitadas con correo, cada envío exitoso genera una nueva contraseña, la comunica por correo y revoca las sesiones previas de esa cuenta.** Un envío fallido no reemplaza la contraseña. La bienvenida incluye el enlace directo de veedores. Las cuentas vinculadas ingresan allí con su documento y contraseña habituales. Una cuenta sin correo no admite bienvenida.
 
 El acceso de invitados en `/olimpiadas-veedores/ingresar` reutiliza el módulo de login con textos específicos (las direcciones anteriores `/olimpiadas-colaboradores…` redirigen). Se puede mantener la sesión, recuperar la contraseña por código de correo y registrar claves de acceso (huella, rostro o PIN). Los códigos y renovaciones se guardan como hashes; el cierre de sesión revoca el acceso en el servidor. Los bloqueos y cambios de contraseña de la cuenta Mi AJB vinculada se comprueban también en sus accesos de veedor.
 

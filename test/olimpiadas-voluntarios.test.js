@@ -205,7 +205,7 @@ test("bienvenida rota clave sólo al enviar, registra auditoría sin secretos y 
   const result = await __test.enviarBienvenida({ db, voluntarioId: 12, olimpiada: edicion, cabecera: { id: 1, rol: "admin" }, enviar: async (datos) => { correo = datos; return { enviado: true }; } });
   assert.equal(result.enviado, true);
   assert.equal(correo.autenticacion, true);
-  assert.match(correo.boton.url, /\/olimpiadas-veedores$/);
+  assert.match(correo.boton.url, /\/olimpiadas-veedores\/ingresar$/);
   const password = correo.datos.find((d) => d.etiqueta === "Nueva contraseña").valor;
   const update = consultas.find((q) => /UPDATE olimpiada_voluntario/.test(q.sql));
   assert.ok(await bcrypt.compare(password, update.params[0]));
