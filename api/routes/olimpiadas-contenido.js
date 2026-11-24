@@ -2196,6 +2196,10 @@ function describirMedallas(filas) {
  * disciplina, esa disciplina queda como la dejó (hasta que elija «volver al cálculo automático»).
  */
 async function sincronizarMedallasAutomaticas(connection, cabecera, olimpiadaId, disciplinaId) {
+  // Maratón, natación, pesca y póker no tienen final: sus medallas salen de las categorías y los ganadores cargados.
+  if (await pruebasLectura.esPorCategorias(connection, disciplinaId)) {
+    return pruebasLectura.sincronizarMedallas(connection, { cabecera, olimpiadaId, disciplinaId, historial });
+  }
   const [existentes] = await connection.query(
     `SELECT m.id, m.puesto, m.departamental_id, m.equipo_id, m.origen, dep.nombre
      FROM olimpiada_medalla m INNER JOIN departamental dep ON dep.id = m.departamental_id
@@ -2593,17 +2597,27 @@ async function armarMedallero(conexion, olimpiada) {
      WHERE c.olimpiada_id = ? AND d.habilitado = 'Y' AND COALESCE(t.competitiva, 1) = 1 ORDER BY d.nombre`,
     [olimpiada.id]
   );
-  const [medallas] = await conexion.query(
+  // En las disciplinas por categorías cada medalla dice de qué categoría salió y quién la ganó.
+  const conCategorias = await pruebasLectura.esquemaDisponible(conexion) && await pruebasLectura.esquemaMedallero(conexion);
+  const [filasMedallas] = await conexion.query(
     `SELECT m.id, m.disciplina_id, d.nombre AS disciplina_nombre, m.puesto, m.departamental_id, dep.nombre,
-            m.equipo_id, e.nombre AS equipo_nombre, m.origen, m.puntos_manual
+            m.equipo_id, e.nombre AS equipo_nombre, m.origen, m.puntos_manual${conCategorias ? `,
+            m.criterio, pr.nombre AS prueba_nombre, pr.orden AS prueba_orden, pp.nombre AS participante_nombre` : ""}
      FROM olimpiada_medalla m
      INNER JOIN olimpiada_disciplina d ON d.id = m.disciplina_id
      INNER JOIN departamental dep ON dep.id = m.departamental_id
-     LEFT JOIN olimpiada_equipo e ON e.id = m.equipo_id
+     LEFT JOIN olimpiada_equipo e ON e.id = m.equipo_id${conCategorias ? `
+     LEFT JOIN olimpiada_prueba pr ON pr.id = m.prueba_id
+     LEFT JOIN olimpiada_prueba_participante pp ON pp.id = m.participante_id` : ""}
      WHERE m.olimpiada_id = ?
-     ORDER BY d.nombre, m.puesto, dep.nombre`,
+     ORDER BY d.nombre, m.puesto, ${conCategorias ? "pr.orden IS NULL, pr.orden, m.criterio, " : ""}dep.nombre, m.id`,
     [olimpiada.id]
   );
+  const medallas = filasMedallas.map(({ criterio, prueba_nombre, prueba_orden, participante_nombre, ...medalla }) => ({
+    ...medalla,
+    // «Femenino · Ana Pérez», «Costa · peso · Raúl Díaz» o, en póker, sólo la persona
+    detalle: [prueba_nombre, criterio === "PIEZAS" ? "piezas" : criterio === "PESO" ? "peso" : null, participante_nombre].filter(Boolean).join(" · ") || null,
+  }));
   return {
     publicado: Number(olimpiada.medallero_publicado) === 1,
     division,
@@ -2685,6 +2699,8 @@ router.put("/olimpiadas/:id(\\d+)/medallero/puntos", verifyToken, async (req, re
           campo_modificado: "sistema_puntos", valor_anterior: describir(anteriores), valor_nuevo: describir(nuevos),
         });
       }
+      // Las disciplinas por categorías conocen todos los puestos: si ahora puntúan más (o menos), se ajustan
+      if (anteriores.length !== nuevos.length) await pruebasLectura.sincronizarMedallasEdicion(connection, { cabecera, olimpiadaId, historial });
     });
     res.status(200).json({ success: true, message: "Sistema de puntos actualizado", medallero: await armarMedallero(db, { ...olimpiada, ...legado }) });
   } catch (error) {
