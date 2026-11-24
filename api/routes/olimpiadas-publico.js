@@ -4,7 +4,7 @@ const express = require('express');
 const db = require('../connection/connection').promise();
 const { normalizarFechaCivil } = require('../services/valores-dominio');
 const { validarRutaPublica } = require('../services/olimpiadas-ruta-publica');
-const { crearErrorHttp, responderError, obtenerOlimpiada, listarNombresDisciplinas, firmarSeguro, fechaHoyBuenosAires, estaVentanaInscripcionAbierta, calcularGanadores } = require('../services/olimpiadas-comun');
+const { crearErrorHttp, responderError, obtenerOlimpiada, listarNombresDisciplinas, firmarSeguro, obtenerUrlAvisoPublico, fechaHoyBuenosAires, estaVentanaInscripcionAbierta, calcularGanadores } = require('../services/olimpiadas-comun');
 const { partidosPublicos, calcularPosiciones, listarTorneos, listarEquipos, filtroId } = require('../services/olimpiadas-competicion');
 const lectura = require('./olimpiadas-contenido').lecturasPublicas;
 const router = express.Router();
@@ -76,8 +76,9 @@ ruta('portal', async (req, o) => {
   // Las categorías y mesas que se están disputando también cuentan como «en vivo»
   conteos.en_vivo += (await lectura.pruebasEnJuego(db, o.id)).length;
   const [videos] = await db.query("SELECT id, titulo, url, descripcion FROM olimpiada_enlace WHERE olimpiada_id = ? AND eliminado = 0 AND tipo = 'VIDEOS' ORDER BY orden, id", [o.id]);
-  const disciplinas = (await listarNombresDisciplinas(db, o.id)).get(Number(o.id)) || [];
-  return { olimpiada: { ...edicionPublica(o), videos, disciplinas }, conteos, mi_inscripcion: null, hoteles_mi_departamental: [], departamental_id: null };
+  const [nombres, popup_imagen_url] = await Promise.all([listarNombresDisciplinas(db, o.id), obtenerUrlAvisoPublico(o.id)]);
+  const disciplinas = nombres.get(Number(o.id)) || [];
+  return { olimpiada: { ...edicionPublica(o), videos, disciplinas, popup_imagen_url }, conteos, mi_inscripcion: null, hoteles_mi_departamental: [], departamental_id: null };
 });
 
 async function partidosFiltrados(req, o) {
