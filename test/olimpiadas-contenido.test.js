@@ -194,6 +194,20 @@ async function jpegDePrueba(width, height) {
   return sharp({ create: { width, height, channels: 3, background: { r: 30, g: 120, b: 200 } } }).jpeg().toBuffer();
 }
 
+test("fotos: etiquetas múltiples, reemplazo y compatibilidad con el campo anterior", () => {
+  const { leerCamposFoto } = require("../api/routes/olimpiadas-contenido").__test;
+  const campos = leerCamposFoto({ etiquetas: " #Azul, La Plata, azul, , #hinchada", partido_id: "9" });
+  assert.deepEqual(JSON.parse(campos.etiquetas), ["Azul", "La Plata", "hinchada"]);
+  assert.equal(campos.etiqueta, "Azul");
+  assert.equal(campos.partido_id, 9);
+  assert.deepEqual(leerCamposFoto({ etiqueta: "Azul" }), { etiquetas: '["Azul"]', etiqueta: "Azul" });
+  assert.deepEqual(leerCamposFoto({ etiquetas: [], partido_id: "" }), { etiquetas: "[]", etiqueta: null, partido_id: null });
+  assert.deepEqual(leerCamposFoto({}), {});
+  assert.throws(() => leerCamposFoto({ etiquetas: ["x".repeat(61)] }), /60 caracteres/);
+  assert.throws(() => leerCamposFoto({ etiquetas: Array.from({ length: 21 }, (_, i) => String(i)) }), /20 etiquetas/);
+  assert.throws(() => leerCamposFoto({ partido_id: "ajeno" }), /inválido/);
+});
+
 test("contenido: el lote de fotos procesa de a una, sigue ante un archivo roto y limpia lo subido de la que falló", async () => {
   const buena = await jpegDePrueba(1200, 800);
   const rota = Buffer.concat([buena.subarray(0, 400), Buffer.from("basura")]);

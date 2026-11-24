@@ -11,6 +11,7 @@ const express = require("express");
 const mysqlConnection = require("../connection/connection");
 const { registrarErrorRuta } = require("../services/errores");
 const { normalizarFechaCivil } = require("../services/valores-dominio");
+const { leerEtiquetas, opcionesPartidos, SELECT_FOTO, serializarFoto, listarFotos } = require("../services/olimpiadas-fotos");
 const { SECCIONES_INICIALES } = require("../data/olimpiadas-plantillas");
 const { verificarAccesoCompeticion, exigirDisciplinaVoluntario, exigirEdicionVoluntario, esVoluntario, puedeEditarEdicion } = require('../security/olimpiadas-voluntarios');
 const {
@@ -50,6 +51,10 @@ const {
 const router = express.Router();
 const db = mysqlConnection.promise();
 
+const { verifyTokenMultimedia, soloGestionMultimedia } = require("./olimpiadas-prensa").registrarPrensa(router, {
+  db, soloSuperior, cargarOlimpiada, idDeRuta,
+});
+
 // ---------------------------------------------------------------------------
 // Constantes
 // ---------------------------------------------------------------------------
@@ -63,8 +68,6 @@ const MAX_FOTO_BYTES = 15 * 1024 * 1024;
 const MAX_TOTAL_FOTOS_BYTES = 80 * 1024 * 1024;
 const MAX_IDS_LOTE_FOTOS = 200;
 const MAX_LINEAS_IMPORTACION = 500;
-const PAGE_SIZE_FOTOS = 24;
-const MAX_PAGE_SIZE_FOTOS = 60;
 const MAX_TEXTO_HISTORIAL = 500;
 
 const manejarUploadFotos = crearUploadOlimpiadas({ maxFiles: MAX_FOTOS_POR_LOTE, maxTotalBytes: MAX_TOTAL_FOTOS_BYTES, maxFileBytes: MAX_FOTO_BYTES });
@@ -1128,6 +1131,8 @@ async function listarSedes(conexion, olimpiadaId) {
   );
   if (sedes.length === 0) return [];
   const ids = sedes.map((sede) => sede.id);
+  const [canchas] = await conexion.query(
+    'SELECT id, sede_id, nombre FROM olimpiada_lugar WHERE sede_id IN (?) AND eliminado = 0 ORDER BY nombre, id', [ids]);
   const [departamentales] = await conexion.query(
     `SELECT sd.sede_id, d.id, d.nombre
      FROM olimpiada_sede_departamental sd
@@ -1144,6 +1149,7 @@ async function listarSedes(conexion, olimpiadaId) {
   );
   return sedes.map((sede) => ({
     ...sede,
+    canchas: canchas.filter(cancha => cancha.sede_id === sede.id),
     lat: sede.lat === null ? null : Number(sede.lat),
     lng: sede.lng === null ? null : Number(sede.lng),
     departamentales: departamentales.filter((fila) => fila.sede_id === sede.id).map((fila) => ({ id: fila.id, nombre: fila.nombre })),
@@ -1203,6 +1209,11 @@ router.put("/olimpiadas/sedes/:sedeId(\\d+)", verifyToken, async (req, res) => {
     const { datos, departamentalesIds } = leerSede(req.body || {}, actual);
     const departamentales = departamentalesIds === undefined ? null : await validarDepartamentales(db, departamentalesIds);
     await enTransaccion(async (connection) => {
+      if (datos.tipo === 'HOTEL') {
+        await connection.query('SELECT id FROM olimpiada_sede WHERE id = ? FOR UPDATE', [sedeId]);
+        const [[cancha]] = await connection.query('SELECT id FROM olimpiada_lugar WHERE sede_id = ? AND eliminado = 0 LIMIT 1 FOR UPDATE', [sedeId]);
+        if (cancha) throw crearErrorHttp('Quitá las canchas de la sede antes de cambiar su tipo a hotel', 409);
+      }
       await connection.query(
         `UPDATE olimpiada_sede SET tipo = ?, nombre = ?, direccion = ?, telefono = ?, descripcion = ?, url_mapa = ?, orden = ?, lat = ?, lng = ? WHERE id = ?`,
         [datos.tipo, datos.nombre, datos.direccion, datos.telefono, datos.descripcion, datos.url_mapa, datos.orden, datos.lat, datos.lng, sedeId]
@@ -1240,6 +1251,9 @@ router.delete("/olimpiadas/sedes/:sedeId(\\d+)", verifyToken, async (req, res) =
     const actual = await exigirFila(db, "olimpiada_sede", sedeId, "La sede no existe");
     await enTransaccion(async (connection) => {
       await connection.query("UPDATE olimpiada_sede SET eliminado = 1 WHERE id = ?", [sedeId]);
+      await connection.query(`UPDATE olimpiada_partido p JOIN olimpiada_lugar l ON l.id = p.lugar_id
+        SET p.lugar_id = NULL WHERE l.sede_id = ?`, [sedeId]);
+      await connection.query('UPDATE olimpiada_lugar SET eliminado = 1 WHERE sede_id = ?', [sedeId]);
       await connection.query("UPDATE olimpiada_disciplina_config SET sede_id = NULL WHERE sede_id = ?", [sedeId]);
       await connection.query("UPDATE olimpiada_evento SET sede_id = NULL WHERE sede_id = ?", [sedeId]);
       await connection.query("UPDATE olimpiada_partido SET sede_id = NULL WHERE sede_id = ?", [sedeId]);
@@ -1608,20 +1622,21 @@ const SELECT_PARTIDO = `
          IF(s.id IS NULL, sd.url_mapa, s.url_mapa) AS sede_url_mapa, IF(s.id IS NULL, sd.lat, s.lat) AS sede_lat, IF(s.id IS NULL, sd.lng, s.lng) AS sede_lng,
          p.observacion, p.orden, p.fecha_modificacion, p.torneo_id, t.nombre AS torneo_nombre,
          p.instancia_id, inst.nombre AS instancia_nombre, ti.orden AS instancia_orden,
-         p.lugar_id, l.nombre AS lugar_nombre, l.predio AS lugar_predio, l.direccion AS lugar_direccion, l.url_mapa AS lugar_url_mapa,
-         l.lat AS lugar_lat, l.lng AS lugar_lng,
+         p.lugar_id, l.nombre AS lugar_nombre, IF(s.id IS NULL, sd.nombre, s.nombre) AS lugar_predio,
+         IF(s.id IS NULL, sd.direccion, s.direccion) AS lugar_direccion, IF(s.id IS NULL, sd.url_mapa, s.url_mapa) AS lugar_url_mapa,
+         IF(s.id IS NULL, sd.lat, s.lat) AS lugar_lat, IF(s.id IS NULL, sd.lng, s.lng) AS lugar_lng,
          p.inscripcion1_id, p.inscripcion2_id, p.mostrar_nombres_publico, p.partido_origen1_id, p.partido_origen2_id,
          p.origen1_tipo, p.origen1_zona, p.origen1_posicion, p.origen2_tipo, p.origen2_zona, p.origen2_posicion,
          dep1.nombre AS departamental1_nombre, dep2.nombre AS departamental2_nombre
   FROM olimpiada_partido p
   INNER JOIN olimpiada_disciplina d ON d.id = p.disciplina_id
-  LEFT JOIN olimpiada_sede s ON s.id = p.sede_id AND s.eliminado = 0
+  LEFT JOIN olimpiada_lugar l ON l.id = p.lugar_id AND l.eliminado = 0
+  LEFT JOIN olimpiada_sede s ON s.id = COALESCE(l.sede_id, p.sede_id) AND s.olimpiada_id = p.olimpiada_id AND s.eliminado = 0
   LEFT JOIN olimpiada_disciplina_config dc ON dc.olimpiada_id = p.olimpiada_id AND dc.disciplina_id = p.disciplina_id
   LEFT JOIN olimpiada_sede sd ON sd.id = dc.sede_id AND sd.eliminado = 0
   LEFT JOIN olimpiada_torneo t ON t.id = p.torneo_id
   LEFT JOIN olimpiada_instancia inst ON inst.id = p.instancia_id
   LEFT JOIN olimpiada_torneo_instancia ti ON ti.torneo_id = p.torneo_id AND ti.instancia_id = p.instancia_id
-  LEFT JOIN olimpiada_lugar l ON l.id = p.lugar_id
   LEFT JOIN olimpiada_equipo eq1 ON eq1.id = p.equipo1_id
   LEFT JOIN olimpiada_equipo eq2 ON eq2.id = p.equipo2_id
   LEFT JOIN departamental dep1 ON dep1.id = p.departamental1_id
@@ -1949,7 +1964,7 @@ function leerPartido(body, base, { completo = false } = {}) {
   return datos;
 }
 
-async function validarReferenciasPartido(conexion, olimpiadaId, datos) {
+async function validarReferenciasPartido(conexion, olimpiadaId, datos, anterior = {}) {
   await validarDisciplinaDeOlimpiada(conexion, olimpiadaId, datos.disciplina_id);
   await validarSedeDeOlimpiada(conexion, olimpiadaId, datos.sede_id);
   if (datos.torneo_id) {
@@ -1963,8 +1978,18 @@ async function validarReferenciasPartido(conexion, olimpiadaId, datos) {
     datos.fase = instancia.nombre;
   }
   if (datos.lugar_id) {
-    const [[lugar]] = await conexion.query('SELECT id FROM olimpiada_lugar WHERE id = ? AND eliminado = 0', [datos.lugar_id]);
-    if (!lugar) throw crearErrorHttp('El lugar elegido no existe');
+    const [[lugar]] = await conexion.query(`SELECT l.id, l.sede_id, s.olimpiada_id FROM olimpiada_lugar l
+      LEFT JOIN olimpiada_sede s ON s.id = l.sede_id AND s.eliminado = 0 AND s.tipo <> 'HOTEL'
+      WHERE l.id = ? AND l.eliminado = 0 LOCK IN SHARE MODE`, [datos.lugar_id]);
+    if (!lugar) throw crearErrorHttp('La cancha elegida no existe');
+    const legadoSinCambios = !lugar.sede_id && Number(anterior.lugar_id) === Number(lugar.id)
+      && Number(anterior.sede_id) === Number(datos.sede_id) && Number(anterior.disciplina_id) === Number(datos.disciplina_id);
+    if (!legadoSinCambios) {
+      if (Number(lugar.olimpiada_id) !== Number(olimpiadaId) || (datos.sede_id && Number(datos.sede_id) !== Number(lugar.sede_id))) {
+        throw crearErrorHttp('La cancha no pertenece a la sede y edición elegidas');
+      }
+      datos.sede_id = lugar.sede_id;
+    }
   }
   for (const lado of [1, 2]) {
     if (datos[`equipo${lado}_id`]) {
@@ -2222,9 +2247,9 @@ router.post("/olimpiadas/:id(\\d+)/partidos", verificarAccesoCompeticion, soloAd
     const olimpiadaId = idDeRuta(req.params.id);
     await cargarOlimpiada(db, olimpiadaId, cabecera);
     const datos = leerPartido(req.body || {}, {});
-    await validarReferenciasPartido(db, olimpiadaId, datos);
     let efectos = null;
     const partidoId = await enTransaccion(async (connection) => {
+      await validarReferenciasPartido(connection, olimpiadaId, datos);
       const [insert] = await connection.query(
         `INSERT INTO olimpiada_partido
            (olimpiada_id, disciplina_id, fecha, hora_inicio, hora_fin, etiqueta, fase, participante1, participante2,
@@ -2329,9 +2354,9 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)", verificarAccesoCompeticion, 
       datos.ganador = calcularGanadorPartido(datos.resultado1, datos.resultado2);
     }
     if (datos.estado !== "FINALIZADO") datos.ganador = null;
-    await validarReferenciasPartido(db, actual.olimpiada_id, datos);
     let efectos = null;
     await enTransaccion(async (connection) => {
+      await validarReferenciasPartido(connection, actual.olimpiada_id, datos, actual);
       await bloquearSinCambios(connection, 'olimpiada_partido', actual);
       const campos = camposVeedor || [
         "disciplina_id", "fecha", "hora_inicio", "hora_fin", "etiqueta", "fase", "participante1", "participante2",
@@ -2794,39 +2819,32 @@ router.put("/olimpiadas/:id(\\d+)/competicion/ajustes", verifyToken, async (req,
 // ---------------------------------------------------------------------------
 // Fotos
 // ---------------------------------------------------------------------------
-const SELECT_FOTO = `
-  SELECT f.id, f.olimpiada_id, f.archivo, f.miniatura_archivo, f.ancho, f.alto, f.epigrafe, f.disciplina_id,
-         d.nombre AS disciplina_nombre, f.fecha, f.etiqueta, f.orden, f.fecha_creacion
-  FROM olimpiada_foto f
-  LEFT JOIN olimpiada_disciplina d ON d.id = f.disciplina_id`;
-
-async function serializarFoto(fila) {
-  const [url, urlMiniatura] = await Promise.all([firmarSeguro(fila.archivo), firmarSeguro(fila.miniatura_archivo)]);
-  return {
-    id: fila.id,
-    olimpiada_id: fila.olimpiada_id,
-    url,
-    url_miniatura: urlMiniatura,
-    ancho: fila.ancho,
-    alto: fila.alto,
-    epigrafe: fila.epigrafe,
-    disciplina_id: fila.disciplina_id,
-    disciplina_nombre: fila.disciplina_nombre || null,
-    fecha: fila.fecha,
-    etiqueta: fila.etiqueta,
-    orden: fila.orden,
-    fecha_creacion: fila.fecha_creacion,
-  };
-}
-
 // Campos comunes de un lote / edición: sólo los que vienen en el body.
 function leerCamposFoto(body, { conEpigrafe = false } = {}) {
   const cambios = {};
   if (body.disciplina_id !== undefined) cambios.disciplina_id = leerIdOpcional(body, "disciplina_id", {}, { etiqueta: "la disciplina" });
   if (body.fecha !== undefined) cambios.fecha = leerFecha(body, "fecha", {}, { etiqueta: "la fecha" });
-  if (body.etiqueta !== undefined) cambios.etiqueta = leerTexto(body, "etiqueta", {}, { maximo: 60, etiqueta: "la etiqueta" });
+  if (body.partido_id !== undefined) cambios.partido_id = leerIdOpcional(body, "partido_id", {}, { etiqueta: "el partido" });
+  if (body.etiquetas !== undefined || body.etiqueta !== undefined) {
+    const etiquetas = leerEtiquetas(body.etiquetas !== undefined ? body.etiquetas : body.etiqueta);
+    cambios.etiquetas = JSON.stringify(etiquetas);
+    cambios.etiqueta = etiquetas[0] || null;
+  }
   if (conEpigrafe && body.epigrafe !== undefined) cambios.epigrafe = leerTexto(body, "epigrafe", {}, { maximo: 200, etiqueta: "el epígrafe" });
   return cambios;
+}
+
+// Un partido determina la disciplina de sus fotos y siempre pertenece a la misma edición.
+async function validarPartidoFoto(conexion, cambios, olimpiadas) {
+  if (!cambios.partido_id) return;
+  const [[partido]] = await conexion.query("SELECT olimpiada_id, disciplina_id FROM olimpiada_partido WHERE id = ? AND eliminado = 0", [cambios.partido_id]);
+  if (!partido || olimpiadas.some(id => Number(id) !== Number(partido.olimpiada_id))) {
+    throw crearErrorHttp("El partido no pertenece a la edición de las fotos");
+  }
+  if (cambios.disciplina_id && Number(cambios.disciplina_id) !== Number(partido.disciplina_id)) {
+    throw crearErrorHttp("La disciplina elegida no corresponde al partido");
+  }
+  cambios.disciplina_id = partido.disciplina_id;
 }
 
 /**
@@ -2848,11 +2866,11 @@ async function procesarLoteFotos(
       // El orden sólo avanza cuando la foto entró (una fallida no deja huecos).
       const ordenFoto = orden + 1;
       const [insert] = await conexion.query(
-        `INSERT INTO olimpiada_foto (olimpiada_id, archivo, miniatura_archivo, ancho, alto, mime, epigrafe, disciplina_id, fecha, etiqueta, orden, usuario_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO olimpiada_foto (olimpiada_id, archivo, miniatura_archivo, ancho, alto, mime, epigrafe, disciplina_id, fecha, etiqueta, orden, usuario_id, etiquetas, partido_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           olimpiadaId, imagen.key, imagen.miniatura_key, imagen.ancho, imagen.alto, imagen.mime,
-          comunes.epigrafe ?? null, comunes.disciplina_id ?? null, comunes.fecha ?? null, comunes.etiqueta ?? null, ordenFoto, usuarioId,
+          comunes.epigrafe ?? null, comunes.disciplina_id ?? null, comunes.fecha ?? null, comunes.etiqueta ?? null, ordenFoto, usuarioId, comunes.etiquetas ?? null, comunes.partido_id ?? null,
         ]
       );
       orden = ordenFoto;
@@ -2868,6 +2886,8 @@ async function procesarLoteFotos(
         disciplina_nombre: comunes.disciplina_nombre ?? null,
         fecha: comunes.fecha ?? null,
         etiqueta: comunes.etiqueta ?? null,
+        etiquetas: comunes.etiquetas ?? null,
+        partido_id: comunes.partido_id ?? null,
         orden,
         fecha_creacion: new Date(),
       });
@@ -2880,83 +2900,35 @@ async function procesarLoteFotos(
   return { fotos, errores };
 }
 
-router.get("/olimpiadas/:id(\\d+)/fotos", verifyToken, async (req, res) => {
+router.get("/olimpiadas/:id(\\d+)/fotos", verifyTokenMultimedia, async (req, res) => {
   try {
     const cabecera = getCabecera(req);
     const olimpiadaId = idDeRuta(req.params.id);
     await cargarOlimpiada(db, olimpiadaId, cabecera);
-    const page = req.query.page === undefined || req.query.page === "" ? 1 : normalizarIdPositivo(req.query.page);
-    const pageSize = req.query.pageSize === undefined || req.query.pageSize === "" ? PAGE_SIZE_FOTOS : normalizarIdPositivo(req.query.pageSize);
-    if (!page || !pageSize || page > 1_000_000 || pageSize > MAX_PAGE_SIZE_FOTOS) return res.status(400).json("La paginación es inválida");
-    const condiciones = ["f.olimpiada_id = ?", "f.eliminado = 0"];
-    const params = [olimpiadaId];
-    if (req.query.disciplina_id !== undefined && req.query.disciplina_id !== "") {
-      const disciplinaId = normalizarIdPositivo(req.query.disciplina_id);
-      if (!disciplinaId) return res.status(400).json("La disciplina es inválida");
-      condiciones.push("f.disciplina_id = ?");
-      params.push(disciplinaId);
-    }
-    if (req.query.fecha !== undefined && req.query.fecha !== "") {
-      const fecha = normalizarFechaCivil(req.query.fecha);
-      if (!fecha) return res.status(400).json("La fecha debe tener formato YYYY-MM-DD");
-      condiciones.push("f.fecha = ?");
-      params.push(fecha);
-    }
-    if (req.query.etiqueta !== undefined && req.query.etiqueta !== "") {
-      const etiqueta = normalizarTexto(String(req.query.etiqueta), 60);
-      if (etiqueta) {
-        condiciones.push("f.etiqueta = ?");
-        params.push(etiqueta);
-      }
-    }
-    const where = condiciones.join(" AND ");
-    const [[conteo]] = await db.query(`SELECT COUNT(*) AS total FROM olimpiada_foto f WHERE ${where}`, params);
-    const [rows] = await db.query(
-      `${SELECT_FOTO} WHERE ${where} ORDER BY f.fecha DESC, f.orden, f.id DESC LIMIT ? OFFSET ?`,
-      [...params, pageSize, (page - 1) * pageSize]
-    );
-    const [[disciplinas], [fechas], [etiquetas]] = await Promise.all([
-      db.query(
-        `SELECT d.id, d.nombre, COUNT(*) AS cantidad FROM olimpiada_foto f INNER JOIN olimpiada_disciplina d ON d.id = f.disciplina_id
-         WHERE f.olimpiada_id = ? AND f.eliminado = 0 GROUP BY d.id, d.nombre ORDER BY d.nombre`,
-        [olimpiadaId]
-      ),
-      db.query(
-        `SELECT f.fecha, COUNT(*) AS cantidad FROM olimpiada_foto f WHERE f.olimpiada_id = ? AND f.eliminado = 0 AND f.fecha IS NOT NULL
-         GROUP BY f.fecha ORDER BY f.fecha DESC`,
-        [olimpiadaId]
-      ),
-      db.query(
-        `SELECT f.etiqueta, COUNT(*) AS cantidad FROM olimpiada_foto f WHERE f.olimpiada_id = ? AND f.eliminado = 0 AND f.etiqueta IS NOT NULL
-         GROUP BY f.etiqueta ORDER BY f.etiqueta`,
-        [olimpiadaId]
-      ),
-    ]);
-    res.status(200).json({
-      results: await Promise.all(rows.map(serializarFoto)),
-      totalItems: Number(conteo.total) || 0,
-      page,
-      pageSize,
-      filtros: {
-        disciplinas: disciplinas.map((fila) => ({ id: fila.id, nombre: fila.nombre, cantidad: Number(fila.cantidad) })),
-        fechas: fechas.map((fila) => ({ fecha: fila.fecha, cantidad: Number(fila.cantidad) })),
-        etiquetas: etiquetas.map((fila) => ({ etiqueta: fila.etiqueta, cantidad: Number(fila.cantidad) })),
-      },
-    });
+    res.json(await listarFotos(db, olimpiadaId, req.query, consultarPartidos, { gestion: esSuperior(cabecera) || cabecera.rol === "prensa" }));
   } catch (error) {
     responderError(res, error, "No se pudieron cargar las fotos");
   }
 });
 
-router.post("/olimpiadas/:id(\\d+)/fotos", verifyToken, soloSuperior, manejarUploadFotos, async (req, res) => {
-  const cabecera = exigirSuperior(req, res);
-  if (!cabecera) return;
+router.get("/olimpiadas/:id(\\d+)/fotos/partidos", verifyTokenMultimedia, soloGestionMultimedia, async (req, res) => {
+  try {
+    const olimpiadaId = idDeRuta(req.params.id);
+    await cargarOlimpiada(db, olimpiadaId, getCabecera(req));
+    res.json(await opcionesPartidos(db, olimpiadaId, consultarPartidos));
+  } catch (error) { responderError(res, error, "No se pudieron cargar los partidos de la galería"); }
+});
+
+router.post("/olimpiadas/:id(\\d+)/fotos", verifyTokenMultimedia, soloGestionMultimedia, manejarUploadFotos, async (req, res) => {
+  const cabecera = getCabecera(req);
   try {
     const olimpiadaId = idDeRuta(req.params.id);
     await cargarOlimpiada(db, olimpiadaId, cabecera);
     const archivos = archivosDeSlot(req, "FOTOS");
     if (archivos.length === 0) return res.status(400).json("Adjuntá al menos una foto en el campo FOTOS");
     const comunes = leerCamposFoto(req.body || {}, { conEpigrafe: true });
+    await validarPartidoFoto(db, comunes, [olimpiadaId]);
+    const [partido] = await opcionesPartidos(db, olimpiadaId, consultarPartidos, comunes.partido_id ? [comunes.partido_id] : []);
     const disciplina = await validarDisciplinaCatalogo(db, comunes.disciplina_id);
     if (disciplina) comunes.disciplina_nombre = disciplina.nombre;
     const [[ultimo]] = await db.query("SELECT COALESCE(MAX(orden), 0) AS orden FROM olimpiada_foto WHERE olimpiada_id = ?", [olimpiadaId]);
@@ -2984,7 +2956,7 @@ router.post("/olimpiadas/:id(\\d+)/fotos", verifyToken, soloSuperior, manejarUpl
         : `Se subieron ${fotos.length} fotos; ${errores.length} no se pudieron procesar`,
       subidas: fotos.length,
       errores,
-      fotos: await Promise.all(fotos.map(serializarFoto)),
+      fotos: await Promise.all(fotos.map(foto => serializarFoto(foto, partido?.nombre))),
     });
   } catch (error) {
     responderError(res, error, "No se pudieron subir las fotos");
@@ -2992,28 +2964,37 @@ router.post("/olimpiadas/:id(\\d+)/fotos", verifyToken, soloSuperior, manejarUpl
 });
 
 // Literal antes que /olimpiadas/fotos/:fotoId
-router.put("/olimpiadas/fotos/lote", verifyToken, async (req, res) => {
-  const cabecera = exigirSuperior(req, res);
-  if (!cabecera) return;
+router.put("/olimpiadas/fotos/lote", verifyTokenMultimedia, soloGestionMultimedia, async (req, res) => {
+  const cabecera = getCabecera(req);
   try {
     const body = req.body || {};
     const ids = normalizarIds(body.ids);
     if (ids === null || ids.length === 0) return res.status(400).json("Elegí al menos una foto");
     if (ids.length > MAX_IDS_LOTE_FOTOS) return res.status(400).json(`Se pueden editar hasta ${MAX_IDS_LOTE_FOTOS} fotos por vez`);
     const cambios = leerCamposFoto(body);
-    const campos = Object.keys(cambios);
-    if (campos.length === 0) return res.status(400).json("Indicá al menos un dato para aplicar (disciplina, fecha o etiqueta)");
-    await validarDisciplinaCatalogo(db, cambios.disciplina_id);
-    const [olimpiadas] = await db.query("SELECT DISTINCT olimpiada_id FROM olimpiada_foto WHERE id IN (?) AND eliminado = 0", [ids]);
+    if (!Object.keys(cambios).length) return res.status(400).json("Indicá al menos un dato para aplicar");
     const resultado = await enTransaccion(async (connection) => {
+      const [fotos] = await connection.query("SELECT id, olimpiada_id FROM olimpiada_foto WHERE id IN (?) AND eliminado = 0 FOR UPDATE", [ids]);
+      if (!fotos.length) throw crearErrorHttp("Las fotos ya no existen", 404);
+      const ediciones = [...new Set(fotos.map(foto => foto.olimpiada_id))];
+      await validarPartidoFoto(connection, cambios, ediciones);
+      await validarDisciplinaCatalogo(connection, cambios.disciplina_id);
+      const campos = Object.keys(cambios);
+      const asignaciones = campos.map(campo => `${campo} = ?`);
+      const valores = campos.map(campo => cambios[campo]);
+      if (cambios.disciplina_id !== undefined && cambios.partido_id === undefined) {
+        // Evaluar la disciplina anterior antes de actualizarla.
+        asignaciones.unshift("partido_id = IF(disciplina_id <=> ?, partido_id, NULL)");
+        valores.unshift(cambios.disciplina_id);
+      }
       const [update] = await connection.query(
-        `UPDATE olimpiada_foto SET ${campos.map((campo) => `${campo} = ?`).join(", ")} WHERE id IN (?) AND eliminado = 0`,
-        [...campos.map((campo) => cambios[campo]), ids]
+        `UPDATE olimpiada_foto SET ${asignaciones.join(", ")} WHERE id IN (?) AND eliminado = 0`,
+        [...valores, ids]
       );
-      for (const fila of olimpiadas) {
+      for (const olimpiadaId of ediciones) {
         await historial(connection, cabecera, {
           entidad: "FOTO",
-          olimpiada_id: fila.olimpiada_id,
+          olimpiada_id: olimpiadaId,
           tipo_operacion: "UPDATE",
           campo_modificado: "lote",
           valor_nuevo: `${ids.length} fotos: ${JSON.stringify(cambios)}`,
@@ -3057,17 +3038,19 @@ router.post("/olimpiadas/fotos/eliminar-lote", verifyToken, async (req, res) => 
   }
 });
 
-router.put("/olimpiadas/fotos/:fotoId(\\d+)", verifyToken, async (req, res) => {
-  const cabecera = exigirSuperior(req, res);
-  if (!cabecera) return;
+router.put("/olimpiadas/fotos/:fotoId(\\d+)", verifyTokenMultimedia, soloGestionMultimedia, async (req, res) => {
+  const cabecera = getCabecera(req);
   try {
     const fotoId = idDeRuta(req.params.fotoId);
-    const actual = await exigirFila(db, "olimpiada_foto", fotoId, "La foto no existe");
     const cambios = leerCamposFoto(req.body || {}, { conEpigrafe: true });
-    const campos = Object.keys(cambios);
-    if (campos.length === 0) return res.status(400).json("Indicá al menos un dato para actualizar");
-    await validarDisciplinaCatalogo(db, cambios.disciplina_id);
+    if (!Object.keys(cambios).length) return res.status(400).json("Indicá al menos un dato para actualizar");
     await enTransaccion(async (connection) => {
+      const [[actual]] = await connection.query("SELECT * FROM olimpiada_foto WHERE id = ? AND eliminado = 0 FOR UPDATE", [fotoId]);
+      if (!actual) throw crearErrorHttp("La foto no existe", 404);
+      await validarPartidoFoto(connection, cambios, [actual.olimpiada_id]);
+      await validarDisciplinaCatalogo(connection, cambios.disciplina_id);
+      if (cambios.partido_id === undefined && cambios.disciplina_id !== undefined && cambios.disciplina_id !== actual.disciplina_id) cambios.partido_id = null;
+      const campos = Object.keys(cambios);
       await connection.query(
         `UPDATE olimpiada_foto SET ${campos.map((campo) => `${campo} = ?`).join(", ")} WHERE id = ?`,
         [...campos.map((campo) => cambios[campo]), fotoId]
@@ -3082,7 +3065,9 @@ router.put("/olimpiadas/fotos/:fotoId(\\d+)", verifyToken, async (req, res) => {
       );
     });
     const [rows] = await db.query(`${SELECT_FOTO} WHERE f.id = ?`, [fotoId]);
-    res.status(200).json({ success: true, id: fotoId, message: "Foto actualizada", foto: rows[0] ? await serializarFoto(rows[0]) : null });
+    const foto = rows[0];
+    const [partido] = await opcionesPartidos(db, foto?.olimpiada_id, consultarPartidos, foto?.partido_id ? [foto.partido_id] : []);
+    res.status(200).json({ success: true, id: fotoId, message: "Foto actualizada", foto: foto ? await serializarFoto(foto, partido?.nombre) : null });
   } catch (error) {
     responderError(res, error, "No se pudo actualizar la foto");
   }
@@ -3118,12 +3103,14 @@ const ayudantes = {
   archivoDeSlot, aplicarEfectosCompeticion, puedeVerPosiciones, listarEscudos,
 };
 require('./olimpiadas-torneos')(router, ayudantes);
+require('./olimpiadas-canchas')(router, ayudantes);
 require('./olimpiadas-equipos')(router, ayudantes);
-const videos = require('./olimpiadas-videos')(router, ayudantes);
+const videos = require('./olimpiadas-videos')(router, { ...ayudantes, verifyTokenMultimedia, soloGestionMultimedia });
 
 router.lecturasPublicas = Object.freeze({
-  estadoEdicion, consultarPartidos, listarDisciplinasFixture, listarSedes, armarMedallero, serializarNovedad, serializarEvento, serializarFoto, SELECT_EVENTO, SELECT_FOTO,
+  estadoEdicion, consultarPartidos, listarDisciplinasFixture, listarSedes, armarMedallero, serializarNovedad, serializarEvento, SELECT_EVENTO,
   armarEnVivo, listarEscudos, puedeVerMedallero, medalleroReservado, listarVideos: videos.listarVideos,
+  listarFotos: (conexion, id, filtros) => listarFotos(conexion, id, filtros, consultarPartidos),
 });
 
 router.__test = Object.freeze({

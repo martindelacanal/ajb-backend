@@ -110,8 +110,9 @@ async function leerCatalogos(db) {
   const [disciplinas] = await db.query("SELECT d.id, d.nombre, d.tipo_id, d.icono_archivo FROM olimpiada_disciplina d JOIN olimpiada_disciplina_tipo t ON d.tipo_id=t.id WHERE d.habilitado='Y' AND t.competitiva=1 AND t.habilitado='Y'");
   const [departamentales] = await db.query("SELECT id, nombre FROM departamental");
   const [lugares] = await db.query("SELECT id, nombre, predio FROM olimpiada_lugar WHERE eliminado=0");
+  const [columnasSede] = await db.query("SHOW COLUMNS FROM olimpiada_lugar LIKE 'sede_id'");
   const [instancias] = await db.query("SELECT id, nombre FROM olimpiada_instancia WHERE eliminado=0");
-  return { disciplinas, departamentales, lugares, instancias };
+  return { disciplinas, departamentales, lugares, instancias, canchasPorSede: columnasSede.length > 0 };
 }
 
 function leerRival(nombre, catalogos) {
@@ -218,6 +219,10 @@ async function cargarPrograma(db, edicion, programa, catalogos) {
   for (const p of programa.partidos) {
     const disciplina = competencia.disciplinas.get(p.actividad), lugar = cancha(p.cancha);
     const canchaClave = identificador(p.sede, lugar);
+    if (catalogos.canchasPorSede && !canchas.has(canchaClave)) {
+      const id = await insertar(db, "olimpiada_lugar", { nombre: lugar, sede_id: sedes.get(p.sede) });
+      canchas.set(canchaClave, id);
+    }
     if (!canchas.has(canchaClave)) {
       const existentes = catalogos.lugares.filter(l => clave(l.predio) === clave(p.sede));
       let id = buscarId(existentes, lugar);

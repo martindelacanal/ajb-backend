@@ -10,12 +10,12 @@ const express = require('express');
 const crypto = require('crypto');
 const { CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand } = require('@aws-sdk/client-s3');
 const {
-  s3, bucketName, verifyToken, getCabecera, crearErrorHttp, responderError, normalizarTexto,
+  s3, bucketName, getCabecera, crearErrorHttp, responderError, normalizarTexto,
   firmarSeguro, subirImagenOptimizada, eliminarObjetosS3Seguro, manejarUploadOlimpiadas,
 } = require('../services/olimpiadas-comun');
 
 const TAMANO_PARTE = 8 * 1024 * 1024;
-const MAX_VIDEO_BYTES = 1536 * 1024 * 1024; // 1,5 GB
+const MAX_VIDEO_BYTES = 200 * 1024 * 1024;
 const MAX_VIDEOS_POR_EDICION = 40;
 const EXPIRACION_VIDEO_SEGUNDOS = 6 * 60 * 60;
 const TIPOS_VIDEO = { 'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov' };
@@ -35,7 +35,7 @@ function leerPartes(valor) {
 }
 
 module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, bucket = bucketName } = {}) {
-  const { db, cargarOlimpiada, enTransaccion, historial, historialCambios, leerTexto, leerEntero, leerFecha, exigirSuperior, soloSuperior, idDeRuta, archivoDeSlot } = helpers;
+  const { db, cargarOlimpiada, enTransaccion, historial, historialCambios, leerTexto, leerEntero, leerFecha, verifyTokenMultimedia, soloGestionMultimedia, idDeRuta, archivoDeSlot } = helpers;
   const endpoint = (fn, mensaje) => async (req, res) => { try { await fn(req, res); } catch (error) { responderError(res, error, mensaje); } };
   const cuerpoBinario = express.raw({ type: 'application/octet-stream', limit: TAMANO_PARTE + 1024 * 1024 });
 
@@ -78,7 +78,7 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
     };
   }
 
-  router.get('/olimpiadas/:id(\\d+)/videos', verifyToken, endpoint(async (req, res) => {
+  router.get('/olimpiadas/:id(\\d+)/videos', verifyTokenMultimedia, endpoint(async (req, res) => {
     const cabecera = getCabecera(req), olimpiadaId = idDeRuta(req.params.id);
     await cargarOlimpiada(db, olimpiadaId, cabecera);
     res.set('Cache-Control', 'no-store');
@@ -86,15 +86,14 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
   }, 'No se pudieron cargar los videos'));
 
   // Paso 1: se anota el video y se abre la subida por partes.
-  router.post('/olimpiadas/:id(\\d+)/videos', verifyToken, endpoint(async (req, res) => {
-    const cabecera = exigirSuperior(req, res);
-    if (!cabecera) return;
+  router.post('/olimpiadas/:id(\\d+)/videos', verifyTokenMultimedia, soloGestionMultimedia, endpoint(async (req, res) => {
+    const cabecera = getCabecera(req);
     const olimpiadaId = idDeRuta(req.params.id);
     await cargarOlimpiada(db, olimpiadaId, cabecera);
     const body = req.body || {};
     const datos = leerDatos(body, {});
     const mime = String(body.mime || '').toLowerCase();
-    const extension = TIPOS_VIDEO[mime];
+    const extension = Object.hasOwn(TIPOS_VIDEO, mime) ? TIPOS_VIDEO[mime] : null;
     if (!extension) throw crearErrorHttp('El video tiene que ser MP4, WebM o MOV. MP4 es el que se reproduce en todos los teléfonos.');
     const bytes = Number(body.bytes);
     if (!Number.isSafeInteger(bytes) || bytes <= 0) throw crearErrorHttp('No pudimos leer el tamaño del video');
@@ -114,7 +113,7 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
   }, 'No se pudo iniciar la subida del video'));
 
   // Paso 2: una parte por pedido (cuerpo binario). Repetir una parte la reemplaza.
-  router.put('/olimpiadas/videos/:videoId(\\d+)/partes/:numero(\\d+)', verifyToken, soloSuperior, cuerpoBinario, endpoint(async (req, res) => {
+  router.put('/olimpiadas/videos/:videoId(\\d+)/partes/:numero(\\d+)', verifyTokenMultimedia, soloGestionMultimedia, cuerpoBinario, endpoint(async (req, res) => {
     const video = await exigirVideo(idDeRuta(req.params.videoId), { subiendo: true });
     const numero = Number(req.params.numero);
     const total = partesTotales(video.bytes);
@@ -145,9 +144,8 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
   }, 'No se pudo subir la parte del video'));
 
   // Paso 3: S3 une las partes y el video queda disponible.
-  router.post('/olimpiadas/videos/:videoId(\\d+)/completar', verifyToken, endpoint(async (req, res) => {
-    const cabecera = exigirSuperior(req, res);
-    if (!cabecera) return;
+  router.post('/olimpiadas/videos/:videoId(\\d+)/completar', verifyTokenMultimedia, soloGestionMultimedia, endpoint(async (req, res) => {
+    const cabecera = getCabecera(req);
     const video = await exigirVideo(idDeRuta(req.params.videoId), { subiendo: true });
     const partes = leerPartes(video.partes).sort((a, b) => Number(a.n) - Number(b.n));
     const total = partesTotales(video.bytes);
@@ -167,9 +165,8 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
   }, 'No se pudo terminar la subida del video'));
 
   // Imagen de portada (la toma el navegador de un cuadro del video).
-  router.post('/olimpiadas/videos/:videoId(\\d+)/poster', verifyToken, soloSuperior, manejarUploadOlimpiadas, endpoint(async (req, res) => {
-    const cabecera = exigirSuperior(req, res);
-    if (!cabecera) return;
+  router.post('/olimpiadas/videos/:videoId(\\d+)/poster', verifyTokenMultimedia, soloGestionMultimedia, manejarUploadOlimpiadas, endpoint(async (req, res) => {
+    const cabecera = getCabecera(req);
     const video = await exigirVideo(idDeRuta(req.params.videoId));
     const archivo = archivoDeSlot(req, 'POSTER');
     if (!archivo) throw crearErrorHttp('Adjuntá la imagen de portada');
@@ -179,9 +176,8 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
     res.json({ success: true, message: 'Portada del video actualizada', poster_url: await firmarSeguro(imagen.key, EXPIRACION_VIDEO_SEGUNDOS) });
   }, 'No se pudo guardar la portada del video'));
 
-  router.put('/olimpiadas/videos/:videoId(\\d+)', verifyToken, endpoint(async (req, res) => {
-    const cabecera = exigirSuperior(req, res);
-    if (!cabecera) return;
+  router.put('/olimpiadas/videos/:videoId(\\d+)', verifyTokenMultimedia, soloGestionMultimedia, endpoint(async (req, res) => {
+    const cabecera = getCabecera(req);
     const video = await exigirVideo(idDeRuta(req.params.videoId));
     const datos = leerDatos(req.body || {}, video);
     await enTransaccion(async (connection) => {
@@ -192,12 +188,19 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
     res.json({ success: true, message: 'Video actualizado', video: await serializar(actualizado) });
   }, 'No se pudo actualizar el video'));
 
-  router.delete('/olimpiadas/videos/:videoId(\\d+)', verifyToken, endpoint(async (req, res) => {
-    const cabecera = exigirSuperior(req, res);
-    if (!cabecera) return;
+  router.delete('/olimpiadas/videos/:videoId(\\d+)', verifyTokenMultimedia, soloGestionMultimedia, endpoint(async (req, res) => {
+    const cabecera = getCabecera(req);
     const video = await exigirVideo(idDeRuta(req.params.videoId));
     await enTransaccion(async (connection) => {
-      await connection.query('UPDATE olimpiada_video SET eliminado = 1, subida_id = NULL, partes = NULL WHERE id = ?', [video.id]);
+      let condicion = '';
+      const params = [video.id];
+      if (cabecera.rol === 'prensa') {
+        condicion = " AND estado = 'SUBIENDO' AND usuario_id = ?";
+        params.push(cabecera.id);
+      }
+      const [baja] = await connection.query(
+        'UPDATE olimpiada_video SET eliminado = 1, subida_id = NULL, partes = NULL WHERE id = ?' + condicion, params);
+      if (!baja.affectedRows) throw crearErrorHttp('Sólo podés cancelar tus propias subidas en curso', 403);
       if (video.estado === 'LISTO') {
         await historial(connection, cabecera, { entidad: 'VIDEO', entidad_id: video.id, olimpiada_id: video.olimpiada_id, tipo_operacion: 'DELETE', valor_anterior: video.titulo });
       }

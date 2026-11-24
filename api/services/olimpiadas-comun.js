@@ -264,7 +264,7 @@ const manejarUploadOlimpiadas = crearUploadOlimpiadas({ maxFiles: 4 });
 // ---------------------------------------------------------------------------
 // Auth y roles
 // ---------------------------------------------------------------------------
-function verifyToken(req, res, next) {
+function verificarSesionOlimpiadas(req, res, next) {
   return verificarTokenConAutorizacionActual({
     req,
     res,
@@ -284,6 +284,15 @@ function verifyToken(req, res, next) {
 
 function getCabecera(req) {
   return JSON.parse(req.data.data);
+}
+
+function verifyToken(req, res, next) {
+  return verificarSesionOlimpiadas(req, res, () => {
+    if (getCabecera(req).rol === "prensa") {
+      return res.status(403).json("Prensa sólo tiene acceso a la galería de sus ediciones asignadas");
+    }
+    return next();
+  });
 }
 
 // Gestión del módulo: administración provincial (admin + admin-central) y departamentales.
@@ -810,6 +819,7 @@ module.exports = {
   MAX_ARCHIVO_OLIMPIADAS_BYTES,
   // auth
   verifyToken,
+  verificarSesionOlimpiadas,
   getCabecera,
   ROLES_GESTION,
   ROLES_SUPERIORES,

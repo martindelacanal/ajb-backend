@@ -52,8 +52,8 @@ async function cargarCuentaVoluntario(db, id, bloquear = false) {
       u.bloqueo_modulos, u.bloqueo_mensaje, u.requiere_cambio_clave
       FROM usuario u INNER JOIN rol r ON r.id=u.rol_id WHERE u.id=? LIMIT 1${bloquear ? " FOR UPDATE" : ""}`, [v.usuario_sistema_id]);
     const u = usuarios[0];
-    if (!u || !usuarioHabilitado(u.habilitado) || Number(u.rol_id) === 4
-      || String(u.rol).toLowerCase() === "invitado") throw crearErrorHttp("La cuenta de Mi AJB vinculada ya no tiene acceso de veedor", 401);
+    if (!u || !usuarioHabilitado(u.habilitado) || [4, 7].includes(Number(u.rol_id))
+      || ["invitado", "prensa"].includes(String(u.rol).toLowerCase())) throw crearErrorHttp("La cuenta de Mi AJB vinculada ya no tiene acceso de veedor", 401);
     exigirAccesoCuenta(u);
     if (Number(u.requiere_cambio_clave) === 1) throw crearErrorHttp("Ingresá a Mi AJB para actualizar tu contraseña habitual antes de entrar como veedor.", 403);
     if (bloquear) {

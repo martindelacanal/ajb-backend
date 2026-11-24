@@ -138,23 +138,7 @@ ruta('secciones', async (req, o) => {
   return rows;
 });
 ruta('enlaces', async (req, o) => { const [rows] = await db.query('SELECT id, tipo, titulo, url, descripcion, orden FROM olimpiada_enlace WHERE olimpiada_id = ? AND eliminado = 0 ORDER BY orden, id', [o.id]); return rows; });
-ruta('fotos', async (req, o) => {
-  const page = filtroId(req.query, 'page') || 1, pageSize = filtroId(req.query, 'pageSize') || 24;
-  if (page > 100000 || pageSize > 60) throw crearErrorHttp('La paginación es inválida');
-  const condiciones = ['f.olimpiada_id = ?', 'f.eliminado = 0'], params = [o.id];
-  const disciplina = filtroId(req.query, 'disciplina_id');
-  if (disciplina) { condiciones.push('f.disciplina_id = ?'); params.push(disciplina); }
-  if (req.query.fecha) { const fecha = normalizarFechaCivil(req.query.fecha); if (!fecha) throw crearErrorHttp('La fecha es inválida'); condiciones.push('f.fecha = ?'); params.push(fecha); }
-  if (req.query.etiqueta) { condiciones.push('f.etiqueta = ?'); params.push(String(req.query.etiqueta).slice(0, 60)); }
-  const [[cuenta]] = await db.query(`SELECT COUNT(*) AS total FROM olimpiada_foto f WHERE ${condiciones.join(' AND ')}`, params);
-  const [rows] = await db.query(`${lectura.SELECT_FOTO} WHERE ${condiciones.join(' AND ')} ORDER BY f.fecha DESC, f.orden, f.id DESC LIMIT ? OFFSET ?`, [...params, pageSize, (page - 1) * pageSize]);
-  const [[disciplinas], [fechas], [etiquetas]] = await Promise.all([
-    db.query('SELECT d.id, d.nombre, COUNT(*) AS cantidad FROM olimpiada_foto f INNER JOIN olimpiada_disciplina d ON d.id = f.disciplina_id WHERE f.olimpiada_id = ? AND f.eliminado = 0 GROUP BY d.id, d.nombre ORDER BY d.nombre', [o.id]),
-    db.query('SELECT fecha, COUNT(*) AS cantidad FROM olimpiada_foto WHERE olimpiada_id = ? AND eliminado = 0 AND fecha IS NOT NULL GROUP BY fecha ORDER BY fecha DESC', [o.id]),
-    db.query('SELECT etiqueta, COUNT(*) AS cantidad FROM olimpiada_foto WHERE olimpiada_id = ? AND eliminado = 0 AND etiqueta IS NOT NULL GROUP BY etiqueta ORDER BY etiqueta', [o.id]),
-  ]);
-  return { results: await Promise.all(rows.map(lectura.serializarFoto)), totalItems: Number(cuenta.total), page, pageSize, filtros: { disciplinas, fechas, etiquetas } };
-});
+ruta('fotos', (req, o) => lectura.listarFotos(db, o.id, req.query));
 ruta('bonos/reglas', async (req, o) => {
   const [tramos] = await db.query('SELECT id, edad_desde, edad_hasta, bonos, etiqueta, orden FROM olimpiada_bono_tramo WHERE olimpiada_id = ? ORDER BY orden, edad_desde', [o.id]);
   return require('./olimpiadas-bonos').__test.armarReglas(o, tramos);

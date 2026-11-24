@@ -4,7 +4,7 @@ const { getCabecera, esSuperior, crearErrorHttp, responderError, normalizarIds, 
 const { calcularPosiciones, listarTorneos, listarEquipos, filtroId } = require('../services/olimpiadas-competicion');
 
 module.exports = function registrarTorneos(router, helpers) {
-  const { db, cargarOlimpiada, enTransaccion, historial, historialCambios, leerTexto, leerIdOpcional, leerEnum, leerEntero, leerUrl, leerCoordenadas, validarDisciplinaDeOlimpiada, consultarPartidos, bloquearSinCambios, puedeVerPosiciones } = helpers;
+  const { db, cargarOlimpiada, enTransaccion, historial, historialCambios, leerTexto, leerIdOpcional, leerEnum, leerEntero, validarDisciplinaDeOlimpiada, consultarPartidos, bloquearSinCambios, puedeVerPosiciones } = helpers;
   const idRuta = valor => { const id = normalizarIdPositivo(valor); if (!id) throw crearErrorHttp('ID inválido'); return id; };
   function soloGestion(cabecera) { if (!esSuperior(cabecera) && !esVoluntario(cabecera)) throw crearErrorHttp('No autorizado', 403); }
   function soloSuperior(cabecera) { if (!esSuperior(cabecera)) throw crearErrorHttp('No autorizado', 403); }
@@ -23,7 +23,9 @@ module.exports = function registrarTorneos(router, helpers) {
     if (asignadas) { condiciones.push('d.disciplina_id IN (?)'); params.push(asignadas.length ? asignadas : [0]); }
     if (disciplinaId) { condiciones.push('d.disciplina_id = ?'); params.push(disciplinaId); }
     const [[lugares], [instancias], [departamentales], [participantes], [sedes]] = await Promise.all([
-      db.query('SELECT id, nombre, predio, direccion, url_mapa, descripcion, lat, lng FROM olimpiada_lugar WHERE eliminado = 0 ORDER BY predio, nombre'),
+      db.query(`SELECT l.id, l.sede_id, l.nombre, s.nombre AS predio, s.direccion, s.url_mapa, l.descripcion, s.lat, s.lng
+        FROM olimpiada_lugar l JOIN olimpiada_sede s ON s.id = l.sede_id
+        WHERE s.olimpiada_id = ? AND s.tipo <> 'HOTEL' AND s.eliminado = 0 AND l.eliminado = 0 ORDER BY s.nombre, l.nombre`, [olimpiadaId]),
       db.query('SELECT id, nombre, orden FROM olimpiada_instancia WHERE eliminado = 0 ORDER BY orden, nombre'),
       db.query('SELECT id, nombre, logo_archivo FROM departamental ORDER BY nombre'),
       db.query(`SELECT i.id, u.nombre, u.apellido, i.departamental_id, dep.nombre AS departamental_nombre, d.disciplina_id
@@ -50,18 +52,17 @@ module.exports = function registrarTorneos(router, helpers) {
     }));
     const guardar = async (req, res) => {
       const cabecera = getCabecera(req); soloSuperior(cabecera);
+      if (tipo === 'lugares') throw crearErrorHttp('Ahora las canchas se gestionan desde su sede en Sedes y lugares', 409);
       const id = req.params.catalogoId ? idRuta(req.params.catalogoId) : null;
       let actual = {};
       if (id) { const [[fila]] = await db.query(`SELECT * FROM ${tabla} WHERE id = ? AND eliminado = 0`, [id]); if (!fila) throw crearErrorHttp('El registro no existe', 404); actual = fila; }
       const body = req.body || {};
-      const datos = { nombre: leerTexto(body, 'nombre', actual, { requerido: true, maximo: tipo === 'lugares' ? 160 : 60 }) };
-      if (tipo === 'lugares') Object.assign(datos, { predio: leerTexto(body, 'predio', actual, { maximo: 160 }), direccion: leerTexto(body, 'direccion', actual, { maximo: 200 }), url_mapa: leerUrl(body, 'url_mapa', actual, { maximo: 400 }), descripcion: leerTexto(body, 'descripcion', actual, { maximo: 400 }), ...leerCoordenadas(body, actual) });
-      else datos.orden = leerEntero(body, 'orden', actual);
+      const datos = { nombre: leerTexto(body, 'nombre', actual, { requerido: true, maximo: 60 }), orden: leerEntero(body, 'orden', actual) };
       const nuevoId = await enTransaccion(async connection => {
         let entidadId = id;
         if (id) await connection.query(`UPDATE ${tabla} SET ? WHERE id = ?`, [datos, id]);
         else { const [insert] = await connection.query(`INSERT INTO ${tabla} SET ?`, [datos]); entidadId = insert.insertId; }
-        const base = { entidad: tipo === 'lugares' ? 'LUGAR' : 'INSTANCIA', entidad_id: entidadId };
+        const base = { entidad: 'INSTANCIA', entidad_id: entidadId };
         if (id) await historialCambios(connection, cabecera, base, actual, datos, Object.keys(datos));
         else await historial(connection, cabecera, { ...base, tipo_operacion: 'CREATE', valor_nuevo: datos.nombre });
         return entidadId;

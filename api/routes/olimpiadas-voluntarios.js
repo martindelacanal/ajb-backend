@@ -30,7 +30,7 @@ function normalizarCuenta(body, actual = null) {
   // El correo es opcional: un invitado sin correo queda con una dirección interna que no recibe mensajes.
   const ingresado = body.email === undefined ? (esCorreoInterno(actual?.email) ? "" : actual?.email ?? "") : body.email ?? "";
   let email = String(ingresado).trim().toLowerCase();
-  if (!email) email = `veedor-${usuario}${DOMINIO_INTERNO}`;
+  if (!email) email = actual?.usuario_sistema_id ? actual.email : `veedor-${usuario}${DOMINIO_INTERNO}`;
   else if (esCorreoInterno(email) || !esCorreoValido(email) || email.length > 254 || /[,;\r\n]/.test(email)) throw crearErrorHttp("Ingresá un correo electrónico válido o dejalo vacío");
   const habilitado = body.habilitado === undefined ? Number(actual?.habilitado ?? 1) : normalizarBooleano01(body.habilitado);
   if (habilitado === null) throw crearErrorHttp("Indicá si el acceso está habilitado");
@@ -262,7 +262,7 @@ function crearRouterVoluntarios({ db = mysqlConnection.promise(), jwtSecret = pr
     if (q.length<2) return res.json([]);
     const [rows] = await db.query(`SELECT u.id,u.nombre,u.apellido,u.documento,u.email,r.nombre AS rol,v.id AS voluntario_id
       FROM usuario u INNER JOIN rol r ON r.id=u.rol_id LEFT JOIN olimpiada_voluntario v ON v.usuario_sistema_id=u.id
-      WHERE u.rol_id<>4 AND LOWER(r.nombre)<>'invitado' AND UPPER(COALESCE(u.habilitado,'S')) NOT IN ('N','NO','0','FALSE')
+      WHERE u.rol_id NOT IN (4,7) AND LOWER(r.nombre) NOT IN ('invitado','prensa') AND UPPER(COALESCE(u.habilitado,'S')) NOT IN ('N','NO','0','FALSE')
       AND COALESCE(u.bloqueo_tipo,'')<>'total' AND u.password IS NOT NULL
       AND CONCAT_WS(' ',u.nombre,u.apellido,u.documento,u.email) LIKE ? ORDER BY u.apellido,u.nombre LIMIT 50`, [`%${q}%`]);
     res.set("Cache-Control","no-store"); res.json(rows);
@@ -278,7 +278,7 @@ function crearRouterVoluntarios({ db = mysqlConnection.promise(), jwtSecret = pr
         u.bloqueo_tipo,u.bloqueo_modulos,u.bloqueo_mensaje,r.nombre AS rol FROM usuario u INNER JOIN rol r ON r.id=u.rol_id
         WHERE u.id=? LIMIT 1 FOR UPDATE`,[usuarioId]);
       const u=usuarios[0];
-      if(!u || !usuarioHabilitado(u.habilitado) || Number(u.rol_id)===4 || String(u.rol).toLowerCase()==="invitado" || !u.password) throw crearErrorHttp("La cuenta no está habilitada para ser veedora",400);
+      if(!u || !usuarioHabilitado(u.habilitado) || [4,7].includes(Number(u.rol_id)) || ["invitado","prensa"].includes(String(u.rol).toLowerCase()) || !u.password) throw crearErrorHttp("La cuenta no está habilitada para ser veedora",400);
       exigirAccesoCuenta(u);
       await validarDisciplinas(cx,olimpiada.id,ids);
       const [existentes] = await cx.query("SELECT id FROM olimpiada_voluntario WHERE usuario_sistema_id=? FOR UPDATE",[usuarioId]);
@@ -324,6 +324,27 @@ function crearRouterVoluntarios({ db = mysqlConnection.promise(), jwtSecret = pr
         nuevo: { ...cuenta, disciplina_ids: ids }, observacion: cambiaPassword ? "Cuenta y asignaciones actualizadas; contraseña restablecida por administración." : "Cuenta y disciplinas asignadas actualizadas." });
     });
     res.json({ success: true, id: voluntarioId, message: "Veedor actualizado" });
+  }));
+
+  router.delete("/olimpiadas/:id/voluntarios/:voluntarioId", verificarAdmin, admin, manejar(async (req, res) => {
+    const olimpiada = await obtenerEdicion(db, req.params.id);
+    const id = normalizarIdPositivo(req.params.voluntarioId);
+    if (!id) throw crearErrorHttp("El veedor no es válido");
+    await transaccion(db, async (connection) => {
+      const [[cuenta]] = await connection.query(
+        "SELECT nombre, usuario_sistema_id FROM olimpiada_voluntario WHERE id = ? FOR UPDATE", [id]);
+      if (!cuenta) throw crearErrorHttp("No encontramos ese veedor", 404);
+      const [asignaciones] = await connection.query(
+        "SELECT DISTINCT olimpiada_id FROM olimpiada_voluntario_disciplina WHERE voluntario_id = ?", [id]);
+      // Las claves foráneas quitan sus sesiones, credenciales y asignaciones de veedor.
+      await connection.query("DELETE FROM olimpiada_voluntario WHERE id = ?", [id]);
+      const ediciones = new Set([Number(olimpiada.id), ...asignaciones.map(a => Number(a.olimpiada_id))]);
+      for (const olimpiadaId of ediciones) {
+        await registrarCambio(connection, { cabecera: getCabecera(req), id, olimpiadaId,
+          operacion: "DELETE", anterior: cuenta, observacion: "Acceso de veedor eliminado en todas las ediciones." });
+      }
+    });
+    res.status(204).end();
   }));
 
   router.post("/olimpiadas/:id/voluntarios/enviar-bienvenida", verificarAdmin, admin, manejar(async (req, res) => {

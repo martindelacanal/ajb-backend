@@ -147,9 +147,34 @@ test("gestión de colaboradores rechaza a afiliados, departamentales y voluntari
   for (rol of ["afiliado", "departamental", ROL]) {
     const response = await fetch(`${base}/olimpiadas/7/voluntarios`);
     assert.equal(response.status, 403);
+    const borrado = await fetch(`${base}/olimpiadas/7/voluntarios/12`, { method: "DELETE" });
+    assert.equal(borrado.status, 403);
     const envio = await fetch(`${base}/olimpiadas/7/voluntarios/enviar-bienvenida`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ voluntario_ids: [12] }) });
     assert.equal(envio.status, 403);
   }
+});
+
+test("eliminar un veedor conserva el usuario vinculado y audita las ediciones afectadas", async (t) => {
+  const consultas = [];
+  const connection = {
+    beginTransaction: async () => {}, commit: async () => {}, rollback: async () => {}, release: () => {},
+    query: async (sql, params) => {
+      consultas.push({ sql, params });
+      if (sql.startsWith("SELECT nombre")) return [[{ nombre: "Ana", usuario_sistema_id: 35 }]];
+      if (sql.startsWith("SELECT DISTINCT")) return [[{ olimpiada_id: 7 }, { olimpiada_id: 8 }]];
+      return [{ affectedRows: 1 }];
+    },
+  };
+  const base = await conServidor(t, {
+    db: { query: async () => [[edicion]], getConnection: async () => connection },
+    verificarAdmin: (req, _res, next) => { req.data = { data: JSON.stringify({ id: 1, rol: "admin" }) }; next(); },
+  });
+  const resultado = await fetch(`${base}/olimpiadas/7/voluntarios/12`, { method: "DELETE" });
+  assert.equal(resultado.status, 204);
+  assert.deepEqual(consultas.filter(q => q.sql.startsWith("DELETE")), [
+    { sql: "DELETE FROM olimpiada_voluntario WHERE id = ?", params: [12] },
+  ]);
+  assert.deepEqual(consultas.filter(q => q.sql.includes("INSERT INTO olimpiada_historial")).map(q => q.params[2]), [7, 8]);
 });
 
 test("login limita intentos antes de consultar o verificar contraseñas", async (t) => {
