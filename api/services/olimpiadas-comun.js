@@ -71,16 +71,18 @@ async function getObjectBufferFromS3(key) {
   }
 }
 
-async function getSignedFileUrlFromS3(key, expiresIn = EXPIRACION_FIRMA) {
+async function getSignedFileUrlFromS3(key, expiresIn = EXPIRACION_FIRMA, contentDisposition) {
   if (!key) return null;
-  return getSignedUrl(s3, new GetObjectCommand({ Bucket: bucketName, Key: key }), { expiresIn });
+  return getSignedUrl(s3, new GetObjectCommand({
+    Bucket: bucketName, Key: key, ResponseContentDisposition: contentDisposition,
+  }), { expiresIn });
 }
 
 // Firma "segura": una key inexistente devuelve null en vez de romper un listado.
-async function firmarSeguro(key, expiresIn = EXPIRACION_FIRMA) {
+async function firmarSeguro(key, expiresIn = EXPIRACION_FIRMA, contentDisposition) {
   if (!key) return null;
   try {
-    return await getSignedFileUrlFromS3(key, expiresIn);
+    return await getSignedFileUrlFromS3(key, expiresIn, contentDisposition);
   } catch (error) {
     return null;
   }

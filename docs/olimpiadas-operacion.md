@@ -91,7 +91,11 @@ El historial registra actor, fecha, campo y valores anteriores/nuevos de partido
 
 ## Videos
 
-Los videos de una edición se guardan en el sistema (`olimpiada_video`, archivos en S3 bajo `olimpiadas/videos/`), no en una carpeta externa. Como pesan cientos de megas, el navegador los sube en partes de 8 MB: `POST /olimpiadas/:id/videos` abre la subida, `PUT /olimpiadas/videos/:videoId/partes/:n` recibe cada parte (cuerpo binario) y la pasa a S3, y `POST /olimpiadas/videos/:videoId/completar` une las partes. Formatos: MP4, WebM o MOV (se verifica el contenido de la primera parte); hasta 1,5 GB por video y 40 por edición. Se reproducen dentro del portal con una dirección firmada de seis horas. Las fotos admiten hasta 15 MB cada una (80 MB por tanda).
+Cada edición admite hasta 40 videos MP4, WebM o MOV de hasta 200 MiB por archivo. La API registra los metadatos en `olimpiada_video` y guarda los videos en S3 bajo `olimpiadas/videos/`.
+
+El navegador inicia la carga con `POST /olimpiadas/:id/videos` y envía partes de 8 MiB mediante `PUT /olimpiadas/videos/:videoId/partes/:n`. La API verifica el formato en la primera parte y envía a S3 cada parte con su número. Se puede reintentar una parte individual y también la confirmación final mediante `POST /olimpiadas/videos/:videoId/completar`. Para cancelar una subida pendiente se usa `DELETE /olimpiadas/videos/:videoId?cancelar=1`.
+
+Tanto el portal público como el de gestión reciben dos direcciones firmadas por seis horas. El reproductor usa `url` para pedir a S3 los rangos que necesita. El enlace `descarga_url` entrega el archivo original desde S3 con un nombre basado en el título del video. Las fotos admiten hasta 15 MB cada una (80 MB por tanda).
 
 ## Gafetes
 
