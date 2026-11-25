@@ -11,7 +11,9 @@ const express = require("express");
 const mysqlConnection = require("../connection/connection");
 const { registrarErrorRuta } = require("../services/errores");
 const { normalizarFechaCivil } = require("../services/valores-dominio");
-const { leerEtiquetas, opcionesPartidos, SELECT_FOTO, serializarFoto, listarFotos } = require("../services/olimpiadas-fotos");
+const {
+  leerEtiquetas, leerDepartamentales, nombresDepartamentales, opcionesPartidos, SELECT_FOTO, serializarFoto, listarFotos,
+} = require("../services/olimpiadas-fotos");
 const { SECCIONES_INICIALES } = require("../data/olimpiadas-plantillas");
 const pruebasLectura = require("./olimpiadas-pruebas");
 const { FORMATOS: FORMATOS_COMPETENCIA } = require("../services/olimpiadas-pruebas");
@@ -2891,6 +2893,11 @@ function leerCamposFoto(body, { conEpigrafe = false } = {}) {
     cambios.etiquetas = JSON.stringify(etiquetas);
     cambios.etiqueta = etiquetas[0] || null;
   }
+  // Las departamentales que aparecen en la foto (pueden ser varias): se guardan como lista de ids.
+  if (body.departamentales !== undefined) {
+    const departamentales = leerDepartamentales(body.departamentales);
+    cambios.departamentales = departamentales.length ? JSON.stringify(departamentales) : null;
+  }
   if (conEpigrafe && body.epigrafe !== undefined) cambios.epigrafe = leerTexto(body, "epigrafe", {}, { maximo: 200, etiqueta: "el epígrafe" });
   return cambios;
 }
@@ -2906,6 +2913,11 @@ async function validarPartidoFoto(conexion, cambios, olimpiadas) {
     throw crearErrorHttp("La disciplina elegida no corresponde al partido");
   }
   cambios.disciplina_id = partido.disciplina_id;
+}
+
+// Las departamentales elegidas tienen que existir.
+async function validarDepartamentalesFoto(conexion, cambios) {
+  if (cambios.departamentales) await validarDepartamentales(conexion, JSON.parse(cambios.departamentales));
 }
 
 /**
@@ -2952,11 +2964,11 @@ async function procesarLoteFotos(
       // El orden sólo avanza cuando la foto entró (una fallida no deja huecos).
       const ordenFoto = orden + 1;
       const [insert] = await conexion.query(
-        `INSERT INTO olimpiada_foto (olimpiada_id, archivo, miniatura_archivo, ancho, alto, mime, epigrafe, disciplina_id, fecha, etiqueta, orden, usuario_id, etiquetas, partido_id, carga_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO olimpiada_foto (olimpiada_id, archivo, miniatura_archivo, ancho, alto, mime, epigrafe, disciplina_id, fecha, etiqueta, orden, usuario_id, etiquetas, partido_id, departamentales, carga_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           olimpiadaId, imagen.key, imagen.miniatura_key, imagen.ancho, imagen.alto, imagen.mime,
-          comunes.epigrafe ?? null, comunes.disciplina_id ?? null, comunes.fecha ?? null, comunes.etiqueta ?? null, ordenFoto, usuarioId, comunes.etiquetas ?? null, comunes.partido_id ?? null, cargaId,
+          comunes.epigrafe ?? null, comunes.disciplina_id ?? null, comunes.fecha ?? null, comunes.etiqueta ?? null, ordenFoto, usuarioId, comunes.etiquetas ?? null, comunes.partido_id ?? null, comunes.departamentales ?? null, cargaId,
         ]
       );
       orden = ordenFoto;
@@ -2975,6 +2987,7 @@ async function procesarLoteFotos(
         fecha: comunes.fecha ?? null,
         etiqueta: comunes.etiqueta ?? null,
         etiquetas: comunes.etiquetas ?? null,
+        departamentales: comunes.departamentales ?? null,
         partido_id: comunes.partido_id ?? null,
         orden,
         fecha_creacion: new Date(),
@@ -3025,6 +3038,7 @@ router.post("/olimpiadas/:id(\\d+)/fotos", verifyTokenMultimedia, soloGestionMul
     if (archivos.length === 0) return res.status(400).json("Adjuntá al menos una foto en el campo FOTOS");
     const comunes = leerCamposFoto(req.body || {}, { conEpigrafe: true });
     await validarPartidoFoto(db, comunes, [olimpiadaId]);
+    await validarDepartamentalesFoto(db, comunes);
     const [partido] = await opcionesPartidos(db, olimpiadaId, consultarPartidos, comunes.partido_id ? [comunes.partido_id] : []);
     const disciplina = await validarDisciplinaCatalogo(db, comunes.disciplina_id);
     if (disciplina) comunes.disciplina_nombre = disciplina.nombre;
@@ -3047,6 +3061,8 @@ router.post("/olimpiadas/:id(\\d+)/fotos", verifyTokenMultimedia, soloGestionMul
       tipo_operacion: "CREATE",
       valor_nuevo: `${nuevas} fotos subidas${comunes.etiqueta ? ` (${comunes.etiqueta})` : ""}${errores.length ? `, ${errores.length} con error` : ""}`,
     });
+    // Un reintento puede devolver fotos ya guardadas, con las departamentales de su primera subida.
+    const nombresDeDepartamentales = await nombresDepartamentales(db, fotos);
     res.status(201).json({
       success: true,
       message: errores.length === 0
@@ -3054,7 +3070,7 @@ router.post("/olimpiadas/:id(\\d+)/fotos", verifyTokenMultimedia, soloGestionMul
         : `Se subieron ${fotos.length} fotos; ${errores.length} no se pudieron procesar`,
       subidas: fotos.length,
       errores,
-      fotos: await Promise.all(fotos.map(foto => serializarFoto(foto, partido?.nombre))),
+      fotos: await Promise.all(fotos.map(foto => serializarFoto(foto, partido?.nombre, nombresDeDepartamentales))),
     });
   } catch (error) {
     responderError(res, error, "No se pudieron subir las fotos");
@@ -3076,6 +3092,7 @@ router.put("/olimpiadas/fotos/lote", verifyTokenMultimedia, soloGestionMultimedi
       if (!fotos.length) throw crearErrorHttp("Las fotos ya no existen", 404);
       const ediciones = [...new Set(fotos.map(foto => foto.olimpiada_id))];
       await validarPartidoFoto(connection, cambios, ediciones);
+      await validarDepartamentalesFoto(connection, cambios);
       await validarDisciplinaCatalogo(connection, cambios.disciplina_id);
       const campos = Object.keys(cambios);
       const asignaciones = campos.map(campo => `${campo} = ?`);
@@ -3100,15 +3117,15 @@ router.put("/olimpiadas/fotos/lote", verifyTokenMultimedia, soloGestionMultimedi
       }
       return update.affectedRows;
     });
-    res.status(200).json({ success: true, message: `Se actualizaron ${resultado} fotos`, actualizadas: resultado });
+    res.status(200).json({ success: true, message: resultado === 1 ? "Se actualizó 1 foto" : `Se actualizaron ${resultado} fotos`, actualizadas: resultado });
   } catch (error) {
     responderError(res, error, "No se pudieron actualizar las fotos");
   }
 });
 
-router.post("/olimpiadas/fotos/eliminar-lote", verifyToken, async (req, res) => {
-  const cabecera = exigirSuperior(req, res);
-  if (!cabecera) return;
+// Eliminar también lo puede hacer Prensa, sólo en sus ediciones asignadas (lo comprueba verifyTokenMultimedia).
+router.post("/olimpiadas/fotos/eliminar-lote", verifyTokenMultimedia, soloGestionMultimedia, async (req, res) => {
+  const cabecera = getCabecera(req);
   try {
     const ids = normalizarIds(req.body?.ids);
     if (ids === null || ids.length === 0) return res.status(400).json("Elegí al menos una foto");
@@ -3130,7 +3147,7 @@ router.post("/olimpiadas/fotos/eliminar-lote", verifyToken, async (req, res) => 
       }
     });
     await eliminarObjetosS3Seguro(fotos.flatMap((foto) => [foto.archivo, foto.miniatura_archivo]));
-    res.status(200).json({ success: true, message: `Se eliminaron ${fotos.length} fotos`, eliminadas: fotos.length });
+    res.status(200).json({ success: true, message: fotos.length === 1 ? "Se eliminó 1 foto" : `Se eliminaron ${fotos.length} fotos`, eliminadas: fotos.length });
   } catch (error) {
     responderError(res, error, "No se pudieron eliminar las fotos");
   }
@@ -3146,6 +3163,7 @@ router.put("/olimpiadas/fotos/:fotoId(\\d+)", verifyTokenMultimedia, soloGestion
       const [[actual]] = await connection.query("SELECT * FROM olimpiada_foto WHERE id = ? AND eliminado = 0 FOR UPDATE", [fotoId]);
       if (!actual) throw crearErrorHttp("La foto no existe", 404);
       await validarPartidoFoto(connection, cambios, [actual.olimpiada_id]);
+      await validarDepartamentalesFoto(connection, cambios);
       await validarDisciplinaCatalogo(connection, cambios.disciplina_id);
       if (cambios.partido_id === undefined && cambios.disciplina_id !== undefined && cambios.disciplina_id !== actual.disciplina_id) cambios.partido_id = null;
       const campos = Object.keys(cambios);
@@ -3165,15 +3183,18 @@ router.put("/olimpiadas/fotos/:fotoId(\\d+)", verifyTokenMultimedia, soloGestion
     const [rows] = await db.query(`${SELECT_FOTO} WHERE f.id = ?`, [fotoId]);
     const foto = rows[0];
     const [partido] = await opcionesPartidos(db, foto?.olimpiada_id, consultarPartidos, foto?.partido_id ? [foto.partido_id] : []);
-    res.status(200).json({ success: true, id: fotoId, message: "Foto actualizada", foto: foto ? await serializarFoto(foto, partido?.nombre) : null });
+    const nombresDeDepartamentales = await nombresDepartamentales(db, foto ? [foto] : []);
+    res.status(200).json({
+      success: true, id: fotoId, message: "Foto actualizada",
+      foto: foto ? await serializarFoto(foto, partido?.nombre, nombresDeDepartamentales) : null,
+    });
   } catch (error) {
     responderError(res, error, "No se pudo actualizar la foto");
   }
 });
 
-router.delete("/olimpiadas/fotos/:fotoId(\\d+)", verifyToken, async (req, res) => {
-  const cabecera = exigirSuperior(req, res);
-  if (!cabecera) return;
+router.delete("/olimpiadas/fotos/:fotoId(\\d+)", verifyTokenMultimedia, soloGestionMultimedia, async (req, res) => {
+  const cabecera = getCabecera(req);
   try {
     const fotoId = idDeRuta(req.params.fotoId);
     const actual = await exigirFila(db, "olimpiada_foto", fotoId, "La foto no existe");

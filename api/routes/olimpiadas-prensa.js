@@ -62,7 +62,8 @@ function registrarPrensa(router, { db, soloSuperior, cargarOlimpiada, idDeRuta }
     if (!edicion) throw crearErrorHttp("La edición no existe", 404);
     const [disciplinas] = await db.query(`SELECT d.id, d.nombre FROM olimpiada_disciplina_config c
       JOIN olimpiada_disciplina d ON d.id = c.disciplina_id WHERE c.olimpiada_id = ? ORDER BY d.nombre`, [id]);
-    res.set("Cache-Control", "no-store").json({ ...edicion, disciplinas });
+    const [departamentales] = await db.query("SELECT id, nombre FROM departamental WHERE habilitado = 'Y' ORDER BY nombre");
+    res.set("Cache-Control", "no-store").json({ ...edicion, disciplinas, departamentales });
   }));
 
   const ruta = "/olimpiadas/:id(\\d+)/prensa";
