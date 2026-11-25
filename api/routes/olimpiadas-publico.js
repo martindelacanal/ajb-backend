@@ -4,7 +4,7 @@ const express = require('express');
 const db = require('../connection/connection').promise();
 const { normalizarFechaCivil } = require('../services/valores-dominio');
 const { validarRutaPublica } = require('../services/olimpiadas-ruta-publica');
-const { crearErrorHttp, responderError, obtenerOlimpiada, listarNombresDisciplinas, firmarSeguro, obtenerUrlAvisoPublico, fechaHoyBuenosAires, estaVentanaInscripcionAbierta, calcularGanadores } = require('../services/olimpiadas-comun');
+const { crearErrorHttp, responderError, obtenerOlimpiada, listarNombresDisciplinas, firmarSeguro, obtenerUrlAvisoPublico, obtenerLogoPublico, fechaHoyBuenosAires, estaVentanaInscripcionAbierta, calcularGanadores } = require('../services/olimpiadas-comun');
 const { partidosPublicos, calcularPosiciones, listarTorneos, listarEquipos, filtroId } = require('../services/olimpiadas-competicion');
 const lectura = require('./olimpiadas-contenido').lecturasPublicas;
 const router = express.Router();
@@ -49,11 +49,11 @@ router.get('/olimpiadas/publico/ediciones', async (req, res) => {
       (SELECT COUNT(*) FROM olimpiada_foto f WHERE f.olimpiada_id = o.id AND f.eliminado = 0) AS fotos,
       (SELECT COUNT(*) FROM olimpiada_novedad n WHERE n.olimpiada_id = o.id AND n.eliminado = 0 AND n.publicada = 1 AND n.fecha_publicacion <= NOW()) AS novedades
       FROM olimpiada o WHERE o.eliminado = 0 AND o.habilitado = 'Y' AND o.publicada_publico = 1 ORDER BY o.fecha_inicio DESC, o.id DESC`);
-    // Los nombres de las disciplinas de cada edición: el banner dibuja esos deportes
-    const disciplinas = await listarNombresDisciplinas(db, rows.map(o => o.id));
+    // Los nombres de las disciplinas de cada edición (el banner dibuja esos deportes) y su logo oficial, si lo tiene
+    const [disciplinas, logos] = await Promise.all([listarNombresDisciplinas(db, rows.map(o => o.id)), Promise.all(rows.map(obtenerLogoPublico))]);
     res.set('Cache-Control', 'no-store');
-    res.json(rows.map(o => ({ ...edicionPublica(o), fotos: Number(o.fotos), novedades: Number(o.novedades), mi_inscripcion: null,
-      disciplinas: disciplinas.get(Number(o.id)) || [] })));
+    res.json(rows.map((o, i) => ({ ...edicionPublica(o), fotos: Number(o.fotos), novedades: Number(o.novedades), mi_inscripcion: null,
+      disciplinas: disciplinas.get(Number(o.id)) || [], logo: logos[i] })));
   } catch (error) { responderError(res, error, 'No se pudieron cargar las ediciones públicas'); }
 });
 
@@ -76,9 +76,9 @@ ruta('portal', async (req, o) => {
   // Las categorías y mesas que se están disputando también cuentan como «en vivo»
   conteos.en_vivo += (await lectura.pruebasEnJuego(db, o.id)).length;
   const [videos] = await db.query("SELECT id, titulo, url, descripcion FROM olimpiada_enlace WHERE olimpiada_id = ? AND eliminado = 0 AND tipo = 'VIDEOS' ORDER BY orden, id", [o.id]);
-  const [nombres, popup_imagen_url] = await Promise.all([listarNombresDisciplinas(db, o.id), obtenerUrlAvisoPublico(o.id)]);
+  const [nombres, popup_imagen_url, logo] = await Promise.all([listarNombresDisciplinas(db, o.id), obtenerUrlAvisoPublico(o.id), obtenerLogoPublico(o)]);
   const disciplinas = nombres.get(Number(o.id)) || [];
-  return { olimpiada: { ...edicionPublica(o), videos, disciplinas, popup_imagen_url }, conteos, mi_inscripcion: null, hoteles_mi_departamental: [], departamental_id: null };
+  return { olimpiada: { ...edicionPublica(o), videos, disciplinas, popup_imagen_url, logo }, conteos, mi_inscripcion: null, hoteles_mi_departamental: [], departamental_id: null };
 });
 
 async function partidosFiltrados(req, o) {
