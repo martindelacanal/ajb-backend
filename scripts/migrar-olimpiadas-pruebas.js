@@ -5,10 +5,16 @@
  *
  * Agrega cómo se compite en cada disciplina (`olimpiada_disciplina.formato_competencia`), las
  * tablas de categorías / mesas (`olimpiada_prueba`) y de sus participantes
- * (`olimpiada_prueba_participante`), y lo que necesita el medallero para sumar solo las medallas
- * de cada categoría (columnas de `olimpiada_medalla` y su clave única).
+ * (`olimpiada_prueba_participante`), lo que necesita el medallero para sumar solo las medallas
+ * de cada categoría (columnas de `olimpiada_medalla` y su clave única) y, para pesca, los ganadores
+ * que se eligen a mano en cada categoría (`olimpiada_prueba_ganador`).
  *
- * Se puede volver a correr sobre una base que ya tenía la primera versión: agrega sólo lo que falta.
+ * Tercera tanda (25/11/2026): en pesca los participantes pasan a ser de la disciplina —los mismos
+ * compiten por todos los premios— y dejan de estar repartidos por categoría. Quien había quedado
+ * cargado en dos categorías figura una sola vez, y se quitan las medallas automáticas que venían
+ * de las tablas de piezas y peso (ya no existen).
+ *
+ * Se puede volver a correr sobre una base que ya tenía una versión anterior: agrega sólo lo que falta.
  *
  * Idempotente. Por defecto sólo informa lo pendiente (check); con --apply lo aplica.
  *
@@ -23,7 +29,7 @@
 require("dotenv").config();
 const fs = require("fs");
 const mysql = require("mysql2/promise");
-const { formatoSugerido } = require("../api/services/olimpiadas-pruebas");
+const { formatoSugerido, sinAcentos } = require("../api/services/olimpiadas-pruebas");
 
 const CONFIRMACION = "APLICAR_OLIMPIADAS_PRUEBAS";
 const CANDADO = "ajb:olimpiadas-pruebas-v1";
@@ -88,7 +94,53 @@ const TABLAS = {
     CONSTRAINT fk_oli_prueba_part_prueba FOREIGN KEY (prueba_id) REFERENCES olimpiada_prueba (id),
     CONSTRAINT fk_oli_prueba_part_departamental FOREIGN KEY (departamental_id) REFERENCES departamental (id)
   ) ${CHARSET}`,
+  olimpiada_prueba_ganador: `CREATE TABLE IF NOT EXISTS olimpiada_prueba_ganador (
+    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    olimpiada_id INT NOT NULL,
+    disciplina_id INT NOT NULL,
+    prueba_id INT NOT NULL COMMENT 'Categoría de pesca que se premia',
+    participante_id INT NOT NULL COMMENT 'Participante de la disciplina (olimpiada_prueba_participante)',
+    puesto TINYINT UNSIGNED NOT NULL COMMENT '1 = oro, 2 = plata, 3 = bronce',
+    marca VARCHAR(60) NULL COMMENT 'Lo que se anota al lado del ganador: 12 piezas, 4,350 kg…',
+    fecha_creacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    fecha_modificacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_oli_prueba_ganador_puesto (prueba_id, puesto),
+    UNIQUE KEY uq_oli_prueba_ganador_persona (prueba_id, participante_id),
+    KEY idx_oli_prueba_ganador_disciplina (olimpiada_id, disciplina_id),
+    KEY idx_oli_prueba_ganador_participante (participante_id),
+    CONSTRAINT fk_oli_prueba_ganador_olimpiada FOREIGN KEY (olimpiada_id) REFERENCES olimpiada (id),
+    CONSTRAINT fk_oli_prueba_ganador_disciplina FOREIGN KEY (disciplina_id) REFERENCES olimpiada_disciplina (id),
+    CONSTRAINT fk_oli_prueba_ganador_prueba FOREIGN KEY (prueba_id) REFERENCES olimpiada_prueba (id),
+    CONSTRAINT fk_oli_prueba_ganador_participante FOREIGN KEY (participante_id) REFERENCES olimpiada_prueba_participante (id)
+  ) ${CHARSET}`,
 };
+
+/**
+ * Pesca: qué hacer con los participantes que estaban cargados dentro de una categoría. Recibe las
+ * filas vigentes de las disciplinas de pesca (primero las que ya son de la disciplina) y devuelve
+ * cuáles pasan al listado de la disciplina, con su orden, y cuáles sobran por estar repetidas
+ * (misma inscripción, o mismo nombre y departamental).
+ */
+function planParticipantesPesca(filas) {
+  const disciplinas = new Map();
+  const mover = [], repetidos = [];
+  for (const fila of filas) {
+    const clave = `${fila.olimpiada_id}|${fila.disciplina_id}`;
+    if (!disciplinas.has(clave)) disciplinas.set(clave, { vistos: new Set(), orden: 0, pendiente: false, filas: [] });
+    const grupo = disciplinas.get(clave);
+    if (fila.prueba_id !== null && fila.prueba_id !== undefined) grupo.pendiente = true;
+    const identidades = [`N${sinAcentos(fila.nombre)}|${Number(fila.departamental_id) || 0}`, ...(fila.inscripcion_id ? [`I${Number(fila.inscripcion_id)}`] : [])];
+    if (identidades.some(identidad => grupo.vistos.has(identidad))) { grupo.filas.push({ id: Number(fila.id), repetido: true }); continue; }
+    identidades.forEach(identidad => grupo.vistos.add(identidad));
+    grupo.filas.push({ id: Number(fila.id), orden: ++grupo.orden });
+  }
+  // Una disciplina que ya tiene a todos en su listado no se toca
+  for (const grupo of disciplinas.values()) {
+    if (!grupo.pendiente) continue;
+    for (const fila of grupo.filas) (fila.repetido ? repetidos : mover).push(fila.repetido ? fila.id : { id: fila.id, orden: fila.orden });
+  }
+  return { mover, repetidos };
+}
 
 async function existeColumna(db, tabla, columna) {
   const [rows] = await db.query(
@@ -152,6 +204,48 @@ async function migrar(db, aplicar = false, { otorgar = true } = {}) {
       informe.push(`${formato}: ${cambios.filter((d) => d.formato === formato).map((d) => d.nombre).join(", ") || "ninguna"}`);
     }
     if (aplicar) for (const d of cambios) await db.query("UPDATE olimpiada_disciplina SET formato_competencia = ? WHERE id = ?", [d.formato, d.id]);
+  }
+
+  // Pesca: los participantes pasan de la categoría a la disciplina (ver el encabezado).
+  const hayParticipantes = !tablasNuevas.has("olimpiada_prueba_participante") && await existeColumna(db, "olimpiada_disciplina", "formato_competencia");
+  if (hayParticipantes) {
+    const [filas] = await db.query(
+      `SELECT p.id, p.olimpiada_id, p.disciplina_id, p.prueba_id, p.nombre, p.departamental_id, p.inscripcion_id
+       FROM olimpiada_prueba_participante p INNER JOIN olimpiada_disciplina d ON d.id = p.disciplina_id
+       WHERE d.formato_competencia = 'PESCA' AND p.eliminado = 0
+       ORDER BY p.olimpiada_id, p.disciplina_id, (p.prueba_id IS NOT NULL), p.prueba_id, p.orden, p.id`
+    );
+    const { mover, repetidos } = planParticipantesPesca(filas);
+    if (mover.length || repetidos.length) {
+      pendientes.push(`Pesca: pasar ${mover.length} participante(s) al listado de la disciplina${repetidos.length ? ` y quitar ${repetidos.length} repetido(s)` : ""}`);
+      if (aplicar) {
+        await db.beginTransaction();
+        try {
+          if (repetidos.length) await db.query("UPDATE olimpiada_prueba_participante SET eliminado = 1 WHERE id IN (?)", [repetidos]);
+          for (const fila of mover) await db.query("UPDATE olimpiada_prueba_participante SET prueba_id = NULL, orden = ? WHERE id = ?", [fila.orden, fila.id]);
+          await db.commit();
+        } catch (error) {
+          await db.rollback();
+          throw error;
+        }
+      }
+    }
+    // Las medallas automáticas de las dos tablas (piezas y peso) salían de datos que ya no se cargan
+    if (await existeColumna(db, "olimpiada_medalla", "criterio")) {
+      const [[viejas]] = await db.query(
+        `SELECT COUNT(*) AS cantidad FROM olimpiada_medalla m INNER JOIN olimpiada_disciplina d ON d.id = m.disciplina_id
+         WHERE d.formato_competencia = 'PESCA' AND m.origen = 'AUTO' AND m.criterio IS NOT NULL`
+      );
+      if (Number(viejas?.cantidad)) {
+        pendientes.push(`Pesca: quitar ${viejas.cantidad} medalla(s) automáticas de las tablas de piezas y peso`);
+        if (aplicar) {
+          await db.query(
+            `DELETE m FROM olimpiada_medalla m INNER JOIN olimpiada_disciplina d ON d.id = m.disciplina_id
+             WHERE d.formato_competencia = 'PESCA' AND m.origen = 'AUTO' AND m.criterio IS NOT NULL`
+          );
+        }
+      }
+    }
   }
 
   // Permisos de la cuenta de ejecución de la API sobre las tablas nuevas (se repite sin problema).
@@ -230,4 +324,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { migrar, COLUMNAS, TABLAS, INDICE_MEDALLA, CONFIRMACION };
+module.exports = { migrar, planParticipantesPesca, COLUMNAS, TABLAS, INDICE_MEDALLA, CONFIRMACION };

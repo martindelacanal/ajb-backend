@@ -1,6 +1,7 @@
 /**
  * Disciplinas que no se juegan 1 contra 1: categorías por tiempo (maratón, natación), pesca
- * (piezas y peso) y mesas de póker. Se registra sobre el router de contenido y comparte sus ayudantes.
+ * (un listado de participantes y los ganadores de cada categoría, elegidos a mano) y mesas de
+ * póker. Se registra sobre el router de contenido y comparte sus ayudantes.
  *
  * Lectura: cualquier sesión (el veedor, sólo sus disciplinas). Escritura: administración
  * provincial y veedores de la disciplina mientras su carga está abierta. Cada cambio deja historial.
@@ -65,7 +66,38 @@ async function esquemaMedallero(conexion) {
   return medalleroListo;
 }
 
+// Los ganadores que se eligen a mano en cada categoría de pesca (tercera tanda de la migración).
+// Mientras falte la tabla, pesca muestra su listado de participantes y no se pueden elegir ganadores.
+let ganadoresListo = false;
+let ultimoChequeoGanadores = 0;
+
+async function esquemaGanadores(conexion) {
+  if (ganadoresListo) return true;
+  if (Date.now() - ultimoChequeoGanadores < RECHEQUEO_ESQUEMA_MS) return false;
+  ultimoChequeoGanadores = Date.now();
+  try {
+    const [rows] = await conexion.query(
+      "SELECT COUNT(*) AS tablas FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'olimpiada_prueba_ganador'"
+    );
+    ganadoresListo = Number(rows[0]?.tablas) === 1;
+  } catch (_error) {
+    ganadoresListo = false;
+  }
+  return ganadoresListo;
+}
+
 const numero = valor => (valor === null || valor === undefined ? null : Number(valor));
+
+/** Pesca: los ganadores elegidos en cada categoría (vacío mientras el servidor no tenga la tabla). */
+async function cargarGanadores(conexion, olimpiadaId, disciplinaIds) {
+  if (!disciplinaIds.length || !(await esquemaGanadores(conexion))) return [];
+  const [rows] = await conexion.query(
+    `SELECT id, disciplina_id, prueba_id, participante_id, puesto, marca FROM olimpiada_prueba_ganador
+     WHERE olimpiada_id = ? AND disciplina_id IN (?) ORDER BY prueba_id, puesto, id`,
+    [olimpiadaId, disciplinaIds]
+  );
+  return rows;
+}
 
 // ---------------------------------------------------------------------------
 // Lecturas
@@ -91,7 +123,7 @@ async function listarPruebas(conexion, olimpiadaId, { disciplinaIds = null, gest
   if (!disciplinas.length) return [];
   const ids = disciplinas.map(d => d.id);
   const conMedallero = await esquemaMedallero(conexion);
-  const [[pruebas], [participantes]] = await Promise.all([
+  const [[pruebas], [participantes], ganadores] = await Promise.all([
     conexion.query(
       `SELECT id, disciplina_id, nombre, descripcion, DATE_FORMAT(fecha, '%Y-%m-%d') AS fecha, TIME_FORMAT(hora_inicio, '%H:%i') AS hora_inicio, estado, orden,
               ${conMedallero ? 'suma_medallero' : "'TODO' AS suma_medallero"}
@@ -99,10 +131,11 @@ async function listarPruebas(conexion, olimpiadaId, { disciplinaIds = null, gest
       [olimpiadaId, ids]
     ),
     conexion.query(`${SELECT_PARTICIPANTE} WHERE p.olimpiada_id = ? AND p.disciplina_id IN (?) AND p.eliminado = 0 ORDER BY p.orden, p.id`, [olimpiadaId, ids]),
+    cargarGanadores(conexion, olimpiadaId, disciplinas.filter(d => d.formato === 'PESCA').map(d => d.id)),
   ]);
   return Promise.all(disciplinas.map(async ({ icono_archivo, ...disciplina }) => P.armarDisciplina(
     { ...disciplina, sede_lat: numero(disciplina.sede_lat), sede_lng: numero(disciplina.sede_lng), icono_url: await firmarSeguro(icono_archivo) },
-    pruebas, participantes, { gestion }
+    pruebas, participantes, { gestion, ganadores }
   )));
 }
 
@@ -167,7 +200,8 @@ async function sincronizarMedallas(connection, { cabecera, olimpiadaId, discipli
   const [pruebas] = await connection.query(
     'SELECT id, nombre, orden, suma_medallero FROM olimpiada_prueba WHERE olimpiada_id = ? AND disciplina_id = ? AND eliminado = 0', [olimpiadaId, disciplinaId]);
   const [participantes] = await connection.query(`${SELECT_PARTICIPANTE} WHERE p.olimpiada_id = ? AND p.disciplina_id = ? AND p.eliminado = 0`, [olimpiadaId, disciplinaId]);
-  const deseadas = P.heredarAjustes(existentes, P.medallasDeDisciplina(disciplina.formato, pruebas, participantes, { maxPuesto: Number(tope.maximo) }));
+  const ganadores = disciplina.formato === 'PESCA' ? await cargarGanadores(connection, olimpiadaId, [disciplinaId]) : [];
+  const deseadas = P.heredarAjustes(existentes, P.medallasDeDisciplina(disciplina.formato, pruebas, participantes, { maxPuesto: Number(tope.maximo), ganadores }));
   const clave = m => `${Number(m.puesto)}:${Number(m.departamental_id)}:${m.clave_origen || ''}`;
   // Sólo se toca lo que cambió: las medallas que siguen igual conservan su fila (y su ajuste de puntos).
   const actuales = new Set(existentes.map(clave)), queridas = new Set(deseadas.map(clave));
@@ -271,16 +305,13 @@ function registrarPruebas(router, helpers) {
     return fila.nombre;
   }
 
-  // Los resultados que admite cada formato. Devuelve sólo lo que vino en el cuerpo.
+  // El resultado que se carga por persona: el tiempo (maratón, natación). En pesca y en póker los
+  // ganadores se eligen a mano. Devuelve sólo lo que vino en el cuerpo.
   function leerResultado(body, formato) {
     const datos = {};
     if (formato === 'TIEMPO') {
       const tiempo = P.leerTiempo(body.tiempo_ms !== undefined ? body.tiempo_ms : body.tiempo);
       if (tiempo !== undefined) datos.tiempo_ms = tiempo;
-    } else if (formato === 'PESCA') {
-      const piezas = P.leerPiezas(body.piezas), peso = P.leerPeso(body);
-      if (piezas !== undefined) datos.piezas = piezas;
-      if (peso !== undefined) datos.peso_gramos = peso;
     }
     return datos;
   }
@@ -294,16 +325,16 @@ function registrarPruebas(router, helpers) {
    */
   async function leerSumaMedallero(body, cabecera, formato, actual = 'TODO') {
     if (formato === 'MESAS') return undefined;
-    const suma = P.leerSumaMedallero(body.suma_medallero, formato);
-    if (suma === undefined || suma === actual) return undefined;
+    const suma = P.leerSumaMedallero(body.suma_medallero);
+    if (suma === undefined || suma === P.sumaMedallero({ suma_medallero: actual })) return undefined;
     if (!esSuperior(cabecera)) throw crearErrorHttp('Qué suma al medallero lo decide la administración', 403);
     if (!(await esquemaMedallero(db))) throw crearErrorHttp('El medallero de las disciplinas por categorías todavía no está habilitado en este servidor', 503);
     return suma;
   }
 
   const describir = (participante, departamental) => [participante, departamental].filter(Boolean).join(' · ');
-  const textoResultado = (campo, valor) => (valor === null || valor === undefined ? null
-    : campo === 'tiempo_ms' ? P.formatearTiempo(valor) : campo === 'peso_gramos' ? P.formatearPeso(valor) : String(valor));
+  const horaCorta = valor => (valor ? String(valor).slice(0, 5) : null);
+  const textoHorario = horario => [horario.fecha, horaCorta(horario.hora_inicio)].filter(Boolean).join(' ') || null;
 
   // -------------------------------------------------------------------------
   // Lectura para la gestión, el veedor y el portal con sesión
@@ -341,7 +372,8 @@ function registrarPruebas(router, helpers) {
     let nombreFinal = '';
     const id = await enTransaccion(async connection => {
       const [existentes] = await connection.query(
-        'SELECT id, nombre, orden FROM olimpiada_prueba WHERE olimpiada_id = ? AND disciplina_id = ? AND eliminado = 0 FOR UPDATE', [olimpiadaId, disciplinaId]);
+        `SELECT id, nombre, orden, DATE_FORMAT(fecha, '%Y-%m-%d') AS fecha, TIME_FORMAT(hora_inicio, '%H:%i') AS hora_inicio, estado
+         FROM olimpiada_prueba WHERE olimpiada_id = ? AND disciplina_id = ? AND eliminado = 0 ORDER BY orden, id FOR UPDATE`, [olimpiadaId, disciplinaId]);
       if (existentes.length >= P.MAX_PRUEBAS_DISCIPLINA) throw crearErrorHttp(`${disciplina.nombre} ya tiene ${P.MAX_PRUEBAS_DISCIPLINA} ${grupo}s`, 409);
       let nombre = leerTexto(body, 'nombre', {}, { maximo: 120, etiqueta: 'el nombre' });
       if (!nombre && disciplina.formato === 'MESAS') {
@@ -352,11 +384,16 @@ function registrarPruebas(router, helpers) {
       }
       if (!nombre) throw crearErrorHttp(`Ingresá el nombre de la ${grupo}`);
       if (existentes.some(e => P.sinAcentos(e.nombre) === P.sinAcentos(nombre))) throw crearErrorHttp(`Ya hay una ${grupo} «${nombre}» en ${disciplina.nombre}`, 409);
+      // Maratón, natación y pesca se disputan todas juntas: la categoría nueva toma el día y la hora
+      // de las demás (y en pesca, también cómo está la competencia). Las mesas llevan los suyos.
+      const comun = disciplina.formato !== 'MESAS' && existentes.length ? P.horarioComun(existentes) : null;
       const datos = {
         olimpiada_id: olimpiadaId, disciplina_id: disciplinaId, nombre,
         descripcion: leerTexto(body, 'descripcion', {}, { maximo: 300, etiqueta: 'la aclaración' }),
-        fecha: leerFecha(body, 'fecha', {}, { etiqueta: 'el día' }), hora_inicio: leerHora(body, 'hora_inicio', {}, { etiqueta: 'la hora' }),
+        fecha: comun ? comun.fecha : leerFecha(body, 'fecha', {}, { etiqueta: 'el día' }),
+        hora_inicio: comun ? comun.hora_inicio : leerHora(body, 'hora_inicio', {}, { etiqueta: 'la hora' }),
         orden: existentes.reduce((maximo, e) => Math.max(maximo, Number(e.orden) || 0), 0) + 1,
+        ...(disciplina.formato === 'PESCA' && existentes.length ? { estado: existentes[0].estado } : {}),
         ...(suma ? { suma_medallero: suma } : {}),
       };
       const [insert] = await connection.query('INSERT INTO olimpiada_prueba SET ?', [datos]);
@@ -421,6 +458,13 @@ function registrarPruebas(router, helpers) {
           await connection.query('UPDATE olimpiada_prueba_participante SET prueba_id = NULL WHERE prueba_id = ? AND eliminado = 0', [pruebaId]);
           mensaje = `${actual.nombre} eliminada: sus ${cantidad} jugadores quedaron sin mesa`;
         }
+      } else if (disciplina.formato === 'PESCA') {
+        // Los participantes son de la disciplina: al quitar una categoría sólo se van sus ganadores
+        if (cantidad) await connection.query('UPDATE olimpiada_prueba_participante SET prueba_id = NULL WHERE prueba_id = ? AND eliminado = 0', [pruebaId]);
+        if (await esquemaGanadores(connection)) {
+          const [borrados] = await connection.query('DELETE FROM olimpiada_prueba_ganador WHERE prueba_id = ?', [pruebaId]);
+          if (borrados.affectedRows) mensaje = `${actual.nombre} eliminada con sus ganadores`;
+        }
       } else if (cantidad) {
         if (!conParticipantes) throw crearErrorHttp(`${actual.nombre} tiene ${cantidad} participante(s) cargados. Confirmá que querés eliminarla con sus participantes.`, 409);
         await connection.query('UPDATE olimpiada_prueba_participante SET eliminado = 1 WHERE prueba_id = ? AND eliminado = 0', [pruebaId]);
@@ -429,7 +473,7 @@ function registrarPruebas(router, helpers) {
       await connection.query('UPDATE olimpiada_prueba SET eliminado = 1 WHERE id = ?', [pruebaId]);
       await historial(connection, cabecera, {
         entidad: 'PRUEBA', entidad_id: pruebaId, olimpiada_id: actual.olimpiada_id, tipo_operacion: 'DELETE',
-        valor_anterior: actual.nombre, observacion: cantidad ? `Tenía ${cantidad} participante(s)` : null,
+        valor_anterior: actual.nombre, observacion: cantidad && disciplina.formato !== 'PESCA' ? `Tenía ${cantidad} participante(s)` : null,
       });
       await medallero(connection, cabecera, actual.olimpiada_id, actual.disciplina_id);
     });
@@ -444,15 +488,18 @@ function registrarPruebas(router, helpers) {
    * Alta de uno o varios participantes: `participantes: [{ nombre, departamental_id }]` o tomados de
    * las inscripciones aprobadas de la disciplina (`inscripcion_id`: el nombre y la departamental
    * salen de ahí). Los que ya estaban cargados se omiten y se avisa.
+   * Por tiempo van a una categoría; en póker, a una mesa o sin mesa; en pesca son de la disciplina
+   * (los mismos compiten en todas las categorías) y `prueba_id` no cuenta.
    */
   router.post('/olimpiadas/:id(\\d+)/pruebas/participantes', verificarAccesoCompeticion, endpoint(async (req, res) => {
     const olimpiadaId = idDeRuta(req.params.id), body = req.body || {};
     const disciplinaId = normalizarIdPositivo(body.disciplina_id);
     if (!disciplinaId) throw crearErrorHttp('Elegí la disciplina');
     const { cabecera, disciplina, grupo } = await contextoEscritura(req, olimpiadaId, disciplinaId);
-    const pruebaId = body.prueba_id === null || body.prueba_id === undefined || body.prueba_id === '' ? null : normalizarIdPositivo(body.prueba_id);
-    if (body.prueba_id && !pruebaId) throw crearErrorHttp(`La ${grupo} es inválida`);
-    if (!pruebaId && disciplina.formato !== 'MESAS') throw crearErrorHttp('Elegí la categoría del participante');
+    const pideGrupo = disciplina.formato !== 'PESCA' && body.prueba_id !== null && body.prueba_id !== undefined && body.prueba_id !== '';
+    const pruebaId = pideGrupo ? normalizarIdPositivo(body.prueba_id) : null;
+    if (pideGrupo && !pruebaId) throw crearErrorHttp(`La ${grupo} es inválida`);
+    if (!pruebaId && disciplina.formato === 'TIEMPO') throw crearErrorHttp('Elegí la categoría del participante');
     const lista = Array.isArray(body.participantes) ? body.participantes : body.nombre || body.inscripcion_id ? [body] : [];
     if (!lista.length) throw crearErrorHttp('Ingresá al menos un participante');
     if (lista.length > P.MAX_PARTICIPANTES_CARGA) throw crearErrorHttp(`Se pueden agregar hasta ${P.MAX_PARTICIPANTES_CARGA} participantes por vez`);
@@ -480,10 +527,11 @@ function registrarPruebas(router, helpers) {
       }
 
       const nuevos = [];
-      // Una persona figura una sola vez por disciplina; por nombre, una sola vez por categoría o mesa.
+      // Una persona figura una sola vez por disciplina; por nombre, una sola vez por categoría (por
+      // tiempo) o en toda la disciplina (póker y pesca).
       const clave = (nombre, departamentalId) => `${P.sinAcentos(nombre)}|${departamentalId || 0}`;
       const yaInscriptos = new Set(existentes.map(e => Number(e.inscripcion_id)).filter(Boolean));
-      const yaCargados = new Set(existentes.filter(e => disciplina.formato === 'MESAS' || numero(e.prueba_id) === pruebaId).map(e => clave(e.nombre, e.departamental_id)));
+      const yaCargados = new Set(existentes.filter(e => disciplina.formato !== 'TIEMPO' || numero(e.prueba_id) === pruebaId).map(e => clave(e.nombre, e.departamental_id)));
       for (const item of lista) {
         if (!item || typeof item !== 'object') throw crearErrorHttp('Hay un participante con formato inválido');
         const inscripcionId = normalizarIdPositivo(item.inscripcion_id);
@@ -541,9 +589,9 @@ function registrarPruebas(router, helpers) {
       }
       Object.assign(datos, leerResultado(body, disciplina.formato));
 
-      // Cambiar de categoría o de mesa (null = sin mesa, sólo en póker)
+      // Cambiar de categoría o de mesa (null = sin mesa, sólo en póker). En pesca no hay de dónde mover.
       let destino = null;
-      if (body.prueba_id !== undefined) {
+      if (body.prueba_id !== undefined && disciplina.formato !== 'PESCA') {
         const pruebaId = body.prueba_id === null || body.prueba_id === '' ? null : normalizarIdPositivo(body.prueba_id);
         if (body.prueba_id && !pruebaId) throw crearErrorHttp(`La ${grupo} es inválida`);
         if (!pruebaId && disciplina.formato !== 'MESAS') throw crearErrorHttp('El participante tiene que estar en una categoría');
@@ -562,11 +610,10 @@ function registrarPruebas(router, helpers) {
       await connection.query('UPDATE olimpiada_prueba_participante SET ? WHERE id = ?', [datos, participanteId]);
       const base = { entidad: 'PRUEBA_PARTICIPANTE', entidad_id: participanteId, olimpiada_id: actual.olimpiada_id };
       await historialCambios(connection, cabecera, base, actual, datos, ['nombre', 'departamental_id', 'prueba_id'].filter(campo => campo in datos));
-      for (const campo of ['tiempo_ms', 'piezas', 'peso_gramos']) {
-        if (!(campo in datos) || numero(actual[campo]) === datos[campo]) continue;
+      if ('tiempo_ms' in datos && numero(actual.tiempo_ms) !== datos.tiempo_ms) {
         await historial(connection, cabecera, {
-          ...base, tipo_operacion: 'UPDATE', campo_modificado: campo,
-          valor_anterior: textoResultado(campo, actual[campo]), valor_nuevo: textoResultado(campo, datos[campo]), observacion: datos.nombre,
+          ...base, tipo_operacion: 'UPDATE', campo_modificado: 'tiempo_ms',
+          valor_anterior: P.formatearTiempo(actual.tiempo_ms), valor_nuevo: P.formatearTiempo(datos.tiempo_ms), observacion: datos.nombre,
         });
         if (mensaje === 'Cambios guardados') mensaje = `Resultado de ${datos.nombre} guardado`;
       }
@@ -583,6 +630,8 @@ function registrarPruebas(router, helpers) {
     await enTransaccion(async connection => {
       const actual = await cargarParticipante(connection, participanteId, { bloquear: true });
       await connection.query('UPDATE olimpiada_prueba_participante SET eliminado = 1, puesto = NULL WHERE id = ?', [participanteId]);
+      // Pesca: si había ganado alguna categoría, ese lugar queda sin definir
+      if (await esquemaGanadores(connection)) await connection.query('DELETE FROM olimpiada_prueba_ganador WHERE participante_id = ?', [participanteId]);
       await historial(connection, cabecera, {
         entidad: 'PRUEBA_PARTICIPANTE', entidad_id: participanteId, olimpiada_id: actual.olimpiada_id, tipo_operacion: 'DELETE',
         valor_anterior: describir(actual.nombre, actual.departamental_nombre),
@@ -630,6 +679,104 @@ function registrarPruebas(router, helpers) {
     res.json(await respuesta(olimpiadaId, disciplinaId, { message: conGanador.length ? 'Ganadores guardados' : 'Se quitaron los ganadores' }));
   }, 'No se pudieron guardar los ganadores'));
 
+  // -------------------------------------------------------------------------
+  // Pesca: los ganadores de cada categoría se eligen a mano entre los participantes de la disciplina,
+  // con la marca de cada uno al lado («12 piezas», «4,350 kg») si se quiere dejar anotada
+  // -------------------------------------------------------------------------
+  router.put('/olimpiadas/pruebas/:pruebaId(\\d+)/ganadores', verificarAccesoCompeticion, endpoint(async (req, res) => {
+    await exigirEsquema();
+    const pruebaId = idDeRuta(req.params.pruebaId);
+    const previa = await cargarPrueba(db, pruebaId);
+    const { cabecera, disciplina } = await contextoEscritura(req, previa.olimpiada_id, previa.disciplina_id);
+    if (disciplina.formato !== 'PESCA') {
+      throw crearErrorHttp(disciplina.formato === 'MESAS'
+        ? `En ${disciplina.nombre} los ganadores son del torneo, no de cada mesa`
+        : `En ${disciplina.nombre} los puestos salen de los tiempos cargados`, 409);
+    }
+    if (!(await esquemaGanadores(db))) throw crearErrorHttp('Los ganadores por categoría todavía no están habilitados en este servidor', 503);
+    const elegidos = P.leerGanadores(req.body?.ganadores, normalizarIdPositivo);
+    let cambio = false;
+    await enTransaccion(async connection => {
+      const actual = await cargarPrueba(connection, pruebaId, { bloquear: true });
+      const [participantes] = await connection.query(
+        'SELECT id, nombre FROM olimpiada_prueba_participante WHERE olimpiada_id = ? AND disciplina_id = ? AND eliminado = 0 FOR UPDATE', [actual.olimpiada_id, actual.disciplina_id]);
+      const porId = new Map(participantes.map(p => [Number(p.id), p]));
+      if (elegidos.some(g => !porId.has(g.participante_id))) throw crearErrorHttp('Uno de los ganadores ya no figura entre los participantes', 409);
+      const [anteriores] = await connection.query('SELECT id, participante_id, puesto, marca FROM olimpiada_prueba_ganador WHERE prueba_id = ? ORDER BY puesto, id FOR UPDATE', [pruebaId]);
+      const firma = lista => lista.map(g => `${Number(g.puesto)}:${Number(g.participante_id)}:${g.marca || ''}`).sort().join('|');
+      if (firma(anteriores) === firma(elegidos)) return;
+      const conNombre = lista => lista.filter(g => porId.has(Number(g.participante_id))).map(g => ({ ...g, nombre: porId.get(Number(g.participante_id)).nombre }));
+      await connection.query('DELETE FROM olimpiada_prueba_ganador WHERE prueba_id = ?', [pruebaId]);
+      for (const ganador of elegidos) {
+        await connection.query('INSERT INTO olimpiada_prueba_ganador SET ?', [{
+          olimpiada_id: actual.olimpiada_id, disciplina_id: actual.disciplina_id, prueba_id: pruebaId,
+          participante_id: ganador.participante_id, puesto: ganador.puesto, marca: ganador.marca,
+        }]);
+      }
+      await historial(connection, cabecera, {
+        entidad: 'PRUEBA', entidad_id: pruebaId, olimpiada_id: actual.olimpiada_id, tipo_operacion: 'UPDATE', campo_modificado: 'ganadores',
+        valor_anterior: P.describirGanadores(conNombre(anteriores)) || null, valor_nuevo: P.describirGanadores(conNombre(elegidos)) || null, observacion: actual.nombre,
+      });
+      await medallero(connection, cabecera, actual.olimpiada_id, actual.disciplina_id);
+      cambio = true;
+    });
+    const message = !cambio ? 'No había cambios para guardar' : elegidos.length ? `Ganadores de ${previa.nombre} guardados` : `Se quitaron los ganadores de ${previa.nombre}`;
+    res.json(await respuesta(previa.olimpiada_id, previa.disciplina_id, { id: pruebaId, message }));
+  }, 'No se pudieron guardar los ganadores'));
+
+  // -------------------------------------------------------------------------
+  // Maratón, natación y pesca se disputan todas juntas: un solo día y una sola hora por disciplina
+  // (y en pesca, también un solo estado). Se guarda en todas sus categorías.
+  // -------------------------------------------------------------------------
+  router.put('/olimpiadas/:id(\\d+)/disciplinas/:disciplinaId(\\d+)/competencia', verificarAccesoCompeticion, endpoint(async (req, res) => {
+    const olimpiadaId = idDeRuta(req.params.id), disciplinaId = idDeRuta(req.params.disciplinaId), body = req.body || {};
+    const { cabecera, disciplina } = await contextoEscritura(req, olimpiadaId, disciplinaId);
+    if (disciplina.formato === 'MESAS') throw crearErrorHttp(`En ${disciplina.nombre} cada mesa lleva su día y su hora`, 409);
+    let estado = null;
+    if (body.estado !== undefined && body.estado !== null && body.estado !== '') {
+      if (disciplina.formato !== 'PESCA') throw crearErrorHttp(`En ${disciplina.nombre} el estado se cambia en cada categoría`, 409);
+      estado = String(body.estado).trim().toUpperCase();
+      if (!P.ESTADOS_PRUEBA.includes(estado)) throw crearErrorHttp('El estado es inválido');
+    }
+    const conHorario = body.fecha !== undefined || body.hora_inicio !== undefined;
+    if (!conHorario && !estado) throw crearErrorHttp('Indicá el día, la hora o el estado');
+    let mensaje = 'No había cambios para guardar';
+    await enTransaccion(async connection => {
+      const [pruebas] = await connection.query(
+        `SELECT id, nombre, DATE_FORMAT(fecha, '%Y-%m-%d') AS fecha, TIME_FORMAT(hora_inicio, '%H:%i') AS hora_inicio, estado
+         FROM olimpiada_prueba WHERE olimpiada_id = ? AND disciplina_id = ? AND eliminado = 0 ORDER BY orden, id FOR UPDATE`, [olimpiadaId, disciplinaId]);
+      if (!pruebas.length) throw crearErrorHttp(`Creá primero una categoría de ${disciplina.nombre}`, 409);
+      const antes = P.horarioComun(pruebas);
+      const datos = {};
+      if (conHorario) {
+        datos.fecha = leerFecha(body, 'fecha', antes, { etiqueta: 'el día' });
+        datos.hora_inicio = leerHora(body, 'hora_inicio', antes, { etiqueta: 'la hora' });
+      }
+      if (estado) datos.estado = estado;
+      const cambiaHorario = conHorario && (antes.mixto || antes.fecha !== datos.fecha || antes.hora_inicio !== horaCorta(datos.hora_inicio));
+      const estadosPrevios = [...new Set(pruebas.map(p => p.estado))];
+      const cambiaEstado = !!estado && (estadosPrevios.length > 1 || estadosPrevios[0] !== estado);
+      if (!cambiaHorario && !cambiaEstado) return;
+      await connection.query('UPDATE olimpiada_prueba SET ? WHERE id IN (?)', [datos, pruebas.map(p => p.id)]);
+      const base = { entidad: 'DISCIPLINA_INFO', entidad_id: disciplinaId, olimpiada_id: olimpiadaId, tipo_operacion: 'UPDATE' };
+      if (cambiaHorario) {
+        await historial(connection, cabecera, {
+          ...base, campo_modificado: 'dia_hora_competencia',
+          valor_anterior: antes.mixto ? 'Cada categoría con el suyo' : textoHorario(antes), valor_nuevo: textoHorario(datos),
+        });
+        mensaje = `Día y hora de ${disciplina.nombre} guardados`;
+      }
+      if (cambiaEstado) {
+        await historial(connection, cabecera, {
+          ...base, campo_modificado: 'estado_competencia',
+          valor_anterior: estadosPrevios.map(e => NOMBRES_ESTADO[e] || e).join(' / '), valor_nuevo: NOMBRES_ESTADO[estado],
+        });
+        mensaje = `${disciplina.nombre}: ${NOMBRES_ESTADO[estado].toLowerCase()}`;
+      }
+    });
+    res.json(await respuesta(olimpiadaId, disciplinaId, { message: mensaje }));
+  }, 'No se pudieron guardar los cambios'));
+
   return { listarPruebas, resumenDisciplinas, pruebasEnJuego, esquemaDisponible };
 }
 
@@ -639,7 +786,12 @@ module.exports.resumenDisciplinas = resumenDisciplinas;
 module.exports.pruebasEnJuego = pruebasEnJuego;
 module.exports.esquemaDisponible = esquemaDisponible;
 module.exports.esquemaMedallero = esquemaMedallero;
+module.exports.esquemaGanadores = esquemaGanadores;
 module.exports.sincronizarMedallas = sincronizarMedallas;
 module.exports.esPorCategorias = esPorCategorias;
 module.exports.sincronizarMedallasEdicion = sincronizarMedallasEdicion;
-module.exports.__test = { reiniciarEsquema: () => { esquemaListo = false; ultimoChequeo = 0; medalleroListo = false; ultimoChequeoMedallero = 0; } };
+module.exports.__test = {
+  reiniciarEsquema: () => {
+    esquemaListo = false; ultimoChequeo = 0; medalleroListo = false; ultimoChequeoMedallero = 0; ganadoresListo = false; ultimoChequeoGanadores = 0;
+  },
+};

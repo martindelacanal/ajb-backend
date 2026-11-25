@@ -36,19 +36,37 @@ test('el tiempo se muestra con horas sólo si hacen falta y con decimales sólo 
   assert.equal(P.formatearTiempo(null), null);
 });
 
-test('el peso de pesca llega en kilos o en gramos y se guarda en gramos', () => {
-  assert.equal(P.leerPeso({ peso_kg: '4,350' }), 4350);
-  assert.equal(P.leerPeso({ peso_kg: '3.4' }), 3400);
-  assert.equal(P.leerPeso({ peso_kg: 2 }), 2000);
-  assert.equal(P.leerPeso({ peso_gramos: 6000 }), 6000);
-  assert.equal(P.leerPeso({ peso_kg: '' }), null);
-  assert.equal(P.leerPeso({}), undefined);
-  assert.equal(P.formatearPeso(4350), '4,350 kg');
-  assert.throws(() => P.leerPeso({ peso_kg: 'mucho' }), error => error.statusCode === 400);
-  assert.throws(() => P.leerPeso({ peso_kg: '4,3501' }), error => error.statusCode === 400);
-  assert.throws(() => P.leerPiezas('3,5'), error => error.statusCode === 400);
-  assert.equal(P.leerPiezas('12'), 12);
-  assert.equal(P.leerPiezas(0), 0);
+test('pesca: la marca de un ganador es un texto corto y libre', () => {
+  assert.equal(P.leerMarca('  12   piezas '), '12 piezas');
+  assert.equal(P.leerMarca(15), '15');
+  assert.equal(P.leerMarca(''), null);
+  assert.equal(P.leerMarca(null), null);
+  assert.equal(P.leerMarca(undefined), undefined);
+  assert.equal(P.leerMarca('x'.repeat(60)).length, 60);
+  assert.throws(() => P.leerMarca('x'.repeat(61)), error => error.statusCode === 400);
+  assert.throws(() => P.leerMarca({}), error => error.statusCode === 400);
+});
+
+test('pesca: los ganadores de una categoría llegan como tres lugares y alguno puede quedar sin definir', () => {
+  const id = valor => (Number.isInteger(Number(valor)) && Number(valor) > 0 ? Number(valor) : null);
+  assert.deepEqual(P.leerGanadores([{ participante_id: 7, marca: '4,350 kg' }, null, { participante_id: '9' }], id),
+    [{ puesto: 1, participante_id: 7, marca: '4,350 kg' }, { puesto: 3, participante_id: 9, marca: null }]);
+  assert.deepEqual(P.leerGanadores([], id), []);
+  assert.deepEqual(P.leerGanadores([{ participante_id: null, marca: 'sin dueño' }, 5], id), [{ puesto: 2, participante_id: 5, marca: null }]);
+  assert.throws(() => P.leerGanadores([{ participante_id: 7 }, { participante_id: 7 }], id), error => error.statusCode === 400, 'la misma persona en dos puestos');
+  assert.throws(() => P.leerGanadores([1, 2, 3, 4], id), error => error.statusCode === 400);
+  assert.throws(() => P.leerGanadores('7', id), error => error.statusCode === 400);
+  assert.throws(() => P.leerGanadores([{ participante_id: 'abc' }], id), error => error.statusCode === 400);
+  assert.equal(P.describirGanadores([{ puesto: 2, nombre: 'Beto' }, { puesto: 1, nombre: 'Ana', marca: '12 piezas' }]), '1.º: Ana (12 piezas) · 2.º: Beto');
+});
+
+test('el día y la hora de una disciplina son los que comparten sus categorías', () => {
+  assert.deepEqual(P.horarioComun([]), { fecha: null, hora_inicio: null, mixto: false });
+  assert.deepEqual(P.horarioComun([{ fecha: '2026-11-28', hora_inicio: '10:00:00' }, { fecha: '2026-11-28', hora_inicio: '10:00' }]),
+    { fecha: '2026-11-28', hora_inicio: '10:00', mixto: false });
+  assert.deepEqual(P.horarioComun([{ fecha: null, hora_inicio: null }, { fecha: '2026-11-28', hora_inicio: '10:00' }]),
+    { fecha: '2026-11-28', hora_inicio: '10:00', mixto: true }, 'una categoría sin horario se nota');
+  assert.deepEqual(P.horarioComun([{ fecha: null, hora_inicio: null }]), { fecha: null, hora_inicio: null, mixto: false });
 });
 
 const persona = (id, extra) => ({ id, nombre: `P${id}`, disciplina_id: 1, prueba_id: 10, orden: id, ...extra });
@@ -68,27 +86,6 @@ test('por tiempo: los empates comparten puesto y medalla, y el siguiente puesto 
   const lista = P.clasificarTiempo([persona(1, { tiempo_ms: 100 }), persona(2, { tiempo_ms: 200 }), persona(3, { tiempo_ms: 200 }), persona(4, { tiempo_ms: 300 })]);
   assert.deepEqual(lista.map(p => p.puesto), [1, 2, 2, 4]);
   assert.deepEqual(lista.map(p => p.medalla), ['ORO', 'PLATA', 'PLATA', null]);
-});
-
-test('pesca: una tabla por piezas y otra por peso; el empate en una se define por la otra', () => {
-  const lista = P.clasificarPesca([
-    persona(1, { piezas: 5, peso_gramos: 2100 }), persona(2, { piezas: 5, peso_gramos: 3400 }),
-    persona(3, { piezas: 2, peso_gramos: 6000 }), persona(4, { piezas: 0, peso_gramos: 0 }), persona(5, { piezas: null, peso_gramos: null }),
-  ]);
-  const de = id => lista.find(p => p.id === id);
-  assert.deepEqual([de(2).puesto_piezas, de(1).puesto_piezas, de(3).puesto_piezas, de(4).puesto_piezas, de(5).puesto_piezas], [1, 2, 3, 4, null]);
-  assert.deepEqual([de(3).puesto_peso, de(2).puesto_peso, de(1).puesto_peso], [1, 2, 3]);
-  assert.equal(de(3).medalla_peso, 'ORO');
-  assert.equal(de(2).medalla_piezas, 'ORO');
-  assert.equal(de(4).medalla_piezas, null, 'sin piezas no hay medalla aunque quede entre los tres primeros');
-  assert.equal(de(2).peso, '3,400 kg');
-  assert.deepEqual(lista.map(p => p.id), [2, 1, 3, 4, 5], 'la lista sale ordenada por piezas');
-});
-
-test('pesca: un empate completo comparte el puesto', () => {
-  const lista = P.clasificarPesca([persona(1, { piezas: 3, peso_gramos: 1000 }), persona(2, { piezas: 3, peso_gramos: 1000 }), persona(3, { piezas: 1, peso_gramos: 500 })]);
-  assert.deepEqual(lista.map(p => p.puesto_piezas), [1, 1, 3]);
-  assert.deepEqual(lista.map(p => p.medalla_piezas), ['ORO', 'ORO', 'BRONCE']);
 });
 
 const disciplina = formato => ({ id: 1, nombre: 'X', formato });
@@ -116,6 +113,40 @@ test('póker: las mesas respetan el orden de los asientos y el podio es el elegi
   assert.equal(sinMesas.sin_mesa.length, 5, 'antes de armar las mesas el portal muestra quiénes juegan');
 });
 
+test('pesca: un solo listado de participantes para todas las categorías y ganadores elegidos a mano', () => {
+  const pruebas = [
+    { id: 10, disciplina_id: 1, nombre: 'Mayor peso total', estado: 'FINALIZADA', orden: 2, suma_medallero: 'PESO' },
+    { id: 11, disciplina_id: 1, nombre: 'Mayor cantidad de piezas', estado: 'FINALIZADA', orden: 1 },
+  ];
+  // El tercero quedó cargado dentro de una categoría (antes de la migración): es igual un participante de la disciplina
+  const pescadores = [
+    persona(1, { prueba_id: null, departamental_id: 5, departamental_nombre: 'Azul' }), persona(2, { prueba_id: null, piezas: 4 }), persona(3, { orden: 0 }),
+  ];
+  const ganadores = [
+    { id: 1, prueba_id: 10, participante_id: 2, puesto: 1, marca: '15 kg' }, { id: 2, prueba_id: 10, participante_id: 1, puesto: 3, marca: null },
+    { id: 3, prueba_id: 11, participante_id: 2, puesto: 1, marca: '12 piezas' }, { id: 4, prueba_id: 11, participante_id: 99, puesto: 2, marca: null },
+    { id: 5, prueba_id: 77, participante_id: 1, puesto: 1, marca: null },
+  ];
+  const d = P.armarDisciplina(disciplina('PESCA'), pruebas, pescadores, { gestion: true, ganadores });
+  assert.equal(d.grupo, 'categoría');
+  assert.equal(d.participantes, 3);
+  assert.deepEqual(d.competidores.map(p => [p.id, p.prueba_id]), [[3, null], [1, null], [2, null]]);
+  assert.deepEqual(d.pruebas.map(p => p.nombre), ['Mayor cantidad de piezas', 'Mayor peso total']);
+  assert.deepEqual(d.pruebas[1].ganadores.map(g => [g.puesto, g.medalla, g.participante_id, g.marca]), [[1, 'ORO', 2, '15 kg'], [3, 'BRONCE', 1, null]]);
+  assert.equal(d.pruebas[1].ganadores[1].departamental_nombre, 'Azul');
+  assert.deepEqual(d.pruebas[0].ganadores.map(g => g.participante_id), [2], 'un ganador que ya no figura entre los participantes no se muestra');
+  assert.equal(d.pruebas[1].con_resultado, 2);
+  assert.deepEqual(d.pruebas[1].participantes, [], 'las personas son de la disciplina, no de la categoría');
+  assert.equal(d.pruebas[1].suma_medallero, 'TODO', 'lo que quedó de las dos tablas cuenta como «suma»');
+  assert.equal(d.podio, undefined);
+
+  const publico = P.armarDisciplina(disciplina('PESCA'), pruebas, pescadores, { ganadores });
+  assert.equal('inscripcion_id' in publico.competidores[0], false);
+  assert.equal('piezas' in publico.competidores[2], false, 'ya no se publican piezas ni peso por persona');
+  assert.equal('suma_medallero' in publico.pruebas[0], false);
+  assert.deepEqual(P.armarDisciplina(disciplina('PESCA'), pruebas, pescadores).pruebas.map(p => p.ganadores), [[], []], 'sin la tabla de ganadores, las categorías salen vacías');
+});
+
 test('una disciplina por tiempo arma sus categorías sin mezclar participantes ni campos de otros formatos', () => {
   const pruebas = [{ id: 10, disciplina_id: 1, nombre: 'Damas', estado: 'FINALIZADA', orden: 2 }, { id: 11, disciplina_id: 1, nombre: 'Caballeros', estado: 'PROGRAMADA', orden: 1 }, { id: 12, disciplina_id: 2, nombre: 'Otra', estado: 'PROGRAMADA', orden: 1 }];
   const participantes = [persona(1, { tiempo_ms: 2000, piezas: 9 }), persona(2, { tiempo_ms: 1000 }), persona(3, { prueba_id: 11 }), { ...persona(4, { prueba_id: 12 }), disciplina_id: 2 }];
@@ -127,6 +158,8 @@ test('una disciplina por tiempo arma sus categorías sin mezclar participantes n
   assert.equal('piezas' in d.pruebas[1].participantes[0], false);
   assert.equal(d.participantes, 3);
   assert.equal(d.podio, undefined);
+  assert.equal(d.competidores, undefined);
+  assert.equal(d.pruebas[0].ganadores, undefined);
   assert.equal(d.grupo, 'categoría');
 });
 
@@ -154,6 +187,8 @@ test('la migración crea lo nuevo una sola vez y asigna el formato sólo al crea
         sentencias.push(sql);
         if (/information_schema/.test(sql)) return [(typeof existe === 'function' ? existe(sql, params) : existe) ? [{}] : []];
         if (/^SELECT id, nombre FROM olimpiada_disciplina/.test(sql)) return [[{ id: 1, nombre: 'Maratón' }, { id: 2, nombre: 'Poker' }, { id: 3, nombre: 'Truco' }]];
+        if (/FROM olimpiada_prueba_participante p INNER JOIN olimpiada_disciplina/.test(sql)) return [[]];
+        if (/COUNT\(\*\) AS cantidad FROM olimpiada_medalla/.test(sql)) return [[{ cantidad: 0 }]];
         if (/SELECT DATABASE\(\)/.test(sql)) return [[{ nombre: 'db' }]];
         if (/FROM mysql\.user/.test(sql)) return [[{ User: 'miajb_runtime', Host: '%' }]];
         return [{ affectedRows: 1 }, params];
@@ -162,18 +197,19 @@ test('la migración crea lo nuevo una sola vez y asigna el formato sólo al crea
   };
   const vacia = crear(false);
   const primera = await migrar(vacia, true);
-  // 2 tablas + el formato de la disciplina + 4 columnas del medallero + su clave única
+  // 3 tablas + el formato de la disciplina + 4 columnas del medallero + su clave única
   // («suma_medallero» ya viene en la tabla nueva de categorías)
-  assert.equal(primera.pendientes.length, 8);
+  assert.equal(primera.pendientes.length, 9);
+  assert.equal(vacia.sentencias.filter(s => /CREATE TABLE IF NOT EXISTS olimpiada_prueba_ganador/.test(s)).length, 1);
   assert.equal(vacia.sentencias.some(s => /ALTER TABLE `olimpiada_prueba` ADD COLUMN/.test(s)), false);
   assert.equal(vacia.sentencias.filter(s => /ADD UNIQUE KEY `uq_oli_medalla_origen`/.test(s)).length, 1);
   assert.equal(vacia.sentencias.filter(s => /^UPDATE olimpiada_disciplina SET formato_competencia/.test(s)).length, 2, 'maratón y póker; el truco queda por partidos');
-  assert.equal(vacia.sentencias.filter(s => /^GRANT/.test(s)).length, 2);
+  assert.equal(vacia.sentencias.filter(s => /^GRANT/.test(s)).length, 3);
 
   const lista = crear(true);
   const segunda = await migrar(lista, true);
   assert.deepEqual(segunda.pendientes, []);
-  assert.equal(lista.sentencias.some(s => /ALTER TABLE|CREATE TABLE|UPDATE olimpiada_disciplina/.test(s)), false, 'no vuelve a tocar lo que la administración haya ajustado');
+  assert.equal(lista.sentencias.some(s => /ALTER TABLE|CREATE TABLE|^\s*(UPDATE|DELETE) /.test(s)), false, 'no vuelve a tocar lo que la administración haya ajustado');
 
   // Una base que ya tenía la primera tanda (tablas y formato): sólo se agrega lo del medallero
   const primeraTanda = crear((sql, params) => {
@@ -190,6 +226,58 @@ test('la migración crea lo nuevo una sola vez y asigna el formato sólo al crea
   const consulta = crear(false);
   await migrar(consulta, false);
   assert.equal(consulta.sentencias.some(s => /ALTER TABLE|CREATE TABLE|UPDATE|GRANT/.test(s)), false, 'el modo consulta no cambia nada');
+});
+
+test('la migración pasa a los participantes de pesca al listado de la disciplina y quita los repetidos', async () => {
+  const { migrar, planParticipantesPesca } = require('../scripts/migrar-olimpiadas-pruebas');
+  const fila = (id, pruebaId, nombre, departamentalId, inscripcionId = null) =>
+    ({ id, olimpiada_id: 2, disciplina_id: 29, prueba_id: pruebaId, nombre, departamental_id: departamentalId, inscripcion_id: inscripcionId });
+  // Ana quedó cargada en dos categorías (con otro acento) y Beto, con la misma inscripción y otro nombre
+  const filas = [fila(1, 2, 'Ana Ruiz', 5), fila(2, 2, 'Beto Paz', 6, 40), fila(3, 3, 'ana ruíz', 5), fila(4, 3, 'Roberto Paz', 6, 40), fila(5, 3, 'Carla Sol', null)];
+  assert.deepEqual(planParticipantesPesca(filas), { mover: [{ id: 1, orden: 1 }, { id: 2, orden: 2 }, { id: 5, orden: 3 }], repetidos: [3, 4] });
+  assert.deepEqual(planParticipantesPesca([fila(1, null, 'Ana Ruiz', 5), fila(2, null, 'Ana Ruiz', 5)]), { mover: [], repetidos: [] },
+    'una disciplina que ya tiene a todos en su listado no se toca');
+  assert.deepEqual(planParticipantesPesca([fila(9, null, 'Ana Ruiz', 5), fila(1, 2, 'Ana Ruiz', 5), { ...fila(7, 4, 'Ana Ruiz', 5), disciplina_id: 30 }]),
+    { mover: [{ id: 9, orden: 1 }, { id: 7, orden: 1 }], repetidos: [1] }, 'quien ya estaba en el listado manda; cada disciplina por separado');
+
+  const crear = () => {
+    const sentencias = [];
+    return {
+      sentencias,
+      beginTransaction: async () => { sentencias.push('BEGIN'); },
+      commit: async () => { sentencias.push('COMMIT'); },
+      rollback: async () => { sentencias.push('ROLLBACK'); },
+      query: async (sql, params = []) => {
+        sentencias.push(sql);
+        if (/information_schema/.test(sql)) return [[{}]];
+        if (/FROM olimpiada_prueba_participante p INNER JOIN olimpiada_disciplina/.test(sql)) return [filas];
+        if (/COUNT\(\*\) AS cantidad FROM olimpiada_medalla/.test(sql)) return [[{ cantidad: 2 }]];
+        if (/SELECT DATABASE\(\)/.test(sql)) return [[{ nombre: 'db' }]];
+        if (/FROM mysql\.user/.test(sql)) return [[]];
+        return [{ affectedRows: 1 }, params];
+      },
+    };
+  };
+  const consulta = crear();
+  const informe = await migrar(consulta, false);
+  assert.deepEqual(informe.pendientes, [
+    'Pesca: pasar 3 participante(s) al listado de la disciplina y quitar 2 repetido(s)',
+    'Pesca: quitar 2 medalla(s) automáticas de las tablas de piezas y peso',
+  ]);
+  assert.equal(consulta.sentencias.some(s => /^(UPDATE|DELETE|BEGIN)/.test(s)), false, 'el modo consulta no cambia nada');
+
+  const aplicada = crear();
+  await migrar(aplicada, true);
+  const cambios = aplicada.sentencias.filter(s => /^(UPDATE|DELETE|BEGIN|COMMIT)/.test(s.trim())).map(s => s.trim().split('\n')[0]);
+  assert.deepEqual(cambios, [
+    'BEGIN',
+    'UPDATE olimpiada_prueba_participante SET eliminado = 1 WHERE id IN (?)',
+    'UPDATE olimpiada_prueba_participante SET prueba_id = NULL, orden = ? WHERE id = ?',
+    'UPDATE olimpiada_prueba_participante SET prueba_id = NULL, orden = ? WHERE id = ?',
+    'UPDATE olimpiada_prueba_participante SET prueba_id = NULL, orden = ? WHERE id = ?',
+    'COMMIT',
+    'DELETE m FROM olimpiada_medalla m INNER JOIN olimpiada_disciplina d ON d.id = m.disciplina_id',
+  ]);
 });
 
 // ---------------------------------------------------------------------------
@@ -223,18 +311,21 @@ test('medallero por tiempo: un empate reparte dos medallas iguales y quien no ti
   assert.deepEqual(conCinco.map(m => [m.puesto, m.participante_id]), [[1, 1], [1, 2], [4, 4]], 'si la edición puntúa más puestos, también suman');
 });
 
-test('medallero: una categoría puede no sumar, y en pesca sumar una sola de sus dos tablas', () => {
-  const corredores = [de(1, 5, { tiempo_ms: 100 })];
-  assert.equal(P.medallasDeDisciplina('TIEMPO', [categoria(10, 'Promocional', 'NADA')], corredores).length, 0);
-
-  const pescadores = [de(1, 5, { piezas: 5, peso_gramos: 2100 }), de(2, 6, { piezas: 2, peso_gramos: 6000 }), de(3, 7, { piezas: 0, peso_gramos: 0 })];
-  const ambas = P.medallasDeDisciplina('PESCA', [categoria(10, 'Costa')], pescadores);
-  assert.deepEqual(ambas.map(m => [m.puesto, m.departamental_id, m.criterio, m.clave_origen]),
-    [[1, 5, 'PIEZAS', 'P1:PIEZAS'], [1, 6, 'PESO', 'P2:PESO'], [2, 5, 'PESO', 'P1:PESO'], [2, 6, 'PIEZAS', 'P2:PIEZAS']], 'quien no sacó nada no lleva medalla');
-  assert.equal(ambas.find(m => m.clave_origen === 'P2:PESO').detalle, 'Costa · peso · P2');
-  assert.deepEqual(P.medallasDeDisciplina('PESCA', [categoria(10, 'Costa', 'PESO')], pescadores).map(m => m.criterio), ['PESO', 'PESO']);
-  assert.deepEqual(P.medallasDeDisciplina('PESCA', [categoria(10, 'Costa', 'PIEZAS')], pescadores).map(m => m.criterio), ['PIEZAS', 'PIEZAS']);
-  assert.equal(P.medallasDeDisciplina('PESCA', [categoria(10, 'Costa', 'NADA')], pescadores).length, 0);
+test('medallero de pesca: cada categoría suma a sus ganadores, y la misma persona puede ganar dos', () => {
+  const pruebas = [categoria(10, 'Mayor peso total'), categoria(11, 'Mayor cantidad de piezas'), categoria(12, 'Pieza de mayor peso', 'NADA')];
+  const pescadores = [de(1, 5, { prueba_id: null }), de(2, 6, { prueba_id: null }), de(3, null, { prueba_id: null })];
+  const ganadores = [
+    { id: 1, prueba_id: 10, participante_id: 1, puesto: 1 }, { id: 2, prueba_id: 10, participante_id: 2, puesto: 2 }, { id: 3, prueba_id: 10, participante_id: 3, puesto: 3 },
+    { id: 4, prueba_id: 11, participante_id: 1, puesto: 1 }, { id: 5, prueba_id: 12, participante_id: 2, puesto: 1 },
+  ];
+  const medallas = P.medallasDeDisciplina('PESCA', pruebas, pescadores, { ganadores });
+  assert.deepEqual(medallas.map(m => [m.puesto, m.departamental_id, m.prueba_id, m.participante_id, m.criterio, m.clave_origen]),
+    [[1, 5, 10, 1, null, 'P1:C10'], [1, 5, 11, 1, null, 'P1:C11'], [2, 6, 10, 2, null, 'P2:C10']],
+    'no suman quien no tiene departamental ni la categoría marcada para no sumar');
+  assert.equal(medallas[0].detalle, 'Mayor peso total · P1');
+  assert.equal(new Set(medallas.map(m => `${m.puesto}:${m.departamental_id}:${m.clave_origen}`)).size, medallas.length, 'dos oros de la misma persona no chocan');
+  assert.equal(P.medallasDeDisciplina('PESCA', pruebas, pescadores).length, 0, 'sin ganadores elegidos no hay medallas');
+  assert.equal(P.medallasDeDisciplina('TIEMPO', [categoria(10, 'Promocional', 'NADA')], [de(1, 5, { tiempo_ms: 100 })]).length, 0);
 });
 
 test('medallero de póker: los tres ganadores elegidos a mano, estén o no sentados en una mesa', () => {
@@ -245,13 +336,16 @@ test('medallero de póker: los tres ganadores elegidos a mano, estén o no senta
   assert.equal(medallas[0].detalle, 'P3');
 });
 
-test('qué suma al medallero se valida según la disciplina', () => {
-  assert.equal(P.leerSumaMedallero('nada', 'TIEMPO'), 'NADA');
-  assert.equal(P.leerSumaMedallero('PESO', 'PESCA'), 'PESO');
-  assert.equal(P.leerSumaMedallero(undefined, 'TIEMPO'), undefined);
-  assert.equal(P.leerSumaMedallero('', 'PESCA'), undefined);
-  assert.throws(() => P.leerSumaMedallero('PESO', 'TIEMPO'), error => error.statusCode === 400, 'piezas y peso son sólo de pesca');
-  assert.throws(() => P.leerSumaMedallero('ALGO', 'PESCA'), error => error.statusCode === 400);
+test('qué suma al medallero: todo o nada', () => {
+  assert.equal(P.leerSumaMedallero('nada'), 'NADA');
+  assert.equal(P.leerSumaMedallero('TODO'), 'TODO');
+  assert.equal(P.leerSumaMedallero(undefined), undefined);
+  assert.equal(P.leerSumaMedallero(''), undefined);
+  assert.throws(() => P.leerSumaMedallero('PESO'), error => error.statusCode === 400, 'las dos tablas de pesca ya no existen');
+  assert.throws(() => P.leerSumaMedallero('ALGO'), error => error.statusCode === 400);
+  assert.equal(P.sumaMedallero({ suma_medallero: 'PIEZAS' }), 'TODO');
+  assert.equal(P.sumaMedallero({ suma_medallero: 'NADA' }), 'NADA');
+  assert.equal(P.sumaMedallero({}), 'TODO');
 });
 
 test('un ajuste de puntos hecho a mano queda en el lugar aunque cambie quién lo ocupa', () => {
