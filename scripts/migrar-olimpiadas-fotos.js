@@ -7,10 +7,10 @@ const { parsearArgumentos, obtenerEntornos, crearOpcionesConexion } = require('.
 const { leerEtiquetas } = require('../api/services/olimpiadas-fotos');
 
 async function migrar(db, aplicar) {
-  const [columnas] = await db.query("SHOW COLUMNS FROM olimpiada_foto WHERE Field IN ('etiquetas','partido_id','carga_id')");
+  const [columnas] = await db.query("SHOW COLUMNS FROM olimpiada_foto WHERE Field IN ('etiquetas','partido_id','carga_id','departamentales')");
   const tipos = new Map(columnas.map(c => [c.Field, c.Type]));
   const cambios = [];
-  for (const [campo, tipo] of [['etiquetas', 'json'], ['partido_id', 'int'], ['carga_id', 'char(36)']]) {
+  for (const [campo, tipo] of [['etiquetas', 'json'], ['partido_id', 'int'], ['carga_id', 'char(36)'], ['departamentales', 'json']]) {
     if (!tipos.has(campo)) cambios.push(`ADD COLUMN ${campo} ${tipo} NULL`);
     else if (tipos.get(campo) !== tipo) throw new Error(`Tipo inesperado en olimpiada_foto.${campo}`);
   }

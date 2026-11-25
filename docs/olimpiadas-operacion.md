@@ -173,7 +173,11 @@ Todas las rutas siguientes están bajo `/api`.
 | Vinculación de cuentas existentes | `GET /olimpiadas/:id/usuarios-disponibles?q=`, `POST /olimpiadas/:id/voluntarios/vincular` |
 | Gafetes autorizados | `GET /olimpiadas/inscripciones/:id/gafete.pdf`, `GET /olimpiadas/:id/gafetes.pdf` |
 
-Los listados de competición admiten `disciplina_id`; fixture y posiciones admiten `torneo_id`, y fixture también `lugar_id`. Los listados públicos de fotos admiten `page`, `pageSize` (máximo 60), `disciplina_id`, `fecha` y `etiqueta`. Los campos publicados se proyectan explícitamente, sin exponer las filas completas de inscripción.
+Los listados de competición admiten `disciplina_id`; fixture y posiciones admiten `torneo_id`, y fixture también `lugar_id`. Los listados de fotos (el público y el de gestión) admiten `page`, `pageSize` (máximo 60) y cinco filtros, cada uno con una o varias opciones separadas por comas: `disciplinas`, `partidos`, `fechas`, `etiquetas` y `departamentales` (también en su forma de una sola opción: `disciplina_id`, `partido_id`, `fecha`, `etiqueta`, `departamental_id`). Dentro de un filtro alcanza con coincidir con una opción; entre filtros se cumplen todos. La respuesta trae en `filtros` las opciones que tienen fotos, con su cantidad.
+
+Cada foto puede llevar varias departamentales (`olimpiada_foto.departamentales`, una lista JSON de ids), además de su disciplina, su partido, su día y sus etiquetas. Se cargan al subir (`departamentales` en el formulario, como lista JSON) y se corrigen de a una o en lote; el contexto de la galería (`GET /olimpiadas/:id/fotos/contexto`) devuelve las departamentales habilitadas para elegir. La columna la agrega `scripts/migrar-olimpiadas-fotos.js` (confirmación `OLIMPIADAS_FOTOS`).
+
+Prensa gestiona las fotos y los videos de las ediciones que tiene asignadas: los sube, los corrige y también los elimina (`DELETE /olimpiadas/fotos/:id`, `POST /olimpiadas/fotos/eliminar-lote`, `DELETE /olimpiadas/videos/:id`). Cada baja queda en el historial con la cuenta que la hizo. Una subida de video en curso sólo la puede cancelar quien la empezó. Los campos publicados se proyectan explícitamente, sin exponer las filas completas de inscripción.
 
 ## Migración e importación
 

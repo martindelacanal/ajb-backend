@@ -213,7 +213,9 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
     const video = await enTransaccion(async (connection) => {
       const fila = await exigirVideo(idDeRuta(req.params.videoId), { conexion: connection });
       if (req.query.cancelar === '1' && fila.estado !== 'SUBIENDO') throw crearErrorHttp('El video ya terminó de subirse', 409);
-      if (cabecera.rol === 'prensa' && (fila.estado !== 'SUBIENDO' || Number(fila.usuario_id) !== Number(cabecera.id))) {
+      // Prensa elimina los videos de sus ediciones. Una subida en curso sólo la corta quien la empezó
+      // (verifyTokenMultimedia ya lo exige; la regla queda escrita también acá).
+      if (cabecera.rol === 'prensa' && fila.estado === 'SUBIENDO' && Number(fila.usuario_id) !== Number(cabecera.id)) {
         throw crearErrorHttp('Sólo podés cancelar tus propias subidas en curso', 403);
       }
       await connection.query('UPDATE olimpiada_video SET eliminado = 1, subida_id = NULL, partes = NULL WHERE id = ?', [fila.id]);
