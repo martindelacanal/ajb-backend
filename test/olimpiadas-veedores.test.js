@@ -296,6 +296,38 @@ test("medallero: la final define oro y plata, y el tercer puesto bronce y cuarto
   assert.equal(puestosSegunResultados([partidos[1], { ...partidos[1], id: 8 }]), null);
 });
 
+test("medallero: resuelve el tercer puesto aunque falte la final y reconoce los rótulos del cuadro", () => {
+  const tercero = { torneo_id: 8, etiqueta: "3º y 4º puesto", fase: "Finales", estado: "FINALIZADO", ganador: 2, departamental1_id: 4, departamental2_id: 8,
+    origen1_tipo: "PERDEDOR", origen2_tipo: "PERDEDOR", partido_origen1_id: 90, partido_origen2_id: 94 };
+  const final = { ...tercero, etiqueta: "D", fase: "Eliminación", instancia_nombre: "Gran final" };
+  const puestos = partidos => puestosSegunResultados(partidos)?.map(p => [p.puesto, p.competidor.departamental_id]);
+  assert.deepEqual(puestos([tercero]), [[3, 8], [4, 4]]);
+  assert.deepEqual(puestos([tercero, final]), [[1, 8], [2, 4], [3, 8], [4, 4]]);
+  const semi = { ...tercero, id: 90, etiqueta: "A", fase: "Semifinal", instancia_nombre: "Semifinal" };
+  const otra = { ...semi, id: 94, etiqueta: "B", departamental1_id: 10 };
+  const compartido = [[1, 8], [2, 8], [3, 8], [4, 4]];
+  assert.deepEqual(puestos([tercero, semi, otra]), compartido);
+  for (const cambio of [{ ganador: 1 }, { estado: "EN_JUEGO" }, { torneo_id: 5 }, { instancia_nombre: null }]) {
+    assert.deepEqual(puestos([tercero, semi, { ...otra, ...cambio }]), [[3, 8], [4, 4]]);
+  }
+  for (const cambio of [{ origen2_tipo: "GANADOR" }, { partido_origen1_id: 94 }, { partido_origen2_id: null }]) {
+    assert.deepEqual(puestos([{ ...tercero, ...cambio }, semi, otra]), [[3, 8], [4, 4]]);
+  }
+  assert.deepEqual(puestos([tercero, semi, otra, { ...final, estado: "PROGRAMADO" }]), [[3, 8], [4, 4]]);
+});
+
+test("medallero: una fecha o fase genérica nunca se toma como la definición de una medalla", () => {
+  const partido = { estado: "FINALIZADO", ganador: 1, departamental1_id: 4, departamental2_id: 8 };
+  for (const rotulos of [
+    { instancia_nombre: "Fase final", etiqueta: "A" }, { fase: "Clasificación final", etiqueta: "Tercera fecha" },
+    { instancia_nombre: "Tercera fecha" }, { etiqueta: "Tercer partido" }, { fase: "Final", instancia_nombre: "Cuartos de final" },
+    { fase: "Fase final", etiqueta: "Semifinal" }, { fase: "Tercero" },
+  ]) assert.equal(puestosSegunResultados([{ ...partido, ...rotulos }]), null);
+  for (const etiqueta of ["3.º y 4.º puesto", "3º y 4º", "3er puesto", "Tercer y cuarto puesto", "Por el bronce"]) {
+    assert.deepEqual(puestosSegunResultados([{ ...partido, fase: "Fase final", etiqueta }]).map(p => p.puesto), [3, 4]);
+  }
+});
+
 test("medallero: el sistema de puntos admite entre 3 y 10 puestos, en orden", () => {
   const olimpiada = { puntos_oro: 10, puntos_plata: 5, puntos_bronce: 4 };
   assert.deepEqual(leerPuestosPuntos({ puestos: [1, 2, 3, 4, 5].map(puesto => ({ puesto, puntos: 12 - puesto * 2 })) }, olimpiada).map(p => p.puntos), [10, 8, 6, 4, 2]);

@@ -21,7 +21,7 @@ const { FORMATOS: FORMATOS_COMPETENCIA } = require("../services/olimpiadas-prueb
 const { verificarAccesoCompeticion, exigirDisciplinaVoluntario, exigirEdicionVoluntario, esVoluntario, puedeEditarEdicion } = require('../security/olimpiadas-voluntarios');
 const {
   CAMPOS_PARTIDO_EXTRA, TIPOS_ORIGEN, TIPOS_MARCADOR, REGLAS_DIVISION, MAX_PUESTOS, calcularPosiciones, listarTorneos, listarEquipos, filtroId,
-  normalizarSets, contarSets, leerParciales, normalizarCuartos, tipoMarcadorDisciplina, conEnVivo, normalizarNombre, resolverClasificacion, hayCiclo,
+  normalizarSets, contarSets, leerParciales, normalizarCuartos, tipoMarcadorDisciplina, permitePenales, conEnVivo, normalizarNombre, resolverClasificacion, hayCiclo,
   nombrePuesto, calcularTablaMedallero, agruparMedallasPorDisciplina, puestosSegunResultados,
 } = require('../services/olimpiadas-competicion');
 const {
@@ -1700,6 +1700,7 @@ async function listarDisciplinasFixture(conexion, olimpiadaId) {
   );
   // Cómo se compite en cada una (partidos, categorías por tiempo, pesca o mesas) y cuántas categorías tiene
   const porCategorias = await pruebasLectura.resumenDisciplinas(conexion, olimpiadaId);
+  const podios = await leerPodiosFixture(conexion, olimpiadaId, rows, porCategorias);
   return Promise.all(
     rows.map(async (fila) => ({
       id: fila.id,
@@ -1720,6 +1721,7 @@ async function listarDisciplinasFixture(conexion, olimpiadaId) {
       // Quiénes están a cargo: las personas asignadas como veedoras de la disciplina en esta edición.
       veedores: veedores.filter((v) => Number(v.disciplina_id) === Number(fila.id) && v.nombre).map((v) => v.nombre),
       reglamento: fila.reglamento,
+      podio: podios.get(Number(fila.id)) || [],
       reglamento_url: await firmarSeguro(fila.reglamento_archivo),
       reglamento_archivo_nombre: fila.reglamento_archivo ? fila.reglamento_archivo_nombre || "Reglamento.pdf" : null,
       partidos: Number(fila.partidos) || 0,
@@ -1962,10 +1964,27 @@ function leerOrigen(body, base, lado) {
   return { tipo, partidoOrigen, zona, posicion };
 }
 
+function leerTandaPenales(pedida, anterior, resultado1, resultado2, estado) {
+  const empate = [resultado1, resultado2].every(goles => /^\d+$/.test(goles) && Number.isSafeInteger(Number(goles)))
+    && Number(resultado1) === Number(resultado2);
+  if (pedida != null && !empate) throw crearErrorHttp("Para cargar penales, el resultado del partido debe estar empatado en goles");
+  if (pedida != null && !["EN_JUEGO", "FINALIZADO"].includes(estado)) throw crearErrorHttp("Cargá los penales con el partido en juego o finalizado");
+
+  // Una corrección que deshace el empate también retira el desempate anterior.
+  const penales = pedida === undefined ? anterior : pedida;
+  if (!empate || penales == null) return null;
+  if (!Array.isArray(penales) || penales.length !== 2 || !penales.every(n => Number.isInteger(n) && n >= 0 && n <= 999)) {
+    throw crearErrorHttp("La tanda de penales lleva dos números enteros entre 0 y 999");
+  }
+  if (estado === "FINALIZADO" && penales[0] === penales[1]) throw crearErrorHttp("La tanda de penales debe tener un ganador al finalizar");
+  return JSON.stringify({ penales });
+}
+
 function leerMarcadorPartido(body, base, estado) {
   const reinicio = estado === "PROGRAMADO" && body.resultado1 === null && body.resultado2 === null;
   const guardados = leerParciales(base.sets);
   const cuartos = body.cuartos === undefined ? guardados?.cuartos : body.cuartos;
+  if (body.penales != null && (cuartos != null || body.sets != null)) throw crearErrorHttp("No se pueden combinar penales con sets o cuartos");
   if (cuartos != null && !reinicio) {
     if (body.sets != null) throw crearErrorHttp("No se pueden combinar sets y cuartos");
     const parciales = normalizarCuartos(cuartos, estado);
@@ -1983,24 +2002,40 @@ function leerMarcadorPartido(body, base, estado) {
     return { resultado1, resultado2, sets: JSON.stringify(sets) };
   }
   const borrarCuartos = body.cuartos === null && !!guardados?.cuartos;
-  return {
-    resultado1: borrarCuartos ? null : leerTexto(body, "resultado1", base, { maximo: 20, etiqueta: "el resultado 1" }),
-    resultado2: borrarCuartos ? null : leerTexto(body, "resultado2", base, { maximo: 20, etiqueta: "el resultado 2" }),
-    sets: reinicio || borrarCuartos || sets === null ? null : base.sets ?? null,
-  };
+  const resultado1 = borrarCuartos ? null : leerTexto(body, "resultado1", base, { maximo: 20, etiqueta: "el resultado 1" });
+  const resultado2 = borrarCuartos ? null : leerTexto(body, "resultado2", base, { maximo: 20, etiqueta: "el resultado 2" });
+  if (body.penales != null || guardados?.penales) {
+    return { resultado1, resultado2, sets: leerTandaPenales(body.penales, guardados?.penales, resultado1, resultado2, estado) };
+  }
+  return { resultado1, resultado2, sets: reinicio || borrarCuartos || sets === null ? null : base.sets ?? null };
 }
 
-function validarModoCuartos(marcador, disciplina) {
-  if (leerParciales(marcador.sets)?.cuartos && tipoMarcadorDisciplina(disciplina.nombre, disciplina.tipo_marcador) !== "CUARTOS") {
+function validarParcialesDisciplina(marcador, disciplina) {
+  const parciales = leerParciales(marcador.sets);
+  if (parciales?.cuartos && tipoMarcadorDisciplina(disciplina.nombre, disciplina.tipo_marcador) !== "CUARTOS") {
     throw crearErrorHttp("Esta disciplina no usa un marcador por cuartos");
   }
+  if (parciales?.penales && !permitePenales(disciplina.nombre, disciplina.tipo_marcador)) throw crearErrorHttp("Los penales corresponden a partidos de fútbol con marcador por tantos");
+}
+
+function partidoParaHistorial(partido) {
+  const parciales = leerParciales(partido.sets);
+  return { ...partido, sets: Array.isArray(parciales) ? JSON.stringify(parciales) : null,
+    cuartos: parciales?.cuartos ? JSON.stringify(parciales.cuartos) : null,
+    penales: parciales?.penales ? JSON.stringify(parciales.penales) : null };
 }
 
 function ganadorDelMarcador(body, base, marcador, estado) {
   const elegido = leerGanador(body.ganador);
   if (estado !== "FINALIZADO") return null;
+  const penales = leerParciales(marcador.sets)?.penales;
+  if (penales) {
+    const ganador = penales[0] > penales[1] ? 1 : 2;
+    if (elegido != null && elegido !== ganador) throw crearErrorHttp("El ganador debe coincidir con la tanda de penales");
+    return ganador;
+  }
   if (elegido != null) return elegido;
-  const editaPuntajes = ["resultado1", "resultado2", "sets", "cuartos"].some(campo => body[campo] !== undefined);
+  const editaPuntajes = ["resultado1", "resultado2", "sets", "cuartos", "penales"].some(campo => body[campo] !== undefined);
   if (elegido === undefined && !editaPuntajes && base.estado === "FINALIZADO" && base.ganador != null) return base.ganador;
   return calcularGanadorPartido(marcador.resultado1, marcador.resultado2);
 }
@@ -2053,7 +2088,7 @@ function leerPartido(body, base, { completo = false } = {}) {
 
 async function validarReferenciasPartido(conexion, olimpiadaId, datos, anterior = {}) {
   const disciplina = await validarDisciplinaDeOlimpiada(conexion, olimpiadaId, datos.disciplina_id);
-  if (Number(datos.disciplina_id) !== Number(anterior.disciplina_id) || datos.sets !== anterior.sets) validarModoCuartos(datos, disciplina);
+  if (Number(datos.disciplina_id) !== Number(anterior.disciplina_id) || datos.sets !== anterior.sets) validarParcialesDisciplina(datos, disciplina);
   await validarSedeDeOlimpiada(conexion, olimpiadaId, datos.sede_id);
   if (datos.torneo_id) {
     const [[torneo]] = await conexion.query('SELECT id FROM olimpiada_torneo WHERE id = ? AND olimpiada_id = ? AND disciplina_id = ? AND eliminado = 0', [datos.torneo_id, olimpiadaId, datos.disciplina_id]);
@@ -2181,7 +2216,7 @@ function describirPartido(partido) {
 // Clasificación automática y medallas que salen de los resultados
 // ---------------------------------------------------------------------------
 const SELECT_PARTIDO_CLASIFICACION = `
-  SELECT p.id, p.torneo_id, p.zona, p.etiqueta, p.fase, inst.nombre AS instancia_nombre, p.estado, p.ganador, p.resultado1, p.resultado2,
+  SELECT p.id, p.disciplina_id, p.torneo_id, p.zona, p.etiqueta, p.fase, inst.nombre AS instancia_nombre, p.estado, p.ganador, p.resultado1, p.resultado2,
          p.participante1, p.participante2, p.departamental1_id, p.departamental2_id, p.inscripcion1_id, p.inscripcion2_id,
          p.equipo1_id, p.equipo2_id, eq1.nombre AS equipo1_nombre, eq2.nombre AS equipo2_nombre,
          dep1.nombre AS departamental1_nombre, dep2.nombre AS departamental2_nombre,
@@ -2193,7 +2228,7 @@ const SELECT_PARTIDO_CLASIFICACION = `
   LEFT JOIN olimpiada_equipo eq2 ON eq2.id = p.equipo2_id
   LEFT JOIN departamental dep1 ON dep1.id = p.departamental1_id
   LEFT JOIN departamental dep2 ON dep2.id = p.departamental2_id
-  WHERE p.olimpiada_id = ? AND p.disciplina_id = ? AND p.eliminado = 0
+  WHERE p.olimpiada_id = ? AND p.disciplina_id IN (?) AND p.eliminado = 0
   ORDER BY p.id`;
 
 // Completa (o vuelve a dejar por definir) los cruces que dependen de otros resultados.
@@ -2234,6 +2269,24 @@ function describirMedallas(filas) {
   }).join(" · ");
 }
 
+// Una fila por departamental: los equipos interdepartamentales comparten el puesto.
+async function filasDePuestos(conexion, puestos) {
+  const ids = [...new Set(puestos.map(p => p.competidor.departamental_id).filter(Boolean))];
+  const equipos = [...new Set(puestos.map(p => p.competidor.equipo_id).filter(Boolean))];
+  const [[departamentales], [miembros]] = await Promise.all([
+    ids.length ? conexion.query("SELECT id, nombre FROM departamental WHERE id IN (?)", [ids]) : [[]],
+    equipos.length ? conexion.query(`SELECT e.id AS equipo_id, e.nombre AS equipo_nombre, dep.id, dep.nombre
+      FROM olimpiada_equipo e JOIN olimpiada_equipo_departamental ed ON ed.equipo_id = e.id
+      JOIN departamental dep ON dep.id = ed.departamental_id WHERE e.id IN (?) ORDER BY dep.nombre`, [equipos]) : [[]],
+  ]);
+  return puestos.flatMap(({ disciplina_id, puesto, competidor }) => {
+    const filas = competidor.equipo_id ? miembros.filter(m => Number(m.equipo_id) === competidor.equipo_id)
+      : departamentales.filter(d => Number(d.id) === competidor.departamental_id);
+    return filas.map(f => ({ disciplina_id, puesto, departamental_id: Number(f.id), nombre: f.nombre,
+      equipo_id: competidor.equipo_id, equipo_nombre: f.equipo_nombre || null, origen: "AUTO" }));
+  });
+}
+
 /**
  * Medallas que salen solas de los resultados: la final define oro y plata; el tercer puesto, bronce
  * y cuarto. Sólo toca las medallas automáticas: si la administración cargó a mano los puestos de una
@@ -2253,29 +2306,14 @@ async function sincronizarMedallasAutomaticas(connection, cabecera, olimpiadaId,
   if (existentes.some(m => m.origen === "MANUAL")) return false;
   const [partidos] = await connection.query(SELECT_PARTIDO_CLASIFICACION, [olimpiadaId, disciplinaId]);
   const puestos = puestosSegunResultados(partidos) || [];
-  const deseadas = [];
-  for (const { puesto, competidor } of puestos) {
-    let filas = [];
-    if (competidor.equipo_id) {
-      const [miembros] = await connection.query(
-        `SELECT d.id, d.nombre FROM olimpiada_equipo_departamental ed INNER JOIN departamental d ON d.id = ed.departamental_id WHERE ed.equipo_id = ? ORDER BY d.nombre`,
-        [competidor.equipo_id]
-      );
-      filas = miembros.map(m => ({ puesto, departamental_id: Number(m.id), equipo_id: Number(competidor.equipo_id), nombre: m.nombre }));
-    } else if (competidor.departamental_id) {
-      const [[departamental]] = await connection.query("SELECT id, nombre FROM departamental WHERE id = ?", [competidor.departamental_id]);
-      if (departamental) filas = [{ puesto, departamental_id: Number(departamental.id), equipo_id: null, nombre: departamental.nombre }];
-    }
-    for (const fila of filas) {
-      if (!deseadas.some(d => d.puesto === fila.puesto && d.departamental_id === fila.departamental_id)) deseadas.push(fila);
-    }
-  }
+  const deseadas = await filasDePuestos(connection, puestos);
   const clave = f => `${Number(f.puesto)}:${Number(f.departamental_id)}:${Number(f.equipo_id) || 0}`;
   const antes = existentes.map(clave).sort().join("|");
   const despues = deseadas.map(clave).sort().join("|");
   if (antes === despues) return false;
-  await connection.query("DELETE FROM olimpiada_medalla WHERE olimpiada_id = ? AND disciplina_id = ? AND origen = 'AUTO'", [olimpiadaId, disciplinaId]);
-  for (const fila of deseadas) {
+  const quitar = existentes.filter(f => !deseadas.some(d => clave(d) === clave(f)));
+  if (quitar.length) await connection.query("DELETE FROM olimpiada_medalla WHERE id IN (?) AND origen = 'AUTO'", [quitar.map(f => f.id)]);
+  for (const fila of deseadas.filter(d => !existentes.some(f => clave(f) === clave(d)))) {
     await connection.query(
       "INSERT INTO olimpiada_medalla (olimpiada_id, disciplina_id, puesto, departamental_id, equipo_id, origen) VALUES (?, ?, ?, ?, ?, 'AUTO')",
       [olimpiadaId, disciplinaId, fila.puesto, fila.departamental_id, fila.equipo_id]
@@ -2458,9 +2496,9 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)", verificarAccesoCompeticion, 
         connection,
         cabecera,
         { entidad: "PARTIDO", entidad_id: partidoId, olimpiada_id: actual.olimpiada_id },
-        actual,
-        datos,
-        camposVeedor || [...campos, ...CAMPOS_PARTIDO_EXTRA]
+        partidoParaHistorial(actual),
+        partidoParaHistorial(datos),
+        camposVeedor || [...campos, ...CAMPOS_PARTIDO_EXTRA, "cuartos", "penales"]
       );
       efectos = await aplicarEfectosCompeticion(connection, cabecera, actual.olimpiada_id, datos.disciplina_id);
       if (Number(actual.disciplina_id) !== Number(datos.disciplina_id)) {
@@ -2480,7 +2518,7 @@ const MENSAJE_RESULTADO = {
   SUSPENDIDO: "Partido suspendido.",
 };
 
-const CAMPOS_RESULTADO = ['estado', 'resultado1', 'resultado2', 'sets', 'cuartos', 'ganador'];
+const CAMPOS_RESULTADO = ['estado', 'resultado1', 'resultado2', 'sets', 'cuartos', 'penales', 'ganador'];
 
 router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCompeticion, async (req, res) => {
   const cabecera = getCabecera(req);
@@ -2500,9 +2538,8 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCom
     }
     const marcador = leerMarcadorPartido(body, actual, estado);
     const { resultado1, resultado2, sets } = marcador;
-    const conCuartos = !!leerParciales(sets)?.cuartos;
-    if (conCuartos && body.cuartos !== undefined) {
-      validarModoCuartos(marcador, await validarDisciplinaDeOlimpiada(db, actual.olimpiada_id, actual.disciplina_id));
+    if (body.cuartos != null || body.penales != null) {
+      validarParcialesDisciplina(marcador, await validarDisciplinaDeOlimpiada(db, actual.olimpiada_id, actual.disciplina_id));
     }
     const ganador = ganadorDelMarcador(body, actual, marcador, estado);
     const nuevo = { estado, resultado1, resultado2, ganador, sets };
@@ -2514,6 +2551,8 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCom
         [estado, resultado1, resultado2, ganador, sets, partidoId]
       );
       const marcador = resultado1 !== null || resultado2 !== null ? ` ${resultado1 ?? "-"} a ${resultado2 ?? "-"}` : "";
+      const penales = leerParciales(sets)?.penales;
+      const desempate = penales ? ` (penales ${penales.join(" a ")})` : ganador === 0 ? " (empate)" : "";
       await historial(connection, cabecera, {
         entidad: "PARTIDO",
         entidad_id: partidoId,
@@ -2522,15 +2561,15 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCom
         campo_modificado: "estado",
         valor_anterior: actual.estado,
         valor_nuevo: estado,
-        observacion: `${actual.participante1} vs ${actual.participante2}${marcador}${ganador === 0 ? " (empate)" : ""}`,
+        observacion: `${actual.participante1} vs ${actual.participante2}${marcador}${desempate}`,
       });
       await historialCambios(
         connection,
         cabecera,
         { entidad: "PARTIDO", entidad_id: partidoId, olimpiada_id: actual.olimpiada_id },
-        actual,
-        nuevo,
-        ["resultado1", "resultado2", "ganador", "sets"]
+        partidoParaHistorial(actual),
+        partidoParaHistorial(nuevo),
+        ["resultado1", "resultado2", "ganador", "sets", "cuartos", "penales"]
       );
       efectos = await aplicarEfectosCompeticion(connection, cabecera, actual.olimpiada_id, actual.disciplina_id);
     });
@@ -2619,6 +2658,52 @@ router.get("/olimpiadas/:id(\\d+)/en-vivo", verificarAccesoCompeticion, async (r
 // ---------------------------------------------------------------------------
 // Medallero
 // ---------------------------------------------------------------------------
+async function leerPodiosFixture(conexion, olimpiadaId, disciplinas, porCategorias) {
+  // Una carga manual fija la disciplina entera, aunque sólo se haya adjudicado un puesto.
+  const [guardadas] = await conexion.query(
+    `SELECT m.disciplina_id, m.puesto, m.departamental_id, dep.nombre, m.equipo_id, e.nombre AS equipo_nombre, m.origen
+     FROM olimpiada_medalla m INNER JOIN departamental dep ON dep.id = m.departamental_id
+     LEFT JOIN olimpiada_equipo e ON e.id = m.equipo_id
+     WHERE m.olimpiada_id = ? ORDER BY m.disciplina_id, m.puesto, dep.nombre, m.id`, [olimpiadaId]
+  );
+  const manuales = new Set(guardadas.filter(m => m.origen === "MANUAL").map(m => Number(m.disciplina_id)));
+  const categorias = [];
+  const cuadrosPendientes = [];
+  for (const d of disciplinas) {
+    const id = Number(d.id);
+    if (manuales.has(id)) continue;
+    const formato = porCategorias.get(id)?.formato || "PARTIDOS";
+    if (formato !== "PARTIDOS") {
+      categorias.push({ id, formato });
+    } else if (Number(d.partidos) !== 0 && ![1, 2, 3].every(p => guardadas.some(m => Number(m.disciplina_id) === id && Number(m.puesto) === p))) {
+      cuadrosPendientes.push(id);
+    }
+  }
+  const categoriaIds = new Set(categorias.map(c => c.id));
+  const medallas = guardadas.filter(m => Number(m.puesto) <= 3 && !categoriaIds.has(Number(m.disciplina_id)));
+  // Los cuadros resueltos antes de esta versión pueden tener puestos sin materializar.
+  if (cuadrosPendientes.length) {
+    const [partidos] = await conexion.query(SELECT_PARTIDO_CLASIFICACION, [olimpiadaId, cuadrosPendientes]);
+    const faltan = cuadrosPendientes.flatMap(id => {
+      const puestos = puestosSegunResultados(partidos.filter(p => Number(p.disciplina_id) === id)) || [];
+      return puestos.filter(p => p.puesto <= 3 && !medallas.some(m => Number(m.disciplina_id) === id && Number(m.puesto) === p.puesto))
+        .map(p => ({ ...p, disciplina_id: id }));
+    });
+    medallas.push(...await filasDePuestos(conexion, faltan));
+  }
+  medallas.push(...await pruebasLectura.medallasParaFixture(conexion, olimpiadaId, categorias));
+  const podios = new Map();
+  for (const disciplina of agruparMedallasPorDisciplina([], medallas)) {
+    const puestos = disciplina.puestos.filter(p => p.ganadores.length).map(p => ({
+      puesto: p.puesto, nombre: p.nombre, ganadores: p.ganadores.map(g => ({
+        nombre: g.nombre, detalle: g.detalle || null, departamentales: g.departamentales.map(({ id, nombre }) => ({ id, nombre })),
+      })),
+    }));
+    podios.set(disciplina.disciplina_id, puestos);
+  }
+  return podios;
+}
+
 async function armarMedallero(conexion, olimpiada) {
   const puestos = await leerPuntosPuestos(conexion, olimpiada);
   const division = REGLAS_DIVISION.includes(olimpiada.medallero_division) ? olimpiada.medallero_division : "EXACTA";
@@ -2812,6 +2897,7 @@ router.put("/olimpiadas/:id(\\d+)/medallero/:disciplinaId(\\d+)", verifyToken, a
         for (const dep of equipo.departamentales) filas.push({ puesto: ganador.puesto, departamental_id: dep.id, equipo_id: equipo.id, nombre: dep.nombre });
       } else filas.push({ puesto: ganador.puesto, departamental_id: ganador.departamental_id, equipo_id: null, nombre: null });
     }
+    if (!filas.length) return res.status(400).json("Elegí al menos un ganador o usá «Volver al cálculo automático».");
     const repetida = filas.find((fila, indice) => filas.findIndex(f => f.puesto === fila.puesto && f.departamental_id === fila.departamental_id) !== indice);
     if (repetida) return res.status(400).json(`Una departamental aparece dos veces en el ${nombrePuesto(repetida.puesto).toLowerCase()}`);
     const departamentales = await validarDepartamentales(db, [...new Set(filas.map(f => f.departamental_id))]);

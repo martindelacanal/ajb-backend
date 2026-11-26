@@ -2,6 +2,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const express = require("express");
+const jwt = require("jsonwebtoken");
 process.env.JWT_SECRET = "competicion-authorization-test-only";
 
 let contexto;
@@ -25,6 +26,8 @@ async function servidor(t, opciones = {}) {
     partidos: opciones.partidos || [partido], asignadas: opciones.asignadas || [4] };
   contexto.query = async (sql, params = []) => {
     contexto.consultas.push({ sql, params });
+    if (/r\.nombre AS rol/.test(sql) && opciones.actor) return [[opciones.actor]];
+    if (/FROM olimpiada_puntos_puesto WHERE/.test(sql)) return [[]];
     if (/FROM olimpiada_voluntario WHERE/.test(sql)) return [[contexto.cuenta]];
     if (/FROM olimpiada_voluntario_disciplina a/.test(sql)) return [Number(params[1]) === 7 ? contexto.asignadas.map((disciplina_id) => ({ ...contexto.edicion, disciplina_id })) : []];
     if (/FROM olimpiada WHERE ruta_publica/.test(sql)) {
@@ -49,6 +52,8 @@ async function servidor(t, opciones = {}) {
     }
     if (/FROM olimpiada_disciplina_config c/.test(sql)) return [opciones.disciplinas || [{ id: 4, olimpiada_id: 7, nombre: "Vóley", tipo_id: 1 }, { id: 5, olimpiada_id: 7, nombre: "Fútbol", tipo_id: 1 }]];
     if (/FROM olimpiada_torneo t/.test(sql)) return [[]];
+    if (/FROM olimpiada_medalla m/.test(sql)) return [opciones.medallas || []];
+    if (/SELECT id, nombre FROM departamental WHERE id IN/.test(sql)) return [opciones.departamentales || []];
     if (/SELECT id, logo_archivo FROM departamental/.test(sql)) return [[]];
     // Equipos interdepartamentales y escudos que acompañan al fixture.
     if (/FROM olimpiada_equipo e/.test(sql)) return [[]];
@@ -59,7 +64,7 @@ async function servidor(t, opciones = {}) {
   const app = express(); app.use(express.json()); app.use(publico); app.use(privado);
   const server = await new Promise((resolve) => { const s = app.listen(0, "127.0.0.1", () => resolve(s)); });
   t.after(() => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); }));
-  const token = crearTokenVoluntario(voluntario);
+  const token = opciones.actor ? jwt.sign({ data: JSON.stringify(opciones.actor) }, process.env.JWT_SECRET) : crearTokenVoluntario(voluntario);
   return { contexto, pedir: (ruta, { method = "GET", body, anonimo = false } = {}) => fetch(`http://127.0.0.1:${server.address().port}${ruta}`, {
     method, headers: { ...(anonimo ? {} : { authorization: `Bearer ${token}` }), "Content-Type": "application/json" },
     ...(body ? { body: JSON.stringify(body) } : {}),
@@ -144,6 +149,10 @@ function simularEscrituraResultado(contexto, encuentro) {
         [encuentro.estado, encuentro.resultado1, encuentro.resultado2, encuentro.ganador, encuentro.sets] = params;
         return [{ affectedRows: 1 }];
       }
+      if (sql.includes("UPDATE olimpiada_partido SET ? WHERE id = ?")) {
+        Object.assign(contexto.partidos.find(p => p.id === params[1]), params[0]);
+        return [{ affectedRows: 1 }];
+      }
       if (sql.includes("INSERT INTO olimpiada_historial")) return [{ insertId: 1 }];
       if (sql.includes("FROM olimpiada_medalla m")) return [[]];
       return contexto.query(sql, params);
@@ -198,6 +207,52 @@ test("básquet: el veedor carga parciales, corrige el resultado y el fixture pú
   assert.deepEqual([encuentro.resultado1, encuentro.resultado2, encuentro.sets, encuentro.ganador], [null, null, null, null]);
 });
 
+test("fútbol: la tanda desempata el partido, clasifica al ganador y conserva los goles en el fixture público", async t => {
+  const disciplina = { id: 4, nombre: "Fútbol 5 Super Senior Masculino + 50 años", tipo_marcador: "TANTOS" };
+  const encuentro = { ...partido, estado: "EN_JUEGO", disciplina_nombre: disciplina.nombre, tipo_marcador: "TANTOS", etiqueta: "A" };
+  const cruce = { id: 45, disciplina_id: 4, estado: "PROGRAMADO", origen1_tipo: "GANADOR", partido_origen1_id: 44, participante1: "Ganador de A" };
+  const { pedir, contexto } = await servidor(t, { partidos: [encuentro, cruce], disciplinas: [disciplina] });
+  simularEscrituraResultado(contexto, encuentro);
+  const guardar = body => pedir("/olimpiadas/partidos/44/resultado", { method: "PUT", body });
+  const igualado = { resultado1: "0", resultado2: "0" };
+  assert.equal((await guardar({ ...igualado, estado: "EN_JUEGO", penales: [2, 2] })).status, 200);
+  assert.equal((await guardar({ estado: "FINALIZADO" })).status, 400);
+  assert.equal((await guardar({ estado: "FINALIZADO", penales: [3, 4], ganador: 1 })).status, 400);
+  assert.equal((await guardar({ estado: "FINALIZADO", penales: [3, 4] })).status, 200);
+  assert.equal(cruce.departamental1_id, encuentro.departamental2_id);
+  const fixture = await (await pedir("/olimpiadas/publico/7/fixture", { anonimo: true })).json();
+  const p = fixture.partidos.find(p => p.id === encuentro.id);
+  assert.deepEqual([p.permite_penales, p.resultado1, p.resultado2, p.penales, p.ganador, p.sets], [true, "0", "0", [3, 4], 2, null]);
+  assert.equal((await guardar({ estado: "FINALIZADO", penales: [5, 4] })).status, 200);
+  assert.equal(cruce.departamental1_id, encuentro.departamental1_id);
+  assert.equal((await guardar({ estado: "FINALIZADO", penales: null })).status, 200);
+  assert.deepEqual([encuentro.ganador, encuentro.sets, cruce.departamental1_id], [0, null, null]);
+  assert.equal((await guardar({ estado: "FINALIZADO", penales: [5, 4] })).status, 200);
+  assert.equal((await guardar({ estado: "FINALIZADO", resultado2: "1" })).status, 200);
+  assert.deepEqual([encuentro.ganador, encuentro.sets], [2, null]);
+  assert.equal((await guardar({ ...igualado, estado: "FINALIZADO", penales: [0, 1] })).status, 200);
+  assert.equal((await guardar({ estado: "PROGRAMADO", resultado1: null, resultado2: null })).status, 200);
+  assert.deepEqual([encuentro.resultado1, encuentro.resultado2, encuentro.ganador, encuentro.sets], [null, null, null, null]);
+});
+
+test("fútbol: acepta únicamente una tanda válida en un marcador empatado de fútbol", async t => {
+  const disciplina = { id: 4, nombre: "Futsal", tipo_marcador: "TANTOS" };
+  const { pedir } = await servidor(t, { disciplinas: [disciplina] });
+  const guardar = datos => pedir("/olimpiadas/partidos/44/resultado", { method: "PUT",
+    body: { estado: "FINALIZADO", resultado1: "2", resultado2: "2", penales: [2, 1], ...datos } });
+  for (const penales of [[1, 1], [-1, 0], [2.5, 0], [1], [1, "0"], [1, null], [1000, 0]]) {
+    assert.equal((await guardar({ penales })).status, 400);
+  }
+  for (const datos of [{ resultado2: "1" }, { resultado1: null }, { resultado1: "W.O.", resultado2: "W.O." },
+    { resultado1: "1.5", resultado2: "1.5" }, { sets: [[1, 0]] }, { cuartos: [[1, 0]] }]) {
+    assert.equal((await guardar(datos)).status, 400);
+  }
+  for (const nombre of ["Fútbol tenis", "Futboltenis", "Hándbol"]) {
+    disciplina.nombre = nombre;
+    assert.equal((await guardar({})).status, 400);
+  }
+});
+
 test("competición: sólo administración puede publicar nombres, gestionar catálogos o leer el portal privado", async (t) => {
   const { pedir } = await servidor(t);
   assert.equal((await pedir("/olimpiadas/7/partidos", { method: "POST", body: { disciplina_id: 4, participante1: "A", participante2: "B", mostrar_nombres_publico: 1 } })).status, 403);
@@ -242,6 +297,95 @@ test("público: fixture y cada grupo en vivo ocultan nombres y datos de inscripc
     }
     assert.equal(JSON.stringify(body).includes("Nombre privado"), false);
   }
+});
+
+test("fixture público: muestra el podio manual y equipos compartidos con el medallero y las posiciones reservados", async t => {
+  const medalla = { disciplina_id: 4, origen: "MANUAL", puntos_manual: 100 };
+  const { pedir } = await servidor(t, { edicion: { medallero_publicado: 0, posiciones_publicas: 0 }, medallas: [
+    { ...medalla, puesto: 1, equipo_id: 9, equipo_nombre: "Equipo del Sur", departamental_id: 1, nombre: "Azul" },
+    { ...medalla, puesto: 1, equipo_id: 9, equipo_nombre: "Equipo del Sur", departamental_id: 2, nombre: "Dolores" },
+    { ...medalla, puesto: 2, departamental_id: 1, nombre: "Azul" },
+    { ...medalla, puesto: 3, departamental_id: 3, nombre: "Mercedes" },
+    { ...medalla, puesto: 4, departamental_id: 4, nombre: "Cuarta" },
+  ] });
+  const fixture = await (await pedir("/olimpiadas/publico/7/fixture", { anonimo: true })).json();
+  const podio = fixture.disciplinas[0].podio;
+  assert.deepEqual(podio.map(p => [p.puesto, p.nombre, p.ganadores.map(g => g.nombre)]),
+    [[1, "Oro", ["Equipo del Sur"]], [2, "Plata", ["Azul"]], [3, "Bronce", ["Mercedes"]]]);
+  assert.deepEqual(podio[0].ganadores[0].departamentales, [{ id: 1, nombre: "Azul" }, { id: 2, nombre: "Dolores" }]);
+  assert.doesNotMatch(JSON.stringify(podio), /puntos|Cuarta|inscripcion|medalla_id|MANUAL/);
+  assert.deepEqual(fixture.disciplinas[1].podio, []);
+  assert.deepEqual(fixture.posiciones, []);
+  const general = await (await pedir("/olimpiadas/publico/7/medallero", { anonimo: true })).json();
+  assert.equal(general.reservado, true);
+  assert.deepEqual(general.tabla, []);
+});
+
+test("medallero: una carga manual sin ganadores conserva la adjudicación previa", async t => {
+  const medallas = [{ disciplina_id: 4, origen: "MANUAL", puesto: 1, departamental_id: 1, nombre: "Azul" }];
+  const actor = { id: 5, rol: "admin", rol_id: 1, habilitado: "Y", requiere_cambio_clave: 0 };
+  const { pedir } = await servidor(t, { medallas, actor });
+  for (const puestos of [[], [{ puesto: 1, departamental_ids: [], equipo_ids: [] }, { puesto: 2, ganadores: [] }]]) {
+    const respuesta = await pedir("/olimpiadas/7/medallero/4", { method: "PUT", body: { puestos } });
+    assert.equal(respuesta.status, 400);
+    assert.match(await respuesta.json(), /al menos un ganador.*Volver al cálculo automático/);
+  }
+  const fixture = await (await pedir("/olimpiadas/publico/7/fixture", { anonimo: true })).json();
+  assert.equal(fixture.disciplinas[0].podio[0].ganadores[0].nombre, "Azul");
+});
+
+test("fixture público: lee un cuadro antiguo sin final sin recargar resultados ni adivinar nombres", async t => {
+  const semifinal = { ...partido, torneo_id: 8, instancia_nombre: "Semifinal", estado: "FINALIZADO", ganador: 1 };
+  const partidos = [
+    { ...semifinal, id: 101, departamental1_id: 19, departamental2_id: 17 },
+    { ...semifinal, id: 102, departamental1_id: 19, departamental2_id: 14 },
+    { ...semifinal, id: 103, instancia_nombre: "Tercer puesto", departamental1_id: 17, departamental2_id: 14, ganador: 2,
+      partido_origen1_id: 101, partido_origen2_id: 102, origen1_tipo: "PERDEDOR", origen2_tipo: "PERDEDOR" },
+  ];
+  const { pedir, contexto } = await servidor(t, { partidos, departamentales: [
+    { id: 19, nombre: "Moreno" }, { id: 17, nombre: "San Martín" }, { id: 14, nombre: "Lomas" },
+  ] });
+  const fixture = await (await pedir("/olimpiadas/publico/7/fixture?torneo_id=8", { anonimo: true })).json();
+  assert.deepEqual(fixture.disciplinas[0].podio.map(p => [p.nombre, p.ganadores[0].nombre]),
+    [["Oro", "Moreno"], ["Plata", "Moreno"], ["Bronce", "Lomas"]]);
+  assert.ok(contexto.consultas.every(c => !/^\s*(?:UPDATE|DELETE|INSERT)/i.test(c.sql)));
+});
+
+test("resultados: finalizar el tercer puesto sin final guarda el bronce, y corregirlo actualiza el podio público", async t => {
+  const encuentro = { ...partido, instancia_nombre: "Tercer puesto", estado: "EN_JUEGO" };
+  const medallas = [];
+  const departamentales = [{ id: 1, nombre: "La Plata" }, { id: 2, nombre: "Mercedes" }];
+  const { pedir, contexto } = await servidor(t, { partidos: [encuentro], medallas, departamentales });
+  simularEscrituraResultado(contexto, encuentro);
+  const query = contexto.conexion.query;
+  let siguienteId = 0;
+  contexto.conexion.query = (sql, params) => {
+    if (sql.includes("FROM olimpiada_medalla m")) return [medallas.slice()];
+    if (sql.includes("INSERT INTO olimpiada_medalla")) {
+      const [, disciplina_id, puesto, departamental_id, equipo_id] = params;
+      medallas.push({ id: ++siguienteId, disciplina_id, puesto, departamental_id, equipo_id,
+        origen: "AUTO", nombre: departamentales.find(d => d.id === departamental_id).nombre });
+      return [{ insertId: siguienteId }];
+    }
+    if (sql.includes("DELETE FROM olimpiada_medalla")) {
+      for (const id of params[0]) medallas.splice(medallas.findIndex(m => m.id === id), 1);
+      return [{ affectedRows: params[0].length }];
+    }
+    if (sql.includes("SELECT nombre FROM olimpiada_disciplina")) return [[{ nombre: "Tenis" }]];
+    return query(sql, params);
+  };
+  const guardar = resultado => pedir("/olimpiadas/partidos/44/resultado", {
+    method: "PUT", body: { estado: "FINALIZADO", resultado1: resultado, resultado2: "1" },
+  });
+  assert.equal((await guardar("3")).status, 200);
+  assert.deepEqual(medallas.map(m => [m.puesto, m.departamental_id]), [[3, 1], [4, 2]]);
+  assert.equal((await guardar("0")).status, 200);
+  assert.deepEqual(medallas.map(m => [m.puesto, m.departamental_id]), [[3, 2], [4, 1]]);
+  const fixture = await (await pedir("/olimpiadas/publico/7/fixture", { anonimo: true })).json();
+  assert.deepEqual(fixture.disciplinas[0].podio.map(p => [p.nombre, p.ganadores[0].nombre]), [["Bronce", "Mercedes"]]);
+  medallas[0].origen = "MANUAL";
+  assert.equal((await guardar("3")).status, 200);
+  assert.deepEqual(medallas.map(m => [m.puesto, m.departamental_id]), [[3, 2], [4, 1]]);
 });
 
 test("público: habilitar nombres sólo expone los nombres del partido autorizado", async (t) => {

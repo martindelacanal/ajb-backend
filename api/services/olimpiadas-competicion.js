@@ -34,8 +34,8 @@ function normalizarSets(valor) {
   return sets.length ? sets : null;
 }
 
-// Los sets históricos se guardan como lista. Los cuartos usan un objeto identificado
-// en el mismo campo de parciales para conservar la diferencia al releer un encuentro.
+// Los sets históricos se guardan como lista. Los cuartos y los penales se identifican
+// por su clave en el mismo campo de parciales.
 function leerParciales(valor) {
   if (!valor) return null;
   if (typeof valor === 'object') return valor;
@@ -45,6 +45,11 @@ function leerParciales(valor) {
 function tipoMarcadorDisciplina(nombre, tipo = 'TANTOS') {
   const basquet = /\b(?:basquet(?:bol|ball)?|basket(?:ball|bol)?|baloncesto)\b/.test(normalizarNombre(nombre));
   return basquet && (!tipo || tipo === 'TANTOS') ? 'CUARTOS' : tipo || 'TANTOS';
+}
+
+function permitePenales(nombre, tipo = 'TANTOS') {
+  const deporte = normalizarNombre(nombre);
+  return (tipo || 'TANTOS') === 'TANTOS' && /\b(?:futbol\d*|futsal)\b/.test(deporte) && !/\btenis\b/.test(deporte);
 }
 
 function normalizarCuartos(cuartos, estado) {
@@ -80,7 +85,9 @@ function conEnVivo(partidos) {
   return (partidos || []).map(p => {
     const parciales = leerParciales(p.sets);
     return { ...p, sets: Array.isArray(parciales) ? parciales : null,
-      cuartos: parciales?.cuartos || null, tipo_marcador: tipoMarcadorDisciplina(p.disciplina_nombre, p.tipo_marcador),
+      cuartos: parciales?.cuartos || null, penales: parciales?.penales || null,
+      permite_penales: permitePenales(p.disciplina_nombre, p.tipo_marcador),
+      tipo_marcador: tipoMarcadorDisciplina(p.disciplina_nombre, p.tipo_marcador),
       en_vivo: estaEnVivo(p), clasificacion1_manual: !!rotuloManual(p, 1), clasificacion2_manual: !!rotuloManual(p, 2) };
   });
 }
@@ -130,7 +137,7 @@ function partidoPublico(p, porId) {
     'ganador', 'estado', 'sede_id', 'sede_nombre', 'orden', 'fecha_modificacion', 'torneo_id', 'torneo_nombre', 'instancia_id',
     'instancia_nombre', 'instancia_orden', 'lugar_id', 'lugar_nombre', 'lugar_predio', 'lugar_direccion', 'lugar_url_mapa',
     'partido_origen1_id', 'partido_origen2_id',
-    'equipo1_id', 'equipo2_id', 'equipo1_nombre', 'equipo2_nombre', 'zona', 'bloque', 'sets', 'cuartos', 'tipo_marcador', 'en_vivo',
+    'equipo1_id', 'equipo2_id', 'equipo1_nombre', 'equipo2_nombre', 'zona', 'bloque', 'sets', 'cuartos', 'penales', 'permite_penales', 'tipo_marcador', 'en_vivo',
     'origen1_tipo', 'origen2_tipo', 'sede_direccion', 'sede_url_mapa', 'sede_lat', 'sede_lng', 'lugar_lat', 'lugar_lng'];
   const salida = Object.fromEntries(campos.filter(c => p[c] !== undefined).map(c => [c, p[c]]));
   for (const lado of [1, 2]) {
@@ -455,16 +462,22 @@ function agruparMedallasPorDisciplina(disciplinas, medallas, { puntos = null, di
 /**
  * Función pura. Con los partidos de una disciplina devuelve los puestos que se desprenden de los
  * resultados: la final define oro y plata; el partido por el tercer puesto, bronce y cuarto.
- * Devuelve null cuando no se puede saber (ninguna final, o más de una en la disciplina).
+ * Cada partido decisivo reparte sus puestos de forma independiente.
  */
 function puestosSegunResultados(partidos) {
-  const rotulo = p => normalizarNombre([p.instancia_nombre, p.fase, p.etiqueta].filter(Boolean).join(' '));
-  const esFinal = p => { const r = rotulo(p); return /\bfinal\b/.test(r) && !/semi|cuartos|octavos|dieciseis|tercer|3er/.test(r); };
-  const esTercero = p => /tercer|3er|3 puesto|3 y 4/.test(rotulo(p));
+  const rotulos = p => [p.instancia_nombre, p.fase, p.etiqueta].map(normalizarNombre);
+  const tercerPuesto = /^(?:(?:partido|final) )?(?:por (?:el |la )?)?(?:(?:tercer|tercero|3(?:er|ro|o)?) (?:puesto|lugar)|(?:tercer|tercero|3(?:er|ro|o)?) (?:y )?(?:cuarto|4(?:to|o)?)(?: puestos?)?|(?:medalla de )?bronce)$/;
+  const esTercero = p => rotulos(p).some(r => tercerPuesto.test(r)) || normalizarNombre(p.instancia_nombre) === 'tercero';
+  const esFinal = p => {
+    const nombres = rotulos(p);
+    return !esTercero(p) && nombres.some(r => /^(?:(?:gran|partido) )?final$/.test(r))
+      && !nombres.some(r => /\b(?:semifinal(?:es)?|semi final(?:es)?|cuartos?|octavos?|dieciseisavos?)\b/.test(r));
+  };
   const vigentes = (partidos || []).filter(p => !Number(p.eliminado));
   const finales = vigentes.filter(esFinal);
   const terceros = vigentes.filter(esTercero);
-  if (finales.length !== 1 || terceros.length > 1) return null;
+  if (finales.length > 1 || terceros.length > 1) return null;
+  if (finales.length && terceros.length && finales[0].torneo_id !== terceros[0].torneo_id) return null;
   const puestos = [];
   const agregar = (partido, puestoGanador) => {
     const ganador = Number(partido.ganador);
@@ -472,7 +485,25 @@ function puestosSegunResultados(partidos) {
     puestos.push({ puesto: puestoGanador, competidor: competidorDe(partido, ganador) });
     puestos.push({ puesto: puestoGanador + 1, competidor: competidorDe(partido, 3 - ganador) });
   };
-  agregar(finales[0], 1);
+  if (finales.length) {
+    agregar(finales[0], 1);
+  } else {
+    // El cruce por el bronce identifica ambas semifinales de la misma llave.
+    // Si sus dos ganadoras representan a la misma departamental, ya se conocen oro y plata.
+    const semifinales = vigentes.filter(p => /^semi\s*final(?:es)?$/.test(normalizarNombre(p.instancia_nombre)));
+    const torneoId = semifinales[0]?.torneo_id;
+    const tercero = terceros[0];
+    const origenes = new Set([1, 2].filter(lado => tercero?.[`origen${lado}_tipo`] === 'PERDEDOR')
+      .map(lado => normalizarIdPositivo(tercero[`partido_origen${lado}_id`])).filter(Boolean));
+    if (torneoId && semifinales.length === 2 && origenes.size === 2 && semifinales.every(p => origenes.has(Number(p.id)))
+      && vigentes.every(p => p.torneo_id === torneoId)) {
+      const finalistas = semifinales.map(p => p.estado === 'FINALIZADO' && [1, 2].includes(Number(p.ganador)) ? competidorDe(p, Number(p.ganador)) : null);
+      if (finalistas[0]?.departamental_id && finalistas[0].departamental_id === finalistas[1]?.departamental_id) {
+        puestos.push({ puesto: 1, competidor: finalistas[0] }, { puesto: 2, competidor: finalistas[1] });
+      }
+    }
+    if (!puestos.length && !terceros.length) return null;
+  }
   if (terceros.length === 1) agregar(terceros[0], 3);
   return puestos.filter(p => p.competidor);
 }
@@ -514,7 +545,7 @@ function filtroId(query, campo) {
 module.exports = {
   CAMPOS_PARTIDO_EXTRA, TIPOS_ORIGEN, TIPOS_MARCADOR, REGLAS_DIVISION, MAX_SETS, MAX_PUESTOS,
   partidoPublico, partidosPublicos, marcadorNumerico, calcularPosiciones, listarTorneos, listarEquipos, filtroId,
-  normalizarSets, leerParciales, normalizarCuartos, tipoMarcadorDisciplina, contarSets, estaEnVivo, conEnVivo,
+  normalizarSets, leerParciales, normalizarCuartos, tipoMarcadorDisciplina, permitePenales, contarSets, estaEnVivo, conEnVivo,
   normalizarNombre, competidorDe, resolverClasificacion, hayCiclo, nombreZona,
   nombrePuesto, repartirPuntos, calcularTablaMedallero, agruparMedallasPorDisciplina, puestosSegunResultados,
 };

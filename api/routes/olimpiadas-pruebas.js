@@ -139,6 +139,21 @@ async function listarPruebas(conexion, olimpiadaId, { disciplinaIds = null, gest
   )));
 }
 
+async function medallasParaFixture(conexion, olimpiadaId, disciplinas) {
+  if (!disciplinas.length) return [];
+  const ids = disciplinas.map(d => d.id);
+  // La premiación de la categoría es independiente de su aporte al medallero general.
+  const [[pruebas], [participantes], ganadores] = await Promise.all([
+    conexion.query(`SELECT id, disciplina_id, nombre, orden FROM olimpiada_prueba
+      WHERE olimpiada_id = ? AND disciplina_id IN (?) AND eliminado = 0 AND estado = 'FINALIZADA'`, [olimpiadaId, ids]),
+    conexion.query(`${SELECT_PARTICIPANTE} WHERE p.olimpiada_id = ? AND p.disciplina_id IN (?) AND p.eliminado = 0`, [olimpiadaId, ids]),
+    cargarGanadores(conexion, olimpiadaId, disciplinas.filter(d => d.formato === 'PESCA').map(d => d.id)),
+  ]);
+  return disciplinas.flatMap(d => P.medallasDeDisciplina(d.formato,
+    pruebas.filter(p => Number(p.disciplina_id) === d.id), participantes.filter(p => Number(p.disciplina_id) === d.id),
+    { ganadores, soloPuntuables: false }).map(m => ({ ...m, disciplina_id: d.id })));
+}
+
 /** Para el listado de disciplinas del fixture: formato, cuántas categorías tiene y cuántas se están disputando. */
 async function resumenDisciplinas(conexion, olimpiadaId) {
   const resumen = new Map();
@@ -783,6 +798,7 @@ function registrarPruebas(router, helpers) {
 module.exports = registrarPruebas;
 module.exports.listarPruebas = listarPruebas;
 module.exports.resumenDisciplinas = resumenDisciplinas;
+module.exports.medallasParaFixture = medallasParaFixture;
 module.exports.pruebasEnJuego = pruebasEnJuego;
 module.exports.esquemaDisponible = esquemaDisponible;
 module.exports.esquemaMedallero = esquemaMedallero;

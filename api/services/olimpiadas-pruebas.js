@@ -243,7 +243,7 @@ function sumaMedallero(prueba) {
  * `ganadores`: pesca, las filas de olimpiada_prueba_ganador de la disciplina.
  * Devuelve [{ puesto, departamental_id, nombre, prueba_id, participante_id, criterio, clave_origen, detalle }].
  */
-function medallasDeDisciplina(formato, pruebas, participantes, { maxPuesto = 3, ganadores = [] } = {}) {
+function medallasDeDisciplina(formato, pruebas, participantes, { maxPuesto = 3, ganadores = [], soloPuntuables = true } = {}) {
   const tope = Math.max(3, Number(maxPuesto) || 3);
   const medallas = [];
   const agregar = (p, puesto, prueba, clave) => {
@@ -260,7 +260,7 @@ function medallasDeDisciplina(formato, pruebas, participantes, { maxPuesto = 3, 
   } else {
     const porId = new Map(participantes.map(p => [Number(p.id), p]));
     for (const prueba of [...pruebas].sort(porOrden)) {
-      if (sumaMedallero(prueba) === 'NADA') continue;
+      if (soloPuntuables && sumaMedallero(prueba) === 'NADA') continue;
       if (formato === 'TIEMPO') {
         const propios = participantes.filter(p => Number(p.prueba_id) === Number(prueba.id));
         for (const p of clasificarTiempo(propios)) agregar(p, p.puesto, prueba);
