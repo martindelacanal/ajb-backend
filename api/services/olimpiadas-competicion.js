@@ -34,10 +34,32 @@ function normalizarSets(valor) {
   return sets.length ? sets : null;
 }
 
-function leerSets(valor) {
+// Los sets históricos se guardan como lista. Los cuartos usan un objeto identificado
+// en el mismo campo de parciales para conservar la diferencia al releer un encuentro.
+function leerParciales(valor) {
   if (!valor) return null;
-  if (Array.isArray(valor)) return valor;
-  try { const sets = JSON.parse(valor); return Array.isArray(sets) && sets.length ? sets : null; } catch (_error) { return null; }
+  if (typeof valor === 'object') return valor;
+  try { return JSON.parse(valor); } catch (_error) { return null; }
+}
+
+function tipoMarcadorDisciplina(nombre, tipo = 'TANTOS') {
+  const basquet = /\b(?:basquet(?:bol|ball)?|basket(?:ball|bol)?|baloncesto)\b/.test(normalizarNombre(nombre));
+  return basquet && (!tipo || tipo === 'TANTOS') ? 'CUARTOS' : tipo || 'TANTOS';
+}
+
+function normalizarCuartos(cuartos, estado) {
+  if (!Array.isArray(cuartos) || cuartos.length < 1 || cuartos.length > 4) {
+    throw crearErrorHttp('Cargá entre uno y cuatro cuartos');
+  }
+  if (estado === 'FINALIZADO' && cuartos.length !== 4) {
+    throw crearErrorHttp('Completá los cuatro cuartos antes de finalizar el partido');
+  }
+  return cuartos.map(par => {
+    if (!Array.isArray(par) || par.length !== 2 || !par.every(n => Number.isInteger(n) && n >= 0 && n <= 999)) {
+      throw crearErrorHttp('Cada cuarto lleva dos puntajes enteros entre 0 y 999');
+    }
+    return par;
+  });
 }
 
 // Sets ganados por cada lado: es el resultado global del partido (2 a 0).
@@ -55,8 +77,12 @@ function estaEnVivo(partido) {
 }
 
 function conEnVivo(partidos) {
-  return (partidos || []).map(p => ({ ...p, sets: leerSets(p.sets), en_vivo: estaEnVivo(p),
-    clasificacion1_manual: !!rotuloManual(p, 1), clasificacion2_manual: !!rotuloManual(p, 2) }));
+  return (partidos || []).map(p => {
+    const parciales = leerParciales(p.sets);
+    return { ...p, sets: Array.isArray(parciales) ? parciales : null,
+      cuartos: parciales?.cuartos || null, tipo_marcador: tipoMarcadorDisciplina(p.disciplina_nombre, p.tipo_marcador),
+      en_vivo: estaEnVivo(p), clasificacion1_manual: !!rotuloManual(p, 1), clasificacion2_manual: !!rotuloManual(p, 2) };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +130,7 @@ function partidoPublico(p, porId) {
     'ganador', 'estado', 'sede_id', 'sede_nombre', 'orden', 'fecha_modificacion', 'torneo_id', 'torneo_nombre', 'instancia_id',
     'instancia_nombre', 'instancia_orden', 'lugar_id', 'lugar_nombre', 'lugar_predio', 'lugar_direccion', 'lugar_url_mapa',
     'partido_origen1_id', 'partido_origen2_id',
-    'equipo1_id', 'equipo2_id', 'equipo1_nombre', 'equipo2_nombre', 'zona', 'bloque', 'sets', 'en_vivo',
+    'equipo1_id', 'equipo2_id', 'equipo1_nombre', 'equipo2_nombre', 'zona', 'bloque', 'sets', 'cuartos', 'tipo_marcador', 'en_vivo',
     'origen1_tipo', 'origen2_tipo', 'sede_direccion', 'sede_url_mapa', 'sede_lat', 'sede_lng', 'lugar_lat', 'lugar_lng'];
   const salida = Object.fromEntries(campos.filter(c => p[c] !== undefined).map(c => [c, p[c]]));
   for (const lado of [1, 2]) {
@@ -488,7 +514,7 @@ function filtroId(query, campo) {
 module.exports = {
   CAMPOS_PARTIDO_EXTRA, TIPOS_ORIGEN, TIPOS_MARCADOR, REGLAS_DIVISION, MAX_SETS, MAX_PUESTOS,
   partidoPublico, partidosPublicos, marcadorNumerico, calcularPosiciones, listarTorneos, listarEquipos, filtroId,
-  normalizarSets, leerSets, contarSets, estaEnVivo, conEnVivo,
+  normalizarSets, leerParciales, normalizarCuartos, tipoMarcadorDisciplina, contarSets, estaEnVivo, conEnVivo,
   normalizarNombre, competidorDe, resolverClasificacion, hayCiclo, nombreZona,
   nombrePuesto, repartirPuntos, calcularTablaMedallero, agruparMedallasPorDisciplina, puestosSegunResultados,
 };

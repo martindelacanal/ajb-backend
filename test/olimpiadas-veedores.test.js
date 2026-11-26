@@ -35,6 +35,25 @@ test("partidos: al guardar sets el marcador pasa a ser los sets ganados", () => 
   assert.equal(datos.sets, "[[25,18],[22,25],[15,10]]");
 });
 
+test("básquet: guarda el desglose por cuarto y respeta los marcadores anteriores", () => {
+  const base = { disciplina_id: 4, resultado1: "34", resultado2: "28", estado: "FINALIZADO" };
+  const editar = body => leerPartido(body, base, { completo: true });
+  const legado = editar({ observacion: "Cambio de sede" });
+  assert.deepEqual([legado.resultado1, legado.resultado2, legado.sets], ["34", "28", null]);
+  const cuartos = [[9, 3], [10, 12], [5, 7], [10, 6]];
+  const partido = editar({ cuartos, resultado1: "999" });
+  assert.deepEqual([partido.resultado1, partido.resultado2, JSON.parse(partido.sets)], ["34", "28", { cuartos }]);
+  const empatado = editar({ cuartos: Array(4).fill([7, 7]), ganador: 2 });
+  assert.equal(empatado.ganador, 2);
+  assert.equal(leerPartido({ hora_inicio: "15:30" }, empatado, { completo: true }).ganador, 2);
+  assert.equal(leerPartido({ cuartos, estado: "FINALIZADO" }, empatado, { completo: true }).ganador, 1);
+  assert.equal(leerPartido({ estado: "EN_JUEGO" }, empatado, { completo: true }).ganador, null);
+  for (const invalido of [[], [[7, null]], [[4, -1]], [[1.5, 2]], Array(5).fill([1, 0]), [[12, 3]]]) {
+    assert.throws(() => editar({ cuartos: invalido }), { statusCode: 400 });
+  }
+  assert.throws(() => editar({ cuartos, sets: [[12, 3]] }), { statusCode: 400 });
+});
+
 test("migración: cada deporte arranca con la forma de carga que le corresponde", () => {
   for (const nombre of ["Voley Femenino", "Voley playa Mixto", "Padle Dobles Mixto", "Tenis Single Masculino", "Ping Pong", "Fútbol Tenis", "Pelota Paleta"]) {
     assert.equal(tipoMarcadorSugerido(nombre), "SETS", nombre);

@@ -20,7 +20,7 @@ const { FORMATOS: FORMATOS_COMPETENCIA } = require("../services/olimpiadas-prueb
 const { verificarAccesoCompeticion, exigirDisciplinaVoluntario, exigirEdicionVoluntario, esVoluntario, puedeEditarEdicion } = require('../security/olimpiadas-voluntarios');
 const {
   CAMPOS_PARTIDO_EXTRA, TIPOS_ORIGEN, TIPOS_MARCADOR, REGLAS_DIVISION, MAX_PUESTOS, calcularPosiciones, listarTorneos, listarEquipos, filtroId,
-  normalizarSets, contarSets, conEnVivo, normalizarNombre, resolverClasificacion, hayCiclo,
+  normalizarSets, contarSets, leerParciales, normalizarCuartos, tipoMarcadorDisciplina, conEnVivo, normalizarNombre, resolverClasificacion, hayCiclo,
   nombrePuesto, calcularTablaMedallero, agruparMedallasPorDisciplina, puestosSegunResultados,
 } = require('../services/olimpiadas-competicion');
 const {
@@ -1705,7 +1705,7 @@ async function listarDisciplinasFixture(conexion, olimpiadaId) {
       nombre: fila.nombre,
       tipo_id: fila.tipo_id,
       tipo_nombre: fila.tipo_nombre || null,
-      tipo_marcador: fila.tipo_marcador || "TANTOS",
+      tipo_marcador: tipoMarcadorDisciplina(fila.nombre, fila.tipo_marcador),
       formato_competencia: porCategorias.get(Number(fila.id))?.formato || "PARTIDOS",
       pruebas: porCategorias.get(Number(fila.id))?.pruebas || 0,
       icono_url: await firmarSeguro(fila.icono_archivo),
@@ -1807,8 +1807,10 @@ router.put("/olimpiadas/:id(\\d+)/disciplinas/:disciplinaId(\\d+)/info", verifyT
       reglamento: leerTexto(body, "reglamento", actual, { maximo: 100000, etiqueta: "el reglamento" }),
     };
     // Cómo se carga el resultado es propio del deporte: vale para todas las ediciones.
+    const marcadorPedido = body.tipo_marcador === "CUARTOS" && tipoMarcadorDisciplina(actual.nombre) === "CUARTOS"
+      ? { ...body, tipo_marcador: "TANTOS" } : body;
     const tipoMarcador = body.tipo_marcador === undefined ? null
-      : leerEnum(body, "tipo_marcador", actual, TIPOS_MARCADOR, { porDefecto: "TANTOS", etiqueta: "la forma de cargar el resultado" });
+      : leerEnum(marcadorPedido, "tipo_marcador", actual, TIPOS_MARCADOR, { porDefecto: "TANTOS", etiqueta: "la forma de cargar el resultado" });
     // Cómo se compite (partidos 1 contra 1, categorías por tiempo, pesca o mesas): también es propio del deporte.
     const formato = body.formato_competencia === undefined || body.formato_competencia === null ? null
       : await leerFormatoCompetencia(db, olimpiadaId, disciplinaId, body, actual.nombre);
@@ -1959,6 +1961,49 @@ function leerOrigen(body, base, lado) {
   return { tipo, partidoOrigen, zona, posicion };
 }
 
+function leerMarcadorPartido(body, base, estado) {
+  const reinicio = estado === "PROGRAMADO" && body.resultado1 === null && body.resultado2 === null;
+  const guardados = leerParciales(base.sets);
+  const cuartos = body.cuartos === undefined ? guardados?.cuartos : body.cuartos;
+  if (cuartos != null && !reinicio) {
+    if (body.sets != null) throw crearErrorHttp("No se pueden combinar sets y cuartos");
+    const parciales = normalizarCuartos(cuartos, estado);
+    let total1 = 0;
+    let total2 = 0;
+    for (const [puntos1, puntos2] of parciales) {
+      total1 += puntos1;
+      total2 += puntos2;
+    }
+    return { resultado1: String(total1), resultado2: String(total2), sets: JSON.stringify({ cuartos: parciales }) };
+  }
+  const sets = normalizarSets(body.sets);
+  if (sets) {
+    const [resultado1, resultado2] = contarSets(sets).map(String);
+    return { resultado1, resultado2, sets: JSON.stringify(sets) };
+  }
+  const borrarCuartos = body.cuartos === null && !!guardados?.cuartos;
+  return {
+    resultado1: borrarCuartos ? null : leerTexto(body, "resultado1", base, { maximo: 20, etiqueta: "el resultado 1" }),
+    resultado2: borrarCuartos ? null : leerTexto(body, "resultado2", base, { maximo: 20, etiqueta: "el resultado 2" }),
+    sets: reinicio || borrarCuartos || sets === null ? null : base.sets ?? null,
+  };
+}
+
+function validarModoCuartos(marcador, disciplina) {
+  if (leerParciales(marcador.sets)?.cuartos && tipoMarcadorDisciplina(disciplina.nombre, disciplina.tipo_marcador) !== "CUARTOS") {
+    throw crearErrorHttp("Esta disciplina no usa un marcador por cuartos");
+  }
+}
+
+function ganadorDelMarcador(body, base, marcador, estado) {
+  const elegido = leerGanador(body.ganador);
+  if (estado !== "FINALIZADO") return null;
+  if (elegido != null) return elegido;
+  const editaPuntajes = ["resultado1", "resultado2", "sets", "cuartos"].some(campo => body[campo] !== undefined);
+  if (elegido === undefined && !editaPuntajes && base.estado === "FINALIZADO" && base.ganador != null) return base.ganador;
+  return calcularGanadorPartido(marcador.resultado1, marcador.resultado2);
+}
+
 function leerPartido(body, base, { completo = false } = {}) {
   const datos = {
     disciplina_id: leerIdOpcional(body, "disciplina_id", base, { etiqueta: "la disciplina" }),
@@ -1999,19 +2044,15 @@ function leerPartido(body, base, { completo = false } = {}) {
   if (datos.hora_inicio && datos.hora_fin && datos.hora_fin <= datos.hora_inicio) throw crearErrorHttp('La hora de fin debe ser posterior al inicio');
   if (completo) {
     datos.estado = leerEnum(body, "estado", base, ESTADOS_PARTIDO, { porDefecto: "PROGRAMADO", etiqueta: "el estado" });
-    datos.resultado1 = leerTexto(body, "resultado1", base, { maximo: 20, etiqueta: "el resultado 1" });
-    datos.resultado2 = leerTexto(body, "resultado2", base, { maximo: 20, etiqueta: "el resultado 2" });
-    const ganador = leerGanador(body.ganador);
-    datos.ganador = ganador === undefined ? base.ganador ?? null : ganador;
-    const sets = normalizarSets(body.sets);
-    datos.sets = sets === undefined ? base.sets ?? null : sets ? JSON.stringify(sets) : null;
-    if (sets) [datos.resultado1, datos.resultado2] = contarSets(sets).map(String);
+    Object.assign(datos, leerMarcadorPartido(body, base, datos.estado));
+    datos.ganador = ganadorDelMarcador(body, base, datos, datos.estado);
   }
   return datos;
 }
 
 async function validarReferenciasPartido(conexion, olimpiadaId, datos, anterior = {}) {
-  await validarDisciplinaDeOlimpiada(conexion, olimpiadaId, datos.disciplina_id);
+  const disciplina = await validarDisciplinaDeOlimpiada(conexion, olimpiadaId, datos.disciplina_id);
+  if (Number(datos.disciplina_id) !== Number(anterior.disciplina_id) || datos.sets !== anterior.sets) validarModoCuartos(datos, disciplina);
   await validarSedeDeOlimpiada(conexion, olimpiadaId, datos.sede_id);
   if (datos.torneo_id) {
     const [[torneo]] = await conexion.query('SELECT id FROM olimpiada_torneo WHERE id = ? AND olimpiada_id = ? AND disciplina_id = ? AND eliminado = 0', [datos.torneo_id, olimpiadaId, datos.disciplina_id]);
@@ -2398,12 +2439,6 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)", verificarAccesoCompeticion, 
     await autorizarPartido(cabecera, actual.olimpiada_id, actual.disciplina_id);
     const camposVeedor = esVoluntario(cabecera) ? camposEdicionPartidoVeedor(body, actual) : null;
     const datos = leerPartido(body, actual, { completo: true });
-    if ((body.resultado1 !== undefined || body.resultado2 !== undefined || body.sets !== undefined) && body.ganador === undefined) datos.ganador = null;
-    // Finalizado sin ganador definido y con marcador numérico → se calcula (igual que /resultado).
-    if (datos.estado === "FINALIZADO" && datos.ganador === null) {
-      datos.ganador = calcularGanadorPartido(datos.resultado1, datos.resultado2);
-    }
-    if (datos.estado !== "FINALIZADO") datos.ganador = null;
     let efectos = null;
     await enTransaccion(async (connection) => {
       await validarReferenciasPartido(connection, actual.olimpiada_id, datos, actual);
@@ -2444,7 +2479,7 @@ const MENSAJE_RESULTADO = {
   SUSPENDIDO: "Partido suspendido.",
 };
 
-const CAMPOS_RESULTADO = ['estado', 'resultado1', 'resultado2', 'sets', 'ganador'];
+const CAMPOS_RESULTADO = ['estado', 'resultado1', 'resultado2', 'sets', 'cuartos', 'ganador'];
 
 router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCompeticion, async (req, res) => {
   const cabecera = getCabecera(req);
@@ -2462,18 +2497,13 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCom
         return res.status(409).json("Marcá el inicio del partido antes de cargar un resultado parcial.");
       }
     }
-    let resultado1 = leerTexto(body, "resultado1", actual, { maximo: 20, etiqueta: "el resultado 1" });
-    let resultado2 = leerTexto(body, "resultado2", actual, { maximo: 20, etiqueta: "el resultado 2" });
-    // Por sets: el resultado global (2 a 0) sale de contar los sets ganados por cada lado.
-    const setsLeidos = normalizarSets(body.sets);
-    let sets = setsLeidos === undefined ? actual.sets ?? null : setsLeidos ? JSON.stringify(setsLeidos) : null;
-    if (setsLeidos) [resultado1, resultado2] = contarSets(setsLeidos).map(String);
-    if (estado === "PROGRAMADO" && body.sets === undefined && body.resultado1 === null && body.resultado2 === null) sets = null;
-    let ganador = leerGanador(body.ganador);
-    if (ganador === undefined || ganador === null) {
-      ganador = estado === "FINALIZADO" ? calcularGanadorPartido(resultado1, resultado2) : null;
+    const marcador = leerMarcadorPartido(body, actual, estado);
+    const { resultado1, resultado2, sets } = marcador;
+    const conCuartos = !!leerParciales(sets)?.cuartos;
+    if (conCuartos && body.cuartos !== undefined) {
+      validarModoCuartos(marcador, await validarDisciplinaDeOlimpiada(db, actual.olimpiada_id, actual.disciplina_id));
     }
-    if (estado !== 'FINALIZADO') ganador = null;
+    const ganador = ganadorDelMarcador(body, actual, marcador, estado);
     const nuevo = { estado, resultado1, resultado2, ganador, sets };
     let efectos = null;
     await enTransaccion(async (connection) => {

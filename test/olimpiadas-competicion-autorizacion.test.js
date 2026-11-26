@@ -47,7 +47,7 @@ async function servidor(t, opciones = {}) {
       if (asignadas) assert.match(sql, /p\.disciplina_id IN \(\?\)/);
       return [contexto.partidos.filter((p) => !asignadas || asignadas.includes(p.disciplina_id))];
     }
-    if (/FROM olimpiada_disciplina_config c/.test(sql)) return [[{ id: 4, olimpiada_id: 7, nombre: "Vóley", tipo_id: 1 }, { id: 5, olimpiada_id: 7, nombre: "Fútbol", tipo_id: 1 }]];
+    if (/FROM olimpiada_disciplina_config c/.test(sql)) return [opciones.disciplinas || [{ id: 4, olimpiada_id: 7, nombre: "Vóley", tipo_id: 1 }, { id: 5, olimpiada_id: 7, nombre: "Fútbol", tipo_id: 1 }]];
     if (/FROM olimpiada_torneo t/.test(sql)) return [[]];
     if (/SELECT id, logo_archivo FROM departamental/.test(sql)) return [[]];
     // Equipos interdepartamentales y escudos que acompañan al fixture.
@@ -136,9 +136,7 @@ test("veedor: la estructura de su propia disciplina también queda reservada a l
   ]) assert.equal((await pedir(url, { method, body })).status, 403, `${method} ${url} ${JSON.stringify(body)}`);
 });
 
-test("veedor: un partido sólo sale en vivo al iniciar, conserva los sets al suspender y permite reanudar", async (t) => {
-  const encuentro = { ...partido, hora_inicio: "00:00:00", hora_fin: "23:59:00" };
-  const { pedir, contexto } = await servidor(t, { partidos: [encuentro] });
+function simularEscrituraResultado(contexto, encuentro) {
   contexto.conexion = {
     beginTransaction() {}, commit() {}, rollback() {}, release() {},
     async query(sql, params) {
@@ -151,6 +149,12 @@ test("veedor: un partido sólo sale en vivo al iniciar, conserva los sets al sus
       return contexto.query(sql, params);
     },
   };
+}
+
+test("veedor: un partido sólo sale en vivo al iniciar, conserva los sets al suspender y permite reanudar", async (t) => {
+  const encuentro = { ...partido, hora_inicio: "00:00:00", hora_fin: "23:59:00" };
+  const { pedir, contexto } = await servidor(t, { partidos: [encuentro] });
+  simularEscrituraResultado(contexto, encuentro);
   const guardar = body => pedir("/olimpiadas/partidos/44/resultado", { method: "PUT", body });
   const enJuego = async () => (await (await pedir("/olimpiadas/publico/7/en-vivo", { anonimo: true })).json()).en_juego.map(p => p.id);
   assert.deepEqual(await enJuego(), []);
@@ -164,6 +168,34 @@ test("veedor: un partido sólo sale en vivo al iniciar, conserva los sets al sus
   assert.equal((await guardar({ estado: "EN_JUEGO" })).status, 200);
   assert.deepEqual(await enJuego(), [44]);
   assert.equal(encuentro.sets, "[[25,19]]");
+});
+
+test("básquet: el veedor carga parciales, corrige el resultado y el fixture público muestra los totales", async t => {
+  const disciplina = { id: 4, nombre: "Basquet Masculino", tipo_marcador: "TANTOS" };
+  const encuentro = { ...partido, estado: "EN_JUEGO", disciplina_nombre: disciplina.nombre, tipo_marcador: "TANTOS" };
+  const { pedir, contexto } = await servidor(t, { partidos: [encuentro], disciplinas: [disciplina] });
+  simularEscrituraResultado(contexto, encuentro);
+  const guardar = body => pedir("/olimpiadas/partidos/44/resultado", { method: "PUT", body });
+  const parciales = [[0, 16], [20, 15], [19, 14], [18, 14]];
+
+  assert.equal((await guardar({ estado: "EN_JUEGO", cuartos: parciales.slice(0, 1) })).status, 200);
+  assert.deepEqual([encuentro.resultado1, encuentro.resultado2], ["0", "16"]);
+  assert.equal((await guardar({ estado: "SUSPENDIDO" })).status, 200);
+  assert.equal((await guardar({ estado: "FINALIZADO" })).status, 400);
+  assert.equal((await guardar({ estado: "FINALIZADO", cuartos: parciales, resultado1: "99", ganador: 1 })).status, 200);
+  assert.deepEqual([encuentro.resultado1, encuentro.resultado2, encuentro.ganador], ["57", "59", 1]);
+  assert.equal((await guardar({ estado: "FINALIZADO" })).status, 200);
+  assert.equal(encuentro.ganador, 1);
+  assert.equal((await guardar({ estado: "FINALIZADO", cuartos: parciales })).status, 200);
+  assert.equal(encuentro.ganador, 2);
+  parciales[0] = [5, 16];
+  assert.equal((await guardar({ estado: "FINALIZADO", cuartos: parciales })).status, 200);
+  const fixture = await (await pedir("/olimpiadas/publico/7/fixture", { anonimo: true })).json();
+  assert.equal(fixture.disciplinas[0].tipo_marcador, "CUARTOS");
+  const p = fixture.partidos[0];
+  assert.deepEqual([p.tipo_marcador, p.cuartos, p.sets, p.resultado1, p.resultado2, p.ganador], ["CUARTOS", parciales, null, "62", "59", 1]);
+  assert.equal((await guardar({ estado: "PROGRAMADO", resultado1: null, resultado2: null })).status, 200);
+  assert.deepEqual([encuentro.resultado1, encuentro.resultado2, encuentro.sets, encuentro.ganador], [null, null, null, null]);
 });
 
 test("competición: sólo administración puede publicar nombres, gestionar catálogos o leer el portal privado", async (t) => {
