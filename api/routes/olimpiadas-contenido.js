@@ -11,6 +11,7 @@ const express = require("express");
 const mysqlConnection = require("../connection/connection");
 const { registrarErrorRuta } = require("../services/errores");
 const { normalizarFechaCivil } = require("../services/valores-dominio");
+const drive = require("../services/olimpiadas-drive");
 const {
   leerEtiquetas, leerDepartamentales, nombresDepartamentales, opcionesPartidos, SELECT_FOTO, serializarFoto, listarFotos,
 } = require("../services/olimpiadas-fotos");
@@ -3059,23 +3060,40 @@ router.get("/olimpiadas/:id(\\d+)/fotos/partidos", verifyTokenMultimedia, soloGe
   } catch (error) { responderError(res, error, "No se pudieron cargar los partidos de la galería"); }
 });
 
-router.post("/olimpiadas/:id(\\d+)/fotos", verifyTokenMultimedia, soloGestionMultimedia, manejarUploadFotos, async (req, res) => {
+router.post("/olimpiadas/:id(\\d+)/drive/listar", verifyTokenMultimedia, soloGestionMultimedia, async (req, res) => {
+  try {
+    await cargarOlimpiada(db, idDeRuta(req.params.id), getCabecera(req));
+    const carpeta = await drive.listarCarpeta(req.body?.url);
+    res.set("Cache-Control", "no-store").json({ archivos: Array.from(carpeta.values(),
+      ({ id, nombre, tipo, miniatura_url, vista_url }) => ({ id, nombre, tipo, miniatura_url, vista_url })) });
+  } catch (error) { responderError(res, error, "No se pudo leer la carpeta de Drive"); }
+});
+
+async function recibirFotos(req, res, desdeDrive) {
   const cabecera = getCabecera(req);
   try {
     const olimpiadaId = idDeRuta(req.params.id);
     await cargarOlimpiada(db, olimpiadaId, cabecera);
-    const archivos = archivosDeSlot(req, "FOTOS");
-    if (archivos.length === 0) return res.status(400).json("Adjuntá al menos una foto en el campo FOTOS");
     const comunes = leerCamposFoto(req.body || {}, { conEpigrafe: true });
     await validarPartidoFoto(db, comunes, [olimpiadaId]);
     await validarDepartamentalesFoto(db, comunes);
     const [partido] = await opcionesPartidos(db, olimpiadaId, consultarPartidos, comunes.partido_id ? [comunes.partido_id] : []);
     const disciplina = await validarDisciplinaCatalogo(db, comunes.disciplina_id);
     if (disciplina) comunes.disciplina_nombre = disciplina.nombre;
+    let archivos = archivosDeSlot(req, "FOTOS");
+    const idsCarga = desdeDrive
+      ? leerIdsCarga(req.body?.carga_id == null ? null : JSON.stringify([req.body.carga_id]), 1)
+      : leerIdsCarga(req.body?.carga_ids, archivos.length);
+    if (desdeDrive) {
+      const foto = await drive.archivoSeleccionado(req.body, "foto");
+      const buffer = await drive.juntar(await drive.descargar(foto, MAX_FOTO_BYTES));
+      archivos = [{ fieldname: "FOTOS", originalname: foto.nombre, mimetype: foto.mime, buffer, maxBytesPermitidos: MAX_FOTO_BYTES }];
+    }
+    if (archivos.length === 0) return res.status(400).json("Adjuntá al menos una foto en el campo FOTOS");
     const [[ultimo]] = await db.query("SELECT COALESCE(MAX(orden), 0) AS orden FROM olimpiada_foto WHERE olimpiada_id = ?", [olimpiadaId]);
     const { fotos, errores, nuevas } = await procesarLoteFotos({
       archivos,
-      idsCarga: leerIdsCarga(req.body?.carga_ids, archivos.length),
+      idsCarga,
       olimpiadaId,
       comunes,
       usuarioId: cabecera.id,
@@ -3105,7 +3123,12 @@ router.post("/olimpiadas/:id(\\d+)/fotos", verifyTokenMultimedia, soloGestionMul
   } catch (error) {
     responderError(res, error, "No se pudieron subir las fotos");
   }
-});
+}
+
+router.post("/olimpiadas/:id(\\d+)/fotos", verifyTokenMultimedia, soloGestionMultimedia, manejarUploadFotos,
+  (req, res) => recibirFotos(req, res, false));
+router.post("/olimpiadas/:id(\\d+)/drive/foto", verifyTokenMultimedia, soloGestionMultimedia,
+  (req, res) => recibirFotos(req, res, true));
 
 // Literal antes que /olimpiadas/fotos/:fotoId
 router.put("/olimpiadas/fotos/lote", verifyTokenMultimedia, soloGestionMultimedia, async (req, res) => {

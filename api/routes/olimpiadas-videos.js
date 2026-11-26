@@ -7,6 +7,7 @@
  */
 const express = require('express');
 const crypto = require('crypto');
+const drive = require('../services/olimpiadas-drive');
 const { CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
 const {
   s3, bucketName, getCabecera, crearErrorHttp, responderError,
@@ -28,6 +29,26 @@ function detectarVideo(buffer) {
 }
 
 function partesTotales(bytes) { return Math.max(1, Math.ceil(Number(bytes) / TAMANO_PARTE)); }
+
+// Drive puede entregar bloques de cualquier tamaño y omitir Content-Length. Mantener sólo una
+// parte en memoria permite subir a S3 mientras llegan los bytes y verificar el límite real.
+async function* agruparPartes(flujo) {
+  let parte, usados = 0;
+  for await (const bloque of flujo) {
+    for (let pos = 0; pos < bloque.length;) {
+      parte ??= Buffer.allocUnsafe(TAMANO_PARTE);
+      const n = bloque.copy(parte, usados, pos, pos + TAMANO_PARTE - usados);
+      pos += n;
+      usados += n;
+      if (usados === TAMANO_PARTE) {
+        yield parte;
+        parte = null;
+        usados = 0;
+      }
+    }
+  }
+  if (usados) yield parte.subarray(0, usados);
+}
 
 function leerPartes(valor) {
   try { const partes = JSON.parse(valor || '[]'); return Array.isArray(partes) ? partes : []; } catch (_error) { return []; }
@@ -82,6 +103,16 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
     catch (_error) { /* Sin permiso para abortar, las partes sueltas quedan huérfanas en S3; no afecta al sistema. */ }
   }
 
+  async function completarSubida(key, uploadId, partes, bytes) {
+    try {
+      await clienteS3.send(new CompleteMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: uploadId, MultipartUpload: { Parts: partes } }));
+    } catch (error) {
+      // S3 puede haber ensamblado el objeto aunque se haya perdido la confirmación.
+      const objeto = await clienteS3.send(new HeadObjectCommand({ Bucket: bucket, Key: key })).catch(() => null);
+      if (!objeto || Number(objeto.ContentLength) !== Number(bytes)) throw error;
+    }
+  }
+
   function leerDatos(body, base) {
     return {
       titulo: leerTexto(body, 'titulo', base, { maximo: 160, requerido: true, etiqueta: 'el título del video' }),
@@ -90,6 +121,77 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
       orden: leerEntero(body, 'orden', base, { etiqueta: 'el orden' }),
     };
   }
+
+  router.post('/olimpiadas/:id(\\d+)/drive/video', verifyTokenMultimedia, soloGestionMultimedia, endpoint(async (req, res) => {
+    const cabecera = getCabecera(req), olimpiadaId = idDeRuta(req.params.id);
+    await cargarOlimpiada(db, olimpiadaId, cabecera);
+    const body = req.body || {};
+    const carga = body.carga_id ?? crypto.randomUUID();
+    if (typeof carga !== 'string' || !/^[a-f\d]{8}-[a-f\d]{4}-4[a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i.test(carga)) {
+      throw crearErrorHttp('Identificador de carga inválido');
+    }
+    const prefijo = `olimpiadas/videos/${olimpiadaId}/drive/${cabecera.id}/${carga.toLowerCase()}/`;
+    async function buscarCarga(conexion) {
+      const [[video]] = await conexion.query("SELECT id, archivo FROM olimpiada_video WHERE olimpiada_id = ? AND archivo LIKE ? AND eliminado = 0 AND estado = 'LISTO' LIMIT 1",
+        [olimpiadaId, prefijo + '%']);
+      return video;
+    }
+    async function cupo(conexion) {
+      const [[cuenta]] = await conexion.query('SELECT COUNT(*) AS cantidad, COALESCE(MAX(orden), 0) AS orden FROM olimpiada_video WHERE olimpiada_id = ? AND eliminado = 0', [olimpiadaId]);
+      if (Number(cuenta.cantidad) >= MAX_VIDEOS_POR_EDICION) throw crearErrorHttp(`Una edición admite hasta ${MAX_VIDEOS_POR_EDICION} videos`);
+      return Number(cuenta.orden) + 1;
+    }
+    const confirmar = video => res.status(201).json({ success: true, id: video.id, message: 'Video importado' });
+    const anterior = await buscarCarga(db);
+    if (anterior) return confirmar(anterior);
+    await cupo(db);
+    const origen = await drive.archivoSeleccionado(body, 'video');
+    const datos = leerDatos(body, { titulo: origen.nombre.replace(/\.(mp4|webm|mov)$/i, '').trim().slice(0, 160) || 'Video' });
+    const key = prefijo + crypto.randomUUID() + '.' + TIPOS_VIDEO[origen.mime];
+    const destino = { Bucket: bucket, Key: key };
+    let uploadId, completado = false, bytes = 0;
+    const partes = [];
+    try {
+      for await (const parte of agruparPartes(await drive.descargar(origen, MAX_VIDEO_BYTES))) {
+        if (!uploadId) {
+          const tipo = detectarVideo(parte);
+          if (!tipo || (tipo === 'video/webm') !== (origen.mime === 'video/webm')) throw crearErrorHttp('El archivo no es un video válido para ese formato.');
+          const subida = await clienteS3.send(new CreateMultipartUploadCommand({ ...destino, ContentType: origen.mime }));
+          uploadId = subida.UploadId;
+          if (!uploadId) throw crearErrorHttp('No se pudo iniciar la subida del video', 502);
+        }
+        const numero = partes.length + 1;
+        const { ETag } = await clienteS3.send(new UploadPartCommand({ ...destino, UploadId: uploadId, PartNumber: numero, Body: parte, ContentLength: parte.length }));
+        if (!ETag) throw crearErrorHttp('No se pudo guardar la parte del video', 502);
+        partes.push({ ETag, PartNumber: numero });
+        bytes += parte.length;
+      }
+      if (!bytes) throw crearErrorHttp('El video está vacío.');
+      await completarSubida(key, uploadId, partes, bytes);
+      completado = true;
+      const video = await enTransaccion(async conexion => {
+        await cargarOlimpiada(conexion, olimpiadaId, cabecera, { forUpdate: true });
+        const guardado = await buscarCarga(conexion);
+        if (guardado) return guardado;
+        const orden = await cupo(conexion);
+        const [insert] = await conexion.query(
+          "INSERT INTO olimpiada_video (olimpiada_id, titulo, descripcion, fecha, archivo, mime, bytes, orden, estado, usuario_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'LISTO', ?)",
+          [olimpiadaId, datos.titulo, datos.descripcion, datos.fecha, key, origen.mime, bytes, orden, cabecera.id]);
+        await historial(conexion, cabecera, { entidad: 'VIDEO', entidad_id: insert.insertId, olimpiada_id: olimpiadaId, tipo_operacion: 'CREATE', valor_nuevo: datos.titulo });
+        return { id: insert.insertId, archivo: key };
+      });
+      if (video.archivo !== key) await eliminarObjetosS3Seguro([key]);
+      confirmar(video);
+    } catch (error) {
+      if (!completado && uploadId) await abortarSubida({ archivo: key, subida_id: uploadId });
+      if (completado) {
+        const guardado = await buscarCarga(db);
+        if (guardado?.archivo !== key) await eliminarObjetosS3Seguro([key]);
+        if (guardado) return confirmar(guardado);
+      }
+      throw error;
+    }
+  }, 'No se pudo importar el video desde Drive'));
 
   router.get('/olimpiadas/:id(\\d+)/videos', verifyTokenMultimedia, endpoint(async (req, res) => {
     const cabecera = getCabecera(req), olimpiadaId = idDeRuta(req.params.id);
@@ -167,16 +269,7 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
       if (partes.length !== total || partes.some((parte, indice) => Number(parte.n) !== indice + 1)) {
         throw crearErrorHttp(`Faltan partes del video (${partes.length} de ${total}). Volvé a intentar la subida.`, 409);
       }
-      try {
-        await clienteS3.send(new CompleteMultipartUploadCommand({
-          Bucket: bucket, Key: video.archivo, UploadId: video.subida_id,
-          MultipartUpload: { Parts: partes.map(parte => ({ PartNumber: Number(parte.n), ETag: parte.e })) },
-        }));
-      } catch (error) {
-        // S3 puede haber ensamblado el objeto aunque se haya cortado la respuesta o fallado el commit.
-        const objeto = await clienteS3.send(new HeadObjectCommand({ Bucket: bucket, Key: video.archivo })).catch(() => null);
-        if (!objeto || Number(objeto.ContentLength) !== Number(video.bytes)) throw error;
-      }
+      await completarSubida(video.archivo, video.subida_id, partes.map(parte => ({ PartNumber: Number(parte.n), ETag: parte.e })), video.bytes);
       await connection.query("UPDATE olimpiada_video SET estado = 'LISTO', subida_id = NULL, partes = NULL WHERE id = ?", [video.id]);
       await historial(connection, cabecera, { entidad: 'VIDEO', entidad_id: video.id, olimpiada_id: video.olimpiada_id, tipo_operacion: 'CREATE', valor_nuevo: video.titulo });
       return video;
