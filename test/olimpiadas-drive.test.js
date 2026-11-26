@@ -99,8 +99,15 @@ test("distingue carpetas hermanas homónimas de forma estable y respeta nombres 
 test("Prensa puede importar una selección, conserva metadata y los reintentos no duplican archivos", async t => {
   const realFetch = global.fetch;
   const png = await sharp({ create: { width: 4, height: 4, channels: 3, background: "#36a" } }).png().toBuffer();
-  const binario = Buffer.alloc(8 * 1024 * 1024 + 16);
-  binario.write("ftypisom", 4);
+  const mib = 1024 * 1024;
+  const bloque = Buffer.alloc(8 * mib);
+  bloque.write("ftypisom", 4);
+  let bytesVideo = 500 * mib;
+  async function* flujoVideo() {
+    for (let restantes = bytesVideo; restantes > 0; restantes -= bloque.length) {
+      yield bloque.subarray(0, Math.min(bloque.length, restantes));
+    }
+  }
   const lecturas = [];
   let permisoConcedido = false;
   t.mock.method(global, "fetch", async destino => {
@@ -126,19 +133,24 @@ test("Prensa puede importar una selección, conserva metadata y los reintentos n
       assert.equal(destino.searchParams.get("resourcekey"), "clave-foto");
       return new Response(png, { headers: { "content-type": "image/png" } });
     }
-    return new Response(binario, { headers: { "content-type": "video/mp4" } });
+    return new Response(flujoVideo(), { headers: { "content-type": "video/mp4" } });
   });
   const partes = [], imagenes = [];
-  t.mock.method(s3, "send", async comando => {
+  let abortos = 0;
+  // El mock de node:test conservaría los cuerpos de todas las partes hasta finalizar.
+  const enviarS3 = s3.send;
+  t.after(() => { s3.send = enviarS3; });
+  s3.send = async comando => {
     const args = comando.input;
     switch (comando.constructor.name) {
       case "PutObjectCommand": imagenes.push([args.Key, args.ContentType]); return {};
       case "CreateMultipartUploadCommand": return { UploadId: "upload-test" };
       case "UploadPartCommand": partes.push(args.ContentLength); return { ETag: "e" + args.PartNumber };
-      case "CompleteMultipartUploadCommand": assert.equal(args.MultipartUpload.Parts.length, 2); return {};
+      case "CompleteMultipartUploadCommand": assert.equal(args.MultipartUpload.Parts.length, 63); return {};
+      case "AbortMultipartUploadCommand": abortos++; return {};
       default: throw Error(comando.constructor.name);
     }
-  });
+  };
   const app = express();
   app.use(express.json(), router);
   const server = await new Promise(resolve => { const s = app.listen(0, "127.0.0.1", () => resolve(s)); });
@@ -161,10 +173,17 @@ test("Prensa puede importar una selección, conserva metadata y los reintentos n
   assert.deepEqual(imagenes.map(i => i[1]), ["image/webp", "image/webp"]);
   assert.equal(foto.epigrafe, "Final");
   const datosVideo = { url, archivoId: "video000001", carga_id: randomUUID() };
-  for (let i = 0; i < 2; i++) assert.equal((await post("2/drive/video", datosVideo)).status, 201);
-  assert.equal(video.titulo, "Resumen");
-  assert.equal(video.bytes, binario.length);
-  assert.deepEqual(partes, [8 * 1024 * 1024, 16]);
+  await t.test("acepta 500 MiB exactos y aborta la transferencia al superar el límite sin Content-Length", async () => {
+    for (let i = 0; i < 2; i++) assert.equal((await post("2/drive/video", datosVideo)).status, 201);
+    assert.equal(video.titulo, "Resumen");
+    assert.equal(video.bytes, 500 * mib);
+    assert.deepEqual(partes, [...Array(62).fill(8 * mib), 4 * mib]);
+    bytesVideo++;
+    const excedido = await post("2/drive/video", { ...datosVideo, carga_id: randomUUID() });
+    assert.equal(excedido.status, 413);
+    assert.match(await excedido.json(), /máximo de 500/);
+    assert.equal(abortos, 1);
+  });
   assert.deepEqual(historial, ["FOTO", "VIDEO"]);
   permisoConcedido = true;
   const actualizado = await post("2/drive/listar", { url });

@@ -16,6 +16,7 @@ const {
 
 const TAMANO_PARTE = 8 * 1024 * 1024;
 const MAX_VIDEO_BYTES = 200 * 1024 * 1024;
+const MAX_VIDEO_DRIVE_BYTES = 500 * 1024 * 1024;
 const MAX_VIDEOS_POR_EDICION = 40;
 const EXPIRACION_VIDEO_SEGUNDOS = 6 * 60 * 60;
 const TIPOS_VIDEO = { 'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov' };
@@ -152,7 +153,7 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
     let uploadId, completado = false, bytes = 0;
     const partes = [];
     try {
-      for await (const parte of agruparPartes(await drive.descargar(origen, MAX_VIDEO_BYTES))) {
+      for await (const parte of agruparPartes(await drive.descargar(origen, MAX_VIDEO_DRIVE_BYTES))) {
         if (!uploadId) {
           const tipo = detectarVideo(parte);
           if (!tipo || (tipo === 'video/webm') !== (origen.mime === 'video/webm')) throw crearErrorHttp('El archivo no es un video válido para ese formato.');

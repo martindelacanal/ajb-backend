@@ -128,7 +128,7 @@ El historial registra actor, fecha, campo y valores anteriores/nuevos de partido
 
 ## Videos
 
-Cada edición admite hasta 40 videos MP4, WebM o MOV de hasta 200 MiB por archivo. La API registra los metadatos en `olimpiada_video` y guarda los videos en S3 bajo `olimpiadas/videos/`.
+Cada edición admite hasta 40 videos MP4, WebM o MOV. El límite por video es de 500 MiB al importar desde Google Drive y de 200 MiB al subir un archivo desde el dispositivo. La API registra los metadatos en `olimpiada_video` y guarda los videos en S3 bajo `olimpiadas/videos/`.
 
 El navegador inicia la carga con `POST /olimpiadas/:id/videos` y envía partes de 8 MiB mediante `PUT /olimpiadas/videos/:videoId/partes/:n`. La API verifica el formato en la primera parte y envía a S3 cada parte con su número. Se puede reintentar una parte individual y también la confirmación final mediante `POST /olimpiadas/videos/:videoId/completar`. Para cancelar una subida pendiente se usa `DELETE /olimpiadas/videos/:videoId?cancelar=1`.
 
