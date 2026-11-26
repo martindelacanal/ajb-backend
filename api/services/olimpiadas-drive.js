@@ -1,6 +1,7 @@
 "use strict";
 
 const { crearErrorHttp } = require("./olimpiadas-comun");
+const { obtenerFechaCivilArgentina } = require("./valores-dominio");
 
 const ID_DRIVE = /^[\w-]{10,160}$/;
 const CLAVE_DRIVE = /^[\w-]{1,200}$/;
@@ -220,7 +221,8 @@ async function recorrerCarpetas(raiz) {
         if (!listado) continue;
         const ruta = lote[i].ruta;
         for (const archivo of listado.archivos.values()) {
-          if (!archivos.has(archivo.id)) archivos.set(archivo.id, { ...archivo, ruta_carpetas: ruta });
+          if (!archivos.has(archivo.id)) archivos.set(archivo.id, { ...archivo, ruta_carpetas: ruta,
+            carpeta_origen: { id: lote[i].id, clave: lote[i].clave } });
         }
         if (archivos.size > MAX_ARCHIVOS) throw crearErrorHttp(ARBOL_GRANDE, 413);
         for (const subcarpeta of listado.subcarpetas) {
@@ -269,6 +271,49 @@ async function archivoSeleccionado(body, tipo) {
   return archivo;
 }
 
+// La vista embebida sólo muestra la última modificación. La vista completa incluye los
+// metadatos de los hijos: el índice 9 es createdTime y el 10 es modifiedTime.
+function leerFechasCreacion(html, carpeta, archivos) {
+  const contenido = html.match(/window\['_DRIVE_ivd'\]\s*=\s*'([\s\S]*?)';/)?.[1];
+  if (!contenido) return new Map();
+  const json = contenido.replace(/\\(?:x([\da-f]{2})|u([\da-f]{4})|(['"\\/]))/gi, (_, hex, unicode, literal) =>
+    literal ?? String.fromCharCode(parseInt(hex || unicode, 16)));
+  const filas = JSON.parse(json)?.[0];
+  const fechas = new Map();
+  for (const fila of Array.isArray(filas) ? filas : []) {
+    const archivo = archivos.get(fila?.[0]);
+    if (!archivo || typeof fila[2] !== "string" || archivo.nombre !== fila[2].trim() || archivo.mime !== fila[3] ||
+      !Array.isArray(fila[1]) || !fila[1].includes(carpeta.id) || !Number.isSafeInteger(fila[9]) || fila[9] <= 0) continue;
+    const fecha = new Date(fila[9]);
+    if (Number.isFinite(fecha.getTime())) fechas.set(archivo.id, obtenerFechaCivilArgentina(fecha));
+  }
+  return fechas;
+}
+
+async function fechasCreacionDrive(archivos) {
+  const porCarpeta = new Map();
+  for (const archivo of archivos.values()) {
+    if (archivo.carpeta_origen) porCarpeta.set(archivo.carpeta_origen.id, archivo.carpeta_origen);
+  }
+  const pendientes = [...porCarpeta.values()];
+  const fechas = new Map();
+  const plazo = AbortSignal.timeout(15000);
+  let bytes = 0;
+  async function leer(carpeta) {
+    try {
+      const url = enlaceDrive("https://drive.google.com/drive/folders/" + carpeta.id, "", carpeta.clave);
+      const respuesta = await pedirGoogle(url, plazo);
+      const html = await juntar(cuerpoLimitado(respuesta, 3 * 1024 * 1024, "Listado demasiado grande."));
+      bytes += html.length;
+      for (const [id, fecha] of leerFechasCreacion(html.toString("utf8"), carpeta, archivos)) fechas.set(id, fecha);
+    } catch { /* Las fechas son opcionales, incluso si Google sólo entrega la vista embebida. */ }
+  }
+  while (pendientes.length && !plazo.aborted && bytes < 32 * 1024 * 1024) {
+    await Promise.all(pendientes.splice(0, LISTADOS_SIMULTANEOS).map(leer));
+  }
+  return fechas;
+}
+
 async function descargar(archivo, limite) {
   const url = enlaceDescarga(archivo.id, archivo.clave);
   const signal = AbortSignal.timeout(5 * 60000);
@@ -288,4 +333,4 @@ async function descargar(archivo, limite) {
   return cuerpoLimitado(respuesta, limite, "El archivo supera el máximo de " + limite / 1024 / 1024 + " MB.");
 }
 
-module.exports = { listarCarpeta, archivoSeleccionado, descargar, juntar, recursoDeEnlace, leerListado, cuerpoLimitado };
+module.exports = { listarCarpeta, fechasCreacionDrive, archivoSeleccionado, descargar, juntar, recursoDeEnlace, leerListado, cuerpoLimitado };

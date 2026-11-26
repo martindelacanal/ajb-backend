@@ -79,7 +79,7 @@ ruta('portal', async (req, o) => {
   const [videos] = await db.query("SELECT id, titulo, url, descripcion FROM olimpiada_enlace WHERE olimpiada_id = ? AND eliminado = 0 AND tipo = 'VIDEOS' ORDER BY orden, id", [o.id]);
   const [nombres, popup_imagen_url, logo] = await Promise.all([listarNombresDisciplinas(db, o.id), obtenerUrlAvisoPublico(o.id), obtenerLogoPublico(o)]);
   const disciplinas = nombres.get(Number(o.id)) || [];
-  return { olimpiada: { ...edicionPublica(o), videos, disciplinas, popup_imagen_url, logo }, conteos, mi_inscripcion: null, hoteles_mi_departamental: [], departamental_id: null };
+  return { olimpiada: { ...edicionPublica(o), drive_publico_url: o.drive_publico_url ?? null, videos, disciplinas, popup_imagen_url, logo }, conteos, mi_inscripcion: null, hoteles_mi_departamental: [], departamental_id: null };
 });
 
 async function partidosFiltrados(req, o) {
@@ -119,7 +119,7 @@ ruta('medallero', async (req, o) => {
   const medallero = await lectura.armarMedallero(db, o);
   return { ...medallero, tabla: await conLogos(medallero.tabla) };
 });
-ruta('videos', (req, o) => lectura.listarVideos(db, o.id));
+ruta('videos', (req, o) => lectura.listarVideos(db, o.id, req.query));
 ruta('en-vivo', async (req, o) => {
   const partidos = partidosPublicos(await partidosFiltrados(req, o)), hoy = fechaHoyBuenosAires();
   return { actualizado: new Date().toISOString(), en_juego: partidos.filter(p => p.en_vivo), pruebas_en_juego: await lectura.pruebasEnJuego(db, o.id),

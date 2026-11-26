@@ -8,9 +8,10 @@
 const express = require('express');
 const crypto = require('crypto');
 const drive = require('../services/olimpiadas-drive');
+const { clasificacionGaleria, condicionesGaleria, tablaEtiquetas, opcionesPartidos, nombresDepartamentales } = require('../services/olimpiadas-fotos');
 const { CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
 const {
-  s3, bucketName, getCabecera, crearErrorHttp, responderError,
+  s3, bucketName, getCabecera, crearErrorHttp, responderError, esSuperior,
   firmarSeguro, subirImagenOptimizada, eliminarObjetosS3Seguro, manejarUploadOlimpiadas,
 } = require('../services/olimpiadas-comun');
 
@@ -20,6 +21,13 @@ const MAX_VIDEO_DRIVE_BYTES = 500 * 1024 * 1024;
 const MAX_VIDEOS_POR_EDICION = 40;
 const EXPIRACION_VIDEO_SEGUNDOS = 6 * 60 * 60;
 const TIPOS_VIDEO = { 'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov' };
+
+const CAMPOS_CLASIFICACION_VIDEO = ['epigrafe', 'disciplina_id', 'partido_id', 'etiquetas', 'departamentales'];
+const SELECT_VIDEO = `SELECT f.id, f.olimpiada_id, f.titulo, f.descripcion, f.fecha, f.archivo, f.poster_archivo,
+  f.mime, f.bytes, f.orden, f.fecha_creacion, f.epigrafe, f.disciplina_id, d.nombre AS disciplina_nombre,
+  p.id AS partido_id, f.etiquetas, f.departamentales FROM olimpiada_video f
+  LEFT JOIN olimpiada_disciplina d ON d.id = f.disciplina_id
+  LEFT JOIN olimpiada_partido p ON p.id = f.partido_id AND p.olimpiada_id = f.olimpiada_id AND p.eliminado = 0`;
 
 // El contenedor se reconoce por sus primeros bytes: MP4/MOV traen «ftyp»; WebM, la cabecera EBML.
 function detectarVideo(buffer) {
@@ -70,25 +78,40 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
   const endpoint = (fn, mensaje) => async (req, res) => { try { await fn(req, res); } catch (error) { responderError(res, error, mensaje); } };
   const cuerpoBinario = express.raw({ type: 'application/octet-stream', limit: TAMANO_PARTE + 1024 * 1024 });
 
-  async function serializar(fila) {
+  async function serializar(fila, partidoNombre, departamentales) {
     const [url, descargaUrl, posterUrl] = await Promise.all([
       firmarSeguro(fila.archivo, EXPIRACION_VIDEO_SEGUNDOS),
       firmarSeguro(fila.archivo, EXPIRACION_VIDEO_SEGUNDOS, disposicionDescarga(fila)),
       firmarSeguro(fila.poster_archivo, EXPIRACION_VIDEO_SEGUNDOS),
     ]);
     return {
-      id: fila.id, olimpiada_id: fila.olimpiada_id, titulo: fila.titulo, descripcion: fila.descripcion, fecha: fila.fecha,
+      id: fila.id, olimpiada_id: fila.olimpiada_id, titulo: fila.titulo, descripcion: fila.descripcion,
+      ...clasificacionGaleria(fila, partidoNombre, departamentales),
       url, descarga_url: descargaUrl, poster_url: posterUrl, mime: fila.mime, bytes: Number(fila.bytes) || 0, orden: fila.orden, fecha_creacion: fila.fecha_creacion,
     };
   }
 
-  async function listarVideos(conexion, olimpiadaId) {
-    const [rows] = await conexion.query(
-      `SELECT id, olimpiada_id, titulo, descripcion, fecha, archivo, poster_archivo, mime, bytes, orden, fecha_creacion
-       FROM olimpiada_video WHERE olimpiada_id = ? AND eliminado = 0 AND estado = 'LISTO' ORDER BY fecha IS NULL, fecha, orden, id`,
-      [olimpiadaId]
-    );
-    return Promise.all(rows.map(serializar));
+  async function serializarFilas(conexion, olimpiadaId, filas) {
+    const idsPartidos = [...new Set(filas.map(f => f.partido_id).filter(Boolean))];
+    const [partidos, departamentales] = await Promise.all([
+      opcionesPartidos(conexion, olimpiadaId, helpers.consultarPartidos, idsPartidos),
+      nombresDepartamentales(conexion, filas),
+    ]);
+    const nombres = new Map(partidos.map(p => [Number(p.id), p.nombre]));
+    return Promise.all(filas.map(f => serializar(f, nombres.get(Number(f.partido_id)), departamentales)));
+  }
+
+  async function listarVideos(conexion, olimpiadaId, query = {}, { gestion = false } = {}) {
+    const estadoVisible = gestion ? '' : " AND p.estado IN ('EN_JUEGO', 'FINALIZADO')";
+    const { condiciones, params } = condicionesGaleria(olimpiadaId, query, estadoVisible, tablaEtiquetas('COALESCE(f.etiquetas, JSON_ARRAY())'));
+    const [filas] = await conexion.query(`${SELECT_VIDEO}${estadoVisible} WHERE ${condiciones.join(' AND ')}
+      AND f.estado = 'LISTO' ORDER BY f.fecha IS NULL, f.fecha, f.orden, f.id`, params);
+    return serializarFilas(conexion, olimpiadaId, filas);
+  }
+
+  async function videoActualizado(video) {
+    const [filas] = await db.query(`${SELECT_VIDEO} WHERE f.id = ? AND f.eliminado = 0`, [video.id]);
+    return (await serializarFilas(db, video.olimpiada_id, filas))[0];
   }
 
   async function exigirVideo(videoId, { subiendo = false, conexion } = {}) {
@@ -123,6 +146,12 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
     };
   }
 
+  async function leerClasificacion(conexion, body, olimpiadaId, actual) {
+    const { cambios } = await helpers.clasificarMedio(conexion, body, olimpiadaId, actual);
+    return Object.fromEntries(CAMPOS_CLASIFICACION_VIDEO.filter(campo => campo in cambios).map(campo => [campo, cambios[campo]]));
+  }
+  const valoresClasificacion = datos => CAMPOS_CLASIFICACION_VIDEO.map(campo => datos[campo] ?? null);
+
   router.post('/olimpiadas/:id(\\d+)/drive/video', verifyTokenMultimedia, soloGestionMultimedia, endpoint(async (req, res) => {
     const cabecera = getCabecera(req), olimpiadaId = idDeRuta(req.params.id);
     await cargarOlimpiada(db, olimpiadaId, cabecera);
@@ -148,6 +177,7 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
     await cupo(db);
     const origen = await drive.archivoSeleccionado(body, 'video');
     const datos = leerDatos(body, { titulo: origen.nombre.replace(/\.(mp4|webm|mov)$/i, '').trim().slice(0, 160) || 'Video' });
+    const clasificacion = await leerClasificacion(db, body, olimpiadaId);
     const key = prefijo + crypto.randomUUID() + '.' + TIPOS_VIDEO[origen.mime];
     const destino = { Bucket: bucket, Key: key };
     let uploadId, completado = false, bytes = 0;
@@ -176,8 +206,9 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
         if (guardado) return guardado;
         const orden = await cupo(conexion);
         const [insert] = await conexion.query(
-          "INSERT INTO olimpiada_video (olimpiada_id, titulo, descripcion, fecha, archivo, mime, bytes, orden, estado, usuario_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'LISTO', ?)",
-          [olimpiadaId, datos.titulo, datos.descripcion, datos.fecha, key, origen.mime, bytes, orden, cabecera.id]);
+          `INSERT INTO olimpiada_video (olimpiada_id, titulo, descripcion, fecha, archivo, mime, bytes, orden, estado, usuario_id,
+            ${CAMPOS_CLASIFICACION_VIDEO.join(', ')}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'LISTO', ?, ?, ?, ?, ?, ?)`,
+          [olimpiadaId, datos.titulo, datos.descripcion, datos.fecha, key, origen.mime, bytes, orden, cabecera.id, ...valoresClasificacion(clasificacion)]);
         await historial(conexion, cabecera, { entidad: 'VIDEO', entidad_id: insert.insertId, olimpiada_id: olimpiadaId, tipo_operacion: 'CREATE', valor_nuevo: datos.titulo });
         return { id: insert.insertId, archivo: key };
       });
@@ -198,7 +229,7 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
     const cabecera = getCabecera(req), olimpiadaId = idDeRuta(req.params.id);
     await cargarOlimpiada(db, olimpiadaId, cabecera);
     res.set('Cache-Control', 'no-store');
-    res.json(await listarVideos(db, olimpiadaId));
+    res.json(await listarVideos(db, olimpiadaId, req.query, { gestion: esSuperior(cabecera) || cabecera.rol === 'prensa' }));
   }, 'No se pudieron cargar los videos'));
 
   // Paso 1: se anota el video y se abre la subida por partes.
@@ -216,15 +247,22 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
     if (bytes > MAX_VIDEO_BYTES) throw crearErrorHttp(`El video supera el máximo de ${Math.floor(MAX_VIDEO_BYTES / 1024 / 1024)} MB`);
     const [[cuenta]] = await db.query('SELECT COUNT(*) AS cantidad FROM olimpiada_video WHERE olimpiada_id = ? AND eliminado = 0', [olimpiadaId]);
     if (Number(cuenta.cantidad) >= MAX_VIDEOS_POR_EDICION) throw crearErrorHttp(`Una edición admite hasta ${MAX_VIDEOS_POR_EDICION} videos`);
+    const clasificacion = await leerClasificacion(db, body, olimpiadaId);
     const key = `olimpiadas/videos/${olimpiadaId}/video_${Date.now()}_${crypto.randomBytes(6).toString('hex')}.${extension}`;
+    const [[ultimo]] = await db.query('SELECT COALESCE(MAX(orden), 0) AS orden FROM olimpiada_video WHERE olimpiada_id = ? AND eliminado = 0', [olimpiadaId]);
     const subida = await clienteS3.send(new CreateMultipartUploadCommand({ Bucket: bucket, Key: key, ContentType: mime }));
     if (!subida.UploadId) throw crearErrorHttp('No se pudo iniciar la subida del video', 502);
-    const [[ultimo]] = await db.query('SELECT COALESCE(MAX(orden), 0) AS orden FROM olimpiada_video WHERE olimpiada_id = ? AND eliminado = 0', [olimpiadaId]);
-    const [insert] = await db.query(
-      `INSERT INTO olimpiada_video (olimpiada_id, titulo, descripcion, fecha, archivo, mime, bytes, orden, estado, subida_id, partes, usuario_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SUBIENDO', ?, '[]', ?)`,
-      [olimpiadaId, datos.titulo, datos.descripcion, datos.fecha, key, mime, bytes, body.orden === undefined ? Number(ultimo.orden) + 1 : datos.orden, subida.UploadId, cabecera.id]
-    );
+    let insert;
+    try {
+      [insert] = await db.query(
+        `INSERT INTO olimpiada_video (olimpiada_id, titulo, descripcion, fecha, archivo, mime, bytes, orden, estado, subida_id, partes, usuario_id, ${CAMPOS_CLASIFICACION_VIDEO.join(', ')})
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SUBIENDO', ?, '[]', ?, ?, ?, ?, ?, ?)`,
+        [olimpiadaId, datos.titulo, datos.descripcion, datos.fecha, key, mime, bytes, body.orden === undefined ? Number(ultimo.orden) + 1 : datos.orden, subida.UploadId, cabecera.id, ...valoresClasificacion(clasificacion)]
+      );
+    } catch (error) {
+      await abortarSubida({ archivo: key, subida_id: subida.UploadId });
+      throw error;
+    }
     res.status(201).json({ success: true, id: insert.insertId, tamano_parte: TAMANO_PARTE, partes: partesTotales(bytes), message: 'Subida iniciada' });
   }, 'No se pudo iniciar la subida del video'));
 
@@ -275,7 +313,7 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
       await historial(connection, cabecera, { entidad: 'VIDEO', entidad_id: video.id, olimpiada_id: video.olimpiada_id, tipo_operacion: 'CREATE', valor_nuevo: video.titulo });
       return video;
     });
-    res.json({ success: true, message: `Video «${listo.titulo}» subido`, video: await serializar(listo) });
+    res.json({ success: true, message: `Video «${listo.titulo}» subido`, video: await videoActualizado(listo) });
   }, 'No se pudo terminar la subida del video'));
 
   // Imagen de portada (la toma el navegador de un cuadro del video).
@@ -292,14 +330,16 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
 
   router.put('/olimpiadas/videos/:videoId(\\d+)', verifyTokenMultimedia, soloGestionMultimedia, endpoint(async (req, res) => {
     const cabecera = getCabecera(req);
-    const video = await exigirVideo(idDeRuta(req.params.videoId));
-    const datos = leerDatos(req.body || {}, video);
-    await enTransaccion(async (connection) => {
-      await connection.query('UPDATE olimpiada_video SET titulo = ?, descripcion = ?, fecha = ?, orden = ? WHERE id = ?', [datos.titulo, datos.descripcion, datos.fecha, datos.orden, video.id]);
-      await historialCambios(connection, cabecera, { entidad: 'VIDEO', entidad_id: video.id, olimpiada_id: video.olimpiada_id }, video, datos, ['titulo', 'descripcion', 'fecha', 'orden']);
+    const video = await enTransaccion(async connection => {
+      const anterior = await exigirVideo(idDeRuta(req.params.videoId), { conexion: connection });
+      const body = req.body || {};
+      const datos = { ...leerDatos(body, anterior), ...await leerClasificacion(connection, body, anterior.olimpiada_id, anterior) };
+      await connection.query('UPDATE olimpiada_video SET ? WHERE id = ?', [datos, anterior.id]);
+      await historialCambios(connection, cabecera, { entidad: 'VIDEO', entidad_id: anterior.id, olimpiada_id: anterior.olimpiada_id },
+        anterior, datos, Object.keys(datos));
+      return anterior;
     });
-    const [[actualizado]] = await db.query('SELECT * FROM olimpiada_video WHERE id = ?', [video.id]);
-    res.json({ success: true, message: 'Video actualizado', video: await serializar(actualizado) });
+    res.json({ success: true, message: 'Video actualizado', video: await videoActualizado(video) });
   }, 'No se pudo actualizar el video'));
 
   router.delete('/olimpiadas/videos/:videoId(\\d+)', verifyTokenMultimedia, soloGestionMultimedia, endpoint(async (req, res) => {

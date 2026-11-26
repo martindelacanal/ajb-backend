@@ -130,6 +130,8 @@ El historial registra actor, fecha, campo y valores anteriores/nuevos de partido
 
 Cada edición admite hasta 40 videos MP4, WebM o MOV. El límite por video es de 500 MiB al importar desde Google Drive y de 200 MiB al subir un archivo desde el dispositivo. La API registra los metadatos en `olimpiada_video` y guarda los videos en S3 bajo `olimpiadas/videos/`.
 
+Los videos admiten los mismos campos de galería que las fotos (`epigrafe`, `disciplina_id`, `partido_id`, `fecha`, `etiquetas` y `departamentales`). Se pueden enviar al iniciar la carga, al importar desde Drive o al editar un video. Los listados público y de gestión de videos aceptan los cinco filtros de las fotos y devuelven los videos coincidentes en un arreglo. La migración `scripts/migrar-olimpiadas-galeria.js` agrega los campos opcionales a los videos y el enlace público de Drive a la edición. Para aplicarla se usa `--confirm=OLIMPIADAS_GALERIA`.
+
 El navegador inicia la carga con `POST /olimpiadas/:id/videos` y envía partes de 8 MiB mediante `PUT /olimpiadas/videos/:videoId/partes/:n`. La API verifica el formato en la primera parte y envía a S3 cada parte con su número. Se puede reintentar una parte individual y también la confirmación final mediante `POST /olimpiadas/videos/:videoId/completar`. Para cancelar una subida pendiente se usa `DELETE /olimpiadas/videos/:videoId?cancelar=1`.
 
 Tanto el portal público como el de gestión reciben dos direcciones firmadas por seis horas. El reproductor usa `url` para pedir a S3 los rangos que necesita. El enlace `descarga_url` entrega el archivo original desde S3 con un nombre basado en el título del video. Las fotos admiten hasta 15 MB cada una (80 MB por tanda).

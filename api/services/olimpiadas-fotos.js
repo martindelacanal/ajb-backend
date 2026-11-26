@@ -22,7 +22,7 @@ function leerEtiquetas(valor, { historicas = false } = {}) {
       if (!etiquetas.has(clave)) etiquetas.set(clave, etiqueta);
     }
   }
-  if (!historicas && etiquetas.size > MAX_ETIQUETAS) throw crearErrorHttp('Podés usar hasta 20 etiquetas por foto');
+  if (!historicas && etiquetas.size > MAX_ETIQUETAS) throw crearErrorHttp('Podés usar hasta 20 etiquetas por archivo');
   return [...etiquetas.values()];
 }
 
@@ -45,15 +45,16 @@ function leerDepartamentales(valor) {
     if (!id) throw crearErrorHttp('Las departamentales elegidas son inválidas');
     ids.add(id);
   }
-  if (ids.size > MAX_DEPARTAMENTALES) throw crearErrorHttp(`Podés elegir hasta ${MAX_DEPARTAMENTALES} departamentales por foto`);
+  if (ids.size > MAX_DEPARTAMENTALES) throw crearErrorHttp(`Podés elegir hasta ${MAX_DEPARTAMENTALES} departamentales por archivo`);
   return [...ids];
 }
 
 // Las inserciones anteriores a la migración conservan su etiqueta original.
 const ETIQUETAS_SQL = "COALESCE(f.etiquetas, IF(f.etiqueta IS NULL, JSON_ARRAY(), JSON_ARRAY(f.etiqueta)))";
-const TABLA_ETIQUETAS = `JSON_TABLE(${ETIQUETAS_SQL}, '$[*]' COLUMNS (
+const tablaEtiquetas = datos => `JSON_TABLE(${datos}, '$[*]' COLUMNS (
   etiqueta VARCHAR(60) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci PATH '$'
 )) AS tag`;
+const TABLA_ETIQUETAS = tablaEtiquetas(ETIQUETAS_SQL);
 const TABLA_DEPARTAMENTALES = "JSON_TABLE(COALESCE(f.departamentales, JSON_ARRAY()), '$[*]' COLUMNS (id INT PATH '$')) AS dep";
 
 const SELECT_FOTO = `SELECT f.id, f.olimpiada_id, f.archivo, f.miniatura_archivo, f.mime, f.ancho, f.alto, f.epigrafe,
@@ -86,6 +87,13 @@ async function serializarFoto(fila, partidoNombre = null, departamentales = new 
     firmarSeguro(fila.archivo), firmarSeguro(fila.miniatura_archivo),
     firmarSeguro(fila.archivo, undefined, `attachment; filename="${nombre}"`),
   ]);
+  return {
+    id: fila.id, olimpiada_id: fila.olimpiada_id, url, url_miniatura: miniatura, descarga_url: descargaUrl, ancho: fila.ancho, alto: fila.alto,
+    ...clasificacionGaleria(fila, partidoNombre, departamentales), orden: fila.orden, fecha_creacion: fila.fecha_creacion,
+  };
+}
+
+function clasificacionGaleria(fila, partidoNombre = null, departamentales = new Map()) {
   const etiquetas = fila.etiquetas == null ? (fila.etiqueta ? [fila.etiqueta] : [])
     : Array.isArray(fila.etiquetas) ? fila.etiquetas : JSON.parse(fila.etiquetas);
   // Una departamental que ya no existe deja de mostrarse, sin romper la foto.
@@ -93,10 +101,9 @@ async function serializarFoto(fila, partidoNombre = null, departamentales = new 
     .map(id => ({ id, nombre: departamentales.get(id) }))
     .sort((a, b) => String(a.nombre).localeCompare(String(b.nombre), 'es'));
   return {
-    id: fila.id, olimpiada_id: fila.olimpiada_id, url, url_miniatura: miniatura, descarga_url: descargaUrl, ancho: fila.ancho, alto: fila.alto,
-    epigrafe: fila.epigrafe, disciplina_id: fila.disciplina_id, disciplina_nombre: fila.disciplina_nombre || null,
+    epigrafe: fila.epigrafe ?? null, disciplina_id: fila.disciplina_id ?? null, disciplina_nombre: fila.disciplina_nombre || null,
     partido_id: fila.partido_id ?? null, partido_nombre: partidoNombre, fecha: fila.fecha,
-    etiquetas, etiqueta: etiquetas.join(', ') || null, departamentales: deLaFoto, orden: fila.orden, fecha_creacion: fila.fecha_creacion,
+    etiquetas, etiqueta: etiquetas.join(', ') || null, departamentales: deLaFoto,
   };
 }
 
@@ -138,10 +145,7 @@ function opcionesFiltro(query, plural, singular, leer) {
   return [...valores];
 }
 
-async function listarFotos(conexion, olimpiadaId, query, consultarPartidos, { gestion = false } = {}) {
-  const estadoVisible = gestion ? '' : " AND p.estado IN ('EN_JUEGO', 'FINALIZADO')";
-  const page = filtroEntero(query, 'page', 1), pageSize = filtroEntero(query, 'pageSize', 24);
-  if (page > 1000000 || pageSize > 60) throw crearErrorHttp('La paginación es inválida');
+function condicionesGaleria(olimpiadaId, query, estadoVisible, etiquetasSql = TABLA_ETIQUETAS) {
   const condiciones = ['f.olimpiada_id = ?', 'f.eliminado = 0'], params = [olimpiadaId];
   const disciplinas = opcionesFiltro(query, 'disciplinas', 'disciplina_id', normalizarIdPositivo);
   if (disciplinas.length) {
@@ -163,7 +167,7 @@ async function listarFotos(conexion, olimpiadaId, query, consultarPartidos, { ge
   // subconsulta en un semijoin que pierde la relación con la foto y devuelve totales equivocados.
   const etiquetasElegidas = leerEtiquetas(query.etiquetas ?? query.etiqueta);
   if (etiquetasElegidas.length) {
-    condiciones.push(`(SELECT COUNT(*) FROM ${TABLA_ETIQUETAS} WHERE tag.etiqueta IN (?)) > 0`);
+    condiciones.push(`(SELECT COUNT(*) FROM ${etiquetasSql} WHERE tag.etiqueta IN (?)) > 0`);
     params.push(etiquetasElegidas);
   }
   const departamentalesElegidas = opcionesFiltro(query, 'departamentales', 'departamental_id', normalizarIdPositivo);
@@ -171,6 +175,13 @@ async function listarFotos(conexion, olimpiadaId, query, consultarPartidos, { ge
     condiciones.push(`(SELECT COUNT(*) FROM ${TABLA_DEPARTAMENTALES} WHERE dep.id IN (?)) > 0`);
     params.push(departamentalesElegidas);
   }
+  return { condiciones, params };
+}
+async function listarFotos(conexion, olimpiadaId, query, consultarPartidos, { gestion = false } = {}) {
+  const estadoVisible = gestion ? '' : " AND p.estado IN ('EN_JUEGO', 'FINALIZADO')";
+  const page = filtroEntero(query, 'page', 1), pageSize = filtroEntero(query, 'pageSize', 24);
+  if (page > 1000000 || pageSize > 60) throw crearErrorHttp('La paginación es inválida');
+  const { condiciones, params } = condicionesGaleria(olimpiadaId, query, estadoVisible);
   const where = condiciones.join(' AND ');
   const [[[cuenta]], [rows], [disciplinasConFotos], [fechas], [etiquetas], [cuentasPartidos], [departamentales]] = await Promise.all([
     conexion.query(`SELECT COUNT(*) AS total FROM olimpiada_foto f WHERE ${where}`, params),
@@ -202,5 +213,5 @@ async function listarFotos(conexion, olimpiadaId, query, consultarPartidos, { ge
 }
 
 module.exports = {
-  leerEtiquetas, leerDepartamentales, idsDepartamentales, nombresDepartamentales, opcionesPartidos, SELECT_FOTO, serializarFoto, listarFotos,
+  condicionesGaleria, tablaEtiquetas, clasificacionGaleria, leerEtiquetas, leerDepartamentales, idsDepartamentales, nombresDepartamentales, opcionesPartidos, SELECT_FOTO, serializarFoto, listarFotos,
 };

@@ -58,7 +58,7 @@ const router = express.Router();
 const db = mysqlConnection.promise();
 
 const { verifyTokenMultimedia, soloGestionMultimedia } = require("./olimpiadas-prensa").registrarPrensa(router, {
-  db, soloSuperior, cargarOlimpiada, idDeRuta,
+  db, soloSuperior, cargarOlimpiada, idDeRuta, enTransaccion, historial,
 });
 
 // ---------------------------------------------------------------------------
@@ -3027,7 +3027,7 @@ async function validarPartidoFoto(conexion, cambios, olimpiadas) {
   if (!cambios.partido_id) return;
   const [[partido]] = await conexion.query("SELECT olimpiada_id, disciplina_id FROM olimpiada_partido WHERE id = ? AND eliminado = 0", [cambios.partido_id]);
   if (!partido || olimpiadas.some(id => Number(id) !== Number(partido.olimpiada_id))) {
-    throw crearErrorHttp("El partido no pertenece a la edición de las fotos");
+    throw crearErrorHttp("El partido no pertenece a la edición");
   }
   if (cambios.disciplina_id && Number(cambios.disciplina_id) !== Number(partido.disciplina_id)) {
     throw crearErrorHttp("La disciplina elegida no corresponde al partido");
@@ -3038,6 +3038,17 @@ async function validarPartidoFoto(conexion, cambios, olimpiadas) {
 // Las departamentales elegidas tienen que existir.
 async function validarDepartamentalesFoto(conexion, cambios) {
   if (cambios.departamentales) await validarDepartamentales(conexion, JSON.parse(cambios.departamentales));
+}
+
+async function clasificarMedio(conexion, body, olimpiadaId, actual = null) {
+  const cambios = leerCamposFoto(body, { conEpigrafe: true });
+  await validarPartidoFoto(conexion, cambios, [olimpiadaId]);
+  await validarDepartamentalesFoto(conexion, cambios);
+  const disciplina = await validarDisciplinaCatalogo(conexion, cambios.disciplina_id);
+  if (actual && cambios.partido_id === undefined && cambios.disciplina_id !== undefined && cambios.disciplina_id !== actual.disciplina_id) {
+    cambios.partido_id = null;
+  }
+  return { cambios, disciplina };
 }
 
 /**
@@ -3153,9 +3164,10 @@ router.post("/olimpiadas/:id(\\d+)/drive/listar", verifyTokenMultimedia, soloGes
   try {
     await cargarOlimpiada(db, idDeRuta(req.params.id), getCabecera(req));
     const { archivos, carpetas_sin_acceso } = await drive.listarCarpeta(req.body?.url, { revisarPermisos: true });
+    const fechas = req.body?.incluir_fechas === true ? await drive.fechasCreacionDrive(archivos) : null;
     res.set("Cache-Control", "no-store").json({
       archivos: Array.from(archivos.values(), ({ id, nombre, tipo, miniatura_url, vista_url, ruta_carpetas }) =>
-        ({ id, nombre, tipo, miniatura_url, vista_url, ruta_carpetas })),
+        ({ id, nombre, tipo, miniatura_url, vista_url, ruta_carpetas, ...(fechas && { fecha_creacion: fechas.get(id) ?? null }) })),
       carpetas_sin_acceso,
     });
   } catch (error) { responderError(res, error, "No se pudo leer la carpeta de Drive"); }
@@ -3166,11 +3178,7 @@ async function recibirFotos(req, res, desdeDrive) {
   try {
     const olimpiadaId = idDeRuta(req.params.id);
     await cargarOlimpiada(db, olimpiadaId, cabecera);
-    const comunes = leerCamposFoto(req.body || {}, { conEpigrafe: true });
-    await validarPartidoFoto(db, comunes, [olimpiadaId]);
-    await validarDepartamentalesFoto(db, comunes);
-    const [partido] = await opcionesPartidos(db, olimpiadaId, consultarPartidos, comunes.partido_id ? [comunes.partido_id] : []);
-    const disciplina = await validarDisciplinaCatalogo(db, comunes.disciplina_id);
+    const { cambios: comunes, disciplina } = await clasificarMedio(db, req.body || {}, olimpiadaId);
     if (disciplina) comunes.disciplina_nombre = disciplina.nombre;
     let archivos = archivosDeSlot(req, "FOTOS");
     const idsCarga = desdeDrive
@@ -3201,8 +3209,12 @@ async function recibirFotos(req, res, desdeDrive) {
       tipo_operacion: "CREATE",
       valor_nuevo: `${nuevas} fotos subidas${comunes.etiqueta ? ` (${comunes.etiqueta})` : ""}${errores.length ? `, ${errores.length} con error` : ""}`,
     });
-    // Un reintento puede devolver fotos ya guardadas, con las departamentales de su primera subida.
-    const nombresDeDepartamentales = await nombresDepartamentales(db, fotos);
+    // Un reintento puede devolver la clasificación guardada en la primera subida.
+    const idsPartidos = [...new Set(fotos.map(f => f.partido_id).filter(Boolean))];
+    const [partidos, nombresDeDepartamentales] = await Promise.all([
+      opcionesPartidos(db, olimpiadaId, consultarPartidos, idsPartidos), nombresDepartamentales(db, fotos),
+    ]);
+    const nombresPartidos = new Map(partidos.map(p => [Number(p.id), p.nombre]));
     res.status(201).json({
       success: true,
       message: errores.length === 0
@@ -3210,7 +3222,7 @@ async function recibirFotos(req, res, desdeDrive) {
         : `Se subieron ${fotos.length} fotos; ${errores.length} no se pudieron procesar`,
       subidas: fotos.length,
       errores,
-      fotos: await Promise.all(fotos.map(foto => serializarFoto(foto, partido?.nombre, nombresDeDepartamentales))),
+      fotos: await Promise.all(fotos.map(foto => serializarFoto(foto, nombresPartidos.get(Number(foto.partido_id)), nombresDeDepartamentales))),
     });
   } catch (error) {
     responderError(res, error, "No se pudieron subir las fotos");
@@ -3302,16 +3314,12 @@ router.put("/olimpiadas/fotos/:fotoId(\\d+)", verifyTokenMultimedia, soloGestion
   const cabecera = getCabecera(req);
   try {
     const fotoId = idDeRuta(req.params.fotoId);
-    const cambios = leerCamposFoto(req.body || {}, { conEpigrafe: true });
-    if (!Object.keys(cambios).length) return res.status(400).json("Indicá al menos un dato para actualizar");
     await enTransaccion(async (connection) => {
       const [[actual]] = await connection.query("SELECT * FROM olimpiada_foto WHERE id = ? AND eliminado = 0 FOR UPDATE", [fotoId]);
       if (!actual) throw crearErrorHttp("La foto no existe", 404);
-      await validarPartidoFoto(connection, cambios, [actual.olimpiada_id]);
-      await validarDepartamentalesFoto(connection, cambios);
-      await validarDisciplinaCatalogo(connection, cambios.disciplina_id);
-      if (cambios.partido_id === undefined && cambios.disciplina_id !== undefined && cambios.disciplina_id !== actual.disciplina_id) cambios.partido_id = null;
+      const { cambios } = await clasificarMedio(connection, req.body || {}, actual.olimpiada_id, actual);
       const campos = Object.keys(cambios);
+      if (!campos.length) throw crearErrorHttp("Indicá al menos un dato para actualizar");
       await connection.query(
         `UPDATE olimpiada_foto SET ${campos.map((campo) => `${campo} = ?`).join(", ")} WHERE id = ?`,
         [...campos.map((campo) => cambios[campo]), fotoId]
@@ -3370,7 +3378,7 @@ require('./olimpiadas-torneos')(router, ayudantes);
 require('./olimpiadas-canchas')(router, ayudantes);
 require('./olimpiadas-equipos')(router, ayudantes);
 pruebasLectura(router, ayudantes);
-const videos = require('./olimpiadas-videos')(router, { ...ayudantes, verifyTokenMultimedia, soloGestionMultimedia });
+const videos = require('./olimpiadas-videos')(router, { ...ayudantes, verifyTokenMultimedia, soloGestionMultimedia, clasificarMedio });
 
 router.lecturasPublicas = Object.freeze({
   estadoEdicion, consultarPartidos, listarDisciplinasFixture, listarSedes, armarMedallero, serializarNovedad, serializarEvento, SELECT_EVENTO,
@@ -3380,6 +3388,7 @@ router.lecturasPublicas = Object.freeze({
 });
 
 router.__test = Object.freeze({
+  clasificarMedio,
   TIPOS_SEDE,
   TIPOS_EVENTO,
   UBICACIONES_SECCION,

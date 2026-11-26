@@ -17,16 +17,20 @@ const db = {
     if (sql.includes("r.nombre AS rol")) return [[actor]];
     if (sql.includes("JOIN olimpiada_prensa")) return [Number(p[1]) === 2 ? [edicion] : []];
     if (sql.includes("SELECT * FROM olimpiada WHERE")) return [[edicion]];
+    if (sql.includes("FROM olimpiada_disciplina WHERE id")) return [[{ id: 4, nombre: "Fútbol" }]];
+    if (sql.includes("FROM departamental WHERE id IN")) return [[{ id: 3, nombre: "La Plata" }, { id: 7, nombre: "Azul" }]];
+    if (sql.includes("SELECT olimpiada_id, disciplina_id FROM olimpiada_partido")) return [[{ olimpiada_id: 2, disciplina_id: 4 }]];
+    if (sql.includes("FROM olimpiada_partido p")) return [[{ id: 8, disciplina_id: 4, disciplina_nombre: "Fútbol" }]];
     if (sql.includes("MAX(orden)") && sql.includes("olimpiada_foto")) return [[{ orden: 0 }]];
     if (sql.includes("f.carga_id")) return [foto ? [foto] : []];
     if (sql.includes("INSERT INTO olimpiada_foto")) {
-      foto = { id: 21, olimpiada_id: p[0], archivo: p[1], miniatura_archivo: p[2], epigrafe: p[6] };
+      foto = { id: 21, olimpiada_id: p[0], archivo: p[1], miniatura_archivo: p[2], epigrafe: p[6], disciplina_id: p[7], fecha: p[8], etiquetas: p[12], partido_id: p[13], departamentales: p[14] };
       return [{ insertId: foto.id }];
     }
     if (sql.includes("archivo LIKE")) return [video && video.archivo.startsWith(p[1].slice(0, -1)) ? [video] : []];
     if (sql.includes("COUNT(*)") && sql.includes("olimpiada_video")) return [[{ cantidad: video ? 1 : 0, orden: 0 }]];
     if (sql.includes("INSERT INTO olimpiada_video")) {
-      video = { id: 31, titulo: p[1], archivo: p[4], bytes: p[6] };
+      video = { id: 31, titulo: p[1], archivo: p[4], bytes: p[6], fecha: p[3], epigrafe: p[9], disciplina_id: p[10], partido_id: p[11], etiquetas: p[12], departamentales: p[13] };
       return [{ insertId: video.id }];
     }
     if (sql.includes("INSERT INTO olimpiada_historial")) { historial.push(p[0]); return [{ insertId: 1 }]; }
@@ -168,14 +172,28 @@ test("Prensa puede importar una selección, conserva metadata y los reintentos n
   assert.deepEqual(indice.carpetas_sin_acceso, [["Prensa"]]);
   assert.equal((await post("2/drive/foto", { url, archivoId: "no-elegible" })).status, 400);
   assert.equal(lecturas.length, 4);
-  const datosFoto = { url, archivoId: "foto0000001", carga_id: randomUUID(), epigrafe: "Final" };
+  const meta = { partido_id: 8, fecha: "2026-11-26", departamentales: [3, 7], etiquetas: ["Podio", "Final"], epigrafe: "Final" };
+  const verificarMeta = fila => {
+    assert.equal(fila.disciplina_id, 4);
+    assert.equal(fila.partido_id, 8);
+    assert.equal(fila.fecha, meta.fecha);
+    assert.equal(fila.epigrafe, meta.epigrafe);
+    assert.deepEqual(JSON.parse(fila.departamentales), meta.departamentales);
+    assert.deepEqual(JSON.parse(fila.etiquetas), meta.etiquetas);
+  };
+  const datosFoto = { ...meta, url, archivoId: "foto0000001", carga_id: randomUUID() };
   for (let i = 0; i < 2; i++) assert.equal((await post("2/drive/foto", datosFoto)).status, 201);
+  const repetida = await post("2/drive/foto", { ...datosFoto, partido_id: null, epigrafe: "Otro pie" });
+  const [guardada] = (await repetida.json()).fotos;
+  assert.equal(guardada.epigrafe, meta.epigrafe);
+  assert.match(guardada.partido_nombre, /^#8 /);
   assert.deepEqual(imagenes.map(i => i[1]), ["image/webp", "image/webp"]);
-  assert.equal(foto.epigrafe, "Final");
-  const datosVideo = { url, archivoId: "video000001", carga_id: randomUUID() };
+  verificarMeta(foto);
+  const datosVideo = { ...meta, url, archivoId: "video000001", carga_id: randomUUID() };
   await t.test("acepta 500 MiB exactos y aborta la transferencia al superar el límite sin Content-Length", async () => {
     for (let i = 0; i < 2; i++) assert.equal((await post("2/drive/video", datosVideo)).status, 201);
     assert.equal(video.titulo, "Resumen");
+    verificarMeta(video);
     assert.equal(video.bytes, 500 * mib);
     assert.deepEqual(partes, [...Array(62).fill(8 * mib), 4 * mib]);
     bytesVideo++;

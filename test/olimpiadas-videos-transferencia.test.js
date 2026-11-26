@@ -12,20 +12,31 @@ test("video de 200 MiB: partes, reintento de cierre y enlaces de lectura y desca
   const titulo = 'Final / vóley "2026"';
   let fila, fallarRegistro = false;
   const historial = [];
+  const datosGaleria = { epigrafe: "Gol de la final", fecha: "2026-11-26", disciplina_id: 4, partido_id: 9,
+    etiquetas: ["Final", "Gol"], departamentales: [2, 3] };
+  const departamentos = [{ id: 2, nombre: "Azul" }, { id: 3, nombre: "La Plata" }];
+  const consultasVideos = [];
   const db = { async query(sql, p) {
     if (sql.includes("FROM olimpiada WHERE")) return [[{ id: 1, habilitado: "Y", publicada_publico: 1 }]];
-    if (sql.includes("COUNT(*)")) return [[{ cantidad: 0 }]];
+    if (sql.includes("SELECT olimpiada_id, disciplina_id FROM olimpiada_partido")) return [p[0] === 9 ? [{ olimpiada_id: 1, disciplina_id: 4 }] : []];
+    if (sql.includes("FROM olimpiada_disciplina WHERE id = ?")) return [[{ id: 4, nombre: "Fútbol" }]];
+    if (sql.includes("FROM departamental WHERE id IN")) return [departamentos.filter(d => p[0].includes(d.id))];
+    if (sql.includes("FROM olimpiada_partido p") && !sql.includes("FROM olimpiada_video f")) return [[{ id: 9, disciplina_id: 4, disciplina_nombre: "Fútbol" }]];
+    if (sql.startsWith("SELECT COUNT(*)")) return [[{ cantidad: 0 }]];
     if (sql.includes("MAX(orden)")) return [[{ orden: 0 }]];
     if (sql.includes("INSERT INTO olimpiada_video")) {
       fila = { id: 12, olimpiada_id: p[0], titulo: p[1], archivo: p[4], mime: p[5], bytes: p[6],
-        orden: p[7], subida_id: p[8], usuario_id: p[9], partes: "[]", estado: "SUBIENDO", eliminado: 0 };
+        fecha: p[3], orden: p[7], subida_id: p[8], usuario_id: p[9],
+        epigrafe: p[10], disciplina_id: p[11], partido_id: p[12], etiquetas: p[13], departamentales: p[14], partes: "[]", estado: "SUBIENDO", eliminado: 0 };
       return [{ insertId: fila.id }];
     }
-    if (sql.includes("FROM olimpiada_video WHERE olimpiada_id")) {
-      return [fila.estado === "LISTO" && !fila.eliminado ? [{ ...fila }] : []];
+    if (sql.includes("FROM olimpiada_video f")) {
+      consultasVideos.push({ sql, params: p });
+      return [fila.estado === "LISTO" && !fila.eliminado ? [{ ...fila, disciplina_nombre: "Fútbol" }] : []];
     }
     if (sql.includes("FROM olimpiada_video WHERE id")) return [fila.eliminado ? [] : [{ ...fila }]];
-    if (sql.includes("SET partes = ?")) fila.partes = p[0];
+    if (sql.includes("UPDATE olimpiada_video SET ? WHERE")) Object.assign(fila, p[0]);
+    else if (sql.includes("SET partes = ?")) fila.partes = p[0];
     else if (sql.includes("SET estado = 'LISTO'")) {
       if (fallarRegistro) { fallarRegistro = false; throw new Error("Corte simulado antes de guardar"); }
       Object.assign(fila, { estado: "LISTO", partes: null, subida_id: null });
@@ -77,7 +88,11 @@ test("video de 200 MiB: partes, reintento de cierre y enlaces de lectura y desca
   registrarVideos(app, {
     db, cargarOlimpiada: async () => ({}), idDeRuta: Number,
     enTransaccion: fn => fn(db), historial: async (_db, _actor, cambio) => historial.push(cambio.tipo_operacion),
-    leerTexto: (body, campo) => body[campo] ?? null, leerEntero: () => 0, leerFecha: () => null,
+    clasificarMedio: require("../api/routes/olimpiadas-contenido").__test.clasificarMedio,
+    consultarPartidos: require("../api/routes/olimpiadas-contenido").lecturasPublicas.consultarPartidos,
+    historialCambios: async () => {},
+    leerTexto: (body, campo, base) => body[campo] ?? base[campo] ?? null, leerEntero: () => 0,
+    leerFecha: (body, campo, base) => body[campo] ?? base[campo] ?? null,
     verifyTokenMultimedia(req, _res, next) { req.data = { data: JSON.stringify({ id: 91, rol: "admin" }) }; next(); },
     soloGestionMultimedia: pasar,
   });
@@ -86,7 +101,7 @@ test("video de 200 MiB: partes, reintento de cierre y enlaces de lectura y desca
   const base = "http://127.0.0.1:" + servidor.address().port + "/olimpiadas/";
   const enviar = (ruta, method, body, tipo = "application/json") =>
     fetch(base + ruta, { method, headers: { "Content-Type": tipo }, body });
-  const abrir = tamano => enviar("1/videos", "POST", JSON.stringify({ titulo, bytes: tamano, mime: "video/mp4" }));
+  const abrir = tamano => enviar("1/videos", "POST", JSON.stringify({ ...datosGaleria, titulo, bytes: tamano, mime: "video/mp4" }));
   const transferir = (numero, datos) => enviar("videos/12/partes/" + numero, "PUT", datos, "application/octet-stream");
   const completar = () => enviar("videos/12/completar", "POST");
   assert.equal((await abrir(bytes + 1)).status, 400);
@@ -115,10 +130,20 @@ test("video de 200 MiB: partes, reintento de cierre y enlaces de lectura y desca
   assert.ok(controlesHead >= 1);
   assert.deepEqual(historial, ["CREATE"]);
 
-  for (const ruta of ["1/videos", "publico/1/videos"]) {
+  const filtro = "?disciplinas=4&partidos=9&fechas=2026-11-26&etiquetas=Gol&departamentales=2,3";
+  for (const ruta of ["1/videos" + filtro, "publico/1/videos" + filtro]) {
     const respuesta = await fetch(base + ruta);
     assert.equal(respuesta.status, 200);
     const [video] = await respuesta.json();
+    assert.equal(video.epigrafe, datosGaleria.epigrafe);
+    assert.deepEqual(video.etiquetas, datosGaleria.etiquetas);
+    assert.deepEqual(video.departamentales, departamentos);
+    assert.equal(video.disciplina_nombre, "Fútbol");
+    assert.equal(video.fecha, datosGaleria.fecha);
+    assert.match(video.partido_nombre, /#9/);
+    const consulta = consultasVideos.at(-1);
+    assert.deepEqual(consulta.params, [1, [4], [9], [datosGaleria.fecha], ["Gol"], [2, 3]]);
+    assert.equal(consulta.sql.includes("p.estado IN ('EN_JUEGO', 'FINALIZADO')"), ruta.startsWith("publico/"));
     const lectura = new URL(video.url), descarga = new URL(video.descarga_url);
     assert.equal(lectura.pathname, descarga.pathname);
     assert.equal(lectura.searchParams.get("response-content-disposition"), null);
@@ -133,6 +158,15 @@ test("video de 200 MiB: partes, reintento de cierre y enlaces de lectura y desca
     assert.match(nombre, /vóley.*\.mp4$/);
     assert.doesNotMatch(nombre, /["/\\\r\n]/);
   }
+  const editar = datos => enviar("videos/12", "PUT", JSON.stringify(datos));
+  assert.equal((await editar({ partido_id: 10 })).status, 400);
+  assert.equal((await editar({ departamentales: [999] })).status, 400);
+  const editado = (await (await editar({ etiquetas: ["Podio"], epigrafe: null, departamentales: [] })).json()).video;
+  assert.equal(editado.titulo, titulo);
+  assert.match(editado.partido_nombre, /#9/);
+  assert.equal(editado.epigrafe, null);
+  assert.deepEqual(editado.etiquetas, ["Podio"]);
+  assert.deepEqual(editado.departamentales, []);
   const cancelar = await enviar("videos/12?cancelar=1", "DELETE");
   assert.ok(cancelar.status >= 400 && cancelar.status < 500);
   assert.equal(fila.eliminado, 0);

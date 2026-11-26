@@ -6,6 +6,7 @@ const {
 } = require("../services/olimpiadas-comun");
 
 const EDICION = "o.id, o.nombre, o.edicion, o.localidad, o.fecha_inicio, o.fecha_fin";
+const { recursoDeEnlace } = require("../services/olimpiadas-drive");
 const ASIGNACION = `JOIN olimpiada_prensa a ON a.olimpiada_id = o.id AND a.usuario_id = ?
   WHERE o.eliminado = 0`;
 
@@ -35,7 +36,7 @@ function soloGestionMultimedia(req, res, next) {
   return res.status(403).json("No tenés permiso para gestionar fotos y videos");
 }
 
-function registrarPrensa(router, { db, soloSuperior, cargarOlimpiada, idDeRuta }) {
+function registrarPrensa(router, { db, soloSuperior, cargarOlimpiada, idDeRuta, enTransaccion, historial }) {
   const manejar = fn => async (req, res) => {
     try { await fn(req, res); }
     catch (error) { responderError(res, error, "No pudimos cargar los datos de Prensa"); }
@@ -58,12 +59,36 @@ function registrarPrensa(router, { db, soloSuperior, cargarOlimpiada, idDeRuta }
 
   router.get("/olimpiadas/:id(\\d+)/fotos/contexto", verifyTokenMultimedia, soloGestionMultimedia, manejar(async (req, res) => {
     const id = idDeRuta(req.params.id);
-    const [[edicion]] = await db.query(`SELECT ${EDICION} FROM olimpiada o WHERE o.id = ? AND o.eliminado = 0`, [id]);
+    const [[edicion]] = await db.query(`SELECT ${EDICION}, o.drive_publico_url FROM olimpiada o WHERE o.id = ? AND o.eliminado = 0`, [id]);
     if (!edicion) throw crearErrorHttp("La edición no existe", 404);
     const [disciplinas] = await db.query(`SELECT d.id, d.nombre FROM olimpiada_disciplina_config c
       JOIN olimpiada_disciplina d ON d.id = c.disciplina_id WHERE c.olimpiada_id = ? ORDER BY d.nombre`, [id]);
     const [departamentales] = await db.query("SELECT id, nombre FROM departamental WHERE habilitado = 'Y' ORDER BY nombre");
     res.set("Cache-Control", "no-store").json({ ...edicion, disciplinas, departamentales });
+  }));
+
+  router.put("/olimpiadas/:id(\\d+)/fotos/drive-publico", verifyTokenMultimedia, soloGestionMultimedia, manejar(async (req, res) => {
+    const id = idDeRuta(req.params.id);
+    const cabecera = getCabecera(req);
+    const valor = req.body?.drive_publico_url;
+    let enlace = null;
+    if (valor !== null) {
+      const recurso = recursoDeEnlace(valor);
+      const legado = new URL(valor.trim()).pathname === "/open";
+      const ruta = legado ? "/open" : recurso.tipo === "archivo" ? `/file/d/${recurso.id}/view` : `/drive/folders/${recurso.id}`;
+      const destino = new URL(ruta, "https://drive.google.com");
+      if (legado) destino.searchParams.set("id", recurso.id);
+      if (recurso.clave) destino.searchParams.set("resourcekey", recurso.clave);
+      enlace = destino.href;
+    }
+    await enTransaccion(async conexion => {
+      const edicion = await cargarOlimpiada(conexion, id, cabecera, { forUpdate: true });
+      if ((edicion.drive_publico_url ?? null) === enlace) return;
+      await conexion.query("UPDATE olimpiada SET drive_publico_url = ? WHERE id = ?", [enlace, id]);
+      await historial(conexion, cabecera, { entidad: "OLIMPIADA", entidad_id: id, olimpiada_id: id, tipo_operacion: "UPDATE",
+        campo_modificado: "drive_publico_url", observacion: enlace ? "Actualizó el enlace público de Google Drive" : "Ocultó el enlace público de Google Drive" });
+    });
+    res.json({ drive_publico_url: enlace });
   }));
 
   const ruta = "/olimpiadas/:id(\\d+)/prensa";
