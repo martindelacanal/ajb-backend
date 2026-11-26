@@ -67,6 +67,12 @@ module.exports = function registrarTorneos(router, helpers) {
         const base = { entidad: 'INSTANCIA', entidad_id: entidadId };
         if (id) await historialCambios(connection, cabecera, base, actual, datos, Object.keys(datos));
         else await historial(connection, cabecera, { ...base, tipo_operacion: 'CREATE', valor_nuevo: datos.nombre });
+        if (id && actual.nombre !== datos.nombre) {
+          const [cuadros] = await connection.query(`SELECT DISTINCT t.olimpiada_id, t.disciplina_id
+            FROM olimpiada_torneo_instancia ti JOIN olimpiada_torneo t ON t.id = ti.torneo_id
+            WHERE ti.instancia_id = ? AND t.eliminado = 0 ORDER BY t.olimpiada_id, t.disciplina_id`, [id]);
+          for (const cuadro of cuadros) await sincronizarMedallasAutomaticas(connection, cabecera, cuadro.olimpiada_id, cuadro.disciplina_id);
+        }
         return entidadId;
       });
       res.status(id ? 200 : 201).json({ success: true, id: nuevoId, message: 'Catálogo guardado' });
@@ -123,7 +129,7 @@ module.exports = function registrarTorneos(router, helpers) {
         for (let orden = 0; orden < instanciaIds.length; orden++) await connection.query('INSERT INTO olimpiada_torneo_instancia (torneo_id, instancia_id, orden) VALUES (?, ?, ?)', [entidadId, instanciaIds[orden], orden]);
         await historial(connection, cabecera, { ...base, tipo_operacion: 'UPDATE', campo_modificado: 'instancias', valor_anterior: anteriores.map(i => i.instancia_id).join(', '), valor_nuevo: instanciaIds.join(', ') });
       }
-      if (id && actual.formato !== datos.formato) await sincronizarMedallasAutomaticas(connection, cabecera, olimpiadaId, datos.disciplina_id);
+      if (id && (actual.formato !== datos.formato || instanciaIds)) await sincronizarMedallasAutomaticas(connection, cabecera, olimpiadaId, datos.disciplina_id);
       return entidadId;
     });
     res.status(id ? 200 : 201).json({ success: true, id: nuevoId, message: 'Torneo guardado' });

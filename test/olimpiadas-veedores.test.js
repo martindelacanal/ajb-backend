@@ -5,7 +5,7 @@ process.env.JWT_SECRET ||= "test-only-secret";
 
 const {
   normalizarSets, contarSets, estaEnVivo, partidoPublico, calcularPosiciones, resolverClasificacion, hayCiclo,
-  repartirPuntos, calcularTablaMedallero, agruparMedallasPorDisciplina, puestosSegunResultados,
+  repartirPuntos, calcularTablaMedallero, agruparMedallasPorDisciplina, detectarTriangular, puestosSegunResultados,
 } = require("../api/services/olimpiadas-competicion");
 const { leerPartido, leerOrigen, camposEdicionPartidoVeedor, leerCoordenadas, leerPuestosPuntos, mensajeConEfectos } = require("../api/routes/olimpiadas-contenido").__test;
 const { validarPasswordVeedor, esCorreoInterno } = require("../api/security/olimpiadas-voluntarios");
@@ -345,7 +345,31 @@ test("triangular de liga: los tres cruces adjudican las medallas al terminar y u
   assert.equal(puestosSegunResultados([partidos[0], { ...partidos[1], ganador: 2 }, { ...partidos[2], ganador: 1 }]), null, "empate circular aun con diferencia de tantos");
   assert.equal(puestosSegunResultados(partidos.slice(0, 2)), null);
   assert.equal(puestosSegunResultados([...partidos, partidos[0]]), null);
-  assert.equal(puestosSegunResultados(partidos.map(p => ({ ...p, torneo_formato: "GRUPOS" }))), null);
+  assert.deepEqual(puestos(partidos.map(p => ({ ...p, torneo_formato: "GRUPOS" }))), [[1, 19], [2, 14], [3, 17]]);
+});
+
+test("triangular: reconoce las tres parejas antes de jugar independientemente del formato y conserva las llaves", () => {
+  const cruces = [[19, 17], [19, 14], [17, 14]].map(([a, b], i) => ({
+    id: i + 1, torneo_formato: "ELIMINACION", torneo_id: 24, estado: "PROGRAMADO", ganador: null,
+    instancia_nombre: i === 2 ? "Tercer puesto" : "Semifinal", departamental1_id: a, departamental2_id: b,
+  }));
+  assert.deepEqual(detectarTriangular(cruces), { estado: "EN_CURSO", puestos: [] });
+  const sinTorneo = cruces.map(p => ({ ...p, torneo_id: null, torneo_formato: null }));
+  assert.equal(detectarTriangular(sinTorneo).estado, "EN_CURSO");
+  for (const cambio of [{ zona: "B" }, { torneo_id: null }, { instancia_nombre: "Gran final" },
+    { partido_origen1_id: 1 }, { origen1_tipo: "POSICION" }, { departamental2_id: 19 },
+    { departamental1_id: null, participante1: "Nombre libre" }, { torneo_eliminatoria_pendiente: 1, torneo_formato: "MIXTO" }]) {
+    assert.equal(detectarTriangular([cruces[0], cruces[1], { ...cruces[2], ...cambio }]), null);
+  }
+  assert.equal(detectarTriangular(cruces.slice(0, 2)), null);
+  assert.equal(detectarTriangular([...cruces, cruces[0]]), null);
+  const circular = cruces.map((p,i) => ({ ...p, estado: "FINALIZADO", ganador: i === 1 ? 2 : 1 }));
+  assert.deepEqual(detectarTriangular(circular), { estado: "EMPATADO", puestos: [] });
+  assert.equal(puestosSegunResultados(circular), null, "no toma el rótulo heredado de tercer puesto");
+  const resueltos = circular.map(p => ({ ...p, ganador: p.id === 3 ? 2 : 1 }));
+  assert.equal(detectarTriangular(resueltos).estado, "RESUELTO");
+  assert.deepEqual(puestosSegunResultados(resueltos).map(p => p.competidor.departamental_id), [19,14,17]);
+  assert.deepEqual(detectarTriangular([...resueltos, { ...cruces[0], eliminado: 1 }]), detectarTriangular(resueltos));
 });
 
 test("triangular: dos inscripciones distintas de la misma departamental pueden ganar oro y plata", () => {
@@ -358,6 +382,28 @@ test("triangular: dos inscripciones distintas de la misma departamental pueden g
   assert.deepEqual(puestosSegunResultados(partidos).map(p => p.competidor.inscripcion_id), [1, 2, 3]);
   const ambiguos = partidos.map(p => ({ ...p, inscripcion1_id: p.inscripcion1_id === 2 ? null : p.inscripcion1_id, inscripcion2_id: p.inscripcion2_id === 2 ? null : p.inscripcion2_id }));
   assert.equal(puestosSegunResultados(ambiguos), null);
+});
+
+test("triangular: ganador y perdedor del primer partido enfrentan al mismo tercer rival", () => {
+  const comun = { torneo_formato: "ELIMINACION", torneo_id: 12, fase: "Partido", estado: "PROGRAMADO" };
+  const primero = { ...comun, id: 58, equipo1_id: 4, departamental2_id: 22 };
+  const segundo = { ...comun, id: 38, equipo1_id: 9, partido_origen2_id: 58, origen2_tipo: "PERDEDOR" };
+  const tercero = { ...comun, id: 182, equipo2_id: 9, partido_origen1_id: 58, origen1_tipo: "GANADOR" };
+  const detectar = (a = primero, b = segundo, c = tercero) => detectarTriangular([b, a, c]);
+  assert.deepEqual(detectar(), { estado: "EN_CURSO", puestos: [] });
+  for (const cambio of [{ equipo2_id: 7 }, { equipo2_id: 4 }, { equipo2_id: null }, { partido_origen1_id: 38 },
+    { origen1_tipo: "PERDEDOR" }, { origen1_tipo: "POSICION" }, { partido_origen1_id: null }]) {
+    assert.equal(detectar(primero, segundo, { ...tercero, ...cambio }), null);
+  }
+  const a = { ...primero, estado: "FINALIZADO", ganador: 2 };
+  const b = { ...segundo, estado: "FINALIZADO", ganador: 1, equipo2_id: 4 };
+  const c = { ...tercero, estado: "FINALIZADO", ganador: 2, departamental1_id: 22 };
+  assert.deepEqual(detectar(a, b, c).puestos.map(p => p.competidor.clave), ["E9", "D22", "E4"]);
+  assert.deepEqual(detectar(a, b, { ...c, ganador: 1 }).puestos.map(p => p.competidor.clave), ["D22", "E9", "E4"]);
+  for (const cambio of [{ departamental1_id: null }, { departamental1_id: 23 }]) {
+    assert.deepEqual(detectar(a, b, { ...c, ...cambio }).puestos, []);
+  }
+  assert.equal(detectar({ ...a, ganador: 0 }, b, c).estado, "EN_CURSO");
 });
 
 test("medallero: el sistema de puntos admite entre 3 y 10 puestos, en orden", () => {

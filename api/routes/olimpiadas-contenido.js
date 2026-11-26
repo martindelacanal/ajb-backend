@@ -23,7 +23,7 @@ const { filtrarVeedoresManuales, filtrarContactosVeedores } = require('../servic
 const {
   CAMPOS_PARTIDO_EXTRA, TIPOS_ORIGEN, TIPOS_MARCADOR, REGLAS_DIVISION, MAX_PUESTOS, calcularPosiciones, listarTorneos, listarEquipos, filtroId,
   normalizarSets, contarSets, leerParciales, normalizarCuartos, tipoMarcadorDisciplina, permitePenales, conEnVivo, normalizarNombre, resolverClasificacion, hayCiclo,
-  nombrePuesto, calcularTablaMedallero, agruparMedallasPorDisciplina, puestosSegunResultados,
+  nombrePuesto, calcularTablaMedallero, agruparMedallasPorDisciplina, detectarTriangular, puestosSegunResultados,
 } = require('../services/olimpiadas-competicion');
 const {
   verifyToken,
@@ -1621,6 +1621,14 @@ router.delete("/olimpiadas/enlaces/:enlaceId(\\d+)", verifyToken, async (req, re
 // Fixture: disciplinas de la edición, partidos y resultados
 // ---------------------------------------------------------------------------
 // La sede que se muestra es la del partido y, si no tiene, la de la disciplina (con su mapa).
+// Una fase de grupos de tres todavía puede clasificar a una eliminatoria sin partidos cargados.
+const FORMATO_CUADRO = `t.formato AS torneo_formato,
+  (t.formato IN ('GRUPOS', 'MIXTO') AND EXISTS (
+    SELECT 1 FROM olimpiada_torneo_instancia etapa JOIN olimpiada_instancia i ON i.id = etapa.instancia_id
+    WHERE etapa.torneo_id = t.id AND i.eliminado = 0 AND LOWER(i.nombre) REGEXP 'final|tercer|bronce|elimina|repech'
+      AND NOT EXISTS (SELECT 1 FROM olimpiada_partido jugado WHERE jugado.torneo_id = t.id
+        AND jugado.instancia_id = etapa.instancia_id AND jugado.eliminado = 0)
+  )) AS torneo_eliminatoria_pendiente`;
 const SELECT_PARTIDO = `
   SELECT p.id, p.olimpiada_id, p.disciplina_id, d.nombre AS disciplina_nombre, d.tipo_marcador, p.fecha, p.hora_inicio, p.hora_fin,
          p.etiqueta, p.fase, p.zona, p.bloque, p.participante1, p.participante2, p.departamental1_id, p.departamental2_id,
@@ -1628,7 +1636,7 @@ const SELECT_PARTIDO = `
          p.resultado1, p.resultado2, p.sets, p.ganador, p.estado, p.sede_id,
          IF(s.id IS NULL, sd.nombre, s.nombre) AS sede_nombre, IF(s.id IS NULL, sd.direccion, s.direccion) AS sede_direccion,
          IF(s.id IS NULL, sd.url_mapa, s.url_mapa) AS sede_url_mapa, IF(s.id IS NULL, sd.lat, s.lat) AS sede_lat, IF(s.id IS NULL, sd.lng, s.lng) AS sede_lng,
-         p.observacion, p.orden, p.fecha_modificacion, p.torneo_id, t.nombre AS torneo_nombre,
+         p.observacion, p.orden, p.fecha_modificacion, p.torneo_id, t.nombre AS torneo_nombre, ${FORMATO_CUADRO},
          p.instancia_id, inst.nombre AS instancia_nombre, ti.orden AS instancia_orden,
          p.lugar_id, l.nombre AS lugar_nombre, IF(s.id IS NULL, sd.nombre, s.nombre) AS lugar_predio,
          IF(s.id IS NULL, sd.direccion, s.direccion) AS lugar_direccion, IF(s.id IS NULL, sd.url_mapa, s.url_mapa) AS lugar_url_mapa,
@@ -1676,7 +1684,7 @@ async function obtenerPartidoCompleto(conexion, partidoId) {
 }
 
 // Sólo las disciplinas que se juegan: las categorías que no son deporte (prensa, organización…) no entran.
-async function listarDisciplinasFixture(conexion, olimpiadaId, { gestion = false } = {}) {
+async function listarDisciplinasFixture(conexion, olimpiadaId, { gestion = false, partidosCompletos = null } = {}) {
   const [rows] = await conexion.query(
     `SELECT d.id, d.nombre, d.tipo_id, t.nombre AS tipo_nombre, d.icono_archivo, d.tipo_marcador,
             c.sede_id, s.nombre AS sede_nombre, s.direccion AS sede_direccion, s.url_mapa AS sede_url_mapa, s.lat AS sede_lat, s.lng AS sede_lng,
@@ -1701,7 +1709,7 @@ async function listarDisciplinasFixture(conexion, olimpiadaId, { gestion = false
   );
   // Cómo se compite en cada una (partidos, categorías por tiempo, pesca o mesas) y cuántas categorías tiene
   const porCategorias = await pruebasLectura.resumenDisciplinas(conexion, olimpiadaId);
-  const podios = await leerPodiosFixture(conexion, olimpiadaId, rows, porCategorias);
+  const { podios, triangulares } = await leerPodiosFixture(conexion, olimpiadaId, rows, porCategorias, await partidosCompletos);
   const disciplinas = gestion ? rows : await filtrarVeedoresManuales(conexion, rows);
   return Promise.all(
     disciplinas.map(async (fila) => ({
@@ -1724,6 +1732,7 @@ async function listarDisciplinasFixture(conexion, olimpiadaId, { gestion = false
       veedores: veedores.filter((v) => Number(v.disciplina_id) === Number(fila.id) && v.nombre).map((v) => v.nombre),
       reglamento: fila.reglamento,
       podio: podios.get(Number(fila.id)) || [],
+      ...(gestion ? { triangular_detectado: triangulares.get(Number(fila.id)) || null } : {}),
       reglamento_url: await firmarSeguro(fila.reglamento_archivo),
       reglamento_archivo_nombre: fila.reglamento_archivo ? fila.reglamento_archivo_nombre || "Reglamento.pdf" : null,
       partidos: Number(fila.partidos) || 0,
@@ -1775,9 +1784,11 @@ router.get("/olimpiadas/:id(\\d+)/fixture", verificarAccesoCompeticion, async (r
       await exigirDisciplinaVoluntario({ db, cabecera, olimpiadaId, disciplinaId });
     }
     for (const campo of ['torneo_id', 'lugar_id']) { const id = filtroId(req.query, campo); if (id) { condiciones.push(`p.${campo} = ?`); params.push(id); } }
+    const encuentros = consultarPartidos(db, { condiciones, params });
     const [disciplinas, partidos, torneos, equipos, escudos] = await Promise.all([
-      listarDisciplinasFixture(db, olimpiadaId, { gestion: esSuperior(cabecera) || esVoluntario(cabecera) }),
-      consultarPartidos(db, { condiciones, params }),
+      listarDisciplinasFixture(db, olimpiadaId, { gestion: esSuperior(cabecera) || esVoluntario(cabecera),
+        partidosCompletos: condiciones.length === (asignadas ? 2 : 1) ? encuentros : null }),
+      encuentros,
       listarTorneos(db, olimpiadaId, asignadas),
       listarEquipos(db, olimpiadaId, asignadas),
       listarEscudos(db),
@@ -2218,7 +2229,7 @@ function describirPartido(partido) {
 // Clasificación automática y medallas que salen de los resultados
 // ---------------------------------------------------------------------------
 const SELECT_PARTIDO_CLASIFICACION = `
-  SELECT p.id, p.disciplina_id, p.torneo_id, t.formato AS torneo_formato, p.zona, p.etiqueta, p.fase, inst.nombre AS instancia_nombre, p.estado, p.ganador, p.resultado1, p.resultado2,
+  SELECT p.id, p.disciplina_id, p.torneo_id, ${FORMATO_CUADRO}, p.zona, p.etiqueta, p.fase, inst.nombre AS instancia_nombre, p.estado, p.ganador, p.resultado1, p.resultado2,
          p.participante1, p.participante2, p.departamental1_id, p.departamental2_id, p.inscripcion1_id, p.inscripcion2_id,
          p.equipo1_id, p.equipo2_id, eq1.nombre AS equipo1_nombre, eq2.nombre AS equipo2_nombre,
          dep1.nombre AS departamental1_nombre, dep2.nombre AS departamental2_nombre,
@@ -2458,6 +2469,7 @@ router.post("/olimpiadas/:id(\\d+)/partidos/importar", verificarAccesoCompeticio
         campo_modificado: "importacion",
         valor_nuevo: `${partidos.length} partidos de ${disciplina.nombre} importados desde texto`,
       });
+      await aplicarEfectosCompeticion(connection, cabecera, olimpiadaId, disciplinaId);
     });
     const sinVincular = partidos.length * 2 - vinculados;
     res.status(201).json({
@@ -2661,7 +2673,7 @@ router.get("/olimpiadas/:id(\\d+)/en-vivo", verificarAccesoCompeticion, async (r
 // ---------------------------------------------------------------------------
 // Medallero
 // ---------------------------------------------------------------------------
-async function leerPodiosFixture(conexion, olimpiadaId, disciplinas, porCategorias) {
+async function leerPodiosFixture(conexion, olimpiadaId, disciplinas, porCategorias, partidosCompletos) {
   // Una carga manual fija la disciplina entera, aunque sólo se haya adjudicado un puesto.
   const [guardadas] = await conexion.query(
     `SELECT m.disciplina_id, m.puesto, m.departamental_id, dep.nombre, m.equipo_id, e.nombre AS equipo_nombre, m.origen
@@ -2674,25 +2686,38 @@ async function leerPodiosFixture(conexion, olimpiadaId, disciplinas, porCategori
   const cuadrosPendientes = [];
   for (const d of disciplinas) {
     const id = Number(d.id);
-    if (manuales.has(id)) continue;
     const formato = porCategorias.get(id)?.formato || "PARTIDOS";
     if (formato !== "PARTIDOS") {
-      categorias.push({ id, formato });
-    } else if (Number(d.partidos) !== 0 && ![1, 2, 3].every(p => guardadas.some(m => Number(m.disciplina_id) === id && Number(m.puesto) === p))) {
+      if (!manuales.has(id)) categorias.push({ id, formato });
+    } else if (d.partidos == null || Number(d.partidos) === 3 || (Number(d.partidos) > 0 && !manuales.has(id)
+      && ![1, 2, 3].every(p => guardadas.some(m => Number(m.disciplina_id) === id && Number(m.puesto) === p)))) {
       cuadrosPendientes.push(id);
     }
   }
   const categoriaIds = new Set(categorias.map(c => c.id));
-  const medallas = guardadas.filter(m => Number(m.puesto) <= 3 && !categoriaIds.has(Number(m.disciplina_id)));
-  // Los cuadros resueltos antes de esta versión pueden tener puestos sin materializar.
+  let medallas = guardadas.filter(m => Number(m.puesto) <= 3 && !categoriaIds.has(Number(m.disciplina_id)));
+  const triangulares = new Map();
   if (cuadrosPendientes.length) {
-    const [partidos] = await conexion.query(SELECT_PARTIDO_CLASIFICACION, [olimpiadaId, cuadrosPendientes]);
-    const faltan = cuadrosPendientes.flatMap(id => {
-      const puestos = puestosSegunResultados(partidos.filter(p => Number(p.disciplina_id) === id)) || [];
-      return puestos.filter(p => p.puesto <= 3 && !medallas.some(m => Number(m.disciplina_id) === id && Number(m.puesto) === p.puesto))
-        .map(p => ({ ...p, disciplina_id: id }));
-    });
-    medallas.push(...await filasDePuestos(conexion, faltan));
+    const partidos = partidosCompletos ?? (await conexion.query(SELECT_PARTIDO_CLASIFICACION, [olimpiadaId, cuadrosPendientes]))[0];
+    const calcular = [];
+    for (const id of cuadrosPendientes) {
+      const cuadro = partidos.filter(p => Number(p.disciplina_id) === id);
+      const triangular = detectarTriangular(cuadro);
+      if (triangular) triangulares.set(id, { estado: triangular.estado, podio_manual: manuales.has(id) });
+      if (manuales.has(id)) continue;
+      let puestos;
+      if (triangular) {
+        // Las AUTO antiguas pudieron surgir de un rótulo de tercer puesto. En un triangular
+        // siempre manda la tabla de los tres encuentros, incluso si quedó empatada o se reabrió.
+        medallas = medallas.filter(m => Number(m.disciplina_id) !== id);
+        puestos = triangular.puestos;
+      } else {
+        puestos = (puestosSegunResultados(cuadro) || []).filter(p =>
+          p.puesto <= 3 && !medallas.some(m => Number(m.disciplina_id) === id && Number(m.puesto) === p.puesto));
+      }
+      calcular.push(...puestos.map(p => ({ ...p, disciplina_id: id })));
+    }
+    medallas.push(...await filasDePuestos(conexion, calcular));
   }
   medallas.push(...await pruebasLectura.medallasParaFixture(conexion, olimpiadaId, categorias));
   const podios = new Map();
@@ -2704,7 +2729,7 @@ async function leerPodiosFixture(conexion, olimpiadaId, disciplinas, porCategori
     }));
     podios.set(disciplina.disciplina_id, puestos);
   }
-  return podios;
+  return { podios, triangulares };
 }
 
 async function armarMedallero(conexion, olimpiada) {

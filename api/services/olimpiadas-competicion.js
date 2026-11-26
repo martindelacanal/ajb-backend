@@ -459,34 +459,83 @@ function agruparMedallasPorDisciplina(disciplinas, medallas, { puntos = null, di
   return [...porDisciplina.values()].sort((a, b) => String(a.disciplina_nombre).localeCompare(String(b.disciplina_nombre), "es"));
 }
 
-function puestosDeTriangular(partidos) {
-  const torneoId = partidos[0]?.torneo_id;
-  if (partidos.length !== 3 || !torneoId || !partidos.every(p => p.torneo_id === torneoId && p.torneo_formato === 'LIGA'
-    && !p.origen1_tipo && !p.origen2_tipo && !p.partido_origen1_id && !p.partido_origen2_id)) return null;
-  const tabla = calcularPosiciones(partidos, { porNombre: true, conCompetidor: true });
-  // Con tres competidores y tres encuentros, dos partidos por competidor
-  // implica que cada par se enfrentó exactamente una vez.
-  if (tabla.length !== 3 || tabla.some(f => f.jugados !== 2 || !(f.departamental_id || f.equipo_id))) return null;
-  // Un lado cargado sólo por departamental puede ser la misma persona que otro
-  // inscripto de esa departamental. Tampoco se desempata un podio por nombre o tantos.
-  if (tabla.some(f => f.departamental_id && !f.competidor.inscripcion_id && tabla.some(otra =>
-    otra.departamental_id === f.departamental_id && otra.competidor.inscripcion_id))) return null;
-  if (new Set(tabla.map(f => f.puntos)).size !== 3) return null;
-  return tabla.map(f => ({ puesto: f.posicion, competidor: f.competidor }));
+const rotulos = p => [p.instancia_nombre, p.fase, p.etiqueta].map(normalizarNombre);
+const tercerPuesto = /^(?:(?:partido|final) )?(?:por (?:el |la )?)?(?:(?:tercer|tercero|3(?:er|ro|o)?) (?:puesto|lugar)|(?:tercer|tercero|3(?:er|ro|o)?) (?:y )?(?:cuarto|4(?:to|o)?)(?: puestos?)?|(?:medalla de )?bronce)$/;
+const esTercero = p => rotulos(p).some(r => tercerPuesto.test(r)) || normalizarNombre(p.instancia_nombre) === 'tercero';
+const esFinal = p => {
+  const nombres = rotulos(p);
+  return !esTercero(p) && nombres.some(r => /^(?:(?:gran|partido) )?final$/.test(r))
+    && !nombres.some(r => /\b(?:semifinal(?:es)?|semi final(?:es)?|cuartos?|octavos?|dieciseisavos?)\b/.test(r));
+};
+
+// En algunos triangulares C juega primero con quien pierda A-B y después con
+// quien gane A-B. Es la misma rueda aunque el resultado decida el orden.
+function parejasDelTriangular(partidos) {
+  const parejas = partidos.map(p => [1, 2].map(lado => competidorDe(p, lado, { porNombre: true })));
+  const derivados = partidos.map(p => [1, 2].filter(lado => p[`partido_origen${lado}_id`] || p[`origen${lado}_tipo`]));
+  if (derivados.every(lados => !lados.length)) return { parejas, materializadas: true };
+  const base = derivados.findIndex(lados => lados.length === 0);
+  if (base === -1 || derivados.filter(lados => lados.length === 1).length !== 2) return null;
+  const primero = partidos[base];
+  if (!normalizarIdPositivo(primero.id) || parejas[base].some(c => !c || !(c.equipo_id || c.departamental_id))) return null;
+  const definido = primero.estado === 'FINALIZADO' && [1, 2].includes(Number(primero.ganador));
+  const usados = new Set();
+  let materializadas = definido;
+  for (let indice = 0; indice < partidos.length; indice++) {
+    if (indice === base) continue;
+    const p = partidos[indice], lado = derivados[indice][0];
+    const tipo = p[`origen${lado}_tipo`];
+    if (Number(p[`partido_origen${lado}_id`]) !== Number(primero.id) || !['GANADOR', 'PERDEDOR'].includes(tipo) || usados.has(tipo)) return null;
+    usados.add(tipo);
+    // Antes del resultado ambas posibilidades producen las mismas parejas sin importar el orden.
+    const ganador = definido ? Number(primero.ganador) : 1;
+    const esperado = parejas[base][(tipo === 'GANADOR' ? ganador : 3 - ganador) - 1];
+    const actual = parejas[indice][lado - 1];
+    if (actual?.clave !== esperado.clave || actual?.departamental_id !== esperado.departamental_id) materializadas = false;
+    parejas[indice][lado - 1] = esperado;
+  }
+  return { parejas, materializadas };
+}
+
+// Se reconoce el todos contra todos por sus parejas, aun antes de jugarse.
+// La disciplina completa es el alcance del podio: una zona o un filtro no lo define.
+function detectarTriangular(partidos) {
+  const vigentes = (partidos || []).filter(p => !Number(p.eliminado));
+  if (vigentes.length !== 3) return null;
+  const primero = vigentes[0];
+  if (vigentes.some(p => !mismoTorneo(p.torneo_id, primero.torneo_id) || normalizarNombre(p.zona) !== normalizarNombre(primero.zona)
+    || Number(p.torneo_eliminatoria_pendiente) || (p.torneo_formato !== 'LIGA' && esFinal(p)))) return null;
+  const rueda = parejasDelTriangular(vigentes);
+  if (!rueda) return null;
+  const cruces = new Set(), competidores = new Map();
+  for (const lados of rueda.parejas) {
+    if (lados.some(c => !c || !(c.departamental_id || c.equipo_id)) || lados[0].clave === lados[1].clave) return null;
+    for (const c of lados) {
+      const anterior = competidores.get(c.clave);
+      if (anterior && anterior.departamental_id !== c.departamental_id) return null;
+      competidores.set(c.clave, c);
+    }
+    cruces.add(lados.map(c => c.clave).sort().join(':'));
+  }
+  if (competidores.size !== 3 || cruces.size !== 3) return null;
+  // Una inscripción y un lado identificado sólo con esa departamental pueden
+  // ser la misma persona: no alcanzan para distinguir dos competidores.
+  const jugadores = [...competidores.values()];
+  if (jugadores.some(c => c.inscripcion_id && competidores.has(`D${c.departamental_id}`))) return null;
+  if (!rueda.materializadas || vigentes.some(p => p.estado !== 'FINALIZADO' || p.ganador == null || ![0, 1, 2].includes(Number(p.ganador)))) {
+    return { estado: 'EN_CURSO', puestos: [] };
+  }
+  const tabla = calcularPosiciones(vigentes, { porNombre: true, conCompetidor: true });
+  if (new Set(tabla.map(f => f.puntos)).size !== 3) return { estado: 'EMPATADO', puestos: [] };
+  return { estado: 'RESUELTO', puestos: tabla.map(f => ({ puesto: f.posicion, competidor: f.competidor })) };
 }
 
 /** Podio de una disciplina por partidos, a partir del cuadro completo. */
 function puestosSegunResultados(partidos) {
-  const rotulos = p => [p.instancia_nombre, p.fase, p.etiqueta].map(normalizarNombre);
-  const tercerPuesto = /^(?:(?:partido|final) )?(?:por (?:el |la )?)?(?:(?:tercer|tercero|3(?:er|ro|o)?) (?:puesto|lugar)|(?:tercer|tercero|3(?:er|ro|o)?) (?:y )?(?:cuarto|4(?:to|o)?)(?: puestos?)?|(?:medalla de )?bronce)$/;
-  const esTercero = p => rotulos(p).some(r => tercerPuesto.test(r)) || normalizarNombre(p.instancia_nombre) === 'tercero';
-  const esFinal = p => {
-    const nombres = rotulos(p);
-    return !esTercero(p) && nombres.some(r => /^(?:(?:gran|partido) )?final$/.test(r))
-      && !nombres.some(r => /\b(?:semifinal(?:es)?|semi final(?:es)?|cuartos?|octavos?|dieciseisavos?)\b/.test(r));
-  };
   const vigentes = (partidos || []).filter(p => !Number(p.eliminado));
-  if (vigentes.length && vigentes.every(p => p.torneo_formato === 'LIGA')) return puestosDeTriangular(vigentes);
+  const triangular = detectarTriangular(vigentes);
+  if (triangular) return triangular.puestos.length ? triangular.puestos : null;
+  if (vigentes.length && vigentes.every(p => p.torneo_formato === 'LIGA')) return null;
   const finales = vigentes.filter(esFinal);
   const terceros = vigentes.filter(esTercero);
   if (finales.length > 1 || terceros.length > 1) return null;
@@ -561,5 +610,5 @@ module.exports = {
   partidoPublico, partidosPublicos, marcadorNumerico, calcularPosiciones, listarTorneos, listarEquipos, filtroId,
   normalizarSets, leerParciales, normalizarCuartos, tipoMarcadorDisciplina, permitePenales, contarSets, estaEnVivo, conEnVivo,
   normalizarNombre, competidorDe, resolverClasificacion, hayCiclo, nombreZona,
-  nombrePuesto, repartirPuntos, calcularTablaMedallero, agruparMedallasPorDisciplina, puestosSegunResultados,
+  nombrePuesto, repartirPuntos, calcularTablaMedallero, agruparMedallasPorDisciplina, detectarTriangular, puestosSegunResultados,
 };

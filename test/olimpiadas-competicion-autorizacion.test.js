@@ -170,11 +170,12 @@ test("veedor: la estructura de su propia disciplina también queda reservada a l
   ]) assert.equal((await pedir(url, { method, body })).status, 403, `${method} ${url} ${JSON.stringify(body)}`);
 });
 
-function simularEscrituraResultado(contexto, encuentro) {
+function simularEscrituraResultado(contexto) {
   contexto.conexion = {
     beginTransaction() {}, commit() {}, rollback() {}, release() {},
     async query(sql, params) {
       if (sql.includes("UPDATE olimpiada_partido SET estado = ?")) {
+        const encuentro = contexto.partidos.find(p => p.id === params[5]);
         [encuentro.estado, encuentro.resultado1, encuentro.resultado2, encuentro.ganador, encuentro.sets] = params;
         return [{ affectedRows: 1 }];
       }
@@ -189,10 +190,30 @@ function simularEscrituraResultado(contexto, encuentro) {
   };
 }
 
+function simularEscrituraMedallas(contexto, medallas, departamentales) {
+  const query = contexto.conexion.query;
+  let siguienteId = Math.max(0, ...medallas.map(m => m.id));
+  contexto.conexion.query = (sql, params) => {
+    if (sql.includes("FROM olimpiada_medalla m")) return [medallas.slice()];
+    if (sql.includes("INSERT INTO olimpiada_medalla")) {
+      const [, disciplina_id, puesto, departamental_id, equipo_id] = params;
+      medallas.push({ id: ++siguienteId, disciplina_id, puesto, departamental_id, equipo_id,
+        origen: "AUTO", nombre: departamentales.find(d => d.id === departamental_id).nombre });
+      return [{ insertId: siguienteId }];
+    }
+    if (sql.includes("DELETE FROM olimpiada_medalla")) {
+      for (const id of params[0]) medallas.splice(medallas.findIndex(m => m.id === id), 1);
+      return [{ affectedRows: params[0].length }];
+    }
+    if (sql.includes("SELECT nombre FROM olimpiada_disciplina")) return [[{ nombre: "Tenis" }]];
+    return query(sql, params);
+  };
+}
+
 test("veedor: un partido sólo sale en vivo al iniciar, conserva los sets al suspender y permite reanudar", async (t) => {
   const encuentro = { ...partido, hora_inicio: "00:00:00", hora_fin: "23:59:00" };
   const { pedir, contexto } = await servidor(t, { partidos: [encuentro] });
-  simularEscrituraResultado(contexto, encuentro);
+  simularEscrituraResultado(contexto);
   const guardar = body => pedir("/olimpiadas/partidos/44/resultado", { method: "PUT", body });
   const enJuego = async () => (await (await pedir("/olimpiadas/publico/7/en-vivo", { anonimo: true })).json()).en_juego.map(p => p.id);
   assert.deepEqual(await enJuego(), []);
@@ -212,7 +233,7 @@ test("básquet: el veedor carga parciales, corrige el resultado y el fixture pú
   const disciplina = { id: 4, nombre: "Basquet Masculino", tipo_marcador: "TANTOS" };
   const encuentro = { ...partido, estado: "EN_JUEGO", disciplina_nombre: disciplina.nombre, tipo_marcador: "TANTOS" };
   const { pedir, contexto } = await servidor(t, { partidos: [encuentro], disciplinas: [disciplina] });
-  simularEscrituraResultado(contexto, encuentro);
+  simularEscrituraResultado(contexto);
   const guardar = body => pedir("/olimpiadas/partidos/44/resultado", { method: "PUT", body });
   const parciales = [[0, 16], [20, 15], [19, 14], [18, 14]];
 
@@ -241,7 +262,7 @@ test("fútbol: la tanda desempata el partido, clasifica al ganador y conserva lo
   const encuentro = { ...partido, estado: "EN_JUEGO", disciplina_nombre: disciplina.nombre, tipo_marcador: "TANTOS", etiqueta: "A" };
   const cruce = { id: 45, disciplina_id: 4, estado: "PROGRAMADO", origen1_tipo: "GANADOR", partido_origen1_id: 44, participante1: "Ganador de A" };
   const { pedir, contexto } = await servidor(t, { partidos: [encuentro, cruce], disciplinas: [disciplina] });
-  simularEscrituraResultado(contexto, encuentro);
+  simularEscrituraResultado(contexto);
   const guardar = body => pedir("/olimpiadas/partidos/44/resultado", { method: "PUT", body });
   const igualado = { resultado1: "0", resultado2: "0" };
   assert.equal((await guardar({ ...igualado, estado: "EN_JUEGO", penales: [2, 2] })).status, 200);
@@ -396,29 +417,143 @@ test("fixture público: un triangular terminado publica las tres departamentales
   assert.doesNotMatch(JSON.stringify(fixture.disciplinas[0].podio), /puntos|inscripcion/);
 });
 
+const departamentalesTriangular = [{ id: 1, nombre: "Azul" }, { id: 2, nombre: "Mercedes" }, { id: 3, nombre: "La Plata" }];
+const administradorFixture = { id: 5, rol: "admin", rol_id: 1, habilitado: "Y", requiere_cambio_clave: 0 };
+
+function partidosTriangular(torneo) {
+  const base = { ...partido, ...torneo, inscripcion1_id: null, inscripcion2_id: null, estado: "FINALIZADO" };
+  return [
+    { ...base, id: 41, departamental1_id: 1, departamental2_id: 2, resultado1: "2", resultado2: "0", ganador: 1 },
+    { ...base, id: 42, departamental1_id: 1, departamental2_id: 3, resultado1: "0", resultado2: "1", ganador: 2 },
+    { ...base, id: 44, departamental1_id: 2, departamental2_id: 3, resultado1: null, resultado2: null, ganador: null, estado: "PROGRAMADO" },
+  ].map(p => ({ ...p, participante1: departamentalesTriangular[p.departamental1_id - 1].nombre,
+    participante2: departamentalesTriangular[p.departamental2_id - 1].nombre }));
+}
+
+const puestosDePodio = d => d.podio.map(p => [p.puesto, p.ganadores[0].departamentales[0].id]);
+
+test("gestión: reconoce el triangular sin elegir Liga, guarda las medallas al cerrar y las retira si cambia el desempate", async t => {
+  for (const torneo of [{ torneo_id: 8, torneo_formato: "ELIMINACION" }, { torneo_id: null, torneo_formato: null }]) {
+    const partidos = partidosTriangular(torneo);
+    const medallas = [];
+    const { pedir, contexto } = await servidor(t, { actor: administradorFixture, partidos, medallas, departamentales: departamentalesTriangular,
+      disciplinas: [{ id: 4, nombre: "Tenis", partidos: 3 }] });
+    simularEscrituraResultado(contexto);
+    simularEscrituraMedallas(contexto, medallas, departamentalesTriangular);
+    const guardar = async body => {
+      const resultado = await pedir("/olimpiadas/partidos/44/resultado", { method: "PUT", body });
+      assert.equal(resultado.status, 200, JSON.stringify(await resultado.json()));
+    };
+    const verificar = async (estado, esperado) => {
+      const gestion = await (await pedir("/olimpiadas/7/fixture")).json();
+      const publico = await (await pedir("/olimpiadas/publico/7/fixture", { anonimo: true })).json();
+      assert.deepEqual(gestion.disciplinas[0].triangular_detectado, { estado, podio_manual: false });
+      assert.equal("triangular_detectado" in publico.disciplinas[0], false);
+      assert.deepEqual(puestosDePodio(gestion.disciplinas[0]), esperado);
+      assert.deepEqual(puestosDePodio(publico.disciplinas[0]), esperado);
+      assert.deepEqual(medallas.map(m => [m.puesto, m.departamental_id]), esperado);
+    };
+    await verificar("EN_CURSO", []);
+    await guardar({ estado: "FINALIZADO", resultado1: "1", resultado2: "2" });
+    await verificar("RESUELTO", [[1, 3], [2, 1], [3, 2]]);
+    // Los tres ganaron un partido. La diferencia de tantos y los nombres no rompen el empate.
+    await guardar({ estado: "FINALIZADO", resultado1: "4", resultado2: "0" });
+    await verificar("EMPATADO", []);
+    await guardar({ estado: "EN_JUEGO" });
+    await verificar("EN_CURSO", []);
+  }
+});
+
+test("el fixture reinterpreta un triangular histórico con medallas automáticas equivocadas y conserva una adjudicación manual", async t => {
+  const partidos = partidosTriangular({ torneo_id: 8, torneo_formato: "ELIMINACION" });
+  Object.assign(partidos[2], { instancia_nombre: "Tercer puesto", estado: "FINALIZADO", resultado1: "0", resultado2: "1", ganador: 2 });
+  const medallas = departamentalesTriangular.map((d, i) => ({
+    id: i + 1, disciplina_id: 4, puesto: i + 1, departamental_id: d.id, nombre: d.nombre, origen: "AUTO",
+  }));
+  const { pedir, contexto } = await servidor(t, { actor: administradorFixture, partidos, medallas, departamentales: departamentalesTriangular,
+    disciplinas: [{ id: 4, nombre: "Tenis", partidos: 3 }] });
+  for (const manual of [false, true]) {
+    if (manual) medallas.forEach(m => { m.origen = "MANUAL"; });
+    const gestion = await (await pedir("/olimpiadas/7/fixture")).json();
+    const publico = await (await pedir("/olimpiadas/publico/7/fixture", { anonimo: true })).json();
+    const esperado = manual ? [[1, 1], [2, 2], [3, 3]] : [[1, 3], [2, 1], [3, 2]];
+    assert.deepEqual(gestion.disciplinas[0].triangular_detectado, { estado: "RESUELTO", podio_manual: manual });
+    assert.deepEqual(puestosDePodio(gestion.disciplinas[0]), esperado);
+    assert.deepEqual(puestosDePodio(publico.disciplinas[0]), esperado);
+  }
+  assert.ok(contexto.consultas.every(c => !/^\s*(?:UPDATE|DELETE|INSERT)/i.test(c.sql)));
+});
+
+test("un triangular armado con ganador y perdedor del primer partido se reconoce antes de conocer sus nombres", async t => {
+  for (const invertir of [false, true]) {
+    const [inicial] = partidosTriangular({ torneo_id: 8, torneo_formato: "ELIMINACION" });
+    Object.assign(inicial, { id: 58, estado: "PROGRAMADO", resultado1: null, resultado2: null, ganador: null });
+    const derivado = (id, tipo, ladoOrigen) => {
+      const ladoFijo = 3 - ladoOrigen;
+      return { ...inicial, id, [`origen${ladoOrigen}_tipo`]: tipo, [`partido_origen${ladoOrigen}_id`]: inicial.id,
+        [`departamental${ladoOrigen}_id`]: null, [`participante${ladoOrigen}`]: "A confirmar",
+        [`departamental${ladoFijo}_id`]: 3, [`participante${ladoFijo}`]: "La Plata" };
+    };
+    const origenPerdedor = invertir ? 1 : 2;
+    const origenGanador = 3 - origenPerdedor;
+    const conPerdedor = derivado(38, "PERDEDOR", origenPerdedor);
+    const conGanador = derivado(81, "GANADOR", origenGanador);
+    const medallas = [];
+    const { pedir, contexto } = await servidor(t, { actor: administradorFixture, partidos: [conPerdedor, inicial, conGanador],
+      medallas, departamentales: departamentalesTriangular, disciplinas: [{ id: 4, nombre: "Vóley", partidos: 3 }] });
+    simularEscrituraResultado(contexto);
+    simularEscrituraMedallas(contexto, medallas, departamentalesTriangular);
+    const gestion = async () => (await (await pedir("/olimpiadas/7/fixture")).json()).disciplinas[0];
+    const finalizar = async (id, ganador) => {
+      const respuesta = await pedir(`/olimpiadas/partidos/${id}/resultado`, { method: "PUT",
+        body: { estado: "FINALIZADO", resultado1: ganador === 1 ? "2" : "0", resultado2: ganador === 2 ? "2" : "0" } });
+      assert.equal(respuesta.status, 200, JSON.stringify(await respuesta.json()));
+    };
+    assert.deepEqual((await gestion()).triangular_detectado, { estado: "EN_CURSO", podio_manual: false });
+    await finalizar(inicial.id, 1);
+    assert.equal(conPerdedor[`departamental${origenPerdedor}_id`], 2);
+    assert.equal(conGanador[`departamental${origenGanador}_id`], 1);
+    await finalizar(conPerdedor.id, 3 - origenPerdedor);
+    assert.deepEqual((await gestion()).podio, []);
+    await finalizar(conGanador.id, origenGanador);
+    assert.deepEqual((await gestion()).triangular_detectado, { estado: "RESUELTO", podio_manual: false });
+    const esperado = [[1, 1], [2, 3], [3, 2]];
+    assert.deepEqual(medallas.map(m => [m.puesto, m.departamental_id]), esperado);
+    const publico = await (await pedir("/olimpiadas/publico/7/fixture", { anonimo: true })).json();
+    assert.deepEqual(puestosDePodio(publico.disciplinas[0]), esperado);
+  }
+});
+
+test("una zona de tres con eliminatorias pendientes conserva reservado el podio de la disciplina", async t => {
+  const partidos = partidosTriangular({ torneo_id: 8, torneo_formato: "GRUPOS", torneo_eliminatoria_pendiente: 1, zona: "A" });
+  Object.assign(partidos[2], { estado: "FINALIZADO", resultado1: "0", resultado2: "1", ganador: 2 });
+  const { pedir } = await servidor(t, { actor: administradorFixture, partidos, departamentales: departamentalesTriangular,
+    disciplinas: [{ id: 4, nombre: "Tenis", partidos: 3 }] });
+  const gestion = await (await pedir("/olimpiadas/7/fixture")).json();
+  assert.equal(gestion.disciplinas[0].triangular_detectado, null);
+  const publico = await (await pedir("/olimpiadas/publico/7/fixture", { anonimo: true })).json();
+  assert.deepEqual(publico.disciplinas[0].podio, []);
+});
+
+test("tres rivales en una llave con cruces dependientes conservan el podio de la final", async t => {
+  const partidos = partidosTriangular({ torneo_id: 8, torneo_formato: "ELIMINACION" });
+  Object.assign(partidos[2], { instancia_nombre: "Final", estado: "FINALIZADO", resultado1: "0", resultado2: "1", ganador: 2,
+    origen1_tipo: "PERDEDOR", partido_origen1_id: 41, origen2_tipo: "GANADOR", partido_origen2_id: 42 });
+  const { pedir } = await servidor(t, { actor: administradorFixture, partidos, departamentales: departamentalesTriangular,
+    disciplinas: [{ id: 4, nombre: "Tenis", partidos: 3 }] });
+  const gestion = await (await pedir("/olimpiadas/7/fixture")).json();
+  assert.equal(gestion.disciplinas[0].triangular_detectado, null);
+  const publico = await (await pedir("/olimpiadas/publico/7/fixture", { anonimo: true })).json();
+  assert.deepEqual(puestosDePodio(publico.disciplinas[0]), [[1, 3], [2, 2]]);
+});
+
 test("resultados: finalizar el tercer puesto sin final guarda el bronce, y corregirlo actualiza el podio público", async t => {
   const encuentro = { ...partido, instancia_nombre: "Tercer puesto", estado: "EN_JUEGO" };
   const medallas = [];
   const departamentales = [{ id: 1, nombre: "La Plata" }, { id: 2, nombre: "Mercedes" }];
   const { pedir, contexto } = await servidor(t, { partidos: [encuentro], medallas, departamentales });
-  simularEscrituraResultado(contexto, encuentro);
-  const query = contexto.conexion.query;
-  let siguienteId = 0;
-  contexto.conexion.query = (sql, params) => {
-    if (sql.includes("FROM olimpiada_medalla m")) return [medallas.slice()];
-    if (sql.includes("INSERT INTO olimpiada_medalla")) {
-      const [, disciplina_id, puesto, departamental_id, equipo_id] = params;
-      medallas.push({ id: ++siguienteId, disciplina_id, puesto, departamental_id, equipo_id,
-        origen: "AUTO", nombre: departamentales.find(d => d.id === departamental_id).nombre });
-      return [{ insertId: siguienteId }];
-    }
-    if (sql.includes("DELETE FROM olimpiada_medalla")) {
-      for (const id of params[0]) medallas.splice(medallas.findIndex(m => m.id === id), 1);
-      return [{ affectedRows: params[0].length }];
-    }
-    if (sql.includes("SELECT nombre FROM olimpiada_disciplina")) return [[{ nombre: "Tenis" }]];
-    return query(sql, params);
-  };
+  simularEscrituraResultado(contexto);
+  simularEscrituraMedallas(contexto, medallas, departamentales);
   const guardar = resultado => pedir("/olimpiadas/partidos/44/resultado", {
     method: "PUT", body: { estado: "FINALIZADO", resultado1: resultado, resultado2: "1" },
   });

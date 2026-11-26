@@ -96,7 +96,9 @@ async function conLogos(tabla) {
 }
 const posicionesPublicas = o => Number(o.posiciones_publicas) === 1;
 ruta('fixture', async (req, o) => {
-  const [disciplinas, partidos, torneos, equipos, escudos] = await Promise.all([lectura.listarDisciplinasFixture(db, o.id), partidosFiltrados(req, o),
+  const encuentros = partidosFiltrados(req, o);
+  const filtrados = ['disciplina_id', 'torneo_id', 'lugar_id'].some(campo => req.query[campo]);
+  const [disciplinas, partidos, torneos, equipos, escudos] = await Promise.all([lectura.listarDisciplinasFixture(db, o.id, { partidosCompletos: filtrados ? null : encuentros }), encuentros,
     listarTorneos(db, o.id), listarEquipos(db, o.id), lectura.listarEscudos(db)]);
   return { olimpiada: edicionPublica(o), puede_editar: false, disciplinas, partidos: partidosPublicos(partidos), torneos, equipos, ...escudos,
     posiciones: posicionesPublicas(o) ? await conLogos(calcularPosiciones(partidos)) : [] };
