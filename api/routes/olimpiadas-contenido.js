@@ -3063,9 +3063,12 @@ router.get("/olimpiadas/:id(\\d+)/fotos/partidos", verifyTokenMultimedia, soloGe
 router.post("/olimpiadas/:id(\\d+)/drive/listar", verifyTokenMultimedia, soloGestionMultimedia, async (req, res) => {
   try {
     await cargarOlimpiada(db, idDeRuta(req.params.id), getCabecera(req));
-    const carpeta = await drive.listarCarpeta(req.body?.url);
-    res.set("Cache-Control", "no-store").json({ archivos: Array.from(carpeta.values(),
-      ({ id, nombre, tipo, miniatura_url, vista_url }) => ({ id, nombre, tipo, miniatura_url, vista_url })) });
+    const { archivos, carpetas_sin_acceso } = await drive.listarCarpeta(req.body?.url, { revisarPermisos: true });
+    res.set("Cache-Control", "no-store").json({
+      archivos: Array.from(archivos.values(), ({ id, nombre, tipo, miniatura_url, vista_url, ruta_carpetas }) =>
+        ({ id, nombre, tipo, miniatura_url, vista_url, ruta_carpetas })),
+      carpetas_sin_acceso,
+    });
   } catch (error) { responderError(res, error, "No se pudo leer la carpeta de Drive"); }
 });
 

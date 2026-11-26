@@ -44,15 +44,21 @@ const html = `<div class="flip-entries"><a href="https://drive.google.com/file/d
   <div class="flip-entry-thumb"><img src="https://lh3.googleusercontent.com/drive-storage/test=s190"/></div>
   <div class="flip-entry-title">Final &amp; podio.PNG</div></a>
   <a href="https://drive.google.com/file/d/video000001/view"><img src="https://drive-thirdparty.googleusercontent.com/16/type/video/mp4">Resumen.mp4</a>
-  <a href="https://drive.google.com/drive/folders/secundaria001">Finales</a><a href="https://drive.google.com/file/d/documento001/view">Presupuesto.xlsx</a></div>`;
+  <a href="https://drive.google.com/drive/folders/secundaria001?resourcekey=clave-finales">Finales</a><a href="https://drive.google.com/file/d/documento001/view">Presupuesto.xlsx</a></div>`;
 
-test("el listado valida carpeta y recurso, ignora subcarpetas y documentos", async t => {
-  assert.deepEqual(drive.carpetaDeEnlace(url), { id: "carpeta123456", clave: "clave-carpeta" });
-  for (const enlace of [url.replace("google.com", "google.com.example"), url.replace("https:", "http:"),
-    url.replace("drive.google.com/", "usuario@drive.google.com/"), "https://drive.google.com/file/d/carpeta123456/view"]) {
-    assert.throws(() => drive.carpetaDeEnlace(enlace), /enlace de una carpeta/);
+test("el listado reconoce carpetas y medios, conserva la clave de cada recurso e ignora documentos", async t => {
+  assert.deepEqual(drive.recursoDeEnlace(url), { id: "carpeta123456", clave: "clave-carpeta", tipo: "carpeta" });
+  assert.equal(drive.recursoDeEnlace("https://drive.google.com/open?id=carpeta123456").tipo, "carpeta");
+  for (const ruta of ["/file/d/foto0000001/view", "/file/u/2/d/foto0000001/preview", "/file/d/foto0000001"]) {
+    assert.deepEqual(drive.recursoDeEnlace("https://drive.google.com" + ruta + "?resourcekey=clave-foto"),
+      { id: "foto0000001", clave: "clave-foto", tipo: "archivo" });
   }
-  const archivos = drive.leerListado(html);
+  for (const enlace of [url.replace("google.com", "google.com.example"), url.replace("https:", "http:"),
+    url.replace("drive.google.com/", "usuario@drive.google.com/"), "https://drive.google.com/file/d/foto0000001/edit"]) {
+    assert.throws(() => drive.recursoDeEnlace(enlace), /enlace de Google Drive/);
+  }
+  const { archivos, subcarpetas } = drive.leerListado(html);
+  assert.deepEqual(subcarpetas, [{ id: "secundaria001", clave: "clave-finales", nombre: "Finales" }]);
   assert.deepEqual([...archivos.keys()], ["foto0000001", "video000001"]);
   assert.equal(archivos.get("foto0000001").nombre, "Final & podio.PNG");
   assert.match(archivos.get("foto0000001").miniatura_url, /lh3\.googleusercontent\.com/);
@@ -64,17 +70,56 @@ test("el listado valida carpeta y recurso, ignora subcarpetas y documentos", asy
   await assert.rejects(drive.juntar(drive.cuerpoLimitado(new Response(Buffer.alloc(8)), 7, "Demasiado grande")), /Demasiado grande/);
 });
 
+test("avisa al alcanzar el límite de carpetas y permite reintentar sin cachear resultados parciales", async t => {
+  const urlGrande = "https://drive.google.com/drive/folders/carpeta-grande";
+  const hijas = Array.from({ length: 256 }, (_, i) => `<a href="/drive/folders/subcarpeta-${i}">Carpeta ${i}</a>`).join("");
+  let intentos = 0;
+  t.mock.method(global, "fetch", async () => new Response(intentos++ === 0 ? hijas : '<div class="flip-entries"></div>'));
+  await assert.rejects(drive.listarCarpeta(urlGrande), { statusCode: 413 });
+  assert.equal((await drive.listarCarpeta(urlGrande)).archivos.size, 0);
+  assert.equal(intentos, 2);
+});
+
+test("distingue carpetas hermanas homónimas de forma estable y respeta nombres que ya incluyen números", () => {
+  const hermanas = [
+    '<a href="/drive/folders/carpeta00001">Sábado</a>',
+    '<a href="/drive/folders/carpeta00002">Sábado</a>',
+    '<a href="/drive/folders/carpeta00003">Sábado (2)</a>',
+  ];
+  for (const orden of [hermanas, [...hermanas].reverse()]) {
+    const { subcarpetas } = drive.leerListado(orden.join(""));
+    assert.deepEqual(Object.fromEntries(subcarpetas.map(c => [c.id, c.nombre])), {
+      carpeta00001: "Sábado", carpeta00002: "Sábado (3)", carpeta00003: "Sábado (2)",
+    });
+  }
+  assert.equal(drive.leerListado('<div class="flip-entries"></div>').archivos.size, 0);
+  assert.throws(() => drive.leerListado('<div class="flip-not-found"></div>'), { code: "DRIVE_SIN_ACCESO" });
+});
+
 test("Prensa puede importar una selección, conserva metadata y los reintentos no duplican archivos", async t => {
   const realFetch = global.fetch;
   const png = await sharp({ create: { width: 4, height: 4, channels: 3, background: "#36a" } }).png().toBuffer();
   const binario = Buffer.alloc(8 * 1024 * 1024 + 16);
   binario.write("ftypisom", 4);
   const lecturas = [];
+  let permisoConcedido = false;
   t.mock.method(global, "fetch", async destino => {
     lecturas.push(destino);
     if (destino.pathname === "/embeddedfolderview") {
-      assert.equal(destino.searchParams.get("resourcekey"), "clave-carpeta");
-      return new Response(html);
+      switch (destino.searchParams.get("id")) {
+        case "carpeta123456":
+          assert.equal(destino.searchParams.get("resourcekey"), "clave-carpeta");
+          return new Response(`<div class="flip-entries"><a href="/drive/folders/secundaria001?resourcekey=clave-finales">
+            <div class="flip-entry-title">Finales</div></a><a href="/drive/folders/restringida01">Prensa</a>
+            <a href="/drive/folders/secundaria001">Finales repetida</a></div>`);
+        case "secundaria001":
+          assert.equal(destino.searchParams.get("resourcekey"), "clave-finales");
+          return new Response(`<a href="/drive/u/1/folders/jueves0000001"><div class="flip-entry-title">Jueves &amp; viernes</div></a>
+            <a href="/drive/folders/carpeta123456">Volver</a>`);
+        case "restringida01": return permisoConcedido ? new Response('<div class="flip-entries"></div>') : new Response(null, { status: 403 });
+        case "jueves0000001": return new Response(html);
+        default: assert.fail("ID de carpeta inesperado");
+      }
     }
     assert.equal(destino.hostname, "drive.usercontent.google.com");
     if (destino.searchParams.get("id") === "foto0000001") {
@@ -105,9 +150,12 @@ test("Prensa puede importar una selección, conserva metadata y los reintentos n
   assert.equal(lecturas.length, 0);
   const lista = await post("2/drive/listar", { url });
   assert.equal(lista.status, 200);
-  assert.deepEqual((await lista.json()).archivos.map(v => v.tipo), ["foto", "video"]);
+  const indice = await lista.json();
+  assert.deepEqual(indice.archivos.map(v => v.tipo), ["foto", "video"]);
+  for (const archivo of indice.archivos) assert.deepEqual(archivo.ruta_carpetas, ["Finales", "Jueves & viernes"]);
+  assert.deepEqual(indice.carpetas_sin_acceso, [["Prensa"]]);
   assert.equal((await post("2/drive/foto", { url, archivoId: "no-elegible" })).status, 400);
-  assert.equal(lecturas.length, 1);
+  assert.equal(lecturas.length, 4);
   const datosFoto = { url, archivoId: "foto0000001", carga_id: randomUUID(), epigrafe: "Final" };
   for (let i = 0; i < 2; i++) assert.equal((await post("2/drive/foto", datosFoto)).status, 201);
   assert.deepEqual(imagenes.map(i => i[1]), ["image/webp", "image/webp"]);
@@ -118,4 +166,7 @@ test("Prensa puede importar una selección, conserva metadata y los reintentos n
   assert.equal(video.bytes, binario.length);
   assert.deepEqual(partes, [8 * 1024 * 1024, 16]);
   assert.deepEqual(historial, ["FOTO", "VIDEO"]);
+  permisoConcedido = true;
+  const actualizado = await post("2/drive/listar", { url });
+  assert.deepEqual((await actualizado.json()).carpetas_sin_acceso, []);
 });
