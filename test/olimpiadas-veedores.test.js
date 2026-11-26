@@ -303,11 +303,12 @@ test("medallero: resuelve el tercer puesto aunque falte la final y reconoce los 
   const puestos = partidos => puestosSegunResultados(partidos)?.map(p => [p.puesto, p.competidor.departamental_id]);
   assert.deepEqual(puestos([tercero]), [[3, 8], [4, 4]]);
   assert.deepEqual(puestos([tercero, final]), [[1, 8], [2, 4], [3, 8], [4, 4]]);
-  const semi = { ...tercero, id: 90, etiqueta: "A", fase: "Semifinal", instancia_nombre: "Semifinal" };
-  const otra = { ...semi, id: 94, etiqueta: "B", departamental1_id: 10 };
+  const semi = { ...tercero, id: 90, etiqueta: "A", fase: "Semifinal", instancia_nombre: "Semifinal", inscripcion2_id: 201 };
+  const otra = { ...semi, id: 94, etiqueta: "B", departamental1_id: 10, inscripcion2_id: 202 };
   const compartido = [[1, 8], [2, 8], [3, 8], [4, 4]];
   assert.deepEqual(puestos([tercero, semi, otra]), compartido);
-  for (const cambio of [{ ganador: 1 }, { estado: "EN_JUEGO" }, { torneo_id: 5 }, { instancia_nombre: null }]) {
+  for (const cambio of [{ ganador: 1 }, { estado: "EN_JUEGO" }, { torneo_id: 5 }, { instancia_nombre: null },
+    { inscripcion2_id: 201 }, { inscripcion2_id: null }]) {
     assert.deepEqual(puestos([tercero, semi, { ...otra, ...cambio }]), [[3, 8], [4, 4]]);
   }
   for (const cambio of [{ origen2_tipo: "GANADOR" }, { partido_origen1_id: 94 }, { partido_origen2_id: null }]) {
@@ -326,6 +327,37 @@ test("medallero: una fecha o fase genérica nunca se toma como la definición de
   for (const etiqueta of ["3.º y 4.º puesto", "3º y 4º", "3er puesto", "Tercer y cuarto puesto", "Por el bronce"]) {
     assert.deepEqual(puestosSegunResultados([{ ...partido, fase: "Fase final", etiqueta }]).map(p => p.puesto), [3, 4]);
   }
+});
+
+test("triangular de liga: los tres cruces adjudican las medallas al terminar y una corrección cambia los puestos", () => {
+  const base = { torneo_id: 24, torneo_formato: "LIGA", estado: "FINALIZADO" };
+  const partidos = [
+    { ...base, departamental1_id: 19, departamental2_id: 17, ganador: 1, resultado1: "3", resultado2: "0" },
+    { ...base, departamental1_id: 19, departamental2_id: 14, ganador: 1, resultado1: "3", resultado2: "1" },
+    { ...base, departamental1_id: 17, departamental2_id: 14, ganador: 2, resultado1: "0", resultado2: "3" },
+  ];
+  const puestos = encuentros => puestosSegunResultados(encuentros)?.map(p => [p.puesto, p.competidor.departamental_id]);
+  assert.deepEqual(puestos(partidos), [[1, 19], [2, 14], [3, 17]]);
+  assert.deepEqual(puestos([partidos[0], partidos[1], { ...partidos[2], ganador: 1 }]), [[1, 19], [2, 17], [3, 14]]);
+  for (const cambio of [{ ganador: null }, { estado: "EN_JUEGO" }, { torneo_id: 25 }, { origen1_tipo: "PERDEDOR" }, { departamental1_id: 19 }]) {
+    assert.equal(puestosSegunResultados([partidos[0], partidos[1], { ...partidos[2], ...cambio }]), null);
+  }
+  assert.equal(puestosSegunResultados([partidos[0], { ...partidos[1], ganador: 2 }, { ...partidos[2], ganador: 1 }]), null, "empate circular aun con diferencia de tantos");
+  assert.equal(puestosSegunResultados(partidos.slice(0, 2)), null);
+  assert.equal(puestosSegunResultados([...partidos, partidos[0]]), null);
+  assert.equal(puestosSegunResultados(partidos.map(p => ({ ...p, torneo_formato: "GRUPOS" }))), null);
+});
+
+test("triangular: dos inscripciones distintas de la misma departamental pueden ganar oro y plata", () => {
+  const base = { estado: "FINALIZADO", torneo_id: 1, torneo_formato: "LIGA", ganador: 1 };
+  const partidos = [
+    { ...base, inscripcion1_id: 1, inscripcion2_id: 2, departamental1_id: 19, departamental2_id: 19 },
+    { ...base, inscripcion1_id: 1, inscripcion2_id: 3, departamental1_id: 19, departamental2_id: 14 },
+    { ...base, inscripcion1_id: 2, inscripcion2_id: 3, departamental1_id: 19, departamental2_id: 14 },
+  ];
+  assert.deepEqual(puestosSegunResultados(partidos).map(p => p.competidor.inscripcion_id), [1, 2, 3]);
+  const ambiguos = partidos.map(p => ({ ...p, inscripcion1_id: p.inscripcion1_id === 2 ? null : p.inscripcion1_id, inscripcion2_id: p.inscripcion2_id === 2 ? null : p.inscripcion2_id }));
+  assert.equal(puestosSegunResultados(ambiguos), null);
 });
 
 test("medallero: el sistema de puntos admite entre 3 y 10 puestos, en orden", () => {

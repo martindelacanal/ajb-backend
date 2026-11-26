@@ -6,7 +6,7 @@ const { calcularPosiciones, listarTorneos, listarEquipos, filtroId } = require('
 const esquemaPruebas = conexion => require('./olimpiadas-pruebas').esquemaDisponible(conexion);
 
 module.exports = function registrarTorneos(router, helpers) {
-  const { db, cargarOlimpiada, enTransaccion, historial, historialCambios, leerTexto, leerIdOpcional, leerEnum, leerEntero, validarDisciplinaDeOlimpiada, consultarPartidos, bloquearSinCambios, puedeVerPosiciones } = helpers;
+  const { db, cargarOlimpiada, enTransaccion, historial, historialCambios, leerTexto, leerIdOpcional, leerEnum, leerEntero, validarDisciplinaDeOlimpiada, consultarPartidos, bloquearSinCambios, puedeVerPosiciones, sincronizarMedallasAutomaticas } = helpers;
   const idRuta = valor => { const id = normalizarIdPositivo(valor); if (!id) throw crearErrorHttp('ID inválido'); return id; };
   function soloGestion(cabecera) { if (!esSuperior(cabecera) && !esVoluntario(cabecera)) throw crearErrorHttp('No autorizado', 403); }
   function soloSuperior(cabecera) { if (!esSuperior(cabecera)) throw crearErrorHttp('No autorizado', 403); }
@@ -123,6 +123,7 @@ module.exports = function registrarTorneos(router, helpers) {
         for (let orden = 0; orden < instanciaIds.length; orden++) await connection.query('INSERT INTO olimpiada_torneo_instancia (torneo_id, instancia_id, orden) VALUES (?, ?, ?)', [entidadId, instanciaIds[orden], orden]);
         await historial(connection, cabecera, { ...base, tipo_operacion: 'UPDATE', campo_modificado: 'instancias', valor_anterior: anteriores.map(i => i.instancia_id).join(', '), valor_nuevo: instanciaIds.join(', ') });
       }
+      if (id && actual.formato !== datos.formato) await sincronizarMedallasAutomaticas(connection, cabecera, olimpiadaId, datos.disciplina_id);
       return entidadId;
     });
     res.status(id ? 200 : 201).json({ success: true, id: nuevoId, message: 'Torneo guardado' });

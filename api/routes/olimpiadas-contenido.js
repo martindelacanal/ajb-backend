@@ -19,6 +19,7 @@ const { SECCIONES_INICIALES } = require("../data/olimpiadas-plantillas");
 const pruebasLectura = require("./olimpiadas-pruebas");
 const { FORMATOS: FORMATOS_COMPETENCIA } = require("../services/olimpiadas-pruebas");
 const { verificarAccesoCompeticion, exigirDisciplinaVoluntario, exigirEdicionVoluntario, esVoluntario, puedeEditarEdicion } = require('../security/olimpiadas-voluntarios');
+const { filtrarVeedoresManuales, filtrarContactosVeedores } = require('../services/olimpiadas-visibilidad-veedores');
 const {
   CAMPOS_PARTIDO_EXTRA, TIPOS_ORIGEN, TIPOS_MARCADOR, REGLAS_DIVISION, MAX_PUESTOS, calcularPosiciones, listarTorneos, listarEquipos, filtroId,
   normalizarSets, contarSets, leerParciales, normalizarCuartos, tipoMarcadorDisciplina, permitePenales, conEnVivo, normalizarNombre, resolverClasificacion, hayCiclo,
@@ -1305,7 +1306,7 @@ router.get("/olimpiadas/:id(\\d+)/contactos", verifyToken, async (req, res) => {
        ORDER BY grupo, orden, id`,
       [olimpiadaId]
     );
-    res.status(200).json(rows);
+    res.status(200).json(esSuperior(cabecera) ? rows : await filtrarContactosVeedores(db, rows));
   } catch (error) {
     responderError(res, error, "No se pudieron cargar los contactos");
   }
@@ -1675,7 +1676,7 @@ async function obtenerPartidoCompleto(conexion, partidoId) {
 }
 
 // Sólo las disciplinas que se juegan: las categorías que no son deporte (prensa, organización…) no entran.
-async function listarDisciplinasFixture(conexion, olimpiadaId) {
+async function listarDisciplinasFixture(conexion, olimpiadaId, { gestion = false } = {}) {
   const [rows] = await conexion.query(
     `SELECT d.id, d.nombre, d.tipo_id, t.nombre AS tipo_nombre, d.icono_archivo, d.tipo_marcador,
             c.sede_id, s.nombre AS sede_nombre, s.direccion AS sede_direccion, s.url_mapa AS sede_url_mapa, s.lat AS sede_lat, s.lng AS sede_lng,
@@ -1693,7 +1694,7 @@ async function listarDisciplinasFixture(conexion, olimpiadaId) {
   const [veedores] = await conexion.query(
     `SELECT a.disciplina_id, TRIM(CASE WHEN u.id IS NULL THEN v.nombre ELSE CONCAT_WS(' ', u.nombre, u.apellido) END) AS nombre
        FROM olimpiada_voluntario_disciplina a
-       INNER JOIN olimpiada_voluntario v ON v.id = a.voluntario_id AND v.habilitado = 1
+       INNER JOIN olimpiada_voluntario v ON v.id = a.voluntario_id AND v.habilitado = 1 ${gestion ? "" : "AND v.visible_publico = 1"}
        LEFT JOIN usuario u ON u.id = v.usuario_sistema_id
        WHERE a.olimpiada_id = ? ORDER BY nombre`,
     [olimpiadaId]
@@ -1701,8 +1702,9 @@ async function listarDisciplinasFixture(conexion, olimpiadaId) {
   // Cómo se compite en cada una (partidos, categorías por tiempo, pesca o mesas) y cuántas categorías tiene
   const porCategorias = await pruebasLectura.resumenDisciplinas(conexion, olimpiadaId);
   const podios = await leerPodiosFixture(conexion, olimpiadaId, rows, porCategorias);
+  const disciplinas = gestion ? rows : await filtrarVeedoresManuales(conexion, rows);
   return Promise.all(
-    rows.map(async (fila) => ({
+    disciplinas.map(async (fila) => ({
       id: fila.id,
       nombre: fila.nombre,
       tipo_id: fila.tipo_id,
@@ -1774,7 +1776,7 @@ router.get("/olimpiadas/:id(\\d+)/fixture", verificarAccesoCompeticion, async (r
     }
     for (const campo of ['torneo_id', 'lugar_id']) { const id = filtroId(req.query, campo); if (id) { condiciones.push(`p.${campo} = ?`); params.push(id); } }
     const [disciplinas, partidos, torneos, equipos, escudos] = await Promise.all([
-      listarDisciplinasFixture(db, olimpiadaId),
+      listarDisciplinasFixture(db, olimpiadaId, { gestion: esSuperior(cabecera) || esVoluntario(cabecera) }),
       consultarPartidos(db, { condiciones, params }),
       listarTorneos(db, olimpiadaId, asignadas),
       listarEquipos(db, olimpiadaId, asignadas),
@@ -2216,13 +2218,14 @@ function describirPartido(partido) {
 // Clasificación automática y medallas que salen de los resultados
 // ---------------------------------------------------------------------------
 const SELECT_PARTIDO_CLASIFICACION = `
-  SELECT p.id, p.disciplina_id, p.torneo_id, p.zona, p.etiqueta, p.fase, inst.nombre AS instancia_nombre, p.estado, p.ganador, p.resultado1, p.resultado2,
+  SELECT p.id, p.disciplina_id, p.torneo_id, t.formato AS torneo_formato, p.zona, p.etiqueta, p.fase, inst.nombre AS instancia_nombre, p.estado, p.ganador, p.resultado1, p.resultado2,
          p.participante1, p.participante2, p.departamental1_id, p.departamental2_id, p.inscripcion1_id, p.inscripcion2_id,
          p.equipo1_id, p.equipo2_id, eq1.nombre AS equipo1_nombre, eq2.nombre AS equipo2_nombre,
          dep1.nombre AS departamental1_nombre, dep2.nombre AS departamental2_nombre,
          p.partido_origen1_id, p.partido_origen2_id, p.origen1_tipo, p.origen1_zona, p.origen1_posicion,
          p.origen2_tipo, p.origen2_zona, p.origen2_posicion
   FROM olimpiada_partido p
+  LEFT JOIN olimpiada_torneo t ON t.id = p.torneo_id AND t.eliminado = 0
   LEFT JOIN olimpiada_instancia inst ON inst.id = p.instancia_id
   LEFT JOIN olimpiada_equipo eq1 ON eq1.id = p.equipo1_id
   LEFT JOIN olimpiada_equipo eq2 ON eq2.id = p.equipo2_id
@@ -3361,7 +3364,7 @@ router.delete("/olimpiadas/fotos/:fotoId(\\d+)", verifyTokenMultimedia, soloGest
 const ayudantes = {
   db, cargarOlimpiada, enTransaccion, historial, historialCambios, leerTexto, leerIdOpcional, leerEnum, leerEntero, leerUrl, leerFecha, leerHora, leerCoordenadas,
   validarDisciplinaDeOlimpiada, validarDepartamentales, consultarPartidos, bloquearSinCambios, exigirSuperior, soloSuperior, idDeRuta,
-  archivoDeSlot, aplicarEfectosCompeticion, puedeVerPosiciones, listarEscudos,
+  archivoDeSlot, aplicarEfectosCompeticion, sincronizarMedallasAutomaticas, puedeVerPosiciones, listarEscudos,
 };
 require('./olimpiadas-torneos')(router, ayudantes);
 require('./olimpiadas-canchas')(router, ayudantes);

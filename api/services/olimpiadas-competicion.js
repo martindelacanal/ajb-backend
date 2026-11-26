@@ -459,11 +459,23 @@ function agruparMedallasPorDisciplina(disciplinas, medallas, { puntos = null, di
   return [...porDisciplina.values()].sort((a, b) => String(a.disciplina_nombre).localeCompare(String(b.disciplina_nombre), "es"));
 }
 
-/**
- * Función pura. Con los partidos de una disciplina devuelve los puestos que se desprenden de los
- * resultados: la final define oro y plata; el partido por el tercer puesto, bronce y cuarto.
- * Cada partido decisivo reparte sus puestos de forma independiente.
- */
+function puestosDeTriangular(partidos) {
+  const torneoId = partidos[0]?.torneo_id;
+  if (partidos.length !== 3 || !torneoId || !partidos.every(p => p.torneo_id === torneoId && p.torneo_formato === 'LIGA'
+    && !p.origen1_tipo && !p.origen2_tipo && !p.partido_origen1_id && !p.partido_origen2_id)) return null;
+  const tabla = calcularPosiciones(partidos, { porNombre: true, conCompetidor: true });
+  // Con tres competidores y tres encuentros, dos partidos por competidor
+  // implica que cada par se enfrentó exactamente una vez.
+  if (tabla.length !== 3 || tabla.some(f => f.jugados !== 2 || !(f.departamental_id || f.equipo_id))) return null;
+  // Un lado cargado sólo por departamental puede ser la misma persona que otro
+  // inscripto de esa departamental. Tampoco se desempata un podio por nombre o tantos.
+  if (tabla.some(f => f.departamental_id && !f.competidor.inscripcion_id && tabla.some(otra =>
+    otra.departamental_id === f.departamental_id && otra.competidor.inscripcion_id))) return null;
+  if (new Set(tabla.map(f => f.puntos)).size !== 3) return null;
+  return tabla.map(f => ({ puesto: f.posicion, competidor: f.competidor }));
+}
+
+/** Podio de una disciplina por partidos, a partir del cuadro completo. */
 function puestosSegunResultados(partidos) {
   const rotulos = p => [p.instancia_nombre, p.fase, p.etiqueta].map(normalizarNombre);
   const tercerPuesto = /^(?:(?:partido|final) )?(?:por (?:el |la )?)?(?:(?:tercer|tercero|3(?:er|ro|o)?) (?:puesto|lugar)|(?:tercer|tercero|3(?:er|ro|o)?) (?:y )?(?:cuarto|4(?:to|o)?)(?: puestos?)?|(?:medalla de )?bronce)$/;
@@ -474,6 +486,7 @@ function puestosSegunResultados(partidos) {
       && !nombres.some(r => /\b(?:semifinal(?:es)?|semi final(?:es)?|cuartos?|octavos?|dieciseisavos?)\b/.test(r));
   };
   const vigentes = (partidos || []).filter(p => !Number(p.eliminado));
+  if (vigentes.length && vigentes.every(p => p.torneo_formato === 'LIGA')) return puestosDeTriangular(vigentes);
   const finales = vigentes.filter(esFinal);
   const terceros = vigentes.filter(esTercero);
   if (finales.length > 1 || terceros.length > 1) return null;
@@ -498,7 +511,8 @@ function puestosSegunResultados(partidos) {
     if (torneoId && semifinales.length === 2 && origenes.size === 2 && semifinales.every(p => origenes.has(Number(p.id)))
       && vigentes.every(p => p.torneo_id === torneoId)) {
       const finalistas = semifinales.map(p => p.estado === 'FINALIZADO' && [1, 2].includes(Number(p.ganador)) ? competidorDe(p, Number(p.ganador)) : null);
-      if (finalistas[0]?.departamental_id && finalistas[0].departamental_id === finalistas[1]?.departamental_id) {
+      if (finalistas[0]?.departamental_id && finalistas[0].departamental_id === finalistas[1]?.departamental_id
+        && finalistas[0].inscripcion_id && finalistas[1].inscripcion_id && finalistas[0].inscripcion_id !== finalistas[1].inscripcion_id) {
         puestos.push({ puesto: 1, competidor: finalistas[0] }, { puesto: 2, competidor: finalistas[1] });
       }
     }

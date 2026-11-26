@@ -4,6 +4,7 @@ const express = require('express');
 const db = require('../connection/connection').promise();
 const { normalizarFechaCivil } = require('../services/valores-dominio');
 const { validarRutaPublica } = require('../services/olimpiadas-ruta-publica');
+const { filtrarContactosVeedores } = require('../services/olimpiadas-visibilidad-veedores');
 const { crearErrorHttp, responderError, obtenerOlimpiada, listarNombresDisciplinas, firmarSeguro, obtenerUrlAvisoPublico, obtenerLogoPublico, fechaHoyBuenosAires, estaVentanaInscripcionAbierta, calcularGanadores } = require('../services/olimpiadas-comun');
 const { partidosPublicos, calcularPosiciones, listarTorneos, listarEquipos, filtroId } = require('../services/olimpiadas-competicion');
 const lectura = require('./olimpiadas-contenido').lecturasPublicas;
@@ -139,7 +140,7 @@ ruta('eventos', async (req, o) => {
 ruta('sedes', (req, o) => lectura.listarSedes(db, o.id));
 ruta('contactos', async (req, o) => {
   const [rows] = await db.query('SELECT id, grupo, nombre, cargo, telefono, email, orden FROM olimpiada_contacto WHERE olimpiada_id = ? AND eliminado = 0 ORDER BY grupo, orden, id', [o.id]);
-  return rows;
+  return filtrarContactosVeedores(db, rows);
 });
 ruta('secciones', async (req, o) => {
   const ubicacion = String(req.query.ubicacion || '').toUpperCase();

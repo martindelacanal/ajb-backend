@@ -149,9 +149,39 @@ test("gestión de colaboradores rechaza a afiliados, departamentales y voluntari
     assert.equal(response.status, 403);
     const borrado = await fetch(`${base}/olimpiadas/7/voluntarios/12`, { method: "DELETE" });
     assert.equal(borrado.status, 403);
+    const visibilidad = await fetch(`${base}/olimpiadas/7/voluntarios/12/visibilidad`, { method: "PUT" });
+    assert.equal(visibilidad.status, 403);
     const envio = await fetch(`${base}/olimpiadas/7/voluntarios/enviar-bienvenida`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ voluntario_ids: [12] }) });
     assert.equal(envio.status, 403);
   }
+});
+
+test("ocultar y volver a mostrar al veedor solo cambia su visibilidad y audita cada cambio una vez", async t => {
+  const cuenta = { ...v, visible_publico: 1 };
+  const cambios = [];
+  const cx = { beginTransaction() {}, commit() {}, rollback() {}, release() {}, async query(sql, params) {
+    if (sql.startsWith("SELECT visible_publico")) return [[{ ...cuenta }]];
+    if (sql.startsWith("UPDATE")) {
+      assert.equal(sql, "UPDATE olimpiada_voluntario SET visible_publico = ? WHERE id = ?");
+      assert.equal(params[1], v.id);
+      cuenta.visible_publico = params[0];
+    } else {
+      assert.match(sql, /INSERT INTO olimpiada_historial/);
+      cambios.push(params);
+    }
+    return [{ affectedRows: 1 }];
+  } };
+  const base = await conServidor(t, {
+    db: { query: async () => [[edicion]], getConnection: async () => cx },
+    verificarAdmin: (req, _res, next) => { req.data = { data: JSON.stringify({ id: 1, rol: "admin" }) }; next(); },
+  });
+  for (const visible of [false, false, true]) {
+    const r = await fetch(`${base}/olimpiadas/7/voluntarios/12/visibilidad`, { method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ visible_publico: visible }) });
+    assert.equal(r.status, 200);
+    assert.deepEqual(await r.json(), { success: true, id: v.id, visible_publico: visible });
+  }
+  assert.equal(cambios.length, 2);
 });
 
 test("eliminar un veedor conserva el usuario vinculado y audita las ediciones afectadas", async (t) => {

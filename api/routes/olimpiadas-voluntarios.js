@@ -224,7 +224,7 @@ function crearRouterVoluntarios({ db = mysqlConnection.promise(), jwtSecret = pr
     const [cuentas] = await db.query(`SELECT v.id, CASE WHEN u.id IS NULL THEN v.nombre ELSE CONCAT_WS(' ',u.nombre,u.apellido) END AS nombre,
       CASE WHEN u.id IS NULL THEN v.usuario ELSE CAST(u.documento AS CHAR) END AS usuario,
       CASE WHEN u.id IS NULL THEN IF(v.email LIKE '%@cuentas.internas.invalid', '', v.email) ELSE u.email END AS email,
-      v.habilitado, v.ultimo_correo_en, v.fecha_creacion, v.usuario_sistema_id
+      v.habilitado, v.visible_publico, v.ultimo_correo_en, v.fecha_creacion, v.usuario_sistema_id
       FROM olimpiada_voluntario v LEFT JOIN usuario u ON u.id=v.usuario_sistema_id
       WHERE (? = '' OR v.nombre LIKE ? OR v.usuario LIKE ? OR v.email LIKE ? OR CONCAT_WS(' ',u.nombre,u.apellido,u.documento,u.email) LIKE ?)
       ORDER BY nombre, v.id LIMIT 500`, [q, `%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`]);
@@ -235,8 +235,26 @@ function crearRouterVoluntarios({ db = mysqlConnection.promise(), jwtSecret = pr
     res.set("Cache-Control", "no-store");
     res.json(cuentas.map((v) => {
       const disciplinas = asignaciones.filter((a) => Number(a.voluntario_id) === Number(v.id)).map((a) => ({ id: Number(a.disciplina_id), nombre: a.nombre }));
-      return { ...v, cuenta_sistema: Boolean(v.usuario_sistema_id), disciplinas, asignado: disciplinas.length > 0 };
+      return { ...v, visible_publico: Number(v.visible_publico) === 1, cuenta_sistema: Boolean(v.usuario_sistema_id), disciplinas, asignado: disciplinas.length > 0 };
     }));
+  }));
+
+  router.put("/olimpiadas/:id/voluntarios/:voluntarioId/visibilidad", verificarAdmin, admin, manejar(async (req, res) => {
+    const id = normalizarIdPositivo(req.params.voluntarioId);
+    if (!id) throw crearErrorHttp("El veedor no es válido");
+    const visible = normalizarBooleano01(req.body?.visible_publico);
+    if (visible === null) throw crearErrorHttp("Indicá si el veedor debe figurar en la publicación");
+    const edicion = await obtenerEdicion(db, req.params.id);
+    await transaccion(db, async cx => {
+      const [[cuenta]] = await cx.query("SELECT visible_publico FROM olimpiada_voluntario WHERE id = ? FOR UPDATE", [id]);
+      if (!cuenta) throw crearErrorHttp("No encontramos ese veedor", 404);
+      if (Number(cuenta.visible_publico) === visible) return;
+      await cx.query("UPDATE olimpiada_voluntario SET visible_publico = ? WHERE id = ?", [visible, id]);
+      await registrarCambio(cx, { cabecera: getCabecera(req), id, olimpiadaId: edicion.id, operacion: "UPDATE",
+        anterior: { visible_publico: Number(cuenta.visible_publico) }, nuevo: { visible_publico: visible },
+        observacion: "Visibilidad del veedor en la publicación de Olimpiadas" });
+    });
+    res.json({ success: true, id, visible_publico: Boolean(visible) });
   }));
 
   router.post("/olimpiadas/:id/voluntarios", verificarAdmin, admin, manejar(async (req, res) => {

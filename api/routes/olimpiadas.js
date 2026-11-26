@@ -25,6 +25,7 @@ const router = express.Router();
 const mysqlConnection = require("../connection/connection");
 const { registrarErrorRuta } = require("../services/errores");
 const { normalizarFechaCivil } = require("../services/valores-dominio");
+const { filtrarVeedoresManuales } = require("../services/olimpiadas-visibilidad-veedores");
 const { validarRutaPublica, esRutaDuplicada, MENSAJE_OCUPADA } = require("../services/olimpiadas-ruta-publica");
 const {
   // archivos / S3
@@ -469,7 +470,7 @@ async function firmarIconosDisciplinas(disciplinas) {
  *  - conOcupacion = false: sólo el tope, sin inscriptos_departamental ni cupo_disponible (la
  *    administración provincial no tiene una departamental propia: pide la ocupación a /cupos).
  */
-async function obtenerDisciplinasOlimpiada(db, olimpiadaId, { departamentalId = null, excluirInscripcionId = null, conOcupacion = true } = {}) {
+async function obtenerDisciplinasOlimpiada(db, olimpiadaId, { departamentalId = null, excluirInscripcionId = null, conOcupacion = true, gestion = false } = {}) {
   const columnaOcupacion = conOcupacion
     ? `,
             (SELECT COUNT(*)
@@ -492,7 +493,8 @@ async function obtenerDisciplinasOlimpiada(db, olimpiadaId, { departamentalId = 
      ORDER BY t.nombre ASC, d.nombre ASC`,
     params
   );
-  return firmarIconosDisciplinas(disciplinas.map((d) => {
+  const visibles = gestion ? disciplinas : await filtrarVeedoresManuales(db, disciplinas);
+  return firmarIconosDisciplinas(visibles.map((d) => {
     if (!conOcupacion) return d;
     const inscriptos = Number(d.inscriptos_departamental) || 0;
     return {
@@ -1339,7 +1341,7 @@ router.get("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
     // el cupo es por departamental y depende de la persona, así que lo pide a /cupos al elegirla.
     const disciplinas = await obtenerDisciplinasOlimpiada(
       db, olimpiadaId,
-      cabecera.rol === "departamental" ? { departamentalId: departamentalDe(cabecera) } : { conOcupacion: false }
+      cabecera.rol === "departamental" ? { departamentalId: departamentalDe(cabecera) } : { conOcupacion: false, gestion: true }
     );
     const [popupImagenUrl, logo] = await Promise.all([obtenerUrlAvisoPublico(olimpiadaId), obtenerLogoPublico(olimpiada)]);
     res.status(200).json({

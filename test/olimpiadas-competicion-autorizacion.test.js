@@ -28,6 +28,11 @@ async function servidor(t, opciones = {}) {
     contexto.consultas.push({ sql, params });
     if (/r\.nombre AS rol/.test(sql) && opciones.actor) return [[opciones.actor]];
     if (/FROM olimpiada_puntos_puesto WHERE/.test(sql)) return [[]];
+    if (/SELECT a\.disciplina_id, TRIM\(CASE/.test(sql)) return [(opciones.veedores || [])
+      .filter(v => !sql.includes("v.visible_publico = 1") || v.visible_publico === 1)];
+    if (/FROM olimpiada_voluntario v .*JOIN usuario/.test(sql) && sql.includes("v.visible_publico = 0")) return [(opciones.veedores || [])
+      .filter(v => v.visible_publico === 0)];
+    if (/^SELECT id, grupo, nombre/.test(sql) && /FROM olimpiada_contacto WHERE/.test(sql)) return [opciones.contactos || []];
     if (/FROM olimpiada_voluntario WHERE/.test(sql)) return [[contexto.cuenta]];
     if (/FROM olimpiada_voluntario_disciplina a/.test(sql)) return [Number(params[1]) === 7 ? contexto.asignadas.map((disciplina_id) => ({ ...contexto.edicion, disciplina_id })) : []];
     if (/FROM olimpiada WHERE ruta_publica/.test(sql)) {
@@ -70,6 +75,30 @@ async function servidor(t, opciones = {}) {
     ...(body ? { body: JSON.stringify(body) } : {}),
   }) };
 }
+
+test("veedores: el portal público y el afiliado filtran nombres asignados y manuales, y gestión los conserva", async t => {
+  const veedores = [{ disciplina_id: 4, nombre: "Ana López", visible_publico: 0 },
+    { disciplina_id: 4, nombre: "Pedro Díaz", visible_publico: 1 }];
+  const veedor = "LÓPEZ, ANA / Pedro Díaz";
+  for (const rol of ["admin", "afiliado"]) {
+    const actor = { id: 5, rol, rol_id: rol === "admin" ? 1 : 2, habilitado: "Y", modulo_olimpiadas: 1, requiere_cambio_clave: 0 };
+    const { pedir } = await servidor(t, { actor, veedores, disciplinas: [{ id: 4, nombre: "Vóley", veedor }],
+      contactos: [{ nombre: "López Ana", grupo: "Veedores" }, { nombre: "Pedro Díaz", cargo: "Veedor" }] });
+    for (const anonimo of [false, true]) {
+      const prefijo = anonimo ? "/olimpiadas/publico/7/" : "/olimpiadas/7/";
+      const [fixture, contactos] = await Promise.all(["fixture", "contactos"].map(async ruta => {
+        const respuesta = await pedir(prefijo + ruta, { anonimo });
+        const cuerpo = await respuesta.json();
+        assert.equal(respuesta.status, 200, `${rol} ${prefijo}${ruta}: ${JSON.stringify(cuerpo)}`);
+        return cuerpo;
+      }));
+      const gestion = !anonimo && rol === "admin";
+      assert.deepEqual(fixture.disciplinas[0].veedores, gestion ? ["Ana López", "Pedro Díaz"] : ["Pedro Díaz"]);
+      assert.equal(fixture.disciplinas[0].veedor, gestion ? veedor : "Pedro Díaz");
+      assert.deepEqual(contactos.map(c => c.nombre), gestion ? ["López Ana", "Pedro Díaz"] : ["Pedro Díaz"]);
+    }
+  }
+});
 
 test("competición: todos los listados restringidos rechazan otra edición y disciplina", async (t) => {
   const { pedir } = await servidor(t);
@@ -337,8 +366,8 @@ test("medallero: una carga manual sin ganadores conserva la adjudicación previa
 test("fixture público: lee un cuadro antiguo sin final sin recargar resultados ni adivinar nombres", async t => {
   const semifinal = { ...partido, torneo_id: 8, instancia_nombre: "Semifinal", estado: "FINALIZADO", ganador: 1 };
   const partidos = [
-    { ...semifinal, id: 101, departamental1_id: 19, departamental2_id: 17 },
-    { ...semifinal, id: 102, departamental1_id: 19, departamental2_id: 14 },
+    { ...semifinal, id: 101, inscripcion1_id: 201, departamental1_id: 19, departamental2_id: 17 },
+    { ...semifinal, id: 102, inscripcion1_id: 202, departamental1_id: 19, departamental2_id: 14 },
     { ...semifinal, id: 103, instancia_nombre: "Tercer puesto", departamental1_id: 17, departamental2_id: 14, ganador: 2,
       partido_origen1_id: 101, partido_origen2_id: 102, origen1_tipo: "PERDEDOR", origen2_tipo: "PERDEDOR" },
   ];
@@ -349,6 +378,22 @@ test("fixture público: lee un cuadro antiguo sin final sin recargar resultados 
   assert.deepEqual(fixture.disciplinas[0].podio.map(p => [p.nombre, p.ganadores[0].nombre]),
     [["Oro", "Moreno"], ["Plata", "Moreno"], ["Bronce", "Lomas"]]);
   assert.ok(contexto.consultas.every(c => !/^\s*(?:UPDATE|DELETE|INSERT)/i.test(c.sql)));
+});
+
+test("fixture público: un triangular terminado publica las tres departamentales y conserva reservado el medallero", async t => {
+  const base = { ...partido, estado: "FINALIZADO", torneo_id: 24, torneo_formato: "LIGA", fase: "Triangular", inscripcion1_id: null, inscripcion2_id: null };
+  const partidos = [
+    { ...base, id: 90, departamental1_id: 19, departamental2_id: 17, ganador: 1 },
+    { ...base, id: 94, departamental1_id: 19, departamental2_id: 14, ganador: 1 },
+    { ...base, id: 220, departamental1_id: 17, departamental2_id: 14, ganador: 2 },
+  ];
+  const { pedir } = await servidor(t, { partidos, edicion: { medallero_publicado: 0, posiciones_publicas: 0 },
+    departamentales: [{ id: 19, nombre: "Moreno" }, { id: 14, nombre: "Lomas" }, { id: 17, nombre: "San Martín" }] });
+  const fixture = await (await pedir("/olimpiadas/publico/7/fixture", { anonimo: true })).json();
+  assert.deepEqual(fixture.disciplinas[0].podio.map(p => [p.nombre, p.ganadores[0].nombre]),
+    [["Oro", "Moreno"], ["Plata", "Lomas"], ["Bronce", "San Martín"]]);
+  assert.deepEqual(fixture.posiciones, []);
+  assert.doesNotMatch(JSON.stringify(fixture.disciplinas[0].podio), /puntos|inscripcion/);
 });
 
 test("resultados: finalizar el tercer puesto sin final guarda el bronce, y corregirlo actualiza el podio público", async t => {
