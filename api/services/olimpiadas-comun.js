@@ -263,27 +263,15 @@ async function guardarAvisoPublico(olimpiadaId, archivo) {
 }
 
 // ---------------------------------------------------------------------------
-// Logo oficial de la edición: lo carga la organización y, en las pantallas públicas, va en el
-// banner en lugar del nombre escrito. Como el aviso, vive en una clave fija por edición y un
-// objeto vacío recuerda que se lo retiró. El ancho y el alto viajan en los metadatos del objeto:
-// la página le reserva el lugar antes de descargarlo.
+// Logo y mascota del banner público. Cada imagen vive en una clave fija por edición y un objeto
+// vacío recuerda que la organización la retiró. Los metadatos guardan sus medidas para que el
+// portal le reserve el lugar antes de descargarla.
 // ---------------------------------------------------------------------------
-const CACHE_LOGO_PUBLICO = "public, max-age=3600";
+const CACHE_IMAGEN_PUBLICA = "public, max-age=3600";
 // Las páginas públicas preguntan por la edición una vez por minuto y por visitante: a S3 se le
-// consulta como mucho cada medio minuto por edición. Mientras el logo no cambia se entrega la
+// consulta como mucho cada medio minuto por imagen. Mientras la imagen no cambia se entrega la
 // misma dirección firmada (hasta la mitad de su vigencia), así el navegador no lo vuelve a bajar.
-const VIGENCIA_CONSULTA_LOGO_MS = 30_000;
-const logosConsultados = new Map();
-
-// Ediciones que ya mostraban su logo oficial antes de que fuera configurable: la primera consulta
-// lo deja cargado como si lo hubiera subido la organización, que después lo puede cambiar o quitar.
-const LOGOS_INICIALES = [
-  { numero: "XXVII", anio: "2026", archivo: path.join(__dirname, "../data/olimpiadas-logos/xxvii-miramar-2026.webp"), ancho: 1200, alto: 266 },
-];
-
-function claveLogoPublico(olimpiadaId) {
-  return `olimpiadas/ediciones/${olimpiadaId}/logo-publico`;
-}
+const VIGENCIA_CONSULTA_IMAGEN_MS = 30_000;
 
 // «XXVII», «xxvii°», «27», «27ª edición» → «XXVII». Lo que no es un número de edición queda vacío.
 function numeroDeEdicion(valor) {
@@ -299,10 +287,10 @@ function numeroDeEdicion(valor) {
 }
 
 /**
- * Prepara el logo para el banner: sin los márgenes vacíos (así se lo mide por lo que se ve), de
+ * Prepara la imagen para el banner: sin los márgenes vacíos (así se mide por lo que se ve), de
  * hasta 1200 × 600 px y en WebP, que conserva la transparencia.
  */
-async function procesarLogoWeb(buffer) {
+async function procesarImagenBannerWeb(buffer) {
   const preparar = (recortar) => {
     const imagen = sharp(buffer, { failOn: "error", limitInputPixels: MAX_PIXELES_ENTRADA }).rotate();
     return (recortar ? imagen.trim() : imagen)
@@ -319,88 +307,104 @@ async function procesarLogoWeb(buffer) {
   }
 }
 
-async function precargarLogoInicial(olimpiada, key) {
-  const inicial = LOGOS_INICIALES.find(logo =>
-    logo.anio === String(olimpiada.fecha_inicio ?? "").slice(0, 4) && logo.numero === numeroDeEdicion(olimpiada.edicion));
-  if (!inicial) return null;
-  try {
-    const buffer = await fs.promises.readFile(inicial.archivo);
-    const metadata = { ancho: String(inicial.ancho), alto: String(inicial.alto) };
-    const resultado = await uploadBufferToS3({ key, buffer, contentType: "image/webp", cacheControl: CACHE_LOGO_PUBLICO, metadata, soloSiNoExiste: true });
-    return { ContentLength: buffer.length, ETag: resultado.ETag, Metadata: metadata };
-  } catch (error) {
-    // 412: ya hay un objeto en la clave (otra consulta lo precargó o se lo retiró en el medio)
-    if (error?.$metadata?.httpStatusCode !== 412) registrarErrorRuta(error, "olimpiadas:precargar-logo");
-    return null;
-  }
-}
+function crearImagenPublicaEdicion({ nombre, sufijoClave, inicial }) {
+  const consultadas = new Map();
+  const clave = id => `olimpiadas/ediciones/${id}/${sufijoClave}`;
+  const consultar = key => s3.send(new HeadObjectCommand({ Bucket: bucketName, Key: key }), {
+    abortSignal: AbortSignal.timeout(2500),
+  });
 
-function recordarLogo(olimpiadaId, logo, firmadoEn) {
-  logosConsultados.set(olimpiadaId, { hasta: Date.now() + VIGENCIA_CONSULTA_LOGO_MS, logo, firmadoEn });
-  return logo;
-}
-
-async function logoFirmado(key, meta, previo) {
-  const version = String(meta.ETag || "").replace(/[^a-zA-Z0-9-]/g, "");
-  if (previo?.logo?.version === version && Date.now() - previo.firmadoEn < EXPIRACION_FIRMA * 500) return previo;
-  return {
-    firmadoEn: Date.now(),
-    logo: {
-      url: await getSignedFileUrlFromS3(key, EXPIRACION_FIRMA, `inline; filename="logo-${version}.webp"`),
-      ancho: Number(meta.Metadata?.ancho) || null,
-      alto: Number(meta.Metadata?.alto) || null,
-      version,
-    },
-  };
-}
-
-/**
- * El logo de la edición para el banner: { url, ancho, alto, version } o null si no tiene (la
- * página muestra entonces el nombre escrito). `olimpiada` es la fila de la edición: hacen falta
- * su id y, para la precarga inicial, su número y su fecha de inicio.
- */
-async function obtenerLogoPublico(olimpiada) {
-  const olimpiadaId = Number(olimpiada?.id);
-  if (!Number.isInteger(olimpiadaId) || olimpiadaId <= 0) return null;
-  const previo = logosConsultados.get(olimpiadaId);
-  if (previo && previo.hasta > Date.now()) return previo.logo;
-  const key = claveLogoPublico(olimpiadaId);
-  let meta;
-  try {
-    meta = await s3.send(new HeadObjectCommand({ Bucket: bucketName, Key: key }), { abortSignal: AbortSignal.timeout(2500) });
-  } catch (error) {
-    // Si el usuario de S3 carece de ListBucket, S3 responde 403 para una clave inexistente.
-    if (![403, 404].includes(error?.$metadata?.httpStatusCode)) {
-      // S3 no contestó: vale lo último que se supo y se vuelve a preguntar pasado el medio minuto
-      registrarErrorRuta(error, "olimpiadas:leer-logo");
-      return recordarLogo(olimpiadaId, previo?.logo ?? null, previo?.firmadoEn ?? 0);
+  async function precargar(olimpiada, key) {
+    if (inicial.anio !== String(olimpiada.fecha_inicio ?? "").slice(0, 4) ||
+        inicial.numero !== numeroDeEdicion(olimpiada.edicion)) return null;
+    try {
+      const buffer = await fs.promises.readFile(inicial.archivo);
+      const metadata = { ancho: String(inicial.ancho), alto: String(inicial.alto) };
+      const resultado = await uploadBufferToS3({
+        key, buffer, contentType: "image/webp", cacheControl: CACHE_IMAGEN_PUBLICA, metadata, soloSiNoExiste: true,
+      });
+      return { ContentLength: buffer.length, ETag: resultado.ETag, Metadata: metadata };
+    } catch (error) {
+      // Si ya había una imagen o un retiro, se respeta el objeto que ganó la carrera.
+      if (error?.$metadata?.httpStatusCode === 412) return consultar(key);
+      throw error;
     }
-    meta = await precargarLogoInicial(olimpiada, key);
   }
-  try {
-    if (!(meta?.ContentLength > 0)) return recordarLogo(olimpiadaId, null, 0);
-    const { logo, firmadoEn } = await logoFirmado(key, meta, previo);
-    return recordarLogo(olimpiadaId, logo, firmadoEn);
-  } catch (error) {
-    registrarErrorRuta(error, "olimpiadas:firmar-logo");
-    return null;
+
+  function recordar(id, imagen, firmadoEn) {
+    consultadas.set(id, { hasta: Date.now() + VIGENCIA_CONSULTA_IMAGEN_MS, imagen, firmadoEn });
+    return imagen;
   }
+
+  async function firmar(key, meta, previo) {
+    const version = String(meta.ETag || "").replace(/[^a-zA-Z0-9-]/g, "");
+    if (previo?.imagen?.version === version && Date.now() - previo.firmadoEn < EXPIRACION_FIRMA * 500) return previo;
+    return {
+      firmadoEn: Date.now(),
+      imagen: {
+        url: await getSignedFileUrlFromS3(key, EXPIRACION_FIRMA, `inline; filename="${nombre}-${version}.webp"`),
+        ancho: Number(meta.Metadata?.ancho) || null,
+        alto: Number(meta.Metadata?.alto) || null,
+        version,
+      },
+    };
+  }
+
+  async function obtener(olimpiada) {
+    const id = Number(olimpiada?.id);
+    if (!Number.isInteger(id) || id <= 0) return null;
+    const previo = consultadas.get(id);
+    if (previo && previo.hasta > Date.now()) return previo.imagen;
+    const key = clave(id);
+    let meta;
+    try {
+      meta = await consultar(key).catch(error => {
+        // S3 puede responder 403 para una clave inexistente si el usuario no tiene ListBucket.
+        if (![403, 404].includes(error?.$metadata?.httpStatusCode)) throw error;
+        return precargar(olimpiada, key);
+      });
+    } catch (error) {
+      registrarErrorRuta(error, `olimpiadas:leer-${nombre}`);
+      return recordar(id, previo?.imagen ?? null, previo?.firmadoEn ?? 0);
+    }
+    try {
+      if (!(meta?.ContentLength > 0)) return recordar(id, null, 0);
+      const { imagen, firmadoEn } = await firmar(key, meta, previo);
+      return recordar(id, imagen, firmadoEn);
+    } catch (error) {
+      registrarErrorRuta(error, `olimpiadas:firmar-${nombre}`);
+      return null;
+    }
+  }
+
+  async function guardar(olimpiadaId, archivo) {
+    const id = Number(olimpiadaId);
+    const key = clave(id);
+    // El objeto vacío recuerda el retiro para que la precarga inicial no lo reponga.
+    const procesada = archivo ? await procesarImagenBannerWeb(archivo.buffer) : null;
+    const metadata = procesada ? { ancho: String(procesada.ancho), alto: String(procesada.alto) } : undefined;
+    const resultado = await uploadBufferToS3({
+      key, buffer: procesada?.buffer || Buffer.alloc(0), contentType: procesada?.mime || "application/octet-stream",
+      cacheControl: procesada ? CACHE_IMAGEN_PUBLICA : "no-cache, max-age=0, must-revalidate", metadata,
+    });
+    consultadas.delete(id);
+    if (!procesada) return recordar(id, null, 0);
+    const { imagen, firmadoEn } = await firmar(key, { ETag: resultado.ETag, Metadata: metadata }, null);
+    return recordar(id, imagen, firmadoEn);
+  }
+
+  return { obtener, guardar };
 }
 
-/** Guarda el logo de la edición (o lo retira, sin `archivo`) y devuelve el que queda publicado. */
-async function guardarLogoPublico(olimpiadaId, archivo) {
-  const id = Number(olimpiadaId);
-  const key = claveLogoPublico(id);
-  // El objeto vacío recuerda que la organización retiró el logo: la precarga inicial no lo repone.
-  const imagen = archivo ? await procesarLogoWeb(archivo.buffer) : null;
-  const metadata = imagen ? { ancho: String(imagen.ancho), alto: String(imagen.alto) } : undefined;
-  const resultado = await uploadBufferToS3({ key, buffer: imagen?.buffer || Buffer.alloc(0),
-    contentType: imagen?.mime || "application/octet-stream", cacheControl: imagen ? CACHE_LOGO_PUBLICO : "no-cache, max-age=0, must-revalidate", metadata });
-  logosConsultados.delete(id);
-  if (!imagen) return recordarLogo(id, null, 0);
-  const { logo, firmadoEn } = await logoFirmado(key, { ETag: resultado.ETag, Metadata: metadata }, null);
-  return recordarLogo(id, logo, firmadoEn);
-}
+const { obtener: obtenerLogoPublico, guardar: guardarLogoPublico } = crearImagenPublicaEdicion({
+  nombre: "logo", sufijoClave: "logo-publico",
+  inicial: { numero: "XXVII", anio: "2026", archivo: path.join(__dirname, "../data/olimpiadas-logos/xxvii-miramar-2026.webp"), ancho: 1200, alto: 266 },
+});
+
+const { obtener: obtenerMascotaPublica, guardar: guardarMascotaPublica } = crearImagenPublicaEdicion({
+  nombre: "mascota", sufijoClave: "mascota-publica",
+  inicial: { numero: "XXVII", anio: "2026", archivo: path.join(__dirname, "../data/olimpiadas-mascotas/xxvii-miramar-2026.webp"), ancho: 540, alto: 582 },
+});
 
 // ---------------------------------------------------------------------------
 // Multer (memoria). Cualquier slot; el contenido se valida por magic bytes.
@@ -997,6 +1001,8 @@ module.exports = {
   guardarAvisoPublico,
   obtenerLogoPublico,
   guardarLogoPublico,
+  obtenerMascotaPublica,
+  guardarMascotaPublica,
   crearUploadOlimpiadas,
   manejarUploadOlimpiadas,
   MIME_IMAGEN_PERMITIDO,

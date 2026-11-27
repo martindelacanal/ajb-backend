@@ -9,16 +9,18 @@ const sharp = require("sharp");
 Object.assign(process.env, { JWT_SECRET: "logo-prueba", BUCKET_REGION: "us-east-1",
   BUCKET_NAME: "logo-prueba", ACCESS_KEY: "test", SECRET_ACCESS_KEY: "test" });
 
-test("el logo de la edición lo carga, reemplaza y retira la administración; sin logo el banner dice el nombre", async t => {
+test("imágenes públicas del banner de una edición", async t => {
   const admin = { id: 5, rol: "admin", rol_id: 1, habilitado: "Y", requiere_cambio_clave: 0 };
   const departamental = { ...admin, id: 6, rol: "departamental", rol_id: 3 };
   const ediciones = new Map([
-    [2, { id: 2, nombre: "Olimpiadas Judiciales 2026", edicion: "XXVII", fecha_inicio: "2026-11-26" }],
+    [2, { id: 2, nombre: "Olimpiadas Judiciales 2026", edicion: "XXVII", fecha_inicio: "2026-11-26", habilitado: "Y", publicada_publico: 1 }],
     [4, { id: 4, nombre: "Olimpiadas 2027", edicion: "XXVIII", fecha_inicio: "2027-11-18" }],
   ]);
   const db = { async query(sql, params) {
     if (sql.includes("r.nombre AS rol")) return [[Number(params[0]) === admin.id ? admin : departamental]];
     if (sql.includes("FROM olimpiada WHERE")) return [ediciones.has(Number(params[0])) ? [ediciones.get(Number(params[0]))] : []];
+    if (sql.includes("FROM olimpiada o WHERE o.eliminado = 0")) return [[ediciones.get(2)]];
+    if (sql.includes(" AS en_vivo")) return [[{}]];
     // El detalle de la edición también lee sus disciplinas y los tramos de bonos: acá no tiene
     if (/^\s*SELECT/i.test(sql)) return [[]];
     assert.match(sql, /INSERT INTO olimpiada_historial/);
@@ -26,7 +28,7 @@ test("el logo de la edición lo carga, reemplaza y retira la administración; si
   } };
   const conexion = require.resolve("../api/connection/connection");
   require.cache[conexion] = { id: conexion, filename: conexion, loaded: true, exports: { promise: () => db } };
-  const { s3, obtenerLogoPublico } = require("../api/services/olimpiadas-comun");
+  const { s3, obtenerLogoPublico, obtenerMascotaPublica } = require("../api/services/olimpiadas-comun");
   const objetos = new Map();
   const pedidos = [];
   t.mock.method(s3, "send", async comando => {
@@ -48,6 +50,7 @@ test("el logo de la edición lo carga, reemplaza y retira la administración; si
 
   const app = express();
   app.use(require("../api/routes/olimpiadas"));
+  app.use(require("../api/routes/olimpiadas-publico"));
   const server = await new Promise(resolve => { const s = app.listen(0, "127.0.0.1", () => resolve(s)); });
   t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
   const base = "http://127.0.0.1:" + server.address().port + "/olimpiadas/";
@@ -128,4 +131,43 @@ test("el logo de la edición lo carga, reemplaza y retira la administración; si
   pasan(31);
   assert.equal(await obtenerLogoPublico(ediciones.get(2)), null);
   assert.equal(objetos.get(clave(2)).ContentLength, 0);
+
+  await t.test("precarga la mascota para 2026 y conserva los cambios de la administración", async () => {
+    const ruta = base + "2/mascota";
+    const claveMascota = "olimpiadas/ediciones/2/mascota-publica";
+    assert.equal(await obtenerMascotaPublica(ediciones.get(4)), null);
+    assert.equal((await fetch(ruta, { method: "DELETE", headers: sesion(departamental) })).status, 401);
+    assert.equal((await fetch(ruta, { method: "PUT", headers })).status, 400);
+    assert.equal((await subir(ruta, Buffer.from("no es una imagen"))).status, 400);
+    assert.equal((await fetch(base + "4/mascota", { method: "DELETE" })).status, 401);
+    assert.equal((await fetch(base + "9/mascota", { method: "DELETE", headers })).status, 404);
+
+    const [listado, portal] = await Promise.all([
+      fetch(base + "publico/ediciones").then(r => r.json()),
+      fetch(base + "publico/2/portal").then(r => r.json()),
+    ]);
+    const inicial = portal.olimpiada.mascota;
+    assert.deepEqual(listado[0].mascota, inicial);
+    assert.deepEqual([inicial.ancho, inicial.alto], [540, 582]);
+    assert.equal(new URL(inicial.url).pathname, "/" + claveMascota);
+    const metaMascota = await sharp(objetos.get(claveMascota).Body).metadata();
+    assert.deepEqual([metaMascota.format, metaMascota.width, metaMascota.height, metaMascota.hasAlpha], ["webp", 540, 582, true]);
+    assert.equal((await fetch(base + "publico/4/portal")).status, 404);
+    assert.deepEqual((await (await fetch(base + "2", { headers })).json()).mascota, inicial);
+
+    const alta = await subir(ruta, cuadrado);
+    assert.equal(alta.status, 200);
+    const { mascota } = await alta.json();
+    assert.notEqual(mascota.version, inicial.version);
+    assert.deepEqual([mascota.ancho, mascota.alto], [80, 80]);
+    assert.deepEqual(await obtenerMascotaPublica(ediciones.get(2)), mascota);
+    assert.equal(await obtenerLogoPublico(ediciones.get(2)), null);
+
+    const retirada = await fetch(ruta, { method: "DELETE", headers });
+    assert.equal(retirada.status, 200);
+    assert.equal((await retirada.json()).mascota, null);
+    pasan(31);
+    assert.equal(await obtenerMascotaPublica(ediciones.get(2)), null);
+    assert.equal(objetos.get(claveMascota).ContentLength, 0);
+  });
 });

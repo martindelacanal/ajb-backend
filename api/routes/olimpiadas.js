@@ -40,6 +40,8 @@ const {
   guardarAvisoPublico,
   obtenerLogoPublico,
   guardarLogoPublico,
+  obtenerMascotaPublica,
+  guardarMascotaPublica,
   decodificarFirmaBase64,
   detectarMimeArchivo,
   validarContenidoArchivo,
@@ -1343,11 +1345,14 @@ router.get("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
       db, olimpiadaId,
       cabecera.rol === "departamental" ? { departamentalId: departamentalDe(cabecera) } : { conOcupacion: false, gestion: true }
     );
-    const [popupImagenUrl, logo] = await Promise.all([obtenerUrlAvisoPublico(olimpiadaId), obtenerLogoPublico(olimpiada)]);
+    const [popupImagenUrl, logo, mascota] = await Promise.all([
+      obtenerUrlAvisoPublico(olimpiadaId), obtenerLogoPublico(olimpiada), obtenerMascotaPublica(olimpiada),
+    ]);
     res.status(200).json({
       ...olimpiada,
       popup_imagen_url: popupImagenUrl,
       logo,
+      mascota,
       requiere_aprobacion: 1, // fijo: la aprobación del afiliado es obligatoria (la columna ya no se lee)
       estado_edicion: calcularEstadoEdicion(olimpiada),
       disciplinas,
@@ -1360,7 +1365,7 @@ router.get("/olimpiadas/:id(\\d+)", verifyToken, async (req, res) => {
 });
 
 const rutaImagenAviso = "/olimpiadas/:id(\\d+)/popup-imagen";
-async function autorizarEdicionAviso(req, res, next) {
+async function autorizarImagenDeEdicion(req, res, next) {
   if (!esSuperior(getCabecera(req))) return res.status(401).json("No autorizado");
   try {
     if (!await obtenerOlimpiada(mysqlConnection.promise(), Number(req.params.id))) {
@@ -1370,7 +1375,7 @@ async function autorizarEdicionAviso(req, res, next) {
   } catch (error) { responderError(res, error, "Error al consultar la olimpiada"); }
 }
 
-// El aviso y el logo de la edición se guardan igual: PUT con la imagen en «IMAGEN» la reemplaza y
+// Las imágenes de la edición se guardan igual: PUT con la imagen en «IMAGEN» la reemplaza y
 // DELETE la retira. `guardar` devuelve lo que queda publicado, que viaja en la respuesta como `campo`.
 function actualizarImagenDeEdicion({ guardar, campo, historial, falta, guardada, retirada, error: mensajeError }) {
   return async (req, res) => {
@@ -1397,8 +1402,8 @@ const actualizarImagenAviso = actualizarImagenDeEdicion({
   falta: "Seleccioná una imagen para el aviso", guardada: "Imagen del aviso guardada", retirada: "Aviso retirado",
   error: "No se pudo guardar la imagen del aviso",
 });
-router.put(rutaImagenAviso, verifyToken, autorizarEdicionAviso, crearUploadOlimpiadas({ maxFiles: 1 }), actualizarImagenAviso);
-router.delete(rutaImagenAviso, verifyToken, autorizarEdicionAviso, actualizarImagenAviso);
+router.put(rutaImagenAviso, verifyToken, autorizarImagenDeEdicion, crearUploadOlimpiadas({ maxFiles: 1 }), actualizarImagenAviso);
+router.delete(rutaImagenAviso, verifyToken, autorizarImagenDeEdicion, actualizarImagenAviso);
 
 // El logo oficial de la edición: en las pantallas públicas va en el banner en lugar del nombre escrito.
 const rutaLogoEdicion = "/olimpiadas/:id(\\d+)/logo";
@@ -1407,8 +1412,17 @@ const actualizarLogoEdicion = actualizarImagenDeEdicion({
   falta: "Seleccioná la imagen del logo", guardada: "Logo de la edición guardado", retirada: "Logo retirado: el banner muestra el nombre de la edición",
   error: "No se pudo guardar el logo de la edición",
 });
-router.put(rutaLogoEdicion, verifyToken, autorizarEdicionAviso, crearUploadOlimpiadas({ maxFiles: 1 }), actualizarLogoEdicion);
-router.delete(rutaLogoEdicion, verifyToken, autorizarEdicionAviso, actualizarLogoEdicion);
+router.put(rutaLogoEdicion, verifyToken, autorizarImagenDeEdicion, crearUploadOlimpiadas({ maxFiles: 1 }), actualizarLogoEdicion);
+router.delete(rutaLogoEdicion, verifyToken, autorizarImagenDeEdicion, actualizarLogoEdicion);
+
+const rutaMascotaEdicion = "/olimpiadas/:id(\\d+)/mascota";
+const actualizarMascotaEdicion = actualizarImagenDeEdicion({
+  guardar: guardarMascotaPublica, campo: "mascota", historial: "mascota",
+  falta: "Seleccioná la imagen de la mascota", guardada: "Mascota de la edición guardada", retirada: "Mascota retirada",
+  error: "No se pudo guardar la mascota de la edición",
+});
+router.put(rutaMascotaEdicion, verifyToken, autorizarImagenDeEdicion, crearUploadOlimpiadas({ maxFiles: 1 }), actualizarMascotaEdicion);
+router.delete(rutaMascotaEdicion, verifyToken, autorizarImagenDeEdicion, actualizarMascotaEdicion);
 
 /**
  * Cupos para el formulario de inscripción. La departamental la decide el servidor:
