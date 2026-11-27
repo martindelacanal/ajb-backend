@@ -136,6 +136,8 @@ El navegador inicia la carga con `POST /olimpiadas/:id/videos` y envía partes d
 
 La descarga de cada video desde Drive admite hasta 10 minutos. En Nginx, usar `proxy_read_timeout 660s` en la ruta `/api/olimpiadas/<id>/drive/video` para dar tiempo a que la API responda.
 
+Si un video publicado quedó sin portada, la API puede generar una WebP a partir del primer fotograma y guardarla en S3. Para habilitar esa tarea en el servidor Ubuntu, instalar el paquete `ffmpeg` (`sudo apt-get install --no-install-recommends ffmpeg`) antes de iniciar la API. Se usa `/usr/bin/ffmpeg`, con `OLIMPIADAS_FFMPEG` como alternativa para otro entorno. Cada proceso de la API prepara una portada a la vez y limita cada intento a 16 MiB de lecturas parciales de S3 y 15 segundos de extracción. El listado indica `poster_en_proceso` mientras se prepara la imagen.
+
 Tanto el portal público como el de gestión reciben dos direcciones firmadas por seis horas. El reproductor usa `url` para pedir a S3 los rangos que necesita. El enlace `descarga_url` entrega el archivo original desde S3 con un nombre basado en el título del video. Las fotos admiten hasta 15 MB cada una (80 MB por tanda).
 
 ## Gafetes

@@ -7,7 +7,9 @@
  */
 const express = require('express');
 const crypto = require('crypto');
+const { existsSync } = require('node:fs');
 const drive = require('../services/olimpiadas-drive');
+const { capturarPortadaVideo } = require('../services/olimpiadas-portada-video');
 const { clasificacionGaleria, condicionesGaleria, tablaEtiquetas, opcionesPartidos, nombresDepartamentales } = require('../services/olimpiadas-fotos');
 const { CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
 const {
@@ -22,6 +24,9 @@ const PLAZO_DESCARGA_VIDEO_DRIVE_MS = 10 * 60 * 1000;
 const MAX_VIDEOS_POR_EDICION = 40;
 const EXPIRACION_VIDEO_SEGUNDOS = 6 * 60 * 60;
 const TIPOS_VIDEO = { 'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov' };
+const MAX_PORTADAS_PENDIENTES = 12;
+const MAX_FALLOS_PORTADAS = 256;
+const ESPERA_REINTENTO_PORTADA_MS = 30 * 60 * 1000;
 
 const CAMPOS_CLASIFICACION_VIDEO = ['epigrafe', 'disciplina_id', 'partido_id', 'etiquetas', 'departamentales'];
 const SELECT_VIDEO = `SELECT f.id, f.olimpiada_id, f.titulo, f.descripcion, f.fecha, f.archivo, f.poster_archivo,
@@ -74,10 +79,19 @@ function disposicionDescarga(fila) {
   return 'attachment; filename="' + base + '.' + extension + '"; filename*=UTF-8\'\'' + nombre;
 }
 
-module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, bucket = bucketName } = {}) {
+module.exports = function registrarVideos(router, helpers, {
+  clienteS3 = s3,
+  bucket = bucketName,
+  capturarPortada = existsSync(process.env.OLIMPIADAS_FFMPEG || '/usr/bin/ffmpeg') ? capturarPortadaVideo : null,
+} = {}) {
   const { db, cargarOlimpiada, enTransaccion, historial, historialCambios, leerTexto, leerEntero, leerFecha, verifyTokenMultimedia, soloGestionMultimedia, idDeRuta, archivoDeSlot } = helpers;
   const endpoint = (fn, mensaje) => async (req, res) => { try { await fn(req, res); } catch (error) { responderError(res, error, mensaje); } };
   const cuerpoBinario = express.raw({ type: 'application/octet-stream', limit: TAMANO_PARTE + 1024 * 1024 });
+  const portadasDrive = new Set();
+  const portadasPendientes = new Set();
+  const colaPortadas = [];
+  const fallosPortadas = new Map();
+  let procesandoPortadas = false;
 
   async function serializar(fila, partidoNombre, departamentales) {
     const [url, descargaUrl, posterUrl] = await Promise.all([
@@ -89,6 +103,7 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
       id: fila.id, olimpiada_id: fila.olimpiada_id, titulo: fila.titulo, descripcion: fila.descripcion,
       ...clasificacionGaleria(fila, partidoNombre, departamentales),
       url, descarga_url: descargaUrl, poster_url: posterUrl, mime: fila.mime, bytes: Number(fila.bytes) || 0, orden: fila.orden, fecha_creacion: fila.fecha_creacion,
+      ...(!posterUrl && fila.poster_en_proceso ? { poster_en_proceso: true } : {}),
     };
   }
 
@@ -107,6 +122,7 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
     const { condiciones, params } = condicionesGaleria(olimpiadaId, query, estadoVisible, tablaEtiquetas('COALESCE(f.etiquetas, JSON_ARRAY())'));
     const [filas] = await conexion.query(`${SELECT_VIDEO}${estadoVisible} WHERE ${condiciones.join(' AND ')}
       AND f.estado = 'LISTO' ORDER BY f.fecha IS NULL, f.fecha, f.orden, f.id`, params);
+    for (const fila of filas) fila.poster_en_proceso = encolarPortada(fila);
     return serializarFilas(conexion, olimpiadaId, filas);
   }
 
@@ -159,20 +175,72 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
     if (resultado && !resultado[0].length) await eliminarObjetosS3Seguro([key]);
   }
 
-  async function guardarPortadaDrive(video, olimpiadaId, origen) {
+  async function guardarPortadaSiFalta(video, archivo) {
     let imagen;
     try {
-      const archivo = await drive.descargarMiniatura(origen);
-      if (!archivo) return;
-      imagen = await subirImagenOptimizada(archivo, `videos/${olimpiadaId}/poster`, { anchoMaximo: 1280 });
+      imagen = await subirImagenOptimizada(archivo, `videos/${video.olimpiada_id}/poster`, { anchoMaximo: 1280 });
       const [resultado] = await db.query(
         `UPDATE olimpiada_video SET poster_archivo = ? WHERE id = ? AND archivo = ?
          AND estado = 'LISTO' AND eliminado = 0 AND poster_archivo IS NULL`, [imagen.key, video.id, video.archivo]);
       if (!resultado.affectedRows) await eliminarObjetosS3Seguro([imagen.key]);
+      return resultado.affectedRows === 1;
     } catch (_error) {
-      // La portada es opcional y se pide sólo una vez que el video ya quedó guardado.
       if (imagen) await limpiarPortadaSinUso(video.id, imagen.key);
+      return false;
     }
+  }
+
+  function registrarFalloPortada(id) {
+    fallosPortadas.delete(id);
+    if (fallosPortadas.size >= MAX_FALLOS_PORTADAS) fallosPortadas.delete(fallosPortadas.keys().next().value);
+    fallosPortadas.set(id, Date.now() + ESPERA_REINTENTO_PORTADA_MS);
+  }
+
+  async function procesarColaPortadas() {
+    if (procesandoPortadas) return;
+    procesandoPortadas = true;
+    try {
+      while (colaPortadas.length) {
+        const { id, archivo } = colaPortadas.shift();
+        try {
+          // Una portada manual o una baja pueden haber llegado durante la espera.
+          const actual = await exigirVideo(id);
+          if (actual.poster_archivo || actual.estado !== 'LISTO' || actual.archivo !== archivo) continue;
+          const imagen = await capturarPortada({ clienteS3, bucket, key: archivo, bytes: Number(actual.bytes), mime: actual.mime });
+          if (!imagen || !(await guardarPortadaSiFalta(actual, imagen))) registrarFalloPortada(id);
+        } catch (_error) {
+          registrarFalloPortada(id);
+        } finally {
+          portadasPendientes.delete(id);
+        }
+      }
+    } finally {
+      procesandoPortadas = false;
+    }
+  }
+
+  function encolarPortada(video) {
+    if (video.poster_archivo) return false;
+    if (portadasDrive.has(video.id) || portadasPendientes.has(video.id)) return true;
+    if (!capturarPortada || !Object.hasOwn(TIPOS_VIDEO, video.mime)
+      || !video.archivo || !Number.isSafeInteger(Number(video.bytes)) || Number(video.bytes) <= 0
+      || portadasPendientes.size >= MAX_PORTADAS_PENDIENTES || (fallosPortadas.get(video.id) || 0) > Date.now()) return false;
+    fallosPortadas.delete(video.id);
+    portadasPendientes.add(video.id);
+    colaPortadas.push({ id: video.id, archivo: video.archivo });
+    void procesarColaPortadas();
+    return true;
+  }
+
+  async function prepararPortadaDrive(video, origen) {
+    portadasDrive.add(video.id);
+    try {
+      const imagen = await drive.descargarMiniatura(origen).catch(() => null);
+      if (imagen && await guardarPortadaSiFalta(video, imagen)) return;
+    } finally {
+      portadasDrive.delete(video.id);
+    }
+    encolarPortada(video);
   }
 
   router.post('/olimpiadas/:id(\\d+)/drive/video', verifyTokenMultimedia, soloGestionMultimedia, endpoint(async (req, res) => {
@@ -237,10 +305,10 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
             ${CAMPOS_CLASIFICACION_VIDEO.join(', ')}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'LISTO', ?, ?, ?, ?, ?, ?)`,
           [olimpiadaId, datos.titulo, datos.descripcion, datos.fecha, key, origen.mime, bytes, orden, cabecera.id, ...valoresClasificacion(clasificacion)]);
         await historial(conexion, cabecera, { entidad: 'VIDEO', entidad_id: insert.insertId, olimpiada_id: olimpiadaId, tipo_operacion: 'CREATE', valor_nuevo: datos.titulo });
-        return { id: insert.insertId, archivo: key };
+        return { id: insert.insertId, olimpiada_id: olimpiadaId, archivo: key, bytes, mime: origen.mime };
       });
       if (video.archivo !== key) await eliminarObjetosS3Seguro([key]);
-      else await guardarPortadaDrive(video, olimpiadaId, origen);
+      else await prepararPortadaDrive(video, origen);
       return confirmar(video);
     } catch (error) {
       if (!completado && uploadId) await abortarSubida({ archivo: key, subida_id: uploadId });
