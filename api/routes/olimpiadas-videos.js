@@ -153,6 +153,28 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
   }
   const valoresClasificacion = datos => CAMPOS_CLASIFICACION_VIDEO.map(campo => datos[campo] ?? null);
 
+  // Si se perdió la respuesta de la BD, comprobar que la imagen no quedó publicada antes de borrarla.
+  async function limpiarPortadaSinUso(videoId, key) {
+    const resultado = await db.query('SELECT id FROM olimpiada_video WHERE id = ? AND poster_archivo = ?', [videoId, key]).catch(() => null);
+    if (resultado && !resultado[0].length) await eliminarObjetosS3Seguro([key]);
+  }
+
+  async function guardarPortadaDrive(video, olimpiadaId, origen) {
+    let imagen;
+    try {
+      const archivo = await drive.descargarMiniatura(origen);
+      if (!archivo) return;
+      imagen = await subirImagenOptimizada(archivo, `videos/${olimpiadaId}/poster`, { anchoMaximo: 1280 });
+      const [resultado] = await db.query(
+        `UPDATE olimpiada_video SET poster_archivo = ? WHERE id = ? AND archivo = ?
+         AND estado = 'LISTO' AND eliminado = 0 AND poster_archivo IS NULL`, [imagen.key, video.id, video.archivo]);
+      if (!resultado.affectedRows) await eliminarObjetosS3Seguro([imagen.key]);
+    } catch (_error) {
+      // La portada es opcional y se pide sólo una vez que el video ya quedó guardado.
+      if (imagen) await limpiarPortadaSinUso(video.id, imagen.key);
+    }
+  }
+
   router.post('/olimpiadas/:id(\\d+)/drive/video', verifyTokenMultimedia, soloGestionMultimedia, endpoint(async (req, res) => {
     const cabecera = getCabecera(req), olimpiadaId = idDeRuta(req.params.id);
     await cargarOlimpiada(db, olimpiadaId, cabecera);
@@ -218,7 +240,8 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
         return { id: insert.insertId, archivo: key };
       });
       if (video.archivo !== key) await eliminarObjetosS3Seguro([key]);
-      confirmar(video);
+      else await guardarPortadaDrive(video, olimpiadaId, origen);
+      return confirmar(video);
     } catch (error) {
       if (!completado && uploadId) await abortarSubida({ archivo: key, subida_id: uploadId });
       if (completado) {
@@ -323,13 +346,22 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
 
   // Imagen de portada (la toma el navegador de un cuadro del video).
   router.post('/olimpiadas/videos/:videoId(\\d+)/poster', verifyTokenMultimedia, soloGestionMultimedia, manejarUploadOlimpiadas, endpoint(async (req, res) => {
-    const cabecera = getCabecera(req);
     const video = await exigirVideo(idDeRuta(req.params.videoId));
     const archivo = archivoDeSlot(req, 'POSTER');
     if (!archivo) throw crearErrorHttp('Adjuntá la imagen de portada');
     const imagen = await subirImagenOptimizada(archivo, `videos/${video.olimpiada_id}/poster`, { anchoMaximo: 1280 });
-    await db.query('UPDATE olimpiada_video SET poster_archivo = ? WHERE id = ?', [imagen.key, video.id]);
-    await eliminarObjetosS3Seguro([video.poster_archivo]);
+    let anterior;
+    try {
+      anterior = await enTransaccion(async conexion => {
+        const actual = await exigirVideo(video.id, { conexion });
+        await conexion.query('UPDATE olimpiada_video SET poster_archivo = ? WHERE id = ?', [imagen.key, video.id]);
+        return actual.poster_archivo;
+      });
+    } catch (error) {
+      await limpiarPortadaSinUso(video.id, imagen.key);
+      throw error;
+    }
+    await eliminarObjetosS3Seguro([anterior]);
     res.json({ success: true, message: 'Portada del video actualizada', poster_url: await firmarSeguro(imagen.key, EXPIRACION_VIDEO_SEGUNDOS) });
   }, 'No se pudo guardar la portada del video'));
 

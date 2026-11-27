@@ -30,8 +30,14 @@ const db = {
     if (sql.includes("archivo LIKE")) return [video && video.archivo.startsWith(p[1].slice(0, -1)) ? [video] : []];
     if (sql.includes("COUNT(*)") && sql.includes("olimpiada_video")) return [[{ cantidad: video ? 1 : 0, orden: 0 }]];
     if (sql.includes("INSERT INTO olimpiada_video")) {
-      video = { id: 31, titulo: p[1], archivo: p[4], bytes: p[6], fecha: p[3], epigrafe: p[9], disciplina_id: p[10], partido_id: p[11], etiquetas: p[12], departamentales: p[13] };
+      video = { id: 31, titulo: p[1], archivo: p[4], bytes: p[6], fecha: p[3], epigrafe: p[9], disciplina_id: p[10], partido_id: p[11], etiquetas: p[12], departamentales: p[13], poster_archivo: null };
       return [{ insertId: video.id }];
+    }
+    if (sql.includes("UPDATE olimpiada_video SET poster_archivo")) {
+      assert.match(sql, /archivo = \?.*AND estado = 'LISTO' AND eliminado = 0 AND poster_archivo IS NULL/s);
+      if (video.id !== p[1] || video.archivo !== p[2] || video.poster_archivo !== null) return [{ affectedRows: 0 }];
+      video.poster_archivo = p[0];
+      return [{ affectedRows: 1 }];
     }
     if (sql.includes("INSERT INTO olimpiada_historial")) { historial.push(p[0]); return [{ insertId: 1 }]; }
     throw new Error("SQL inesperado: " + sql);
@@ -100,6 +106,27 @@ test("distingue carpetas hermanas homónimas de forma estable y respeta nombres 
   assert.throws(() => drive.leerListado('<div class="flip-not-found"></div>'), { code: "DRIVE_SIN_ACCESO" });
 });
 
+test("la miniatura de Drive sigue sólo destinos de Google y limita los bytes recibidos", async t => {
+  const origen = { miniatura_url: "https://drive.google.com/thumbnail?id=video000001" };
+  let redireccion = "https://lh3.googleusercontent.com/miniatura";
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  let cuerpo = jpeg;
+  const fetch = t.mock.method(global, "fetch", async (url, opciones) => {
+    assert.equal(opciones.redirect, "manual");
+    assert.ok(opciones.signal instanceof AbortSignal);
+    if (url.hostname === "drive.google.com") return new Response(null, { status: 302, headers: { location: redireccion } });
+    assert.equal(url.hostname, "lh3.googleusercontent.com");
+    return new Response(cuerpo, { headers: { "content-type": "image/jpeg; charset=binary" } });
+  });
+  assert.deepEqual(await drive.descargarMiniatura(origen), { buffer: jpeg, fieldname: "POSTER", mimetype: "image/jpeg" });
+  cuerpo = Buffer.alloc(2 * 1024 * 1024 + 1);
+  await assert.rejects(drive.descargarMiniatura(origen), { statusCode: 413 });
+  redireccion = "https://googleusercontent.com.example/miniatura";
+  await assert.rejects(drive.descargarMiniatura(origen), { code: "DRIVE_SIN_ACCESO" });
+  assert.equal(await drive.descargarMiniatura({}), null);
+  assert.equal(fetch.mock.callCount(), 5);
+});
+
 test("Prensa puede importar una selección, conserva metadata y los reintentos no duplican archivos", async t => {
   const realFetch = global.fetch;
   const png = await sharp({ create: { width: 4, height: 4, channels: 3, background: "#36a" } }).png().toBuffer();
@@ -114,6 +141,9 @@ test("Prensa puede importar una selección, conserva metadata y los reintentos n
     }
   }
   const lecturas = [];
+  let miniaturas = 0;
+  let miniaturaInvalida = false;
+  let portadaConcurrente = false;
   let permisoConcedido = false;
   t.mock.method(global, "fetch", async destino => {
     lecturas.push(destino);
@@ -133,6 +163,13 @@ test("Prensa puede importar una selección, conserva metadata y los reintentos n
         default: assert.fail("ID de carpeta inesperado");
       }
     }
+    if (destino.pathname === "/thumbnail") {
+      assert.equal(destino.hostname, "drive.google.com");
+      assert.equal(destino.searchParams.get("id"), "video000001");
+      miniaturas++;
+      if (portadaConcurrente) video.poster_archivo = "portada-manual.webp";
+      return new Response(miniaturaInvalida ? "Respuesta ajena" : png, { headers: { "content-type": "image/png" } });
+    }
     assert.equal(destino.hostname, "drive.usercontent.google.com");
     if (destino.searchParams.get("id") === "foto0000001") {
       assert.equal(destino.searchParams.get("resourcekey"), "clave-foto");
@@ -140,7 +177,7 @@ test("Prensa puede importar una selección, conserva metadata y los reintentos n
     }
     return new Response(flujoVideo(), { headers: { "content-type": "video/mp4" } });
   });
-  const partes = [], imagenes = [];
+  const partes = [], imagenes = [], eliminadas = [];
   let abortos = 0;
   // El mock de node:test conservaría los cuerpos de todas las partes hasta finalizar.
   const enviarS3 = s3.send;
@@ -149,9 +186,10 @@ test("Prensa puede importar una selección, conserva metadata y los reintentos n
     const args = comando.input;
     switch (comando.constructor.name) {
       case "PutObjectCommand": imagenes.push([args.Key, args.ContentType]); return {};
+      case "DeleteObjectCommand": eliminadas.push(args.Key); return {};
       case "CreateMultipartUploadCommand": return { UploadId: "upload-test" };
       case "UploadPartCommand": partes.push(args.ContentLength); return { ETag: "e" + args.PartNumber };
-      case "CompleteMultipartUploadCommand": assert.equal(args.MultipartUpload.Parts.length, 128); return {};
+      case "CompleteMultipartUploadCommand": assert.equal(args.MultipartUpload.Parts.length, Math.ceil(bytesVideo / bloque.length)); return {};
       case "AbortMultipartUploadCommand": abortos++; return {};
       default: throw Error(comando.constructor.name);
     }
@@ -197,13 +235,30 @@ test("Prensa puede importar una selección, conserva metadata y los reintentos n
     verificarMeta(video);
     assert.equal(video.bytes, limiteVideo);
     assert.deepEqual(partes, Array(128).fill(8 * mib));
+    assert.equal(miniaturas, 1, "el reintento no vuelve a pedir la portada");
+    assert.match(video.poster_archivo, /^olimpiadas\/videos\/2\/poster_.*\.webp$/);
+    assert.deepEqual(imagenes.at(-1), [video.poster_archivo, "image/webp"]);
     bytesVideo++;
     const excedido = await post("2/drive/video", { ...datosVideo, carga_id: randomUUID() });
     assert.equal(excedido.status, 413);
     assert.match(await excedido.json(), /máximo de 1 GB/);
     assert.equal(abortos, 1);
+    assert.equal(miniaturas, 1, "sólo se pide miniatura después de guardar correctamente el video");
   });
-  assert.deepEqual(historial, ["FOTO", "VIDEO"]);
+  await t.test("una miniatura inválida deja el video disponible y una portada contemporánea tiene prioridad", async () => {
+    bytesVideo = bloque.length;
+    const previo = imagenes.length;
+    miniaturaInvalida = true;
+    assert.equal((await post("2/drive/video", { ...datosVideo, carga_id: randomUUID() })).status, 201);
+    assert.equal(video.poster_archivo, null);
+    assert.equal(imagenes.length, previo);
+    miniaturaInvalida = false;
+    portadaConcurrente = true;
+    assert.equal((await post("2/drive/video", { ...datosVideo, carga_id: randomUUID() })).status, 201);
+    assert.equal(video.poster_archivo, "portada-manual.webp");
+    assert.deepEqual(eliminadas, [imagenes.at(-1)[0]], "la portada automática que perdió la carrera se elimina");
+  });
+  assert.deepEqual(historial, ["FOTO", "VIDEO", "VIDEO", "VIDEO"]);
   permisoConcedido = true;
   const actualizado = await post("2/drive/listar", { url });
   assert.deepEqual((await actualizado.json()).carpetas_sin_acceso, []);

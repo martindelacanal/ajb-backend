@@ -336,4 +336,22 @@ async function descargar(archivo, limite, {
   return cuerpoLimitado(respuesta, limite, mensajeLimite);
 }
 
-module.exports = { listarCarpeta, fechasCreacionDrive, archivoSeleccionado, descargar, juntar, recursoDeEnlace, leerListado, cuerpoLimitado };
+const LIMITE_MINIATURA = 2 * 1024 * 1024;
+const PLAZO_MINIATURA_MS = 4000;
+const MIME_MINIATURAS = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
+
+async function descargarMiniatura(archivo) {
+  if (!archivo.miniatura_url) return null;
+  const respuesta = await pedirGoogle(new URL(archivo.miniatura_url), AbortSignal.timeout(PLAZO_MINIATURA_MS), {
+    headers: { Accept: "image/jpeg, image/png, image/webp" },
+  });
+  const mimetype = respuesta.headers.get("content-type")?.split(";")[0].trim().toLowerCase();
+  if (!MIME_MINIATURAS.has(mimetype)) {
+    await respuesta.body?.cancel();
+    return null;
+  }
+  const buffer = await juntar(cuerpoLimitado(respuesta, LIMITE_MINIATURA, "La miniatura de Drive es demasiado grande."));
+  return { buffer, mimetype, fieldname: "POSTER" };
+}
+
+module.exports = { listarCarpeta, fechasCreacionDrive, archivoSeleccionado, descargar, descargarMiniatura, juntar, recursoDeEnlace, leerListado, cuerpoLimitado };
