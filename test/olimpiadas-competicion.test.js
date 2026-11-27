@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 process.env.JWT_SECRET ||= 'test-only-secret';
-const { partidoPublico, partidosPublicos, conEnVivo, calcularPosiciones } = require('../api/services/olimpiadas-competicion');
+const { partidoPublico, partidosPublicos, conEnVivo, calcularPosiciones, criterioPosiciones, tipoTanda } = require('../api/services/olimpiadas-competicion');
 const { leerPartido, validarReferenciasPartido, guardarExtrasPartido, bloquearSinCambios } = require('../api/routes/olimpiadas-contenido').__test;
 const { endpoint } = require('../api/routes/olimpiadas-publico').__test;
 
@@ -74,6 +74,42 @@ test('posiciones: resultados corregidos, empates y W.O. se recalculan sin contar
 test('posiciones: encuentros internos o sin departamental no generan puntos artificiales', () => {
   assert.deepEqual(calcularPosiciones([{ estado: 'FINALIZADO', ganador: 1, departamental1_id: 1, departamental2_id: 1 },
     { estado: 'FINALIZADO', ganador: 1, departamental1_id: 1 }]), []);
+});
+
+test('Burako: la edición completa y el fixture admiten puntajes con signo sólo para sus variantes por tantos', () => {
+  const base = { disciplina_id: 2, participante1: 'Azul', participante2: 'Mercedes' };
+  for (const nombre of ['Burako', 'BURAKO MIXTO', 'Buraco por parejas']) {
+    const disciplina = { nombre, tipo_marcador: 'TANTOS' };
+    const datos = leerPartido({ estado: 'FINALIZADO', resultado1: '-1533', resultado2: '+0' }, base, { completo: true, disciplina });
+    assert.deepEqual([datos.resultado1, datos.resultado2, datos.ganador], ['-1533', '0', 2]);
+    assert.equal(conEnVivo([{ disciplina_nombre: nombre, tipo_marcador: 'TANTOS' }])[0].permite_puntos_negativos, true);
+    assert.throws(() => leerPartido({ resultado1: '1.2' }, base, { completo: true, disciplina }), /entero/);
+  }
+  for (const disciplina of [{ nombre: 'Vóley', tipo_marcador: 'TANTOS' }, { nombre: 'Burako', tipo_marcador: 'SETS' }]) {
+    assert.equal(conEnVivo([{ disciplina_nombre: disciplina.nombre, tipo_marcador: disciplina.tipo_marcador }])[0].permite_puntos_negativos, false);
+    const tabla = calcularPosiciones([{ estado: 'FINALIZADO', ganador: 1, disciplina_nombre: disciplina.nombre, tipo_marcador: disciplina.tipo_marcador,
+      resultado1: '0', resultado2: '-1533', departamental1_id: 1, departamental2_id: 2 }]);
+    assert.deepEqual(tabla.map(f => [f.a_favor, f.en_contra]), [[0, 0], [0, 0]]);
+  }
+});
+
+test('tandas y tabla: las variantes de hándbol comparten siete metros, y fútbol conserva sus tres puntos', () => {
+  for (const nombre of ['Hándball Femenino', 'Handball', 'Hándbol', 'Balonmano']) {
+    assert.equal(tipoTanda(nombre, 'TANTOS'), 'SIETE_METROS');
+    assert.equal(tipoTanda(nombre, 'SETS'), null);
+  }
+  const base = { estado: 'FINALIZADO', departamental1_id: 1, departamental2_id: 2, resultado1: '0', resultado2: '0', ganador: 1 };
+  const futbol = { ...base, disciplina_nombre: 'Fútbol 11', penales: [4, 2] };
+  const handball = { ...base, disciplina_nombre: 'Hándbol', resultado1: 'W.O.', resultado2: null, ganador: 2 };
+  assert.equal(tipoTanda(futbol.disciplina_nombre), 'PENALES');
+  assert.equal(criterioPosiciones([futbol]), 'Victoria 3 puntos · empate 1 punto');
+  assert.match(criterioPosiciones([futbol, handball]), /3 puntos \(2 en hándbol\)/);
+  assert.deepEqual(calcularPosiciones([futbol, handball]).map(f => [f.departamental_id, f.ganados, f.puntos]),
+    [[1, 1, 3], [2, 1, 2]]);
+  // La organización pudo adjudicarle el encuentro a quien tenía menos goles.
+  const fallo = { ...handball, resultado1: '20', resultado2: '18', ganador: 2 };
+  assert.deepEqual(calcularPosiciones([fallo]).map(f => [f.departamental_id, f.ganados, f.puntos]),
+    [[2, 1, 2], [1, 0, 0]]);
 });
 
 test('partidos: privacidad por defecto y horario coherente', () => {

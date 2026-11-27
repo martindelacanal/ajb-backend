@@ -285,7 +285,39 @@ test("fútbol: la tanda desempata el partido, clasifica al ganador y conserva lo
   assert.deepEqual([encuentro.resultado1, encuentro.resultado2, encuentro.ganador, encuentro.sets], [null, null, null, null]);
 });
 
-test("fútbol: acepta únicamente una tanda válida en un marcador empatado de fútbol", async t => {
+test("hándball: los siete metros definen el cruce y el empate suma un punto a ambos en la liguilla", async t => {
+  const disciplina = { id: 4, nombre: "Hándball Femenino", tipo_marcador: "TANTOS" };
+  const encuentro = { ...partido, estado: "EN_JUEGO", disciplina_nombre: disciplina.nombre, tipo_marcador: "TANTOS" };
+  const previo = { ...encuentro, id: 42, estado: "FINALIZADO", resultado1: "10", resultado2: "8", ganador: 1 };
+  const cruce = { id: 45, disciplina_id: 4, disciplina_nombre: disciplina.nombre, estado: "PROGRAMADO",
+    origen1_tipo: "GANADOR", partido_origen1_id: encuentro.id, participante1: "A confirmar" };
+  const { pedir, contexto } = await servidor(t, { partidos: [encuentro, previo, cruce], disciplinas: [disciplina],
+    edicion: { posiciones_publicas: 1 } });
+  simularEscrituraResultado(contexto);
+  const guardar = body => pedir("/olimpiadas/partidos/44/resultado", { method: "PUT", body });
+  assert.equal((await guardar({ estado: "FINALIZADO", resultado1: "14", resultado2: "14" })).status, 200);
+  assert.equal(encuentro.ganador, 0);
+  assert.equal((await guardar({ estado: "FINALIZADO", penales: [3, 4] })).status, 200);
+  assert.equal(cruce.departamental1_id, encuentro.departamental2_id);
+  for (const anonimo of [false, true]) {
+    const prefijo = anonimo ? "/olimpiadas/publico/7/" : "/olimpiadas/7/";
+    const fixture = await (await pedir(prefijo + "fixture", { anonimo })).json();
+    const p = fixture.partidos.find(p => p.id === encuentro.id);
+    assert.deepEqual([p.tipo_tanda, p.permite_penales, p.resultado1, p.resultado2, p.penales, p.ganador],
+      ["SIETE_METROS", true, "14", "14", [3, 4], 2]);
+    const posiciones = await (await pedir(prefijo + "posiciones?disciplina_id=4", { anonimo })).json();
+    assert.match(posiciones.criterio, /Victoria 2 puntos/);
+    assert.deepEqual(posiciones.tabla.map(f => [f.departamental_id, f.ganados, f.empatados, f.perdidos, f.puntos, f.a_favor, f.en_contra]),
+      [[1, 1, 1, 0, 3, 24, 22], [2, 0, 1, 1, 1, 22, 24]]);
+  }
+  assert.equal((await guardar({ estado: "FINALIZADO", resultado2: "15", penales: [3, 4] })).status, 400);
+  assert.equal((await guardar({ estado: "FINALIZADO", penales: null })).status, 200);
+  assert.equal(cruce.departamental1_id, null);
+  const clasificacion = contexto.consultas.find(c => /SELECT p\.id, p\.disciplina_id,/.test(c.sql));
+  assert.match(clasificacion.sql, /d\.nombre AS disciplina_nombre/);
+});
+
+test("fútbol: acepta únicamente una tanda válida en un marcador empatado y un deporte con penales", async t => {
   const disciplina = { id: 4, nombre: "Futsal", tipo_marcador: "TANTOS" };
   const { pedir } = await servidor(t, { disciplinas: [disciplina] });
   const guardar = datos => pedir("/olimpiadas/partidos/44/resultado", { method: "PUT",
@@ -297,10 +329,41 @@ test("fútbol: acepta únicamente una tanda válida en un marcador empatado de f
     { resultado1: "1.5", resultado2: "1.5" }, { sets: [[1, 0]] }, { cuartos: [[1, 0]] }]) {
     assert.equal((await guardar(datos)).status, 400);
   }
-  for (const nombre of ["Fútbol tenis", "Futboltenis", "Hándbol"]) {
+  for (const nombre of ["Fútbol tenis", "Futboltenis", "Vóley", "Burako", "Metegol", "Hándbol playa"]) {
     disciplina.nombre = nombre;
     assert.equal((await guardar({})).status, 400);
   }
+});
+
+test("Burako: el veedor guarda puntajes enteros con signo y el fixture y las posiciones conservan el marcador", async t => {
+  const disciplina = { id: 4, nombre: "Burako por parejas", tipo_marcador: "TANTOS" };
+  const encuentro = { ...partido, disciplina_nombre: disciplina.nombre, tipo_marcador: "TANTOS", estado: "EN_JUEGO" };
+  const { pedir, contexto } = await servidor(t, { disciplinas: [disciplina], partidos: [encuentro], edicion: { posiciones_publicas: 1 } });
+  simularEscrituraResultado(contexto);
+  const guardar = body => pedir("/olimpiadas/partidos/44/resultado", { method: "PUT", body });
+  assert.equal((await guardar({ estado: "EN_JUEGO", resultado1: -1533, resultado2: 0 })).status, 200);
+  assert.deepEqual([encuentro.resultado1, encuentro.resultado2, encuentro.ganador], ["-1533","0",null]);
+  assert.equal((await guardar({ estado: "FINALIZADO", resultado2: "+1533" })).status, 200);
+  const fixture = await (await pedir("/olimpiadas/publico/7/fixture", { anonimo: true })).json();
+  assert.deepEqual([fixture.partidos[0].permite_puntos_negativos, fixture.partidos[0].resultado1, fixture.partidos[0].resultado2, fixture.partidos[0].ganador],
+    [true,"-1533","1533",2]);
+  assert.deepEqual(fixture.posiciones.map(f => [f.a_favor, f.en_contra, f.diferencia]), [[1533,-1533,3066],[-1533,1533,-3066]]);
+  const finalizar = body => guardar({ estado: "FINALIZADO", ...body });
+  assert.equal((await finalizar({ resultado2: -1600 })).status, 200);
+  assert.equal(encuentro.ganador, 1, "entre dos negativos gana el mayor");
+  assert.equal((await finalizar({ resultado2: -1533 })).status, 200);
+  assert.equal(encuentro.ganador, 0);
+  assert.equal((await finalizar({ ganador: 2 })).status, 200);
+  assert.equal(encuentro.ganador, 2, "la adjudicación manual se conserva");
+  for (const valor of ["1,5","-1.5","--3","1e4","9007199254740992"]) {
+    assert.equal((await finalizar({ resultado1: valor })).status, 400, valor);
+  }
+  assert.equal((await finalizar({ resultado1: "W.O.", resultado2: null, ganador: 2 })).status, 200);
+  Object.assign(encuentro, { resultado1: "Por abandono" });
+  assert.equal((await finalizar({ resultado1: "Por abandono" })).status, 200, "un rótulo histórico puede volver a guardarse");
+  assert.equal(encuentro.ganador, 2);
+  assert.equal((await guardar({ estado: "PROGRAMADO", resultado1: null, resultado2: null })).status, 200);
+  assert.deepEqual([encuentro.resultado1, encuentro.resultado2, encuentro.ganador], [null,null,null]);
 });
 
 test("competición: sólo administración puede publicar nombres, gestionar catálogos o leer el portal privado", async (t) => {

@@ -21,8 +21,9 @@ const { FORMATOS: FORMATOS_COMPETENCIA } = require("../services/olimpiadas-prueb
 const { verificarAccesoCompeticion, exigirDisciplinaVoluntario, exigirEdicionVoluntario, esVoluntario, puedeEditarEdicion } = require('../security/olimpiadas-voluntarios');
 const { filtrarVeedoresManuales, filtrarContactosVeedores } = require('../services/olimpiadas-visibilidad-veedores');
 const {
+  permitePuntosNegativos, marcadorNumerico,
   CAMPOS_PARTIDO_EXTRA, TIPOS_ORIGEN, TIPOS_MARCADOR, REGLAS_DIVISION, MAX_PUESTOS, calcularPosiciones, listarTorneos, listarEquipos, filtroId,
-  normalizarSets, contarSets, leerParciales, normalizarCuartos, tipoMarcadorDisciplina, permitePenales, conEnVivo, normalizarNombre, resolverClasificacion, hayCiclo,
+  normalizarSets, contarSets, leerParciales, normalizarCuartos, tipoMarcadorDisciplina, tipoTanda, conEnVivo, normalizarNombre, resolverClasificacion, hayCiclo,
   nombrePuesto, calcularTablaMedallero, agruparMedallasPorDisciplina, detectarTriangular, puestosSegunResultados,
 } = require('../services/olimpiadas-competicion');
 const {
@@ -532,9 +533,9 @@ function resultadoNumerico(valor) {
 }
 
 // 1 = gana participante1, 2 = participante2, 0 = empate, null = no se puede calcular.
-function calcularGanadorPartido(resultado1, resultado2) {
-  const r1 = resultadoNumerico(resultado1);
-  const r2 = resultadoNumerico(resultado2);
+function calcularGanadorPartido(resultado1, resultado2, conSigno = false) {
+  const r1 = conSigno ? marcadorNumerico(resultado1, true) : resultadoNumerico(resultado1);
+  const r2 = conSigno ? marcadorNumerico(resultado2, true) : resultadoNumerico(resultado2);
   if (r1 === null || r2 === null) return null;
   if (r1 > r2) return 1;
   if (r2 > r1) return 2;
@@ -1993,7 +1994,20 @@ function leerTandaPenales(pedida, anterior, resultado1, resultado2, estado) {
   return JSON.stringify({ penales });
 }
 
-function leerMarcadorPartido(body, base, estado) {
+function leerPuntaje(body, campo, base, disciplina) {
+  const valor = leerTexto(body, campo, base, { maximo: 20, etiqueta: `el resultado ${campo.slice(-1)}` });
+  const cambiaDisciplina = body.disciplina_id !== undefined && Number(body.disciplina_id) !== Number(base.disciplina_id);
+  if (!disciplina || valor == null || (!cambiaDisciplina && valor === base[campo])) return valor;
+  if (permitePuntosNegativos(disciplina.nombre, disciplina.tipo_marcador)) {
+    if (/^w\s*\.?\s*o\s*\.?$/i.test(valor)) return valor;
+    const numero = marcadorNumerico(valor, true);
+    if (numero === null) throw crearErrorHttp("El puntaje de Burako debe ser un número entero");
+    return String(numero);
+  }
+  return valor;
+}
+
+function leerMarcadorPartido(body, base, estado, disciplina) {
   const reinicio = estado === "PROGRAMADO" && body.resultado1 === null && body.resultado2 === null;
   const guardados = leerParciales(base.sets);
   const cuartos = body.cuartos === undefined ? guardados?.cuartos : body.cuartos;
@@ -2015,8 +2029,8 @@ function leerMarcadorPartido(body, base, estado) {
     return { resultado1, resultado2, sets: JSON.stringify(sets) };
   }
   const borrarCuartos = body.cuartos === null && !!guardados?.cuartos;
-  const resultado1 = borrarCuartos ? null : leerTexto(body, "resultado1", base, { maximo: 20, etiqueta: "el resultado 1" });
-  const resultado2 = borrarCuartos ? null : leerTexto(body, "resultado2", base, { maximo: 20, etiqueta: "el resultado 2" });
+  const resultado1 = borrarCuartos ? null : leerPuntaje(body, "resultado1", base, disciplina);
+  const resultado2 = borrarCuartos ? null : leerPuntaje(body, "resultado2", base, disciplina);
   if (body.penales != null || guardados?.penales) {
     return { resultado1, resultado2, sets: leerTandaPenales(body.penales, guardados?.penales, resultado1, resultado2, estado) };
   }
@@ -2028,7 +2042,7 @@ function validarParcialesDisciplina(marcador, disciplina) {
   if (parciales?.cuartos && tipoMarcadorDisciplina(disciplina.nombre, disciplina.tipo_marcador) !== "CUARTOS") {
     throw crearErrorHttp("Esta disciplina no usa un marcador por cuartos");
   }
-  if (parciales?.penales && !permitePenales(disciplina.nombre, disciplina.tipo_marcador)) throw crearErrorHttp("Los penales corresponden a partidos de fútbol con marcador por tantos");
+  if (parciales?.penales && !tipoTanda(disciplina.nombre, disciplina.tipo_marcador)) throw crearErrorHttp("Los penales corresponden a partidos de fútbol o hándbol con marcador por tantos");
 }
 
 function partidoParaHistorial(partido) {
@@ -2038,7 +2052,7 @@ function partidoParaHistorial(partido) {
     penales: parciales?.penales ? JSON.stringify(parciales.penales) : null };
 }
 
-function ganadorDelMarcador(body, base, marcador, estado) {
+function ganadorDelMarcador(body, base, marcador, estado, disciplina) {
   const elegido = leerGanador(body.ganador);
   if (estado !== "FINALIZADO") return null;
   const penales = leerParciales(marcador.sets)?.penales;
@@ -2049,11 +2063,13 @@ function ganadorDelMarcador(body, base, marcador, estado) {
   }
   if (elegido != null) return elegido;
   const editaPuntajes = ["resultado1", "resultado2", "sets", "cuartos", "penales"].some(campo => body[campo] !== undefined);
-  if (elegido === undefined && !editaPuntajes && base.estado === "FINALIZADO" && base.ganador != null) return base.ganador;
-  return calcularGanadorPartido(marcador.resultado1, marcador.resultado2);
+  const conSigno = permitePuntosNegativos(disciplina?.nombre, disciplina?.tipo_marcador);
+  const mismosPuntos = conSigno && marcador.resultado1 === base.resultado1 && marcador.resultado2 === base.resultado2;
+  if (elegido === undefined && (!editaPuntajes || mismosPuntos) && base.estado === "FINALIZADO" && base.ganador != null) return base.ganador;
+  return calcularGanadorPartido(marcador.resultado1, marcador.resultado2, conSigno);
 }
 
-function leerPartido(body, base, { completo = false } = {}) {
+function leerPartido(body, base, { completo = false, disciplina } = {}) {
   const datos = {
     disciplina_id: leerIdOpcional(body, "disciplina_id", base, { etiqueta: "la disciplina" }),
     fecha: leerFecha(body, "fecha", base, { etiqueta: "la fecha" }),
@@ -2093,14 +2109,14 @@ function leerPartido(body, base, { completo = false } = {}) {
   if (datos.hora_inicio && datos.hora_fin && datos.hora_fin <= datos.hora_inicio) throw crearErrorHttp('La hora de fin debe ser posterior al inicio');
   if (completo) {
     datos.estado = leerEnum(body, "estado", base, ESTADOS_PARTIDO, { porDefecto: "PROGRAMADO", etiqueta: "el estado" });
-    Object.assign(datos, leerMarcadorPartido(body, base, datos.estado));
-    datos.ganador = ganadorDelMarcador(body, base, datos, datos.estado);
+    Object.assign(datos, leerMarcadorPartido(body, base, datos.estado, disciplina));
+    datos.ganador = ganadorDelMarcador(body, base, datos, datos.estado, disciplina);
   }
   return datos;
 }
 
-async function validarReferenciasPartido(conexion, olimpiadaId, datos, anterior = {}) {
-  const disciplina = await validarDisciplinaDeOlimpiada(conexion, olimpiadaId, datos.disciplina_id);
+async function validarReferenciasPartido(conexion, olimpiadaId, datos, anterior = {}, disciplinaValidada) {
+  const disciplina = disciplinaValidada || await validarDisciplinaDeOlimpiada(conexion, olimpiadaId, datos.disciplina_id);
   if (Number(datos.disciplina_id) !== Number(anterior.disciplina_id) || datos.sets !== anterior.sets) validarParcialesDisciplina(datos, disciplina);
   await validarSedeDeOlimpiada(conexion, olimpiadaId, datos.sede_id);
   if (datos.torneo_id) {
@@ -2229,13 +2245,14 @@ function describirPartido(partido) {
 // Clasificación automática y medallas que salen de los resultados
 // ---------------------------------------------------------------------------
 const SELECT_PARTIDO_CLASIFICACION = `
-  SELECT p.id, p.disciplina_id, p.torneo_id, ${FORMATO_CUADRO}, p.zona, p.etiqueta, p.fase, inst.nombre AS instancia_nombre, p.estado, p.ganador, p.resultado1, p.resultado2,
+  SELECT p.id, p.disciplina_id, d.nombre AS disciplina_nombre, d.tipo_marcador, p.torneo_id, ${FORMATO_CUADRO}, p.zona, p.etiqueta, p.fase, inst.nombre AS instancia_nombre, p.estado, p.ganador, p.resultado1, p.resultado2,
          p.participante1, p.participante2, p.departamental1_id, p.departamental2_id, p.inscripcion1_id, p.inscripcion2_id,
          p.equipo1_id, p.equipo2_id, eq1.nombre AS equipo1_nombre, eq2.nombre AS equipo2_nombre,
          dep1.nombre AS departamental1_nombre, dep2.nombre AS departamental2_nombre,
          p.partido_origen1_id, p.partido_origen2_id, p.origen1_tipo, p.origen1_zona, p.origen1_posicion,
          p.origen2_tipo, p.origen2_zona, p.origen2_posicion
   FROM olimpiada_partido p
+  INNER JOIN olimpiada_disciplina d ON d.id = p.disciplina_id
   LEFT JOIN olimpiada_torneo t ON t.id = p.torneo_id AND t.eliminado = 0
   LEFT JOIN olimpiada_instancia inst ON inst.id = p.instancia_id
   LEFT JOIN olimpiada_equipo eq1 ON eq1.id = p.equipo1_id
@@ -2492,10 +2509,13 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)", verificarAccesoCompeticion, 
     const body = req.body || {};
     await autorizarPartido(cabecera, actual.olimpiada_id, actual.disciplina_id);
     const camposVeedor = esVoluntario(cabecera) ? camposEdicionPartidoVeedor(body, actual) : null;
-    const datos = leerPartido(body, actual, { completo: true });
     let efectos = null;
     await enTransaccion(async (connection) => {
-      await validarReferenciasPartido(connection, actual.olimpiada_id, datos, actual);
+      const disciplinaId = leerIdOpcional(body, "disciplina_id", actual);
+      if (!disciplinaId) throw crearErrorHttp("Indicá la disciplina del partido");
+      const disciplina = await validarDisciplinaDeOlimpiada(connection, actual.olimpiada_id, disciplinaId);
+      const datos = leerPartido(body, actual, { completo: true, disciplina });
+      await validarReferenciasPartido(connection, actual.olimpiada_id, datos, actual, disciplina);
       await bloquearSinCambios(connection, 'olimpiada_partido', actual);
       const campos = camposVeedor || [
         "disciplina_id", "fecha", "hora_inicio", "hora_fin", "etiqueta", "fase", "participante1", "participante2",
@@ -2551,12 +2571,13 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCom
         return res.status(409).json("Marcá el inicio del partido antes de cargar un resultado parcial.");
       }
     }
-    const marcador = leerMarcadorPartido(body, actual, estado);
+    const disciplina = await validarDisciplinaDeOlimpiada(db, actual.olimpiada_id, actual.disciplina_id);
+    const marcador = leerMarcadorPartido(body, actual, estado, disciplina);
     const { resultado1, resultado2, sets } = marcador;
     if (body.cuartos != null || body.penales != null) {
-      validarParcialesDisciplina(marcador, await validarDisciplinaDeOlimpiada(db, actual.olimpiada_id, actual.disciplina_id));
+      validarParcialesDisciplina(marcador, disciplina);
     }
-    const ganador = ganadorDelMarcador(body, actual, marcador, estado);
+    const ganador = ganadorDelMarcador(body, actual, marcador, estado, disciplina);
     const nuevo = { estado, resultado1, resultado2, ganador, sets };
     let efectos = null;
     await enTransaccion(async (connection) => {

@@ -6,7 +6,7 @@ const { normalizarFechaCivil } = require('../services/valores-dominio');
 const { validarRutaPublica } = require('../services/olimpiadas-ruta-publica');
 const { filtrarContactosVeedores } = require('../services/olimpiadas-visibilidad-veedores');
 const { crearErrorHttp, responderError, obtenerOlimpiada, listarNombresDisciplinas, firmarSeguro, obtenerUrlAvisoPublico, obtenerLogoPublico, fechaHoyBuenosAires, estaVentanaInscripcionAbierta, calcularGanadores } = require('../services/olimpiadas-comun');
-const { partidosPublicos, calcularPosiciones, listarTorneos, listarEquipos, filtroId } = require('../services/olimpiadas-competicion');
+const { partidosPublicos, calcularPosiciones, criterioPosiciones, listarTorneos, listarEquipos, filtroId } = require('../services/olimpiadas-competicion');
 const lectura = require('./olimpiadas-contenido').lecturasPublicas;
 const router = express.Router();
 
@@ -112,9 +112,11 @@ ruta('pruebas', async (req, o) => {
   return { puede_editar: false, disciplinas, departamentales: escudos.departamentales };
 });
 ruta('torneos', (req, o) => listarTorneos(db, o.id, filtroId(req.query, 'disciplina_id') ? [filtroId(req.query, 'disciplina_id')] : null));
-ruta('posiciones', async (req, o) => (posicionesPublicas(o)
-  ? { tabla: await conLogos(calcularPosiciones(await partidosFiltrados(req, o))), criterio: 'Victoria 3 puntos · empate 1 punto' }
-  : { tabla: [], criterio: '', reservado: true }));
+ruta('posiciones', async (req, o) => {
+  if (!posicionesPublicas(o)) return { tabla: [], criterio: '', reservado: true };
+  const partidos = await partidosFiltrados(req, o);
+  return { tabla: await conLogos(calcularPosiciones(partidos)), criterio: criterioPosiciones(partidos) };
+});
 // El medallero se reserva hasta que la organización lo publica.
 ruta('medallero', async (req, o) => {
   if (!lectura.puedeVerMedallero(null, o)) return lectura.medalleroReservado(o);

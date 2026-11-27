@@ -47,9 +47,20 @@ function tipoMarcadorDisciplina(nombre, tipo = 'TANTOS') {
   return basquet && (!tipo || tipo === 'TANTOS') ? 'CUARTOS' : tipo || 'TANTOS';
 }
 
-function permitePenales(nombre, tipo = 'TANTOS') {
+function esHandball(nombre) {
   const deporte = normalizarNombre(nombre);
-  return (tipo || 'TANTOS') === 'TANTOS' && /\b(?:futbol\d*|futsal)\b/.test(deporte) && !/\btenis\b/.test(deporte);
+  return /\b(?:handb[ao]ll?|balonmano)\b/.test(deporte) && !/\b(?:playa|beach)\b/.test(deporte);
+}
+
+function tipoTanda(nombre, tipo = 'TANTOS') {
+  if (tipo && tipo !== 'TANTOS') return null;
+  if (esHandball(nombre)) return 'SIETE_METROS';
+  const deporte = normalizarNombre(nombre);
+  return /\b(?:futbol\d*|futsal)\b/.test(deporte) && !/\btenis\b/.test(deporte) ? 'PENALES' : null;
+}
+
+function permitePuntosNegativos(nombre, tipo = 'TANTOS') {
+  return (tipo || 'TANTOS') === 'TANTOS' && /\bbura[ck]o\b/.test(normalizarNombre(nombre));
 }
 
 function normalizarCuartos(cuartos, estado) {
@@ -84,10 +95,12 @@ function estaEnVivo(partido) {
 function conEnVivo(partidos) {
   return (partidos || []).map(p => {
     const parciales = leerParciales(p.sets);
+    const tanda = tipoTanda(p.disciplina_nombre, p.tipo_marcador);
     return { ...p, sets: Array.isArray(parciales) ? parciales : null,
       cuartos: parciales?.cuartos || null, penales: parciales?.penales || null,
-      permite_penales: permitePenales(p.disciplina_nombre, p.tipo_marcador),
+      permite_penales: tanda !== null, tipo_tanda: tanda,
       tipo_marcador: tipoMarcadorDisciplina(p.disciplina_nombre, p.tipo_marcador),
+      permite_puntos_negativos: permitePuntosNegativos(p.disciplina_nombre, p.tipo_marcador),
       en_vivo: estaEnVivo(p), clasificacion1_manual: !!rotuloManual(p, 1), clasificacion2_manual: !!rotuloManual(p, 2) };
   });
 }
@@ -132,13 +145,13 @@ function partidosPublicos(partidos) {
 }
 
 function partidoPublico(p, porId) {
-  const campos = ['id', 'olimpiada_id', 'disciplina_id', 'disciplina_nombre', 'fecha', 'hora_inicio', 'hora_fin', 'etiqueta', 'fase',
+  const campos = ['id', 'olimpiada_id', 'disciplina_id', 'disciplina_nombre', 'fecha', 'hora_inicio', 'hora_fin', 'etiqueta', 'fase', 'permite_puntos_negativos',
     'departamental1_id', 'departamental2_id', 'departamental1_nombre', 'departamental2_nombre', 'resultado1', 'resultado2',
     'ganador', 'estado', 'sede_id', 'sede_nombre', 'orden', 'fecha_modificacion', 'torneo_id', 'torneo_nombre', 'instancia_id',
     'instancia_nombre', 'instancia_orden', 'lugar_id', 'lugar_nombre', 'lugar_predio', 'lugar_direccion', 'lugar_url_mapa',
     'partido_origen1_id', 'partido_origen2_id',
     'equipo1_id', 'equipo2_id', 'equipo1_nombre', 'equipo2_nombre', 'zona', 'bloque', 'sets', 'cuartos', 'penales', 'permite_penales', 'tipo_marcador', 'en_vivo',
-    'origen1_tipo', 'origen2_tipo', 'sede_direccion', 'sede_url_mapa', 'sede_lat', 'sede_lng', 'lugar_lat', 'lugar_lng'];
+    'origen1_tipo', 'origen2_tipo', 'sede_direccion', 'sede_url_mapa', 'sede_lat', 'sede_lng', 'lugar_lat', 'lugar_lng', 'tipo_tanda'];
   const salida = Object.fromEntries(campos.filter(c => p[c] !== undefined).map(c => [c, p[c]]));
   for (const lado of [1, 2]) {
     const manual = rotuloManual(p, lado);
@@ -150,8 +163,12 @@ function partidoPublico(p, porId) {
   return salida;
 }
 
-function marcadorNumerico(valor) {
+function marcadorNumerico(valor, conSigno = false) {
   if (valor === null || valor === undefined || String(valor).trim() === '') return null;
+  if (conSigno) {
+    const entero = String(valor).trim();
+    return /^[+-]?\d+$/.test(entero) && Number.isSafeInteger(Number(entero)) ? Number(entero) : null;
+  }
   const texto = String(valor).trim().replace(',', '.');
   if (!/^\d+(?:\.\d+)?$/.test(texto)) return null;
   const numero = Number(texto);
@@ -185,13 +202,27 @@ function competidorDe(partido, lado, { porNombre = false } = {}) {
 
 // Standings count only finalized matches with an adjudicated winner/draw and both
 // sides known; scheduled matches and undecided walkovers never award points.
+function criterioPosiciones(partidos) {
+  if (!partidos.length) return '';
+  const deHandball = partidos.filter(p => esHandball(p.disciplina_nombre)).length;
+  if (!deHandball) return 'Victoria 3 puntos · empate 1 punto';
+  if (deHandball === partidos.length) return 'Victoria 2 puntos · empate 1 punto por equipo, incluso con definición por penales';
+  return 'Victoria 3 puntos (2 en hándbol) · empate 1 punto por equipo. En hándbol los penales definen el cruce y se mantiene el empate en la tabla';
+}
+
 function calcularPosiciones(partidos, opciones = {}) {
   const tabla = new Map();
   for (const p of partidos) {
     if (p.estado !== 'FINALIZADO' || ![0, 1, 2].includes(Number(p.ganador)) || p.ganador == null) continue;
     const lados = [competidorDe(p, 1, opciones), competidorDe(p, 2, opciones)];
     if (lados.some(lado => !lado) || lados[0].clave === lados[1].clave) continue;
-    const tantos = [marcadorNumerico(p.resultado1), marcadorNumerico(p.resultado2)];
+    const conSigno = permitePuntosNegativos(p.disciplina_nombre, p.tipo_marcador);
+    const tantos = [marcadorNumerico(p.resultado1, conSigno), marcadorNumerico(p.resultado2, conSigno)];
+    const handball = esHandball(p.disciplina_nombre);
+    // La tanda de siete metros resuelve el cruce. Para la liguilla vale el marcador de juego.
+    const empateReglamentario = handball && tantos[0] !== null && tantos[0] === tantos[1];
+    const ganadorTabla = empateReglamentario ? 0 : Number(p.ganador);
+    const puntosVictoria = handball ? 2 : 3;
     for (let i = 0; i < 2; i++) {
       const lado = lados[i];
       if (!tabla.has(lado.clave)) {
@@ -203,10 +234,10 @@ function calcularPosiciones(partidos, opciones = {}) {
       }
       const fila = tabla.get(lado.clave);
       fila.jugados++;
-      const empate = Number(p.ganador) === 0;
-      const gano = Number(p.ganador) === i + 1;
+      const empate = ganadorTabla === 0;
+      const gano = ganadorTabla === i + 1;
       fila[empate ? 'empatados' : gano ? 'ganados' : 'perdidos']++;
-      fila.puntos += empate ? 1 : gano ? 3 : 0;
+      fila.puntos += empate ? 1 : gano ? puntosVictoria : 0;
       if (tantos.every(n => n !== null)) {
         fila.a_favor += tantos[i];
         fila.en_contra += tantos[1 - i];
@@ -607,8 +638,8 @@ function filtroId(query, campo) {
 
 module.exports = {
   CAMPOS_PARTIDO_EXTRA, TIPOS_ORIGEN, TIPOS_MARCADOR, REGLAS_DIVISION, MAX_SETS, MAX_PUESTOS,
-  partidoPublico, partidosPublicos, marcadorNumerico, calcularPosiciones, listarTorneos, listarEquipos, filtroId,
-  normalizarSets, leerParciales, normalizarCuartos, tipoMarcadorDisciplina, permitePenales, contarSets, estaEnVivo, conEnVivo,
+  partidoPublico, partidosPublicos, permitePuntosNegativos, marcadorNumerico, calcularPosiciones, criterioPosiciones, listarTorneos, listarEquipos, filtroId,
+  normalizarSets, leerParciales, normalizarCuartos, tipoMarcadorDisciplina, tipoTanda, contarSets, estaEnVivo, conEnVivo,
   normalizarNombre, competidorDe, resolverClasificacion, hayCiclo, nombreZona,
   nombrePuesto, repartirPuntos, calcularTablaMedallero, agruparMedallasPorDisciplina, detectarTriangular, puestosSegunResultados,
 };

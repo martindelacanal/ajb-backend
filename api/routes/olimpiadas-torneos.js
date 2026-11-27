@@ -1,7 +1,7 @@
 /* Registers competition management on the content router, sharing its validation and audit helpers. */
 const { verificarAccesoCompeticion, exigirEdicionVoluntario, exigirDisciplinaVoluntario, esVoluntario } = require('../security/olimpiadas-voluntarios');
 const { getCabecera, esSuperior, crearErrorHttp, responderError, normalizarIds, normalizarIdPositivo, firmarSeguro } = require('../services/olimpiadas-comun');
-const { calcularPosiciones, listarTorneos, listarEquipos, filtroId } = require('../services/olimpiadas-competicion');
+const { calcularPosiciones, criterioPosiciones, listarTorneos, listarEquipos, filtroId } = require('../services/olimpiadas-competicion');
 // Se pide al usarlo: este archivo y el de las categorías se cargan desde el mismo router de contenido.
 const esquemaPruebas = conexion => require('./olimpiadas-pruebas').esquemaDisponible(conexion);
 
@@ -161,7 +161,8 @@ module.exports = function registrarTorneos(router, helpers) {
     res.set('Cache-Control', 'no-store');
     // Fuera de la gestión, las posiciones sólo se ven si la organización las publicó.
     if (!puedeVerPosiciones(cabecera, olimpiada)) return res.json({ tabla: [], criterio: '', reservado: true });
-    res.json({ tabla: calcularPosiciones(await consultarPartidos(db, { condiciones, params })), criterio: 'Victoria 3 puntos · empate 1 punto' });
+    const partidos = await consultarPartidos(db, { condiciones, params });
+    res.json({ tabla: calcularPosiciones(partidos), criterio: criterioPosiciones(partidos) });
   }));
 
   router.get('/olimpiadas/:id(\\d+)/competicion/historial', verificarAccesoCompeticion, endpoint(async (req, res) => {
