@@ -127,7 +127,7 @@ ruta('medallero', async (req, o) => {
   const medallero = await lectura.armarMedallero(db, o);
   return { ...medallero, tabla: await conLogos(medallero.tabla) };
 });
-ruta('videos', (req, o) => lectura.listarVideos(db, o.id, req.query));
+ruta('videos', (req, o) => lectura.listarVideos(db, o.id, req.query, { porSubida: req.query.orden === 'SUBIDA' }));
 ruta('en-vivo', async (req, o) => {
   const partidos = partidosPublicos(await partidosFiltrados(req, o)), hoy = fechaHoyBuenosAires();
   return { actualizado: new Date().toISOString(), en_juego: partidos.filter(p => p.en_vivo), pruebas_en_juego: await lectura.pruebasEnJuego(db, o.id),
@@ -158,7 +158,7 @@ ruta('secciones', async (req, o) => {
   return rows;
 });
 ruta('enlaces', async (req, o) => { const [rows] = await db.query('SELECT id, tipo, titulo, url, descripcion, orden FROM olimpiada_enlace WHERE olimpiada_id = ? AND eliminado = 0 ORDER BY orden, id', [o.id]); return rows; });
-ruta('fotos', (req, o) => lectura.listarFotos(db, o.id, req.query));
+ruta('fotos', (req, o) => lectura.listarFotos(db, o.id, req.query, { porSubida: req.query.orden === 'SUBIDA' }));
 ruta('bonos/reglas', async (req, o) => {
   const [tramos] = await db.query('SELECT id, edad_desde, edad_hasta, bonos, etiqueta, orden FROM olimpiada_bono_tramo WHERE olimpiada_id = ? ORDER BY orden, edad_desde', [o.id]);
   return require('./olimpiadas-bonos').__test.armarReglas(o, tramos);

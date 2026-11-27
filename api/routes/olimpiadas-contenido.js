@@ -3535,7 +3535,7 @@ router.lecturasPublicas = Object.freeze({
   estadoEdicion, consultarPartidos, listarDisciplinasFixture, listarSedes, armarMedallero, serializarNovedad, serializarEvento, SELECT_EVENTO,
   armarEnVivo, listarEscudos, puedeVerMedallero, medalleroReservado, listarVideos: videos.listarVideos,
   listarPruebas: pruebasLectura.listarPruebas, pruebasEnJuego: pruebasLectura.pruebasEnJuego,
-  listarFotos: (conexion, id, filtros) => listarFotos(conexion, id, filtros, consultarPartidos),
+  listarFotos: (conexion, id, filtros, opciones) => listarFotos(conexion, id, filtros, consultarPartidos, opciones),
 });
 
 router.__test = Object.freeze({

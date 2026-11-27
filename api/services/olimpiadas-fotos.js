@@ -177,15 +177,16 @@ function condicionesGaleria(olimpiadaId, query, estadoVisible, etiquetasSql = TA
   }
   return { condiciones, params };
 }
-async function listarFotos(conexion, olimpiadaId, query, consultarPartidos, { gestion = false } = {}) {
+async function listarFotos(conexion, olimpiadaId, query, consultarPartidos, { gestion = false, porSubida = false } = {}) {
   const estadoVisible = gestion ? '' : " AND p.estado IN ('EN_JUEGO', 'FINALIZADO')";
   const page = filtroEntero(query, 'page', 1), pageSize = filtroEntero(query, 'pageSize', 24);
   if (page > 1000000 || pageSize > 60) throw crearErrorHttp('La paginación es inválida');
   const { condiciones, params } = condicionesGaleria(olimpiadaId, query, estadoVisible);
   const where = condiciones.join(' AND ');
+  const orden = porSubida ? 'f.fecha_creacion DESC, f.id DESC' : 'f.fecha DESC, f.orden, f.id DESC';
   const [[[cuenta]], [rows], [disciplinasConFotos], [fechas], [etiquetas], [cuentasPartidos], [departamentales]] = await Promise.all([
     conexion.query(`SELECT COUNT(*) AS total FROM olimpiada_foto f WHERE ${where}`, params),
-    conexion.query(`${SELECT_FOTO}${estadoVisible} WHERE ${where} ORDER BY f.fecha DESC, f.orden, f.id DESC LIMIT ? OFFSET ?`, [...params, pageSize, (page - 1) * pageSize]),
+    conexion.query(`${SELECT_FOTO}${estadoVisible} WHERE ${where} ORDER BY ${orden} LIMIT ? OFFSET ?`, [...params, pageSize, (page - 1) * pageSize]),
     conexion.query(`SELECT d.id, d.nombre, COUNT(*) AS cantidad FROM olimpiada_foto f INNER JOIN olimpiada_disciplina d ON d.id = f.disciplina_id
       WHERE f.olimpiada_id = ? AND f.eliminado = 0 GROUP BY d.id, d.nombre ORDER BY d.nombre`, [olimpiadaId]),
     conexion.query(`SELECT fecha, COUNT(*) AS cantidad FROM olimpiada_foto WHERE olimpiada_id = ? AND eliminado = 0 AND fecha IS NOT NULL

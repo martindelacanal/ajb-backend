@@ -117,11 +117,12 @@ module.exports = function registrarVideos(router, helpers, {
     return Promise.all(filas.map(f => serializar(f, nombres.get(Number(f.partido_id)), departamentales)));
   }
 
-  async function listarVideos(conexion, olimpiadaId, query = {}, { gestion = false } = {}) {
+  async function listarVideos(conexion, olimpiadaId, query = {}, { gestion = false, porSubida = false } = {}) {
     const estadoVisible = gestion ? '' : " AND p.estado IN ('EN_JUEGO', 'FINALIZADO')";
     const { condiciones, params } = condicionesGaleria(olimpiadaId, query, estadoVisible, tablaEtiquetas('COALESCE(f.etiquetas, JSON_ARRAY())'));
+    const orden = porSubida ? 'f.fecha_creacion DESC, f.id DESC' : 'f.fecha IS NULL, f.fecha, f.orden, f.id';
     const [filas] = await conexion.query(`${SELECT_VIDEO}${estadoVisible} WHERE ${condiciones.join(' AND ')}
-      AND f.estado = 'LISTO' ORDER BY f.fecha IS NULL, f.fecha, f.orden, f.id`, params);
+      AND f.estado = 'LISTO' ORDER BY ${orden}`, params);
     for (const fila of filas) fila.poster_en_proceso = encolarPortada(fila);
     return serializarFilas(conexion, olimpiadaId, filas);
   }
