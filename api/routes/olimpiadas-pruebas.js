@@ -66,6 +66,24 @@ async function esquemaMedallero(conexion) {
   return medalleroListo;
 }
 
+let medalleroManualListo = false;
+let ultimoChequeoMedalleroManual = 0;
+async function esquemaMedalleroManual(conexion) {
+  if (medalleroManualListo) return true;
+  if (Date.now() - ultimoChequeoMedalleroManual < RECHEQUEO_ESQUEMA_MS) return false;
+  ultimoChequeoMedalleroManual = Date.now();
+  try {
+    const [rows] = await conexion.query(
+      `SELECT COUNT(*) AS columnas FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'olimpiada_prueba' AND COLUMN_NAME = 'medallero_manual'`
+    );
+    medalleroManualListo = Number(rows[0]?.columnas) === 1;
+  } catch (_error) {
+    medalleroManualListo = false;
+  }
+  return medalleroManualListo;
+}
+
 // Los ganadores que se eligen a mano en cada categoría de pesca (tercera tanda de la migración).
 // Mientras falte la tabla, pesca muestra su listado de participantes y no se pueden elegir ganadores.
 let ganadoresListo = false;
@@ -196,8 +214,8 @@ function describirMedallas(filas) {
 
 /**
  * Pasa al medallero las medallas que salen de los resultados cargados (origen AUTO). Igual que en
- * las disciplinas por partidos: si la administración cargó a mano los puestos de la disciplina, no
- * se toca hasta que elija «volver al cálculo automático». Los puntos ajustados a mano se conservan.
+ * las disciplinas por partidos, una carga general manual fija la disciplina. Una adjudicación
+ * manual por categoría suspende sólo sus resultados automáticos, incluso si está vacía.
  * Va dentro de la transacción del cambio que la provoca. Devuelve true si el medallero cambió.
  */
 async function sincronizarMedallas(connection, { cabecera, olimpiadaId, disciplinaId, historial }) {
@@ -210,17 +228,19 @@ async function sincronizarMedallas(connection, { cabecera, olimpiadaId, discipli
      WHERE m.olimpiada_id = ? AND m.disciplina_id = ? ORDER BY m.puesto, dep.nombre FOR UPDATE`,
     [olimpiadaId, disciplinaId]
   );
-  if (existentes.some(m => m.origen === 'MANUAL')) return false;
+  if (existentes.some(m => m.origen === 'MANUAL' && m.prueba_id == null)) return false;
+  const automaticas = existentes.filter(m => m.origen === 'AUTO');
+  const medalleroManual = await esquemaMedalleroManual(connection);
   const [[tope]] = await connection.query('SELECT COALESCE(MAX(puesto), 3) AS maximo FROM olimpiada_puntos_puesto WHERE olimpiada_id = ?', [olimpiadaId]);
   const [pruebas] = await connection.query(
-    'SELECT id, nombre, orden, suma_medallero FROM olimpiada_prueba WHERE olimpiada_id = ? AND disciplina_id = ? AND eliminado = 0', [olimpiadaId, disciplinaId]);
+    `SELECT id, nombre, orden, suma_medallero FROM olimpiada_prueba WHERE olimpiada_id = ? AND disciplina_id = ? AND eliminado = 0${medalleroManual ? ' AND medallero_manual = 0' : ''}`, [olimpiadaId, disciplinaId]);
   const [participantes] = await connection.query(`${SELECT_PARTICIPANTE} WHERE p.olimpiada_id = ? AND p.disciplina_id = ? AND p.eliminado = 0`, [olimpiadaId, disciplinaId]);
   const ganadores = disciplina.formato === 'PESCA' ? await cargarGanadores(connection, olimpiadaId, [disciplinaId]) : [];
-  const deseadas = P.heredarAjustes(existentes, P.medallasDeDisciplina(disciplina.formato, pruebas, participantes, { maxPuesto: Number(tope.maximo), ganadores }));
+  const deseadas = P.heredarAjustes(automaticas, P.medallasDeDisciplina(disciplina.formato, pruebas, participantes, { maxPuesto: Number(tope.maximo), ganadores }));
   const clave = m => `${Number(m.puesto)}:${Number(m.departamental_id)}:${m.clave_origen || ''}`;
   // Sólo se toca lo que cambió: las medallas que siguen igual conservan su fila (y su ajuste de puntos).
-  const actuales = new Set(existentes.map(clave)), queridas = new Set(deseadas.map(clave));
-  const sobran = existentes.filter(m => !queridas.has(clave(m))), faltan = deseadas.filter(m => !actuales.has(clave(m)));
+  const actuales = new Set(automaticas.map(clave)), queridas = new Set(deseadas.map(clave));
+  const sobran = automaticas.filter(m => !queridas.has(clave(m))), faltan = deseadas.filter(m => !actuales.has(clave(m)));
   if (!sobran.length && !faltan.length) return false;
   if (sobran.length) await connection.query('DELETE FROM olimpiada_medalla WHERE id IN (?)', [sobran.map(m => m.id)]);
   for (const medalla of faltan) {
@@ -232,7 +252,7 @@ async function sincronizarMedallas(connection, { cabecera, olimpiadaId, discipli
   }
   await historial(connection, cabecera, {
     entidad: 'MEDALLA', entidad_id: disciplinaId, olimpiada_id: olimpiadaId, tipo_operacion: 'UPDATE', campo_modificado: disciplina.nombre,
-    valor_anterior: describirMedallas(existentes) || null, valor_nuevo: describirMedallas(deseadas) || null,
+    valor_anterior: describirMedallas(automaticas) || null, valor_nuevo: describirMedallas(deseadas) || null,
     observacion: 'Calculado con los resultados cargados',
   });
   return true;
@@ -486,6 +506,10 @@ function registrarPruebas(router, helpers) {
         mensaje = `${actual.nombre} eliminada con sus ${cantidad} participante(s)`;
       }
       await connection.query('UPDATE olimpiada_prueba SET eliminado = 1 WHERE id = ?', [pruebaId]);
+      if (await esquemaMedallero(connection) && await esquemaMedalleroManual(connection)) {
+        await connection.query("DELETE FROM olimpiada_medalla WHERE olimpiada_id = ? AND disciplina_id = ? AND prueba_id = ? AND origen = 'MANUAL'",
+          [actual.olimpiada_id, actual.disciplina_id, pruebaId]);
+      }
       await historial(connection, cabecera, {
         entidad: 'PRUEBA', entidad_id: pruebaId, olimpiada_id: actual.olimpiada_id, tipo_operacion: 'DELETE',
         valor_anterior: actual.nombre, observacion: cantidad && disciplina.formato !== 'PESCA' ? `Tenía ${cantidad} participante(s)` : null,
@@ -802,6 +826,7 @@ module.exports.medallasParaFixture = medallasParaFixture;
 module.exports.pruebasEnJuego = pruebasEnJuego;
 module.exports.esquemaDisponible = esquemaDisponible;
 module.exports.esquemaMedallero = esquemaMedallero;
+module.exports.esquemaMedalleroManual = esquemaMedalleroManual;
 module.exports.esquemaGanadores = esquemaGanadores;
 module.exports.sincronizarMedallas = sincronizarMedallas;
 module.exports.esPorCategorias = esPorCategorias;
@@ -809,5 +834,6 @@ module.exports.sincronizarMedallasEdicion = sincronizarMedallasEdicion;
 module.exports.__test = {
   reiniciarEsquema: () => {
     esquemaListo = false; ultimoChequeo = 0; medalleroListo = false; ultimoChequeoMedallero = 0; ganadoresListo = false; ultimoChequeoGanadores = 0;
+    medalleroManualListo = false; ultimoChequeoMedalleroManual = 0;
   },
 };

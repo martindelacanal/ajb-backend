@@ -232,6 +232,33 @@ function sumaMedallero(prueba) {
   return prueba?.suma_medallero === 'NADA' ? 'NADA' : 'TODO';
 }
 
+function esNatacion25o50(categoria) {
+  const disciplina = sinAcentos(categoria.disciplina_nombre);
+  const nombre = sinAcentos(`${categoria.nombre || ''} ${categoria.descripcion || ''}`);
+  return /\bnatacion\b/.test(disciplina) && !/\b(?:postas?|relevos?)\b/.test(nombre)
+    && /\b(?:25|50)\s*m(?:ts?|tos?|etros?)?\b/.test(nombre);
+}
+
+/** Las adjudicaciones se conservan; para sumar sólo se toma la mejor medalla de cada departamental. */
+function medallasComputables(medallas, categoriasNatacion) {
+  const mejorPorDepartamental = new Map();
+  const computables = new Set();
+  for (const medalla of medallas) {
+    if (!categoriasNatacion.has(Number(medalla.prueba_id)) || Number(medalla.puesto) > MEDALLAS.length) {
+      computables.add(medalla);
+      continue;
+    }
+    const id = Number(medalla.departamental_id);
+    const mejor = mejorPorDepartamental.get(id);
+    if (!mejor || Number(medalla.puesto) < Number(mejor.puesto)
+      || (Number(medalla.puesto) === Number(mejor.puesto) && medalla.origen === 'MANUAL' && mejor.origen !== 'MANUAL')) {
+      mejorPorDepartamental.set(id, medalla);
+    }
+  }
+  for (const medalla of mejorPorDepartamental.values()) computables.add(medalla);
+  return medallas.filter(medalla => computables.has(medalla));
+}
+
 /**
  * Las medallas que estas disciplinas le suman solas al medallero: los primeros puestos de cada
  * categoría (por tiempo), los ganadores elegidos en cada categoría de pesca o los de póker.
@@ -387,6 +414,6 @@ module.exports = {
   formatoSugerido, esPorCategorias, nombreGrupo, sinAcentos,
   leerTiempo, formatearTiempo, leerMarca, leerGanadores, describirGanadores,
   puestosSegun, medallaDe, clasificarTiempo, clasificarMesa, clasificar, ganadoresDePrueba,
-  leerSumaMedallero, sumaMedallero, medallasDeDisciplina, lugarDeMedalla, heredarAjustes,
+  leerSumaMedallero, sumaMedallero, esNatacion25o50, medallasComputables, medallasDeDisciplina, lugarDeMedalla, heredarAjustes,
   participantePublico, armarDisciplina, horarioComun,
 };

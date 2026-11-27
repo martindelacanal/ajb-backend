@@ -28,6 +28,7 @@
  */
 require("dotenv").config();
 const fs = require("fs");
+const net = require("net");
 const mysql = require("mysql2/promise");
 const { formatoSugerido, sinAcentos } = require("../api/services/olimpiadas-pruebas");
 
@@ -41,6 +42,7 @@ const COLUMNAS = [
     "ENUM('PARTIDOS','TIEMPO','PESCA','MESAS') NOT NULL DEFAULT 'PARTIDOS' COMMENT 'PARTIDOS = 1 contra 1; TIEMPO = categorías por tiempo; PESCA = categorías por piezas y peso; MESAS = póker'"],
   ["olimpiada_prueba", "suma_medallero",
     "ENUM('TODO','PIEZAS','PESO','NADA') NOT NULL DEFAULT 'TODO' COMMENT 'Qué le suma la categoría al medallero (PIEZAS y PESO: sólo una de las dos tablas de pesca)'"],
+  ["olimpiada_prueba", "medallero_manual", "TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'Adjudicación manual de la categoría, incluso sin medallas'"],
   // Una medalla que salió de una categoría: de quién es y de cuál de las tablas (pesca)
   ["olimpiada_medalla", "prueba_id", "INT NULL COMMENT 'Categoría de la que salió la medalla (disciplinas por categorías)'"],
   ["olimpiada_medalla", "participante_id", "INT NULL COMMENT 'Participante que la ganó (olimpiada_prueba_participante)'"],
@@ -49,7 +51,7 @@ const COLUMNAS = [
 ];
 
 // Con varias categorías, una departamental puede ganar dos oros en la misma disciplina: la clave
-// única pasa a incluir de dónde salió cada medalla (para las de partidos y las manuales queda vacía).
+// única pasa a incluir de dónde salió cada medalla (queda vacía para cargas generales y partidos).
 const INDICE_MEDALLA = { nuevo: "uq_oli_medalla_origen", anterior: "uq_oli_medalla", columnas: "(olimpiada_id, disciplina_id, puesto, departamental_id, clave_origen)" };
 
 const TABLAS = {
@@ -63,6 +65,7 @@ const TABLAS = {
     hora_inicio TIME NULL,
     estado ENUM('PROGRAMADA','EN_JUEGO','FINALIZADA') NOT NULL DEFAULT 'PROGRAMADA',
     suma_medallero ENUM('TODO','PIEZAS','PESO','NADA') NOT NULL DEFAULT 'TODO' COMMENT 'Qué le suma la categoría al medallero (PIEZAS y PESO: sólo una de las dos tablas de pesca)',
+    medallero_manual TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'Adjudicación manual de la categoría, incluso sin medallas',
     orden INT NOT NULL DEFAULT 0,
     eliminado TINYINT(1) NOT NULL DEFAULT 0,
     fecha_creacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -285,25 +288,31 @@ function conexionDesdeEntorno(env) {
 async function main(argv = process.argv.slice(2)) {
   const aplicar = argv.includes("--apply");
   const target = argv.find((a) => a.startsWith("--target="))?.slice(9) || null;
+  const puertoTunel = argv.find((a) => a.startsWith("--puerto-tunel="))?.slice("--puerto-tunel=".length);
+  if (puertoTunel !== undefined && (!/^\d{1,5}$/.test(puertoTunel) || Number(puertoTunel) < 1 || Number(puertoTunel) > 65535)) {
+    throw new Error("El puerto del túnel es inválido");
+  }
   const permiteProduccion = argv.includes("--allow-production");
   if (aplicar && !argv.includes(`--confirm=${CONFIRMACION}`)) throw new Error(`Aplicar requiere --confirm=${CONFIRMACION}`);
 
   let entornos;
   if (target) {
     const { parsearArgumentos, obtenerEntornos, crearOpcionesConexion } = require("./migrar-webauthn-v1");
-    const opciones = parsearArgumentos(argv.filter((a) => !a.startsWith("--confirm=")));
+    const opciones = parsearArgumentos(argv.filter((a) => !a.startsWith("--confirm=") && !a.startsWith("--puerto-tunel=")));
     if (["production", "all"].includes(opciones.target) && !permiteProduccion) throw new Error("Production requiere --allow-production");
     entornos = obtenerEntornos(opciones, fs.readFileSync(opciones.envFile, "utf8"))
-      .map((e) => ({ nombre: e.nombre, opciones: crearOpcionesConexion(e.config) }));
+      .map((e) => ({ nombre: e.nombre, opciones: crearOpcionesConexion(e.config), modoTls: e.config.DB_SSL_MODE }));
   } else {
     const { remoto, opciones } = conexionDesdeEntorno(process.env);
     if (aplicar && (remoto || process.env.NODE_ENV === "production") && !permiteProduccion) {
       throw new Error("La base remota o de producción requiere --allow-production");
     }
-    entornos = [{ nombre: remoto ? "remota" : "local", opciones }];
+    entornos = [{ nombre: remoto ? "remota" : "local", opciones, modoTls: process.env.DB_SSL_MODE }];
   }
 
   for (const entorno of entornos) {
+    if (puertoTunel) entorno.opciones.stream = () => net.connect({ host: "127.0.0.1", port: Number(puertoTunel) });
+    if (entorno.opciones.ssl && entorno.modoTls === "verify-full") entorno.opciones.ssl.verifyIdentity = true;
     const db = await mysql.createConnection(entorno.opciones);
     try {
       const [[lock]] = await db.query("SELECT GET_LOCK(?, 15) AS tomado", [CANDADO]);

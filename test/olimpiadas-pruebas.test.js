@@ -216,7 +216,7 @@ test('la migración crea lo nuevo una sola vez y asigna el formato sólo al crea
   const vacia = crear(false);
   const primera = await migrar(vacia, true);
   // 3 tablas + el formato de la disciplina + 4 columnas del medallero + su clave única
-  // («suma_medallero» ya viene en la tabla nueva de categorías)
+  // Las dos columnas del medallero de categorías ya vienen en la tabla nueva.
   assert.equal(primera.pendientes.length, 9);
   assert.equal(vacia.sentencias.filter(s => /CREATE TABLE IF NOT EXISTS olimpiada_prueba_ganador/.test(s)).length, 1);
   assert.equal(vacia.sentencias.some(s => /ALTER TABLE `olimpiada_prueba` ADD COLUMN/.test(s)), false);
@@ -236,9 +236,10 @@ test('la migración crea lo nuevo una sola vez y asigna el formato sólo al crea
     return params[1] === 'uq_oli_medalla'; // sólo existe la clave única anterior
   });
   const tercera = await migrar(primeraTanda, true);
-  assert.equal(tercera.pendientes.length, 6, 'suma_medallero + 4 columnas de olimpiada_medalla + la clave única');
+  assert.equal(tercera.pendientes.length, 7, '2 columnas en la categoría + 4 en olimpiada_medalla + la clave única');
   assert.equal(primeraTanda.sentencias.some(s => /CREATE TABLE|UPDATE olimpiada_disciplina SET formato_competencia/.test(s)), false, 'no recrea ni reasigna formatos');
   assert.equal(primeraTanda.sentencias.filter(s => /ADD COLUMN `suma_medallero`/.test(s)).length, 1);
+  assert.equal(primeraTanda.sentencias.filter(s => /ADD COLUMN `medallero_manual`/.test(s)).length, 1);
   assert.equal(primeraTanda.sentencias.filter(s => /ADD UNIQUE KEY `uq_oli_medalla_origen`.*DROP INDEX `uq_oli_medalla`/.test(s)).length, 1, 'la clave nueva entra y la anterior sale en el mismo paso');
 
   const consulta = crear(false);
@@ -327,6 +328,19 @@ test('medallero por tiempo: un empate reparte dos medallas iguales y quien no ti
     de(1, 5, { tiempo_ms: 100 }), de(2, 5, { tiempo_ms: 100 }), de(3, null, { tiempo_ms: 150 }), de(4, 7, { tiempo_ms: 200 }),
   ], { maxPuesto: 5 });
   assert.deepEqual(conCinco.map(m => [m.puesto, m.participante_id]), [[1, 1], [1, 2], [4, 4]], 'si la edición puntúa más puestos, también suman');
+});
+
+test('natación de 25 y 50 metros aporta la mejor medalla por departamental, con las postas y el legado por separado', () => {
+  const prueba = (id, nombre, descripcion = null, disciplina_nombre = 'Natación') => ({ id, nombre, descripcion, disciplina_nombre });
+  const pruebas = [prueba(1, 'Femenino C (40 a 49 años) 25mts.'), prueba(2, 'Masculino D', '50 metros libres'),
+    prueba(3, 'Postas 50 mts'), prueba(4, 'Relevo 4 × 25 m'), prueba(5, '100 m'), prueba(6, '25 m', null, 'Maratón')];
+  const individuales = new Set(pruebas.filter(P.esNatacion25o50).map(p => p.id));
+  assert.deepEqual([...individuales], [1, 2]);
+  const medalla = (id, prueba_id, departamental_id, puesto, origen = 'AUTO') => ({ id, prueba_id, departamental_id, puesto, origen });
+  const medallas = [medalla(1, 1, 5, 2, 'MANUAL'), medalla(2, 2, 5, 1), medalla(3, 1, 5, 1, 'MANUAL'),
+    medalla(4, 2, 7, 3), medalla(5, 3, 5, 1), medalla(6, null, 5, 1, 'MANUAL'), medalla(7, 6, 5, 2), medalla(8, 2, 5, 4)];
+  assert.deepEqual(P.medallasComputables(medallas, individuales).map(m => m.id), [3, 4, 5, 6, 7, 8]);
+  assert.equal(medallas.length, 8, 'las adjudicaciones originales se conservan');
 });
 
 test('medallero de pesca: cada categoría suma a sus ganadores, y la misma persona puede ganar dos', () => {

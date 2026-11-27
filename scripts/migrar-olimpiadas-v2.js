@@ -282,6 +282,7 @@ CREATE TABLE IF NOT EXISTS olimpiada_partido (
   resultado2 VARCHAR(20) NULL,
   ganador TINYINT NULL COMMENT '1 = participante1, 2 = participante2, 0 = empate, NULL = sin definir',
   estado ENUM('PROGRAMADO','EN_JUEGO','FINALIZADO','SUSPENDIDO') NOT NULL DEFAULT 'PROGRAMADO',
+  motivo_resultado VARCHAR(300) NULL COMMENT 'Motivo público del resultado sin marcador',
   sede_id INT NULL,
   observacion VARCHAR(300) NULL,
   orden INT NOT NULL DEFAULT 0,

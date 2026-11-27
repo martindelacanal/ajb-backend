@@ -175,15 +175,19 @@ function simularEscrituraResultado(contexto) {
     beginTransaction() {}, commit() {}, rollback() {}, release() {},
     async query(sql, params) {
       if (sql.includes("UPDATE olimpiada_partido SET estado = ?")) {
-        const encuentro = contexto.partidos.find(p => p.id === params[5]);
-        [encuentro.estado, encuentro.resultado1, encuentro.resultado2, encuentro.ganador, encuentro.sets] = params;
+        const encuentro = contexto.partidos.find(p => p.id === params[6]);
+        [encuentro.estado, encuentro.resultado1, encuentro.resultado2, encuentro.ganador, encuentro.sets, encuentro.motivo_resultado] = params;
         return [{ affectedRows: 1 }];
       }
       if (sql.includes("UPDATE olimpiada_partido SET ? WHERE id = ?")) {
         Object.assign(contexto.partidos.find(p => p.id === params[1]), params[0]);
         return [{ affectedRows: 1 }];
       }
-      if (sql.includes("INSERT INTO olimpiada_historial")) return [{ insertId: 1 }];
+      if (sql.includes("UPDATE olimpiada_partido SET torneo_id = ?")) return [{ affectedRows: 1 }];
+      if (sql.includes("INSERT INTO olimpiada_historial")) {
+        contexto.consultas.push({ sql, params });
+        return [{ insertId: 1 }];
+      }
       if (sql.includes("FROM olimpiada_medalla m")) return [[]];
       return contexto.query(sql, params);
     },
@@ -227,6 +231,55 @@ test("veedor: un partido sólo sale en vivo al iniciar, conserva los sets al sus
   assert.equal((await guardar({ estado: "EN_JUEGO" })).status, 200);
   assert.deepEqual(await enJuego(), [44]);
   assert.equal(encuentro.sets, "[[25,19]]");
+});
+
+test("veedor: el motivo de un ganador sin marcador se publica, se audita y se retira al cambiar el resultado", async t => {
+  const encuentro = { ...partido };
+  const { pedir, contexto } = await servidor(t, { partidos: [encuentro] });
+  simularEscrituraResultado(contexto);
+  const guardar = body => pedir("/olimpiadas/partidos/44/resultado", { method: "PUT", body: { estado: "FINALIZADO", ...body } });
+  const ausente = "El rival no se presentó";
+  const respuesta = await guardar({ ganador: 1, motivo_resultado: `  ${ausente}  ` });
+  assert.equal(respuesta.status, 200);
+  assert.equal((await respuesta.json()).partido.motivo_resultado, ausente);
+  for (const prefijo of ["/olimpiadas/7", "/olimpiadas/publico/7"]) {
+    const fixture = await pedir(`${prefijo}/fixture`, { anonimo: prefijo.includes("publico") });
+    assert.equal(fixture.status, 200);
+    const resultado = (await fixture.json()).partidos[0];
+    assert.equal(resultado.motivo_resultado, ausente);
+    if (prefijo.includes("publico")) assert.equal(resultado.observacion, undefined);
+  }
+  assert.equal((await guardar({ resultado1: null, resultado2: null, sets: null })).status, 200);
+  assert.equal(encuentro.motivo_resultado, ausente);
+  for (const datos of [{ ganador: 1, motivo_resultado: 300 }, { ganador: 1, motivo_resultado: "a".repeat(301) },
+    { ganador: 0, motivo_resultado: ausente }, { ganador: 1, resultado1: "1", motivo_resultado: ausente },
+    { ganador: 1, sets: [[21, 19]], motivo_resultado: ausente }, { estado: "SUSPENDIDO", ganador: 1, motivo_resultado: ausente }]) {
+    assert.equal((await guardar(datos)).status, 400, JSON.stringify(datos));
+    assert.equal(encuentro.motivo_resultado, ausente);
+  }
+  assert.equal((await guardar({ ganador: 2 })).status, 200);
+  assert.equal(encuentro.motivo_resultado, null);
+  for (const datos of [{ ganador: 2, motivo_resultado: null }, { estado: "PROGRAMADO" },
+    { ganador: 0 }, { resultado1: "21", resultado2: "17" }]) {
+    assert.equal((await guardar({ ganador: 2, motivo_resultado: ausente })).status, 200);
+    assert.equal((await guardar(datos)).status, 200);
+    assert.equal(encuentro.motivo_resultado, null);
+  }
+  const cambios = contexto.consultas.filter(({ params }) => params[7] === "motivo_resultado").map(({ params }) => params.slice(8, 10));
+  assert.deepEqual(cambios.slice(0, 2), [[null, ausente], [ausente, null]]);
+});
+
+test("administración: editar la ficha conserva el motivo salvo que se cambie el resultado", async t => {
+  const actor = { id: 5, rol: "admin", rol_id: 1, habilitado: "Y", modulo_olimpiadas: 1, requiere_cambio_clave: 0 };
+  const encuentro = { ...partido, departamental1_id: null, departamental2_id: null, inscripcion1_id: null, inscripcion2_id: null,
+    estado: "FINALIZADO", ganador: 1, motivo_resultado: "El rival no se presentó" };
+  const { pedir, contexto } = await servidor(t, { actor, partidos: [encuentro] });
+  simularEscrituraResultado(contexto);
+  const editar = body => pedir("/olimpiadas/partidos/44", { method: "PUT", body });
+  assert.equal((await editar({ hora_inicio: "16:00" })).status, 200);
+  assert.equal(encuentro.motivo_resultado, "El rival no se presentó");
+  assert.equal((await editar({ resultado1: "21", resultado2: "19" })).status, 200);
+  assert.equal(encuentro.motivo_resultado, null);
 });
 
 test("básquet: el veedor carga parciales, corrige el resultado y el fixture público muestra los totales", async t => {

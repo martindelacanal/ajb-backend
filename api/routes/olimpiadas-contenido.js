@@ -17,7 +17,7 @@ const {
 } = require("../services/olimpiadas-fotos");
 const { SECCIONES_INICIALES } = require("../data/olimpiadas-plantillas");
 const pruebasLectura = require("./olimpiadas-pruebas");
-const { FORMATOS: FORMATOS_COMPETENCIA } = require("../services/olimpiadas-pruebas");
+const { FORMATOS: FORMATOS_COMPETENCIA, esNatacion25o50, medallasComputables, sumaMedallero } = require("../services/olimpiadas-pruebas");
 const { verificarAccesoCompeticion, exigirDisciplinaVoluntario, exigirEdicionVoluntario, esVoluntario, puedeEditarEdicion } = require('../security/olimpiadas-voluntarios');
 const { filtrarVeedoresManuales, filtrarContactosVeedores } = require('../services/olimpiadas-visibilidad-veedores');
 const {
@@ -1634,7 +1634,7 @@ const SELECT_PARTIDO = `
   SELECT p.id, p.olimpiada_id, p.disciplina_id, d.nombre AS disciplina_nombre, d.tipo_marcador, p.fecha, p.hora_inicio, p.hora_fin,
          p.etiqueta, p.fase, p.zona, p.bloque, p.participante1, p.participante2, p.departamental1_id, p.departamental2_id,
          p.equipo1_id, p.equipo2_id, eq1.nombre AS equipo1_nombre, eq2.nombre AS equipo2_nombre,
-         p.resultado1, p.resultado2, p.sets, p.ganador, p.estado, p.sede_id,
+         p.resultado1, p.resultado2, p.sets, p.ganador, p.estado, p.motivo_resultado, p.sede_id,
          IF(s.id IS NULL, sd.nombre, s.nombre) AS sede_nombre, IF(s.id IS NULL, sd.direccion, s.direccion) AS sede_direccion,
          IF(s.id IS NULL, sd.url_mapa, s.url_mapa) AS sede_url_mapa, IF(s.id IS NULL, sd.lat, s.lat) AS sede_lat, IF(s.id IS NULL, sd.lng, s.lng) AS sede_lng,
          p.observacion, p.orden, p.fecha_modificacion, p.torneo_id, t.nombre AS torneo_nombre, ${FORMATO_CUADRO},
@@ -2052,6 +2052,22 @@ function partidoParaHistorial(partido) {
     penales: parciales?.penales ? JSON.stringify(parciales.penales) : null };
 }
 
+function sinMarcador(partido) {
+  return partido.resultado1 == null && partido.resultado2 == null && partido.sets == null;
+}
+
+function leerMotivoResultado(motivo, anterior, nuevo) {
+  if (motivo != null && typeof motivo !== "string") throw crearErrorHttp("El motivo del resultado debe ser un texto");
+  const texto = motivo === undefined ? null : normalizarTexto(motivo);
+  if (texto && texto.length > 300) throw crearErrorHttp("El motivo del resultado supera los 300 caracteres");
+  const admiteMotivo = nuevo.estado === "FINALIZADO" && (nuevo.ganador === 1 || nuevo.ganador === 2) && sinMarcador(nuevo);
+  if (texto && !admiteMotivo) throw crearErrorHttp("El motivo sólo se puede cargar al finalizar eligiendo un ganador sin marcador");
+  if (motivo === undefined && admiteMotivo && anterior.estado === "FINALIZADO" && Number(anterior.ganador) === nuevo.ganador && sinMarcador(anterior)) {
+    return anterior.motivo_resultado ?? null;
+  }
+  return texto;
+}
+
 function ganadorDelMarcador(body, base, marcador, estado, disciplina) {
   const elegido = leerGanador(body.ganador);
   if (estado !== "FINALIZADO") return null;
@@ -2065,7 +2081,10 @@ function ganadorDelMarcador(body, base, marcador, estado, disciplina) {
   const editaPuntajes = ["resultado1", "resultado2", "sets", "cuartos", "penales"].some(campo => body[campo] !== undefined);
   const conSigno = permitePuntosNegativos(disciplina?.nombre, disciplina?.tipo_marcador);
   const mismosPuntos = conSigno && marcador.resultado1 === base.resultado1 && marcador.resultado2 === base.resultado2;
-  if (elegido === undefined && (!editaPuntajes || mismosPuntos) && base.estado === "FINALIZADO" && base.ganador != null) return base.ganador;
+  const sigueSinMarcador = sinMarcador(base) && sinMarcador(marcador);
+  if (elegido === undefined && (!editaPuntajes || mismosPuntos || sigueSinMarcador) && base.estado === "FINALIZADO" && base.ganador != null) {
+    return Number(base.ganador);
+  }
   return calcularGanadorPartido(marcador.resultado1, marcador.resultado2, conSigno);
 }
 
@@ -2111,6 +2130,7 @@ function leerPartido(body, base, { completo = false, disciplina } = {}) {
     datos.estado = leerEnum(body, "estado", base, ESTADOS_PARTIDO, { porDefecto: "PROGRAMADO", etiqueta: "el estado" });
     Object.assign(datos, leerMarcadorPartido(body, base, datos.estado, disciplina));
     datos.ganador = ganadorDelMarcador(body, base, datos, datos.estado, disciplina);
+    datos.motivo_resultado = leerMotivoResultado(undefined, base, datos);
   }
   return datos;
 }
@@ -2520,7 +2540,7 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)", verificarAccesoCompeticion, 
       const campos = camposVeedor || [
         "disciplina_id", "fecha", "hora_inicio", "hora_fin", "etiqueta", "fase", "participante1", "participante2",
         "departamental1_id", "departamental2_id", "sede_id", "observacion", "orden",
-        "estado", "resultado1", "resultado2", "ganador", "sets",
+        "estado", "resultado1", "resultado2", "ganador", "sets", "motivo_resultado",
       ];
       if (campos.length) {
         const cambios = Object.fromEntries(campos.map(campo => [campo, datos[campo]]));
@@ -2553,7 +2573,7 @@ const MENSAJE_RESULTADO = {
   SUSPENDIDO: "Partido suspendido.",
 };
 
-const CAMPOS_RESULTADO = ['estado', 'resultado1', 'resultado2', 'sets', 'cuartos', 'penales', 'ganador'];
+const CAMPOS_RESULTADO = ['estado', 'resultado1', 'resultado2', 'sets', 'cuartos', 'penales', 'ganador', 'motivo_resultado'];
 
 router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCompeticion, async (req, res) => {
   const cabecera = getCabecera(req);
@@ -2566,7 +2586,7 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCom
     const estado = leerEnum(body, "estado", {}, ESTADOS_PARTIDO, { etiqueta: "el estado" });
     if (esVoluntario(cabecera)) {
       const campos = Object.keys(body);
-      if (campos.some(campo => !CAMPOS_RESULTADO.includes(campo))) return res.status(403).json("Esta operación sólo permite cargar el estado y el marcador.");
+      if (campos.some(campo => !CAMPOS_RESULTADO.includes(campo))) return res.status(403).json("Esta operación sólo permite cargar el estado y el resultado.");
       if (estado === "EN_JUEGO" && actual.estado !== "EN_JUEGO" && campos.length > 1) {
         return res.status(409).json("Marcá el inicio del partido antes de cargar un resultado parcial.");
       }
@@ -2579,12 +2599,13 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCom
     }
     const ganador = ganadorDelMarcador(body, actual, marcador, estado, disciplina);
     const nuevo = { estado, resultado1, resultado2, ganador, sets };
+    nuevo.motivo_resultado = leerMotivoResultado(body.motivo_resultado, actual, nuevo);
     let efectos = null;
     await enTransaccion(async (connection) => {
       await bloquearSinCambios(connection, 'olimpiada_partido', actual);
       await connection.query(
-        "UPDATE olimpiada_partido SET estado = ?, resultado1 = ?, resultado2 = ?, ganador = ?, sets = ? WHERE id = ?",
-        [estado, resultado1, resultado2, ganador, sets, partidoId]
+        "UPDATE olimpiada_partido SET estado = ?, resultado1 = ?, resultado2 = ?, ganador = ?, sets = ?, motivo_resultado = ? WHERE id = ?",
+        [estado, resultado1, resultado2, ganador, sets, nuevo.motivo_resultado, partidoId]
       );
       const marcador = resultado1 !== null || resultado2 !== null ? ` ${resultado1 ?? "-"} a ${resultado2 ?? "-"}` : "";
       const penales = leerParciales(sets)?.penales;
@@ -2605,7 +2626,7 @@ router.put("/olimpiadas/partidos/:partidoId(\\d+)/resultado", verificarAccesoCom
         { entidad: "PARTIDO", entidad_id: partidoId, olimpiada_id: actual.olimpiada_id },
         partidoParaHistorial(actual),
         partidoParaHistorial(nuevo),
-        ["resultado1", "resultado2", "ganador", "sets", "cuartos", "penales"]
+        ["resultado1", "resultado2", "ganador", "sets", "cuartos", "penales", "motivo_resultado"]
       );
       efectos = await aplicarEfectosCompeticion(connection, cabecera, actual.olimpiada_id, actual.disciplina_id);
     });
@@ -2696,11 +2717,13 @@ router.get("/olimpiadas/:id(\\d+)/en-vivo", verificarAccesoCompeticion, async (r
 // ---------------------------------------------------------------------------
 async function leerPodiosFixture(conexion, olimpiadaId, disciplinas, porCategorias, partidosCompletos) {
   // Una carga manual fija la disciplina entera, aunque sólo se haya adjudicado un puesto.
+  const conCategorias = await pruebasLectura.esquemaDisponible(conexion) && await pruebasLectura.esquemaMedallero(conexion);
   const [guardadas] = await conexion.query(
     `SELECT m.disciplina_id, m.puesto, m.departamental_id, dep.nombre, m.equipo_id, e.nombre AS equipo_nombre, m.origen
      FROM olimpiada_medalla m INNER JOIN departamental dep ON dep.id = m.departamental_id
      LEFT JOIN olimpiada_equipo e ON e.id = m.equipo_id
-     WHERE m.olimpiada_id = ? ORDER BY m.disciplina_id, m.puesto, dep.nombre, m.id`, [olimpiadaId]
+     WHERE m.olimpiada_id = ?${conCategorias ? " AND (m.origen <> 'MANUAL' OR m.prueba_id IS NULL)" : ""}
+     ORDER BY m.disciplina_id, m.puesto, dep.nombre, m.id`, [olimpiadaId]
   );
   const manuales = new Set(guardadas.filter(m => m.origen === "MANUAL").map(m => Number(m.disciplina_id)));
   const categorias = [];
@@ -2753,7 +2776,7 @@ async function leerPodiosFixture(conexion, olimpiadaId, disciplinas, porCategori
   return { podios, triangulares };
 }
 
-async function armarMedallero(conexion, olimpiada) {
+async function armarMedallero(conexion, olimpiada, { gestion = false } = {}) {
   const puestos = await leerPuntosPuestos(conexion, olimpiada);
   const division = REGLAS_DIVISION.includes(olimpiada.medallero_division) ? olimpiada.medallero_division : "EXACTA";
   const puntosDe = puesto => puestos.find(p => p.puesto === puesto)?.puntos || 0;
@@ -2766,32 +2789,66 @@ async function armarMedallero(conexion, olimpiada) {
   );
   // En las disciplinas por categorías cada medalla dice de qué categoría salió y quién la ganó.
   const conCategorias = await pruebasLectura.esquemaDisponible(conexion) && await pruebasLectura.esquemaMedallero(conexion);
+  const conCargaManual = conCategorias && gestion && await pruebasLectura.esquemaMedalleroManual(conexion);
+  const [categorias] = conCategorias ? await conexion.query(
+    `SELECT pr.id, pr.disciplina_id, d.nombre AS disciplina_nombre, pr.nombre, pr.descripcion, pr.suma_medallero${conCargaManual ? ", pr.medallero_manual" : ""}
+     FROM olimpiada_prueba pr INNER JOIN olimpiada_disciplina d ON d.id = pr.disciplina_id
+     WHERE pr.olimpiada_id = ? AND pr.eliminado = 0 AND d.formato_competencia IN ('TIEMPO', 'PESCA')
+     ORDER BY pr.orden, pr.id`, [olimpiada.id]
+  ) : [[]];
   const [filasMedallas] = await conexion.query(
     `SELECT m.id, m.disciplina_id, d.nombre AS disciplina_nombre, m.puesto, m.departamental_id, dep.nombre,
             m.equipo_id, e.nombre AS equipo_nombre, m.origen, m.puntos_manual${conCategorias ? `,
-            m.criterio, pr.nombre AS prueba_nombre, pr.orden AS prueba_orden, pp.nombre AS participante_nombre` : ""}
+            m.prueba_id, m.criterio, pr.nombre AS prueba_nombre, pp.nombre AS participante_nombre` : ""}
      FROM olimpiada_medalla m
      INNER JOIN olimpiada_disciplina d ON d.id = m.disciplina_id
      INNER JOIN departamental dep ON dep.id = m.departamental_id
      LEFT JOIN olimpiada_equipo e ON e.id = m.equipo_id${conCategorias ? `
      LEFT JOIN olimpiada_prueba pr ON pr.id = m.prueba_id
      LEFT JOIN olimpiada_prueba_participante pp ON pp.id = m.participante_id` : ""}
-     WHERE m.olimpiada_id = ?
+     WHERE m.olimpiada_id = ?${conCategorias ? " AND (m.prueba_id IS NULL OR pr.eliminado = 0)" : ""}
      ORDER BY d.nombre, m.puesto, ${conCategorias ? "pr.orden IS NULL, pr.orden, m.criterio, " : ""}dep.nombre, m.id`,
     [olimpiada.id]
   );
-  const medallas = filasMedallas.map(({ criterio, prueba_nombre, prueba_orden, participante_nombre, ...medalla }) => ({
+  const medallas = filasMedallas.map(({ criterio, prueba_nombre, participante_nombre, ...medalla }) => ({
     ...medalla,
     // «Femenino · Ana Pérez», «Costa · peso · Raúl Díaz» o, en póker, sólo la persona
     detalle: [prueba_nombre, criterio === "PIEZAS" ? "piezas" : criterio === "PESO" ? "peso" : null, participante_nombre].filter(Boolean).join(" · ") || null,
   }));
+  const natacion25o50 = new Set(categorias.filter(esNatacion25o50).map(categoria => Number(categoria.id)));
+  const computables = medallasComputables(medallas, natacion25o50);
+  const opciones = { puntos: puestos, division };
+  const agrupadas = agruparMedallasPorDisciplina(disciplinas, computables, opciones);
+  if (conCargaManual) {
+    const computablesIds = new Set(computables.map(medalla => Number(medalla.id)));
+    for (const disciplina of agrupadas) {
+      const propias = categorias.filter(categoria => Number(categoria.disciplina_id) === disciplina.disciplina_id);
+      if (!propias.length) continue;
+      const referencia = [{ id: disciplina.disciplina_id, nombre: disciplina.disciplina_nombre }];
+      const filas = medallas.filter(medalla => Number(medalla.disciplina_id) === disciplina.disciplina_id);
+      const [general] = agruparMedallasPorDisciplina(referencia, filas.filter(medalla => medalla.prueba_id == null), opciones);
+      disciplina.automatico = general.automatico;
+      disciplina.puestos_generales = general.puestos;
+      disciplina.categorias = propias.map(categoria => {
+        const id = Number(categoria.id);
+        const [grupo] = agruparMedallasPorDisciplina(referencia, filas.filter(medalla => Number(medalla.prueba_id) === id), opciones);
+        for (const puesto of grupo.puestos) {
+          for (const ganador of puesto.ganadores) {
+            for (const aporte of ganador.departamentales) aporte.computa = computablesIds.has(Number(aporte.medalla_id));
+          }
+        }
+        return { id, nombre: categoria.nombre, manual: Number(categoria.medallero_manual) === 1,
+          suma_medallero: sumaMedallero(categoria), mejor_por_departamental: natacion25o50.has(id), puestos: grupo.puestos };
+      });
+    }
+  }
   return {
     publicado: Number(olimpiada.medallero_publicado) === 1,
     division,
     puestos,
     puntos: { oro: puntosDe(1), plata: puntosDe(2), bronce: puntosDe(3) },
-    disciplinas: agruparMedallasPorDisciplina(disciplinas, medallas, { puntos: puestos, division }),
-    tabla: calcularTablaMedallero(medallas, puestos, { division }),
+    disciplinas: agrupadas,
+    tabla: calcularTablaMedallero(computables, puestos, { division }),
   };
 }
 
@@ -2813,7 +2870,7 @@ router.get("/olimpiadas/:id(\\d+)/medallero", verifyToken, async (req, res) => {
     const olimpiadaId = idDeRuta(req.params.id);
     const olimpiada = await cargarOlimpiada(db, olimpiadaId, cabecera);
     res.set("Cache-Control", "no-store");
-    res.status(200).json(puedeVerMedallero(cabecera, olimpiada) ? await armarMedallero(db, olimpiada) : medalleroReservado(olimpiada));
+    res.status(200).json(puedeVerMedallero(cabecera, olimpiada) ? await armarMedallero(db, olimpiada, { gestion: esSuperior(cabecera) }) : medalleroReservado(olimpiada));
   } catch (error) {
     responderError(res, error, "No se pudo cargar el medallero");
   }
@@ -2869,49 +2926,80 @@ router.put("/olimpiadas/:id(\\d+)/medallero/puntos", verifyToken, async (req, re
       // Las disciplinas por categorías conocen todos los puestos: si ahora puntúan más (o menos), se ajustan
       if (anteriores.length !== nuevos.length) await pruebasLectura.sincronizarMedallasEdicion(connection, { cabecera, olimpiadaId, historial });
     });
-    res.status(200).json({ success: true, message: "Sistema de puntos actualizado", medallero: await armarMedallero(db, { ...olimpiada, ...legado }) });
+    res.status(200).json({ success: true, message: "Sistema de puntos actualizado", medallero: await armarMedallero(db, { ...olimpiada, ...legado }, { gestion: true }) });
   } catch (error) {
     responderError(res, error, "No se pudo actualizar el sistema de puntos");
   }
 });
 
-// Vuelve una disciplina al cálculo automático: descarta lo cargado a mano y toma los resultados.
-router.post("/olimpiadas/:id(\\d+)/medallero/:disciplinaId(\\d+)/automatico", verifyToken, async (req, res) => {
+const RUTA_MEDALLERO_DISCIPLINA = "/olimpiadas/:id(\\d+)/medallero/:disciplinaId(\\d+)";
+const RUTA_MEDALLERO_CATEGORIA = `${RUTA_MEDALLERO_DISCIPLINA}/pruebas/:pruebaId(\\d+)`;
+
+async function cargarCategoriaMedallero(connection, olimpiadaId, disciplinaId, pruebaId) {
+  const [[categoria]] = await connection.query(
+    `SELECT pr.nombre, pr.medallero_manual FROM olimpiada_prueba pr INNER JOIN olimpiada_disciplina d ON d.id = pr.disciplina_id
+     WHERE pr.id = ? AND pr.olimpiada_id = ? AND pr.disciplina_id = ? AND pr.eliminado = 0
+       AND d.formato_competencia IN ('TIEMPO', 'PESCA') FOR UPDATE`, [pruebaId, olimpiadaId, disciplinaId]);
+  if (!categoria) throw crearErrorHttp("La categoría no forma parte de esta disciplina", 404);
+  return categoria;
+}
+
+async function alcanceMedallero(pruebaId) {
+  const conCategorias = await pruebasLectura.esquemaDisponible(db) && await pruebasLectura.esquemaMedallero(db);
+  if (pruebaId && (!conCategorias || !(await pruebasLectura.esquemaMedalleroManual(db)))) {
+    throw crearErrorHttp("La carga manual por categoría todavía no está habilitada en este servidor", 503);
+  }
+  return conCategorias;
+}
+
+// Restablece únicamente el ámbito de la adjudicación elegida.
+async function restablecerMedalleroAutomatico(req, res) {
   const cabecera = exigirSuperior(req, res);
   if (!cabecera) return;
   try {
     const olimpiadaId = idDeRuta(req.params.id);
     const disciplinaId = idDeRuta(req.params.disciplinaId);
+    const pruebaId = req.params.pruebaId ? idDeRuta(req.params.pruebaId) : null;
     const olimpiada = await cargarOlimpiada(db, olimpiadaId, cabecera);
     const disciplina = await validarDisciplinaDeOlimpiada(db, olimpiadaId, disciplinaId);
+    const conCategorias = await alcanceMedallero(pruebaId);
+    const alcance = pruebaId ? " AND m.prueba_id = ?" : conCategorias ? " AND m.prueba_id IS NULL" : "";
+    const args = pruebaId ? [olimpiadaId, disciplinaId, pruebaId] : [olimpiadaId, disciplinaId];
+    let etiqueta = disciplina.nombre;
     await enTransaccion(async (connection) => {
+      const categoria = pruebaId ? await cargarCategoriaMedallero(connection, olimpiadaId, disciplinaId, pruebaId) : null;
+      if (categoria) etiqueta = `${disciplina.nombre} · ${categoria.nombre}`;
       const [previas] = await connection.query(
         `SELECT m.puesto, dep.nombre FROM olimpiada_medalla m INNER JOIN departamental dep ON dep.id = m.departamental_id
-         WHERE m.olimpiada_id = ? AND m.disciplina_id = ? AND m.origen = 'MANUAL' ORDER BY m.puesto, dep.nombre`,
-        [olimpiadaId, disciplinaId]
+         WHERE m.olimpiada_id = ? AND m.disciplina_id = ? AND m.origen = 'MANUAL'${alcance} ORDER BY m.puesto, dep.nombre FOR UPDATE`, args
       );
-      await connection.query("DELETE FROM olimpiada_medalla WHERE olimpiada_id = ? AND disciplina_id = ?", [olimpiadaId, disciplinaId]);
-      if (previas.length) {
+      const eraManual = Number(categoria?.medallero_manual) === 1;
+      if (previas.length) await connection.query(`DELETE m FROM olimpiada_medalla m WHERE m.olimpiada_id = ? AND m.disciplina_id = ? AND m.origen = 'MANUAL'${alcance}`, args);
+      if (eraManual) await connection.query("UPDATE olimpiada_prueba SET medallero_manual = 0 WHERE id = ?", [pruebaId]);
+      if (previas.length || eraManual) {
         await historial(connection, cabecera, {
           entidad: "MEDALLA", entidad_id: disciplinaId, olimpiada_id: olimpiadaId, tipo_operacion: "UPDATE",
-          campo_modificado: disciplina.nombre, valor_anterior: describirMedallas(previas), valor_nuevo: null,
+          campo_modificado: etiqueta, valor_anterior: describirMedallas(previas) || "Sin medallas", valor_nuevo: null,
           observacion: "Se descartó la carga manual para volver al cálculo automático",
         });
       }
       await sincronizarMedallasAutomaticas(connection, cabecera, olimpiadaId, disciplinaId);
     });
-    res.status(200).json({ success: true, message: `${disciplina.nombre} vuelve a calcularse con los resultados`, medallero: await armarMedallero(db, olimpiada) });
+    res.status(200).json({ success: true, message: `${etiqueta} vuelve a calcularse con los resultados`, medallero: await armarMedallero(db, olimpiada, { gestion: true }) });
   } catch (error) {
     responderError(res, error, "No se pudo volver al cálculo automático");
   }
-});
+}
+router.post(`${RUTA_MEDALLERO_DISCIPLINA}/automatico`, verifyToken, restablecerMedalleroAutomatico);
+router.post(`${RUTA_MEDALLERO_CATEGORIA}/automatico`, verifyToken, restablecerMedalleroAutomatico);
 
-router.put("/olimpiadas/:id(\\d+)/medallero/:disciplinaId(\\d+)", verifyToken, async (req, res) => {
+async function guardarMedalleroManual(req, res) {
   const cabecera = exigirSuperior(req, res);
   if (!cabecera) return;
   try {
     const olimpiadaId = idDeRuta(req.params.id);
     const disciplinaId = idDeRuta(req.params.disciplinaId);
+    const pruebaId = req.params.pruebaId ? idDeRuta(req.params.pruebaId) : null;
     const olimpiada = await cargarOlimpiada(db, olimpiadaId, cabecera);
     const disciplina = await validarDisciplinaDeOlimpiada(db, olimpiadaId, disciplinaId);
     const puestos = Array.isArray(req.body?.puestos) ? req.body.puestos : null;
@@ -2936,7 +3024,8 @@ router.put("/olimpiadas/:id(\\d+)/medallero/:disciplinaId(\\d+)", verifyToken, a
       for (const id of new Set(departamentalIds)) ganadores.push({ puesto, departamental_id: id, equipo_id: null });
       for (const id of new Set(equipoIds)) ganadores.push({ puesto, departamental_id: null, equipo_id: id });
     }
-    const equipos = await listarEquipos(db, olimpiadaId, [disciplinaId]);
+    if (pruebaId && ganadores.some(ganador => ganador.equipo_id)) return res.status(400).json("Elegí las departamentales de la categoría");
+    const equipos = pruebaId ? [] : await listarEquipos(db, olimpiadaId, [disciplinaId]);
     const equipoPor = new Map(equipos.map(e => [Number(e.id), e]));
     const filas = [];
     for (const ganador of ganadores) {
@@ -2946,43 +3035,59 @@ router.put("/olimpiadas/:id(\\d+)/medallero/:disciplinaId(\\d+)", verifyToken, a
         for (const dep of equipo.departamentales) filas.push({ puesto: ganador.puesto, departamental_id: dep.id, equipo_id: equipo.id, nombre: dep.nombre });
       } else filas.push({ puesto: ganador.puesto, departamental_id: ganador.departamental_id, equipo_id: null, nombre: null });
     }
-    if (!filas.length) return res.status(400).json("Elegí al menos un ganador o usá «Volver al cálculo automático».");
+    if (!pruebaId && !filas.length) return res.status(400).json("Elegí al menos un ganador o usá «Volver al cálculo automático».");
     const repetida = filas.find((fila, indice) => filas.findIndex(f => f.puesto === fila.puesto && f.departamental_id === fila.departamental_id) !== indice);
     if (repetida) return res.status(400).json(`Una departamental aparece dos veces en el ${nombrePuesto(repetida.puesto).toLowerCase()}`);
     const departamentales = await validarDepartamentales(db, [...new Set(filas.map(f => f.departamental_id))]);
     const nombrePor = new Map(departamentales.map((d) => [Number(d.id), d.nombre]));
     for (const fila of filas) fila.nombre = nombrePor.get(Number(fila.departamental_id));
+    const conCategorias = await alcanceMedallero(pruebaId);
+    const alcance = pruebaId ? " AND m.prueba_id = ?" : conCategorias ? " AND (m.prueba_id IS NULL OR m.origen = 'AUTO')" : "";
+    const args = pruebaId ? [olimpiadaId, disciplinaId, pruebaId] : [olimpiadaId, disciplinaId];
+    let etiqueta = disciplina.nombre;
     await enTransaccion(async (connection) => {
+      const categoria = pruebaId ? await cargarCategoriaMedallero(connection, olimpiadaId, disciplinaId, pruebaId) : null;
+      if (categoria) etiqueta = `${disciplina.nombre} · ${categoria.nombre}`;
       const [previas] = await connection.query(
-        `SELECT m.puesto, m.departamental_id, m.equipo_id, m.puntos_manual, dep.nombre FROM olimpiada_medalla m INNER JOIN departamental dep ON dep.id = m.departamental_id
-         WHERE m.olimpiada_id = ? AND m.disciplina_id = ? ORDER BY m.puesto, dep.nombre`,
-        [olimpiadaId, disciplinaId]
+        `SELECT m.id, m.puesto, m.departamental_id, m.equipo_id, m.puntos_manual, m.origen, dep.nombre FROM olimpiada_medalla m INNER JOIN departamental dep ON dep.id = m.departamental_id
+         WHERE m.olimpiada_id = ? AND m.disciplina_id = ?${alcance} ORDER BY m.puesto, dep.nombre FOR UPDATE`, args
       );
-      await connection.query("DELETE FROM olimpiada_medalla WHERE olimpiada_id = ? AND disciplina_id = ?", [olimpiadaId, disciplinaId]);
+      const coincide = (previa, fila) => Number(previa.puesto) === fila.puesto && Number(previa.departamental_id) === Number(fila.departamental_id)
+        && (Number(previa.equipo_id) || 0) === (fila.equipo_id || 0);
+      const quitar = previas.filter(previa => previa.origen !== "MANUAL" || !filas.some(fila => coincide(previa, fila)));
+      const cambiarModo = categoria && Number(categoria.medallero_manual) !== 1;
+      let huboCambios = quitar.length > 0 || cambiarModo;
+      if (quitar.length) await connection.query("DELETE FROM olimpiada_medalla WHERE id IN (?)", [quitar.map(previa => previa.id)]);
+      if (cambiarModo) await connection.query("UPDATE olimpiada_prueba SET medallero_manual = 1 WHERE id = ?", [pruebaId]);
       for (const fila of filas) {
-        // Un ajuste manual de puntos se conserva mientras la departamental siga en el mismo puesto y equipo.
-        const anterior = previas.find(p => Number(p.puesto) === fila.puesto && Number(p.departamental_id) === Number(fila.departamental_id) && (Number(p.equipo_id) || 0) === (fila.equipo_id || 0));
+        if (previas.some(previa => previa.origen === "MANUAL" && coincide(previa, fila))) continue;
+        const anterior = previas.find(previa => coincide(previa, fila));
         await connection.query(
-          "INSERT INTO olimpiada_medalla (olimpiada_id, disciplina_id, puesto, departamental_id, equipo_id, origen, puntos_manual) VALUES (?, ?, ?, ?, ?, 'MANUAL', ?)",
-          [olimpiadaId, disciplinaId, fila.puesto, fila.departamental_id, fila.equipo_id, anterior?.puntos_manual ?? null]
+          `INSERT INTO olimpiada_medalla (olimpiada_id, disciplina_id, puesto, departamental_id, equipo_id, origen, puntos_manual${pruebaId ? ", prueba_id, clave_origen" : ""})
+           VALUES (?, ?, ?, ?, ?, 'MANUAL', ?${pruebaId ? ", ?, ?" : ""})`,
+          [olimpiadaId, disciplinaId, fila.puesto, fila.departamental_id, fila.equipo_id, anterior?.puntos_manual ?? null, ...(pruebaId ? [pruebaId, `C${pruebaId}:MANUAL`] : [])]
         );
+        huboCambios = true;
       }
+      if (!huboCambios) return;
       await historial(connection, cabecera, {
         entidad: "MEDALLA",
         entidad_id: disciplinaId,
         olimpiada_id: olimpiadaId,
         tipo_operacion: "UPDATE",
-        campo_modificado: disciplina.nombre,
+        campo_modificado: etiqueta,
         valor_anterior: describirMedallas(previas) || null,
-        valor_nuevo: describirMedallas(filas) || null,
+        valor_nuevo: describirMedallas(filas) || "Sin medallas",
         observacion: "Cargado a mano por la administración",
       });
     });
-    res.status(200).json({ success: true, message: `Medallas de ${disciplina.nombre} guardadas`, medallero: await armarMedallero(db, olimpiada) });
+    res.status(200).json({ success: true, message: `Medallas de ${etiqueta} guardadas`, medallero: await armarMedallero(db, olimpiada, { gestion: true }) });
   } catch (error) {
     responderError(res, error, "No se pudieron guardar las medallas");
   }
-});
+}
+router.put(RUTA_MEDALLERO_DISCIPLINA, verifyToken, guardarMedalleroManual);
+router.put(RUTA_MEDALLERO_CATEGORIA, verifyToken, guardarMedalleroManual);
 
 // Ajuste manual de los puntos que una medalla le suma a una departamental (null = volver al cálculo).
 router.put("/olimpiadas/medallas/:medallaId(\\d+)/puntos", verifyToken, async (req, res) => {
@@ -3014,7 +3119,7 @@ router.put("/olimpiadas/medallas/:medallaId(\\d+)/puntos", verifyToken, async (r
         observacion: `${medalla.disciplina_nombre} · ${nombrePuesto(Number(medalla.puesto))} · ${medalla.departamental_nombre}`,
       });
     });
-    res.status(200).json({ success: true, message: puntos === null ? "Los puntos vuelven a calcularse solos" : "Puntos ajustados a mano", medallero: await armarMedallero(db, olimpiada) });
+    res.status(200).json({ success: true, message: puntos === null ? "Los puntos vuelven a calcularse solos" : "Puntos ajustados a mano", medallero: await armarMedallero(db, olimpiada, { gestion: true }) });
   } catch (error) {
     responderError(res, error, "No se pudieron ajustar los puntos");
   }

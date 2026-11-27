@@ -109,8 +109,8 @@ function conEnVivo(partidos) {
 // Proyección pública
 // ---------------------------------------------------------------------------
 
-// Public responses deliberately use an allowlist: registration IDs and free-text notes
-// must never become public merely because another column is added to the private query.
+// Public responses deliberately use an allowlist. `motivo_resultado` se carga para publicar
+// el resultado sin marcador. La observación del partido queda en gestión.
 // Sólo estos casilleros describen una clasificación sin identificar a una persona.
 const ROTULOS_MANUALES = [
   /^\d{1,2}\.?[º°] (?:ganador|perdedor)$/i,
@@ -147,7 +147,7 @@ function partidosPublicos(partidos) {
 function partidoPublico(p, porId) {
   const campos = ['id', 'olimpiada_id', 'disciplina_id', 'disciplina_nombre', 'fecha', 'hora_inicio', 'hora_fin', 'etiqueta', 'fase', 'permite_puntos_negativos',
     'departamental1_id', 'departamental2_id', 'departamental1_nombre', 'departamental2_nombre', 'resultado1', 'resultado2',
-    'ganador', 'estado', 'sede_id', 'sede_nombre', 'orden', 'fecha_modificacion', 'torneo_id', 'torneo_nombre', 'instancia_id',
+    'ganador', 'estado', 'motivo_resultado', 'sede_id', 'sede_nombre', 'orden', 'fecha_modificacion', 'torneo_id', 'torneo_nombre', 'instancia_id',
     'instancia_nombre', 'instancia_orden', 'lugar_id', 'lugar_nombre', 'lugar_predio', 'lugar_direccion', 'lugar_url_mapa',
     'partido_origen1_id', 'partido_origen2_id',
     'equipo1_id', 'equipo2_id', 'equipo1_nombre', 'equipo2_nombre', 'zona', 'bloque', 'sets', 'cuartos', 'penales', 'permite_penales', 'tipo_marcador', 'en_vivo',
