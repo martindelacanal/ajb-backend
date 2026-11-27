@@ -314,9 +314,12 @@ async function fechasCreacionDrive(archivos) {
   return fechas;
 }
 
-async function descargar(archivo, limite) {
+async function descargar(archivo, limite, {
+  plazoMs = 5 * 60000,
+  mensajeLimite = "El archivo supera el máximo de " + limite / 1024 / 1024 + " MB.",
+} = {}) {
   const url = enlaceDescarga(archivo.id, archivo.clave);
-  const signal = AbortSignal.timeout(5 * 60000);
+  const signal = AbortSignal.timeout(plazoMs);
   let respuesta = await pedirGoogle(url, signal);
   if (respuesta.headers.get("content-type")?.includes("text/html")) {
     // Algunas descargas públicas grandes presentan la confirmación con un UUID además del ID.
@@ -330,7 +333,7 @@ async function descargar(archivo, limite) {
     await respuesta.body?.cancel();
     throw crearErrorHttp(SIN_ACCESO, 422);
   }
-  return cuerpoLimitado(respuesta, limite, "El archivo supera el máximo de " + limite / 1024 / 1024 + " MB.");
+  return cuerpoLimitado(respuesta, limite, mensajeLimite);
 }
 
 module.exports = { listarCarpeta, fechasCreacionDrive, archivoSeleccionado, descargar, juntar, recursoDeEnlace, leerListado, cuerpoLimitado };

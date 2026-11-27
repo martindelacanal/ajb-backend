@@ -16,8 +16,9 @@ const {
 } = require('../services/olimpiadas-comun');
 
 const TAMANO_PARTE = 8 * 1024 * 1024;
-const MAX_VIDEO_BYTES = 200 * 1024 * 1024;
-const MAX_VIDEO_DRIVE_BYTES = 500 * 1024 * 1024;
+const MAX_VIDEO_BYTES = 1024 ** 3;
+const MENSAJE_LIMITE_VIDEO = 'El video supera el máximo de 1 GB.';
+const PLAZO_DESCARGA_VIDEO_DRIVE_MS = 10 * 60 * 1000;
 const MAX_VIDEOS_POR_EDICION = 40;
 const EXPIRACION_VIDEO_SEGUNDOS = 6 * 60 * 60;
 const TIPOS_VIDEO = { 'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov' };
@@ -183,7 +184,11 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
     let uploadId, completado = false, bytes = 0;
     const partes = [];
     try {
-      for await (const parte of agruparPartes(await drive.descargar(origen, MAX_VIDEO_DRIVE_BYTES))) {
+      const flujo = await drive.descargar(origen, MAX_VIDEO_BYTES, {
+        plazoMs: PLAZO_DESCARGA_VIDEO_DRIVE_MS,
+        mensajeLimite: MENSAJE_LIMITE_VIDEO,
+      });
+      for await (const parte of agruparPartes(flujo)) {
         if (!uploadId) {
           const tipo = detectarVideo(parte);
           if (!tipo || (tipo === 'video/webm') !== (origen.mime === 'video/webm')) throw crearErrorHttp('El archivo no es un video válido para ese formato.');
@@ -244,7 +249,7 @@ module.exports = function registrarVideos(router, helpers, { clienteS3 = s3, buc
     if (!extension) throw crearErrorHttp('El video tiene que ser MP4, WebM o MOV. MP4 es el que se reproduce en todos los teléfonos.');
     const bytes = Number(body.bytes);
     if (!Number.isSafeInteger(bytes) || bytes <= 0) throw crearErrorHttp('No pudimos leer el tamaño del video');
-    if (bytes > MAX_VIDEO_BYTES) throw crearErrorHttp(`El video supera el máximo de ${Math.floor(MAX_VIDEO_BYTES / 1024 / 1024)} MB`);
+    if (bytes > MAX_VIDEO_BYTES) throw crearErrorHttp(MENSAJE_LIMITE_VIDEO);
     const [[cuenta]] = await db.query('SELECT COUNT(*) AS cantidad FROM olimpiada_video WHERE olimpiada_id = ? AND eliminado = 0', [olimpiadaId]);
     if (Number(cuenta.cantidad) >= MAX_VIDEOS_POR_EDICION) throw crearErrorHttp(`Una edición admite hasta ${MAX_VIDEOS_POR_EDICION} videos`);
     const clasificacion = await leerClasificacion(db, body, olimpiadaId);

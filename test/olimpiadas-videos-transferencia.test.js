@@ -7,8 +7,8 @@ const express = require("express");
 Object.assign(process.env, { BUCKET_REGION: "us-east-1", BUCKET_NAME: "videos-test",
   ACCESS_KEY: "test", SECRET_ACCESS_KEY: "test", JWT_SECRET: "test-only" });
 
-test("video de 200 MiB: partes, reintento de cierre y enlaces de lectura y descarga", async t => {
-  const bytes = 200 * 1024 * 1024;
+test("video de 1 GiB: partes, reintento de cierre y enlaces de lectura y descarga", async t => {
+  const bytes = 1024 ** 3;
   const titulo = 'Final / vóley "2026"';
   let fila, fallarRegistro = false;
   const historial = [];
@@ -68,7 +68,7 @@ test("video de 200 MiB: partes, reintento de cierre y enlaces de lectura y desca
       }
       case "CompleteMultipartUploadCommand":
         if (objetoCreado) throw Object.assign(new Error("Subida cerrada"), { name: "NoSuchUpload", $metadata: { httpStatusCode: 404 } });
-        assert.deepEqual(entrada.MultipartUpload.Parts, Array.from({ length: 25 }, (_, i) =>
+        assert.deepEqual(entrada.MultipartUpload.Parts, Array.from({ length: 128 }, (_, i) =>
           ({ PartNumber: i + 1, ETag: partesS3.get(i + 1) })));
         objetoCreado = true;
         cierresS3++;
@@ -104,14 +104,16 @@ test("video de 200 MiB: partes, reintento de cierre y enlaces de lectura y desca
   const abrir = tamano => enviar("1/videos", "POST", JSON.stringify({ ...datosGaleria, titulo, bytes: tamano, mime: "video/mp4" }));
   const transferir = (numero, datos) => enviar("videos/12/partes/" + numero, "PUT", datos, "application/octet-stream");
   const completar = () => enviar("videos/12/completar", "POST");
-  assert.equal((await abrir(bytes + 1)).status, 400);
+  const excedido = await abrir(bytes + 1);
+  assert.equal(excedido.status, 400);
+  assert.match(await excedido.json(), /máximo de 1 GB/);
   const inicio = await abrir(bytes);
   assert.equal(inicio.status, 201);
   const { partes, tamano_parte } = await inicio.json();
-  assert.equal(partes, 25);
+  assert.equal(partes, 128);
   const trozo = Buffer.alloc(tamano_parte);
   trozo.write("ftypisom", 4);
-  assert.equal((await transferir(26, trozo.subarray(0, 16))).status, 400);
+  assert.equal((await transferir(129, trozo.subarray(0, 16))).status, 400);
   assert.equal((await transferir(1, trozo.subarray(0, 16))).status, 400);
   assert.equal((await completar()).status, 409);
   assert.equal(partesS3.size, 0);
@@ -121,7 +123,7 @@ test("video de 200 MiB: partes, reintento de cierre y enlaces de lectura y desca
     assert.equal((await respuesta.json()).recibidas, n);
     if (n === 1) assert.equal((await (await transferir(n, trozo)).json()).recibidas, 1);
   }
-  assert.equal(partesS3.size, 25);
+  assert.equal(partesS3.size, 128);
   fallarRegistro = true;
   assert.equal((await completar()).status, 500);
   assert.equal((await completar()).status, 200);
