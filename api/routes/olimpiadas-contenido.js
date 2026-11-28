@@ -1710,7 +1710,7 @@ async function listarDisciplinasFixture(conexion, olimpiadaId, { gestion = false
   );
   // Cómo se compite en cada una (partidos, categorías por tiempo, pesca o mesas) y cuántas categorías tiene
   const porCategorias = await pruebasLectura.resumenDisciplinas(conexion, olimpiadaId);
-  const { podios, triangulares } = await leerPodiosFixture(conexion, olimpiadaId, rows, porCategorias, await partidosCompletos);
+  const { podios, podiosCategorias, triangulares } = await leerPodiosFixture(conexion, olimpiadaId, rows, porCategorias, await partidosCompletos);
   const disciplinas = gestion ? rows : await filtrarVeedoresManuales(conexion, rows);
   return Promise.all(
     disciplinas.map(async (fila) => ({
@@ -1733,6 +1733,7 @@ async function listarDisciplinasFixture(conexion, olimpiadaId, { gestion = false
       veedores: veedores.filter((v) => Number(v.disciplina_id) === Number(fila.id) && v.nombre).map((v) => v.nombre),
       reglamento: fila.reglamento,
       podio: podios.get(Number(fila.id)) || [],
+      ...(!gestion && podiosCategorias.has(Number(fila.id)) ? { podios_categorias: podiosCategorias.get(Number(fila.id)) } : {}),
       ...(gestion ? { triangular_detectado: triangulares.get(Number(fila.id)) || null } : {}),
       reglamento_url: await firmarSeguro(fila.reglamento_archivo),
       reglamento_archivo_nombre: fila.reglamento_archivo ? fila.reglamento_archivo_nombre || "Reglamento.pdf" : null,
@@ -2715,6 +2716,16 @@ router.get("/olimpiadas/:id(\\d+)/en-vivo", verificarAccesoCompeticion, async (r
 // ---------------------------------------------------------------------------
 // Medallero
 // ---------------------------------------------------------------------------
+function podiosFixture(medallas) {
+  return new Map(agruparMedallasPorDisciplina([], medallas).map(disciplina => [disciplina.disciplina_id,
+    disciplina.puestos.filter(p => p.ganadores.length).map(p => ({
+      puesto: p.puesto, nombre: p.nombre, ganadores: p.ganadores.map(g => ({
+        nombre: g.nombre, detalle: g.detalle || null, departamentales: g.departamentales.map(({ id, nombre }) => ({ id, nombre })),
+      })),
+    })),
+  ]));
+}
+
 async function leerPodiosFixture(conexion, olimpiadaId, disciplinas, porCategorias, partidosCompletos) {
   // Una carga manual fija la disciplina entera, aunque sólo se haya adjudicado un puesto.
   const conCategorias = await pruebasLectura.esquemaDisponible(conexion) && await pruebasLectura.esquemaMedallero(conexion);
@@ -2732,7 +2743,7 @@ async function leerPodiosFixture(conexion, olimpiadaId, disciplinas, porCategori
     const id = Number(d.id);
     const formato = porCategorias.get(id)?.formato || "PARTIDOS";
     if (formato !== "PARTIDOS") {
-      if (!manuales.has(id)) categorias.push({ id, formato });
+      if (!manuales.has(id)) categorias.push({ id, formato, nombre: d.nombre });
     } else if (d.partidos == null || Number(d.partidos) === 3 || (Number(d.partidos) > 0 && !manuales.has(id)
       && ![1, 2, 3].every(p => guardadas.some(m => Number(m.disciplina_id) === id && Number(m.puesto) === p)))) {
       cuadrosPendientes.push(id);
@@ -2763,17 +2774,16 @@ async function leerPodiosFixture(conexion, olimpiadaId, disciplinas, porCategori
     }
     medallas.push(...await filasDePuestos(conexion, calcular));
   }
-  medallas.push(...await pruebasLectura.medallasParaFixture(conexion, olimpiadaId, categorias));
-  const podios = new Map();
-  for (const disciplina of agruparMedallasPorDisciplina([], medallas)) {
-    const puestos = disciplina.puestos.filter(p => p.ganadores.length).map(p => ({
-      puesto: p.puesto, nombre: p.nombre, ganadores: p.ganadores.map(g => ({
-        nombre: g.nombre, detalle: g.detalle || null, departamentales: g.departamentales.map(({ id, nombre }) => ({ id, nombre })),
-      })),
-    }));
-    podios.set(disciplina.disciplina_id, puestos);
+  const premios = await pruebasLectura.premiosParaFixture(conexion, olimpiadaId, categorias);
+  medallas.push(...premios.medallas);
+  const podiosCategorias = new Map();
+  for (const categoria of premios.categorias) {
+    const { id, nombre, disciplina_id } = categoria;
+    const puestos = categoria.puestos ?? podiosFixture(categoria.medallas).get(disciplina_id);
+    if (!podiosCategorias.has(disciplina_id)) podiosCategorias.set(disciplina_id, []);
+    podiosCategorias.get(disciplina_id).push({ id, nombre, puestos });
   }
-  return { podios, triangulares };
+  return { podios: podiosFixture(medallas), podiosCategorias, triangulares };
 }
 
 async function armarMedallero(conexion, olimpiada, { gestion = false } = {}) {

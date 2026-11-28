@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const P = require('../api/services/olimpiadas-pruebas');
 
 test('fixture: premia las categorías finalizadas aunque sus resultados no sumen al medallero', async () => {
-  const { medallasParaFixture } = require('../api/routes/olimpiadas-pruebas');
+  const { premiosParaFixture } = require('../api/routes/olimpiadas-pruebas');
   const tiempos = [
     { id: 1, disciplina_id: 4, prueba_id: 10, nombre: 'Ana', departamental_id: 3, departamental_nombre: 'Azul', tiempo_ms: 200 },
     { id: 2, disciplina_id: 4, prueba_id: 10, nombre: 'Sol', departamental_id: 5, departamental_nombre: 'Tandil', tiempo_ms: 250 },
@@ -15,9 +15,10 @@ test('fixture: premia las categorías finalizadas aunque sus resultados no sumen
     assert.match(sql, /estado = 'FINALIZADA'/);
     return [[{ id: 10, disciplina_id: 4, nombre: '50 metros', orden: 1, suma_medallero: 'NADA' }]];
   } };
-  const medallas = await medallasParaFixture(conexion, 7, [{ id: 4, formato: 'TIEMPO' }]);
+  const { medallas, categorias } = await premiosParaFixture(conexion, 7, [{ id: 4, formato: 'TIEMPO' }]);
   assert.deepEqual(medallas.map(m => [m.disciplina_id, m.puesto, m.nombre, m.detalle]),
     [[4, 1, 'Azul', '50 metros · Ana'], [4, 2, 'Tandil', '50 metros · Sol']]);
+  assert.deepEqual(categorias.map(c => [c.id, c.nombre, c.medallas.map(m => m.detalle)]), [[10, '50 metros', ['Ana', 'Sol']]]);
 });
 
 test('el formato sugerido reconoce las disciplinas que no se juegan 1 contra 1', () => {

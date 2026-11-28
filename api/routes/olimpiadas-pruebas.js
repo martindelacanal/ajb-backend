@@ -157,19 +157,62 @@ async function listarPruebas(conexion, olimpiadaId, { disciplinaIds = null, gest
   )));
 }
 
-async function medallasParaFixture(conexion, olimpiadaId, disciplinas) {
-  if (!disciplinas.length) return [];
+function puestosPostaFixture(participantes) {
+  // En el detalle cada tiempo distinto corresponde a una posta. El equipo puede reunir varias departamentales.
+  const porTiempo = new Map();
+  for (const p of P.clasificarTiempo(participantes)) {
+    if (p.tiempo_ms === null) continue;
+    let lugar = porTiempo.get(p.tiempo_ms);
+    if (!lugar) {
+      const puesto = porTiempo.size + 1;
+      if (puesto > 3) break;
+      lugar = { puesto, nombre: nombrePuesto(puesto), ganadores: [] };
+      porTiempo.set(p.tiempo_ms, lugar);
+    }
+    lugar.ganadores.push({
+      nombre: p.departamental_nombre || p.nombre,
+      detalle: p.departamental_nombre ? p.nombre : null,
+      departamentales: p.departamental_id && p.departamental_nombre ? [{ id: Number(p.departamental_id), nombre: p.departamental_nombre }] : [],
+    });
+  }
+  return [...porTiempo.values()];
+}
+
+async function premiosParaFixture(conexion, olimpiadaId, disciplinas) {
+  const medallas = [], categorias = [];
+  if (!disciplinas.length) return { medallas, categorias };
   const ids = disciplinas.map(d => d.id);
   // La premiación de la categoría es independiente de su aporte al medallero general.
   const [[pruebas], [participantes], ganadores] = await Promise.all([
     conexion.query(`SELECT id, disciplina_id, nombre, orden FROM olimpiada_prueba
-      WHERE olimpiada_id = ? AND disciplina_id IN (?) AND eliminado = 0 AND estado = 'FINALIZADA'`, [olimpiadaId, ids]),
+      WHERE olimpiada_id = ? AND disciplina_id IN (?) AND eliminado = 0 AND estado = 'FINALIZADA' ORDER BY orden, id`, [olimpiadaId, ids]),
     conexion.query(`${SELECT_PARTICIPANTE} WHERE p.olimpiada_id = ? AND p.disciplina_id IN (?) AND p.eliminado = 0`, [olimpiadaId, ids]),
     cargarGanadores(conexion, olimpiadaId, disciplinas.filter(d => d.formato === 'PESCA').map(d => d.id)),
   ]);
-  return disciplinas.flatMap(d => P.medallasDeDisciplina(d.formato,
-    pruebas.filter(p => Number(p.disciplina_id) === d.id), participantes.filter(p => Number(p.disciplina_id) === d.id),
-    { ganadores, soloPuntuables: false }).map(m => ({ ...m, disciplina_id: d.id })));
+  const personas = new Map(participantes.map(p => [Number(p.id), p.nombre]));
+  for (const d of disciplinas) {
+    const propias = pruebas.filter(p => Number(p.disciplina_id) === d.id);
+    const participantesDisciplina = participantes.filter(p => Number(p.disciplina_id) === d.id);
+    const premiadas = P.medallasDeDisciplina(d.formato, propias, participantesDisciplina, { ganadores, soloPuntuables: false })
+      .map(m => ({ ...m, disciplina_id: d.id }));
+    medallas.push(...premiadas);
+    if (d.formato !== 'TIEMPO' && d.formato !== 'PESCA') continue;
+
+    for (const p of propias) {
+      const id = Number(p.id);
+      const categoria = { id, nombre: p.nombre, disciplina_id: d.id };
+      if (d.formato === 'TIEMPO' && /\bnatacion\b/.test(P.sinAcentos(d.nombre)) && /\b(?:postas?|relevos?)\b/.test(P.sinAcentos(p.nombre))) {
+        const puestos = puestosPostaFixture(participantesDisciplina.filter(persona => Number(persona.prueba_id) === id));
+        if (puestos.length) categorias.push({ ...categoria, puestos });
+      } else {
+        const filas = premiadas.filter(m => m.prueba_id === id).map(m => ({
+          ...m, detalle: personas.get(m.participante_id) ?? null,
+        }));
+        if (filas.length) categorias.push({ ...categoria, medallas: filas });
+      }
+    }
+  }
+  return { medallas, categorias };
 }
 
 /** Para el listado de disciplinas del fixture: formato, cuántas categorías tiene y cuántas se están disputando. */
@@ -822,7 +865,7 @@ function registrarPruebas(router, helpers) {
 module.exports = registrarPruebas;
 module.exports.listarPruebas = listarPruebas;
 module.exports.resumenDisciplinas = resumenDisciplinas;
-module.exports.medallasParaFixture = medallasParaFixture;
+module.exports.premiosParaFixture = premiosParaFixture;
 module.exports.pruebasEnJuego = pruebasEnJuego;
 module.exports.esquemaDisponible = esquemaDisponible;
 module.exports.esquemaMedallero = esquemaMedallero;
